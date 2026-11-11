@@ -1,8 +1,8 @@
 # core/recursion_core/plugin_security (build-order item 9, candidate)
 
 In-process plugin loader (lane G2), the core approval gate and connection-keyed engine
-breaker (O11), and installer-signed authority profiles (lane K3). Candidate code: not
-yet called by a running daemon, and not reviewed or accepted.
+breaker (O11), and installer-signed authority profiles (lane K3). Candidate code, not
+reviewed or accepted. The user daemon calls it (see "Called by the daemon" below).
 
 - `loader.PluginLoader` checks a signed `csl-plugin-manifest/vNext` and the artifact
   bytes, grants requested ∩ granted permissions bound to the artifact digest and signer
@@ -87,7 +87,56 @@ against it.
 
 Production runtime: CPython 3.14 free-threaded, started with `-X gil=0`
 (`runtime.require_production_runtime`). Signature checks need `cryptography`
-(`requirements.txt`); without it every verification refuses.
+(`requirements.txt`); without it every verification refuses, and the daemon loads no
+plugin at all (next section).
+
+## Called by the daemon
+
+Spec: PRODUCT.md d84cdd26 (CSLR-D-012), sections 4.1 to 4.3. `daemon/plugins.py`
+(`PluginHost`, built by `daemon/control_adapter.compose_control` at daemon start) is the
+only place the daemon loads plugin code, and it does so only through `PluginLoader.load`:
+the daemon reads each installed plugin as bytes and never imports one by name.
+
+- Installed plugins are `$XDG_CONFIG_HOME/recursion/plugins/<name>/` (`manifest.json`,
+  `manifest.sig`, `plugin.py`) plus every `--plugin DIR`. Trusted keys, grants and reserved
+  effects come from `$XDG_CONFIG_HOME/recursion/plugins/install.json`. Every file must be
+  operator-owned and not group- or other-writable.
+- A plugin the loader refuses (bad manifest, artifact digest mismatch, reserved credential
+  or destination, compile or import failure) is kept out. Its typed code and findings are
+  in the inventory (`plugin.list` on the control socket, and a `plugin:<id>` row on the
+  GUI's route table), and the daemon keeps running without it. A plugin with a bad or
+  untrusted signature loads as unsigned, as section 4.3 says, and a grant bound to a signer
+  then grants it nothing.
+- **No verification, no load.** If `cryptography` cannot be imported, no signature can be
+  checked, so the daemon refuses every installed plugin with
+  `plugin_verification_unavailable: cryptography missing; install recipe in
+  plugin_security/README.md`. Nothing is loaded as "unsigned" in that state and nothing
+  is skipped quietly; the refusal is logged and shown on every surface.
+- A loaded plugin's `registry()` panels need the `panel` permission and its
+  `operator(command)` O7 reads need `read`. `bind_core(call)` receives the plugin's
+  `csl-core/v0` client. No surface can approve or veto yet, and every run is bound to
+  `host`, so no effect is authorized today. The authority ledger is never created by the
+  daemon; without an installer-made ledger an order effect refuses `authority_unconfigured`.
+- The breaker store is `$XDG_STATE_HOME/recursion/plugin-security/breaker.sqlite3`. There
+  is no installer yet, so the daemon creates it on first start (`create_breaker_store`)
+  and opens it on every later one; `daemon/breaker.py` writes typed connection limits, run
+  bindings and faults to it, so they survive a daemon restart. A store that was deleted
+  is created empty again and the daemon logs that. `breaker.py` here is unchanged.
+
+### Consumer recipe: a free-threaded interpreter with `cryptography`
+
+The venv must be on a filesystem that allows exec (not a `noexec` mount). Checked with
+`cryptography` 50.0.2 (its `cp314t` wheel) and `cffi` 2.1.1:
+
+```sh
+python3.14t -m venv ~/.local/lib/recursion/venv
+~/.local/lib/recursion/venv/bin/python -m pip install --only-binary=:all: -r core/recursion_core/plugin_security/requirements.txt
+PYTHONPATH=core ~/.local/lib/recursion/venv/bin/python -X gil=0 -c "import sys, cryptography; assert not sys._is_gil_enabled()"
+PYTHONPATH=core ~/.local/lib/recursion/venv/bin/python -X gil=0 -B -m unittest discover -s core -t core
+```
+
+The third line fails if `cryptography` is missing or if importing it turned the GIL on.
+Run the daemon with that interpreter (`daemon/README.md`).
 
 ## Tests
 

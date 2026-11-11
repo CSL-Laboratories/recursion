@@ -174,8 +174,34 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
 - **GUI.** The loopback GUI gets the same object as its client and a real door:
   `DeviceDoor` accepts only `Authorization: Bearer <token>` or the `recursion_device`
   cookie matching a per-start random token in
-  `$XDG_RUNTIME_DIR/recursion/gui-device-token` (0600). Its Stop is `run.stop`. The route
-  inventory and the O7 reads answer "not implemented"; the page says so.
+  `$XDG_RUNTIME_DIR/recursion/gui-device-token` (0600). Its Stop is `run.stop`. Its route
+  table is the daemon's own inventory (`route.list`): one row per engine the daemon has an
+  adapter for (configured or `route_not_configured`), the CLI surface, the plugin panels
+  and one `plugin:<id>` row per installed plugin, loaded or refused. The daemon records no
+  bar evidence, so every row is BETA. Its O7 reads go to the loaded operator plugin's
+  `operator(command)`. A read with no source answers `unavailable: <reason>` (no plugin
+  installed, no loaded plugin serves the contract, the plugin failed, verification
+  unavailable); the O7 interventions are not wired and answer `unavailable` too.
+- **TUI.** `python -m recursion_core.control.tui [--plain]` is the TUI on the same socket
+  client as the CLI, so its `start`, `list`, `status` and `stop` are the daemon's `run.*`
+  calls. Daemon down: the TUI shows `control_api_unavailable` (`UNAVAILABLE`), no traceback.
+- **Plugins.** Loaded only through `plugin_security.PluginLoader` (`plugins.PluginHost`):
+  manifest, artifact digest, signature against this install's trusted keys and the
+  installer's grant are checked before any plugin code runs. A refused plugin is listed
+  with its typed finding (`plugin.list`, and the GUI's route table) and the daemon runs
+  without it. With no `cryptography` every plugin is refused
+  `plugin_verification_unavailable`; none loads unverified. Layout, the install file and
+  the interpreter recipe are in `plugin_security/README.md`. Plugins run in the daemon's
+  process and uid: this is not a containment boundary.
+- **Breaker.** The route breaker writes typed connection limits, each run's binding
+  (connection, engine, model, owned by `host`) and faulted runs to
+  `$XDG_STATE_HOME/recursion/plugin-security/breaker.sqlite3` through
+  `plugin_security.ConnectionBreaker` (`breaker.DurableRouteBreaker`). After a restart a
+  connection the store calls tripped is fenced again at its first request for the breaker's
+  cooldown (the vendor's reset time is not stored), then one leased probe is admitted and
+  only its success clears the trip. A model-bucket limit stays in memory. A store that
+  exists and cannot be read refuses every start (`breaker_store_unavailable`); reads and
+  Stop still work.
 - **Routes.** `$XDG_CONFIG_HOME/recursion/routes.json` (operator-owned, not group or other
   writable) names the route per engine: `{"routes": {"claude_code": {"model": ...,
   "connection": {"kind": "subscription", "id": ...}, "api_key_helper": "absent",
@@ -186,11 +212,17 @@ Not done: credential custody (an API-key route refuses, `no credential`), Pi, He
 OpenCode, the Control MCP transport, a browser pairing step for the device token, a second
 launch per run (a fallback route refuses `run_already_launched`), re-attaching the route
 driver to a run that outlived a daemon (its output file keeps growing and is readable; its
-route result is not produced), and a durable breaker (the route breaker is in memory).
+route result is not produced), bar evidence for any route, the O7 interventions, a surface
+that can approve or veto an effect, and an installer for the plugin files, the authority
+ledger and the breaker store.
 
 Evidence: `evidence_ns.sh` runs `evidence_e2e.py`, which drives the real daemon and CLI
 against a real `systemd --user` manager with a stand-in engine
-(`evidence_standin_engine.py`): start, stream, inspect, Stop, cleanup, restart.
+(`evidence_standin_engine.py`): start, stream, inspect, Stop, cleanup, restart, a signed
+test plugin loaded through the plugin loader, the GUI inventory and an O7 read with the device
+token, the TUI over the socket, and a breaker trip that survives SIGKILL and restart. The
+daemon interpreter needs `cryptography`: set `RECURSION_EVIDENCE_PYTHON`, or put its path on
+the first line of `./evidence-python` when the wrapper's environment is reset.
 
 ## B14: a recorded Stop survives a daemon crash (kill -9 cells)
 
@@ -248,14 +280,17 @@ request (401); it does not silently trust loopback, invent data, or manufacture 
 token. Tests inject a fake API/device door and prove a real GET returns the page.
 Control-API credential/pairing integration remains with #327, not claimed here.
 
-For an installed operator plugin, configure the composition root with the explicit
-trusted factory `--plugin <MODULE:REGISTRY>`, for example `--plugin pkg.module:registry`
-(the plugin and what it imports must be on the module path). The root passes the registry's
-plain `required`/`panels` mappings to `recursion_core.gui.compose`; the plugin does not import
-Recursion. The cross-repo tests take the real plugin's factory from
-`RECURSION_CROSS_REPO_PLUGIN=pkg.module:registry` and skip when it is unset. `/panel?id=...`
-renders only the named O7 reads, with the shared venue-data filter, no panel order
-verb and no panel Stop. Shared interventions and run Stop stay in the core page.
+An installed operator plugin is a directory (`manifest.json`, `manifest.sig`, `plugin.py`)
+under `$XDG_CONFIG_HOME/recursion/plugins/`, or named with `--plugin <DIR>` (absolute). The
+daemon no longer imports a `MODULE:REGISTRY` factory by name: every plugin goes through the
+plugin loader (see "Plugins" above), and its `registry()` gives the plain `required`/`panels`
+mappings that reach `recursion_core.gui.compose`; the plugin does not import Recursion. A
+plugin that is a package is installed as a small `plugin.py` that imports it, and then only
+that file's bytes are covered by the manifest digest and signature. The cross-repo tests take
+the real plugin's factory from `RECURSION_CROSS_REPO_PLUGIN=pkg.module:registry` and skip when
+it is unset. `/panel?id=...` renders only the named O7 reads, through the one shared
+venue-data filter (`gui/panels.py` `filter_venue_rows`; the daemon has no copy of it), with
+no panel order verb and no panel Stop. Run Stop stays in the core page.
 
 Contract: `contracts/PRODUCT.md` at
 `055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256

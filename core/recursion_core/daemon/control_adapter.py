@@ -20,9 +20,19 @@ or was lost at a reboot, so an answer shows ``state: "ended"`` or ``"lost_reboot
 run (``"unknown"`` when the unit could not be observed) and keeps the stored word in
 ``recorded_state``. Reads never write.
 
-Not here: custody (an API-key route has no credential source and refuses), the O7 operator
-reads and the route inventory (the GUI is told they are not implemented), scopes on the
-socket beyond the uid check, and the Control MCP transport.
+Reads beyond the run records: ``route.list`` is the route inventory (the engines this daemon
+has adapters for, with what ``routes.json`` configured, the breaker's view of each connection,
+the surfaces it serves and the plugin rows), and ``plugin.list`` is the plugin registry as
+``plugins.PluginHost`` loaded it. The GUI's ``GET /v1/routes`` and ``POST /v1/operator`` are
+those reads and the loaded operator plugin's O7 reads. A read with no source answers
+``unavailable: <reason>``, never an empty or invented answer.
+
+The route breaker is ``breaker.DurableRouteBreaker``: trips, run bindings and faults are kept in
+the plugin-security breaker store under the daemon's state directory and survive a restart.
+
+Not here: custody (an API-key route has no credential source and refuses), the O7
+interventions, bar evidence for any route (every route reads BETA), scopes on the socket beyond
+the uid check, and the Control MCP transport.
 """
 from __future__ import annotations
 
@@ -32,6 +42,7 @@ import logging
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import stat
 import threading
 import time
@@ -42,12 +53,15 @@ from recursion_core.control.client import socket_directory
 from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
 from recursion_core.control_transport import UnixControlServer, with_ping_health
 from recursion_core.gui.client import ControlClient
+from recursion_core.plugin_security import Refused
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as route_contract
 
 from . import RUN_ID, TERMINAL
+from .breaker import DurableRouteBreaker, open_breaker_store
 from .launcher import (EngineUnitManager, ProductionLauncher, RunContext, UnitKillTree, bound_run,
                        private_dir, require_launcher_platform)
+from .plugins import PluginHost
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +71,8 @@ ROUTES_FILE = 'routes.json'         # $XDG_CONFIG_HOME/recursion/routes.json
 OUTPUT_TAIL_BYTES = 64 * 1024
 OUTPUT_TAIL_LINES = 50
 ENDED, LOST_REBOOT = 'ended', 'lost_reboot'
+WIRED_ENGINES = ('claude_code', 'codex')  # the engines compose_control builds an adapter and a launcher for
+NO_BAR_EVIDENCE = 'no bar evidence is recorded by the daemon'
 
 
 # -- registry ------------------------------------------------------------------------------------
@@ -121,7 +137,7 @@ def load_routes(path):
         raise RoutesUnreadable('routes file has no "routes" object')
     out = {}
     for engine, entry in routes.items():
-        if engine not in ('claude_code', 'codex') or not isinstance(entry, dict):
+        if engine not in WIRED_ENGINES or not isinstance(entry, dict):
             raise RoutesUnreadable(f'route {engine!r}: only claude_code and codex are wired')
         deadline = entry.get('deadline_s')
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or deadline <= 0:
@@ -133,6 +149,14 @@ def load_routes(path):
         route['engine'] = engine
         out[engine] = {'route': route, 'deadline_s': float(deadline), 'binary': binary}
     return out
+
+
+def route_connection(entry):
+    """The connection key of a loaded route entry, or None when the entry names none."""
+    try:
+        return route_contract.connection_key(entry['route'])
+    except (KeyError, TypeError):
+        return None
 
 
 def no_custody(connection_id, env_name):
@@ -155,8 +179,12 @@ class RouteStarter:
     is abandoned: the launcher refuses or ends the unit if it gets there later.
     """
 
-    def __init__(self, service, routes, daemon, state_dir, *, start_timeout_s=20.0, exit_grace_s=5.0):
+    def __init__(self, service, routes, daemon, state_dir, *, start_timeout_s=20.0, exit_grace_s=5.0,
+                 breaker=None, breaker_unavailable=None):
         self._service, self._routes, self._daemon = service, dict(routes), daemon
+        # ``breaker`` is the DurableRouteBreaker (None in a test that composes without one);
+        # ``breaker_unavailable`` is why its store could not be opened, and refuses every start.
+        self._breaker, self._breaker_unavailable = breaker, breaker_unavailable
         self._state = Path(state_dir)
         self._start_timeout_s, self._exit_grace_s = start_timeout_s, exit_grace_s
         self._lock = threading.Lock()
@@ -175,6 +203,14 @@ class RouteStarter:
         entry = self._routes.get(engine)
         if entry is None:
             raise self._refuse(run_id, 'route_not_configured', engine)
+        if self._breaker_unavailable is not None:
+            raise self._refuse(run_id, 'breaker_store_unavailable', self._breaker_unavailable)
+        connection = route_connection(entry)
+        if self._breaker is not None and connection is not None:
+            if not self._breaker.representable(connection):
+                # A limit on this connection could never be kept across a restart: refuse, do not run unfenced.
+                raise self._refuse(run_id, 'breaker_connection_unrepresentable', 'connection id')
+            self._breaker.bind_run(run_id, connection, engine, str(entry['route'].get('model')))
         request = {'contract': route_contract.CONTRACT_VERSION, 'request_id': run_id,
                    'tenant': params['tenant'], 'prompt': params['prompt'],
                    'deadline_s': entry['deadline_s'], 'route': json.loads(json.dumps(entry['route']))}
@@ -211,6 +247,8 @@ class RouteStarter:
             closing = getattr(self._daemon, 'closed', False)  # shutdown: the run is left to the next daemon
             if ctx.process is not None and not closing:
                 self._record_result(ctx.run_id, result)
+                if self._breaker is not None and result.get('code') is not None:
+                    self._breaker.fault_run(ctx.run_id)  # an effect citing this run is refused (4.2)
             ctx.finished(result)
             if ctx.process is not None:
                 if closing:
@@ -260,12 +298,21 @@ class RouteStarter:
 class DaemonControl:
     """``call(method, params) -> dict`` for the socket, the CLI and the GUI."""
 
-    def __init__(self, api, registry, daemon, starter, state_dir):
+    def __init__(self, api, registry, daemon, starter, state_dir, *, routes=None, plugins=None, breaker=None,
+                 breaker_store='not composed'):
         self.api, self.registry, self.daemon, self.starter = api, registry, daemon, starter
         self._state = Path(state_dir)
+        self._routes, self.plugins, self._breaker = dict(routes or {}), plugins, breaker
+        self._breaker_store = breaker_store
 
     # -- calls ---------------------------------------------------------------------------------
     def call(self, method, params=None):
+        if method == 'route.list':
+            return {'code': 'ok', 'routes': self.route_records(), 'breaker_store': self._breaker_store}
+        if method == 'plugin.list':
+            if self.plugins is None:
+                return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
+            return {'code': 'ok', **self.plugins.inventory()}
         answer = self.api.call(method, dict(params or {}))
         if method == 'run.start' and answer.get('code') == 'start_failed':
             failure = self.starter.failures.get(answer.get('run_id'))
@@ -278,6 +325,44 @@ class DaemonControl:
                 if isinstance(run, dict):
                     self._observe(run, full=False)
         return answer
+
+    def route_records(self):
+        """The route inventory: what this daemon can launch, what it serves, and its plugins.
+
+        Read from the routes the daemon loaded and the plugin host, at the time of the call.
+        No bar is claimed: the daemon records no bar evidence, so every row is beta (O50).
+        """
+        records = []
+        for engine in WIRED_ENGINES:
+            entry = self._routes.get(engine)
+            record = {'id': f'engine:{engine}', 'class': 'engine', 'engine': engine, 'sign_in': '',
+                      'configured': False, 'maturity': 'beta', 'beta': True, 'bars': {}}
+            if entry is None:
+                record['blocker'] = 'route_not_configured: no entry for this engine in routes.json'
+            else:
+                route = entry['route']
+                connection = route.get('connection')
+                kind = connection.get('kind') if isinstance(connection, dict) else None
+                record.update(configured=True, sign_in=kind if isinstance(kind, str) else '',
+                              model=str(route.get('model')), blocker=NO_BAR_EVIDENCE)
+                key = route_connection(entry)
+                if self._breaker is not None and key is not None:
+                    state, tripped = self._breaker.state(key), self._breaker.tripped(key)
+                    if tripped and state == 'closed':
+                        state = 'open'  # tripped under an earlier daemon; this one fences it at the first request
+                    record['breaker'] = {'connection': key, 'state': state, 'tripped_in_store': tripped}
+                    if tripped or state != 'closed':
+                        record['blocker'] = f'breaker {state} on this connection (typed limit); {NO_BAR_EVIDENCE}'
+            records.append(record)
+        records.append({'id': 'surface:cli', 'class': 'surface', 'surface': 'cli', 'sign_in': '', 'configured': True,
+                        'maturity': 'beta', 'beta': True, 'bars': {}, 'blocker': NO_BAR_EVIDENCE})
+        if self.plugins is not None:
+            panels = sum(len(entry.get('panels', ())) for entry in self.plugins.registries)
+            records.append({'id': 'plugin_panels', 'class': 'plugin_panels', 'sign_in': '', 'configured': panels > 0,
+                            'maturity': 'beta', 'beta': True, 'bars': {},
+                            'blocker': f'{panels} panel(s) from loaded plugins; {NO_BAR_EVIDENCE}'})
+            records.extend(self.plugins.route_records())
+        return records
 
     def _row(self, run_id):
         try:
@@ -411,7 +496,7 @@ class DaemonControl:
 
     # -- GUI -----------------------------------------------------------------------------------
     def gui_transport(self, method, path, body):
-        """The GUI client's transport, in process. Only Stop exists; the rest says so."""
+        """The GUI client's transport, in process: Stop, the route inventory and the O7 reads."""
         if (method, path) == ('POST', '/v1/runs/stop'):
             try:
                 payload = json.loads(body or b'')
@@ -422,9 +507,18 @@ class DaemonControl:
             answer = self.call('run.stop', {'run_id': payload.get('run_id')})
             return 200, json.dumps(answer, sort_keys=True).encode()
         if (method, path) == ('GET', '/v1/routes'):
-            return 501, b'{"error": "route_inventory_not_implemented"}'
+            return 200, json.dumps({'routes': self.route_records()}, sort_keys=True).encode()
         if (method, path) == ('POST', '/v1/operator'):
-            return 501, b'{"error": "operator_contract_not_implemented"}'
+            try:
+                payload = json.loads(body or b'')
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                return 400, b'{"error": "request_invalid"}'
+            if self.plugins is None:
+                return 503, b'{"error": "unavailable: no plugin host is composed"}'
+            status, answer = self.plugins.operator(payload)
+            return status, json.dumps(answer, sort_keys=True).encode()
         return 404, b'{"error": "not_found"}'
 
 
@@ -486,24 +580,36 @@ class DeviceDoor:
 class Composition:
     """What ``compose_control`` built, and how to stop it. Closing never stops a run."""
 
-    def __init__(self, control, server, door):
+    def __init__(self, control, server, door, plugins=None, breaker=None):
         self.control, self.server, self.door = control, server, door
+        self.plugins, self.breaker = plugins, breaker
         self.client = ControlClient(control.gui_transport)
 
     def close(self):
         try:
             self.server.close()
         finally:
-            self.door.close()
+            try:
+                self.door.close()
+            finally:
+                for item in (self.plugins, self.breaker):
+                    if item is not None:
+                        item.close()
 
 
 def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.monotonic,
-                    confirm_timeout_s=5.0):
+                    confirm_timeout_s=5.0, plugin_dirs=(), plugin_options=None):
     """Build the control API over ``daemon`` and serve it on the owner-only socket.
 
     ``daemon.manager`` must be an ``EngineUnitManager``. ``routes`` overrides the operator's
     route file (tests). A route file that cannot be trusted leaves every start refused
-    (``route_not_configured``) and is logged; reads and Stop still work.
+    (``route_not_configured``) and is logged; reads and Stop still work. The same holds for a
+    breaker store that exists and cannot be opened (``breaker_store_unavailable``).
+
+    Operator plugins under ``$XDG_CONFIG_HOME/recursion/plugins`` and in ``plugin_dirs`` are
+    loaded through ``plugins.PluginHost``; one that is refused is kept in the inventory with its
+    finding and the daemon runs without it. ``plugin_options`` are ``PluginHost`` keyword
+    arguments for tests (a simulated GIL probe on a GIL build, a missing verification backend).
     """
     require_launcher_platform()  # Windows: typed PlatformUnsupported; no socket, token file or state is made
     environ = dict(os.environ if environ is None else environ)
@@ -518,17 +624,34 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         except RoutesUnreadable as exc:
             log.error('no route can start: %s', exc)
             routes = {}
+    config_dir = Path(environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')) / 'recursion'
     registry = DurableRunRegistry(daemon.registry, processes=pid_alive(manager))
+    stored = breaker = breaker_unavailable = None
+    try:
+        stored, created = open_breaker_store(state_dir, clock=clock)
+    except (Refused, OSError, sqlite3.Error) as exc:
+        breaker_unavailable = exc.code if isinstance(exc, Refused) else type(exc).__name__
+        log.error('breaker store cannot be opened (%s): every start is refused; reads and Stop still work',
+                  breaker_unavailable)
+    else:
+        breaker = DurableRouteBreaker(ConnectionBreaker(clock), stored)
+        if created and registry.list():
+            log.warning('the breaker store was missing and was created empty while run records exist: '
+                        'earlier trips, run bindings and faults are not known to this daemon')
+    plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, **(plugin_options or {}))
     adapters = {}
     for engine, cls in (('claude_code', ClaudeCodeAdapter), ('codex', CodexAdapter)):
         entry = routes.get(engine)
         launcher = ProductionLauncher(engine, daemon, manager, state_dir)
         options = {'binary': entry['binary']} if entry and entry.get('binary') else {}
         adapters[engine] = cls(launcher, clock, no_custody, environ, **options)
-    service = RouteService(adapters, ConnectionBreaker(clock), clock)
-    starter = RouteStarter(service, routes, daemon, state_dir)
+    service = RouteService(adapters, breaker if breaker is not None else ConnectionBreaker(clock), clock)
+    starter = RouteStarter(service, routes, daemon, state_dir, breaker=breaker,
+                           breaker_unavailable=breaker_unavailable)
     api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s)
-    control = DaemonControl(api, registry, daemon, starter, state_dir)
+    control = DaemonControl(api, registry, daemon, starter, state_dir, routes=routes, plugins=plugins,
+                            breaker=breaker, breaker_store='durable' if breaker is not None
+                            else f'unavailable: {breaker_unavailable}')
     directory = socket_directory(environ)
     door = DeviceDoor(directory)
     server = UnixControlServer(directory, with_ping_health(control.handle))
@@ -536,5 +659,8 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         server.start()
     except BaseException:
         door.close()
+        for item in (plugins, breaker):
+            if item is not None:
+                item.close()
         raise
-    return Composition(control, server, door)
+    return Composition(control, server, door, plugins, breaker)

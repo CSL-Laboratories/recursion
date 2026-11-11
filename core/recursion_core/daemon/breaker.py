@@ -1,0 +1,187 @@
+"""The daemon's route breaker with its trips, run bindings and faults in a durable store (CSL-738).
+
+``routes.ConnectionBreaker`` decides admission (cooldown, the one leased probe, short faults) and
+lives in memory. ``plugin_security.ConnectionBreaker`` is the durable register the approval path
+reads (PRODUCT.md d84cdd26, CSLR-D-012, section 4.2 "Two breakers": an intent from a run on a
+tripped route, or from a run that ended in a fault, is refused; section 3.1 lines 459-461: runs
+outlive the daemon, so losing this state at a restart would remove a refusal). ``DurableRouteBreaker``
+is the route breaker ``RouteService`` calls, and writes what must survive into that store. The
+store's module is only called here, never changed.
+
+* A connection-scoped typed limit that opens the route breaker is reported to the store
+  (``report(connection, "plan_limit")``). A model-bucket limit is not: the store is keyed by
+  connection only, and tripping it would fence every model on that login.
+* After a restart the in-memory breaker is empty. The first request on a connection the store
+  still calls tripped reopens it in memory with the breaker's own cooldown (the vendor's reset
+  time is not stored), so that request is refused ``breaker_open``. After the cooldown one
+  leased probe is admitted; the trip clears in the store only through that probe's lease
+  (``begin_probe`` / ``reset_after_probe``), and only when the probe run succeeded.
+* Every run the daemon launches is bound in the store to its connection, engine and model, owned
+  by ``host``: a reserved plugin id, so no plugin's effect can cite an operator's run. A run whose
+  route result is an error is recorded as faulted.
+
+The store is ``<state dir>/plugin-security/breaker.sqlite3`` (0600 in a 0700 directory). There is
+no installer yet, so the daemon creates it on first start; a store deleted later is created empty
+again and that is logged, not hidden. A store that exists and cannot be read is not replaced: the
+daemon keeps serving reads and Stop, and refuses every start (``breaker_store_unavailable``).
+"""
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+import sqlite3
+import threading
+
+from recursion_core.plugin_security import ConnectionBreaker as StoredBreaker
+from recursion_core.plugin_security import Refused, create_breaker_store
+from recursion_core.routes import contract as c
+
+from .launcher import private_dir, require_launcher_platform
+
+log = logging.getLogger(__name__)
+
+STORE_DIR = 'plugin-security'
+STORE_FILE = 'breaker.sqlite3'
+HOST = 'host'  # plugin_security.protocol.HOST: reserved, so no plugin manifest can carry it
+RESTORED_SOURCE = 'recursion.breaker_store'
+
+
+def store_path(state_dir):
+    return Path(state_dir) / STORE_DIR / STORE_FILE
+
+
+def open_breaker_store(state_dir, *, clock):
+    """Open the daemon's breaker store, creating it when there is none. Returns ``(store, created)``.
+
+    A new store is built under a temporary name and renamed, so a daemon killed part-way never
+    leaves a half-made file that a later start would have to refuse.
+    """
+    require_launcher_platform()  # Windows: typed PlatformUnsupported before any directory or file
+    path = store_path(state_dir)
+    private_dir(path.parent)
+    created = False
+    if not os.path.lexists(path):
+        tmp = path.with_name(f'{STORE_FILE}.{os.getpid()}.tmp')
+        for leftover in (tmp, Path(f'{tmp}-wal'), Path(f'{tmp}-shm')):
+            try:
+                os.unlink(leftover)
+            except FileNotFoundError:
+                pass
+        create_breaker_store(str(tmp))
+        os.replace(tmp, path)
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        created = True
+    return StoredBreaker(str(path), clock=clock), created
+
+
+class DurableRouteBreaker:
+    """``admit`` / ``record`` for ``RouteService``, over the in-memory breaker and the durable store."""
+
+    def __init__(self, inner, stored):
+        self._inner, self._stored = inner, stored
+        self._lock = threading.Lock()
+        self._restored = set()  # connections whose stored trip this process has already taken over
+        self._leases = {}       # route probe token -> the store's probe lease
+
+    # -- the store, with its refusals and errors kept out of a route request -------------------
+    def tripped(self, connection):
+        """True, False, or None when the store could not be read."""
+        try:
+            return self._stored.tripped(connection)
+        except (Refused, sqlite3.Error) as exc:
+            log.error('breaker store could not be read for a connection: %s', _code(exc))
+            return None
+
+    def representable(self, connection):
+        """Whether the store can key this connection at all. An id it refuses could never be durable.
+
+        ``core_timeout`` is an event the store checks the connection id for and then ignores by
+        contract (the core's own timeouts never trip), so this asks without writing anything.
+        """
+        try:
+            self._stored.report(connection, 'core_timeout')
+        except Refused:
+            return False
+        except sqlite3.Error:
+            pass
+        return True
+
+    def state(self, connection):
+        return self._inner.state(connection)
+
+    # -- runs -----------------------------------------------------------------------------------
+    def bind_run(self, run_id, connection, provider, model_version):
+        """Record the run's connection, engine and model for the approval path. Returns a refusal code or None."""
+        try:
+            self._stored.bind_run(run_id, connection, HOST, provider, model_version)
+        except (Refused, sqlite3.Error) as exc:
+            # Not bound: an effect citing this run is refused ``run_unknown``, which fails closed.
+            log.error('run %s was not bound in the breaker store: %s', run_id, _code(exc))
+            return _code(exc)
+        return None
+
+    def fault_run(self, run_id):
+        try:
+            self._stored.fault_run(run_id)
+        except (Refused, sqlite3.Error) as exc:
+            log.error('fault of run %s was not recorded in the breaker store: %s', run_id, _code(exc))
+
+    # -- routes.ConnectionBreaker interface ---------------------------------------------------------
+    def admit(self, connection, model, tenant, *, deadline_s=None):
+        self._restore(connection, model, tenant)
+        answer = self._inner.admit(connection, model, tenant, deadline_s=deadline_s)
+        probe = answer.get('probe')
+        if answer.get('admitted') and probe is not None and self.tripped(connection):
+            try:
+                lease = self._stored.begin_probe(connection)
+            except (Refused, sqlite3.Error) as exc:
+                log.error('no probe lease from the breaker store: %s', _code(exc))
+            else:
+                with self._lock:
+                    self._leases[probe] = lease
+        return answer
+
+    def record(self, connection, model, tenant, outcome, probe=None):
+        effect = self._inner.record(connection, model, tenant, outcome, probe)
+        with self._lock:
+            lease = self._leases.pop(probe, None) if probe is not None else None
+        try:
+            if effect == 'opened':
+                limit = outcome.get('limit')
+                if isinstance(limit, dict) and limit.get('scope') == 'connection':
+                    self._stored.report(connection, c.PLAN_LIMIT)  # also drops any lease the store held
+            elif effect == 'closed':
+                if self._stored.tripped(connection):
+                    if lease is None:
+                        lease = self._stored.begin_probe(connection)
+                    self._stored.reset_after_probe(connection, lease, True)
+            elif lease is not None:
+                self._stored.reset_after_probe(connection, lease, False)  # the probe proved nothing: spend it
+        except (Refused, sqlite3.Error) as exc:
+            # The in-memory breaker already holds the outcome; what did not reach the store is said.
+            log.error('breaker store was not updated (%s after %s): the change is not durable', _code(exc), effect)
+        return effect
+
+    def _restore(self, connection, model, tenant):
+        with self._lock:
+            if connection in self._restored:
+                return
+            self._restored.add(connection)
+            # Under the lock: a second request on this connection must not be admitted in between.
+            if self.tripped(connection) and self._inner.state(connection) == 'closed':
+                log.warning('connection is tripped in the breaker store from an earlier daemon; it stays '
+                            'fenced for the cooldown, then one probe is admitted')
+                self._inner.record(connection, model, tenant, {
+                    'code': c.PLAN_LIMIT, 'limit': c.limit_signal('connection', RESTORED_SOURCE)})
+
+    def close(self):
+        self._stored.close()
+
+
+def _code(exc):
+    return exc.code if isinstance(exc, Refused) else f'store_error:{type(exc).__name__}'

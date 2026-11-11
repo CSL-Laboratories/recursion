@@ -11,7 +11,7 @@ import unittest
 
 import recursion_core.daemon as daemon
 from recursion_core.daemon import __main__ as entry
-from recursion_core.daemon import control_adapter, launcher
+from recursion_core.daemon import breaker, control_adapter, launcher, plugins
 from recursion_core.daemon import (Daemon, PlatformUnsupported, Registry, SystemdUserManager,
                                    UserLock, require_posix)
 from recursion_core.daemon.engine_user import EngineManagerPresent, check_engine_no_user_manager
@@ -83,6 +83,18 @@ class WindowsRefusalTests(unittest.TestCase):
             control_adapter.load_routes(self.path / 'routes.json')
         self.assertEqual([], list(self.path.iterdir()))
 
+    def test_plugin_host_and_breaker_store_refuse_and_make_no_file(self):
+        (self.path / 'config' / 'plugins' / 'one').mkdir(parents=True)
+        before = sorted(p.as_posix() for p in self.path.rglob('*'))
+        with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+            plugins.PluginHost(self.path / 'config', self.path / 'state')
+        with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+            plugins.PluginHost(self.path / 'config', self.path / 'state', plugin_dirs=(self.path / 'config',),
+                               verification_available=lambda: False)
+        with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+            breaker.open_breaker_store(self.path / 'state', clock=lambda: 0.0)
+        self.assertEqual(before, sorted(p.as_posix() for p in self.path.rglob('*')))
+
     def test_daemon_entry_point_refuses_before_any_lock_state_or_gui(self):
         def never(*args, **kwargs):
             raise AssertionError('the daemon entry point went past the platform refusal')
@@ -96,6 +108,8 @@ class WindowsRefusalTests(unittest.TestCase):
                 entry.main(port=0)
             with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
                 entry.main(client=object(), door=bool, port=0)
+            with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+                entry.main(plugin_dirs=(str(self.path),), port=0)
         finally:
             for name, value in saved.items():
                 setattr(entry, name, value)

@@ -12,6 +12,9 @@ SIGINT (so a Stop has to end the tree, not just the engine; ``helper=0`` in the 
 then print one ``assistant`` line every half second (``fast=1``: every 50 ms). ``ticks=N`` in the
 prompt ends the run with a ``result`` line after N ticks; without it the engine runs until it is
 stopped. SIGINT prints a ``stand_in_sigint`` line and exits. With no user message it exits at once.
+``limit=1`` in the prompt ends the run at once with a STAND-IN typed limit result (``error:
+"rate_limit"`` on an error ``result`` line, one of the typed fields the adapter reads), so the
+connection breaker can be tripped without any vendor: no real limit was hit.
 """
 import json
 import os
@@ -50,6 +53,10 @@ def main():
     if prompt is None:  # started by hand or by a probe: do nothing, start nothing
         emit(type='result', subtype='error_during_execution', is_error=True, result='stand-in engine got no user message')
         return 2
+    if 'limit=1' in prompt:
+        emit(type='result', subtype='error_during_execution', is_error=True, error='rate_limit',
+             result='stand-in engine: simulated typed limit, no vendor was contacted')
+        return 1
     helper = None
     if 'helper=0' not in prompt:  # unit tests have no cgroup to end an escaped session with
         helper = subprocess.Popen(

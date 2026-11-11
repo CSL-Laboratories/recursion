@@ -30,8 +30,13 @@ from recursion_core.control.registry import EMPTY, POPULATED, TIMEOUT, UNKNOWN, 
 from recursion_core.control_transport import TransportBusy
 from recursion_core.daemon import Daemon, Registry, Run, UnitNotLoaded
 from recursion_core.daemon import control_adapter as adapter
+from recursion_core.daemon import breaker as daemon_breaker
 from recursion_core.daemon import engine_exec, launcher
 from recursion_core.daemon.gui import LoopbackGUI
+from recursion_core.daemon.tests import plugin_fixture as fx
+from recursion_core.gui import panels as gui_panels
+from recursion_core.gui import surface as gui_surface
+from recursion_core.plugin_security.tests.support import FakeGilProbe, Key, needs_crypto
 from recursion_core.routes import ClaudeCodeAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as c
 from recursion_core.routes.launch import ReadTimeout
@@ -391,7 +396,19 @@ class ComposedDaemonTest(unittest.TestCase):
                 self.assertIn('device_not_authenticated', page)
             status, page = self.gui(gui, 'GET', '/', bearer)
             self.assertEqual(status, 200)
-            self.assertIn('Route inventory unavailable: control_api_501:route_inventory_not_implemented', page)
+            # The inventory is the daemon's own: the configured route, the adapter with no route, no bar claimed.
+            self.assertNotIn('Route inventory unavailable', page)
+            self.assertNotIn('not_implemented', page)
+            self.assertIn('<th scope="row">engine:claude_code</th><td>engine</td><td>claude_code</td><td>subscription</td>',
+                          page)
+            self.assertIn('route_not_configured: no entry for this engine in routes.json', page)
+            self.assertIn('no bar evidence is recorded by the daemon', page)
+            self.assertNotIn('MATURE', page)
+            self.assertIn('gap:engine:gemini', page)  # what the daemon does not have is still a gap, not hidden
+            # No plugin is installed: the O7 read has no source, and says so in words.
+            status, read = self.gui(gui, 'GET', '/read?command=operator.health.inspect', bearer)
+            self.assertEqual(status, 200)
+            self.assertIn('Unavailable: control_api_503:unavailable: no operator plugin is installed', read)
             self.assertEqual(self.gui(gui, 'GET', '/', {'Cookie': 'a=b; recursion_device=' + token})[0], 200)
             origin = 'http://127.0.0.1:%d' % gui.address[1]
             form = {'Content-Type': 'application/x-www-form-urlencoded', 'Origin': origin}
@@ -405,6 +422,203 @@ class ComposedDaemonTest(unittest.TestCase):
         self.shutdown()
         self.assertFalse(token_file.exists())
         self.assertFalse(adapter.DeviceDoor(self.runtime / 'recursion')({'HTTP_AUTHORIZATION': 'Bearer ' + token}))
+
+    # -- route inventory, plugins and O7 reads through the daemon --------------------------------
+    def install_fixture_plugin(self, key, source=fx.OPERATOR_SOURCE):
+        config = Path(self.environ['XDG_CONFIG_HOME']) / 'recursion'
+        fx.write_install(config, trusted={'dev': key.public}, grants=[fx.grant_for(source, key=key)])
+        fx.write_plugin(config / 'plugins' / 'fixture', source, key=key)
+        return config / 'plugins' / 'fixture'
+
+    def test_route_and_plugin_inventory_are_reads_of_the_running_daemon(self):
+        _, composed = self.boot()
+        api = self.api(composed)
+        answer = api.call('route.list')
+        self.assertEqual((answer['code'], answer['breaker_store']), ('ok', 'durable'))
+        rows = {row['id']: row for row in answer['routes']}
+        self.assertEqual(sorted(rows), ['engine:claude_code', 'engine:codex', 'plugin_panels', 'surface:cli'])
+        self.assertEqual(rows['engine:claude_code']['breaker'],
+                         {'connection': 'subscription:stand-in-login', 'state': 'closed', 'tripped_in_store': False})
+        self.assertEqual((rows['engine:claude_code']['configured'], rows['engine:claude_code']['model']),
+                         (True, 'stand-in-model'))
+        self.assertEqual((rows['engine:codex']['configured'], rows['engine:codex']['blocker']),
+                         (False, 'route_not_configured: no entry for this engine in routes.json'))
+        self.assertTrue(all(row['maturity'] == 'beta' and row['bars'] == {} for row in rows.values()))
+        plugins = api.call('plugin.list')
+        self.assertEqual((plugins['code'], plugins['plugins']), ('ok', []))
+        self.assertTrue(plugins['containment'].startswith('none:'))
+        self.assertEqual(api.call('run.list'), {'code': 'ok', 'runs': []})  # the run methods are unchanged
+        self.assertEqual(api.call('plugin.install')['code'], 'method_unknown')
+
+    def test_missing_cryptography_is_visible_on_every_surface_and_the_daemon_keeps_running(self):
+        config = Path(self.environ['XDG_CONFIG_HOME']) / 'recursion'
+        marker = self.tmp / 'plugin-code-ran'
+        source = f'open({str(marker)!r}, "w").close()\n'.encode() + fx.OPERATOR_SOURCE
+        fx.write_install(config, grants=[fx.grant_for(source)])
+        fx.write_plugin(config / 'plugins' / 'fixture', source)
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            _, composed = self.boot(plugin_options={'verification_available': lambda: False})  # SIMULATED: no cryptography
+        api = self.api(composed)
+        self.assertFalse(marker.exists())
+        listed = api.call('plugin.list')
+        self.assertEqual(listed['verification'], 'unavailable: cryptography missing; install recipe in plugin_security/README.md')
+        self.assertEqual([(p['state'], p['code']) for p in listed['plugins']], [('refused', 'plugin_verification_unavailable')])
+        row = next(r for r in api.call('route.list')['routes'] if r['class'] == 'plugin')
+        self.assertEqual(row['blocker'], 'refused: plugin_verification_unavailable: cryptography missing; '
+                                         'install recipe in plugin_security/README.md')
+        token = (self.runtime / 'recursion' / 'gui-device-token').read_text().strip()
+        with LoopbackGUI(composed.client, composed.door, plugins=composed.plugins.registries, port=0) as gui:
+            bearer = {'Authorization': 'Bearer ' + token}
+            status, page = self.gui(gui, 'GET', '/', bearer)
+            self.assertEqual(status, 200)
+            self.assertIn('refused: plugin_verification_unavailable: cryptography missing', page)
+            _, read = self.gui(gui, 'GET', '/read?command=operator.positions.inspect', bearer)
+            self.assertIn('Unavailable: control_api_503:unavailable: plugin_verification_unavailable', read)
+        run_id = self.start(api)  # runs, reads and Stop are untouched by the refusal
+        self.assertEqual(api.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+
+    @needs_crypto
+    def test_daemon_gui_reads_o7_through_the_loaded_plugin_and_the_one_venue_filter(self):
+        self.install_fixture_plugin(Key())
+        # SIMULATED GIL state (off): this suite also runs on GIL builds; the real probe runs in the evidence harness.
+        _, composed = self.boot(plugin_options={'gil_probe': FakeGilProbe()})
+        api = self.api(composed)
+        listed = api.call('plugin.list')['plugins']
+        self.assertEqual([(p['plugin_id'], p['state'], p['trust'], p['permissions']) for p in listed],
+                         [('fixture.operator', 'loaded', 'signed', ['read', 'panel'])])
+        rows = {row['id']: row for row in api.call('route.list')['routes']}
+        self.assertTrue(rows['plugin:fixture.operator']['configured'])
+        self.assertTrue(rows['plugin_panels']['configured'])
+        self.assertIs(gui_surface.filter_venue_rows, gui_panels.filter_venue_rows)
+        from recursion_core.daemon import __main__ as entry
+        token = (self.runtime / 'recursion' / 'gui-device-token').read_text().strip()
+        bearer = {'Authorization': 'Bearer ' + token}
+        with mock.patch.object(gui_surface, 'filter_venue_rows', wraps=gui_panels.filter_venue_rows) as shared:
+            # The daemon's own GUI entry (what main() calls), with the panels the plugin host loaded.
+            gui = entry._start_gui(composed.client, composed.door, composed.plugins.registries, 0, announced=False)
+            try:
+                self.assertEqual(self.gui(gui, 'GET', '/panel?id=fixture.positions')[0], 401)
+                status, home = self.gui(gui, 'GET', '/', bearer)
+                self.assertEqual(status, 200)
+                self.assertIn('Fixture positions', home)
+                self.assertIn('loaded signed; permissions: read, panel', home)
+                self.assertIn('gap:venue_use:kalshi:fixture_read', home)
+                status, page = self.gui(gui, 'GET', '/panel?id=fixture.positions', bearer)
+                self.assertEqual(status, 200)
+                status, raw = self.gui(gui, 'GET', '/read?command=operator.positions.inspect', bearer)
+                self.assertEqual(status, 200)
+                _, broken = self.gui(gui, 'GET', '/panel?id=fixture.health', bearer)
+            finally:
+                gui.__exit__(None, None, None)
+        # The declared venue filtered the rows after the read, in the one shared filter.
+        self.assertEqual([call.args[1] for call in shared.call_args_list], ['kalshi'])
+        read = shared.call_args_list[0].args[0]
+        self.assertEqual([row['symbol'] for row in read['result']['positions']], ['FIXTURE-OWN-ROW', 'FIXTURE-OTHER-ROW'])
+        self.assertIn('FIXTURE-OWN-ROW', page)
+        self.assertNotIn('FIXTURE-OTHER-ROW', page)
+        self.assertNotIn('FIXTURE-UNLABELLED-TOTAL', page)
+        self.assertIn('Withheld: data not labelled <code>kalshi</code>', page)
+        self.assertIn('Status reported by the control API: <strong>ok</strong>', page)
+        # The unscoped read shows what the plugin answered; a failing reader is typed, not a page error.
+        self.assertIn('FIXTURE-OTHER-ROW', raw)
+        self.assertIn('Unavailable: control_api_502:unavailable: operator plugin failed: RuntimeError', broken)
+
+    def test_no_second_copy_of_the_venue_filter_exists_in_core(self):
+        import ast
+        core = Path(launcher.__file__).parents[2]
+        found = []
+        for path in sorted(core.glob('recursion_core/**/*.py')):
+            if '/tests/' in path.as_posix():
+                continue
+            for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and 'venue' in node.name \
+                        and ('filter' in node.name or node.name.startswith('_venue_only')):
+                    found.append(f'{path.relative_to(core).as_posix()}:{node.name}')
+        self.assertEqual(found, ['recursion_core/gui/panels.py:filter_venue_rows', 'recursion_core/gui/panels.py:_venue_only'])
+        daemon_gui = (Path(launcher.__file__).with_name('gui.py')).read_text(encoding='utf-8')
+        self.assertIn('from recursion_core.gui import compose', daemon_gui)
+
+    # -- TUI over the socket ---------------------------------------------------------------------
+    def run_tui(self, lines):
+        from recursion_core.control import tui as tui_entry
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(self.runtime)}):
+            code = tui_entry.main(['--plain'], stdin=io.StringIO(''.join(line + '\n' for line in lines)),
+                                  stdout=out, stderr=err, environ={'TERM': 'dumb'})
+        return code, out.getvalue(), err.getvalue()
+
+    def test_tui_start_list_status_and_stop_act_on_the_real_daemon(self):
+        _, composed = self.boot()
+        api = self.api(composed)
+        code, text, err = self.run_tui(['start --tenant t1 --engine claude_code --prompt "helper=0 fast=1" --client-key tui-1',
+                                        'list', 'q'])
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('answer run.start status=started', text)
+        run, = api.call('run.list')['runs']
+        run_id = run['run_id']
+        unit = self.units.procs[f'recursion-run-{run_id}.service']
+        self.assertIsNone(unit.poll())  # the TUI's start launched the real unit; closing the TUI stopped nothing
+        self.assertEqual(run['start_key']['client_key'], 'tui-1')
+        code, text, err = self.run_tui([f'status {run_id}', f'stop {run_id}', 'q'])
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('answer run.status status=ok', text)
+        self.assertIn('answer run.stop status=stopped', text)
+        self.assertIsNotNone(until(lambda: unit.poll()))
+        self.assertEqual(api.call('run.status', {'run_id': run_id})['run']['state'], 'stopped')
+        self.shutdown()  # daemon down: the TUI says so and raises nothing
+        code, text, err = self.run_tui(['list', f'stop {run_id}', 'q'])
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('status=control_api_unavailable', text)
+        self.assertIn('UNAVAILABLE: control API unavailable', text)
+        self.assertNotIn('status=stopped', text)
+        self.assertNotIn('Traceback', text)
+
+    # -- durable breaker -------------------------------------------------------------------------
+    def test_a_typed_limit_trips_the_breaker_and_the_trip_survives_a_daemon_restart(self):
+        _, composed = self.boot()
+        api = self.api(composed)
+        run_id = self.start(api, 'limit=1')  # the STAND-IN engine prints a typed limit result; no vendor is involved
+        done = until(lambda: (lambda r: r if r.get('result') else None)(api.call('run.status', {'run_id': run_id})['run']))
+        self.assertEqual((done['result']['code'], done['result']['breaker_effect']), ('plan_limit', 'opened'))
+        row = next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+        self.assertEqual(row['breaker'], {'connection': 'subscription:stand-in-login', 'state': 'open', 'tripped_in_store': True})
+        refused = api.call('run.start', {'tenant': 't2', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+        self.assertEqual((refused['code'], refused['start_error']['code']), ('start_failed', 'breaker_open'))
+        self.shutdown()
+
+        # A new daemon on the same state directory: nothing in memory, the trip is read from the store.
+        _, composed = self.boot()
+        api = self.api(composed)
+        row = next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+        self.assertEqual((row['breaker']['state'], row['breaker']['tripped_in_store']), ('open', True))
+        self.assertTrue(row['blocker'].startswith('breaker open on this connection (typed limit)'))
+        with self.assertLogs('recursion_core.daemon.breaker', 'WARNING'):
+            refused = api.call('run.start', {'tenant': 't2', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+        self.assertEqual((refused['code'], refused['start_error']['code']), ('start_failed', 'breaker_open'))
+        self.assertEqual(len(self.units.started), 1, 'the refused starts launched nothing')
+        stored, created = daemon_breaker.open_breaker_store(self.state, clock=time.monotonic)
+        self.addCleanup(stored.close)
+        self.assertFalse(created)
+        # The limited run is bound to host and recorded as faulted: no effect may cite it (4.2).
+        with self.assertRaises(adapter.Refused) as caught:
+            stored.check(run_id, 'subscription:stand-in-login', 'host')
+        self.assertEqual(caught.exception.code, 'run_faulted')
+
+    def test_a_breaker_store_that_cannot_be_read_refuses_starts_and_keeps_reads(self):
+        path = daemon_breaker.store_path(self.state)
+        Registry(self.state).close()
+        path.parent.mkdir(mode=0o700)
+        path.write_bytes(b'not a breaker store')
+        with self.assertLogs('recursion_core.daemon.control_adapter', 'ERROR'):
+            _, composed = self.boot()
+        api = self.api(composed)
+        self.assertEqual(api.call('run.list'), {'code': 'ok', 'runs': []})
+        self.assertEqual(api.call('route.list')['breaker_store'], 'unavailable: breaker_store_invalid')
+        refused = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+        self.assertEqual((refused['code'], refused['start_error']),
+                         ('start_failed', {'code': 'breaker_store_unavailable', 'detail': 'breaker_store_invalid'}))
+        self.assertEqual(self.units.started, [])
+        self.assertEqual(path.read_bytes(), b'not a breaker store')
 
     # -- restart ---------------------------------------------------------------------------------
     def test_restart_recovers_runs_and_reports_what_happened_while_the_daemon_was_down(self):
@@ -793,6 +1007,7 @@ class CompositionRootTest(unittest.TestCase):
         self.assertIsInstance(manager, launcher.EngineUnitManager)
         composed = compose.return_value
         gui.assert_called_once_with(composed.client, composed.door, plugins=(), port=0)
+        compose.assert_called_once_with(daemon.return_value, mock.ANY, plugin_dirs=())
         # Sweep first, so recovered runs are observed before any surface can ask; never stop a run on exit.
         self.assertEqual(order, ['sweep', 'compose', 'reconcile', 'sweep', 'reconcile', 'close_control', 'close_daemon'])
         stopped.return_value.wait.assert_called_with(1.5)

@@ -14,7 +14,7 @@ from pathlib import Path
 import signal
 import threading
 from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_linger,
-               refuse_engine_user, require_free_threaded)
+               refuse_engine_user, require_free_threaded, require_posix)
 
 from .control_adapter import compose_control
 from .gui import LoopbackGUI
@@ -24,6 +24,7 @@ log = logging.getLogger('recursion_core.daemon')
 
 
 def main(*, client=None, door=None, plugins=(), port=8765, sweep_seconds=5):
+    require_posix()  # Windows: typed PlatformUnsupported before any lock, state, socket or GUI
     require_free_threaded()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
     refuse_engine_user(os.environ)

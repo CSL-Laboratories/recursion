@@ -28,7 +28,10 @@ the durable Stop intent before it touches the unit, so a daemon restart replays 
 from __future__ import annotations
 
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: the launcher refuses in require_launcher_platform()
+    fcntl = None
 import json
 import logging
 import os
@@ -36,7 +39,10 @@ from pathlib import Path
 import select
 import stat
 import sys
-import termios
+try:
+    import termios
+except ImportError:  # Windows, as above
+    termios = None
 import threading
 import time
 
@@ -47,7 +53,7 @@ from recursion_core.control.registry import EMPTY, POPULATED, TIMEOUT, UNKNOWN
 from recursion_core.routes import contract as c
 from recursion_core.routes.launch import ReadTimeout
 
-from . import TERMINAL, UNIT, SystemdUserManager
+from . import TERMINAL, UNIT, PlatformUnsupported, SystemdUserManager, require_posix
 from .engine_exec import MAX_ENV_BYTES
 
 log = logging.getLogger(__name__)
@@ -64,6 +70,19 @@ _current = threading.local()
 
 def refused(detail):
     return c.RouteError(c.LAUNCH_REFUSED, detail)
+
+
+def require_launcher_platform():
+    """Refuse where the engine launcher's Linux calls are missing (Windows, macOS).
+
+    A typed ``PlatformUnsupported`` before any directory, FIFO or unit exists, never an
+    AttributeError or ImportError part-way through a launch.
+    """
+    require_posix()
+    if (termios is None or not hasattr(termios, 'FIONREAD') or not hasattr(os, 'mkfifo')
+            or not hasattr(os, 'pidfd_open') or not hasattr(os, 'geteuid')):
+        raise PlatformUnsupported('platform_unsupported: the engine launcher needs Linux '
+                                  '(FIFO stdio, FIONREAD, pidfd, systemd user units)')
 
 
 class RunContext:
@@ -116,6 +135,7 @@ class bound_run:
 
 def private_dir(path):
     """Create ``path`` (and missing parents) at 0700, or check an existing one is ours and 0700."""
+    require_launcher_platform()
     path = Path(path)
     missing = []
     current = path
@@ -203,6 +223,7 @@ class UnitEngineProcess:
     """``routes.launch.EngineProcess`` over one run unit: FIFO stdin, a tailed stdout file, a pidfd."""
 
     def __init__(self, daemon, run_id, stdin_fd, stdout_path, pidfd, *, poll_s=0.05):
+        require_launcher_platform()
         self._daemon, self.run_id = daemon, run_id
         self._stdin, self._pidfd, self._poll_s = stdin_fd, pidfd, poll_s
         self._out = os.open(stdout_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -301,6 +322,7 @@ class ProductionLauncher:
     """``launcher(argv, *, env, shell=False) -> EngineProcess`` for one engine's route adapter."""
 
     def __init__(self, engine, daemon, manager, state_dir, *, python=None, start_timeout_s=10.0):
+        require_launcher_platform()
         if engine not in ENGINE_PROFILES:
             raise ValueError(engine)
         self.engine, self._daemon, self._manager = engine, daemon, manager
@@ -455,6 +477,7 @@ class UnitKillTree:
     """``control.registry.KillTree`` over the daemon: #916 stop of the unit, attested confirmation."""
 
     def __init__(self, daemon, *, poll_s=0.25, clock=time.monotonic, sleep=time.sleep):
+        require_launcher_platform()
         self._daemon, self._poll_s, self._clock, self._sleep = daemon, poll_s, clock, sleep
 
     @staticmethod

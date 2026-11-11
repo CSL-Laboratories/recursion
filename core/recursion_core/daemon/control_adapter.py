@@ -47,7 +47,7 @@ from recursion_core.routes import contract as route_contract
 
 from . import RUN_ID, TERMINAL
 from .launcher import (EngineUnitManager, ProductionLauncher, RunContext, UnitKillTree, bound_run,
-                       private_dir)
+                       private_dir, require_launcher_platform)
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +104,7 @@ def load_routes(path):
     defaulted: an engine with no entry cannot be started. The file must be a regular file of
     ours that no one else can write.
     """
+    require_launcher_platform()  # the owner check below needs a uid
     path = Path(path)
     try:
         info = os.lstat(path)
@@ -504,6 +505,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     route file (tests). A route file that cannot be trusted leaves every start refused
     (``route_not_configured``) and is logged; reads and Stop still work.
     """
+    require_launcher_platform()  # Windows: typed PlatformUnsupported; no socket, token file or state is made
     environ = dict(os.environ if environ is None else environ)
     manager = daemon.manager
     if not isinstance(manager, EngineUnitManager):

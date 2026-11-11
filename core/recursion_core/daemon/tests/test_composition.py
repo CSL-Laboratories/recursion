@@ -38,6 +38,10 @@ from recursion_core.routes.launch import ReadTimeout
 from recursion_core.routes.tests.fakes import FakeClock, request
 
 LINUX = sys.platform.startswith('linux')
+LINUX_ONLY = ('Linux-only: the composed daemon needs pidfd, FIFO stdio, AF_UNIX peer credentials and systemd '
+              'user units; on Windows the launcher, compose_control and the daemon entry point refuse '
+              'PlatformUnsupported (platform_unsupported) and the CLI answers control_api_unavailable; '
+              'covered by WindowsRefusalTests in daemon/tests and control/tests')
 STANDIN = Path(launcher.__file__).with_name('evidence_standin_engine.py')
 BOOT = 'boot-1'
 
@@ -114,7 +118,7 @@ class ProcessUnitManager(launcher.EngineUnitManager):
         return os.pidfd_open(pid)
 
 
-@unittest.skipUnless(LINUX, 'the daemon is Linux only (pidfd, FIFO stdio, AF_UNIX peer credentials)')
+@unittest.skipUnless(LINUX, LINUX_ONLY)
 class ComposedDaemonTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='rc-compose-'))
@@ -549,7 +553,7 @@ class ComposedDaemonTest(unittest.TestCase):
             adapter.load_routes(path)
 
 
-@unittest.skipUnless(LINUX, 'the daemon is Linux only (pidfd, FIFO stdio, AF_UNIX peer credentials)')
+@unittest.skipUnless(LINUX, LINUX_ONLY)
 class LauncherTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='rc-launch-'))
@@ -757,6 +761,7 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual((refused.returncode, refused.stdout), (127, ''))
 
 
+@unittest.skipUnless(LINUX, LINUX_ONLY)
 class CompositionRootTest(unittest.TestCase):
     """``python -m recursion_core.daemon`` composes its own control adapter unless one is injected."""
 
@@ -813,7 +818,7 @@ class CompositionRootTest(unittest.TestCase):
             daemon.return_value.close.assert_called_once()
 
 
-@unittest.skipUnless(LINUX, 'the daemon is Linux only')
+@unittest.skipUnless(LINUX, LINUX_ONLY)
 class RealUserManagerTest(unittest.TestCase):
     """The same launch and Stop against a real ``systemd --user`` manager, where one is running."""
 

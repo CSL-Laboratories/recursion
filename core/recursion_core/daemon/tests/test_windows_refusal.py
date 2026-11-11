@@ -10,6 +10,8 @@ import tempfile
 import unittest
 
 import recursion_core.daemon as daemon
+from recursion_core.daemon import __main__ as entry
+from recursion_core.daemon import control_adapter, launcher
 from recursion_core.daemon import (Daemon, PlatformUnsupported, Registry, SystemdUserManager,
                                    UserLock, require_posix)
 from recursion_core.daemon.engine_user import EngineManagerPresent, check_engine_no_user_manager
@@ -56,6 +58,47 @@ class WindowsRefusalTests(unittest.TestCase):
             raise AssertionError('probe ran without an operator uid')
         with self.assertRaisesRegex(EngineManagerPresent, 'platform_unsupported'):
             check_engine_no_user_manager('csl-engine', 1001, call=call, runtime_root=self.path)
+
+    def test_launcher_imports_without_fcntl_or_termios_and_refuses_typed(self):
+        self.assertIsNone(launcher.fcntl)
+        self.assertIsNone(launcher.termios)
+        with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+            launcher.require_launcher_platform()
+        for build in (lambda: launcher.EngineUnitManager(self.path / 'cgroup'),
+                      lambda: launcher.ProductionLauncher('claude_code', object(), object(), self.path / 'state'),
+                      lambda: launcher.UnitEngineProcess(object(), 'run-1', 0, self.path / 'stdout', None),
+                      lambda: launcher.UnitKillTree(object()),
+                      lambda: launcher.private_dir(self.path / 'private')):
+            with self.assertRaises(PlatformUnsupported):
+                build()
+        self.assertEqual([], list(self.path.iterdir()))
+
+    def test_composition_refuses_and_makes_no_socket_token_or_state(self):
+        environ = {'XDG_RUNTIME_DIR': str(self.path / 'rt'), 'XDG_CONFIG_HOME': str(self.path / 'config')}
+        with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+            control_adapter.compose_control(object(), self.path / 'state', environ=environ, routes={})
+        with self.assertRaises(PlatformUnsupported):
+            control_adapter.DeviceDoor(self.path / 'door')
+        with self.assertRaises(PlatformUnsupported):
+            control_adapter.load_routes(self.path / 'routes.json')
+        self.assertEqual([], list(self.path.iterdir()))
+
+    def test_daemon_entry_point_refuses_before_any_lock_state_or_gui(self):
+        def never(*args, **kwargs):
+            raise AssertionError('the daemon entry point went past the platform refusal')
+        saved = {name: getattr(entry, name) for name in
+                 ('require_free_threaded', 'check_operator_linger', 'UserLock', 'Registry', 'Daemon',
+                  'compose_control', 'LoopbackGUI')}
+        try:
+            for name in saved:
+                setattr(entry, name, never)
+            with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+                entry.main(port=0)
+            with self.assertRaisesRegex(PlatformUnsupported, 'platform_unsupported'):
+                entry.main(client=object(), door=bool, port=0)
+        finally:
+            for name, value in saved.items():
+                setattr(entry, name, value)
 
 
 if __name__ == '__main__':

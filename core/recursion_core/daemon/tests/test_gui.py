@@ -1,8 +1,9 @@
 """Real loopback HTTP requests through the daemon's GUI composition root."""
 from http.client import HTTPConnection
 import importlib
+import os
 from pathlib import Path
-from unittest import TestCase, mock
+from unittest import TestCase, mock, skipIf
 import socket
 from types import SimpleNamespace
 from wsgiref.simple_server import WSGIServer
@@ -11,6 +12,11 @@ from recursion_core.daemon import __main__ as entry
 from recursion_core.daemon.gui import LoopbackGUI
 from recursion_core.gui.client import ControlClient
 from recursion_core.gui.tests.fakes import FakeControlAPI, wsgi_transport
+
+NOT_POSIX = os.name == 'nt' or not hasattr(os, 'getuid')
+ENTRY_LINUX_ONLY = ('Linux-only: the daemon entry point needs flock, uid ownership checks and systemd; on Windows '
+                    'main() refuses PlatformUnsupported (platform_unsupported) before any GUI is built; covered '
+                    'by WindowsRefusalTests in daemon/tests/test_windows_refusal.py')
 
 
 class LoopbackTests(TestCase):
@@ -136,6 +142,7 @@ class LoopbackTests(TestCase):
         self.assertIn("panels", plugin)
         self.assertTrue(plugin["panels"])
 
+    @skipIf(NOT_POSIX, ENTRY_LINUX_ONLY)
     def test_service_entry_point_starts_and_closes_gui(self):
         plugin = {"panels": []}
         with mock.patch.object(entry, "require_free_threaded"), \
@@ -155,6 +162,7 @@ class LoopbackTests(TestCase):
             gui.return_value.__exit__.assert_called_once()
             daemon.return_value.close.assert_called_once()
 
+    @skipIf(NOT_POSIX, ENTRY_LINUX_ONLY)
     def test_occupied_gui_port_keeps_reconciliation_running_and_retries(self):
         occupant = socket.socket()
         occupant.bind(("127.0.0.1", 0))
@@ -203,6 +211,7 @@ class LoopbackTests(TestCase):
         with socket.socket() as probe:
             self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
 
+    @skipIf(NOT_POSIX, ENTRY_LINUX_ONLY)
     def test_bad_plugin_registry_still_stops_the_service(self):
         with mock.patch.object(entry, "require_free_threaded"), \
              mock.patch.object(entry, "check_operator_linger"), \
@@ -217,6 +226,7 @@ class LoopbackTests(TestCase):
                 entry.main(client=self.client, plugins=(bad,), port=0)
             daemon.return_value.close.assert_called_once()
 
+    @skipIf(NOT_POSIX, ENTRY_LINUX_ONLY)
     def test_bad_plugin_registry_stops_the_service_even_when_the_port_is_occupied(self):
         occupant = socket.socket()
         occupant.bind(("127.0.0.1", 0))

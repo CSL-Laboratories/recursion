@@ -51,7 +51,8 @@ POSIX_ONLY_MODULES = ("fcntl", "grp", "posix", "pwd", "resource", "termios")
 HERE = Path(__file__).resolve().parent
 CORE = HERE.parents[2]
 TARGET = HERE / "test_child_env.py"
-REFUSAL_AREAS = ("cgroup_leaf", "child_env", "control_transport", "daemon", "routes", "subscription_routes", "tui")
+REFUSAL_AREAS = ("cgroup_leaf", "child_env", "control", "control_transport", "daemon", "routes", "subscription_routes",
+                 "tui")
 _FRAME = re.compile(r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<func>\S+)', re.MULTILINE)
 
 

@@ -12,6 +12,9 @@ d84cdd26, CSLR-D-012, section 3.4 S6 line 888):
   cap. The request did not reach the control API.
 * ``delivered: "unknown"``: the request was written and no complete reply came back. It may have
   been carried out; read the run's status before retrying.
+
+On a platform without the Unix transport (Windows) every call answers ``control_api_unavailable``
+with ``delivered: false`` and ``detail: "platform_unsupported"``; nothing is connected.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from recursion_core.control_transport import TransportBusy, TransportRefused, UnixControlClient
+from recursion_core.control_transport import PlatformNotSupported, TransportBusy, TransportRefused, UnixControlClient
 
 SOCKET_DIR = "recursion"  # $XDG_RUNTIME_DIR/recursion/control.sock
 UNAVAILABLE = "control_api_unavailable"
@@ -30,6 +33,10 @@ DEFAULT_TIMEOUT_S = 60.0
 
 def socket_directory(environ=None) -> str:
     environ = os.environ if environ is None else environ
+    if os.name == "nt" or not hasattr(os, "getuid"):
+        raise PlatformNotSupported(
+            "platform_unsupported: the daemon's control socket needs POSIX (AF_UNIX under the user's runtime directory)"
+        )
     runtime = environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     return str(Path(runtime) / SOCKET_DIR)
 
@@ -40,12 +47,19 @@ def socket_path(environ=None) -> str:
 
 class SocketAPI:
     def __init__(self, path: str | None = None, *, timeout_s: float = DEFAULT_TIMEOUT_S, connect=UnixControlClient) -> None:
-        self.path = path if path is not None else socket_path()
+        try:
+            self.path = path if path is not None else socket_path()
+        except PlatformNotSupported:  # Windows: there is no socket to name; every call answers the typed refusal
+            self.path = None
         self._timeout_s, self._connect = timeout_s, connect
 
     def call(self, method: str, params: dict | None = None) -> dict:
+        if self.path is None:
+            return {"code": UNAVAILABLE, "delivered": False, "detail": "platform_unsupported"}
         try:
             client = self._connect(self.path, timeout_s=self._timeout_s)
+        except PlatformNotSupported:
+            return {"code": UNAVAILABLE, "delivered": False, "detail": "platform_unsupported"}
         except (OSError, TransportRefused) as err:
             return {"code": UNAVAILABLE, "delivered": False, "detail": f"connect:{type(err).__name__}"}
         try:

@@ -36,6 +36,9 @@ from typing import Protocol
 
 # Answers from KillTree.confirm. Only EMPTY means the run's cgroup holds no process.
 EMPTY, POPULATED, TIMEOUT, UNKNOWN = "empty", "populated", "timeout", "unknown"
+# CPython's int() rejects digit strings past this limit. Stay at the limit so a longer suffix
+# never reaches the conversion.
+_MAX_MARKER_DIGITS = 4300
 
 
 class StaleGeneration(Exception):
@@ -175,6 +178,7 @@ class InMemoryRunRegistry:
         self.locks = OwnerLockTable()
         self._processes = processes
         self._marker = 0
+        self._accepted_markers: set[str] = set()
         self.commit_gate: Callable[[dict], None] | None = None
         self._runs: dict[str, dict] = {}
         self._starts: dict[tuple[str, str], list[str]] = {}  # (tenant, client_key) -> run ids, first seen first
@@ -394,17 +398,27 @@ class InMemoryRunRegistry:
         return copy.deepcopy(stored)
 
     def _new_marker(self) -> str:
-        self._marker += 1
-        return f"cg-{self._marker}"
+        while True:
+            self._marker += 1
+            marker = f"cg-{self._marker}"
+            if marker not in self._accepted_markers:
+                return marker
 
     def _note_marker(self, marker: object) -> None:
-        """Remember a ``cg-N`` so a later mint cannot repeat it, including across a restore."""
+        """Remember a marker so a later mint, or a new path, cannot repeat it."""
+        if isinstance(marker, str) and marker:
+            self._accepted_markers.add(marker)
         value = _marker_seq(marker)
         if value > self._marker:
             self._marker = value
 
     def _bind_cgroup(self, current: dict | None, stored: dict) -> None:
-        """Give ``stored`` a cgroup marker. A new path does not keep the previous path's marker."""
+        """Give ``stored`` a cgroup marker.
+
+        The same path keeps the marker already stored. A new path keeps a supplied marker only when
+        it has never been stored, so an adopted launch proof still matches. A marker that was stored
+        before is not put back, so a copied generation cannot restore it onto a replacement cgroup.
+        """
         path = stored.get("cgroup")
         if not isinstance(path, str) or not path:
             stored["cgroup_marker"] = None
@@ -412,9 +426,9 @@ class InMemoryRunRegistry:
         previous_path = current.get("cgroup") if current else None
         previous_marker = current.get("cgroup_marker") if current else None
         supplied = stored.get("cgroup_marker")
-        if path == previous_path and previous_marker:
-            stored["cgroup_marker"] = supplied or previous_marker
-        elif isinstance(supplied, str) and supplied and supplied != previous_marker:
+        if path == previous_path and isinstance(previous_marker, str) and previous_marker:
+            stored["cgroup_marker"] = previous_marker
+        elif isinstance(supplied, str) and supplied and supplied not in self._accepted_markers:
             stored["cgroup_marker"] = supplied
         else:
             stored["cgroup_marker"] = self._new_marker()
@@ -512,13 +526,22 @@ class InMemoryRunRegistry:
 
 
 def _marker_seq(marker: object) -> int:
-    """The integer in a ``cg-N`` marker, or 0 when ``marker`` is not one."""
+    """The integer in a short ASCII ``cg-N`` marker, or 0 otherwise.
+
+    ``str.isdigit`` is true for superscripts and subscripts, and ``int`` rejects those and digit
+    strings past its conversion limit. A restore must ignore both instead of aborting.
+    """
     if not isinstance(marker, str) or not marker.startswith("cg-"):
         return 0
     suffix = marker[3:]
-    if not suffix.isdigit():
+    if not suffix or len(suffix) > _MAX_MARKER_DIGITS:
         return 0
-    return int(suffix)
+    if not suffix.isascii() or not suffix.isdigit():
+        return 0
+    try:
+        return int(suffix)
+    except ValueError:
+        return 0
 
 
 def _member(member: dict) -> dict:

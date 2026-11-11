@@ -27,7 +27,10 @@ WINDOWS_ONLY = "Windows-only assertions; a POSIX host runs them simulated (child
 @unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
 class WindowsRefusalTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.base = tempfile.mkdtemp(prefix="ctw-")
+        # A short base keeps the address checks (run before the platform refusal) from refusing a
+        # long TMPDIR path first, as on macOS under the simulation (which reports os.name "nt").
+        short = "/tmp" if os.path.isdir("/tmp") else None
+        self.base = tempfile.mkdtemp(prefix="ctw-", dir=short)
         self.addCleanup(os.rmdir, self.base)  # fails if a refusal left anything behind
         self.sock_dir = os.path.join(self.base, "run")
 

@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import tempfile
+import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -55,8 +56,14 @@ def owned_tmpdir(prefix: str) -> str:
 
     The process temp dir is tried first, then /tmp. With neither usable the fixtures cannot be built, and
     that is an error, not a skip: a cell must never pass or fail because of where the host put TMPDIR.
+
+    Windows has no ``os.geteuid``, so the owned-chain rule cannot be evaluated. Skip rather than call
+    it: a fixture must not pass by accepting a directory the POSIX rule would refuse, and it must not
+    raise ``AttributeError``.
     """
 
+    if os.name == "nt" or not hasattr(os, "geteuid") or not hasattr(os, "getuid"):
+        raise unittest.SkipTest("POSIX rules")
     for base in (tempfile.gettempdir(), "/tmp"):
         try:
             path = tempfile.mkdtemp(prefix=prefix, dir=os.path.realpath(base))
@@ -176,7 +183,9 @@ def _replaced(*bad: str) -> Callable[[dict], str | None]:
         st = os.lstat(tmp)
         if tmp in bad or any(env[name] != tmp for name in names):
             return f"temp not replaced: {tmp}"
-        if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        geteuid = getattr(os, "geteuid", None)
+        # No euid: do not accept the temp root. A SID/DACL check is future work.
+        if geteuid is None or st.st_uid != geteuid() or st.st_mode & 0o077:
             return "route temp root not private"
         return None
 
@@ -490,6 +499,39 @@ def cells(s: Scratch) -> list[Cell]:
     for name, engine, value, with_proxy in ordinary:
         parent = {"NO_PROXY": value, **({"HTTPS_PROXY": PROXY} if with_proxy else {})}
         add("no_proxy_ok", name, parent, L(_same(NO_PROXY=value)), engine=engine)
+
+    # The route base host is an endpoint the child uses. While a proxy is set, a NO_PROXY entry that matches it
+    # refuses, including a CIDR that contains an IP literal. A CIDR does not match a domain name.
+    gateway = ChildRoute(api_key=USER_KEY, base_url=base_url)
+    ip_route = ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000")
+    add("no_proxy_route", "route_host", {"HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid"}, R("no_proxy_engine_host"),
+        auth=api, route=gateway)
+    add("no_proxy_route", "route_suffix", {"HTTPS_PROXY": PROXY, "NO_PROXY": "invalid"}, R("no_proxy_engine_host"),
+        auth=api, route=gateway)
+    add("no_proxy_route", "route_dot_domain", {"HTTPS_PROXY": PROXY, "NO_PROXY": ".invalid"}, R("no_proxy_engine_host"),
+        auth=api, route=gateway)
+    add("no_proxy_route", "route_cidr", {"HTTPS_PROXY": PROXY, "NO_PROXY": "10.0.0.0/8"}, R("no_proxy_engine_host"),
+        auth=api, route=ip_route)
+    add("no_proxy_route", "route_cidr_v6", {"HTTPS_PROXY": PROXY, "NO_PROXY": "::1/128"}, R("no_proxy_engine_host"),
+        auth=api, route=ChildRoute(api_key=USER_KEY, base_url="http://[::1]:4000"))
+    add("no_proxy_route", "route_wildcard", {"HTTPS_PROXY": PROXY, "NO_PROXY": "*.invalid"}, R("no_proxy_engine_host"),
+        auth=api, route=gateway)
+    add("no_proxy_route", "route_star", {"HTTPS_PROXY": PROXY, "NO_PROXY": "*"}, R("no_proxy_wildcard"),
+        auth=api, route=gateway)
+    add("no_proxy_route", "route_bracket_v6", {"HTTPS_PROXY": PROXY, "NO_PROXY": "[::1]"}, R("no_proxy_engine_host"),
+        auth=api, route=ChildRoute(api_key=USER_KEY, base_url="http://[::1]:4000"))
+    add("no_proxy_route", "route_host_trusted", {"HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid"},
+        R("no_proxy_engine_host"), route=ChildRoute(base_url=base_url, trusted_base_urls=("https://gateway.invalid",)))
+    add("no_proxy_route_ok", "cidr_other_net", {"HTTPS_PROXY": PROXY, "NO_PROXY": "192.168.0.0/16"},
+        L(_same(NO_PROXY="192.168.0.0/16", **{url: "http://10.1.2.3:4000"})), auth=api, route=ip_route)
+    add("no_proxy_route_ok", "cidr_domain", {"HTTPS_PROXY": PROXY, "NO_PROXY": "10.0.0.0/8"},
+        L(_same(NO_PROXY="10.0.0.0/8", **{url: base_url})), auth=api, route=gateway)
+    add("no_proxy_route_ok", "cidr_no_route", {"HTTPS_PROXY": PROXY, "NO_PROXY": "10.0.0.0/8,localhost"},
+        L(_same(NO_PROXY="10.0.0.0/8,localhost")))
+    add("no_proxy_route_ok", "host_without_proxy", {"NO_PROXY": "gateway.invalid"},
+        L(_same(NO_PROXY="gateway.invalid", **{url: base_url})), auth=api, route=gateway)
+    add("no_proxy_route_ok", "lookalike", {"HTTPS_PROXY": PROXY, "NO_PROXY": "notgateway.invalid,gateway.invalid.example"},
+        L(_same(**{url: base_url})), auth=api, route=gateway)
     return out
 
 

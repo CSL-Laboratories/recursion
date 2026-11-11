@@ -58,7 +58,13 @@ Spec: CSLR-D-012, PRODUCT.md `d84cdd26a4de2366f3c5d34c4aec5215f822a494` (SHA-256
 - The old route transport (`scripts/v3/route_contract/transport.py`) is frozen and
   unchanged; it still passes `os.environ.copy()`.
 
-POSIX only. On Windows every call refuses with `platform_unsupported`.
+POSIX only. On Windows, and wherever `os.geteuid`, `os.getuid` or the `fcntl`
+module is missing, every call refuses with `platform_unsupported` instead of
+passing values the ownership rules cannot judge or raising `AttributeError`.
+A Windows SID/DACL backend is future work. Until then the directory-owner,
+symlink-owner and mode `0o077` checks run only where `os.geteuid` exists. Where
+it does not, they refuse (`owner_check_unsupported`, or the owned-chain and
+private-dir checks return false). They never return true and never invent a uid.
 
 ## Auth mode and the route
 
@@ -94,6 +100,59 @@ Foundry switches are dropped. The child gets one only from the route:
   and the same host in a proxy value refuses with `proxy_malformed`. On an `api_key` or `cloud_provider`
   route a URL that meets this rule is set as it is. On a `subscription` route it must also
   pass the rule in [Subscription base URL](#subscription-base-url).
+- **`NO_PROXY` includes the route host.** While a proxy is set (`HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY`, or the lowercase names), both `NO_PROXY` and `no_proxy` are checked against the
+  route base host as well as the engine's own endpoints. Either name is enough to refuse.
+  `NO_PROXY=gateway.invalid` cannot send `https://gateway.invalid` around the proxy
+  (`no_proxy_engine_host`). A CIDR matches an IP it contains (`10.0.0.0/8` covers `10.1.2.3`,
+  `::1/128` covers `::1`), including a requests shorthand (`10.0/8` via `socket.inet_aton`),
+  a permissive prefix (`10.0.0.0/+8`, `10.0.0.0/\t8` from requests, `10.0.0.0/8x` from curl;
+  curl also ignores whatever follows those digits, so `10.0.0.0/8/foo` and `10.0.0.0/8/24` are `/8`;
+  leading zeros do not change the value, so `10.0.0.0/00008/foo` is `/8`. requests' `int()`
+  of the whole suffix is also read, so `10.0.0.0/0_8`, `10.0.0.0/+0_8` and a fullwidth `8`
+  are `/8`. A zero with junk that `int()` rejects is not a prefix: `10.0.0.0/0x8/foo` is not `/0`),
+  the IPv4 address inside `[::ffff:10.1.2.3]`, and an IPv4-mapped CIDR compared as IPv4
+  (Go: `::ffff:10.0.0.0/104` is `10.0.0.0/8`, `::ffff:0:0/96` is every IPv4). `::/0` stays IPv6.
+  A prefix of 0 covers that whole address family (`0.0.0.0/0`, `::/0`); a bare `/0` covers every
+  IP of both families. A CIDR does not match a domain name. A prefix that cannot be read without
+  raising (`10/²`, a thousands-digit mask) refuses with `no_proxy_malformed`. A NUL in the value
+  refuses with `value_malformed`. A bracketed IPv6 entry (`[::1]`) is that address. IDNA2003 and
+  IDNA2008 spellings both match (`bücher.invalid`, `faß.invalid` and `xn--fa-hia.invalid`,
+  `FAẞ.INVALID`, a trailing dot). Before that, names are mapped with the Unicode 15.1.0
+  UTS46 table, nontransitional (deviation characters stay: `ß` stays `ß`, final sigma stays
+  final sigma). Ignored characters include U+180F. Cherokee U+13A0 stays U+13A0 (`xn--58d`);
+  U+1C80 maps to U+0432 (`xn--b1a`). `faß。invalid`, `ｆａß.invalid`, `fªß.invalid`
+  and `fa` plus a variation selector match `xn--fa-hia.invalid`. An entry that maps to empty or
+  only dots (`\u00ad`, `。`, and a literal `.` or `.:443` against a trailing-dot host) refuses.
+  A code point the 15.1 table does not map, ignore, or accept refuses too: IDNA2003 is not
+  a fallback, because it would rewrite `ß` to `ss` and miss the name a newer Go lookup uses.
+  Trailing dots are stripped again after that mapping. Before that strip, requests' suffix
+  test is applied to the unbracketed hostname and to `hostname:port` (engine endpoints are
+  HTTPS, port 443; a route uses its own origin port), after a leading dot is removed.
+  `:443`, `443`, `43` and `3` therefore match `https://gateway.invalid`, and
+  `.2001:db8::1:8443` matches `[2001:db8::1]:8443`. urllib is asked about the same
+  unbracketed host: it splits at the last colon, so `2001:db8:` matches `2001:db8::1`
+  and `:` matches `::1`.
+  A leading `*.` is normalised the same way, so `*.bücher.invalid` matches
+  `sub.xn--bcher-kva.invalid`. Dropping an ignored character does not turn `.*` into a
+  match-all. Final sigma
+  (`ς`) is not small sigma (`σ`). A leading dot is suffix syntax, so `.münchen.example` does not
+  match an unrelated host. A non-ASCII entry that will not encode refuses. Undici 7.30.1's leading
+  `*.` matches the apex, so `*.gateway.invalid` and `*.gateway.invalid:443` match `gateway.invalid`.
+  With no proxy set, `NO_PROXY` is kept as it is.
+  The match is the union of the readers, and it over-refuses on purpose:
+  - ports are dropped, so `gateway.invalid:9` matches `gateway.invalid`;
+  - a `*` in the middle matches across dots, so `gate*invalid` matches `gateway.invalid`;
+  - an entry that is only `*`, `.`, or both (`*`, `*.`, `**`, `.*`) is `no_proxy_wildcard`;
+  - a scheme is stripped, so `http://gateway.invalid` is `gateway.invalid`;
+  - spaces are deleted the way requests does, so `gate way.invalid` is `gateway.invalid`;
+  - a plain suffix needs no dot boundary. That is requests <=2.32.3 (`hostname.endswith(entry)`),
+    and this check follows it because a child may still run that requests. `ateway.invalid`
+    therefore exempts `gateway.invalid`. A minimum requests version is not assumed.
+  `corp.internal`, `localhost`, `127.0.0.1` and `::1` do not match a remote name such as
+  `gateway.invalid`, and the list is kept.
+  `npm_config_no_proxy`, `NPM_CONFIG_NO_PROXY` and `GLOBAL_AGENT_NO_PROXY` are not on the
+  allowlist, so they are dropped and are not read as bypass lists.
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or
   the owner-only key file (A44), and does no keyring or file I/O. The caller fetches the
   user-entered key from the OS keyring, or from the owner-only file on a host with no

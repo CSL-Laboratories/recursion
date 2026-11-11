@@ -13,12 +13,14 @@ come from that descriptor. A symlink is a refusal, not a path that is opened lat
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
+import sqlite3
 import stat
 
 from .errors import Refused
 
-__all__ = ["abandon_store", "check_store_path", "open_new_store", "read_within_root"]
+__all__ = ["abandon_store", "check_store_path", "init_created_store", "open_new_store", "read_within_root"]
 
 _JOURNAL = b"-journal"
 _SQLITE_MAX_PATHNAME = 512
@@ -40,6 +42,10 @@ def check_store_path(path: object) -> str:
         resolved = os.path.join(parent_real, name)
         encoded = os.fsencode(resolved)
         limit = _name_max(parent_real)
+        # SQLite also creates ``<name>-journal`` (8 bytes), ``-wal`` and ``-shm``.
+        # A basename that fits NAME_MAX can still make the sidecar too long.
+        if len(os.fsencode(name)) + len(_JOURNAL) > limit:
+            raise Refused("store_path_too_long")
         for part in resolved.split(os.sep):
             if part and len(os.fsencode(part)) > limit:
                 raise Refused("store_path_too_long")
@@ -74,6 +80,20 @@ def open_new_store(path: str) -> str:
         raise
     os.close(fd)
     return resolved
+
+
+def init_created_store(path: str, db: sqlite3.Connection, build) -> None:
+    """Finish a store file. A path SQLite cannot open becomes ``store_path_too_long``."""
+    try:
+        try:
+            build()
+        except BaseException as exc:
+            abandon_store(path)
+            if _path_open_failure(exc):
+                raise Refused("store_path_too_long") from None
+            raise
+    finally:
+        db.close()
 
 
 def abandon_store(path: str) -> None:
@@ -134,6 +154,24 @@ def _name_max(directory: str) -> int:
         return 255
 
 
+def _path_open_failure(exc: BaseException) -> bool:
+    if isinstance(exc, UnicodeEncodeError):
+        return True
+    if isinstance(exc, OSError) and exc.errno == errno.ENAMETOOLONG:
+        return True
+    if isinstance(exc, sqlite3.Error):
+        text = str(exc).lower()
+        return "unable to open" in text or "too long" in text
+    return False
+
+
+def _clear_nonblock(fd: int) -> None:
+    if not hasattr(os, "O_NONBLOCK"):
+        return
+    current = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, current & ~os.O_NONBLOCK)
+
+
 def _open_dir(path: str) -> int:
     try:
         return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -148,7 +186,11 @@ def _read_from(root_fd: int, parts: list[str]) -> bytes:
         for index, part in enumerate(parts):
             last = index == len(parts) - 1
             flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-            if not last:
+            if last:
+                # A FIFO would block in open() before fstat could reject it, and
+                # load() holds its lock across this read.
+                flags |= getattr(os, "O_NONBLOCK", 0)
+            else:
                 flags |= os.O_DIRECTORY
             try:
                 fd = os.open(part, flags, dir_fd=dir_fd)
@@ -165,6 +207,11 @@ def _read_from(root_fd: int, parts: list[str]) -> bytes:
                 if not stat.S_ISREG(info.st_mode):
                     os.close(fd)
                     raise Refused("plugin_path_escapes_root")
+                try:
+                    _clear_nonblock(fd)
+                except OSError:
+                    os.close(fd)
+                    raise Refused("plugin_path_unreadable") from None
                 file_fd = fd
             else:
                 if not stat.S_ISDIR(info.st_mode):

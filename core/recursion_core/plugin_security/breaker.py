@@ -39,7 +39,7 @@ import time
 from typing import Callable
 
 from .errors import Refused
-from .paths import abandon_store, check_store_path, open_new_store
+from .paths import abandon_store, check_store_path, init_created_store, open_new_store
 
 __all__ = ["ConnectionBreaker", "TYPED_LIMITS", "create_breaker_store"]
 
@@ -63,22 +63,19 @@ def create_breaker_store(path: str) -> None:
     except (sqlite3.Error, OSError, UnicodeEncodeError):
         abandon_store(path)
         raise Refused("store_path_too_long") from None
-    try:
-        try:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
-            db.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY, connection TEXT NOT NULL,"
-                       " plugin_id TEXT NOT NULL, provider TEXT NOT NULL, model_version TEXT NOT NULL)")
-            db.execute("CREATE TABLE faulted (run_id TEXT PRIMARY KEY)")
-            db.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL,"
-                       " generation INTEGER NOT NULL)")
-            db.execute("CREATE TABLE trip_seq (connection TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
-            db.execute("INSERT INTO meta VALUES ('magic', ?)", (_STORE_MAGIC,))
-        except BaseException:
-            abandon_store(path)
-            raise
-    finally:
-        db.close()
+
+    def build() -> None:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        db.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY, connection TEXT NOT NULL,"
+                   " plugin_id TEXT NOT NULL, provider TEXT NOT NULL, model_version TEXT NOT NULL)")
+        db.execute("CREATE TABLE faulted (run_id TEXT PRIMARY KEY)")
+        db.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL,"
+                   " generation INTEGER NOT NULL)")
+        db.execute("CREATE TABLE trip_seq (connection TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
+        db.execute("INSERT INTO meta VALUES ('magic', ?)", (_STORE_MAGIC,))
+
+    init_created_store(path, db, build)
 
 
 class ConnectionBreaker:

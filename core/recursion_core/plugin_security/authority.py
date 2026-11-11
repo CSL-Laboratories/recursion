@@ -85,7 +85,7 @@ _CHARGES_INDEX = "CREATE INDEX IF NOT EXISTS charges_by_profile ON charges (prof
 
 def create_ledger(path: str, anchor_public_key: str) -> None:
     """Installer step: create the ledger bound to one anchor. Refuses if it exists."""
-    from .paths import abandon_store, check_store_path, open_new_store
+    from .paths import abandon_store, check_store_path, init_created_store, open_new_store
     path = check_store_path(path)
     parse_public_key(anchor_public_key)
     path = open_new_store(path)
@@ -94,21 +94,18 @@ def create_ledger(path: str, anchor_public_key: str) -> None:
     except (sqlite3.Error, OSError, UnicodeEncodeError):
         abandon_store(path)
         raise Refused("store_path_too_long") from None
-    try:
-        try:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
-            db.execute("CREATE TABLE profiles (profile_id TEXT PRIMARY KEY, digest TEXT NOT NULL)")
-            db.execute("CREATE TABLE charges (idempotency_key TEXT PRIMARY KEY, profile_id TEXT NOT NULL,"
-                       " amount_minor INTEGER NOT NULL CHECK (amount_minor > 0))")
-            db.execute(_CHARGES_INDEX)
-            db.execute("INSERT INTO meta VALUES ('magic', ?), ('anchor', ?)",
-                       (_LEDGER_MAGIC, key_id(anchor_public_key)))
-        except BaseException:
-            abandon_store(path)
-            raise
-    finally:
-        db.close()
+
+    def build() -> None:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        db.execute("CREATE TABLE profiles (profile_id TEXT PRIMARY KEY, digest TEXT NOT NULL)")
+        db.execute("CREATE TABLE charges (idempotency_key TEXT PRIMARY KEY, profile_id TEXT NOT NULL,"
+                   " amount_minor INTEGER NOT NULL CHECK (amount_minor > 0))")
+        db.execute(_CHARGES_INDEX)
+        db.execute("INSERT INTO meta VALUES ('magic', ?), ('anchor', ?)",
+                   (_LEDGER_MAGIC, key_id(anchor_public_key)))
+
+    init_created_store(path, db, build)
 
 
 class Authority:

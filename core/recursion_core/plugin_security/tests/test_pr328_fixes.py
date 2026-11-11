@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import unittest
 
 from recursion_core.plugin_security import (
@@ -151,6 +152,31 @@ class StorePathTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "store_path_too_long")
         self.assertFalse(os.path.lexists(path))
 
+    def test_basename_plus_journal_suffix_respects_name_max(self) -> None:
+        root = temp_dir(self)
+        limit = os.statvfs(root).f_namemax
+        journal = len(b"-journal")
+        ok = os.path.join(root, "a" * (limit - journal))
+        bad = os.path.join(root, "b" * (limit - journal + 1))
+        self.assertEqual(len(os.path.basename(ok).encode()) + journal, limit)
+        self.assertEqual(len(os.path.basename(bad).encode()) + journal, limit + 1)
+        create_breaker_store(ok)
+        self.assertTrue(os.path.isfile(ok))
+        other = os.path.join(root, "c" * (limit - journal))
+        create_revocation_store(other)
+        self.assertTrue(os.path.isfile(other))
+        for opener in (create_breaker_store, create_revocation_store):
+            with self.subTest(opener=opener.__name__):
+                with self.assertRaises(Refused) as ctx:
+                    opener(bad)
+                self.assertEqual(ctx.exception.code, "store_path_too_long")
+                self.assertFalse(os.path.lexists(bad))
+                self.assertFalse(os.path.lexists(bad + "-journal"))
+        with self.assertRaises(Refused) as ctx:
+            create_ledger(bad, "ab" * 32)
+        self.assertEqual(ctx.exception.code, "store_path_too_long")
+        self.assertFalse(os.path.lexists(bad))
+
     def test_uri_and_memory_names_are_not_opened(self) -> None:
         root = temp_dir(self)
         previous = os.getcwd()
@@ -257,6 +283,32 @@ class PluginTrustPathTests(unittest.TestCase):
                     read_within_root(self.root, declared)
                 self.assertEqual(ctx.exception.code, "plugin_path_escapes_root")
 
+    def test_a_fifo_install_script_does_not_block_load(self) -> None:
+        script = os.path.join(self.root, "install.sh")
+        os.mkfifo(script)
+        raw = manifest_bytes(self.dev.public, source=self.source, install_scripts=("install.sh",))
+        outcome: list = []
+
+        def attempt() -> None:
+            try:
+                self.loader.load(raw, self.dev.sign(raw), self.source, root=self.root)
+                outcome.append("loaded")
+            except BaseException as exc:  # noqa: BLE001 - the assertion is on the test thread
+                outcome.append(exc)
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(2)
+        self.assertFalse(worker.is_alive(), "load blocked on a fifo install script")
+        self.assertIsInstance(outcome[0], Refused)
+        self.assertEqual(outcome[0].code, "plugin_path_escapes_root")
+
+    def test_install_scripts_require_a_root(self) -> None:
+        raw = manifest_bytes(self.dev.public, source=self.source, install_scripts=("install.sh",))
+        with self.assertRaises(Refused) as ctx:
+            self.loader.load(raw, self.dev.sign(raw), self.source)
+        self.assertEqual(ctx.exception.code, "plugin_root_required")
+
     def test_swapped_code_with_the_same_manifest_drops_signed_trust(self) -> None:
         loaded = self.loader.load(self.raw, self.dev.sign(self.raw), self.source)
         self.assertEqual(loaded.trust, "signed")
@@ -327,6 +379,58 @@ class RevocationGenerationTests(unittest.TestCase):
         trust._db.execute("PRAGMA query_only=OFF")
         self.assertEqual(trust.revoke(kid), 3)
         self.assertEqual(trust.revoke(kid), 4)
+
+    def test_a_reopen_after_chdir_keeps_the_original_store(self) -> None:
+        root = temp_dir(self)
+        original = os.path.join(root, "orig")
+        elsewhere = os.path.join(root, "elsewhere")
+        os.mkdir(original)
+        os.mkdir(elsewhere)
+        create_revocation_store(os.path.join(original, "rev.db"))
+        create_revocation_store(os.path.join(elsewhere, "rev.db"))
+        previous = os.getcwd()
+        os.chdir(original)
+        self.addCleanup(os.chdir, previous)
+        kid = "ed25519:" + "ab" * 32
+        trust = TrustStore({}, revocation_store="rev.db")
+        self.addCleanup(trust.close)
+        self.assertTrue(os.path.isabs(trust._store_path))
+        self.assertEqual(trust.revoke(kid), 1)
+        os.chdir(elsewhere)
+        trust._db.execute("PRAGMA query_only=ON")
+        with self.assertRaises(Refused) as ctx:
+            trust.revoke(kid)
+        self.assertEqual(ctx.exception.code, "revocation_not_durable")
+        trust._db.execute("PRAGMA query_only=OFF")
+        self.assertEqual(trust.revoke(kid), 3)
+        original_db = sqlite3.connect(os.path.join(original, "rev.db"))
+        self.addCleanup(original_db.close)
+        other_db = sqlite3.connect(os.path.join(elsewhere, "rev.db"))
+        self.addCleanup(other_db.close)
+        self.assertEqual(
+            original_db.execute("SELECT generation FROM revoked WHERE key_id=?", (kid,)).fetchone()[0], 3)
+        self.assertIsNone(other_db.execute("SELECT key_id FROM revoked").fetchone())
+
+    def test_a_reopen_that_cannot_connect_stays_typed(self) -> None:
+        path = os.path.join(temp_dir(self), "rev.db")
+        create_revocation_store(path)
+        kid = "ed25519:" + "cd" * 32
+        trust = TrustStore({}, revocation_store=path)
+        self.addCleanup(trust.close)
+        self.assertEqual(trust.revoke(kid), 1)
+        trust._db.execute("PRAGMA query_only=ON")
+        real_connect = sqlite3.connect
+
+        def fail_connect(*_args, **_kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        sqlite3.connect = fail_connect
+        try:
+            with self.assertRaises(Refused) as ctx:
+                trust.revoke(kid)
+            self.assertEqual(ctx.exception.code, "revocation_not_durable")
+        finally:
+            sqlite3.connect = real_connect
 
 
 class ChildEnvEncodingTests(unittest.TestCase):

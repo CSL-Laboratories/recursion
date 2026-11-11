@@ -133,25 +133,22 @@ def _script_escapes(value: str) -> bool:
 
 def create_revocation_store(path: str) -> None:
     """Installer step: create the durable revoked-key store. Refuses if it exists."""
-    from .paths import abandon_store, open_new_store
+    from .paths import abandon_store, init_created_store, open_new_store
     path = open_new_store(path)
     try:
         db = sqlite3.connect(path, isolation_level=None)
     except (sqlite3.Error, OSError, UnicodeEncodeError):
         abandon_store(path)
         raise Refused("store_path_too_long") from None
-    try:
-        try:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
-            db.execute(
-                "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
-            db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
-        except BaseException:
-            abandon_store(path)
-            raise
-    finally:
-        db.close()
+
+    def build() -> None:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        db.execute(
+            "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
+        db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
+
+    init_created_store(path, db, build)
 
 
 class TrustStore:
@@ -182,6 +179,11 @@ class TrustStore:
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
+        # Keep the absolute path resolved now. A later chdir must not make a
+        # failed write reopen a different relative ``rev.db``.
+        if revocation_store is not None:
+            from .paths import check_store_path
+            revocation_store = check_store_path(revocation_store)
         self._store_path = revocation_store
         self._db = None if revocation_store is None else self._open_store(revocation_store)
         generations = {}
@@ -301,7 +303,7 @@ class TrustStore:
         if self._store_path is not None:
             try:
                 self._db = self._open_store(self._store_path)
-            except Refused:
+            except (Refused, sqlite3.Error, OSError):
                 self._db = None
 
     def close(self) -> None:

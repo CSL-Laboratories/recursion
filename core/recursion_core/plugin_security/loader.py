@@ -178,9 +178,11 @@ class PluginLoader:
             if perm in perms:
                 findings.append(_finding("admit", perm + "_granted", "warn",
                                          "in-process code is not confined to this grant"))
-        if manifest.install_scripts and root is not None:
-            # Read each script through the directory descriptor. A symlink is refused
-            # here, at the open, rather than by a path checked and opened again later.
+        if manifest.install_scripts:
+            # A declared script is only admitted once it has been read from a root.
+            # Without that root the name is never checked against the filesystem.
+            if root is None:
+                raise Refused("plugin_root_required")
             from .paths import read_within_root
             for script in manifest.install_scripts:
                 read_within_root(root, script)

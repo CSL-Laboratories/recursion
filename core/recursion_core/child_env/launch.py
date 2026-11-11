@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Sequence
 
-from recursion_core.child_env.policy import EnvRefused, ValidatedEnv, _unsafe_file
+from recursion_core.child_env.policy import EnvRefused, ValidatedEnv, _screen_value, _unsafe_file
 
 __all__ = ["spawn"]
 
@@ -42,18 +42,33 @@ def spawn(
         raise TypeError("spawn needs the ValidatedEnv build_child_env returned, not a plain mapping")
     if isinstance(argv, (str, bytes)) or not argv or not all(isinstance(item, str) for item in argv):
         raise EnvRefused(None, "argv_malformed")
+    for item in argv:
+        _screen_value(None, item)
+    if cwd is not None:
+        _screen_value(None, cwd)
     bad = sorted(_FORBIDDEN.intersection(popen_kwargs))
     if "start_new_session" in popen_kwargs and popen_kwargs["start_new_session"] is not True:
         bad.append("start_new_session")  # the child always gets its own session (cleanup signals its group)
     if bad:
         raise EnvRefused(None, "launch_option_denied:" + ",".join(bad))
     executable = _resolve_executable(argv[0], env)
+    _screen_value(None, executable)
     child_env = env.to_dict()
+    for name, value in child_env.items():
+        _screen_value(name, value)
     kwargs: dict[str, object] = dict(popen_kwargs)
     kwargs.update(env=child_env, cwd=cwd, close_fds=True, shell=False)
     if os.name != "nt":
         kwargs["start_new_session"] = True
-    return popen([executable, *argv[1:]], **kwargs)
+    try:
+        return popen([executable, *argv[1:]], **kwargs)
+    except UnicodeEncodeError:
+        raise EnvRefused(None, "value_unencodable") from None
+    except ValueError as exc:
+        # Popen rejects a null or an "=" in a name that a screen above did not see.
+        if "null byte" in str(exc) or "illegal environment variable name" in str(exc):
+            raise EnvRefused(None, "value_malformed") from None
+        raise
 
 
 def _resolve_executable(name: str, env: ValidatedEnv) -> str:

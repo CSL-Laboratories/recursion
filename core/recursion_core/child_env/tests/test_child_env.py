@@ -154,7 +154,7 @@ class ProfileTests(unittest.TestCase):
                 self.assertLessEqual(set(env), set(profile.allowed) | set(profile.passthrough))
                 # The only planted name that may arrive is the user's own sign-in token, on the Claude profile only.
                 self.assertEqual(set(profile.passthrough), set(planted) & set(env))
-                self.assertEqual({"claude_code": {"CLAUDE_CODE_OAUTH_TOKEN"}, "codex": set()}[engine],
+                self.assertEqual({"claude_code": {"CLAUDE_CODE_OAUTH_TOKEN"}}.get(engine, set()),
                                  set(profile.passthrough))
                 self.assertFalse(set(profile.scrub) & set(env))
                 self.assertEqual(home, env["HOME"])
@@ -287,6 +287,20 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(EnvRefused) as caught:
             build_child_env("codex", home=home, auth_mode=SUB, parent=parent)
         self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), (caught.exception.name, caught.exception.cause))
+
+    def test_copilot_wildcard_that_meets_the_family_refuses(self) -> None:
+        # Sampling only the apex and api.<apex> accepts proxy.enterprise.githubcopilot.* .
+        home = _home(self)
+        parent = {"PATH": "/usr/bin", "HTTPS_PROXY": "http://127.0.0.1:9"}
+        for bypass in ("proxy.enterprise.githubcopilot.*", "foo.githubcopilot.*", "*.githubcopilot.com"):
+            with self.subTest(bypass=bypass):
+                with self.assertRaises(EnvRefused) as caught:
+                    build_child_env("copilot", home=home, auth_mode=SUB, parent={**parent, "NO_PROXY": bypass})
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), (caught.exception.name, caught.exception.cause))
+        for allowed in ("*.example.com", "notgithubcopilot.com", "api.openai.com"):
+            with self.subTest(allowed=allowed):
+                env = build_child_env("copilot", home=home, auth_mode=SUB, parent={**parent, "NO_PROXY": allowed})
+                self.assertEqual(allowed, env["NO_PROXY"])
 
     def test_overrides_never_carry_credentials(self) -> None:
         home = _home(self)
@@ -645,8 +659,10 @@ class AuthRouteTests(unittest.TestCase):
         home = _home(self)
         for engine, profile in ENGINE_PROFILES.items():
             for mode in AUTH_MODES:
-                if engine == "codex" and mode == CLOUD:
-                    continue  # refused: see test_codex_routes
+                if mode == CLOUD and not profile.provider_switches:
+                    continue  # this engine has no cloud-provider route
+                if mode == API and profile.key_name is None:
+                    continue  # this engine has no API-key route
                 with self.subTest(engine=engine, mode=mode):
                     env = build_child_env(engine, home=home, auth_mode=mode, route=ROUTES[mode],
                                           parent={"PATH": "/usr/bin", **self.AMBIENT})

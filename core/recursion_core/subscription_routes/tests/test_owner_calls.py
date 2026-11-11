@@ -109,6 +109,63 @@ class _Calls(_Base):
 
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")
+class SurrogateHomeTests(_Calls):
+    def test_a_surrogate_home_is_refused_before_the_filesystem(self) -> None:
+        homes = ["/tmp/review-home-\ud800"]
+        root = os.fsencode(self.root)
+        raw = os.path.join(root, b"\xff")
+        os.mkdir(raw, 0o700)
+        existing = os.fsdecode(raw)
+        self.assertIn("\udcff", existing)
+        homes.append(existing)
+        for home in homes:
+            env = {"PATH": "/usr/bin:/bin", "HOME": home, "OPENAI_API_KEY": "fake"}
+            profile = {"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY"}
+            self.refused(
+                "home_unsafe", check_route, "opencode", profile, env, route_home=home,
+                parent_env=self.parent(), operator_home=str(self.operator),
+            )
+            bare = {"PATH": "/usr/bin:/bin", "HOME": home}
+            self.refused(
+                "home_unsafe", check_cursor_route, bare, route_home=home, wrapper=self.wrapper,
+                parent_env=self.parent(), operator_home=str(self.operator),
+            )
+            self.refused(
+                "home_unsafe", check_antigravity_route, bare, version="1.2.3",
+                binary_path=str(self.agy / "agy"), launcher_path=str(self.agy / "agy-launch"),
+                pin=self.agy_pin, route_home=home, parent_env=self.parent(),
+                operator_home=str(self.operator),
+            )
+
+    def test_a_passwd_surrogate_and_an_owned_hermes_home_are_refused_before_realpath(self) -> None:
+        bad = "/tmp/\udcff"
+        with mock.patch.object(policy.pwd, "getpwuid", return_value=mock.Mock(pw_dir=bad)), \
+                mock.patch.object(policy.os.path, "realpath", side_effect=lambda path: path) as resolve:
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                policy._check_home("opencode", {"HOME": "/missing-route"}, "/missing-route", {}, None)
+        self.assertEqual("home_unsafe", caught.exception.cause)
+        self.assertFalse(any(call.args[0] == bad for call in resolve.call_args_list))
+        checked = policy._checked_requirements(
+            "hermes", RouteRequirements(owned_hermes_home="/tmp/\ud800"), False,
+        )
+        with mock.patch.object(policy.os.path, "realpath", side_effect=AssertionError("realpath")):
+            with self.assertRaises(SubscriptionRouteRefused) as owned:
+                policy._check_hermes_home("hermes", "/tmp/route", checked)
+        self.assertEqual("requirements_malformed", owned.exception.cause)
+        self.assertEqual("owned_hermes_home", owned.exception.detail)
+
+    def test_an_unlistable_own_store_is_home_unsafe(self) -> None:
+        with mock.patch.object(policy.os.path, "lexists", return_value=True), \
+                mock.patch.object(policy.os.path, "islink", return_value=False), \
+                mock.patch.object(policy.os.path, "isdir", return_value=True), \
+                mock.patch.object(policy.os.path, "realpath", side_effect=lambda path: path), \
+                mock.patch.object(policy.os, "scandir", side_effect=PermissionError("denied")):
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                policy._check_own_store("opencode", "/route", "/route", ".local/share/opencode")
+        self.assertEqual("home_unsafe", caught.exception.cause)
+
+
+@unittest.skipIf(os.name == "nt", "POSIX links and home checks")
 class PackageLinkTests(_Calls):
     """Call 1: a link is followed and what it resolves to is hashed; a link out of the root refuses."""
 
@@ -328,8 +385,8 @@ class HermesHomeReuseTests(_Calls):
         return {"provider": "grok", "auth": "subscription", "method": "grok_sign_in", "model": "grok/test-model"}
 
     def launch_sub(self, **inputs: object):
-        return self.launch("hermes", [self.launcher_path, "run", "grok/test-model"], use_profile=self.sub(),
-                           use_env=self.bare(), **inputs)
+        return self.launch("hermes", [self.launcher_path, "run", "--model", "grok/test-model"],
+                           use_profile=self.sub(), use_env=self.bare(), **inputs)
 
     def config(self) -> Path:
         return self.home / ".hermes" / "config.yaml"
@@ -475,6 +532,21 @@ class HermesHomeReuseTests(_Calls):
         self.assertEqual([], self.stray())
         self.launch_sub()  # and the next launch reuses it
         self.assertEqual(2, self.launcher.call_count)
+
+    def test_link_that_installs_a_symlink_does_not_launch(self) -> None:
+        # The new hard-link path must not leave a symlink at config.yaml and then launch.
+        (self.home / ".hermes").mkdir(mode=0o700)
+        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+
+        def plant(src: object, dst: object, **kwargs: object) -> None:
+            os.symlink(src, dst, dir_fd=kwargs.get("dst_dir_fd"))
+
+        with mock.patch.object(policy.os, "link", side_effect=plant):
+            self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+        self.assertFalse(self.config().exists())
+        self.assertEqual(b"hermes-state", (self.home / ".hermes" / "state.db").read_bytes())
+        self.assertEqual([], self.stray())
+        self.launcher.assert_not_called()
 
     def test_link_failure_refuses_and_leaves_no_temp_file(self) -> None:
         (self.home / ".hermes").mkdir(mode=0o700)

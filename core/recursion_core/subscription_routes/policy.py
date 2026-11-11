@@ -65,7 +65,7 @@ import errno
 import os
 import secrets
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -346,7 +346,7 @@ def check_route(
     if credential not in spec.providers[provider].credential_env:
         raise SubscriptionRouteRefused(engine, "credential_env_not_allowed", credential)
 
-    env = dict(child_env)
+    env = _copy_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))
@@ -374,6 +374,34 @@ def check_route(
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
     return _finish(engine, provider, credential, flags, "api_key", "", engine_config, stored_model, env, wrapper,
                    checked)
+
+
+def _copy_child_env(engine: str, child_env: Mapping[str, str]) -> dict[str, str]:
+    """A child env whose names and values can be passed to ``Popen``.
+
+    A null, an empty name, an ``=`` in a name, or a non-string crashes launch with
+    ``ValueError``. Text this process cannot encode crashes it with ``UnicodeEncodeError``.
+    Non-UTF-8 bytes (surrogates) encode with ``surrogateescape`` and stay.
+    """
+
+    if not isinstance(child_env, Mapping):
+        raise SubscriptionRouteRefused(engine, "child_env_malformed")
+    copied: dict[str, str] = {}
+    for name, value in child_env.items():
+        if (not isinstance(name, str) or not isinstance(value, str) or name == "" or "=" in name
+                or "\x00" in name or "\x00" in value):
+            raise SubscriptionRouteRefused(engine, "child_env_malformed")
+        # A surrogate home is home_unsafe, the same refusal as the route-home check, not an
+        # encoding error. Other text this process cannot encode is value_unencodable.
+        if name == "HOME" and _surrogate(value):
+            raise SubscriptionRouteRefused(engine, "home_unsafe")
+        try:
+            os.fsencode(name)
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        copied[name] = value
+    return copied
 
 
 def _norm(label: str) -> str:
@@ -465,7 +493,7 @@ def _check_subscription(
     if model_provider != label:
         raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
 
-    env = dict(child_env)
+    env = _copy_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))
@@ -513,9 +541,16 @@ def guard_then_spawn(
 ) -> tuple[RouteDecision, object]:
     """Run ``check_route`` and only then call the launcher with the env that check accepted.
 
-    A later change to ``child_env`` is not what launches: the launcher receives ``decision.child_env``.
-    A subscription route's ``model`` must be an argv element (or ``--model`` / ``-m``), so the engine is
-    not left to its own default. On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
+    A later change to ``child_env`` is not what launches. The launcher receives that checked
+    snapshot rebuilt by ``child_env.build_child_env`` (a private temp root when a temp name is
+    present, and the one checked credential under its own name). It is never ``os.environ``.
+    A subscription route's ``model`` binds only before ``--``, as ``--model X`` or ``-m X``.
+    ``opencode``, ``hermes``, ``copilot`` and ``nous`` also accept ``--model=X``, ``-m=X`` and an
+    attached ``-mX``. Pi's ``--system-prompt`` and ``--append-system-prompt`` consume the next element,
+    so a flag-shaped value there is not a binding. ``argv[0]`` and a bare element
+    (``opencode run <model>``) do not bind. A second flag with a different value refuses
+    ``model_not_bound``.
+    On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
     the pinned ``wrapper.launcher_path`` (``argv0_not_pinned``); OpenCode has no pin and no such check.
     Hermes's ``auth.adopt_external_logins: false`` is written into the route home's
     ``.hermes/config.yaml`` before the launcher runs; a config already there is reused only when it is
@@ -543,6 +578,15 @@ def _looks_like_claude_login(provider: str) -> bool:
     return squashed.startswith("claude") or squashed.endswith(("-oauth", "-subscription")) and "anthropic" in squashed
 
 
+def _surrogate(value: object) -> bool:
+    """True when ``value`` holds a code point in U+D800–U+DFFF.
+
+    U+DCFF is the surrogateescape form of the byte 0xff. Checked before any filesystem call.
+    """
+
+    return isinstance(value, str) and any(0xD800 <= ord(char) <= 0xDFFF for char in value)
+
+
 def _check_home(
     engine: str,
     env: Mapping[str, str],
@@ -554,16 +598,37 @@ def _check_home(
     """The child's home is route-owned, private, not the operator's, and holds no store or engine state entry.
 
     ``own`` lists the engine's own login store entries a subscription sign-in may keep there.
+    A surrogate in the route home, the child HOME, an operator home, or the passwd home is
+    ``home_unsafe`` before ``realpath`` or ``lstat``.
     """
 
     if os.name == "nt":
         raise SubscriptionRouteRefused(engine, "platform_unsupported")
-    if not isinstance(route_home, str) or not os.path.isabs(route_home):
+    parent_home = parent_env.get("HOME") if parent_env is not None else None
+    if any(_surrogate(item) for item in (route_home, env.get("HOME"), operator_home, parent_home)):
+        raise SubscriptionRouteRefused(engine, "home_unsafe")
+    if not isinstance(route_home, str) or not os.path.isabs(route_home) or "\x00" in route_home:
         raise SubscriptionRouteRefused(engine, "route_home_missing")
+    try:
+        os.fsencode(route_home)
+    except UnicodeEncodeError:
+        raise SubscriptionRouteRefused(engine, "value_unencodable") from None
     if env.get("HOME") != route_home:
         raise SubscriptionRouteRefused(engine, "child_home_not_route_home")
+    homes = _operator_homes(parent_env, operator_home)
+    if any(_surrogate(path) for path in homes):
+        raise SubscriptionRouteRefused(engine, "home_unsafe")
     real = os.path.realpath(route_home)
-    operator = {os.path.realpath(path) for path in _operator_homes(parent_env, operator_home)}
+    operator_paths = []
+    for path in homes:
+        try:
+            os.fsencode(path)
+        except UnicodeEncodeError:
+            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        if "\x00" in path:
+            raise SubscriptionRouteRefused(engine, "route_home_missing")
+        operator_paths.append(os.path.realpath(path))
+    operator = set(operator_paths)
     # A home of "/" must not use the prefix "/": that matches every absolute path, so a
     # container whose passwd home is missing (HOME=/) could launch no route.
     if any(_operator_contains(real, home) for home in operator):
@@ -618,7 +683,11 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
         if not _within(real_current, real_home):
             raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
         seen_dirs.add(real_current)
-        for top, dirs, files in os.walk(current, followlinks=False):
+
+        def _unlistable(_error: OSError) -> None:
+            raise SubscriptionRouteRefused(engine, "home_unsafe")
+
+        for top, dirs, files in os.walk(current, followlinks=False, onerror=_unlistable):
             linked_dirs: list[str] = []
             for name in list(dirs):
                 item = os.path.join(top, name)
@@ -719,7 +788,53 @@ def _checked_requirements(engine: str | None, requirements: object, full_access_
     owned = requirements.owned_hermes_home
     if owned is not None and (not isinstance(owned, str) or "\x00" in owned or not os.path.isabs(owned)):
         raise SubscriptionRouteRefused(engine, "requirements_malformed", "owned_hermes_home")
+    # A surrogate is requirements_malformed in _check_hermes_home, before realpath.
     return _Checked(targets, frozenset(options), owned, full_access_acknowledged is True)
+
+
+def _screen_launch_text(engine: str | None, text: str) -> None:
+    """Refuse a launch string that carries a null or cannot be encoded for this process."""
+
+    if "\x00" in text:
+        raise SubscriptionRouteRefused(engine, "argv_malformed")
+    try:
+        os.fsencode(text)
+    except UnicodeEncodeError:
+        raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+
+
+def _snapshot_cwd(engine: str | None, cwd: object) -> str | bytes:
+    """One ``os.fspath`` of ``cwd``, screened, and that value is what the launcher receives.
+
+    A path-like object is not forwarded. A later read of it can return a different string, including
+    one with a null, after the check has passed. A ``bytearray`` is accepted and copied to ``bytes``
+    before screening, so a later change to the caller's buffer is not what launches.
+    """
+
+    if isinstance(cwd, str):
+        rendered: object = cwd
+    elif isinstance(cwd, (bytes, bytearray)):
+        rendered = bytes(cwd)
+    elif isinstance(cwd, os.PathLike):
+        try:
+            rendered = os.fspath(cwd)
+        except (TypeError, ValueError):
+            raise SubscriptionRouteRefused(engine, "argv_malformed") from None
+    else:
+        raise SubscriptionRouteRefused(engine, "argv_malformed")
+    if isinstance(rendered, str):
+        _screen_launch_text(engine, rendered)
+        return rendered
+    if isinstance(rendered, (bytes, bytearray)):
+        snapshot = bytes(rendered)
+        if b"\x00" in snapshot:
+            raise SubscriptionRouteRefused(engine, "argv_malformed")
+        try:
+            os.fsencode(os.fsdecode(snapshot))
+        except UnicodeError:
+            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        return snapshot
+    raise SubscriptionRouteRefused(engine, "argv_malformed")
 
 
 def _reject_launch_shape(
@@ -736,11 +851,16 @@ def _reject_launch_shape(
         raise SubscriptionRouteRefused(engine, "launch_option_denied", ",".join(bad))
     if isinstance(argv, (str, bytes)) or not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise SubscriptionRouteRefused(engine, "argv_malformed")
+    forward = dict(launch_kwargs)
+    if forward.get("cwd") is not None:
+        forward["cwd"] = _snapshot_cwd(engine, forward["cwd"])
+    for item in (*argv, *(value for value in forward.values() if isinstance(value, str))):
+        _screen_launch_text(engine, item)
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
-    unknown = sorted(set(launch_kwargs) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
+    unknown = sorted(set(forward) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
     if unknown:  # full access adds no launch option
         raise SubscriptionRouteRefused(engine, "launch_option_unknown", ",".join(unknown))
-    return dict(launch_kwargs)
+    return forward
 
 
 def _verify_wrapper(engine: str, wrapper: WrapperInstall, checked: _Checked) -> None:
@@ -765,15 +885,115 @@ def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
     return any(isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path) == real for path in pinned)
 
 
-def _argv_binds_model(argv: list[str], model: str) -> bool:
-    if model in argv:
-        return True
-    for index, item in enumerate(argv):
-        if item == f"--model={model}":
-            return True
-        if item in _MODEL_FLAGS and index + 1 < len(argv) and argv[index + 1] == model:
-            return True
-    return False
+# Options that take the next argv element as a value, so a following ``--model`` is that value and
+# not a model flag. Pi's ``--system-prompt`` is one case. ``--session`` takes a value on each of
+# these engines. A consumed value is never read again as a flag.
+_VALUE_OPTIONS = {
+    "pi": frozenset({"--system-prompt", "--append-system-prompt", "--session"}),
+    "hermes": frozenset({"--session"}),
+    "opencode": frozenset({"--session"}),
+    "copilot": frozenset({"--session"}),
+    "nous": frozenset({"--session"}),
+}
+# Engines whose CLIs accept ``--model=VALUE``, ``-m=VALUE`` and an attached ``-mVALUE``.
+_EQUALS_MODEL = frozenset({"opencode", "hermes", "copilot", "nous"})
+
+
+def _scan_argv(argv: Sequence[str], engine: str) -> tuple[list[str], list[str], list[str], bool]:
+    """One left-to-right pass. Each flag's value is consumed once, even when it looks like a flag.
+
+    Returns ``(model values, base-url values, adapter values, saw a model flag)``. ``argv[0]`` is
+    the program. A token after ``--`` is not a flag. ``--model``, ``-m``, ``--base-url`` and
+    ``--adapter`` take the next element. ``opencode``, ``hermes``, ``copilot`` and ``nous`` also
+    accept ``--model=X``, ``-m=X`` and an attached ``-mX``. Engines not listed in
+    ``_VALUE_OPTIONS`` keep that equals form and have no value-taking options. A value option such
+    as ``--session`` or Pi's ``--system-prompt`` consumes the next element, so that element is not
+    a later flag.
+    """
+
+    value_options = _VALUE_OPTIONS.get(engine, frozenset())
+    equals = engine in _EQUALS_MODEL or engine not in _VALUE_OPTIONS
+    models: list[str] = []
+    base_urls: list[str] = []
+    adapters: list[str] = []
+    saw_model = False
+    index = 1
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            break
+        if item in _MODEL_FLAGS:
+            saw_model = True
+            if index + 1 >= len(argv):
+                models.append("")
+                break
+            models.append(argv[index + 1])
+            index += 2
+            continue
+        if item == "--base-url":
+            if index + 1 >= len(argv):
+                base_urls.append("")
+                break
+            base_urls.append(argv[index + 1])
+            index += 2
+            continue
+        if item == "--adapter":
+            if index + 1 >= len(argv):
+                adapters.append("")
+                break
+            adapters.append(argv[index + 1])
+            index += 2
+            continue
+        if equals and item.startswith("--model="):
+            saw_model = True
+            models.append(item[len("--model="):])
+            index += 1
+            continue
+        if equals and item.startswith("-m=") and len(item) > 3:
+            saw_model = True
+            models.append(item[len("-m="):])
+            index += 1
+            continue
+        # Attached short form (-mchatgpt/test-model). ``-m`` alone is the flag with no value.
+        if equals and item.startswith("-m") and len(item) > 2:
+            saw_model = True
+            models.append(item[2:])
+            index += 1
+            continue
+        if item.startswith("--base-url="):
+            base_urls.append(item[len("--base-url="):])
+            index += 1
+            continue
+        if item.startswith("--adapter="):
+            adapters.append(item[len("--adapter="):])
+            index += 1
+            continue
+        if item in value_options:
+            index += 2
+            continue
+        index += 1
+    return models, base_urls, adapters, saw_model
+
+
+def _argv_binds_model(argv: list[str], model: str, engine: str = "opencode") -> bool:
+    """True when every model flag before ``--`` names ``model`` for ``engine``.
+
+    Accepted forms are ``--model X`` and ``-m X``. ``opencode``, ``hermes``, ``copilot`` and ``nous``
+    also accept ``--model=X``, ``-m=X`` and an attached ``-mX``. ``argv[0]`` is the program. A bare
+    element, including ``opencode run <model>``, does not bind. A flag after ``--`` does not bind.
+    A flag with no value, an empty ``--model=``, or two flags that disagree, does not bind.
+
+    Value-taking options (Pi's ``--system-prompt`` and ``--append-system-prompt``, and ``--session``
+    on Pi, OpenCode, Hermes, Copilot and Nous) consume the next element, even when that element is
+    spelled like a model flag. The scan is the one in ``_scan_argv``.
+    """
+
+    if not model:
+        return False
+    models, _base_urls, _adapters, _saw_model = _scan_argv(argv, engine)
+    if not models or any(not value for value in models):
+        return False
+    return all(value == model for value in models)
 
 
 def _refuse_hermes_config(engine: str, detail: str) -> SubscriptionRouteRefused:
@@ -815,11 +1035,14 @@ def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
         except OSError:
             raise _refuse_hermes_config(engine, "config.yaml") from None
         try:
-            opened = os.fstat(fd)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
-                    or opened.st_uid != os.geteuid()):
-                raise _refuse_hermes_config(engine, "config.yaml")
-            data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+            try:
+                opened = os.fstat(fd)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
+                        or opened.st_uid != os.geteuid()):
+                    raise _refuse_hermes_config(engine, "config.yaml")
+                data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+            except OSError:
+                raise _refuse_hermes_config(engine, "config.yaml") from None
         finally:
             os.close(fd)
     finally:
@@ -857,6 +1080,8 @@ def _check_hermes_home(engine: str, route_home: str, checked: _Checked) -> None:
 
     if engine != "hermes":
         return
+    if _surrogate(checked.owned_hermes_home):
+        raise SubscriptionRouteRefused(engine, "requirements_malformed", "owned_hermes_home")
     if checked.owned_hermes_home is not None and os.path.realpath(checked.owned_hermes_home) != os.path.realpath(route_home):
         raise SubscriptionRouteRefused(engine, "hermes_home_not_owned")
     _hermes_config_is_ours(engine, route_home)
@@ -933,7 +1158,8 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
     """``.hermes`` holds Hermes's own entries and no ``config.yaml``: add the switch without replacing.
 
     The switch is written to a temp file in the route home and hard-linked into ``.hermes``. A link
-    never overwrites, so a ``config.yaml`` that appeared meanwhile refuses instead of being replaced.
+    never overwrites and does not follow a source symlink, so a ``config.yaml`` that appeared
+    meanwhile refuses instead of being replaced. The caller checks the result is that regular file.
     """
 
     temp = os.path.join(route_home, _HERMES_STAGING_PREFIX + secrets.token_hex(8))
@@ -942,7 +1168,7 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
         try:
             parent_fd = os.open(parent, _DIR_OPEN_FLAGS)
             try:
-                os.link(temp, "config.yaml", dst_dir_fd=parent_fd)
+                os.link(temp, "config.yaml", dst_dir_fd=parent_fd, follow_symlinks=False)
                 _fsync_dir(parent_fd)
             finally:
                 os.close(parent_fd)
@@ -953,8 +1179,36 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
     _fsync_dir(route_home)
 
 
+def _drop_config_symlink(route_home: str) -> None:
+    """Remove a ``config.yaml`` symlink the link step just installed. A regular file is left alone."""
+
+    dest = os.path.join(route_home, ".hermes", "config.yaml")
+    if os.path.islink(dest):
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+
+
+def _confirm_hermes_switch(engine: str, route_home: str) -> None:
+    """The switch just written is the regular file we expect. A symlink is removed and the launch refuses."""
+
+    try:
+        ok = _hermes_config_is_ours(engine, route_home)
+    except SubscriptionRouteRefused:
+        _drop_config_symlink(route_home)
+        raise
+    if not ok:
+        _drop_config_symlink(route_home)
+        raise _refuse_hermes_config(engine, "config.yaml")
+
+
 def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> None:
-    """Write Hermes's adopt switch, or reuse the one an earlier launch in this home wrote."""
+    """Write Hermes's adopt switch, or reuse the one an earlier launch in this home wrote.
+
+    After a write, the switch is read back. Anything that is not that regular file refuses, and a
+    symlink left at ``config.yaml`` is removed, before the launcher runs.
+    """
 
     if decision.engine != "hermes":
         return
@@ -963,12 +1217,18 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
     parent = os.path.join(route_home, ".hermes")
     if _hermes_config_is_ours(decision.engine, route_home):
         return
-    if not os.path.lexists(parent) or _hermes_dir_is_empty(route_home):
-        _stage_hermes_dir(decision.engine, route_home, parent)
-    elif os.path.islink(parent) or not os.path.isdir(parent):
-        raise _refuse_hermes_config(decision.engine, ".hermes")
-    else:
-        _link_hermes_config(decision.engine, route_home, parent)
+    try:
+        if not os.path.lexists(parent) or _hermes_dir_is_empty(route_home):
+            _stage_hermes_dir(decision.engine, route_home, parent)
+        elif os.path.islink(parent) or not os.path.isdir(parent):
+            raise _refuse_hermes_config(decision.engine, ".hermes")
+        else:
+            _link_hermes_config(decision.engine, route_home, parent)
+        _confirm_hermes_switch(decision.engine, route_home)
+    except OSError:
+        # A read-only route home, a full disk, or a name the kernel rejects must refuse before
+        # the launcher runs. PermissionError is an OSError; it is not a successful launch.
+        raise _refuse_hermes_config(decision.engine, ".hermes") from None
 
 
 def _launch_checked(
@@ -981,13 +1241,25 @@ def _launch_checked(
 ) -> tuple[RouteDecision, object]:
     if pinned and not _argv0_is_pinned(argv, pinned):
         raise SubscriptionRouteRefused(decision.engine, "argv0_not_pinned")
-    if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model):
+    if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model, decision.engine):
         raise SubscriptionRouteRefused(decision.engine, "model_not_bound", decision.model)
+    # Rebuild before the Hermes write, so a refused environment does not leave a config behind.
+    # Imported here: validated_launch does not import this module.
+    from recursion_core.child_env import EnvRefused
+    from recursion_core.subscription_routes.validated_launch import launch_env
+
+    try:
+        _validated, launched = launch_env(
+            decision.child_env, route_home=route_home, credential_env=decision.credential_env,
+        )
+    except EnvRefused as exc:
+        detail = exc.cause if not exc.name else f"{exc.name}:{exc.cause}"
+        raise SubscriptionRouteRefused(decision.engine, "child_env_refused", detail) from None
     _apply_hermes_adopt_override(decision, route_home)
-    # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
-    # launch options _reject_launch_shape let through; none can replace env, shell or the model.
+    # ``launched`` is the rebuilt snapshot, not another read of the caller's mapping and not
+    # ``os.environ``. ``forward`` holds only the options _reject_launch_shape let through.
     return decision, launcher(
-        list(argv), env=dict(decision.child_env), shell=False,
+        list(argv), env=launched, shell=False,
         engine_config=decision.engine_config, model=decision.model, **forward,
     )
 
@@ -1001,7 +1273,7 @@ def _checked_baseline(
 ) -> tuple[tuple[str, str], ...]:
     """Safe child env only: no Claude subscription name and no credential. Then the home rules."""
 
-    env = dict(child_env)
+    env = _copy_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))

@@ -228,6 +228,8 @@ class EngineProfile:
     key_name: str | None = None  # the user-entered vendor key, ``api_key`` mode only
     base_url_name: str | None = None  # the route's own base URL, any mode (``subscription``: see ``_route_env``)
     provider_switches: tuple[str, ...] = ()  # set to "1" when picked, ``cloud_provider`` mode only
+    # Apex names. A NO_PROXY entry equal to the apex, or under it, bypasses every host in the family.
+    host_suffixes: tuple[str, ...] = ()
 
 
 _CLAUDE_SCRUB = (
@@ -267,6 +269,39 @@ ENGINE_PROFILES: Mapping[str, EngineProfile] = MappingProxyType(
             ("chatgpt.com", "auth.openai.com", "api.openai.com"),
             _CODEX_SCRUB,
             key_name="CODEX_API_KEY",  # the variable ``codex exec`` reads; no base URL and no cloud switch here
+        ),
+        # Copilot CLI >= 1.0.1 reads COPILOT_HOME, else ~/.copilot, and does not read XDG_CONFIG_HOME.
+        # Hosts are the Copilot service names a NO_PROXY entry must not exempt. OpenAI's hosts are not
+        # among them: a Copilot child may exclude api.openai.com.
+        "copilot": EngineProfile(
+            "copilot",
+            BASE_NAMES + ("COPILOT_HOME",),
+            (
+                "github.com",
+                "api.github.com",
+                "copilot-proxy.githubusercontent.com",
+                "proxy.individual.githubcopilot.com",
+                "api.individual.githubcopilot.com",
+                "api.business.githubcopilot.com",
+                "api.enterprise.githubcopilot.com",
+            ),
+            (
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                "GH_PAT",
+                "GITHUB_COPILOT_API_TOKEN",
+                "COPILOT_GITHUB_TOKEN",
+                "COPILOT_API_URL",
+            ),
+            host_suffixes=("githubcopilot.com",),
+        ),
+        # OpenAI API key inside a ValidatedEnv, so spawn's executable checks run. Not the OpenCode harness name.
+        "openai": EngineProfile(
+            "openai",
+            BASE_NAMES,
+            ("api.openai.com", "chatgpt.com"),
+            ("OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"),
+            key_name="OPENAI_API_KEY",
         ),
     }
 )
@@ -335,9 +370,24 @@ def build_child_env(
     if not isinstance(auth_mode, str) or auth_mode not in AUTH_MODES:
         raise EnvRefused(None, "auth_mode_unknown")
     route_env = _route_env(profile, auth_mode, route)  # refuses before anything is read from the parent
+    if isinstance(home, str):
+        if "\0" in home:
+            raise EnvRefused("HOME", "home_unsafe")
+        try:
+            os.fsencode(home)
+        except UnicodeEncodeError:
+            raise EnvRefused("HOME", "value_unencodable") from None
     if not _private_dir(home):
         raise EnvRefused("HOME", "home_unsafe")
-    source = dict(os.environ if parent is None else parent)
+    raw = os.environ if parent is None else parent
+    if not isinstance(raw, Mapping):
+        raise EnvRefused(None, "value_malformed")
+    source = {}
+    for name, value in raw.items():
+        # A non-string name breaks the dropped-name sort; a non-string value breaks Popen.
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise EnvRefused(None, "value_malformed")
+        source[name] = value
     env = {name: source[name] for name in profile.allowed if name in source and name != "HOME"}
     passed = {name: source[name] for name in profile.passthrough if name in source}
     dropped = tuple(sorted(name for name in source if name not in env and name not in passed and name != "HOME"))
@@ -356,6 +406,11 @@ def build_child_env(
             raise EnvRefused(name, "override_denied")
         env[name] = value
 
+    # Before any path is stat'd. A temp value is replaced below and is not read. NO_PROXY is
+    # included even when no proxy is set: a null in it never reaches Popen (ValueError).
+    for name, value in env.items():
+        if name not in TEMP_NAMES:
+            _screen_value(name, value)
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:
         cause = _unsafe_value(name, env[name]) if env[name] else None  # empty: no path or URL to check
         if cause is not None:
@@ -365,20 +420,26 @@ def build_child_env(
     # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
         for name in [name for name in NO_PROXY_NAMES if name in env]:
-            if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
+            if (cause := _no_proxy_bypass(env[name], profile.hosts, profile.host_suffixes)) is not None:
                 raise EnvRefused(name, cause)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
     if present:
         env.update(dict.fromkeys(present, _route_tmp()))
     env["HOME"] = home
+    for name, value in passed.items():
+        _screen_value(name, value)  # not read, but Popen still has to encode it
     env.update(passed)  # after every check: the user's own sign-in value is passed as it is, never read here
 
     leaked = sorted(name for name in env if name in profile.scrub
                     or (name not in profile.allowed and name not in profile.passthrough and _DENIED.search(name)))
     if leaked:  # unreachable by construction; kept so a later edit to the allowlist fails closed
         raise EnvRefused(leaked[0], "scrub_failed")
+    for name, value in route_env.items():
+        _screen_value(name, value)
     env.update(route_env)  # last: only what this call's route named, never a parent or override value
+    for name, value in env.items():
+        _screen_value(name, value)
     return ValidatedEnv(env, engine, dropped, auth_mode=auth_mode, _seal=ValidatedEnv._seal)
 
 
@@ -408,6 +469,10 @@ def _route_env(profile: EngineProfile, auth_mode: str, route: ChildRoute | None)
             raise EnvRefused(profile.key_name, "route_key_not_allowed")
         if not isinstance(route.api_key, str) or not route.api_key or "\0" in route.api_key:
             raise EnvRefused(profile.key_name, "route_key_malformed")
+        try:
+            os.fsencode(route.api_key)
+        except UnicodeEncodeError:
+            raise EnvRefused(profile.key_name, "value_unencodable") from None
     if auth_mode == "api_key":
         if profile.key_name is None:
             raise EnvRefused(None, "auth_mode_unsupported")
@@ -509,6 +574,23 @@ def _unsafe_base_url(value: object) -> str | None:
     return None
 
 
+def _screen_value(name: str | None, value: object) -> None:
+    """Refuse a value ``Popen`` cannot put in the child environment.
+
+    A null crashes launch with ``ValueError``. Text this process cannot encode (a non-ASCII
+    value when the filesystem encoding is ASCII, for example) crashes launch with
+    ``UnicodeEncodeError``. Bytes that are not valid UTF-8 arrive as surrogates and
+    ``os.fsencode`` keeps them, so those values stay.
+    """
+
+    if not isinstance(value, str) or "\0" in value:
+        raise EnvRefused(name, "value_malformed")
+    try:
+        os.fsencode(value)
+    except UnicodeEncodeError:
+        raise EnvRefused(name, "value_unencodable") from None
+
+
 def _unsafe_value(name: str, value: str) -> str | None:
     if "\0" in value:
         return "value_malformed"
@@ -526,6 +608,9 @@ def _unsafe_value(name: str, value: str) -> str | None:
         if path.startswith("/"):
             return _unsafe_file(path)
         return "tz_relative_path" if ".." in path.split("/") else None
+    if name == "COPILOT_HOME":
+        # Same rule as HOME: the directory itself is not a symlink, and it is private to this user.
+        return None if _private_dir(value) else "home_unsafe"
     if name in VALUE_FILES:
         return _unsafe_file(value)
     if name in VALUE_DIRS:
@@ -636,8 +721,13 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
-def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
+def _no_proxy_bypass(value: str, hosts: tuple[str, ...], suffixes: tuple[str, ...] = ()) -> str | None:
+    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers.
+
+    ``suffixes`` are apexes such as ``githubcopilot.com``. An entry on that apex, or any name under
+    it, bypasses the whole family. A wildcard that can match the apex or any name under it refuses,
+    not only a pattern that matches the apex or ``api.<apex>``.
+    """
 
     for entry in re.split(r"[,\s]+", value.strip().lower()):
         entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry).strip("[]")
@@ -646,15 +736,21 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
             continue
         if entry.strip("*.") == "":
             return "no_proxy_wildcard"
-        if "*" in entry:
-            pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-            hit = any(pattern.match(host) for host in hosts)
-        else:
-            bare = entry.lstrip(".")
-            hit = any(host == bare or host.endswith("." + bare) for host in hosts)
-        if hit:
+        if _proxy_entry_hits(entry, hosts, suffixes):
             return "no_proxy_engine_host"
     return None
+
+
+def _proxy_entry_hits(entry: str, hosts: tuple[str, ...], suffixes: tuple[str, ...]) -> bool:
+    if "*" in entry:
+        pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
+        if any(pattern.match(host) for host in hosts):
+            return True
+        return any(_wildcard_intersects_suffix(entry, pattern, suffix) for suffix in suffixes)
+    bare = entry.lstrip(".")
+    if any(host == bare or host.endswith("." + bare) for host in hosts):
+        return True
+    return any(bare == suffix or bare.endswith("." + suffix) for suffix in suffixes)
 
 
 def _unsafe_proxy(value: str, schemes: tuple[str, ...] = ("http", "https")) -> str | None:
@@ -710,7 +806,36 @@ def _lexical_dir(path: str) -> str:
     return str(Path(path))
 
 
+def _wildcard_intersects_suffix(entry: str, pattern: re.Pattern[str], suffix: str) -> bool:
+    """True when the glob can match ``suffix`` or some name under it.
+
+    ``*`` is any string, including dots, the same as the host match above. A trailing ``*`` can
+    always be completed to ``.<suffix>``. Otherwise every match ends with the last literal, so
+    that literal and ``.<suffix>`` have to be the same ending.
+    """
+
+    if pattern.match(suffix):
+        return True
+    last = entry.split("*")[-1]
+    if last == "":
+        return True
+    tail = "." + suffix
+    return last.endswith(tail) or tail.endswith(last)
+
+
 def _private_dir(path: str | None) -> bool:
+    # A code point in U+D800–U+DFFF is refused before any filesystem call. U+DCFF is the
+    # surrogateescape form of the byte 0xff, and a private directory of that byte name would
+    # otherwise be accepted. NUL reaches ``lstat`` as ValueError.
+    if isinstance(path, str) and any(0xD800 <= ord(char) <= 0xDFFF for char in path):
+        return False
+    try:
+        return _private_dir_is(path)
+    except (ValueError, UnicodeError):
+        return False
+
+
+def _private_dir_is(path: str | None) -> bool:
     if not isinstance(path, str) or not os.path.isabs(path):
         return False
     entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling

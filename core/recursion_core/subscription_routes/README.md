@@ -14,7 +14,9 @@ reviewed or accepted.
   Pi and Hermes require `wrapper` (see Wrapper pins). Cursor and Antigravity CLI use
   `check_cursor_route` and `check_antigravity_route`.
 - `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher,
-  always with the checked env and `shell=False`. It refuses `env`, `shell`, `executable`,
+  with `shell=False` and the checked env rebuilt by `child_env.build_child_env` (a temp name
+  becomes one private temp root; the one checked credential is kept under the harness's own
+  name). That env is never `os.environ`. It refuses `env`, `shell`, `executable`,
   `preexec_fn`, fd, user and group options before any check, forwards `cwd`, and refuses
   any other option (see Launch options). `launcher` and `argv` are trusted, core-owned
   inputs: argv is not parsed beyond `argv[0]` and the model, so it must not carry a
@@ -42,7 +44,10 @@ What refuses:
   operator's home, and must hold no Claude Code store entry (`.claude`, `.claude.json`,
   `.config/claude`) and no Pi, Hermes or OpenCode state or login entry (`.pi`, `.hermes`,
   `.local/share/opencode`, `.config/opencode`, `.codex/auth.json`). So the route home must
-  hold none of these at spawn. Checked with `lstat` only; no credential file is opened.
+  hold none of these at spawn. A surrogate code point (U+D800–U+DFFF) in that home, the
+  child `HOME`, an operator home, or the passwd home refuses `home_unsafe` before `realpath`
+  or `lstat`. A surrogate `owned_hermes_home` refuses `requirements_malformed` before `realpath`.
+  Otherwise checked with `lstat` only; no credential file is opened.
   One exception, for Hermes routes only: a `.hermes` directory that holds nothing but the
   `config.yaml` an earlier launch in this home wrote, or (API-key Hermes route) nothing at
   all (see Hermes route-home reuse).
@@ -82,7 +87,8 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   `.local/share/opencode` and `.config/opencode`), which the check allows for that engine only,
   by `lstat`. The own store may not be a link or sit under one (`own_store_is_link`), and no link
   inside it may resolve outside the route home (`own_store_links_outside_route_home`), so it cannot
-  reach the operator's store. Every other engine's store, `.codex/auth.json` and every Claude Code store still
+  reach the operator's store. A directory in that walk that cannot be listed is `home_unsafe`.
+  Every other engine's store, `.codex/auth.json` and every Claude Code store still
   refuse. Recursion never stores, copies or ships these tokens and cannot see what else a store
   holds without reading it, which it does not do. So a present own store is flagged in
   `RouteDecision.flags` as `own_login_store_not_inspected:<entry>`: it could hold a login
@@ -99,26 +105,129 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   looks like a token, key or credential refuses, and `GITHUB_COPILOT_API_TOKEN`,
   `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_API_URL` (plus the `gh`
   selectors `GH_HOST`, `GH_CONFIG_DIR`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`) are
-  removed from that run's child, as is every other provider credential (`*_API_KEY`, `*_TOKEN`, for
-  example `ANTHROPIC_API_KEY`). An optional `model` is checked (printable, no spaces, at most 128
-  characters) and carried on the decision. With no stored `copilot` login (or no probe, or a failing probe)
-  the run refuses rather than fall back to `gh`. The probe is the caller's; nothing here opens a
-  login store.
+  removed from that run's child, as is every other provider credential (`*_API_KEY`, `*_TOKEN`,
+  `GITHUB_PAT`, `GH_PAT`, `GITHUB_PASSWORD`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `OPENAI_BASE_URL`, `OPENAI_API_BASE`, for example `ANTHROPIC_API_KEY`) and git's
+  config-injection channel (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`,
+  `GIT_CONFIG_PARAMETERS`). Anything outside `child_env`'s base allowlist is removed too, and a
+  proxy value with userinfo is removed. The same projection drops the families below even if that
+  allowlist later grows. What remains is rebuilt with `build_child_env` and started by
+  `spawn_copilot_own_loop`. `NODE_EXTRA_CA_CERTS`, `PATH`, `HOME` and the locale names stay.
+  An optional `model` is checked (printable, no spaces, at most 128 characters) and carried on the
+  decision. With no stored `copilot` login, no probe, a probe that fails or raises `SystemExit`,
+  or a probe that does not return within 5 seconds (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a
+  shorter `probe_deadline`, not a longer one) the run refuses rather than fall back to `gh`.
+  Copilot probing is refused in threaded processes (`probe threaded`): the probe runs in a forked
+  child, and `fork` copies only the calling thread. Call it before any other thread is started.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
   `{"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": ...}`.
   The own loop calls only the user's own Hermes subscription proxy at a loopback IP literal
   (`127.0.0.0/8`, `::1`, or IPv4-mapped loopback); names, including `localhost`, are not resolved
   and refuse. Adapters are `["nous"]` only; `xai` refuses (`adapter_must_stay_off`). Recursion holds
-  no Nous token: token-like route fields and URL credentials refuse, and provider credential
-  variables are removed from the child. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, any
-  case) are removed too, so loopback-bound traffic cannot be carried off the host. An optional
-  `model` is checked and carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
+  no Nous token: token-like route fields and URL credentials refuse. A non-empty query string or
+  fragment on the proxy URL is treated as a credential, same as userinfo (a bare `?` or `#` is
+  not). The same provider credentials as on the Copilot child are removed. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY`, any case) are removed too, so loopback-bound traffic cannot be carried off the host.
+  Names outside `child_env`'s base allowlist are removed as well. `spawn_nous_own_loop` rebuilds
+  what remains with `build_child_env` and starts the process. An optional `model` is checked and
+  carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
   `adapter_must_stay_off`).
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
-  local user can reach a loopback proxy, which "accepts any bearer"). With no
-  `interactive_users`, it and `check_nous_own_loop` warn "host users unknown" instead of
-  reporting a clean host.
+  local user can reach a loopback proxy, which "accepts any bearer"). The reported address is the
+  canonical origin only (`scheme://host:port`, default port included) after the URL is an accepted
+  loopback: no userinfo, path, query or fragment. A refusal reports an empty address, so a
+  hostname, a rejected scheme and an IPv6 zone id are not echoed. The decision's `base_url` still
+  keeps the caller's path. Refusal text is a fixed phrase (`proxy address`, or
+  `use 127.0.0.1 or ::1`), not the parser's message and not the raw URL. A control character is
+  rejected before whitespace is stripped, so a leading newline is not a loopback URL. A bare `?`
+  or `#` (empty query or fragment) is accepted; any non-empty query or fragment is refused,
+  including one that is not a credential. With no `interactive_users`, it and
+  `check_nous_own_loop` warn "host users unknown" instead of reporting a clean host.
+- **Login probe.** `has_copilot_login` stays a callable. It is the caller's function, not a command
+  this package can turn into argv, and nothing here opens a login store. An argv/`Popen` contract
+  was not adopted: the caller supplies the check (a lambda or a nested function), and a subprocess
+  would need a different product API. The callable is not picklable, so there is no forkserver.
+  Where another thread is already alive, the route refuses `probe threaded` and does not fork.
+  That includes a `threading` thread, a thread started with `_thread`, and any extra native thread
+  in `/proc/self/task`. When that directory exists but cannot be listed, or `stat` fails with
+  anything other than a missing `/proc`, the route refuses the same way: a hidden native thread
+  must not be treated as absent. A lock that thread holds is
+  never released in the child. A thread started
+  in the gap before `fork` is still a race. `home` is required (`route_home_missing` otherwise):
+  a probe without it would approve the ambient account. Where `fork`, `setsid`, `killpg`, `pidfd_open`, `pidfd_send_signal` and `waitid(P_PIDFD)` exist,
+  the child calls `setsid`, writes a handshake byte, and does not run the callable until the
+  parent has recorded that process group and written an ack. `pidfd_send_signal` is
+  `signal.pidfd_send_signal` when this interpreter has it, otherwise `os.pidfd_send_signal`,
+  otherwise the libc function. The parent blocks SIGINT and SIGCHLD from before `fork` until
+  after the group is signalled and the direct child is reaped, then restores the previous mask
+  with `SIG_SETMASK`. If that restore fails, the probe refuses `probe unenforceable` after
+  cleanup, including when the child reported a login and when cleanup raises
+  `KeyboardInterrupt`. A signal the caller had already blocked
+  stays blocked. SIGINT stays
+  blocked across `pidfd_open` and the store of that fd. Before `fork`, and only on Linux LP64
+  x86_64 or aarch64 with glibc or musl, the probe reads the real `SIGCHLD` disposition with
+  `sigaction` into a 256-byte buffer. musl is only the mapped basename
+  `ld-musl-<machine>.so.1` or `libc.musl-<machine>.so.1` for this machine. Any other platform,
+  word size, machine or C library
+  refuses `probe unenforceable` without calling `libc`. `SIG_IGN` or `SA_NOCLDWAIT` refuses
+  the same way: the kernel would auto-reap, `signal.getsignal` still reports `SIG_DFL` for
+  `SA_NOCLDWAIT`, and blocking the signal does not stop that auto-reap. A custom
+  SIGCHLD handler cannot run while the signal is blocked, so it cannot collect the leader
+  before the group is signalled. The leader is signalled with `pidfd_send_signal`.
+  `waitid(P_PIDFD)` is checked before the ack. `killpg` runs unless that `waitid` reports
+  `ECHILD`. Any other `waitid` error still signals the group and the probe refuses
+  `probe unenforceable`. A failed `pidfd_open` signals that identified worker only when
+  `waitid` still shows it is this process's unreaped child. Cleanup does not scan the process
+  list or signal any other child. Every exit, including a probe that returns true, signals that
+  original process group: SIGTERM, then at most 20% of the deadline (never more than 200 ms)
+  and still inside the deadline, then SIGKILL. A `KeyboardInterrupt` during cleanup still
+  delivers SIGKILL, then closes the pipe fds and reaps. The direct child is reaped only after
+  those signals. A descendant that calls `setpgid(0, 0)` leaves the process group and stays
+  in the session; it is not signalled. This is not session cleanup. Where the group cannot be
+  enforced (Windows, or any platform without a pidfd signal), the route refuses
+  `probe unenforceable` and does not leave a daemon thread running.
+  The probe runs with the child's final environment: `HOME` is the route home and `COPILOT_HOME`
+  is `<home>/.copilot`, created mode `0700` when absent and only after `home` itself is a private
+  directory. A home containing NUL or a surrogate code point (U+D800–U+DFFF) is `home_unsafe`.
+  An unsafe home leaves
+  no `.copilot` behind. An existing `COPILOT_HOME` must be a
+  private directory owned by this user, not a symlink and not world-accessible, the same rule as
+  `HOME`. Copilot CLI >= 1.0.1 reads `COPILOT_HOME` (otherwise `~/.copilot`) and ignores
+  `XDG_CONFIG_HOME`, which is not on the allowlist. A parent `COPILOT_HOME` does not select
+  another account.
+- **Spawn argv.** `spawn_copilot_own_loop` and `spawn_nous_own_loop` copy `argv` once at entry
+  and use that copy for the check and the launch. They refuse caller argv that does not carry
+  the decision's model, base URL and adapters (`model_not_bound`, `base_url_not_bound`,
+  `adapter_not_bound`). One scan consumes each flag's value, so a model value of `--adapter` is
+  not also an adapter flag. A `base_url_not_bound` refusal names the canonical origin only, not
+  the path. Copilot is rebuilt on the Copilot `child_env` profile. `NO_PROXY` is matched against
+  Copilot's hosts and the `githubcopilot.com` family, not Codex's, so `NO_PROXY=api.openai.com`
+  is kept. `NO_PROXY=api.github.com`, `NO_PROXY=api.githubcopilot.com`,
+  `NO_PROXY=*.githubcopilot.com` and a wildcard that can name any host under `githubcopilot.com`
+  (including `proxy.enterprise.githubcopilot.*`) with a proxy refuse. `notgithubcopilot.com` and
+  `*.example.com` do not match the family. The literal host list is the public Copilot service
+  names used for that check.
+- **Harness credential.** `launch_env` injects only `ANTHROPIC_API_KEY` (Claude profile) or
+  `OPENAI_API_KEY` (OpenAI profile), both inside the `ValidatedEnv`. Every launch, including an
+  OpenAI key, goes through `child_env.spawn`, so a world-writable executable is refused.
+  `HOME`, `LD_PRELOAD`, `PATH` and any other credential name refuse `credential_env_denied`.
+- **Accepted over-refusals.** These are stricter than a secret-only reading, and they are intended:
+  any non-empty query or fragment; a host name, including `localhost` (it is not resolved); every
+  `HERMES_*` and `NOUS_*` name, including ones that are not tokens; a second `--model` / `-m` that
+  names a different model (real CLIs often take the last flag). A subscription model binds only
+  before `--`, as `--model X` or `-m X`. `opencode`, `hermes`, `copilot` and `nous` also accept
+  `--model=X`, `-m=X` and an attached `-mX`. Pi's `--system-prompt` and `--append-system-prompt`,
+  and `--session` on Pi, OpenCode, Hermes, Copilot and Nous, consume the next element, even when
+  it is spelled like a model flag. `argv[0]` and a bare element do not bind.
+  `opencode run chatgpt/good` refuses `model_not_bound`.
+- **Env families dropped on top of the allowlist**, for both Copilot and Nous: suffixes `_SECRET`,
+  `_PASSWORD`, `_KEY`, `_PAT`, `_CREDENTIALS`; prefixes `AWS_`, `AZURE_`, `ARM_`, `GOOGLE_`,
+  `CLOUDSDK_`, `GCLOUD_`, `DYLD_`; and `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`, `GIT_SSH`,
+  `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `KUBECONFIG`, `DOCKER_CONFIG`,
+  `GITHUB_API_URL`, `COPILOT_API_URL` (Nous as well as Copilot), `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+  `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONSTARTUP`, `BASH_ENV`, `ENV`. The harness
+  launch uses the same predicate, so a later allowlist growth does not put them on a route child.
 - Still *[to verify]* in PRODUCT.md (O61): GitHub's Generative AI Services terms for Copilot, and
   whether the Nous Portal terms' consent clause covers an app calling through the proxy. No
   provider, DNS or network call is made here.
@@ -210,9 +319,13 @@ pinned file passes, and argv reaches the launcher unchanged. OpenCode has no pin
 `guard_then_spawn` does not bind its `argv[0]`. Full access does not relax this. The check
 compares paths at guard time; it does not hold the file open across the launch.
 
-`guard_then_spawn` launches the env `check_route` accepted, not a second read of the
-caller's mapping. A subscription `model` must appear in argv (or as `--model` / `-m`);
-otherwise the launch refuses `model_not_bound`. An empty model segment (`anthropic/`)
+`guard_then_spawn` launches the env `check_route` accepted, rebuilt through `child_env`
+(`validated_launch.launch_env`), not a second read of the caller's mapping and not
+`os.environ`. `spawn_route_process` is the subprocess entry for that same env.
+A subscription `model` binds only as `--model X`, `--model=X`, `-m X` or an attached `-mX`,
+and only before `--`. `argv[0]` and a bare element (`opencode run chatgpt/good`) do not bind.
+A second flag with a different value refuses `model_not_bound` (the first match does not bind;
+taking the last flag would launch a different model). An empty model segment (`anthropic/`)
 refuses `model_name_empty`. `borrow_claude_code_login` is not a profile field.
 `repr(RouteDecision)` leaves out `child_env`, which holds the API key on an API-key route.
 
@@ -264,8 +377,10 @@ How the switch is written:
   `hermes_config_blocks_adopt_override` and the staging directory is removed.
 - `.hermes` holds entries and no `config.yaml` (a sign-in route's own store): the 37 bytes
   go to a `.hermes.recursion-<random>` temp file in the route home, which is hard-linked to
-  `.hermes/config.yaml` and then removed. A link never overwrites. Any failure on this path
-  refuses `hermes_config_blocks_adopt_override`.
+  `.hermes/config.yaml` and then removed. A link never overwrites and does not follow a source
+  symlink. Any failure on this path refuses `hermes_config_blocks_adopt_override`.
+- After either write the guard reads the switch back with the same rules and refuses to launch
+  if it is not exactly that regular file. A symlink left at `config.yaml` is removed.
 - Fallback for any other leftover (a partial or foreign `config.yaml`, a `.hermes` this
   route refuses): the driver discards the route home and makes a new one. The guard does
   not repair it.

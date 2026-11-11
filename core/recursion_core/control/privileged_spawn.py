@@ -294,17 +294,50 @@ def is_shared_system_account(backend: Backend) -> bool:
     )
 
 
-_ROOT_USER_NAMES = frozenset({"root", "0", "#0"})
+def _normalised_uid_token(user: str) -> int | None:
+    """Uid spelled by a sudo ``#uid`` token or a systemd numeric uid.
+
+    ``#00`` and ``00`` are uid 0. A username returns ``None``.
+    """
+
+    text = user[1:] if user.startswith("#") else user
+    if not text.isascii() or not text.isdigit():
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _is_root_user_token(user: str | None) -> bool:
+    """True for root, any numeric spelling of uid 0, or a local uid-0 account.
+
+    Configured names are resolved with ``pwd`` so an alias such as ``toor``
+    is refused before a launch. The username match for the literal is the
+    exact token ``root``; ``ROOT`` is not that token when it is not uid 0.
+    """
+
+    if not user:
+        return False
+    uid = _normalised_uid_token(user)
+    if uid is not None:
+        return uid == 0
+    if user == "root":
+        return True
+    try:
+        return pwd.getpwnam(user).pw_uid == 0
+    except KeyError:
+        return False
 
 
 def is_root_target(backend: Backend) -> bool:
     """True when ``backend`` targets root; root is never the engine user.
 
-    ``target_user`` of ``"0"`` or ``"#0"`` is uid 0 even when ``target_uid`` was
-    not filled in. The username match is the exact token ``root``.
+    ``target_user`` of ``"0"``, ``"#0"``, ``"00"`` or ``"#00"`` is uid 0 even
+    when ``target_uid`` was not filled in.
     """
 
-    return backend.target_uid == 0 or backend.target_user in _ROOT_USER_NAMES
+    return backend.target_uid == 0 or _is_root_user_token(backend.target_user)
 
 
 def select_path(
@@ -443,22 +476,19 @@ def _is_setuid_root(st: os.stat_result) -> bool:
     return bool(st.st_mode & stat.S_ISUID) and st.st_uid == 0
 
 
-def _fstat_nofollow(path: str) -> os.stat_result:
-    """Stat one inode. ``O_PATH|O_NOFOLLOW`` does not follow a final symlink."""
-
-    fd = os.open(path, os.O_PATH | os.O_NOFOLLOW)
-    try:
-        return os.fstat(fd)
-    finally:
-        os.close(fd)
+# Directory walks use O_PATH so a search-only (0111) ancestor still yields a
+# dir fd. O_RDONLY on that directory returns EACCES even when create and read
+# of the leaf would succeed. O_NOFOLLOW applies at every component: a single
+# open of the full path would follow a symlinked ancestor.
+_DIR_TRAVERSAL = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 def _open_leaf_nofollow(path: str, flags: int, mode: int = 0o777) -> tuple[int, int, str]:
     """Open the last component via a directory fd.
 
-    Each directory component is opened with ``O_DIRECTORY|O_NOFOLLOW``, then
-    the leaf with ``O_NOFOLLOW``. ``O_NOFOLLOW`` on a single ``open`` of the
-    full path only covers the last component. Returns ``(leaf_fd, dir_fd, name)``.
+    Each directory component is opened with ``O_PATH|O_DIRECTORY|O_NOFOLLOW``,
+    then the leaf with ``O_NOFOLLOW``. ``O_NOFOLLOW`` on a single ``open`` of
+    the full path only covers the last component. Returns ``(leaf_fd, dir_fd, name)``.
     The caller closes both descriptors.
     """
 
@@ -467,10 +497,10 @@ def _open_leaf_nofollow(path: str, flags: int, mode: int = 0o777) -> tuple[int, 
     if not parts:
         raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), path)
     name = parts.pop()
-    cur = os.open(os.sep if absolute else ".", os.O_RDONLY | os.O_DIRECTORY)
+    cur = os.open(os.sep if absolute else ".", _DIR_TRAVERSAL)
     try:
         for part in parts:
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            nxt = os.open(part, _DIR_TRAVERSAL, dir_fd=cur)
             os.close(cur)
             cur = nxt
         leaf = os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=cur)
@@ -480,21 +510,39 @@ def _open_leaf_nofollow(path: str, flags: int, mode: int = 0o777) -> tuple[int, 
     return leaf, cur, name
 
 
+def _fstat_nofollow(path: str) -> os.stat_result:
+    """Stat one inode without following a symlink at any component.
+
+    Ancestors are walked with directory fds. The leaf is opened
+    ``O_PATH|O_NOFOLLOW`` and that fd is what ``fstat`` reports.
+    """
+
+    fd, dirfd, _name = _open_leaf_nofollow(path, os.O_PATH)
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+        os.close(dirfd)
+
+
 def _inspect_helpers(
     paths: Sequence[str],
     stat_fn: StatFn,
 ) -> tuple[str | None, str]:
     notes: list[str] = []
     found: str | None = None
-    # The default ``os.stat`` follows a symlink swapped in after ``lstat``.
-    # One ``O_PATH|O_NOFOLLOW`` fd is the inode we report. Injected stats stay
-    # available for tests that have no real file.
+    # The default ``os.stat`` follows a symlink swapped in after ``lstat``,
+    # including a symlinked ancestor. The walk opens each directory
+    # ``O_NOFOLLOW`` and fstats the leaf fd. Injected stats stay available
+    # for tests that have no real file.
     follow_free = stat_fn is os.stat
     for path in paths:
         try:
             st = _fstat_nofollow(path) if follow_free else stat_fn(path)
         except OSError as exc:
-            if follow_free and exc.errno == errno.ELOOP:
+            # ELOOP: O_NOFOLLOW stopped on a symlink. ENOTDIR: an ancestor
+            # opened O_DIRECTORY|O_NOFOLLOW was a symlink (or not a directory).
+            if follow_free and exc.errno in (errno.ELOOP, errno.ENOTDIR):
                 notes.append(f"{path} is a symlink; not a setuid helper")
             else:
                 notes.append(f"{path} absent")
@@ -527,8 +575,9 @@ def _sudo_n_true(run_fn: RunFn) -> bool:
 def store_writer_script(path: str) -> str:
     """Python ``-c`` body used by the absolute-path store probe (and sudo detection).
 
-    The leaf is created through a directory fd. ``O_NOFOLLOW`` applies to every
-    component, and the mode is set with ``fchmod`` on that fd before it is closed.
+    The leaf is created through a directory fd. Ancestors are opened
+    ``O_PATH|O_DIRECTORY|O_NOFOLLOW`` so a search-only directory still works,
+    and the mode is set with ``fchmod`` on the leaf fd before it is closed.
     """
 
     quoted = repr(str(path))
@@ -536,10 +585,10 @@ def store_writer_script(path: str) -> str:
         "import os; p=" + quoted + "; "
         "abs=os.path.isabs(p); parts=[part for part in p.split(os.sep) if part]; "
         "name=parts.pop(); "
-        "cur=os.open(os.sep if abs else '.', os.O_RDONLY|os.O_DIRECTORY); "
+        "cur=os.open(os.sep if abs else '.', os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW); "
         "\n"
         "for part in parts:\n"
-        " nxt=os.open(part, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=cur); os.close(cur); cur=nxt\n"
+        " nxt=os.open(part, os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=cur); os.close(cur); cur=nxt\n"
         "fd=os.open(name, os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_WRONLY, 0o600, dir_fd=cur); "
         "os.write(fd, b'store-bytes'); os.fchmod(fd, 0o600); os.close(fd); os.close(cur)"
     )
@@ -571,7 +620,7 @@ def _probe_sudo_target(
 
     notes: list[str] = []
     for user in candidates:
-        if user in _ROOT_USER_NAMES:
+        if _is_root_user_token(user):
             notes.append(
                 f"sudo -n -u {user} refused before launch; "
                 "rejected: engine user must not be root or the calling uid"
@@ -631,7 +680,7 @@ def _probe_sudo_target(
 
 
 def _probe_systemd_run(run_fn: RunFn, user: str, our_uid: int) -> tuple[bool, int | None, str]:
-    if user in _ROOT_USER_NAMES:
+    if _is_root_user_token(user):
         return False, None, (
             f"systemd-run --uid={user} refused before launch; "
             "rejected: engine user must not be root or the calling uid"
@@ -811,23 +860,84 @@ def probe_proc_pid_root(pid: int) -> ProbeOutcome:
     return False, "opened"
 
 
+def _await_ptrace_stop(pid: int) -> str:
+    """Block until ``pid`` stops, exits, or is reaped.
+
+    Returns ``stopped``, ``exited``, or ``reaped``. ``EINTR`` is retried.
+    ``ChildProcessError`` and ``ECHILD`` mean the tracee is already gone.
+    """
+
+    while True:
+        try:
+            _pid, status = os.waitpid(pid, 0)
+        except ChildProcessError:
+            return "reaped"
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            if exc.errno == errno.ECHILD:
+                return "reaped"
+            raise
+        if os.WIFSTOPPED(status):
+            return "stopped"
+        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            return "exited"
+
+
+def _detach_ptrace(pid: int) -> tuple[int, int, str]:
+    """Wait for the attach stop, then detach. Returns ``(rc, errno, state)``.
+
+    ``PTRACE_DETACH`` before that stop returns ``ESRCH`` and leaves the
+    tracee attached, so an ``EINTR`` from ``waitpid`` is not a reason to
+    detach yet. ``ESRCH`` after the tracee has been reaped means nothing
+    remains attached. Any other wait error still detaches once, then propagates,
+    so the attach is not abandoned.
+    """
+
+    try:
+        state = _await_ptrace_stop(pid)
+    except OSError:
+        _ptrace(PTRACE_DETACH, pid)
+        raise
+    retries = 0
+    while True:
+        rc, err = _ptrace(PTRACE_DETACH, pid)
+        if rc == 0 or err == errno.EINTR:
+            if rc == 0:
+                return rc, err, state
+            continue
+        # Not stopped yet, or the stop raced the detach. Wait again and retry.
+        # A reaped tracee is not still attached.
+        if err == errno.ESRCH and state != "reaped" and retries < 2:
+            retries += 1
+            try:
+                state = _await_ptrace_stop(pid)
+            except OSError:
+                return rc, err, state
+            continue
+        return rc, err, state
+
+
 def probe_ptrace(pid: int) -> ProbeOutcome:
     rc, err = _ptrace(PTRACE_ATTACH, pid)
     if rc == -1 and err == 0:
         return None, "ptrace unavailable: libc not found"
-    if rc == 0:
-        try:
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
-        finally:
-            _ptrace(PTRACE_DETACH, pid)
-        return False, "attached"
-    detail = f"rc={rc}:errno={err}:{os.strerror(err) if err else 'ptrace failed'}"
-    if err in BLOCKED_ERRNOS:
-        return True, detail
-    return None, f"not_denied {detail}"
+    if rc != 0:
+        detail = f"rc={rc}:errno={err}:{os.strerror(err) if err else 'ptrace failed'}"
+        if err in BLOCKED_ERRNOS:
+            return True, detail
+        return None, f"not_denied {detail}"
+    detach_rc, detach_err, state = _detach_ptrace(pid)
+    # ESRCH after a reap is the tracee already being gone, not a live attach.
+    if detach_rc != 0 and not (
+        state == "reaped" and detach_err in (errno.ESRCH, errno.ECHILD)
+    ):
+        detail = (
+            f"rc={detach_rc}:errno={detach_err}:"
+            f"{os.strerror(detach_err) if detach_err else 'ptrace detach failed'}"
+        )
+        return None, f"ptrace detach failed {detail}"
+    return False, "attached"
 
 
 def probe_abs_store_read(
@@ -842,8 +952,11 @@ def probe_abs_store_read(
     A writer that fails, leaves no file, leaves a symlink, or wrote as a uid
     other than ``expected_owner`` is an error (``None``), not a blocked read.
     The read walks the path with ``O_NOFOLLOW`` on every component, not only
-    the leaf. Callers still pass a directory this process created and a unique
-    final name (``store-<pid>-<ns>.secret``).
+    the leaf. The inode is pinned with ``O_PATH`` and checked (owner and mode)
+    before the read open: a 0600 file owned by another uid is refused at that
+    open, and that ``EACCES``/``EPERM`` is blocked, not a missing store.
+    Callers still pass a directory this process created and a unique final
+    name (``store-<pid>-<ns>.secret``).
     """
 
     store = Path(directory) / f"store-{os.getpid()}-{time.time_ns()}.secret"
@@ -851,22 +964,37 @@ def probe_abs_store_read(
     if result.returncode != 0:
         return None, f"writer_failed rc={result.returncode} err={(result.stderr or '')[:160]}"
     try:
-        fd, dirfd, name = _open_leaf_nofollow(str(store), os.O_RDONLY)
+        path_fd, dirfd, name = _open_leaf_nofollow(str(store), os.O_PATH)
     except OSError as exc:
-        # ELOOP: the leaf is a symlink. ENOTDIR: an earlier component is a
-        # symlink (O_DIRECTORY|O_NOFOLLOW does not follow it).
+        # ELOOP: the leaf or an ancestor is a symlink. ENOTDIR: an earlier
+        # component is not a directory (O_DIRECTORY|O_NOFOLLOW did not follow it).
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             return None, f"store_symlink {exc.errno}"
         return None, f"writer_left_no_store {type(exc).__name__}:{exc.errno}"
+    read_fd: int | None = None
+    data = b""
     try:
-        st = os.fstat(fd)
+        st = os.fstat(path_fd)
         owner_uid = st.st_uid
+        # O_PATH|O_NOFOLLOW on a final symlink returns the link itself, not ELOOP.
+        if stat.S_ISLNK(st.st_mode):
+            return None, f"store_symlink {errno.ELOOP}"
         if expected_owner is not None and owner_uid != expected_owner:
             return None, f"writer_wrong_uid owner={owner_uid} expected={expected_owner}"
         if not stat.S_ISREG(st.st_mode):
             return None, f"not_denied store_not_regular mode={oct(st.st_mode)}"
         try:
-            data = os.read(fd, 1024 * 1024)
+            read_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except OSError as exc:
+            detail = (
+                f"{type(exc).__name__}:{exc.errno}:{exc.strerror} "
+                f"owner={owner_uid} mode={oct(st.st_mode)}"
+            )
+            if exc.errno in BLOCKED_ERRNOS:
+                return True, detail
+            return None, f"not_denied {detail}"
+        try:
+            data = os.read(read_fd, 1024 * 1024)
         except OSError as exc:
             detail = (
                 f"{type(exc).__name__}:{exc.errno}:{exc.strerror} "
@@ -876,7 +1004,9 @@ def probe_abs_store_read(
                 return True, detail
             return None, f"not_denied {detail}"
     finally:
-        os.close(fd)
+        if read_fd is not None:
+            os.close(read_fd)
+        os.close(path_fd)
         try:
             os.unlink(name, dir_fd=dirfd)
         except OSError:
@@ -890,6 +1020,8 @@ def spawn_command(
 ) -> list[str]:
     """``unit`` names the transient systemd-run unit; other backends ignore it."""
 
+    if is_root_target(backend):
+        raise ValueError("refusing to launch uid 0")
     if backend.name == "sudo":
         if not backend.target_user:
             raise ValueError("sudo backend needs target_user")
@@ -1170,9 +1302,9 @@ def detect_backends(
     our_uid = facts.uid
     engine = _configured_engine_user(engine_user, env)
     candidates = SUDO_TARGET_CANDIDATES
-    # ``0`` and ``#0`` are uid 0 before any ``id -u`` output. Do not prepend
-    # them, and do not launch sudo or systemd-run against a root name.
-    if engine is not None and engine not in _ROOT_USER_NAMES:
+    # Numeric uid 0 (``0``, ``#0``, ``00``, ``#00``), the name ``root``, and any
+    # local account ``pwd`` resolves to uid 0 are refused before a launch.
+    if engine is not None and not _is_root_user_token(engine):
         candidates = (engine, *(u for u in SUDO_TARGET_CANDIDATES if u != engine))
 
     helper_found, helper_note = _inspect_helpers(

@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import errno
 import os
+import signal
 import stat
 import subprocess
 import tempfile
@@ -1382,6 +1383,9 @@ class SpawnDefectTests(unittest.TestCase):
                 )
 
     def test_ptrace_detaches_when_waitpid_fails(self) -> None:
+        # EINTR is retried (see the stop/detach test). A non-restartable wait
+        # error still detaches before it propagates, so the attach is not left
+        # in place.
         calls: list[int] = []
 
         def ptrace(request, pid, *args):
@@ -1390,7 +1394,7 @@ class SpawnDefectTests(unittest.TestCase):
 
         with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
             with mock.patch.object(
-                privileged_spawn.os, "waitpid", side_effect=OSError(errno.EINTR, "interrupted")
+                privileged_spawn.os, "waitpid", side_effect=OSError(errno.EIO, "io error")
             ):
                 with self.assertRaises(OSError):
                     probe_ptrace(4242)
@@ -1432,7 +1436,12 @@ class SpawnDefectTests(unittest.TestCase):
             real_stat = privileged_spawn.os.stat
 
             def spy_open(file, flags, *args, **kwargs):
-                if os.fspath(file) == path:
+                name = os.fspath(file)
+                # The leaf is opened by name through a directory fd. A single
+                # open of the full path would follow a symlinked ancestor.
+                if name == path or (
+                    name == os.path.basename(path) and kwargs.get("dir_fd") is not None
+                ):
                     opens.append(flags)
                 return real_open(file, flags, *args, **kwargs)
 
@@ -1514,6 +1523,201 @@ class SpawnDefectTests(unittest.TestCase):
                 result, detail = probe_ptrace(7)
         self.assertEqual((result, detail), (False, "attached"))
         self.assertEqual(len(calls), 2)
+
+    def test_store_read_denial_on_a_validated_inode_is_blocked(self) -> None:
+        # A 0600 store owned by another uid is refused at open(), not read().
+        # That EACCES is the channel being blocked. Pin the inode with
+        # O_PATH first so the denial is not reported as a missing store.
+        def run(cmd, timeout: float) -> ProcResult:
+            exec(cmd[-1], {})
+            return ProcResult(0, "", "")
+
+        real_open = privileged_spawn.os.open
+
+        def open_denies_plain_reads(path, flags, *args, **kwargs):
+            access = flags & os.O_ACCMODE
+            directory = flags & os.O_DIRECTORY
+            if access == os.O_RDONLY and not (flags & os.O_PATH) and not directory:
+                raise OSError(errno.EACCES, "Permission denied", path)
+            return real_open(path, flags, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(privileged_spawn.os, "open", open_denies_plain_reads):
+                result, detail = probe_abs_store_read(
+                    (), tmp, expected_owner=os.getuid(), run_fn=run
+                )
+            self.assertEqual(os.listdir(tmp), [])
+        self.assertIs(result, True)
+        self.assertIn(str(errno.EACCES), detail)
+
+    def test_ptrace_retries_eintr_and_detaches_after_the_stop(self) -> None:
+        # waitpid EINTR before the attach stop, then PTRACE_DETACH returns
+        # ESRCH and the tracee stays attached if that return is ignored.
+        stopped = (signal.SIGSTOP << 8) | 0x7F
+        self.assertTrue(os.WIFSTOPPED(stopped))
+        waits: list[int] = []
+        detach_rcs: list[int] = []
+        detach_after_waits: list[int] = []
+
+        def ptrace(request, pid, *args):
+            if request == privileged_spawn.PTRACE_DETACH:
+                detach_after_waits.append(len(waits))
+                if not detach_rcs:
+                    detach_rcs.append(-1)
+                    return (-1, errno.ESRCH)
+                detach_rcs.append(0)
+                return (0, 0)
+            return (0, 0)
+
+        def waitpid(pid, options):
+            waits.append(pid)
+            if len(waits) == 1:
+                raise OSError(errno.EINTR, "interrupted")
+            return pid, stopped
+
+        with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
+            with mock.patch.object(privileged_spawn.os, "waitpid", side_effect=waitpid):
+                result, detail = probe_ptrace(4242)
+        self.assertEqual((result, detail), (False, "attached"))
+        self.assertGreaterEqual(detach_after_waits[0], 2)
+        self.assertEqual(detach_rcs[0], -1)
+        self.assertEqual(detach_rcs[-1], 0)
+
+    def test_ptrace_esrch_after_reap_is_not_a_live_attachment(self) -> None:
+        def ptrace(request, pid, *args):
+            if request == privileged_spawn.PTRACE_DETACH:
+                return (-1, errno.ESRCH)
+            return (0, 0)
+
+        with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
+            with mock.patch.object(
+                privileged_spawn.os, "waitpid", side_effect=ChildProcessError("reaped")
+            ):
+                result, detail = probe_ptrace(7)
+        self.assertEqual((result, detail), (False, "attached"))
+
+    def test_numeric_root_aliases_are_not_launched_or_selected(self) -> None:
+        # "#00" and "00" are uid 0. A local name whose passwd entry is uid 0
+        # is the same refusal, before any sudo or systemd-run launch.
+        for user in ("#00", "00", "000", "#000"):
+            backend = Backend("sudo", True, True, "ok", target_user=user, target_uid=None)
+            systemd = Backend(
+                "systemd_run", True, True, "ok", target_user=user, target_uid=None
+            )
+            with self.subTest(user=user):
+                self.assertTrue(is_root_target(backend))
+                self.assertTrue(is_root_target(systemd))
+                for candidate in (backend, systemd):
+                    selected = select_path((candidate,), f21_open=())
+                    self.assertEqual(selected.name, "managed_login_folder")
+                    self.assertIsNone(selected.backend)
+                    self.assertIsNone(selected.candidate)
+                    with self.assertRaises(ValueError):
+                        privileged_spawn.spawn_command(candidate, ("true",))
+
+        launched: list[tuple[str, ...]] = []
+
+        def run(cmd, timeout: float) -> ProcResult:
+            launched.append(tuple(cmd))
+            return ProcResult(0, "0\n", "")
+
+        user, uid, reason = _probe_sudo_target(run, 1000, candidates=("#00",))
+        self.assertIsNone(user)
+        self.assertIsNone(uid)
+        self.assertEqual(launched, [])
+        self.assertIn("refused before launch", reason)
+
+        launched.clear()
+        ok, uid, reason = privileged_spawn._probe_systemd_run(run, "00", 1000)
+        self.assertFalse(ok)
+        self.assertIsNone(uid)
+        self.assertEqual(launched, [])
+        self.assertIn("refused before launch", reason)
+
+        def getpwnam(name: str):
+            if name == "toor":
+                return SimpleNamespace(pw_uid=0, pw_name="toor")
+            raise KeyError(name)
+
+        with mock.patch.object(privileged_spawn.pwd, "getpwnam", side_effect=getpwnam):
+            alias = Backend("sudo", True, True, "ok", target_user="toor", target_uid=None)
+            self.assertTrue(is_root_target(alias))
+            selected = select_path((alias,), f21_open=())
+            self.assertIsNone(selected.backend)
+            self.assertIsNone(selected.candidate)
+            launched.clear()
+            user, uid, reason = _probe_sudo_target(run, 1000, candidates=("toor",))
+            self.assertEqual(launched, [])
+            self.assertIsNone(user)
+            launched.clear()
+            ok, uid, reason = privileged_spawn._probe_systemd_run(run, "toor", 1000)
+            self.assertFalse(ok)
+            self.assertEqual(launched, [])
+
+        detect_backends(
+            facts=_facts(),
+            run_fn=run,
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+            engine_user="#00",
+        )
+        flat = [part for cmd in launched for part in cmd]
+        self.assertFalse(any(part in {"#00", "00", "--uid=#00", "--uid=00"} for part in flat), launched)
+        self.assertNotIn("#00", " ".join(flat))
+
+    def test_search_only_ancestor_does_not_block_store_walks(self) -> None:
+        # Mode 0111 is searchable. O_RDONLY on that directory returns EACCES
+        # even though create and read of the leaf succeed.
+        script = store_writer_script("/tmp/example.secret")
+        self.assertIn("os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW", script)
+        self.assertNotIn("os.O_RDONLY", script)
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = os.path.join(tmp, "outer")
+            inner = os.path.join(outer, "inner")
+            os.makedirs(inner, mode=0o700)
+            os.chmod(outer, 0o111)
+            path = os.path.join(inner, "store.secret")
+            try:
+                exec(store_writer_script(path), {})
+                fd, dirfd, _name = privileged_spawn._open_leaf_nofollow(path, os.O_RDONLY)
+                try:
+                    self.assertEqual(os.read(fd, 32), b"store-bytes")
+                finally:
+                    os.close(fd)
+                    os.close(dirfd)
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            finally:
+                os.chmod(outer, 0o700)
+
+    def test_helper_stat_does_not_follow_a_symlinked_ancestor(self) -> None:
+        # O_NOFOLLOW on one open of the full path follows a symlinked ancestor
+        # such as /proc/self/root and can land on a setuid-root inode.
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside")
+            os.mkdir(outside)
+            leaf = os.path.join(outside, "helper")
+            with open(leaf, "wb") as handle:
+                handle.write(b"not-a-helper")
+            holder = os.path.join(tmp, "holder")
+            os.mkdir(holder)
+            link = os.path.join(holder, "root")
+            os.symlink(outside, link)
+            path = os.path.join(link, "helper")
+            self.assertTrue(os.path.exists(path))
+            with self.assertRaises(OSError) as caught:
+                privileged_spawn._fstat_nofollow(path)
+            self.assertIn(caught.exception.errno, (errno.ELOOP, errno.ENOTDIR))
+            backends = detect_backends(
+                facts=_facts(),
+                run_fn=_run_fail,
+                helper_paths=(path,),
+                env={},
+            )
+        helper = next(b for b in backends if b.name == "setuid_helper")
+        self.assertIsNone(helper.helper_path)
+        self.assertNotIn("setuid_root=True", helper.reason)
+        self.assertNotIn("exists mode=", helper.reason)
+        self.assertIn("symlink", helper.reason)
 
 
 def live_newuidmap_ready(facts: HostFacts) -> bool:

@@ -709,10 +709,46 @@ def _no_proxy_hit(entry: str, hosts: tuple[str, ...]) -> bool:
     """Whether one entry (after ``_no_proxy_name``) names a host: a ``*`` pattern, the host or a parent domain."""
 
     if "*" in entry:
-        pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-        return any(pattern.match(host) for host in hosts)
+        return any(_star_match(entry, host) for host in hosts)
     bare = entry.lstrip(".")
     return any(host == bare or host.endswith("." + bare) for host in hosts)
+
+
+def _star_match(pattern: str, text: str) -> bool:
+    """Whether a ``*`` pattern matches the whole of ``text``: ``*`` is any run of characters, the rest literal.
+
+    A ``*`` run may be empty and may hold dots, and case is compared as given. No regex: a compiled ``.*a.*a...``
+    backtracks for exponential time on a host that does not match (Devin rt343, MEDIUM-1), and NO_PROXY is the
+    parent's to set. This walks both strings once and, on a mismatch, goes back to the last ``*`` only, so the
+    worst case is len(pattern) * len(text) steps. The results are those of the regex it replaces
+    (``".*".join(map(re.escape, parts)) + r"\\Z"``, matched from the start), which had no DOTALL: a ``*`` never
+    matches a newline, so a newline is matched only by a newline in the pattern. No entry and no host holds one
+    here (``_no_proxy_entries`` splits on whitespace; ``_BASE_URL`` and the engine hosts have none); the rule is
+    kept so that every input gives the result it gave before.
+    """
+
+    lines, texts = pattern.split("\n"), text.split("\n")
+    return len(lines) == len(texts) and all(map(_star_match_line, lines, texts))
+
+
+def _star_match_line(pattern: str, text: str) -> bool:
+    """``_star_match`` for a pattern and a text with no newline: greedy, going back to the last ``*`` only."""
+
+    p = t = 0
+    star, resume = -1, 0  # the last "*" seen in the pattern, and where in the text its run ends for now
+    while t < len(text):
+        if p < len(pattern) and pattern[p] == "*":
+            star, resume = p, t
+            p += 1
+        elif p < len(pattern) and pattern[p] == text[t]:
+            p += 1
+            t += 1
+        elif star >= 0:
+            resume += 1  # the last "*" takes one more character; an earlier "*" taking more could not help
+            p, t = star + 1, resume
+        else:
+            return False
+    return pattern.count("*", p) == len(pattern) - p
 
 
 def _no_proxy_bypass(lists: list[tuple[str, str]], hosts: tuple[str, ...]) -> EnvRefused | None:

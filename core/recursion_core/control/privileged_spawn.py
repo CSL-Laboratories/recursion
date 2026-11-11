@@ -985,17 +985,34 @@ def _detach_ptrace(pid: int) -> tuple[int, int, str]:
 # the death notification. A non-child (sudo's descendant, systemd's MainPID)
 # stays a traced zombie until that wait; the real parent's WNOHANG returns
 # (0, 0) while TracerPid is still the probe. The wait is bounded so a kill
-# that did not land cannot hang the probe.
+# that did not land cannot hang the probe. Every wait error except ECHILD is
+# retried inside that bound: a first EIO does not mean the death status is
+# gone. If the wait ends with nothing collected, one PTRACE_DETACH resumes a
+# tracee that is still stopped.
 _KILL_WAIT_S = 2.0
 _KILL_POLL_S = 0.05
+
+
+def _release_unreaped(pid: int) -> str:
+    """Detach once when the kill wait collected no death notification."""
+
+    try:
+        rc, err = _ptrace(PTRACE_DETACH, pid)
+    except OSError as exc:
+        return f"unreaped; release failed rc=-1:errno={exc.errno}"
+    if rc == 0:
+        return "unreaped; released"
+    return f"unreaped; release failed rc={rc}:errno={err}"
 
 
 def _kill_traced(pid: int) -> str:
     """SIGKILL ``pid`` and collect its death notification.
 
     Returns ``reaped`` when ``waitpid`` reports the exit, ``gone`` when the
-    tracee is already reaped (``ECHILD``), or ``unreaped`` when the bounded
-    wait ends with no report. ``EINTR`` is retried inside that bound.
+    tracee is already reaped (``ECHILD``), or ``unreaped; released`` /
+    ``unreaped; release failed ...`` when the bounded wait ends with no
+    report. ``EINTR`` and every other ``waitpid`` error are retried until
+    the deadline. The wait uses ``WNOHANG`` only.
     """
 
     try:
@@ -1011,8 +1028,6 @@ def _kill_traced(pid: int) -> str:
         except OSError as exc:
             if exc.errno == errno.ECHILD:
                 return "gone"
-            if exc.errno != errno.EINTR:
-                return "unreaped"
             waited = 0
             status = 0
         if waited != 0 and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
@@ -1021,7 +1036,7 @@ def _kill_traced(pid: int) -> str:
         if remaining <= 0:
             break
         time.sleep(min(_KILL_POLL_S, remaining))
-    return "unreaped"
+    return _release_unreaped(pid)
 
 
 def probe_ptrace(pid: int) -> ProbeOutcome:

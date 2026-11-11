@@ -313,7 +313,7 @@ class PluginHost:
                     # The GUI's own validation, over every panel already accepted plus these.
                     panel_registry([p for _, entry in self._panels for p in entry.get('panels', ())]
                                    + list(snapshot.get('panels', ())))
-                except Exception as exc:  # noqa: BLE001 - a bad registry costs the plugin its panels, not the daemon
+                except BaseException as exc:  # noqa: BLE001 - a bad registry costs the plugin its panels, not the daemon
                     record['findings'].append(_finding('plugin_registry_invalid', 'refuse',
                                                        f'{type(exc).__name__}: panels not registered'))
                 else:
@@ -331,11 +331,17 @@ class PluginHost:
             try:
                 self._guarded(bind, self.core.client_for(loaded.plugin_id))
                 record['provides'].append('core_client')
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001 - SystemExit or KeyboardInterrupt included (_guarded)
                 record['findings'].append(_finding('plugin_bind_core_failed', 'warn', type(exc).__name__))
 
     def _guarded(self, call, *args):
-        """Run plugin code, then read the GIL: a plugin that turned it on poisons the core (4.1)."""
+        """Run plugin code, then read the GIL: a plugin that turned it on poisons the core (4.1).
+
+        Callers catch ``BaseException`` from plugin code, ``SystemExit`` and ``KeyboardInterrupt``
+        included: they cost the plugin, not the daemon (ADV2-4). Nothing the daemon needs for its
+        own shutdown is raised there: SIGTERM and SIGINT only set the main loop's stop event
+        (``daemon/__main__.py``), as the loader's import step already assumes.
+        """
         try:
             return call(*args)
         finally:
@@ -397,7 +403,7 @@ class PluginHost:
             try:
                 answer = self._guarded(self._operators[providers[0]], json.loads(json.dumps(command)))
                 body = json.loads(json.dumps(answer))
-            except Exception as exc:  # noqa: BLE001 - the plugin's failure is reported, never guessed around
+            except BaseException as exc:  # noqa: BLE001 - the plugin's failure is reported, never guessed around
                 return 502, {'error': f'unavailable: operator plugin failed: {type(exc).__name__}'}
         if not isinstance(body, dict):
             return 502, {'error': 'unavailable: operator plugin answered a non-object'}

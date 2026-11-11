@@ -77,7 +77,6 @@ class Adv2FaultingPluginTests(Adv2HostCase):
             host = self.host()
         self.assertEqual((host.records[0]['state'], host.records[0]['code']), ('refused', 'plugin_import_failed'))
 
-    @unittest.expectedFailure  # ADV2-4: SystemExit from registry() escapes PluginHost; the daemon does not start
     def test_systemexit_in_registry_costs_the_plugin_its_panels_not_the_daemon(self):
         self.install(b'def registry():\n    raise SystemExit(3)\n')
         try:
@@ -86,7 +85,6 @@ class Adv2FaultingPluginTests(Adv2HostCase):
             self.fail(f'PluginHost raised {type(exc).__name__}; compose_control and the daemon would not start')
         self.assertIn('plugin_registry_invalid', codes(host.records[0]))
 
-    @unittest.expectedFailure  # ADV2-4: KeyboardInterrupt from bind_core() escapes PluginHost; the daemon does not start
     def test_keyboardinterrupt_in_bind_core_costs_the_plugin_its_client_not_the_daemon(self):
         from recursion_core.daemon import breaker as daemon_breaker
         stored, _ = daemon_breaker.open_breaker_store(self.state, clock=lambda: 0.0)
@@ -98,7 +96,6 @@ class Adv2FaultingPluginTests(Adv2HostCase):
             self.fail(f'PluginHost raised {type(exc).__name__}')
         self.assertIn('plugin_bind_core_failed', codes(host.records[0]))
 
-    @unittest.expectedFailure  # ADV2-4: SystemExit from operator() escapes PluginHost.operator into the GUI request
     def test_systemexit_in_operator_is_a_502(self):
         self.install(b'def operator(command):\n    raise SystemExit(4)\n')
         host = self.host()

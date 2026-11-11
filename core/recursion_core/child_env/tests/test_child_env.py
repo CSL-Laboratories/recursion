@@ -1007,6 +1007,26 @@ class AuthRouteTests(unittest.TestCase):
         self.assertIsNone(policy._no_proxy_bypass(".", ("gateway.invalid",)))
         self.assertEqual(".", launched({"NO_PROXY": "."}, gateway)["NO_PROXY"])
 
+        # A code point Unicode 15.1 does not cover must not fall through to IDNA2003.
+        # That codec maps ß to ss, so fa + U+105C0 + ß was accepted for xn--fa-hia3528x.
+        outside = (
+            ("fa\U000105c0ß.invalid", "xn--fa-hia3528x.invalid"),
+            ("fa\U0001e5d0ß.invalid", "xn--fa-hia39670c.invalid"),
+        )
+        for entry, host in outside:
+            with self.subTest(entry=entry):
+                self.assertEqual("no_proxy_engine_host", policy._no_proxy_bypass(entry, (host,)))
+                route = ChildRoute(api_key=USER_KEY, base_url=f"https://{host}/api")
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, route))
+
+        # requests also tests hostname:port, before the entry's port is stripped.
+        for entry in (":443", "443", "43", "3"):
+            with self.subTest(entry=entry):
+                self.assertEqual("no_proxy_engine_host", policy._no_proxy_bypass(entry, ("gateway.invalid",), (443,)))
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, gateway))
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": ":4000"}, ip))
+        self.assertEqual("3999", launched({"NO_PROXY": "3999"}, gateway)["NO_PROXY"])
+
         # C8. Twelve stars must not backtrack. The host is not a match, and the call returns.
         def _too_slow(signum, frame):
             raise AssertionError("wildcard match exceeded 1s")

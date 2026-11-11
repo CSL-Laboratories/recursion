@@ -378,12 +378,17 @@ def build_child_env(
     # A bypass only matters when a proxy is set. "*" skips every host. An entry that matches an engine
     # endpoint, or the route's own base host, skips the proxy for that host; a CIDR matches an IP it contains.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
-        hosts = profile.hosts
+        # Engine endpoints are HTTPS, so requests sees them as hostname:443.
+        # The route contributes its own origin port, including the scheme default.
+        hosts = tuple(profile.hosts)
+        ports = tuple(443 for _ in hosts)
         base = route_env.get(profile.base_url_name) if profile.base_url_name else None
         if base is not None:
-            hosts = hosts + (_origin(base)[1],)
+            _scheme, host, port = _origin(base)
+            hosts = hosts + (host,)
+            ports = ports + (port,)
         for name in [name for name in NO_PROXY_NAMES if name in env]:
-            if (cause := _no_proxy_bypass(env[name], hosts)) is not None:
+            if (cause := _no_proxy_bypass(env[name], hosts, ports)) is not None:
                 raise EnvRefused(name, cause)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
@@ -1041,18 +1046,16 @@ def _idna_forms(label: str) -> set[str] | None:
 
     A single leading dot is suffix syntax and is not an empty label. Dots are stripped
     after UTS46 mapping and again after each encoding, so ``gateway.invalid。`` is
-    ``gateway.invalid``. None means a non-ASCII label will not encode under IDNA2003.
+    ``gateway.invalid``. None means the Unicode 15.1 table does not map, ignore, or
+    accept a code point in the label. IDNA2003 is not a fallback for that label: it
+    rewrites ``ß`` to ``ss`` and would hide the nontransitional name a newer Go
+    lookup bypasses (``fa`` + U+105C0 + ``ß`` is ``xn--fa-hia3528x``, not ``xn--fass-m86y``).
     The caller refuses: while a proxy is set, an entry that cannot be compared must not be kept.
     """
 
     mapped = _uts46_map(label)
     if mapped is None:
-        # No Go form. IDNA2003 may still encode the original; if it cannot, refuse.
-        try:
-            encoded = label.rstrip(".").encode("idna").decode("ascii").rstrip(".")
-        except UnicodeError:
-            return None
-        return {encoded} if encoded and encoded.strip(".") else None
+        return None
     raw = mapped.rstrip(".")
     # Empty, or only dots (``\u00ad``, ``。``, ``．``, ``｡``). Skipping these accepted a
     # bypass Go and, for a bare dot, requests and urllib still apply. None refuses.
@@ -1189,19 +1192,38 @@ def _trailing_dot_host(host: str) -> bool:
     return host.endswith(".")
 
 
-def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
+def _requests_port_suffix(entry: str, hosts: tuple[str, ...], ports: tuple[int, ...]) -> bool:
+    """requests compares the raw entry with both the hostname and ``hostname:port``.
+
+    ``:443``, ``443``, ``43`` and ``3`` are suffixes of ``gateway.invalid:443``. This runs
+    before the port is stripped off the entry, which used to delete ``:443`` and then miss
+    the rest.
+    """
+
+    for host, port in zip(hosts, ports):
+        bare = _no_proxy_host(host)
+        if bare.endswith(entry) or f"{bare}:{port}".endswith(entry):
+            return True
+    return False
+
+
+def _no_proxy_bypass(value: str, hosts: tuple[str, ...], ports: tuple[int, ...] | None = None) -> str | None:
     """N5i: the union of curl, requests, hyper-util, undici, Go and Codex matchers.
 
-    ``hosts`` is the engine's own endpoints plus the route base host, when the route has one. A CIDR entry
-    matches an IP host it contains, including a requests shorthand (``10.0/8``), a permissive prefix
-    (``+8``, a tab, ``8x``, and anything after those digits, so ``8/foo`` is 8), an IPv4-mapped route
-    host, and an IPv4-mapped CIDR compared as IPv4
+    ``hosts`` is the engine's own endpoints plus the route base host, when the route has one.
+    ``ports`` is the port requests would use for each host (443 for an engine HTTPS endpoint,
+    and the route origin's port, including the scheme default). Omitted ports are 443.
+    A CIDR entry matches an IP host it contains, including a requests shorthand (``10.0/8``), a
+    permissive prefix (``+8``, a tab, ``8x``, and anything after those digits, so ``8/foo`` is 8),
+    an IPv4-mapped route host, and an IPv4-mapped CIDR compared as IPv4
     (Go: ``::ffff:10.0.0.0/104``). requests' ``int()`` of the whole suffix is included, so
     ``10.0.0.0/0_8``, ``/+0_8`` and a fullwidth ``8`` are ``/8``. ``/0x8/foo`` is not.
     It does not match a domain name: none of those matchers resolve DNS.
     ``/0`` covers every IP of both families. A leading ``*.`` also matches the apex (Undici 7.30.1).
-    IDNA2003 and UTS46 (Unicode 15.1.0, nontransitional) spellings are compared. A plain suffix matches
-    without a dot boundary, which is what requests <=2.32.3 does. A non-empty dot-only entry (``.``,
+    IDNA2003 and UTS46 (Unicode 15.1.0, nontransitional) spellings are compared. A code point the
+    15.1 table does not cover refuses; IDNA2003 is not used in its place. A plain suffix matches
+    without a dot boundary, which is what requests <=2.32.3 does, on the hostname and on
+    ``hostname:port``, before the entry's port is stripped. A non-empty dot-only entry (``.``,
     ``.:443``) matches a host that still has its trailing dot; that comparison happens before the
     trailing dot is stripped. A NUL is ``value_malformed``. A CIDR prefix that cannot be read without
     raising is ``no_proxy_malformed``.
@@ -1209,6 +1231,8 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
 
     if "\0" in value:
         return "value_malformed"
+    if ports is None:
+        ports = tuple(443 for _ in hosts)
     checked = tuple(_no_proxy_host(host) for host in hosts)
     for raw in _no_proxy_entries(value):
         entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw)
@@ -1235,6 +1259,10 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
         # urllib matches a trailing-dot host against "."; requests also matches ".:443"
         # once the port is attached to that host. Judge this before the strip.
         if _dot_only_entry(entry) and any(_trailing_dot_host(host) for host in hosts):
+            return "no_proxy_engine_host"
+        # requests: hostname.endswith(entry) or (hostname + ":" + port).endswith(entry),
+        # on the entry before its port is removed.
+        if _requests_port_suffix(entry, hosts, ports):
             return "no_proxy_engine_host"
         entry = _normalize_no_proxy_entry(entry)
         if not entry:

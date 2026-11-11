@@ -4,8 +4,9 @@ Derived from IdnaMappingTable.txt (Date: 2023-08-10, Version 15.1.0):
 https://www.unicode.org/Public/idna/15.1.0/IdnaMappingTable.txt
 
 Copyright 2023 Unicode, Inc.
-For terms of use, see https://www.unicode.org/terms_of_use.html
-and the Unicode Data Files license: https://www.unicode.org/license.txt
+The Unicode License v3 notice for this data is LICENSE-UNICODE.txt in this
+directory. Terms of use: https://www.unicode.org/terms_of_use.html
+Data files license: https://www.unicode.org/license.txt
 
 Deviation characters are stored with the valid ranges. Go's lookup profile
 keeps them (nontransitional): U+00DF stays U+00DF, it is not mapped to ss.

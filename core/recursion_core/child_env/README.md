@@ -124,7 +124,12 @@ Foundry switches are dropped. The child gets one only from the route:
   U+1C80 maps to U+0432 (`xn--b1a`). `faß。invalid`, `ｆａß.invalid`, `fªß.invalid`
   and `fa` plus a variation selector match `xn--fa-hia.invalid`. An entry that maps to empty or
   only dots (`\u00ad`, `。`, and a literal `.` or `.:443` against a trailing-dot host) refuses.
-  Trailing dots are stripped again after that mapping.
+  A code point the 15.1 table does not map, ignore, or accept refuses too: IDNA2003 is not
+  a fallback, because it would rewrite `ß` to `ss` and miss the name a newer Go lookup uses.
+  Trailing dots are stripped again after that mapping. Before that strip, requests' suffix
+  test is applied to the hostname and to `hostname:port` (engine endpoints are HTTPS, port
+  443; a route uses its own origin port). `:443`, `443`, `43` and `3` therefore match
+  `https://gateway.invalid`.
   A leading `*.` is normalised the same way, so `*.bücher.invalid` matches
   `sub.xn--bcher-kva.invalid`. Dropping an ignored character does not turn `.*` into a
   match-all. Final sigma

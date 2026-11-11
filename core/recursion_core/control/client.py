@@ -22,7 +22,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from recursion_core.control_transport import PlatformNotSupported, TransportBusy, TransportRefused, UnixControlClient
+from recursion_core.control_transport import (PeerNotAdmitted, PlatformNotSupported, TransportBusy, TransportRefused,
+                                              UnixControlClient)
 
 SOCKET_DIR = "recursion"  # $XDG_RUNTIME_DIR/recursion/control.sock
 UNAVAILABLE = "control_api_unavailable"
@@ -66,6 +67,8 @@ class SocketAPI:
             reply = client.request({"op": "control", "method": method, "params": dict(params or {})})
         except TransportBusy:
             return {"code": UNAVAILABLE, "delivered": False, "detail": "busy"}
+        except PeerNotAdmitted:  # refused at accept (a peer inside a run unit): no handler saw the request
+            return {"code": UNAVAILABLE, "delivered": False, "detail": "daemon:scope_refused"}
         except (OSError, TransportRefused) as err:
             return {"code": UNAVAILABLE, "delivered": "unknown", "detail": f"request:{type(err).__name__}"}
         finally:

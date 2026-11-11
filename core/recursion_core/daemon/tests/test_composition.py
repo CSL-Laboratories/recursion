@@ -364,7 +364,14 @@ class ComposedDaemonTest(unittest.TestCase):
         _, composed = self.boot()
         with mock.patch.object(adapter, 'peer_is_engine', return_value=True):
             answer = self.api(composed).call('run.list')
-        self.assertEqual(answer, {'code': 'control_api_unavailable', 'delivered': True, 'detail': 'daemon:scope_refused'})
+            # Refused at accept, before a connection slot or a frame (ADV1-4): the request was never delivered.
+            self.assertEqual(answer, {'code': 'control_api_unavailable', 'delivered': False,
+                                      'detail': 'daemon:scope_refused'})
+            self.assertEqual(composed.server.refused, ['not_admitted'])
+            # The per-request check stays: a peer that is inside a run unit by the time it sends a frame.
+            conn = mock.Mock(peer=mock.Mock(pid=os.getpid()))
+            self.assertEqual(composed.control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, conn),
+                             {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}})
         self.assertFalse(adapter.peer_is_engine(os.getpid()))
         for unreadable in (None, 0, -1, 2 ** 22 + 12345):
             self.assertTrue(adapter.peer_is_engine(unreadable))  # fail closed
@@ -837,18 +844,42 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual((result['code'], result['detail'], result['breaker_effect']),
                          (c.LAUNCH_REFUSED, 'no_run_context', 'none'))
 
+    def test_a_systemd_run_that_cannot_pass_argv_verbatim_refuses_the_launch(self):
+        # ADV1-11: no --expand-environment=no, no launch. The flag is never dropped to make an old systemd work.
+        for version in ('systemd 253 (253.5-1)\n', 'systemd 249\n', '', 'not systemd\n',
+                        subprocess.CalledProcessError(1, ['systemd-run']), FileNotFoundError(2, 'systemd-run')):
+            with self.subTest(version=version):
+                manager = launcher.EngineUnitManager()
+                calls = []
+
+                def call(argv, version=version, calls=calls):
+                    calls.append(argv)
+                    if isinstance(version, BaseException):
+                        raise version
+                    return version
+
+                manager._call = call
+                with self.assertRaises(c.RouteError) as caught:
+                    manager.start('recursion-run-run-1.service', ['/opt/claude', '$HOME'])
+                self.assertEqual((caught.exception.code, caught.exception.detail),
+                                 (c.LAUNCH_REFUSED, 'systemd_run_cannot_pass_argv_verbatim'))
+                self.assertEqual(calls, [['systemd-run', '--version']])
+        manager = launcher.EngineUnitManager()
+        manager._call = lambda argv: 'systemd 254 (254.1)\n' if '--version' in argv else ''
+        manager.start('recursion-run-run-1.service', ['/opt/claude', '$HOME'])
+
     def test_unit_command_carries_the_916_stop_properties_and_file_stdio(self):
         manager = launcher.EngineUnitManager()
         calls = []
-        manager._call = lambda argv: calls.append(argv) or ''
+        manager._call = lambda argv: calls.append(argv) or ('systemd 257 (257.13-1)\n' if '--version' in argv else '')
         run_dir = self.tmp / 'runs' / 'run-1'
         launch = self.launcher(manager=manager)
         manager.prepare('recursion-run-run-1.service', properties=launch.unit_properties(run_dir),
                         working_directory=self.tmp / 'homes' / 'claude_code')
         manager.start('recursion-run-run-1.service', launch.unit_argv('/opt/claude', ['claude', '-p'], run_dir / 'env.fifo'))
-        self.assertEqual(calls, [[
+        self.assertEqual(calls, [['systemd-run', '--version'], [
             'systemd-run', '--user', '--quiet', '--unit=recursion-run-run-1.service', '--service-type=exec',
-            '--property=KillMode=control-group', '--property=Delegate=yes', '--property=RemainAfterExit=yes',
+            '--expand-environment=no', '--property=KillMode=control-group', '--property=Delegate=yes', '--property=RemainAfterExit=yes',
             '--property=KillSignal=SIGINT', '--property=TimeoutStopSec=2s', '--property=SendSIGKILL=yes',
             f'--property=StandardInput=file:{run_dir}/stdin.fifo',
             f'--property=StandardOutput=append:{run_dir}/stdout.jsonl',
@@ -856,10 +887,12 @@ class LauncherTest(unittest.TestCase):
             f'--working-directory={self.tmp}/homes/claude_code', '--',
             sys.executable, '-I', '-S', str(launcher.ENGINE_EXEC), f'{run_dir}/env.fifo', '--', '/opt/claude', '-p']])
         # No PartOf/BindsTo to the daemon, no environment and no PAM session in the unit command.
-        self.assertFalse([a for a in calls[0] if 'PartOf' in a or 'BindsTo' in a or 'setenv' in a.lower()
+        self.assertFalse([a for a in calls[1] if 'PartOf' in a or 'BindsTo' in a or 'setenv' in a.lower()
                           or 'Environment' in a or 'PAMName' in a])
         with self.assertRaises(ValueError):
             manager.start('recursion-run-run-2.service', [])
+        manager.start('recursion-run-run-3.service', ['/opt/claude'])
+        self.assertEqual([call[:2] for call in calls[2:]], [['systemd-run', '--user']])  # the version is read once
         self.assertFalse(launcher._unit_path_ok('/tmp/with space/run'))
         self.assertFalse(launcher._unit_path_ok('/tmp/a/../b'))
         self.assertTrue(launcher._unit_path_ok(str(run_dir)))

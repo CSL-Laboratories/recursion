@@ -5,6 +5,11 @@ chmods the socket to 0600, and checks the peer's uid on every accepted connectio
 reading a byte. A refused peer gets no frame back: there is no pre-auth face (CX-026). An
 authenticated peer over the connection cap gets a typed ``busy`` frame instead. The uid
 check is authentication only: the handler gets the peer's credentials and grants scopes.
+The layer above may also pass ``admit``, asked at accept before a slot is taken: a peer it
+refuses gets one typed frame and is closed, so it can never hold a slot. And it may name
+``priority`` requests (Stop) with ``reserved_connections``: when every ordinary slot is
+taken, a connection is served on a reserved slot for one such request, so ``busy`` does
+not keep a Stop out.
 Remote control reaches this socket over an SSH stdio relay; nothing here opens a network
 listener, and any network-shaped address raises ``RemoteBindRefused``.
 
@@ -30,7 +35,8 @@ try:
 except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 stub path
     fcntl = None  # type: ignore[assignment]
 
-from .errors import FrameError, InsecureSocketPath, PeerRefused, PlatformNotSupported, RemoteBindRefused, TransportBusy
+from .errors import (FrameError, InsecureSocketPath, PeerNotAdmitted, PeerRefused, PlatformNotSupported,
+                     RemoteBindRefused, TransportBusy)
 from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
 from .handlers import Connection, Handler, Message
 from .peercred import PeerCred, get_peer_cred
@@ -47,6 +53,12 @@ IDLE_TIMEOUT_S = 30.0
 BUSY_FRAME = encode_frame(
     {"ok": False, "error": {"code": "busy", "layer": "transport", "delivered": False, "retryable": True}}
 )
+# Sent, without reading anything, to an authenticated peer the admission check refused.
+NOT_ADMITTED_FRAME = encode_frame(
+    {"ok": False, "error": {"code": "scope_refused", "layer": "transport", "delivered": False, "retryable": False}}
+)
+# A connection on a reserved slot must send its one priority request within this long.
+RESERVED_TIMEOUT_S = 2.0
 _ACCEPT_POLL_S = 0.1
 # Linux sun_path is 108 bytes including the trailing NUL.
 _MAX_SUN_PATH = 107
@@ -221,6 +233,13 @@ class UnixControlServer:
     ``Connection``; the uid check here is authentication only and grants no scope.
     ``peer_cred`` is injectable so tests can simulate a foreign uid without changing the
     real one; production uses ``get_peer_cred`` (SO_PEERCRED on Linux).
+
+    ``admit(peer) -> bool`` is asked at accept, before a slot is taken. Anything but ``True``
+    (an exception too) sends ``NOT_ADMITTED_FRAME`` and closes. ``priority(request) -> bool``
+    with ``reserved_connections`` keeps that many extra slots for connections that arrive
+    when the ordinary ones are all taken: each serves one request, within
+    ``reserved_timeout_s``, and only if ``priority`` says so; any other request gets the
+    ``busy`` frame, not delivered. The handler still sees every request it is given.
     """
 
     def __init__(
@@ -233,12 +252,18 @@ class UnixControlServer:
         max_connections: int = MAX_CONNECTIONS,
         idle_timeout_s: float = IDLE_TIMEOUT_S,
         max_frame_bytes: int = MAX_FRAME_BYTES,
+        admit: Callable[[PeerCred], bool] | None = None,
+        priority: Callable[[Message], bool] | None = None,
+        reserved_connections: int = 0,
+        reserved_timeout_s: float = RESERVED_TIMEOUT_S,
     ) -> None:
         directory = refuse_remote_bind(directory)
         if not name or "/" in name or name in (".", ".."):
             raise InsecureSocketPath("socket name must be a single path component")
         if max_connections < 1:
             raise ValueError("max_connections must be positive")
+        if reserved_connections < 0 or (reserved_connections and priority is None):
+            raise ValueError("reserved_connections needs a priority test and cannot be negative")
         self.directory = directory
         self._path = refuse_remote_bind(os.path.join(directory, name))
         self._handler = handler
@@ -246,6 +271,10 @@ class UnixControlServer:
         require_unix_transport()
         self._uid = os.geteuid()
         self._slots = threading.BoundedSemaphore(max_connections)
+        self._admit = admit
+        self._priority = priority
+        self._reserved = threading.BoundedSemaphore(reserved_connections) if reserved_connections else None
+        self._reserved_timeout_s = reserved_timeout_s
         self._idle_timeout_s = idle_timeout_s
         self._max_frame_bytes = max_frame_bytes
         self._stop = threading.Event()
@@ -365,18 +394,27 @@ class UnixControlServer:
                 self._refuse(str(exc))
                 conn.close()
                 continue
-            if not self._slots.acquire(blocking=False):
-                # The peer is authenticated, so it gets a typed answer instead of a silent
-                # close it could not tell from a foreign-uid refusal.
-                self._refuse("max_connections")
-                _send_busy(conn)
+            if self._admit is not None and not self._admitted(cred):
+                # Before any slot: a peer the layer above refuses can never hold one.
+                self._refuse("not_admitted")
+                _send_nowait(conn, NOT_ADMITTED_FRAME)
                 conn.close()
                 continue
+            slots = self._slots
+            if not slots.acquire(blocking=False):
+                slots = self._reserved
+                if slots is None or not slots.acquire(blocking=False):
+                    # The peer is authenticated, so it gets a typed answer instead of a silent
+                    # close it could not tell from a foreign-uid refusal.
+                    self._refuse("max_connections")
+                    _send_nowait(conn, BUSY_FRAME)
+                    conn.close()
+                    continue
             with self._lock:
                 self._next_conn_id += 1
                 connection = Connection(conn_id=self._next_conn_id, peer=cred)
             worker = threading.Thread(
-                target=self._serve, args=(conn, connection), name="control-transport-conn", daemon=True
+                target=self._serve, args=(conn, connection, slots), name="control-transport-conn", daemon=True
             )
             with self._lock:
                 self.accepted += 1
@@ -390,12 +428,19 @@ class UnixControlServer:
                     self._workers.discard(worker)
                     self._conns.discard(conn)
                 conn.close()
-                self._slots.release()
+                slots.release()
 
-    def _serve(self, conn: socket.socket, connection: Connection) -> None:
+    def _admitted(self, cred: PeerCred) -> bool:
+        try:
+            return self._admit(cred) is True  # type: ignore[misc]
+        except Exception:  # an admission check that fails refuses; it never stops the accept loop
+            return False
+
+    def _serve(self, conn: socket.socket, connection: Connection, slots: threading.BoundedSemaphore) -> None:
+        reserved = slots is not self._slots
         try:
             while not self._stop.is_set():
-                deadline = time.monotonic() + self._idle_timeout_s
+                deadline = time.monotonic() + (self._reserved_timeout_s if reserved else self._idle_timeout_s)
                 try:
                     request = read_frame(conn, max_bytes=self._max_frame_bytes, deadline=deadline)
                 except FrameError as exc:
@@ -404,6 +449,11 @@ class UnixControlServer:
                 except OSError:
                     return
                 if request is None:
+                    return
+                if reserved and not self._is_priority(request):
+                    # No handler saw it: the same "not delivered, busy" a peer over the cap gets.
+                    self._refuse("max_connections")
+                    _send_nowait(conn, BUSY_FRAME)
                     return
                 try:
                     response = self._handler(request, connection)
@@ -422,32 +472,42 @@ class UnixControlServer:
                     return
                 except OSError:
                     return
+                if reserved:
+                    return  # one priority request per reserved connection
         finally:
             conn.close()
-            self._slots.release()
+            slots.release()
             with self._lock:
                 self._workers.discard(threading.current_thread())
                 self._conns.discard(conn)
 
 
-def _send_busy(conn: socket.socket) -> None:
-    """Best effort, never blocking the accept loop: the frame fits any socket buffer."""
+    def _is_priority(self, request: Message) -> bool:
+        try:
+            return self._priority(request) is True  # type: ignore[misc]
+        except Exception:
+            return False
+
+
+def _send_nowait(conn: socket.socket, frame: bytes) -> None:
+    """Best effort, never blocking the caller: a transport frame fits any socket buffer."""
     try:
         conn.setblocking(False)
-        conn.send(BUSY_FRAME)
+        conn.send(frame)
     except OSError:
         pass
 
 
-# The one transport-layer frame: what the accept loop sends a peer over the cap.
+# The transport-layer frames: what the accept loop sends a peer over the cap, and a peer it did not admit.
 _BUSY_MESSAGE = decode_body(BUSY_FRAME[HEADER.size:])
+_NOT_ADMITTED_MESSAGE = decode_body(NOT_ADMITTED_FRAME[HEADER.size:])
 
 
 def _handler_reply(response: Message) -> Message:
     """A handler reply may not speak for the transport layer.
 
-    ``layer: "transport"`` is reserved for the accept-path busy frame, which the client
-    reads as "not delivered". A handler that saw the request and answered with that layer
+    ``layer: "transport"`` is reserved for the accept-path busy and not-admitted frames, which the
+    client reads as "not delivered". A handler that saw the request and answered with that layer
     (a Stop that ran, then said busy) would make the client report not delivered and
     invite a duplicate retry. Such an error is rewritten to ``layer: "handler"`` and
     ``delivered: True``; the code is kept.
@@ -507,7 +567,8 @@ class UnixControlClient:
         back an earlier request's late reply (a Stop's answer as a ping's). The socket is
         closed instead, and a reply whose ``id`` differs from the request's is refused.
         ``timeout_s`` bounds the whole reply, not each ``recv``. A server at its connection
-        cap raises ``TransportBusy``: the request was not delivered.
+        cap raises ``TransportBusy``, and one that did not admit this peer ``PeerNotAdmitted``:
+        the request was not delivered.
         """
         with self._lock:
             sock = self._sock
@@ -519,15 +580,17 @@ class UnixControlClient:
                 try:
                     write_frame(sock, message, max_bytes=self._max_frame_bytes)
                 except OSError:
-                    # A busy server may have answered and hung up before our write landed.
-                    if _pending_busy(sock):
-                        raise TransportBusy("busy: server at its connection cap; request not delivered") from None
+                    # The server may have answered and hung up before our write landed.
+                    refusal = _pending_refusal(sock)
+                    if refusal is not None:
+                        raise refusal from None
                     raise
                 response = read_frame(sock, max_bytes=self._max_frame_bytes, deadline=deadline)
                 if response is None:
                     raise ConnectionError("server closed the connection")
-                if _is_busy(response):
-                    raise TransportBusy("busy: server at its connection cap; request not delivered")
+                refusal = _transport_refusal(response)
+                if refusal is not None:
+                    raise refusal
                 if "id" in message and response.get("id") != message["id"]:
                     raise FrameError("reply_id_mismatch")
             except BaseException:
@@ -549,9 +612,17 @@ class UnixControlClient:
         self.close()
 
 
-def _pending_busy(sock: socket.socket) -> bool:
+def _transport_refusal(response: Message) -> TransportBusy | PeerNotAdmitted | None:
+    if _is_busy(response):
+        return TransportBusy("busy: server at its connection cap; request not delivered")
+    if response == _NOT_ADMITTED_MESSAGE:
+        return PeerNotAdmitted("scope_refused: the server did not admit this peer; request not delivered")
+    return None
+
+
+def _pending_refusal(sock: socket.socket) -> TransportBusy | PeerNotAdmitted | None:
     try:
         reply = read_frame(sock, deadline=time.monotonic() + 0.5)
     except (OSError, FrameError):
-        return False
-    return reply is not None and _is_busy(reply)
+        return None
+    return _transport_refusal(reply) if reply is not None else None

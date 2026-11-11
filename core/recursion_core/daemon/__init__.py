@@ -6,10 +6,12 @@ try:
     import fcntl
 except ImportError:  # Windows has no fcntl; require_posix() refuses before anything uses it
     fcntl = None
+import json
 import logging
 import os
 from pathlib import Path
 import re
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -32,7 +34,10 @@ UNIT = re.compile(r'recursion-run-[a-zA-Z0-9_-]{1,64}\.service')
 # cgroup subtree read empty and no listed pid, including a descendant cgroup,
 # was alive; the loaded unit reached
 # inactive/failed/exited with its cgroup pruned and its main pid gone; or a
-# synchronous systemctl stop returned and the unit was then garbage-collected.
+# synchronous systemctl stop returned and the unit was then garbage-collected. A unit
+# systemd no longer knows is never an attested end on systemd's word alone: when the
+# run's control record carries a cgroup path, that path is walked, and only an absent
+# or empty cgroup there is the end (ADV1-1).
 # ENOENT and ESRCH are the only read errors that mean a pid or cgroup is gone.
 # Any other error reading cgroup.procs or /proc/<pid>/stat is unknown, not death.
 # lost_reboot: the run belongs to an earlier boot (boot_id changed). Its processes
@@ -44,6 +49,13 @@ SCHEMA_VERSION = 1
 # positive empty result: callers treat None as unknown, never as terminated.
 CGROUP_WALK_MAX_DEPTH = 64
 CGROUP_WALK_MAX_NODES = 4096
+# How long to re-read a recorded cgroup after its processes were sent SIGKILL.
+RECORDED_KILL_WAIT_S = 2.0
+# A stop request that failed (systemctl hung, exited oddly or is missing) is sent again by
+# the sweep only after a wait that doubles from the base to the cap (ADV1-6). A Stop the
+# operator asks for is always sent.
+STOP_RESEND_BASE_S = 30.0
+STOP_RESEND_MAX_S = 600.0
 
 
 def require_free_threaded():
@@ -681,6 +693,28 @@ class Registry:
                 return []
             return self.db.execute('SELECT run_id, record FROM control_runs ORDER BY run_id').fetchall()
 
+    def control_cgroup(self, run_id):
+        """The cgroup path ``run_id``'s control record carries, or None when it records none.
+
+        A record that cannot be read as one raises ValueError: that is not "no cgroup".
+        """
+        with self.lock:
+            self._ensure_open()
+            table = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                    "AND name='control_runs'").fetchone()
+            if table is None:
+                return None
+            row = self.db.execute('SELECT record FROM control_runs WHERE run_id=?', (run_id,)).fetchone()
+        if row is None:
+            return None
+        record = json.loads(row[0])
+        group = record.get('cgroup') if isinstance(record, dict) else False
+        if group is None or group == '':
+            return None
+        if not isinstance(group, str):
+            raise ValueError('control record carries no readable cgroup')
+        return group
+
     def close(self):
         with self.lock:
             if not self.closed:
@@ -713,11 +747,14 @@ class ServiceManager(Protocol):
 
 class Daemon:
     def __init__(self, registry: Registry, manager: ServiceManager,
-                 boot_id: Callable[[], str | None] = read_boot_id):
+                 boot_id: Callable[[], str | None] = read_boot_id,
+                 clock: Callable[[], float] = time.monotonic):
         require_posix()
         self.registry, self.manager, self.boot_id = registry, manager, boot_id
         self.lock = threading.RLock()
         self.closed = False
+        self.clock = clock
+        self._stop_resend = {}  # run_id -> (not before, wait) after a stop request that failed
 
     def _open(self):
         if self.closed:
@@ -746,7 +783,7 @@ class Daemon:
         with self.lock:
             self._open()
             self.registry.request_stop(run_id)
-            self._reconcile(self.registry.get(run_id))
+            self._reconcile(self.registry.get(run_id), send_stop=True)
             return self.registry.get(run_id)
 
     def reconcile(self, run_id):
@@ -756,8 +793,18 @@ class Daemon:
             self._reconcile(self.registry.get(run_id))
             return self.registry.get(run_id)
 
-    def _reconcile(self, run, detail=''):
+    def _stop_send_due(self, run_id):
+        held = self._stop_resend.get(run_id)
+        return held is None or self.clock() >= held[0]
+
+    def _stop_send_failed(self, run_id):
+        held = self._stop_resend.get(run_id)
+        wait = STOP_RESEND_BASE_S if held is None else min(held[1] * 2, STOP_RESEND_MAX_S)
+        self._stop_resend[run_id] = (self.clock() + wait, wait)
+
+    def _reconcile(self, run, detail='', send_stop=False):
         if run.state in TERMINAL:
+            self._stop_resend.pop(run.run_id, None)
             return
         boot = self.boot_id()
         if run.boot_id and boot and run.boot_id != boot:
@@ -768,12 +815,19 @@ class Daemon:
             if boot is None:
                 raise OSError('boot_id unreadable')
             stopped = not_loaded = False
-            if run.stop_requested:
+            if run.stop_requested and (send_stop or self._stop_send_due(run.run_id)):
                 try:
                     self.manager.stop(run.unit)
                     stopped = True
                 except UnitNotLoaded:
                     not_loaded = True
+                except (OSError, subprocess.SubprocessError):
+                    self._stop_send_failed(run.run_id)
+                    raise
+                self._stop_resend.pop(run.run_id, None)
+            elif run.stop_requested:
+                # The last request failed and its wait is not over: only look, and keep saying why.
+                detail = detail or run.detail
             observation = self.manager.observe(run.unit)
             # A gone (not-found) unit is terminated only with a recorded Stop and either
             # this reconcile's stop returning (systemctl stop waits for inactive, then
@@ -782,10 +836,21 @@ class Daemon:
             # unit, or a run that never launched. Either way nothing runs under the unit,
             # and a same-name unit that appears later is stopped by the orphan sweep. A unit
             # that is merely absent with no recorded Stop may never have launched: unknown.
+            # systemd's word that the unit is gone says nothing about a process still sitting
+            # in the cgroup the run was recorded with (a user manager that was killed and
+            # restarted forgets its units; their processes stay). So the recorded cgroup is
+            # walked, and what is still alive there is killed through the cgroup (ADV1-1).
             if observation == 'gone' and (stopped or not_loaded):
-                observation = 'empty'
-                if not_loaded and not detail:
-                    detail = 'stop: unit not loaded, unit gone'
+                clear = self._recorded_cgroup_clear(run)
+                if clear is True:
+                    observation = 'empty'
+                    if not_loaded and not detail:
+                        detail = 'stop: unit not loaded, unit gone'
+                elif clear is False:
+                    observation = 'running'
+                    detail = detail or 'unit gone; the recorded cgroup still holds a process'
+                else:
+                    detail = detail or 'unit gone; the recorded cgroup could not be read'
             state = {'running': 'stopping' if run.stop_requested else 'running',
                      'empty': 'terminated'}.get(observation, 'unknown')
         except (OSError, subprocess.SubprocessError) as exc:
@@ -795,7 +860,34 @@ class Daemon:
         if state == 'terminated' and not self._termination_attested(run.unit):
             state = 'stopping' if run.stop_requested else 'unknown'
             detail = detail or 'process still alive; termination not attested'
-        self.registry.state(run.run_id, state, detail)
+        # An observation that changes nothing is not written: every write is a full publish
+        # of the registry file (ADV1-6).
+        if (state, detail[:500]) != (run.state, run.detail):
+            self.registry.state(run.run_id, state, detail)
+
+    def _recorded_cgroup_clear(self, run):
+        """True when the cgroup recorded for ``run`` is absent or empty, False when a process
+        is still alive in it, None when that cannot be told.
+
+        The recorded path is the one on the run's control record. A run with none (it never
+        launched, or the launch was never recorded) has no path to walk: no receipt can say
+        ``stopped`` for it either, because the control API confirms only a recorded cgroup.
+        """
+        try:
+            group = self.registry.control_cgroup(run.run_id)
+        except ValueError:
+            log.exception('control record of %s is unreadable; its cgroup was not walked', run.run_id)
+            return None
+        if group is None:
+            return True
+        check = getattr(self.manager, 'recorded_cgroup_clear', None)
+        if not callable(check):
+            return None
+        try:
+            return check(run.unit, group)
+        except Exception:
+            log.exception('walk of the recorded cgroup of %s failed', run.run_id)
+            return None
 
     def _termination_attested(self, unit):
         attest = getattr(self.manager, 'processes_gone', None)
@@ -1028,6 +1120,82 @@ class SystemdUserManager:
         if unknown or subtree_populated:
             return None
         return False
+
+    recorded_kill_wait_s = RECORDED_KILL_WAIT_S
+
+    def recorded_cgroup_clear(self, unit, group):
+        """Read the cgroup a run was recorded with, for a unit systemd no longer knows.
+
+        True: the directory is absent, or its whole subtree was walked with no populated
+        bit and no listed pid alive. False: a process is still alive there. None: the path
+        does not name this unit, or the walk could not be finished.
+
+        The caller holds a recorded Stop and systemd has no unit left to stop, so processes
+        found here are killed through the cgroup: ``cgroup.kill`` where the kernel has it,
+        otherwise SIGKILL by pidfd to each pid of ``cgroup.procs`` that /proc still places
+        in this cgroup. The subtree is then re-read until it is empty or the wait runs out.
+        """
+        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
+                or not UNIT.fullmatch(unit) or Path(group).name != unit):
+            return None
+        directory = self.cgroup_root / group.lstrip('/')
+        live = self._recorded_cgroup_live(directory, group)
+        if live is not True or not self._kill_recorded_cgroup(directory, group):
+            return None if live is None else not live
+        deadline = time.monotonic() + self.recorded_kill_wait_s
+        while True:
+            live = self._recorded_cgroup_live(directory, group)
+            if live is False:
+                return True
+            if time.monotonic() >= deadline:
+                return None if live is None else False
+            time.sleep(0.05)
+
+    def _recorded_cgroup_live(self, directory, group):
+        try:
+            directory.lstat()
+        except OSError as exc:
+            # The kernel removes a cgroup directory only once it holds no process.
+            return False if exc.errno == errno.ENOENT else None
+        return self._process_still_live({}, group)
+
+    def _kill_recorded_cgroup(self, directory, group):
+        """SIGKILL what is in the recorded cgroup. True when any kill was delivered."""
+        try:
+            fd = os.open(directory / 'cgroup.kill', os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            fd = None
+        if fd is not None:
+            try:
+                os.write(fd, b'1')
+                return True
+            except OSError:
+                pass  # fall back to the pids
+            finally:
+                os.close(fd)
+        walked = self._subtree(directory)
+        delivered = False
+        for pid in (walked[0] if walked else ()):
+            delivered = self._kill_member(pid, group) or delivered
+        return delivered
+
+    def _kill_member(self, pid, group):
+        """SIGKILL ``pid`` by pidfd, only while /proc still places it inside ``group``."""
+        try:
+            fd = os.pidfd_open(pid)
+        except OSError:
+            return False
+        try:
+            lines = Path(f'/proc/{pid}/cgroup').read_text().splitlines()
+            paths = [line.split(':', 2)[-1] for line in lines if line.startswith('0::')]
+            if not any(path == group or path.startswith(group + '/') for path in paths):
+                return False  # the number was reused, or the cgroup file is not the kernel's
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
 
     def processes_gone(self, unit):
         """Attest the unit's processes are gone. A scripted observe() string is not this."""

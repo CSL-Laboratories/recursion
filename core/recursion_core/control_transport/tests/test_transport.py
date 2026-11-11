@@ -550,6 +550,64 @@ class ConnectionBoundTests(_TmpCase):
         holder.close()
         self.assertTrue(_wait_for(lambda: _new_peer_served(srv.path)))
 
+    def test_a_peer_the_admission_check_refuses_gets_one_typed_frame_and_no_slot(self) -> None:
+        """ADV1-4: admission is decided at accept, so a refused peer can never hold a connection slot."""
+        recorder = _Recorder()
+        verdicts = [False]
+
+        def admit(cred):
+            if verdicts[0] == "raise":
+                raise RuntimeError("cgroup unreadable")
+            return verdicts[0]
+
+        srv = self.server(ct.with_ping_health(recorder), max_connections=1, admit=admit)
+        for verdict in (False, None, 1, "raise"):  # only True admits; a failing check refuses
+            verdicts[0] = verdict
+            for _ in range(3):  # more refused peers than there are slots
+                with self.assertRaises(ct.PeerNotAdmitted):
+                    UnixControlClient(srv.path).request({"op": "stop", "run_id": "r1"})
+        self.assertTrue(_wait_for(lambda: srv.refused == ["not_admitted"] * 12), srv.refused)
+        self.assertEqual((srv.accepted, recorder.seen), (0, []))
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(5)
+            raw.connect(srv.path)
+            self.assertEqual(framing.read_frame(raw), {"ok": False, "error": {
+                "code": "scope_refused", "layer": "transport", "delivered": False, "retryable": False}})
+            self.assertEqual(raw.recv(1), b"")  # closed at once, nothing read
+        verdicts[0] = True
+        with UnixControlClient(srv.path) as admitted:
+            self.assertEqual(admitted.request({"op": "ping"})["op"], "pong")
+
+    def test_a_reserved_connection_serves_one_priority_request_when_every_slot_is_held(self) -> None:
+        """ADV1-4: with all ordinary slots held, Stop still gets through; anything else is busy, undelivered."""
+        recorder = _Recorder()
+        srv = self.server(ct.with_ping_health(recorder), max_connections=1, idle_timeout_s=30.0,
+                          priority=lambda request: request.get("op") == "stop", reserved_connections=1,
+                          reserved_timeout_s=0.5)
+        holder = UnixControlClient(srv.path)
+        self.addCleanup(holder.close)
+        self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
+        with UnixControlClient(srv.path) as stopper:
+            self.assertTrue(stopper.request({"op": "stop", "run_id": "r1"})["ok"])
+            with self.assertRaises((ConnectionError, OSError)):  # one request per reserved connection
+                stopper.request({"op": "stop", "run_id": "r2"})
+        self.assertEqual([message["run_id"] for message in recorder.seen], ["r1"])
+        with self.assertRaises(ct.TransportBusy):
+            UnixControlClient(srv.path).request({"op": "ping"})
+        # A reserved connection that sends nothing is closed at its short deadline and frees the slot.
+        idle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with idle:
+            idle.settimeout(5)
+            idle.connect(srv.path)
+            started = time.monotonic()
+            self.assertEqual(idle.recv(1), b"")
+            self.assertLess(time.monotonic() - started, 3.0)
+        with UnixControlClient(srv.path) as stopper:
+            self.assertTrue(stopper.request({"op": "stop", "run_id": "r3"})["ok"])
+        with self.assertRaises(ValueError):
+            self.server(name="other.sock", reserved_connections=1)
+
     def test_stop_with_every_slot_held_gets_a_typed_refusal_not_a_silent_close(self) -> None:
         """S6/D3: a Stop the server cannot take must come back as 'not delivered', typed."""
         recorder = _Recorder()

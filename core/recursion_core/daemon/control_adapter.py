@@ -73,9 +73,18 @@ OUTPUT_TAIL_LINES = 50
 ENDED, LOST_REBOOT = 'ended', 'lost_reboot'
 WIRED_ENGINES = ('claude_code', 'codex')  # the engines compose_control builds an adapter and a launcher for
 NO_BAR_EVIDENCE = 'no bar evidence is recorded by the daemon'
+# reconcile() asks again for a Stop whose request never got through only after a wait that doubles
+# from the base to the cap (ADV1-6).
+STOP_RETRY_BASE_S, STOP_RETRY_MAX_S = 30.0, 600.0
+# Socket connections kept for run.stop when every ordinary one is taken (ADV1-4).
+STOP_RESERVED_CONNECTIONS = 4
 
 
 # -- registry ------------------------------------------------------------------------------------
+class ControlRecordInvalid(ValueError):
+    """A stored control record is not a JSON object for the run it is filed under."""
+
+
 class DurableRunRegistry(InMemoryRunRegistry):
     """The control API's registry, with every stored record written to the daemon registry first.
 
@@ -84,12 +93,19 @@ class DurableRunRegistry(InMemoryRunRegistry):
     earlier daemon stored. A write that cannot be made durable raises, the in-memory copy is
     left as it was, and the control API answers ``registry_unavailable`` or ``recorded: false``.
     A stored ``stopped`` record that fails the attestation check at load is refused with
-    ``StopUnattested``: the daemon does not start on a registry it cannot trust.
+    ``StopUnattested``, and a row that is not a JSON object carrying the run id it is filed under
+    with ``ControlRecordInvalid`` (ADV1-7: a non-string ``run_id`` used to load and then break every
+    list and reconcile). The daemon does not start on a registry it cannot trust.
     """
 
     def __init__(self, store, *, processes=None):
         self._durable = None
-        records = [json.loads(text) for _, text in store.control_all()]
+        records = []
+        for run_id, text in store.control_all():
+            rec = json.loads(text)
+            if not isinstance(rec, dict) or rec.get('run_id') != run_id:
+                raise ControlRecordInvalid(f'control record filed under {run_id!r} is not a record of that run')
+            records.append(rec)
         super().__init__(records, processes=processes)
         self._durable = store
 
@@ -304,6 +320,9 @@ class DaemonControl:
         self._state = Path(state_dir)
         self._routes, self.plugins, self._breaker = dict(routes or {}), plugins, breaker
         self._breaker_store = breaker_store
+        self._stop_retry = {}  # run_id -> (not before, wait) for a Stop reconcile() could not get sent
+        self._starts_lock = threading.Lock()
+        self._starts_in_flight = 0  # run.start calls of this process that have not answered yet
 
     # -- calls ---------------------------------------------------------------------------------
     def call(self, method, params=None):
@@ -313,7 +332,18 @@ class DaemonControl:
             if self.plugins is None:
                 return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
             return {'code': 'ok', **self.plugins.inventory()}
-        answer = self.api.call(method, dict(params or {}))
+        if method != 'run.start':
+            answer = self.api.call(method, dict(params or {}))
+        else:
+            # The API writes the launch intent before the starter knows the run. reconcile() must not
+            # read that gap as a start that never reached a unit (ADV1-8).
+            with self._starts_lock:
+                self._starts_in_flight += 1
+            try:
+                answer = self.api.call(method, dict(params or {}))
+            finally:
+                with self._starts_lock:
+                    self._starts_in_flight -= 1
         if method == 'run.start' and answer.get('code') == 'start_failed':
             failure = self.starter.failures.get(answer.get('run_id'))
             if failure is not None:
@@ -441,7 +471,8 @@ class DaemonControl:
           request, confirm and attestation path as any Stop.
         * A ``starting`` record with no cgroup that this process is not launching is a start the
           previous daemon did not finish recording. With a unit row, the unit's cgroup is recorded
-          so Stop can reach it; with none, no unit was ever started and it is ``start_failed``.
+          so Stop can reach it; with none, no unit was ever started and it is ``start_failed``
+          (decided only while no ``run.start`` of this process is in flight).
         """
         try:
             records = self.registry.list()
@@ -465,6 +496,9 @@ class DaemonControl:
             if self.starter.active(run_id):
                 return  # this process is still launching it; the start records its own outcome
             if row is None:
+                with self._starts_lock:
+                    if self._starts_in_flight:
+                        return  # it may be a start in flight here; a start left by an earlier daemon waits a pass
                 rec['state'] = 'start_failed'
                 self.registry.put(rec)
                 return
@@ -475,9 +509,25 @@ class DaemonControl:
                     rec = self.registry.put(rec)
         if rec.get('state') == 'stopped' or not rec.get('cgroup'):
             return
-        if (row is not None and row.stop_requested) or rec.get('state') == 'stop_pending' \
-                or rec.get('stop') is not None:
-            self.api.call('run.stop', {'run_id': run_id})
+        stop = rec.get('stop')
+        if not ((row is not None and row.stop_requested) or rec.get('state') == 'stop_pending' or stop is not None):
+            return
+        if rec.get('state') == 'stop_pending' and isinstance(stop, dict) and stop.get('requested') \
+                and (stop.get('cgroup'), stop.get('cgroup_marker')) == (rec.get('cgroup'), rec.get('cgroup_marker')):
+            # The request was sent and "pending" is recorded. Nothing is written or waited for again
+            # until one observation of the unit attests the end (ADV1-6: no rewrite every sweep).
+            if row is None or self.daemon.reconcile(run_id).state != 'terminated':
+                return
+        else:
+            held = self._stop_retry.get(run_id)
+            if held is not None and time.monotonic() < held[0]:
+                return
+        if self.api.call('run.stop', {'run_id': run_id}).get('code') == 'pending':
+            wait = min(self._stop_retry[run_id][1] * 2, STOP_RETRY_MAX_S) if run_id in self._stop_retry \
+                else STOP_RETRY_BASE_S
+            self._stop_retry[run_id] = (time.monotonic() + wait, wait)
+        else:
+            self._stop_retry.pop(run_id, None)
 
     # -- socket --------------------------------------------------------------------------------
     def handle(self, message, conn):
@@ -522,6 +572,15 @@ class DaemonControl:
         return 404, b'{"error": "not_found"}'
 
 
+def admit_peer(cred):
+    """Asked by the socket at accept, before a slot: a peer inside a run unit is closed at once (ADV1-4)."""
+    return not peer_is_engine(cred.pid)
+
+
+def is_stop_request(message):
+    return message.get('op') == 'control' and message.get('method') == 'run.stop'
+
+
 def peer_is_engine(pid):
     """True when the peer is inside a ``recursion-run-*`` unit, or its cgroup cannot be read."""
     if not isinstance(pid, int) or pid <= 0:
@@ -533,6 +592,25 @@ def peer_is_engine(pid):
     return any('recursion-run-' in part for line in text.splitlines() for part in line.split('/'))
 
 
+def door_directory(directory):
+    """Create the door's directory at 0700, or check the one that is there.
+
+    Like the transport (``ensure_private_dir``), an existing directory that is a symlink, is not
+    ours, or grants any group or other bit is refused, not repaired: the door runs before the
+    transport's check, and a chmod here would hide a wrong place from it (ADV1-13).
+    """
+    path = Path(directory)
+    if not path.exists() and not path.is_symlink():
+        return private_dir(path)
+    require_launcher_platform()
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise PermissionError(f'{path} must be an operator-owned directory')
+    if info.st_mode & 0o077:
+        raise PermissionError(f'{path} has mode {stat.S_IMODE(info.st_mode):04o}, want 0700')
+    return path
+
+
 class DeviceDoor:
     """The GUI's device door: a per-daemon-start secret in an owner-only runtime file.
 
@@ -541,20 +619,31 @@ class DeviceDoor:
     lives only in ``$XDG_RUNTIME_DIR/recursion/gui-device-token`` (0600 in a 0700 directory) and is
     never logged. There is no pairing page and no remote path: holding the token means being able
     to read the operator's runtime directory on this machine.
+
+    ``publish=False`` makes the door without writing the file; ``publish()`` writes it. The composition
+    publishes only once the control socket is its own, and ``close`` removes only the file this door
+    wrote, so a composition that loses the socket lock leaves the live daemon's token file alone (ADV1-12).
     """
 
-    def __init__(self, directory):
-        private_dir(directory)
+    def __init__(self, directory, *, publish=True):
+        door_directory(directory)
         self.path = Path(directory) / DEVICE_TOKEN_FILE
         self._token = secrets.token_urlsafe(32)
+        self._published = None  # (device, inode) of the token file this door wrote
+        if publish:
+            self.publish()
+
+    def publish(self):
         tmp = self.path.with_name(DEVICE_TOKEN_FILE + '.tmp')
         fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
             os.fchmod(fd, 0o600)
             os.write(fd, self._token.encode() + b'\n')
+            info = os.fstat(fd)
         finally:
             os.close(fd)
         os.replace(tmp, self.path)
+        self._published = (info.st_dev, info.st_ino)
 
     def __call__(self, env):
         offered = []
@@ -571,8 +660,11 @@ class DeviceDoor:
                    for value in offered)
 
     def close(self):
+        published, self._published = self._published, None
         try:
-            os.unlink(self.path)
+            info = os.lstat(self.path)
+            if published == (info.st_dev, info.st_ino):  # never a file another door wrote
+                os.unlink(self.path)
         except OSError:
             pass
 
@@ -653,14 +745,24 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
                             breaker=breaker, breaker_store='durable' if breaker is not None
                             else f'unavailable: {breaker_unavailable}')
     directory = socket_directory(environ)
-    door = DeviceDoor(directory)
-    server = UnixControlServer(directory, with_ping_health(control.handle))
-    try:
-        server.start()
-    except BaseException:
-        door.close()
+    door = DeviceDoor(directory, publish=False)
+    server = UnixControlServer(directory, with_ping_health(control.handle), admit=admit_peer,
+                               priority=is_stop_request, reserved_connections=STOP_RESERVED_CONNECTIONS)
+    def release():
+        door.close()  # removes only a token file this door wrote
         for item in (plugins, breaker):
             if item is not None:
                 item.close()
+
+    try:
+        server.start()
+    except BaseException:
+        release()
+        raise
+    try:
+        door.publish()  # only now: the socket lock is ours, so no live daemon's token file is replaced
+    except BaseException:
+        server.close()
+        release()
         raise
     return Composition(control, server, door, plugins, breaker)

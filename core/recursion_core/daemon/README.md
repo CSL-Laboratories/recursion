@@ -98,12 +98,21 @@ are unaffected:
   `systemctl stop` answered "Unit ... not loaded" (exit 5) and the unit reads
   not-found, as when a replayed Stop finds the unit an earlier stop already ended
   and collected; the orphan sweep stops any same-name unit that appears later) and
-  `lost_reboot`. A scripted observation that the unit ended, or a listener that is
+  `lost_reboot`. A unit systemd no longer knows is never ended on systemd's word
+  alone: when the run's control record carries a cgroup path, that path is walked,
+  what is still alive there is killed through the cgroup (`cgroup.kill`, else
+  SIGKILL by pidfd to each listed pid /proc still places there), and only an
+  absent or empty cgroup is `terminated`; otherwise the run stays `stopping`. A scripted observation that the unit ended, or a listener that is
   still alive, is not `terminated`. A read of `cgroup.procs` or `/proc/<pid>/stat`
   that fails with anything other than ENOENT or ESRCH is unknown, not an empty
   cgroup and not a dead process, and is not `terminated`. A run with a recorded
   Stop is never reported `running`. Anything not positively observed is
   `unknown`, never `terminated`.
+
+A stop request that failed (`systemctl` hung, exited oddly or is missing) is sent
+again by the sweep only after a wait that doubles from 30 s to 10 min; a Stop the
+operator asks for is always sent. An observation that changes nothing is not
+written, so an unconfirmable Stop does not rewrite the registry on every sweep.
 
 ## Reboot
 
@@ -144,7 +153,10 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
   `$XDG_RUNTIME_DIR/recursion/control.sock` (directory 0700, socket 0600, peer uid checked
   on both ends). A peer whose cgroup is a `recursion-run-*` unit, or cannot be read, is
   refused (`scope_refused`): the uid check alone would let an engine child stop or start
-  runs. Finer scopes do not exist yet.
+  runs. The refusal is decided at accept, before the peer takes a connection slot, and
+  again on every request. When all 16 slots are held, four reserved connections each
+  serve one `run.stop`; anything else there is `busy`, not delivered. A process that
+  left its unit's cgroup passes this check (see Limits). Finer scopes do not exist yet.
 - **CLI.** `python -m recursion_core.control list|status|stop|start|conditions` talks to that
   socket. Daemon down: `{"code": "control_api_unavailable", "delivered": false}`, exit 1.
 - **Durable run records.** `DurableRunRegistry` keeps the control API's records
@@ -174,7 +186,10 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
 - **GUI.** The loopback GUI gets the same object as its client and a real door:
   `DeviceDoor` accepts only `Authorization: Bearer <token>` or the `recursion_device`
   cookie matching a per-start random token in
-  `$XDG_RUNTIME_DIR/recursion/gui-device-token` (0600). Its Stop is `run.stop`. Its route
+  `$XDG_RUNTIME_DIR/recursion/gui-device-token` (0600), written once the control socket
+  is this daemon's. An existing runtime directory that is not 0700 is refused, not
+  repaired. Each connection has its own thread (at most 16) and five seconds for its
+  whole header. Its Stop is `run.stop`. Its route
   table is the daemon's own inventory (`route.list`): one row per engine the daemon has an
   adapter for (configured or `route_not_configured`), the CLI surface, the plugin panels
   and one `plugin:<id>` row per installed plugin, loaded or refused. The daemon records no

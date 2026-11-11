@@ -1107,13 +1107,16 @@ class SystemdManagerTests(unittest.TestCase):
         self.events(group, 0)
         (self.root / group.lstrip('/') / 'cgroup.procs').write_text('')
         root = self.root / group.lstrip('/')
-        real_iterdir = Path.iterdir
         real_lstat = Path.lstat
 
         def listing(count, produced, stated):
             def entries(path):
+                # An empty listing for every path except the root. Do not call
+                # Path.iterdir here: 3.12's is lazy, so returning it just ends
+                # this generator, but 3.13 lists immediately and raises
+                # FileNotFoundError for a fake child that was never created.
                 if path != root:
-                    return real_iterdir(path)
+                    return
                 for i in range(count):
                     produced.append(path / str(i))
                     yield path / str(i)

@@ -54,6 +54,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import threading
 import time
 
@@ -91,6 +92,12 @@ _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
 OPERATOR_DEADLINE_S = 10.0
 OPERATOR_TURN_WAIT_S = 1.5
 OPERATOR_TIMED_OUT = 'unavailable: operator plugin timed out'
+# ADV2-7 (owner call Nov 11 2:20am PST): a load-time finding, not a refusal. Only plugin.py's
+# bytes are digest- and signature-checked; whatever else it imports runs under the same grant.
+UNVERIFIED_IMPORTS = 'plugin_imported_unverified_modules'
+# Not reported: the daemon's own package and its signature backend, whose submodules the host's
+# own signature check can import for the first time while a plugin loads.
+_HOST_PACKAGES = frozenset({'recursion_core', 'cryptography'})
 
 
 class PluginRefused(Exception):
@@ -103,6 +110,26 @@ class PluginRefused(Exception):
 
 def _finding(code, severity, detail=''):
     return {'stage': 'daemon', 'code': code, 'severity': severity, 'detail': detail}
+
+
+def _first_imports(before, own=None):
+    """Non-stdlib modules in ``sys.modules`` now that were not in ``before``, sorted.
+
+    Left out: the standard library (top-level name in ``sys.stdlib_module_names``), the host's
+    packages (``_HOST_PACKAGES``), the plugin's own module object ``own`` under any name, and a
+    submodule whose parent package is itself listed (the package's entry covers it). A module that
+    was already imported before the load is not listed: its code did not first run for this plugin.
+
+    A finding, not a control: it reads names. A module named like a standard-library one, an import
+    the plugin removes from ``sys.modules`` again, and an import made later inside a call are not
+    seen, and an import made by another daemon thread during the load is attributed to this plugin.
+    """
+    fresh = {name for name, module in list(sys.modules.items())
+             if name not in before and module is not None and module is not own
+             and name.partition('.')[0] not in sys.stdlib_module_names
+             and name.partition('.')[0] not in _HOST_PACKAGES}
+    return sorted(name for name in fresh
+                  if not any(name[:i] in fresh for i, char in enumerate(name) if char == '.'))
 
 
 def _read_owned(path, limit, *, missing_ok=False):
@@ -279,6 +306,9 @@ class PluginHost:
     def _load(self, source):
         record = {'source': str(source), 'plugin_id': None, 'state': 'refused', 'code': None, 'detail': '',
                   'findings': []}
+        # Loads are serial (the constructor's loop; the loader holds its own lock), so the modules
+        # that appear between here and the end of this load were first imported for this plugin.
+        before = set(sys.modules)
         try:
             if not _owned_directory(source):
                 raise PluginRefused('plugin_directory_untrusted',
@@ -291,7 +321,8 @@ class PluginHost:
         except (PluginRefused, Refused) as exc:
             findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
             record.update(code=exc.code, detail=exc.detail,
-                          findings=findings + [_finding(exc.code, 'refuse', exc.detail)])
+                          findings=findings + self._import_findings(before)
+                          + [_finding(exc.code, 'refuse', exc.detail)])
             manifest_ok = next((f for f in findings if f.get('code') == 'manifest_ok'), None)
             if manifest_ok is not None:
                 record['plugin_id'] = manifest_ok.get('detail')
@@ -302,9 +333,16 @@ class PluginHost:
                       permissions=list(loaded.permissions), artifact_sha256=loaded.artifact_sha256,
                       findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained')
         self._attach(loaded, record)
+        # After registry() and bind_core(), which are plugin code too. The plugin stays loaded.
+        record['findings'] += self._import_findings(before, loaded.module)
         log.info('plugin %s loaded through the plugin loader: trust=%s permissions=%s provides=%s',
                  loaded.plugin_id, loaded.trust, ','.join(loaded.permissions) or '-', ','.join(record['provides']) or '-')
         return record
+
+    @staticmethod
+    def _import_findings(before, own=None):
+        names = _first_imports(before, own)
+        return [_finding(UNVERIFIED_IMPORTS, 'warn', ','.join(names))] if names else []
 
     @property
     def _registries(self):

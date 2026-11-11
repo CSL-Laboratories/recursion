@@ -18,13 +18,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import plugins
 from recursion_core.daemon.tests import plugin_fixture as fx
 from recursion_core.gui.client import ACTIONS, o7_command
-from recursion_core.plugin_security.tests.support import FakeGilProbe
+from recursion_core.plugin_security.tests.support import FakeGilProbe, Key, needs_crypto
 
 LINUX = sys.platform.startswith('linux')
 LINUX_ONLY = 'Linux-only: the plugin host checks file ownership by uid'
@@ -262,21 +263,103 @@ class Adv2FilesystemTests(Adv2HostCase):
         # Observed: three GUI rows share the id plugin:fixture.operator (one loaded, two refused).
         self.assertEqual({r['id'] for r in host.route_records()}, {'plugin:fixture.operator'})
 
-    @unittest.expectedFailure  # ADV2-7: owner decision pending (S34 decision 4); code imported from outside the verified artifact runs with no finding
-    def test_code_imported_from_outside_the_artifact_is_a_finding(self):
+
+class Adv2UnverifiedImportTests(Adv2HostCase):
+    """ADV2-7 (owner call Nov 11 2:20am PST): code imported from outside the verified artifact is a finding.
+
+    The plugin still loads. Signing the whole package is later work.
+    """
+
+    CODE = 'plugin_imported_unverified_modules'
+
+    def outside(self, **modules):
+        """Importable modules outside any plugin artifact; ``a.b`` names a submodule of package ``a``."""
         outside = self.tmp / 'outside'
-        outside.mkdir()
-        (outside / 'adv2_unverified_helper.py').write_text(f'with open({str(self.marker)!r}, "a") as f:\n    f.write("x")\n')
+        outside.mkdir(exist_ok=True)
+        for name, body in modules.items():
+            path = outside.joinpath(*name.split('__'))
+            if path.parent != outside:
+                path.parent.mkdir(exist_ok=True)
+                (path.parent / '__init__.py').touch()
+            path.with_suffix('.py').write_text(body)
+            self.addCleanup(sys.modules.pop, name.replace('__', '.'), None)
+            self.addCleanup(sys.modules.pop, name.split('__')[0], None)
         sys.path.insert(0, str(outside))
         self.addCleanup(sys.path.remove, str(outside))
-        self.addCleanup(sys.modules.pop, 'adv2_unverified_helper', None)
+
+    def import_findings(self, record):
+        return [f for f in record['findings'] if f['code'] == self.CODE]
+
+    def test_code_imported_from_outside_the_artifact_is_a_finding(self):
+        self.outside(adv2_unverified_helper=f'with open({str(self.marker)!r}, "a") as f:\n    f.write("x")\n')
         self.install(b'import adv2_unverified_helper\n' + ANSWER)
         host = self.host()
         record = host.records[0]
         self.assertEqual(record['state'], 'loaded')
         self.assertTrue(self.marker.exists())  # unverified bytes ran under the grant bound to plugin.py's digest
-        self.assertTrue(any('adv2_unverified_helper' in f.get('detail', '') for f in record['findings']),
-                        f'no finding names the out-of-artifact module: {codes(record)}')
+        self.assertEqual(self.import_findings(record), [
+            {'stage': 'daemon', 'code': self.CODE, 'severity': 'warn', 'detail': 'adv2_unverified_helper'}])
+        status, body = self.read(host)  # a finding, not a refusal: the plugin answers
+        self.assertEqual((status, body['status_code']), (200, 'ok'))
+        listed = host.inventory()['plugins'][0]
+        self.assertEqual(self.import_findings(listed), self.import_findings(record))
+
+    def test_stdlib_only_plugin_has_no_import_finding(self):
+        # ``this`` is a standard-library module nothing else imports; it is first imported here.
+        self.addCleanup(sys.modules.pop, 'this', None)
+        sys.modules.pop('this', None)
+        self.install(b'import contextlib, io, json\nwith contextlib.redirect_stdout(io.StringIO()):\n'
+                     b'    import this\n' + ANSWER)
+        record = self.host().records[0]
+        self.assertEqual(record['state'], 'loaded')
+        self.assertIn('this', sys.modules)
+        self.assertNotIn(self.CODE, codes(record))
+
+    def test_module_already_imported_before_the_load_is_not_reported(self):
+        # Not first imported while the plugin loaded: its code did not run for this plugin.
+        self.outside(adv2_already_imported='', adv2_fresh='')
+        import adv2_already_imported  # noqa: F401
+        self.install(b'import adv2_already_imported, adv2_fresh\n' + ANSWER)
+        record = self.host().records[0]
+        self.assertEqual([f['detail'] for f in self.import_findings(record)], ['adv2_fresh'])
+
+    def test_every_out_of_artifact_module_is_listed_sorted(self):
+        self.outside(adv2_zeta='', adv2_alpha='', adv2_pkg__inner='')
+        self.install(b'import adv2_zeta\nimport adv2_pkg.inner\n' + ANSWER
+                     + b'def registry():\n    import adv2_alpha\n    return {"panels": []}\n')
+        record = self.host().records[0]
+        self.assertEqual(record['state'], 'loaded')
+        # One finding; a submodule is covered by its package's entry; registry() imports count.
+        self.assertEqual([f['detail'] for f in self.import_findings(record)], ['adv2_alpha,adv2_pkg,adv2_zeta'])
+
+    def test_plugin_that_fails_after_importing_still_carries_the_finding(self):
+        self.outside(adv2_before_failure='')
+        self.install(b'import adv2_before_failure\nraise RuntimeError("x")\n')
+        record = self.host().records[0]
+        self.assertEqual((record['state'], record['code']), ('refused', 'plugin_import_failed'))
+        self.assertEqual([f['detail'] for f in self.import_findings(record)], ['adv2_before_failure'])
+        self.assertEqual(codes(record)[-1], 'plugin_import_failed')
+
+    def test_host_packages_and_the_plugins_own_module_are_not_listed(self):
+        # On python3.13 the host's first Ed25519 check imports cryptography submodules lazily.
+        before, own = set(sys.modules), types.ModuleType('adv2_own')
+        fake = {'cryptography.adv2_lazy': types.ModuleType('x'), 'recursion_core.adv2_lazy': types.ModuleType('x'),
+                'adv2_self_registered': own, 'adv2_blocked': None, 'adv2_other.sub': types.ModuleType('x')}
+        for name in fake:
+            self.addCleanup(sys.modules.pop, name, None)
+        sys.modules.update(fake)
+        self.assertEqual(plugins._first_imports(before, own), ['adv2_other.sub'])
+        self.assertEqual(plugins._first_imports(before), ['adv2_other.sub', 'adv2_self_registered'])
+
+    @needs_crypto
+    def test_host_signature_check_imports_are_not_blamed_on_a_signed_plugin(self):
+        key = Key()
+        source = b'import json\n' + ANSWER
+        fx.write_install(self.config, trusted={'dev': key.public}, grants=[fx.grant_for(source, key=key)])
+        fx.write_plugin(self.plugins / 'one', source, key=key)
+        record = self.host().records[0]
+        self.assertEqual((record['state'], record['trust']), ('loaded', 'signed'))
+        self.assertNotIn(self.CODE, codes(record))
 
 
 class Adv2CryptographyMissingTests(Adv2HostCase):

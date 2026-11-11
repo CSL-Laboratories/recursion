@@ -420,8 +420,24 @@ class SubscriptionRobustness(unittest.TestCase):
             self.assertNotIn("\x00", str(caught.exception))
             self.assertNotIn("\\ud800", str(caught.exception).lower())
             self.calls.assert_not_called()
-        guard_then_spawn(**base, cwd=self.home)
-        self.assertEqual(self.home, self.calls.call_args.kwargs["cwd"])
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            guard_then_spawn(**base, cwd=7)
+        self.assertEqual("argv_malformed", caught.exception.cause)
+        self.calls.assert_not_called()
+
+        class _Flip:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def __fspath__(self) -> str:
+                self.reads += 1
+                return str(self_home) if self.reads == 1 else str(self_home) + "\0bad"
+
+        self_home = self.home
+        guard_then_spawn(**base, cwd=_Flip())
+        self.assertEqual(str(self.home), self.calls.call_args.kwargs["cwd"])
+        guard_then_spawn(**base, cwd=os.fsencode(str(self.home)))
+        self.assertEqual(os.fsencode(str(self.home)), self.calls.call_args.kwargs["cwd"])
 
     def test_dropped_unencodable_value_does_not_refuse(self) -> None:
         home = str(self.home)

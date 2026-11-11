@@ -768,6 +768,39 @@ def _screen_launch_text(engine: str | None, text: str) -> None:
         raise SubscriptionRouteRefused(engine, "value_unencodable") from None
 
 
+def _snapshot_cwd(engine: str | None, cwd: object) -> str | bytes:
+    """One ``os.fspath`` of ``cwd``, screened, and that value is what the launcher receives.
+
+    A path-like object is not forwarded. A later read of it can return a different string, including
+    one with a null, after the check has passed.
+    """
+
+    if isinstance(cwd, str):
+        rendered: object = cwd
+    elif isinstance(cwd, (bytes, bytearray)):
+        rendered = bytes(cwd)
+    elif isinstance(cwd, os.PathLike):
+        try:
+            rendered = os.fspath(cwd)
+        except (TypeError, ValueError):
+            raise SubscriptionRouteRefused(engine, "argv_malformed") from None
+    else:
+        raise SubscriptionRouteRefused(engine, "argv_malformed")
+    if isinstance(rendered, str):
+        _screen_launch_text(engine, rendered)
+        return rendered
+    if isinstance(rendered, (bytes, bytearray)):
+        snapshot = bytes(rendered)
+        if b"\x00" in snapshot:
+            raise SubscriptionRouteRefused(engine, "argv_malformed")
+        try:
+            os.fsencode(os.fsdecode(snapshot))
+        except UnicodeError:
+            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        return snapshot
+    raise SubscriptionRouteRefused(engine, "argv_malformed")
+
+
 def _reject_launch_shape(
     engine: str | None,
     argv: object,
@@ -782,27 +815,16 @@ def _reject_launch_shape(
         raise SubscriptionRouteRefused(engine, "launch_option_denied", ",".join(bad))
     if isinstance(argv, (str, bytes)) or not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise SubscriptionRouteRefused(engine, "argv_malformed")
-    for item in (*argv, *(value for value in launch_kwargs.values() if isinstance(value, str))):
+    forward = dict(launch_kwargs)
+    if forward.get("cwd") is not None:
+        forward["cwd"] = _snapshot_cwd(engine, forward["cwd"])
+    for item in (*argv, *(value for value in forward.values() if isinstance(value, str))):
         _screen_launch_text(engine, item)
-    cwd = launch_kwargs.get("cwd")
-    if cwd is not None and not isinstance(cwd, str):
-        rendered: object = cwd
-        if not isinstance(cwd, (bytes, bytearray)):
-            try:
-                rendered = os.fspath(cwd)
-            except TypeError:
-                rendered = None
-        if isinstance(rendered, (bytes, bytearray)):
-            if b"\x00" in rendered:
-                raise SubscriptionRouteRefused(engine, "argv_malformed")
-            rendered = os.fsdecode(bytes(rendered))
-        if isinstance(rendered, str):
-            _screen_launch_text(engine, rendered)
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
-    unknown = sorted(set(launch_kwargs) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
+    unknown = sorted(set(forward) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
     if unknown:  # full access adds no launch option
         raise SubscriptionRouteRefused(engine, "launch_option_unknown", ",".join(unknown))
-    return dict(launch_kwargs)
+    return forward
 
 
 def _verify_wrapper(engine: str, wrapper: WrapperInstall, checked: _Checked) -> None:

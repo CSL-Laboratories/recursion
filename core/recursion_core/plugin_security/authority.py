@@ -161,16 +161,17 @@ class Authority:
     def _check_profile(self, envelope: object) -> tuple[dict, str]:
         if type(envelope) is not dict or set(envelope) != {"profile", "signature"}:
             raise Refused("profile_envelope")
-        profile = envelope["profile"]
+        caller_profile = envelope["profile"]
         try:
-            raw = canonical(profile)
+            raw = canonical(caller_profile)
         except Refused:
             raise Refused("profile_noncanonical") from None
         if not self._verify(envelope["signature"], raw):
             raise Refused("profile_signature_invalid")
         # Every later check, the result and the ledger read a private parse of the exact
         # signed bytes, never the caller's dict: another plugin thread can still change that
-        # dict after the check (3.14t, GIL off).
+        # dict after the check (3.14t, GIL off). The one exception is the ``actions`` shape
+        # rule below, which can only refuse.
         try:
             profile = parse(raw)
         except Refused:  # pragma: no cover - canonical() output always round-trips
@@ -188,6 +189,14 @@ class Authority:
         if any(type(profile[k]) is not str or not _MODEL_VALUE.fullmatch(profile[k])
                for k in ("provider", "model_version")):
             raise Refused("profile_model")
+        # TODO(CSL-738 follow-up): the tuple refusal is a shape rule kept by owner call
+        # Nov 11 2:20am PST; review it and possibly change it later (the signed bytes of a
+        # tuple and a list are identical, so the private parse cannot tell them apart).
+        # One read and one type() check of the caller's object: a racing list<->tuple swap
+        # or removal can only change this refusal, never what is charged, which the
+        # private parse alone decides.
+        if type(caller_profile.get("actions")) is not list:
+            raise Refused("profile_actions")
         actions = profile["actions"]
         if (type(actions) is not list or not actions or actions != sorted(set(actions))
                 or any(type(a) is not str or not _KIND.fullmatch(a) for a in actions)):

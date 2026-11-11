@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import sqlite3
 import threading
 import unittest
 
@@ -94,6 +95,30 @@ class AuthorityTests(unittest.TestCase):
         for code, change in cases.items():
             with self.subTest(code=code):
                 self._refused(code, _charge, self.auth, profile(self.installer, **change), 1, "k-" + code)
+
+    def _ledger_rows(self) -> tuple[int, int]:
+        db = sqlite3.connect(self.path)
+        try:
+            return (db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0],
+                    db.execute("SELECT COUNT(*) FROM charges").fetchone()[0])
+        finally:
+            db.close()
+
+    def test_tuple_actions_refused_though_correctly_signed(self) -> None:
+        # Owner call Nov 11 2:20am PST (CSL-738): a tuple signs to the same bytes as a list,
+        # and is still refused as a shape rule (to be reviewed later).
+        as_list = profile(self.installer)
+        as_tuple = profile(self.installer, actions=("order.submit",))
+        self.assertEqual(as_tuple["signature"], as_list["signature"])
+        self.assertEqual(canonical(as_tuple["profile"]), canonical(as_list["profile"]))
+        self._refused("profile_actions", _charge, self.auth, as_tuple, 100, "k-tuple")
+        self.assertEqual(self._ledger_rows(), (0, 0))
+        out = _charge(self.auth, as_list, 100, "k-list")
+        self.assertEqual(out, {"profile_id": "prof-1", "spent_minor": 100, "remaining_minor": 9_900})
+        self.assertEqual(self._ledger_rows(), (1, 1))
+        # The list's cached signature verdict covers the same bytes; the tuple is still refused.
+        self._refused("profile_actions", _charge, self.auth, as_tuple, 100, "k-tuple-2")
+        self.assertEqual(self._ledger_rows(), (1, 1))
 
     def test_scope_expiry_and_binding(self) -> None:
         env = profile(self.installer, not_before=999_000, expires_at=1_000_100)

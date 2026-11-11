@@ -157,9 +157,10 @@ class RealManagerAttackTest(unittest.TestCase):
         self.assertIs(self.manager.recorded_cgroup_clear(unit, group), True)
         self.assertFalse(alive(main))
 
-    @unittest.expectedFailure  # ADV1-2
+    @unittest.expectedFailure  # ADV1-2: owner decision pending (separate engine uid or a non-delegated unit; O65)
     def test_a_descendant_that_moves_out_of_the_unit_cgroup_outlives_an_attested_stop(self):
-        """ADV1-2: same-uid engine, operator-owned user-manager subtree: one cgroup.procs write escapes Stop."""
+        """ADV1-2 (owner decision pending: it needs a separate engine uid or a non-delegated unit, spec O65):
+        same-uid engine, operator-owned user-manager subtree: one cgroup.procs write escapes Stop."""
         run_id = 'run-adv1esc%d' % os.getpid()
         out = self.tmp / 'escape.txt'
         _, group, main = self.launch(run_id, [sys.executable, '-I', '-c', ESCAPE, str(out)])
@@ -173,9 +174,10 @@ class RealManagerAttackTest(unittest.TestCase):
         self.assertFalse(alive(main))
         self.assertFalse(alive(pid), f'pid {pid} (a descendant of the run) is alive in {target} after "stopped"')
 
-    @unittest.expectedFailure  # ADV1-2b
+    @unittest.expectedFailure  # ADV1-2b: owner decision pending (the scope check is a speed bump until scopes exist)
     def test_an_engine_that_left_its_unit_cgroup_regains_control_of_the_socket(self):
-        """ADV1-2b: peer_is_engine reads the peer's current cgroup, which the engine can change."""
+        """ADV1-2b (owner decision pending: the check is a speed bump, not a boundary, until scopes exist):
+        peer_is_engine reads the peer's current cgroup, which the engine can change."""
         environ = {'XDG_RUNTIME_DIR': str(self.tmp / 'rt'), 'XDG_CONFIG_HOME': str(self.tmp / 'cfg'),
                    'PATH': '/usr/bin:/bin', 'HOME': str(self.tmp)}
         (self.tmp / 'rt').mkdir(mode=0o700)

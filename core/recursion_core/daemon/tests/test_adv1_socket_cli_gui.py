@@ -1,8 +1,8 @@
 """ADV1 red team of the composed daemon's surfaces: control socket, CLI and GUI door (CSL-738 candidate).
 
-Each test is one attack. A test that exposes a real defect at 0beb782f is marked
-``expectedFailure`` with an ``ADV1-<n>`` reason; the others pass and record that the
-hardening held. See /dev/shm/nov11/out/ADV1-report.md for the findings.
+Each test is one attack, written against 0beb782f. The defects fixed since (ADV1-3, -4, -12,
+-13) now pass and say "(fixed)". A test still marked ``expectedFailure`` names a finding
+that waits for an owner decision (ADV1-5); the others pass and record that the hardening held.
 """
 import contextlib
 import http.client
@@ -302,9 +302,10 @@ class SocketAttackTest(ComposedBase):
         self.assertEqual(receipt['code'], 'stopped', receipt)
         self.assertEqual((again['code'], again.get('repeat')), ('stopped', True), again)
 
-    @unittest.expectedFailure  # ADV1-5
+    @unittest.expectedFailure  # ADV1-5: owner decision pending (pagination or pruning changes the API shape)
     def test_run_list_still_answers_after_a_thousand_runs(self):
-        """ADV1-5: control records are never pruned; run.list outgrows the 1 MiB frame at ~1075 runs."""
+        """ADV1-5 (owner decision pending: paginating or pruning run.list changes the control API's shape):
+        control records are never pruned; run.list outgrows the 1 MiB frame at ~1075 runs."""
         store = Registry(self.state)
         count = 1300  # ~975 bytes per listed run with systemd's real cgroup paths: 1 MiB / 975 ~= 1075
         long_group = ('/user.slice/user-1000.slice/user@1000.service/app.slice/'

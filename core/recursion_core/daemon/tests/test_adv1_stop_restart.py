@@ -1,9 +1,9 @@
-"""ADV1 red team of the Stop path, restart recovery and the launcher (CSL-738 candidate at 0beb782f).
+"""ADV1 red team of the Stop path, restart recovery and the launcher (CSL-738, written against 0beb782f).
 
 The service manager is faked two ways: ``ScriptedManager`` keeps the real ``SystemdUserManager``
 observation and attestation code and only scripts what ``systemctl`` prints (and how it exits),
 over a fake cgroup tree on disk; the composed tests use ``ProcessUnitManager`` from
-``test_composition``. Tests that expose a defect are ``expectedFailure`` with an ``ADV1-<n>`` reason.
+``test_composition``. The defects found here (ADV1-1, -6, -7, -8) are fixed and their tests say "(fixed)".
 """
 import json
 import os
@@ -545,7 +545,7 @@ class LauncherAttackTest(unittest.TestCase):
                 self.assertNotIn(name, got)
 
     def test_the_engine_is_told_where_the_runtime_directory_is(self):
-        # Documents ADV1-10 (INFO): B1 carries XDG_RUNTIME_DIR, so the engine is handed the directory of the
+        # Documents ADV1-10 (INFO, owner decision pending): B1 carries XDG_RUNTIME_DIR, so the engine is handed the directory of the
         # control socket and of the user manager it can use to leave its unit (ADV1-2). Dropping it would not
         # be a barrier (the path is /run/user/<uid>), so this is recorded, not marked as a defect.
         launch = launcher.ProductionLauncher('claude_code', mock.Mock(), mock.Mock(), self.tmp)
@@ -553,7 +553,7 @@ class LauncherAttackTest(unittest.TestCase):
         self.assertEqual(got.get('XDG_RUNTIME_DIR'), '/run/user/1000')
 
     def test_env_fifo_handoff_cannot_tell_who_read_the_environment(self):
-        # Documents ADV1-9 (INFO): the launcher's only check is that the FIFO drained. Any same-uid process
+        # Documents ADV1-9 (INFO, owner decision pending): the launcher's only check is that the FIFO drained. Any same-uid process
         # that opens runs/<id>/env.fifo first (an engine of another run) gets the environment, and can write
         # one of its own for engine_exec. The 0700 state directory is the only barrier.
         fifo = self.tmp / 'env.fifo'

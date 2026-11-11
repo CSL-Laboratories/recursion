@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 st
 
 from .correlation import ACCEPTED, CANCELLED, IGNORED, MISMATCH, MISSING_ID, SETTLED_CAP, RequestTable, same_id
 from .errors import FrameError, InsecureSocketPath, PeerRefused, RemoteBindRefused, TransportBusy
-from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
+from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, id_reencodes, read_frame, write_frame
 from .handlers import Connection, Handler, Message
 from .peercred import PeerCred, get_peer_cred
 
@@ -47,6 +47,12 @@ IDLE_TIMEOUT_S = 30.0
 # handler count: N blocked handlers share this deadline, then the ones still running
 # are cancelled and their late results are not written.
 CLOSE_TIMEOUT_S = 5.0
+# After frame_too_large the peer may still be writing the body. The worker returns
+# and frees its slot; this extra fd stays open so those writes are not reset.
+# One deadline, not restarted by arriving bytes.
+_PEER_HOLD_S = 2.0
+_peer_holds = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
 # Sent, without reading anything, to an authenticated peer over the connection cap, so a
 # client can tell "not delivered, server busy" from a refusal or a crash.
 BUSY_FRAME = encode_frame(
@@ -471,6 +477,8 @@ class UnixControlServer:
             if exc.id_known:
                 reply["id"] = exc.request_id
             _send_quietly(conn, reply)
+            if str(exc) == "frame_too_large":
+                _hold_peer_open(conn)
             return None
         except OSError:
             return None
@@ -501,14 +509,16 @@ class UnixControlServer:
         """
         try:
             conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
-            write_frame(conn, message, max_bytes=self._max_frame_bytes)
+            write_frame(conn, _drop_unencodable_id(message), max_bytes=self._max_frame_bytes)
         except FrameError:
             reply: Message = {"ok": False, "error": {"code": "response_too_large"}}
             if request is not None and "id" in request:
                 reply["id"] = request["id"]
             _send_quietly(conn, reply)
             return False
-        except OSError:
+        except (OSError, ValueError):
+            # A reply that still cannot be encoded ends this request. It must not
+            # kill the worker.
             return False
         return True
 
@@ -551,10 +561,57 @@ def _is_busy(response: Message) -> bool:
     return response == _BUSY_MESSAGE
 
 
+def _hold_peer_open(conn: socket.socket) -> None:
+    """Keep one extra fd until a short deadline so a peer still writing is not reset.
+
+    The worker has already answered and is about to release the connection slot.
+    Arriving bytes do not extend the deadline.
+    """
+    if not _peer_holds.acquire(blocking=False):
+        return
+    try:
+        held = conn.dup()
+    except OSError:
+        _peer_holds.release()
+        return
+
+    def drain() -> None:
+        try:
+            deadline = time.monotonic() + _PEER_HOLD_S
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                held.settimeout(remaining)
+                try:
+                    chunk = held.recv(4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+        finally:
+            held.close()
+            _peer_holds.release()
+
+    thread = threading.Thread(target=drain, name="control-transport-hold", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:
+        held.close()
+        _peer_holds.release()
+
+
+def _drop_unencodable_id(message: Message) -> Message:
+    """Omit an id that ``encode_frame`` cannot write. The rest of the reply stands."""
+    if "id" not in message or id_reencodes(message["id"]):
+        return message
+    return {key: value for key, value in message.items() if key != "id"}
+
+
 def _send_quietly(conn: socket.socket, message: Message) -> None:
     try:
-        write_frame(conn, message)
-    except (OSError, FrameError):
+        write_frame(conn, _drop_unencodable_id(message))
+    except (OSError, FrameError, ValueError):
         pass
 
 

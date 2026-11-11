@@ -17,6 +17,7 @@ import time
 import unittest
 
 from recursion_core.control_transport import framing
+from recursion_core.control_transport.errors import FrameError
 from recursion_core.control_transport.correlation import (
     ACCEPTED,
     CANCELLED,
@@ -555,6 +556,101 @@ class SocketCorrelationTests(unittest.TestCase):
         self.assertEqual(nxt, {"ok": True, "op": "pong", "id": "next"})
         self.assertEqual(seen, ["original-id", "next"])
 
+    def test_bad_frame_omits_an_id_that_cannot_be_written_back(self) -> None:
+        """Infinity and a lone surrogate are not echoed. A plain id still is.
+
+        The worker must answer bad_frame and stay alive for the next connection.
+        """
+        crashes: list[str] = []
+        previous = threading.excepthook
+
+        def record(args: threading.ExceptHookArgs) -> None:
+            crashes.append(args.exc_type.__name__)
+
+        threading.excepthook = record
+        self.addCleanup(lambda: setattr(threading, "excepthook", previous))
+        srv = self.server()
+        for body in (b'{"id": 1e9999} trailing', b'{"id": "\\ud800"} trailing'):
+            raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            with raw:
+                raw.settimeout(2)
+                raw.connect(srv.path)
+                raw.sendall(framing.HEADER.pack(len(body)) + body)
+                reply = framing.read_frame(raw)
+            self.assertIsInstance(reply, dict, (body, reply, crashes))
+            self.assertEqual(reply["error"]["code"], "bad_frame")
+            self.assertNotIn("id", reply)
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(2)
+            raw.connect(srv.path)
+            body = b'{"id": "s9"} trailing'
+            raw.sendall(framing.HEADER.pack(len(body)) + body)
+            reply = framing.read_frame(raw)
+        self.assertEqual(reply["error"]["code"], "bad_frame")
+        self.assertEqual(reply["id"], "s9")
+        with UnixControlClient(srv.path, timeout_s=2) as client:
+            self.assertEqual(client.request({"op": "ping"}), {"ok": True, "op": "pong"})
+        self.assertEqual(crashes, [])
+
+    def test_an_unencodable_reply_id_is_dropped_and_the_worker_lives(self) -> None:
+        """A NaN id on the request or the handler reply is omitted, not fatal."""
+
+        def handler(message, conn):
+            if "nan" in message:
+                return {"ok": True, "op": "pong", "id": float("nan")}
+            return {"ok": True, "op": "pong"}
+
+        crashes: list[str] = []
+        previous = threading.excepthook
+
+        def record(args: threading.ExceptHookArgs) -> None:
+            crashes.append(args.exc_type.__name__)
+
+        threading.excepthook = record
+        self.addCleanup(lambda: setattr(threading, "excepthook", previous))
+        srv = self.server(handler)
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(2)
+            raw.connect(srv.path)
+            body = b'{"op":"ping","id":NaN}'
+            raw.sendall(framing.HEADER.pack(len(body)) + body)
+            reply = framing.read_frame(raw)
+        self.assertEqual(reply["error"]["code"], "missing_id")
+        self.assertNotIn("id", reply)
+        with UnixControlClient(srv.path, timeout_s=2) as client:
+            pong = client.request({"op": "ping", "nan": True})
+            self.assertEqual(pong["op"], "pong")
+            self.assertNotIn("id", pong)
+            self.assertEqual(client.request({"op": "ping", "id": "s9"}), {"ok": True, "op": "pong", "id": "s9"})
+        self.assertEqual(crashes, [])
+
+    def test_an_oversize_scan_does_not_restart_its_wait_on_each_byte(self) -> None:
+        """One scan budget covers every byte. A trickle must not hold the worker."""
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        right.sendall(framing.HEADER.pack((1 << 20) + 50))
+
+        def trickle() -> None:
+            for _ in range(8):
+                try:
+                    right.sendall(b"{")
+                except OSError:
+                    return
+                time.sleep(0.15)
+
+        worker = threading.Thread(target=trickle)
+        worker.start()
+        self.addCleanup(worker.join)
+        started = time.monotonic()
+        with self.assertRaises(FrameError) as caught:
+            framing.read_frame(left, max_bytes=1 << 20, deadline=time.monotonic() + 30)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.8, f"scan ran for {elapsed:.3f}s")
+        self.assertEqual(str(caught.exception), "frame_too_large")
+
     def test_a_handler_that_ignores_cancelled_cannot_write_after_close(self) -> None:
         """Close does not deliver a result from a handler that never watches cancelled.
 
@@ -623,6 +719,11 @@ class ParseableIdTests(unittest.TestCase):
         deep = b"[" * 200_000 + b"]" * 200_000
         self.assertEqual(parseable_request_id(b'{"id":"s9","op":' + deep + b"}"), (True, "s9"))
         self.assertEqual(parseable_request_id(b'{"op":' + deep + b"}"), (False, None))
+        # A non-finite number and a lone surrogate can be read, but they cannot be
+        # written back. They are not ids we echo.
+        self.assertEqual(parseable_request_id(b'{"id": 1e9999} trailing'), (False, None))
+        self.assertEqual(parseable_request_id(b'{"id": "\\ud800"} trailing'), (False, None))
+        self.assertEqual(parseable_request_id(b'{"id": "s9"} trailing'), (True, "s9"))
 
 
 if __name__ == "__main__":

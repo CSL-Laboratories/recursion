@@ -33,7 +33,7 @@ STATES = [("pull_request", a, d) for a in PR_ACTIONS for d in (True, False)]
 STATES += [("push", None, None), ("workflow_dispatch", None, None)]
 TRIGGERS = (
     "on:\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\n"
-    "  push:\n    branches: [master]\n  workflow_dispatch:\n"
+    "  push:\n    branches: [master, csl-nov11-integrated-candidate-20261110]\n  workflow_dispatch:\n"
 )
 CONCURRENCY = (
     "concurrency:\n  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n"

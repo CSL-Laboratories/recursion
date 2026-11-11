@@ -51,6 +51,11 @@ CGROUP_WALK_MAX_DEPTH = 64
 CGROUP_WALK_MAX_NODES = 4096
 # How long to re-read a recorded cgroup after its processes were sent SIGKILL.
 RECORDED_KILL_WAIT_S = 2.0
+# A stop request that failed (systemctl hung, exited oddly or is missing) is sent again by
+# the sweep only after a wait that doubles from the base to the cap (ADV1-6). A Stop the
+# operator asks for is always sent.
+STOP_RESEND_BASE_S = 30.0
+STOP_RESEND_MAX_S = 600.0
 
 
 def require_free_threaded():
@@ -742,11 +747,14 @@ class ServiceManager(Protocol):
 
 class Daemon:
     def __init__(self, registry: Registry, manager: ServiceManager,
-                 boot_id: Callable[[], str | None] = read_boot_id):
+                 boot_id: Callable[[], str | None] = read_boot_id,
+                 clock: Callable[[], float] = time.monotonic):
         require_posix()
         self.registry, self.manager, self.boot_id = registry, manager, boot_id
         self.lock = threading.RLock()
         self.closed = False
+        self.clock = clock
+        self._stop_resend = {}  # run_id -> (not before, wait) after a stop request that failed
 
     def _open(self):
         if self.closed:
@@ -775,7 +783,7 @@ class Daemon:
         with self.lock:
             self._open()
             self.registry.request_stop(run_id)
-            self._reconcile(self.registry.get(run_id))
+            self._reconcile(self.registry.get(run_id), send_stop=True)
             return self.registry.get(run_id)
 
     def reconcile(self, run_id):
@@ -785,8 +793,18 @@ class Daemon:
             self._reconcile(self.registry.get(run_id))
             return self.registry.get(run_id)
 
-    def _reconcile(self, run, detail=''):
+    def _stop_send_due(self, run_id):
+        held = self._stop_resend.get(run_id)
+        return held is None or self.clock() >= held[0]
+
+    def _stop_send_failed(self, run_id):
+        held = self._stop_resend.get(run_id)
+        wait = STOP_RESEND_BASE_S if held is None else min(held[1] * 2, STOP_RESEND_MAX_S)
+        self._stop_resend[run_id] = (self.clock() + wait, wait)
+
+    def _reconcile(self, run, detail='', send_stop=False):
         if run.state in TERMINAL:
+            self._stop_resend.pop(run.run_id, None)
             return
         boot = self.boot_id()
         if run.boot_id and boot and run.boot_id != boot:
@@ -797,12 +815,19 @@ class Daemon:
             if boot is None:
                 raise OSError('boot_id unreadable')
             stopped = not_loaded = False
-            if run.stop_requested:
+            if run.stop_requested and (send_stop or self._stop_send_due(run.run_id)):
                 try:
                     self.manager.stop(run.unit)
                     stopped = True
                 except UnitNotLoaded:
                     not_loaded = True
+                except (OSError, subprocess.SubprocessError):
+                    self._stop_send_failed(run.run_id)
+                    raise
+                self._stop_resend.pop(run.run_id, None)
+            elif run.stop_requested:
+                # The last request failed and its wait is not over: only look, and keep saying why.
+                detail = detail or run.detail
             observation = self.manager.observe(run.unit)
             # A gone (not-found) unit is terminated only with a recorded Stop and either
             # this reconcile's stop returning (systemctl stop waits for inactive, then
@@ -835,7 +860,10 @@ class Daemon:
         if state == 'terminated' and not self._termination_attested(run.unit):
             state = 'stopping' if run.stop_requested else 'unknown'
             detail = detail or 'process still alive; termination not attested'
-        self.registry.state(run.run_id, state, detail)
+        # An observation that changes nothing is not written: every write is a full publish
+        # of the registry file (ADV1-6).
+        if (state, detail[:500]) != (run.state, run.detail):
+            self.registry.state(run.run_id, state, detail)
 
     def _recorded_cgroup_clear(self, run):
         """True when the cgroup recorded for ``run`` is absent or empty, False when a process

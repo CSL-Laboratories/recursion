@@ -57,6 +57,9 @@ ROUTES_FILE = 'routes.json'         # $XDG_CONFIG_HOME/recursion/routes.json
 OUTPUT_TAIL_BYTES = 64 * 1024
 OUTPUT_TAIL_LINES = 50
 ENDED, LOST_REBOOT = 'ended', 'lost_reboot'
+# reconcile() asks again for a Stop whose request never got through only after a wait that doubles
+# from the base to the cap (ADV1-6).
+STOP_RETRY_BASE_S, STOP_RETRY_MAX_S = 30.0, 600.0
 
 
 # -- registry ------------------------------------------------------------------------------------
@@ -263,6 +266,7 @@ class DaemonControl:
     def __init__(self, api, registry, daemon, starter, state_dir):
         self.api, self.registry, self.daemon, self.starter = api, registry, daemon, starter
         self._state = Path(state_dir)
+        self._stop_retry = {}  # run_id -> (not before, wait) for a Stop reconcile() could not get sent
 
     # -- calls ---------------------------------------------------------------------------------
     def call(self, method, params=None):
@@ -390,9 +394,25 @@ class DaemonControl:
                     rec = self.registry.put(rec)
         if rec.get('state') == 'stopped' or not rec.get('cgroup'):
             return
-        if (row is not None and row.stop_requested) or rec.get('state') == 'stop_pending' \
-                or rec.get('stop') is not None:
-            self.api.call('run.stop', {'run_id': run_id})
+        stop = rec.get('stop')
+        if not ((row is not None and row.stop_requested) or rec.get('state') == 'stop_pending' or stop is not None):
+            return
+        if rec.get('state') == 'stop_pending' and isinstance(stop, dict) and stop.get('requested') \
+                and (stop.get('cgroup'), stop.get('cgroup_marker')) == (rec.get('cgroup'), rec.get('cgroup_marker')):
+            # The request was sent and "pending" is recorded. Nothing is written or waited for again
+            # until one observation of the unit attests the end (ADV1-6: no rewrite every sweep).
+            if row is None or self.daemon.reconcile(run_id).state != 'terminated':
+                return
+        else:
+            held = self._stop_retry.get(run_id)
+            if held is not None and time.monotonic() < held[0]:
+                return
+        if self.api.call('run.stop', {'run_id': run_id}).get('code') == 'pending':
+            wait = min(self._stop_retry[run_id][1] * 2, STOP_RETRY_MAX_S) if run_id in self._stop_retry \
+                else STOP_RETRY_BASE_S
+            self._stop_retry[run_id] = (time.monotonic() + wait, wait)
+        else:
+            self._stop_retry.pop(run_id, None)
 
     # -- socket --------------------------------------------------------------------------------
     def handle(self, message, conn):

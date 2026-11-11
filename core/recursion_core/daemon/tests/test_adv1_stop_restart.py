@@ -410,10 +410,9 @@ class RestartTest(ComposedBase):
         self.assertEqual(before, after)
         self.assertIsNone(self.units.procs[f'recursion-run-{live}.service'].poll())
 
-    @unittest.expectedFailure  # ADV1-6
     def test_a_stop_that_can_never_confirm_is_not_rewritten_on_every_sweep(self):
-        """ADV1-6: a pending Stop is re-sent from reconcile() on every sweep; each pass writes a new generation
-        (a full registry-file rewrite) and, for an unobservable unit, waits the whole confirm timeout."""
+        """ADV1-6 (fixed): a pending Stop was re-sent from reconcile() on every sweep; each pass wrote a new
+        generation (a full registry-file rewrite) and, for an unobservable unit, waited the whole confirm timeout."""
         daemon, composed = self.boot(confirm_timeout_s=0.3)
         api = self.api(composed)
         run_id = self.start(api)
@@ -421,16 +420,45 @@ class RestartTest(ComposedBase):
         proc = self.units.procs.pop(unit)
         self.addCleanup(lambda: (proc.poll() is None and os.killpg(proc.pid, signal.SIGKILL), proc.wait()))
         manager = daemon.manager
-        with mock.patch.object(manager, 'stop', side_effect=subprocess.TimeoutExpired(['systemctl'], 15)):
+        now = [1000.0]
+        daemon.clock = lambda: now[0]
+        with mock.patch.object(manager, 'stop', side_effect=subprocess.TimeoutExpired(['systemctl'], 15)) as sent:
             self.assertEqual(api.call('run.stop', {'run_id': run_id})['code'], 'pending')
             first = composed.control.registry.get(run_id)['generation']
+            asked = sent.call_count
+            self.assertGreaterEqual(asked, 1)
             started = time.monotonic()
-            for _ in range(5):
+            with mock.patch.object(daemon.registry, 'state', wraps=daemon.registry.state) as row_writes, \
+                    mock.patch.object(daemon.registry, 'control_put', wraps=daemon.registry.control_put) as record_writes:
+                for _ in range(5):
+                    daemon.sweep()
+                    composed.control.reconcile()
+                spent = time.monotonic() - started
+                self.assertEqual(sent.call_count, asked, 'the failed request is not sent again inside its wait')
+                self.assertEqual((row_writes.call_count, record_writes.call_count), (0, 0), 'nothing changed: no write')
+                # A repeat Stop from the operator only re-checks (the request was sent), and the wait still holds.
+                self.assertEqual(api.call('run.stop', {'run_id': run_id})['code'], 'pending')
+                self.assertEqual(sent.call_count, asked)
+                # After the wait the sweep asks once more; the next wait is twice as long.
+                now[0] += 30.0
                 daemon.sweep()
-                composed.control.reconcile()
-            spent = time.monotonic() - started
+                self.assertEqual(sent.call_count, asked + 1)
+                now[0] += 30.0
+                daemon.sweep()
+                self.assertEqual(sent.call_count, asked + 1)
+                now[0] += 30.0
+                daemon.sweep()
+                self.assertEqual(sent.call_count, asked + 2)
         later = composed.control.registry.get(run_id)['generation']
-        self.assertEqual(later, first, f'{later - first} new generations in 5 sweeps, {spent:.1f} s in reconcile')
+        self.assertEqual(later, first + 1, 'only the operator repeat wrote a record')
+        self.assertLess(spent, 2.0, f'{spent:.1f} s in five sweeps')
+        # Once the request gets through and the tree is attested gone, the same reconcile records the Stop.
+        self.units.procs[unit] = proc
+        now[0] += 600.0
+        daemon.sweep()
+        composed.control.reconcile()
+        self.assertEqual(composed.control.registry.get(run_id)['state'], 'stopped')
+        self.assertIsNotNone(proc.poll())
 
     @unittest.expectedFailure  # ADV1-8
     def test_reconcile_racing_a_start_does_not_mark_it_failed(self):

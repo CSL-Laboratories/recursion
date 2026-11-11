@@ -205,7 +205,6 @@ class Adv2TuiSocketTests(unittest.TestCase):
 
 
 class Adv2TuiStopAnswerTests(unittest.TestCase):
-    @unittest.expectedFailure  # ADV2-11: a Stop answer naming another run is announced as this run's Stop
     def test_a_stopped_answer_for_another_run_does_not_confirm_this_stop(self):
         class Api:
             def call(self, method, params=None):
@@ -218,6 +217,8 @@ class Adv2TuiStopAnswerTests(unittest.TestCase):
         self.assertEqual(app.runs[0].get('state'), 'running')  # holds: the snapshot is not marked stopped
         said = '\n'.join(app.transcript)
         self.assertNotIn('stop run=run-1: control API answered stopped', said)
+        self.assertIn('stop run=run-1: stop_answer_run_mismatch', said)
+        self.assertIn('this Stop is not confirmed', said)
 
 
 if __name__ == '__main__':

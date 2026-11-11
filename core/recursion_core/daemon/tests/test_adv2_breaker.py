@@ -291,7 +291,6 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'run_unknown')
 
     # -- the route inventory's view of the store ---------------------------------------------------
-    @unittest.expectedFailure  # ADV2-6: route.list shows a connection whose store read failed as closed, with no blocker
     def test_route_list_does_not_show_an_unreadable_store_as_closed(self):
         stored = self.tripped_by_an_earlier_daemon()
         flaky = FlakyStore(stored, failures=10)
@@ -305,6 +304,8 @@ class Adv2BreakerTests(unittest.TestCase):
         # PRODUCT 3.5, O7's operator rules: "refusal, uncertainty, stale and unreconciled states stay visible as text".
         self.assertNotEqual(row['breaker']['state'], 'closed', row)
         self.assertNotEqual(row['blocker'], adapter.NO_BAR_EVIDENCE, row)
+        self.assertEqual(row['breaker']['state'], 'unknown', row)
+        self.assertIn('could not be read', row['blocker'])
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)

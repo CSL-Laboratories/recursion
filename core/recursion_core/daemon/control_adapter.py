@@ -378,10 +378,17 @@ class DaemonControl:
                 key = route_connection(entry)
                 if self._breaker is not None and key is not None:
                     state, tripped = self._breaker.state(key), self._breaker.tripped(key)
-                    if tripped and state == 'closed':
+                    if tripped is None:
+                        # The store could not be read: whether it holds a trip is unknown, so is the
+                        # connection; a start on it is refused until the store reads (ADV2-1, ADV2-6).
+                        state = 'unknown'
+                    elif tripped and state == 'closed':
                         state = 'open'  # tripped under an earlier daemon; this one fences it at the first request
                     record['breaker'] = {'connection': key, 'state': state, 'tripped_in_store': tripped}
-                    if tripped or state != 'closed':
+                    if tripped is None:
+                        record['blocker'] = ('breaker state unknown: the breaker store could not be read; '
+                                             f'starts on this connection are refused; {NO_BAR_EVIDENCE}')
+                    elif tripped or state != 'closed':
                         record['blocker'] = f'breaker {state} on this connection (typed limit); {NO_BAR_EVIDENCE}'
             records.append(record)
         records.append({'id': 'surface:cli', 'class': 'surface', 'surface': 'cli', 'sign_in': '', 'configured': True,

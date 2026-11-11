@@ -150,3 +150,5 @@ PYTHONPATH=core python3 -B -m unittest discover -s core/recursion_core/plugin_se
 installed, and compiles a small C extension to show the GIL check; it skips otherwise.
 `tools/ci_gate.py` does not collect `core/` tests yet (its `TEST_GLOBS` edit is a
 separate protected-path change).
+
+The frozen ConnectionBreaker surface and its refusal codes are listed in `BREAKER-CONTRACT.md` and pinned by `tests/test_breaker_contract.py`.

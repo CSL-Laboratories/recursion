@@ -317,9 +317,10 @@ _QUOTA_DENIED_AFTER = re.compile(
 )
 # Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive.
 # JSON ``\uXXXX`` / ``\/`` and ``%HH`` are peeled in turn, and every intermediate view is searched.
-# A structural view decodes only slash and colon escapes, so ``%20`` and ``%40`` inside a password
-# stay in the match. A hyphen written as ``\u002d`` and a URL written as ``https:%2F%2Fuser:password@host``
-# still match. Decoded text is only a search view: non-secret escapes stay as they were written.
+# Userinfo is one forward walk of the authority: the scheme separator may be encoded, then the walk
+# stops at whitespace, ``?``, ``#`` or a raw ``/``. ``%2F`` inside a password is not that slash.
+# A later ``@`` in the path or in the following text is left alone. A hyphen written as ``\u002d``
+# still matches. Decoded text is only a search view: non-secret escapes stay as they were written.
 _SECRET = re.compile(
     r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
     r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
@@ -332,12 +333,12 @@ _SECRET = re.compile(
     re.IGNORECASE,
 )
 _URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
-# From after :// through the last @ before the host. A slash in the password stays inside the match.
-_URL_USERINFO_WIDE = re.compile(r"https?://(\S+)@(?=[^\s/@])", re.IGNORECASE)
-_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
-# ``%40`` is an @ that a structural view deliberately does not decode, so it still has to end userinfo.
-_USERINFO_SEP = re.compile(r"@|%40", re.IGNORECASE)
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
+# Scheme separator, longest first so ``\u003a`` is not read as a bare colon. The authority walk treats
+# the same slash and colon spellings as ordinary characters, not as the end of the authority.
+_COLON_FORMS = ("\\u003a", "%3a", "\\:", ":")
+_SLASH_FORMS = ("\\u002f", "%2f", "\\/", "/")
+_AUTHORITY_ORDINARY = ("\\u002f", "\\u003a", "%2f", "%3a", "\\/", "\\:")
 
 
 # One round is a JSON peel and then a percent peel. Eight rounds are shared. A value that is still
@@ -396,12 +397,8 @@ def _decode_pct_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
     return "".join(out), spans, changed
 
 
-def _decode_structural(value: str) -> tuple[str, list[tuple[int, int]], bool]:
-    """Decode only slash and colon escapes. Every other ``%HH`` stays in place.
-
-    ``https:%2F%2Fuser:dummy%20password@host`` is then ``https://user:dummy%20password@host``,
-    so the password is still one userinfo match. ``%40`` is left encoded for the same reason.
-    """
+def _decode_escaped_backslash(value: str) -> tuple[str, list[tuple[int, int]], bool]:
+    """Decode only ``%5C`` so ``\\:`` and ``\\/`` can be seen. ``%20`` and ``%2F`` stay as written."""
 
     out: list[str] = []
     spans: list[tuple[int, int]] = []
@@ -409,41 +406,94 @@ def _decode_structural(value: str) -> tuple[str, list[tuple[int, int]], bool]:
     length = len(value)
     changed = False
     while index < length:
-        window = value[index:index + 6].lower()
-        if window.startswith("%2f"):
-            out.append("/")
+        if value[index:index + 3].lower() == "%5c":
+            out.append("\\")
             spans.append((index, index + 3))
             index += 3
-            changed = True
-            continue
-        if window.startswith("%3a"):
-            out.append(":")
-            spans.append((index, index + 3))
-            index += 3
-            changed = True
-            continue
-        if window.startswith("\\u002f"):
-            out.append("/")
-            spans.append((index, index + 6))
-            index += 6
-            changed = True
-            continue
-        if window.startswith("\\u003a"):
-            out.append(":")
-            spans.append((index, index + 6))
-            index += 6
-            changed = True
-            continue
-        if value.startswith("\\/", index) or value.startswith("\\:", index):
-            out.append("/" if value[index + 1] == "/" else ":")
-            spans.append((index, index + 2))
-            index += 2
             changed = True
             continue
         out.append(value[index])
         spans.append((index, index + 1))
         index += 1
     return "".join(out), spans, changed
+
+
+def _take_ci(text: str, index: int, forms: tuple[str, ...]) -> int:
+    """Length of the longest form at ``index``, or 0. Forms are lowercase."""
+
+    window = text[index:index + 6].lower()
+    found = 0
+    for form in forms:
+        if len(form) > found and window.startswith(form):
+            found = len(form)
+    return found
+
+
+def _scheme_authority_start(text: str, index: int) -> int:
+    """Index where the authority starts, or 0 when ``index`` is not an http(s) scheme.
+
+    Only the scheme separator is recognised in encoded form (``%2F``, ``\\/``, ``\\u002f``, and the
+    same spellings of the colon). The authority itself is not rewritten.
+    """
+
+    if text[index:index + 5].lower() == "https":
+        cursor = index + 5
+    elif text[index:index + 4].lower() == "http":
+        cursor = index + 4
+    else:
+        return 0
+    colon = _take_ci(text, cursor, _COLON_FORMS)
+    if not colon:
+        return 0
+    cursor += colon
+    for _ in range(2):
+        slash = _take_ci(text, cursor, _SLASH_FORMS)
+        if not slash:
+            return 0
+        cursor += slash
+    return cursor
+
+
+def _authority_userinfo(text: str) -> list[tuple[int, int]]:
+    """Userinfo spans: after the scheme separator, through the last ``@`` or ``%40`` in the authority.
+
+    One forward pass. The authority ends at whitespace, ``?``, ``#`` or a raw ``/``. Encoded slashes
+    and colons stay inside it, so a password's ``%2F`` does not end the walk and a later ``@`` does
+    not extend it.
+    """
+
+    found: list[tuple[int, int]] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        auth = _scheme_authority_start(text, index)
+        if not auth:
+            index += 1
+            continue
+        cursor = auth
+        last = auth
+        while cursor < length:
+            if text[cursor] in "%\\":
+                if text[cursor:cursor + 3].lower() == "%40":
+                    last = cursor
+                    cursor += 3
+                    continue
+                unit = _take_ci(text, cursor, _AUTHORITY_ORDINARY)
+                if unit:
+                    cursor += unit
+                    continue
+            char = text[cursor]
+            if char in " \t\r\n?#/":
+                break
+            if char == "@":
+                last = cursor
+                cursor += 1
+                continue
+            cursor += 1
+        if last > auth:
+            found.append((auth, last))
+        index = cursor if cursor > index else index + 1
+    return found
 
 
 def _compose(spans: list[tuple[int, int]], layer: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -484,18 +534,8 @@ def _collect_secret_hits(text: str, spans: list[tuple[int, int]], hits: list[tup
 
     for match in _URL_USERINFO.finditer(text):
         add(match.start(1), match.end(1))
-    for match in _URL_USERINFO_WIDE.finditer(text):
-        add(match.start(1), match.end(1))
-    for scheme in _URL_SCHEME.finditer(text):
-        # Last @ or %40 before the host. This covers a password that contains %20, %40, or a slash.
-        chosen = None
-        rest = text[scheme.end():]
-        for sep in _USERINFO_SEP.finditer(rest):
-            after = rest[sep.end():]
-            if after[:1] not in ("", " ", "\t", "\r", "\n", "/", "@"):
-                chosen = sep
-        if chosen is not None:
-            add(scheme.end(), scheme.end() + chosen.start())
+    for start, end in _authority_userinfo(text):
+        add(start, end)
     for match in _SECRET.finditer(text):
         add(match.start(), match.end())
 
@@ -503,9 +543,9 @@ def _collect_secret_hits(text: str, spans: list[tuple[int, int]], hits: list[tup
 def redact(value: str) -> str:
     """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are.
 
-    JSON and percent-encoding are peeled in turn. Every intermediate view is searched, and so is a
-    structural view of each that decodes only slash and colon escapes. A value that is still
-    changing after the shared cap is replaced as a whole.
+    JSON and percent-encoding are peeled in turn, and every intermediate view is searched. Userinfo
+    is the authority up to its last ``@`` or ``%40``; the walk stops at the path. A value that is
+    still changing after the shared cap is replaced as a whole.
     """
 
     if not value:
@@ -516,9 +556,11 @@ def redact(value: str) -> str:
     hits: list[tuple[int, int]] = []
     for text, spans in views:
         _collect_secret_hits(text, spans, hits)
-        structural, layer, changed = _decode_structural(text)
+        # A percent-encoded backslash is the scheme separator (\: or \/), not part of the password.
+        # Decoding every %HH here would turn %20 into a space and end the authority early.
+        slashed, layer, changed = _decode_escaped_backslash(text)
         if changed:
-            _collect_secret_hits(structural, _compose(spans, layer), hits)
+            _collect_secret_hits(slashed, _compose(spans, layer), hits)
     if not hits:
         return value
     hits.sort()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import random
 import threading
+import time
 import unittest
 from dataclasses import dataclass, field
 
@@ -894,6 +895,27 @@ class ReviewFollowupTest(unittest.TestCase):
             redacted = c.redact(text)
             self.assertNotIn(password, redacted, text)
         self.assertEqual(c.redact("rate 100% of %20 budget"), "rate 100% of %20 budget")
+
+    def test_authority_walk_stops_at_the_path(self) -> None:
+        plain = "see https://example.com/docs and mail ops@example.com"
+        self.assertEqual(c.redact(plain), plain)
+        cred = "prefix https://user:dummy_password@example.invalid/hook\nops@example.com"
+        redacted = c.redact(cred)
+        self.assertNotIn("dummy_password", redacted)
+        self.assertIn("example.invalid", redacted)
+        self.assertIn("ops@example.com", redacted)
+        path = "https://user:secret@example.com/files/a@b.txt"
+        redacted = c.redact(path)
+        self.assertNotIn("secret", redacted)
+        self.assertIn("example.com/files", redacted)
+        self.assertIn("a@b.txt", redacted)
+
+    def test_repeated_urls_redact_within_a_second(self) -> None:
+        for unit in ("https://a@b ", "https://example.com/docs "):
+            blob = (unit * (400_000 // len(unit) + 1))[:400_000]
+            started = time.perf_counter()
+            c.redact(blob)
+            self.assertLess(time.perf_counter() - started, 1.0, unit)
 
     def test_opencode_subscription_providers_are_different_breakers(self) -> None:
         chatgpt = request(

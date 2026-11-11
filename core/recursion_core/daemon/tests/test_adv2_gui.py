@@ -114,7 +114,6 @@ class Adv2HungPluginTests(GuiCase):
             time.sleep(0.02)
         return predicate()
 
-    @unittest.expectedFailure  # ADV2-3: one hung operator() holds the host lock with no deadline; every later O7 read waits for it
     def test_a_second_read_is_not_held_forever_behind_a_hung_plugin(self):
         first = threading.Thread(target=self.host.operator, args=({'command': READ, 'request_id': 'r1'},), daemon=True)
         first.start()
@@ -126,7 +125,29 @@ class Adv2HungPluginTests(GuiCase):
         second.join(3)
         self.assertFalse(second.is_alive(), 'the second O7 read is still waiting on the hung plugin after 3 s')
 
-    @unittest.expectedFailure  # ADV2-3: a hung operator plugin fills the GUI's 16 request threads; GUI Stop is refused
+    def test_a_timed_out_call_answers_504_marks_the_plugin_degraded_and_no_second_call_is_made(self):
+        host = plugins.PluginHost(self.tmp / 'config' / 'recursion', self.tmp / 'state', gil_probe=FakeGilProbe(),
+                                  verification_available=lambda: True, operator_deadline_s=0.3)
+        self.addCleanup(host.close)
+        module = host.loader._active['fixture.operator'].module
+        self.addCleanup(module.GATE.set)
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            status, body = host.operator({'command': READ})
+        self.assertEqual((status, body), (504, {'error': plugins.OPERATOR_TIMED_OUT}))
+        started = time.monotonic()
+        status, body = host.operator({'command': READ})
+        self.assertLess(time.monotonic() - started, 0.2, 'a read into a stuck plugin is answered at once')
+        self.assertEqual(status, 504)
+        self.assertIn('no new call was made', body['error'])
+        self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')
+        self.assertIn('a call has still not returned', host.inventory()['plugins'][0]['degraded'])
+        self.assertIn('degraded', host.route_records()[0]['blocker'])
+        with self.assertLogs('recursion_core.daemon.plugins', 'WARNING'):
+            module.GATE.set()
+            self.assertTrue(self.wait_for(lambda: host._stuck is None))
+        self.assertEqual(host.operator({'command': READ})[0], 200)
+        self.assertEqual(host.inventory()['plugins'][0]['degraded'], 'operator() passed its 0.3 s deadline 1 time(s)')
+
     def test_gui_stop_still_answers_while_the_operator_plugin_hangs(self):
         fake, transport = control_over(self.host)
         with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
@@ -147,6 +168,33 @@ class Adv2HungPluginTests(GuiCase):
                     reader.join(10)
         self.assertEqual(outcome, (200, True), f'GUI Stop while the operator plugin hangs: {outcome}')
         self.assertEqual(fake.call.stops, [{'run_id': 'run-1'}])
+
+    def test_stops_reserved_threads_answer_only_stop(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class BlockedHost:
+            def operator(self, command):
+                release.wait(30)
+                return 200, {'status_code': 'ok', 'result': {}}
+
+        fake, transport = control_over(BlockedHost())
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            readers = [threading.Thread(target=self._read_quietly, args=(gui,), daemon=True)
+                       for _ in range(daemon_gui.MAX_REQUEST_THREADS)]
+            for reader in readers:
+                reader.start()
+            try:
+                self.assertTrue(self.wait_for(lambda: len(gui.server._working) == daemon_gui.MAX_REQUEST_THREADS))
+                status, _ = self.get(gui, '/read?command=' + READ)
+                self.assertEqual(status, 503)  # a read is not answered on Stop's reserve
+                status, page = self.post(gui, '/stop', {'run_id': 'run-2', 'confirm': 'explicit'})
+                self.assertEqual((status, 'stop_pending' in page), (200, True))
+            finally:
+                release.set()
+                for reader in readers:
+                    reader.join(10)
+        self.assertEqual(fake.call.stops, [{'run_id': 'run-2'}])
 
     def _read_quietly(self, gui):
         try:

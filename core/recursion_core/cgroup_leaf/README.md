@@ -12,7 +12,10 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   The launching process must itself be inside that subtree, because cgroup v2
   only lets an unprivileged writer migrate a process when it can write the
   common ancestor's `cgroup.procs`. Leaf names match `run-[A-Za-z0-9_-]{1,64}`;
-  an existing leaf is never reused.
+  an existing leaf is never reused. Creation sets the `user.recursion.leaf`
+  attribute to `recursion-cgroup-leaf/1` on that directory. Sweep and adopt
+  trust a directory only when the name matches and that attribute is present.
+  The `run-` prefix alone is not ownership.
 - No launch race: the parent opens the leaf's `cgroup.procs` and starts a small
   trampoline that writes its own pid there, then execs the target. If the write
   or exec fails, it reports through a close-on-exec pipe and exits without
@@ -21,24 +24,41 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
 - Identity: the parent opens a pidfd for the unreaped child right after spawn and
   signals through it, so a reused pid is never signalled.
 - Kill: write `1` to `cgroup.kill`, SIGKILL the main process through its pidfd,
-  and repeat until the deadline. The outcome is `leaf_empty` only when
-  `cgroup.events` reads `populated 0` and the main process's exit was seen by
-  `waitpid`. Otherwise it is `running` (still populated) or `unknown`. This
+  and repeat until the deadline. Reads and writes of `cgroup.kill` and
+  `cgroup.events` stop at that deadline, so a stuck cgroup file or a process
+  that is slow to exit cannot hold cleanup open. The outcome is `leaf_empty`
+  only when `cgroup.events` reads `populated 0` and the main process's exit was
+  seen by `waitpid`. Otherwise it is `running` (still populated) or `unknown`. This
   launcher never books `terminated`: a same-uid escapee is unseen (see Limits),
   so an empty leaf does not prove the tree ended (PRODUCT.md 055cc7a5 §3.4 S5 and
   the Stop bullet, C1-27). Every outcome carries `escape_observable=False`;
   `terminated` is reserved for a launch path that can observe escapes. A populated
   or unobserved leaf is never removed: populated `0` with the main exit unseen is
   `unknown`, and the leaf and pidfd are kept so a later `close()` retries the kill.
-- Restart: `sweep(keep)` kills leftover leaves the durable run registry no longer
-  lists and books them `empty`, not `terminated`, because their exits were not
-  seen. `keep` is required (no kill-everything default) and must name every leaf
-  the registry still owns, including another launcher's on the same root; those
-  leaves are untouched. `adopt(name)` returns a handle for a kept leaf so the
-  restarted daemon can kill it later; its best outcome is `empty`
+  The directory is removed only after `cgroup.procs` and `cgroup.threads` (if
+  present) list no ids and it has no child cgroups and no symlinks; `rmdir` is
+  not called before that. `EBUSY` while the directory is not empty stops
+  immediately. `EBUSY` while it still reads empty (a dying task still holds the
+  cgroup) is retried until the same deadline, then the directory is left in
+  place. The handle remembers the directory's device and inode. A later
+  `close()` kills or removes only that directory. If the identity was never
+  known, or a different directory is now at the path, the result stays
+  `unknown` and that directory is left in place.
+- Restart: `sweep(keep)` returns a `SweepResult`. It kills a leftover directory
+  only when the name is a leaf id and the directory still has the ownership
+  marker written at creation, and it books that leaf `empty`, not `terminated`,
+  because the exit was not seen. `keep` is required (no kill-everything default)
+  and must name every leaf the registry still owns, including another launcher's
+  on the same root; those leaves are untouched. A systemd `run-*.scope`, any
+  other name, a leaf id without the marker, and a symlink are left in place and
+  listed in `reported`. They are not killed. `adopt(name)` returns a handle for
+  a kept, marked leaf so the restarted daemon can kill it later; its best
+  outcome is `empty`. As a context manager that `empty` outcome is success.
+  `CleanupIncomplete` is still raised when the adopted cleanup does not finish
   (PRODUCT.md 055cc7a5 §3.1, Q38/O53).
 - Errors: a cleanup problem never replaces the original exception; it is added
-  as a note. On a clean exit, incomplete cleanup raises `CleanupIncomplete`.
+  as a note. On a clean exit of a launch, anything other than `leaf_empty`
+  raises `CleanupIncomplete`. An adopted leaf's clean exit accepts `empty`.
 - Interrupted cleanup: `finally` can be interrupted (PRODUCT.md 055cc7a5 §3.4,
   C2-10), so an exception raised inside cleanup (a second `KeyboardInterrupt`, for example)
   is noted and the kill retried, up to 5 attempts, on every exit path; the

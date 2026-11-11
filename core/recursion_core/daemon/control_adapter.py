@@ -498,6 +498,25 @@ def peer_is_engine(pid):
     return any('recursion-run-' in part for line in text.splitlines() for part in line.split('/'))
 
 
+def door_directory(directory):
+    """Create the door's directory at 0700, or check the one that is there.
+
+    Like the transport (``ensure_private_dir``), an existing directory that is a symlink, is not
+    ours, or grants any group or other bit is refused, not repaired: the door runs before the
+    transport's check, and a chmod here would hide a wrong place from it (ADV1-13).
+    """
+    path = Path(directory)
+    if not path.exists() and not path.is_symlink():
+        return private_dir(path)
+    require_launcher_platform()
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise PermissionError(f'{path} must be an operator-owned directory')
+    if info.st_mode & 0o077:
+        raise PermissionError(f'{path} has mode {stat.S_IMODE(info.st_mode):04o}, want 0700')
+    return path
+
+
 class DeviceDoor:
     """The GUI's device door: a per-daemon-start secret in an owner-only runtime file.
 
@@ -513,7 +532,7 @@ class DeviceDoor:
     """
 
     def __init__(self, directory, *, publish=True):
-        private_dir(directory)
+        door_directory(directory)
         self.path = Path(directory) / DEVICE_TOKEN_FILE
         self._token = secrets.token_urlsafe(32)
         self._published = None  # (device, inode) of the token file this door wrote

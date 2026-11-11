@@ -590,19 +590,36 @@ class GuiDoorAttackTest(ComposedBase):
 
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')
 class RuntimeDirTest(unittest.TestCase):
-    def test_an_existing_group_readable_runtime_directory_is_tightened_not_refused(self):
-        # Documents: DeviceDoor's private_dir runs before the transport's ensure_private_dir and chmods a
-        # 0755 directory to 0700, so the transport's "refuse, do not repair" rule never fires.
+    def test_an_existing_group_readable_runtime_directory_is_refused_not_tightened(self):
+        # ADV1-13 (fixed): DeviceDoor's directory check runs before the transport's ensure_private_dir. It
+        # used to chmod a 0755 directory to 0700, so the transport's "refuse, do not repair" rule never fired.
         tmp = Path(tempfile.mkdtemp(prefix='rc-adv1-rt-'))
         self.addCleanup(lambda: __import__('shutil').rmtree(tmp, True))
         os.chmod(tmp, 0o700)
         directory = tmp / 'recursion'
         directory.mkdir()
+        for mode in (0o755, 0o750, 0o701, 0o770):
+            os.chmod(directory, mode)
+            for publish in (True, False):
+                with self.assertRaises(PermissionError):
+                    adapter.DeviceDoor(directory, publish=publish)
+            self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), mode)
+            self.assertEqual(os.listdir(directory), [])
+        # The composition refuses the same directory and leaves it as it was: no socket, lock or token file.
         os.chmod(directory, 0o755)
+        daemon = Daemon(Registry(tmp / 'state'), launcher.EngineUnitManager(), boot_id=lambda: BOOT)
+        self.addCleanup(daemon.close)
+        with self.assertRaises(PermissionError):
+            adapter.compose_control(daemon, tmp / 'state', routes={}, environ={
+                'XDG_RUNTIME_DIR': str(tmp), 'XDG_CONFIG_HOME': str(tmp / 'config'), 'PATH': '/usr/bin:/bin'})
+        self.assertEqual((stat.S_IMODE(os.stat(directory).st_mode), os.listdir(directory)), (0o755, []))
+        # A missing directory is still made at 0700, and a 0700 one is used as it is.
+        os.rmdir(directory)
         door = adapter.DeviceDoor(directory)
         self.addCleanup(door.close)
         self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(os.stat(door.path).st_mode), 0o600)
+        adapter.DeviceDoor(directory, publish=False)
 
 
 if __name__ == '__main__':

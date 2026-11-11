@@ -123,6 +123,56 @@ recorded on F60, CSL-762).
   force a prompt. Without the setting, stop prompts in Auto mode and is refused under `codex exec`. Start
   is not auto-approved.
 
+## Operator inspect reads (read-only, for a separate local process)
+
+`operator_reads.py` and `operator_reads_socket.py` are a second, GET-only surface. It is apart from
+`ControlAPI`: it imports nothing from it, has no mutating method, and cannot start or stop a run.
+
+- **Reads.** `OperatorReads(sources=None, *, profile=None, clock=time.time).call(method, params) -> dict`
+  serves `operator.positions.inspect`, `operator.decisions.inspect` and `operator.budgets.inspect`.
+  `params` is `{}` or `None`. `call` never raises.
+- **Envelope (O7 v0).** `api_version` (`"o7.operator.v0"`), `command`, `request_id` (new per call),
+  `profile`, `authority_effect` (`"none"`), `order_path` (`"none"`), `code`, `status_code` (same string as
+  `code`), `result` (`{"positions" | "decisions" | "budgets": [rows]}` plus any `extra` fields of the
+  source), `errors` (`[]` when ok, else one `{code, status_code, message, recovery}`), `stale`,
+  `unreconciled`, `served_at`; `empty_reason` when an ok read has no rows; `detail` on a refusal.
+  `profile` is the host's summary or `{"profile_id": null, "signature_state": "no_profile"}`.
+- **Codes.** `ok`, `stale_or_unreconciled` (rows still shown), `method_not_allowed`, `request_invalid`,
+  `source_unavailable`, `source_invalid`, `row_invalid`, `venue_refused`; from the socket also
+  `request_too_large`, `request_timeout`, `busy`, `peer_refused`, `reply_too_large`; from the client
+  alone `control_api_unavailable`. A refusal has `result` `{}`: a read is served whole or not at all.
+- **Sources.** Recursion has no paper order book, approval-decision store or authority ledger on this
+  branch, so this code owns no state. The host that composes the server injects one zero-argument
+  callable per read (`sources={"positions": ..., "decisions": ..., "budgets": ...}`), each returning
+  `{"venue": "paper" | "stock", "rows": [...], "stale"?, "unreconciled"?, "empty_reason"?, "extra"?}`.
+  Once composed, positions are meant to come from the order book of the paper venue, decisions from the
+  approval gate's recorded decisions, and budgets from the authority ledger's budgets.
+  **Uncomposed reads answer ok-empty**: `code` `ok`, an empty list and `empty_reason`
+  `no_<read>_source_attached`. No rows are ever made up.
+- **Rows.** Each row is a flat dict of JSON scalars with snake_case keys. Every row is labelled with its
+  source's venue (`venue` is set when absent). A row naming another venue, or a source venue other than
+  `paper`/`stock`, answers `venue_refused`; a nested value, a non-finite float or a bad key answers
+  `row_invalid`. Nothing is dropped silently.
+- **Socket.** `OperatorReadsServer(reads, path=None, *, read_deadline_s=2.0, max_connections=8)` with
+  `start()`, `close()` and `with`; it serves on a daemon thread and accepts only an `OperatorReads`.
+  One request per connection: one JSON line `{"method": str, "params": {}}` of at most 4096 bytes, one
+  JSON reply line, close. Default path `$XDG_RUNTIME_DIR/recursion/operator-reads.sock`, else
+  `/run/user/<uid>/recursion/operator-reads.sock`: its own file, so it can never carry a control request.
+- **Security model.** No token. Owner-only socket: directory `0700` (created if missing; the server
+  refuses to serve if it is a symlink, not owned by this uid, or open to group or other), socket file
+  `0600`, and each peer's uid checked with `SO_PEERCRED` (another uid is answered `peer_refused` unread).
+  Any process of the same user can read. Linux only: where `AF_UNIX`, `SO_PEERCRED` or uids are missing
+  (macOS, Windows) the modules import, `start()` raises `PlatformNotSupported`, and the socket tests skip.
+- **Client.** `from recursion_core.control.operator_reads import connect`;
+  `connect(path: str | None = None, *, timeout_s: float = 5.0)` returns an object whose
+  `call(method, params) -> dict` opens one connection per call and never raises. Unreachable answers
+  `{"code": "control_api_unavailable", "delivered": false, "detail": ...}` (`detail`
+  `platform_unsupported` without `AF_UNIX` or uids); a request written with no complete reply answers
+  `"delivered": "unknown"`. A name that is not `operator.<name>.inspect` is refused locally
+  (`method_not_allowed`, `"delivered": false`).
+
+No host composes or starts this server yet; that belongs to the daemon adapter below.
+
 ## Candidate and unwired
 
 No daemon serves this API yet, no MCP transport is implemented, the CLI has no packaged entry point (its

@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
 
+from recursion_core.control_transport import framing
 from recursion_core.control_transport.correlation import (
     ACCEPTED,
     CANCELLED,
@@ -30,6 +32,10 @@ from recursion_core.control_transport.correlation import (
 from recursion_core.control_transport.unix import UnixControlClient, UnixControlServer
 
 LINUX = sys.platform.startswith("linux")
+
+
+def _pong(message, conn):
+    return {"ok": True, "op": "pong"}
 
 
 class FakeClock:
@@ -239,6 +245,37 @@ class RequestIdentityTests(unittest.TestCase):
         self.assertEqual(table.finish(claim, {"ok": True, "op": "pong"}), IGNORED)
 
 
+class SettledIdBoundTests(unittest.TestCase):
+    def test_settled_ids_stay_bounded_and_a_live_replay_is_still_replayed(self) -> None:
+        cap = 4
+        table = RequestTable(clock=FakeClock(), close_timeout_s=5.0, settled_cap=cap)
+        for n in range(40):
+            claim = table.claim(n, scope="live")
+            self.assertTrue(claim.accepted, n)
+            self.assertEqual(table.finish(claim, {"ok": True, "id": n}), ACCEPTED)
+            self.assertLessEqual(table.settled_count(), cap)
+            self.assertLessEqual(table.settled_count("live"), cap)
+        # The id just completed is still remembered on this live connection.
+        self.assertEqual(table.claim(39, scope="live").code, REPLAYED_ID)
+        self.assertLessEqual(table.settled_count("live"), cap)
+        # An id the cap has forgotten can run again. That is the bound.
+        forgotten = table.claim(0, scope="live")
+        self.assertTrue(forgotten.accepted)
+
+        for scope in range(100):
+            claim = table.claim("s", scope=scope)
+            self.assertEqual(table.finish(claim, {"ok": True, "id": "s"}), ACCEPTED)
+            table.drop_scope(scope)
+            self.assertLessEqual(table.settled_count(), cap)
+        self.assertEqual(table.settled_count(), cap)
+        table.drop_scope("live")
+        self.assertEqual(table.settled_count(), 0)
+        self.assertEqual(table.settled_count("live"), 0)
+        # The connection's record is gone, so the id is not a replay anymore.
+        self.assertTrue(table.claim(39, scope="live").accepted)
+        self.assertTrue(table.claim(0, scope="live").accepted)
+
+
 @unittest.skipUnless(LINUX, "Linux is the tested path")
 class SocketCorrelationTests(unittest.TestCase):
     """The server uses the table: one close deadline, and ids answered on the socket."""
@@ -251,8 +288,8 @@ class SocketCorrelationTests(unittest.TestCase):
     def _rm(self) -> None:
         shutil.rmtree(self.base, ignore_errors=True)
 
-    def server(self, handler, **kwargs) -> UnixControlServer:
-        srv = UnixControlServer(self.sock_dir, handler, **kwargs)
+    def server(self, handler=None, **kwargs) -> UnixControlServer:
+        srv = UnixControlServer(self.sock_dir, handler or _pong, **kwargs)
         srv.start()
         self.addCleanup(srv.close)
         return srv
@@ -365,6 +402,171 @@ class SocketCorrelationTests(unittest.TestCase):
             omitted = client.request({"op": "ping"})
         self.assertEqual(omitted.get("op"), "pong")
         self.assertNotIn("id", omitted)
+
+    def test_settled_ids_on_a_live_connection_stay_bounded(self) -> None:
+        """A long-lived connection remembers a bounded set, then drops it on close.
+
+        The newest id is still a replay while the connection is open. After the
+        connection closes the record is gone, so the server does not keep one
+        entry per request for the process lifetime.
+        """
+        cap = 4
+        seen: list[object] = []
+
+        def handler(message, conn):
+            seen.append(message.get("id"))
+            return {"ok": True, "op": "stop", "state": "stopped"}
+
+        srv = self.server(handler, settled_cap=cap)
+        with UnixControlClient(srv.path, timeout_s=2) as client:
+            for n in range(30):
+                reply = client.request({"op": "stop", "id": f"n{n}"})
+                self.assertEqual(reply["state"], "stopped")
+                self.assertEqual(reply["id"], f"n{n}")
+                self.assertLessEqual(srv.settled_count(), cap)
+            replay = client.request({"op": "stop", "id": "n29"})
+            self.assertEqual(replay["error"]["code"], REPLAYED_ID)
+            self.assertEqual(replay["id"], "n29")
+            self.assertFalse(replay["error"]["retryable"])
+            self.assertLessEqual(srv.settled_count(), cap)
+        self.assertEqual(seen, [f"n{n}" for n in range(30)])
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and srv.settled_count() != 0:
+            time.sleep(0.01)
+        self.assertEqual(srv.settled_count(), 0)
+
+    def test_response_too_large_echoes_the_request_id(self) -> None:
+        """A client that sent an id gets it back, so request() does not raise reply_id_mismatch."""
+
+        def handler(message, conn):
+            return {"ok": True, "id": message["id"], "pad": "x" * 200}
+
+        srv = self.server(handler, max_frame_bytes=80)
+        with UnixControlClient(srv.path, timeout_s=2) as client:
+            reply = client.request({"op": "stop", "id": "s9"})
+        self.assertEqual(reply["error"]["code"], "response_too_large")
+        self.assertEqual(reply["id"], "s9")
+        self.assertEqual(reply["ok"], False)
+
+    def test_bad_frame_echoes_a_parseable_id_and_unparseable_frames_stay_idless(self) -> None:
+        """An oversized frame whose JSON still yields an id comes back as bad_frame with that id.
+
+        A frame that is not JSON has no id to echo. The reply stays id-less. That is
+        the only bad_frame a client cannot correlate: there is no id to put on it,
+        and a client that had attached one would raise reply_id_mismatch.
+        """
+        srv = self.server(max_frame_bytes=48)
+        with UnixControlClient(srv.path, timeout_s=2, max_frame_bytes=1000) as client:
+            reply = client.request({"id": "s9", "op": "stop", "pad": "y" * 40})
+        self.assertEqual(reply["error"]["code"], "bad_frame")
+        self.assertEqual(reply["error"]["detail"], "frame_too_large")
+        self.assertEqual(reply["id"], "s9")
+        # null is an id the client sent. Echoing it is what keeps request() from
+        # raising reply_id_mismatch; omitting the key would.
+        with UnixControlClient(srv.path, timeout_s=2, max_frame_bytes=1000) as client:
+            null_id = client.request({"id": None, "op": "stop", "pad": "z" * 40})
+        self.assertEqual(null_id["error"]["code"], "bad_frame")
+        self.assertIn("id", null_id)
+        self.assertIsNone(null_id["id"])
+
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(2)
+            raw.connect(srv.path)
+            raw.sendall(framing.HEADER.pack(5) + b"nope!")
+            junk = framing.read_frame(raw)
+        self.assertIsInstance(junk, dict)
+        assert isinstance(junk, dict)
+        self.assertEqual(junk["error"]["code"], "bad_frame")
+        self.assertNotIn("id", junk)
+
+    def test_a_deep_frame_with_a_leading_id_echoes_it(self) -> None:
+        """The id is a shallow field at the front, so a too-deep body can still name it.
+
+        A too-deep body that does not start with an id stays id-less. That case is
+        test_deeply_nested_frame_is_a_frame_error_and_the_server_lives.
+        """
+        deep = b"[" * 200_000 + b"]" * 200_000
+        body = b'{"id":"s9","op":' + deep + b"}"
+        srv = self.server()
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(10)
+            raw.connect(srv.path)
+            raw.sendall(framing.HEADER.pack(len(body)) + body)
+            reply = framing.read_frame(raw)
+        self.assertEqual(reply["error"]["code"], "bad_frame")
+        self.assertEqual(reply["error"]["detail"], "frame_too_deep")
+        self.assertEqual(reply["id"], "s9")
+
+    def test_a_handler_that_ignores_cancelled_cannot_write_after_close(self) -> None:
+        """Close does not deliver a result from a handler that never watches cancelled.
+
+        The handler blocks on its own event. Close still returns on the shared
+        deadline, and the result that arrives afterwards is dropped rather than
+        written as a completed stop.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        returned = threading.Event()
+
+        def handler(message, conn):
+            entered.set()
+            release.wait(timeout=3)
+            returned.set()
+            return {"ok": True, "op": "stop", "state": "stopped", "id": message.get("id")}
+
+        srv = self.server(handler, close_timeout_s=0.3, idle_timeout_s=30.0)
+        caught: list[object] = []
+
+        def call() -> None:
+            try:
+                with UnixControlClient(srv.path, timeout_s=3) as client:
+                    caught.append(client.request({"op": "stop", "id": "s1"}))
+            except Exception as exc:
+                caught.append(exc)
+
+        worker = threading.Thread(target=call)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=2))
+        closer = threading.Thread(target=srv.close)
+        closer.start()
+        closer.join(timeout=1.0)
+        release.set()
+        self.assertFalse(closer.is_alive(), "close waited on a handler that ignores cancelled")
+        closer.join(timeout=2)
+        self.assertTrue(returned.wait(timeout=2))
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and srv.late_dropped < 1:
+            time.sleep(0.01)
+        self.assertGreaterEqual(srv.late_dropped, 1)
+        self.assertEqual(len(caught), 1)
+        item = caught[0]
+        if isinstance(item, dict):
+            self.assertNotEqual(item.get("state"), "stopped")
+
+
+class ParseableIdTests(unittest.TestCase):
+    def test_a_leading_id_is_readable_and_unparseable_bytes_are_not(self) -> None:
+        """An id the server can read is echoed. Bytes that are not a frame have no id.
+
+        A too-deep body still yields an id when that id is a shallow value at the
+        start of the object. A body with no such value stays unknown, and the
+        reply omits id.
+        """
+        from recursion_core.control_transport.framing import parseable_request_id
+
+        self.assertEqual(parseable_request_id(b'{"id":"s9","op":"stop"}'), (True, "s9"))
+        self.assertEqual(parseable_request_id(b'{"id":7}'), (True, 7))
+        self.assertEqual(parseable_request_id(b'{"id":null}'), (True, None))
+        self.assertEqual(parseable_request_id(b"nope!"), (False, None))
+        self.assertEqual(parseable_request_id(b"[]"), (False, None))
+        self.assertEqual(parseable_request_id(b'{"op":"ping"}'), (False, None))
+        deep = b"[" * 200_000 + b"]" * 200_000
+        self.assertEqual(parseable_request_id(b'{"id":"s9","op":' + deep + b"}"), (True, "s9"))
+        self.assertEqual(parseable_request_id(b'{"op":' + deep + b"}"), (False, None))
 
 
 if __name__ == "__main__":

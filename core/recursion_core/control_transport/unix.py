@@ -30,7 +30,7 @@ try:
 except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 stub path
     fcntl = None  # type: ignore[assignment]
 
-from .correlation import ACCEPTED, CANCELLED, IGNORED, MISSING_ID, RequestTable, same_id
+from .correlation import ACCEPTED, CANCELLED, IGNORED, MISSING_ID, SETTLED_CAP, RequestTable, same_id
 from .errors import FrameError, InsecureSocketPath, PeerRefused, RemoteBindRefused, TransportBusy
 from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
 from .handlers import Connection, Handler, Message
@@ -225,6 +225,7 @@ class UnixControlServer:
         idle_timeout_s: float = IDLE_TIMEOUT_S,
         max_frame_bytes: int = MAX_FRAME_BYTES,
         close_timeout_s: float = CLOSE_TIMEOUT_S,
+        settled_cap: int = SETTLED_CAP,
     ) -> None:
         directory = refuse_remote_bind(directory)
         if not name or "/" in name or name in (".", ".."):
@@ -239,7 +240,7 @@ class UnixControlServer:
         self._slots = threading.BoundedSemaphore(max_connections)
         self._idle_timeout_s = idle_timeout_s
         self._max_frame_bytes = max_frame_bytes
-        self._requests = RequestTable(close_timeout_s=close_timeout_s)
+        self._requests = RequestTable(close_timeout_s=close_timeout_s, settled_cap=settled_cap)
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
@@ -256,6 +257,10 @@ class UnixControlServer:
     @property
     def path(self) -> str:
         return self._path
+
+    def settled_count(self) -> int:
+        """Settled ids still remembered across open connections."""
+        return self._requests.settled_count()
 
     def start(self) -> None:
         with self._lock:
@@ -404,7 +409,7 @@ class UnixControlServer:
                 if request is None:
                     return
                 if request.get("op") == "cancel":
-                    if not self._write_reply(conn, self._cancel_message(request)):
+                    if not self._write_reply(conn, self._cancel_message(request), request):
                         return
                     continue
                 if "id" not in request:
@@ -413,7 +418,7 @@ class UnixControlServer:
                     claim = self._requests.claim(request["id"], scope=connection.conn_id)
                 if not claim.accepted:
                     code = claim.code if claim.code is not None else MISSING_ID
-                    if not self._write_reply(conn, _correlated_error(code, request)):
+                    if not self._write_reply(conn, _correlated_error(code, request), request):
                         return
                     continue
                 connection.cancelled = claim.event
@@ -423,16 +428,21 @@ class UnixControlServer:
                     self._count_late()
                     # The handler's body is not this request's reply. A live cancel still
                     # tells that client the request was cancelled; a close does not.
+                    # A handler that never watches cancelled hits this same path: close
+                    # has already abandoned the claim, so the late body is not written.
                     if self._requests.past_deadline() or claim.request_id is None:
                         return
-                    if not self._write_reply(conn, _correlated_error(CANCELLED, request)):
+                    if not self._write_reply(conn, _correlated_error(CANCELLED, request), request):
                         return
                     continue
                 if outcome == ACCEPTED and claim.request_id is not None and "id" not in response:
                     response = {**response, "id": claim.request_id}
-                if not self._write_reply(conn, response):
+                if not self._write_reply(conn, response, request):
                     return
         finally:
+            # The connection's settled ids die with it. A replay on a connection
+            # that is still open is unchanged.
+            self._requests.drop_scope(connection.conn_id)
             conn.close()
             self._slots.release()
             with self._lock:
@@ -440,11 +450,21 @@ class UnixControlServer:
                 self._conns.discard(conn)
 
     def _read_request(self, conn: socket.socket) -> Message | None:
+        """Read one request. A bad frame is answered and ends the connection.
+
+        The answer carries the request id when the frame yielded one, including
+        null, so a client that sent an id does not see ``reply_id_mismatch``.
+        A frame that is not JSON, or whose id cannot be read, is answered with
+        no id. That id-less reply is the one bad_frame the client cannot correlate.
+        """
         deadline = time.monotonic() + self._idle_timeout_s
         try:
             return read_frame(conn, max_bytes=self._max_frame_bytes, deadline=deadline)
         except FrameError as exc:
-            _send_quietly(conn, {"ok": False, "error": {"code": "bad_frame", "detail": str(exc)}})
+            reply: Message = {"ok": False, "error": {"code": "bad_frame", "detail": str(exc)}}
+            if exc.id_known:
+                reply["id"] = exc.request_id
+            _send_quietly(conn, reply)
             return None
         except OSError:
             return None
@@ -467,12 +487,20 @@ class UnixControlServer:
             return body
         return _correlated_error(code, request)
 
-    def _write_reply(self, conn: socket.socket, message: Message) -> bool:
+    def _write_reply(self, conn: socket.socket, message: Message, request: Message | None = None) -> bool:
+        """Write ``message``. A frame that does not fit is ``response_too_large``.
+
+        When ``request`` carried an id, that id is copied onto the error, including
+        null, so the client that sent it does not see ``reply_id_mismatch``.
+        """
         try:
             conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
             write_frame(conn, message, max_bytes=self._max_frame_bytes)
         except FrameError:
-            _send_quietly(conn, {"ok": False, "error": {"code": "response_too_large"}})
+            reply: Message = {"ok": False, "error": {"code": "response_too_large"}}
+            if request is not None and "id" in request:
+                reply["id"] = request["id"]
+            _send_quietly(conn, reply)
             return False
         except OSError:
             return False

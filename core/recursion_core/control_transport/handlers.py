@@ -30,7 +30,8 @@ class Connection:
 
     ``cancelled`` is set when this request is cancelled or the server's close deadline
     has passed. The server binds a fresh event for each request. A handler may wait on
-    it; a result returned after it is set is not written.
+    it. A result returned after it is set is not written, including from a handler that
+    never looks at ``cancelled``: close still drops that result.
     """
 
     conn_id: int

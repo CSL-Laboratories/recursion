@@ -24,7 +24,17 @@ class PeerRefused(TransportRefused, PermissionError):
 
 
 class FrameError(TransportRefused, ValueError):
-    """A frame is malformed, oversized or truncated."""
+    """A frame is malformed, oversized or truncated.
+
+    ``id_known`` is true when the body yielded a top-level id, including null.
+    An unparseable frame leaves it false. The reply then omits ``id``: there is
+    nothing to echo, and the server does not invent one.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.id_known = False
+        self.request_id: object = None
 
 
 class PlatformNotSupported(TransportRefused, NotImplementedError):

@@ -5,6 +5,10 @@ JSON booleans and numbers are different ids, and a bool must never be used as a 
 key next to an int (they compare equal in Python). Close arms one deadline for every
 handler. A handler still running at that deadline is cancelled, and a result that
 arrives afterwards is ignored.
+
+Settled ids are remembered per connection, capped, and dropped when that connection
+closes. A replay on a connection that is still open is ``replayed_id`` while the id
+is inside the cap. An id the cap has evicted can run again.
 """
 
 from __future__ import annotations
@@ -25,7 +29,12 @@ ACCEPTED = "accepted"
 IGNORED = "ignored"
 MISMATCH = "mismatch"
 
+# How many finished ids one connection remembers. Older than this, a replay is
+# indistinguishable from a new id: the bound is the point.
+SETTLED_CAP = 128
+
 Clock = Callable[[], float]
+_ALL_SCOPES = object()
 
 
 def usable_id(request_id: object) -> bool:
@@ -66,19 +75,34 @@ class _Record:
 
 
 class RequestTable:
-    """In-flight ids for one server, and the shared close deadline."""
+    """In-flight ids for one server, and the shared close deadline.
 
-    def __init__(self, *, clock: Clock = time.monotonic, close_timeout_s: float = 5.0) -> None:
+    Settled ids are kept per connection scope, oldest first, and only up to
+    ``settled_cap``. A replay of an id still in that set is ``replayed_id``.
+    ``drop_scope`` forgets a connection when it closes.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Clock = time.monotonic,
+        close_timeout_s: float = 5.0,
+        settled_cap: int = SETTLED_CAP,
+    ) -> None:
         if close_timeout_s < 0:
             raise ValueError("close_timeout_s must be >= 0")
+        if type(settled_cap) is not int or settled_cap < 1:
+            raise ValueError("settled_cap must be a positive int")
         self._clock = clock
         self._close_timeout_s = close_timeout_s
+        self._settled_cap = settled_cap
         self._lock = threading.Lock()
         self._inflight: dict[int, _Record] = {}
         # Keyed by (connection scope, id). Two connections may both use id 0.
         # A bool is never a key: it would collide with 0 or 1.
         self._by_id: dict[tuple[object, str | int], int] = {}
-        self._settled: dict[tuple[object, str | int], str] = {}
+        # Per scope, insertion order, oldest first. The cap drops the oldest.
+        self._settled: dict[object, dict[str | int, str]] = {}
         self._deadline: float | None = None
         self._seq = 0
 
@@ -98,7 +122,8 @@ class RequestTable:
             key = (scope, request_id)
             if key in self._by_id:
                 return self._refused(DUPLICATE_ID, request_id)
-            if key in self._settled:
+            remembered = self._settled.get(scope)
+            if remembered is not None and request_id in remembered:
                 return self._refused(REPLAYED_ID, request_id)
             return self._start_locked(request_id, key)
 
@@ -149,7 +174,12 @@ class RequestTable:
             if len(tokens) == 1:
                 self._settle_locked(tokens[0], CANCELLED)
                 return CANCELLED
-            states = [state for key, state in self._settled.items() if same_id(key[1], request_id)]
+            states = [
+                state
+                for bucket in self._settled.values()
+                for ident, state in bucket.items()
+                if same_id(ident, request_id)
+            ]
             if not states:
                 return UNKNOWN_ID
             if all(state == CANCELLED for state in states):
@@ -194,6 +224,26 @@ class RequestTable:
         with self._lock:
             return self._abandon_locked()
 
+    def settled_count(self, scope: object = _ALL_SCOPES) -> int:
+        """How many settled ids are remembered. One scope, or every scope."""
+        with self._lock:
+            if scope is _ALL_SCOPES:
+                return sum(len(bucket) for bucket in self._settled.values())
+            bucket = self._settled.get(scope)
+            return 0 if bucket is None else len(bucket)
+
+    def drop_scope(self, scope: object) -> None:
+        """Forget one connection's settled ids and any request still in flight on it."""
+        with self._lock:
+            self._settled.pop(scope, None)
+            for token, record in list(self._inflight.items()):
+                key = record.key
+                if key is None or type(key[0]) is not type(scope) or key[0] != scope:
+                    continue
+                self._by_id.pop(key, None)
+                del self._inflight[token]
+                record.event.set()
+
     def _abandon_locked(self) -> list[str | int | None]:
         cancelled: list[str | int | None] = []
         for token in list(self._inflight):
@@ -222,5 +272,18 @@ class RequestTable:
             return
         if record.key is not None:
             self._by_id.pop(record.key, None)
-            self._settled[record.key] = state
+            scope, request_id = record.key
+            self._remember_locked(scope, request_id, state)
         record.event.set()
+
+    def _remember_locked(self, scope: object, request_id: str | int, state: str) -> None:
+        bucket = self._settled.get(scope)
+        if bucket is None:
+            bucket = {}
+            self._settled[scope] = bucket
+        # Reinsert so a repeat settle is the newest, then drop the oldest past the cap.
+        if request_id in bucket:
+            del bucket[request_id]
+        bucket[request_id] = state
+        while len(bucket) > self._settled_cap:
+            del bucket[next(iter(bucket))]

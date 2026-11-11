@@ -460,10 +460,12 @@ class ControlAPI:
         return carried
 
     def _adopt_unrecorded_launch(self, rec: dict) -> dict | None:
-        """Point a cgroup-less record at the launch this process kept.
+        """Point a cgroup-less registry row at the launch this process kept.
 
-        The generation just read from the registry is written onto that handle before the stop is
-        retried. Returns a finished answer, or None when ``rec`` is ready for cleanup.
+        The row stays the base. The handle contributes its cgroup and any unwritten cleanup, and the
+        row's generation is copied back onto the handle. A handle that already says stopped is not
+        written as-is: the caller confirms that cgroup and builds a new proof. Returns a finished
+        answer, or None when ``rec`` is ready for cleanup.
         """
         if rec.get("cgroup"):
             return None
@@ -471,14 +473,19 @@ class ControlAPI:
         launched = self._launched.get(run_id)
         if launched is None:  # launch not confirmed yet: keep the Stop as intent
             return self._stop_intent(rec)
-        generation = rec.get("generation")
-        rec.clear()
-        rec.update(launched)
-        if generation is not None:
-            rec["generation"] = generation
-            self._launched[run_id]["generation"] = generation
-        if rec.get("state") == "stopped":
-            return self._recorded({"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}, rec)
+        # The registry row is newer than the handle (its engine, generation, and anything else written
+        # after the launch). Keep that row and take only the cgroup the handle saw, plus a cleanup
+        # decision that never landed. A handle that already says stopped is confirmed again so the
+        # proof is rebuilt for this generation instead of replayed.
+        if launched.get("cgroup"):
+            rec["cgroup"] = launched["cgroup"]
+        if launched.get("cgroup_marker"):
+            rec["cgroup_marker"] = launched["cgroup_marker"]
+        if isinstance(launched.get("stop"), dict):
+            rec["stop"] = dict(launched["stop"])
+        rec.pop("stop_attestation", None)
+        if rec.get("generation") is not None:
+            self._launched[run_id]["generation"] = rec["generation"]
         return None
 
     def _stop(self, rec: dict) -> dict:
@@ -512,6 +519,11 @@ class ControlAPI:
         first = rec["state"] != "stop_pending"
         if rec.get("stop") is None:
             rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
+        # ``requested`` is only true for the cgroup path and marker stored on the stop itself.
+        # A later edit that points the run at another cgroup has not been requested.
+        sent = (rec["stop"].get("cgroup"), rec["stop"].get("cgroup_marker"))
+        if rec["stop"].get("requested") and sent != self._cgroup_identity(rec):
+            rec["stop"]["requested"] = False
         if not rec["stop"].get("requested", True):
             # First stop, a stop intent left during launch, or an earlier request raised before it was known
             # to be sent: (re)send it. A request is not reused for a different cgroup identity.
@@ -520,6 +532,8 @@ class ControlAPI:
             except Exception as err:
                 return self._pending(rec, f"cleanup_error:{type(err).__name__}")
             rec["stop"]["requested"] = True
+            rec["stop"]["cgroup"] = rec.get("cgroup")
+            rec["stop"]["cgroup_marker"] = rec.get("cgroup_marker")
         try:
             answer = self._kill.confirm(rec["cgroup"], self._confirm_timeout_s)
         except Exception as err:

@@ -186,8 +186,10 @@ class InMemoryRunRegistry:
     def _load_record(self, rec: dict) -> None:
         """Accept a snapshot from an older process.
 
-        A cgroup without a marker is given one. A stopped snapshot whose attestation names a different
-        cgroup is rejected here, instead of failing later with ``KeyError``.
+        A cgroup without a marker is given one. A stopped snapshot is rejected when its attestation
+        names another cgroup, a generation newer than the record, or a membership that still lists
+        someone the proof does not cover or who is still alive. A proof older than the record, naming
+        members the row has already dropped, is kept.
         """
         rec.setdefault("generation", 1)
         rec.setdefault("members", [])
@@ -208,6 +210,19 @@ class InMemoryRunRegistry:
             attestation["cgroup_marker"] = rec.get("cgroup_marker")
         elif marker != rec.get("cgroup_marker"):
             raise StopUnattested(run_id)
+        proof_gen = attestation.get("generation")
+        record_gen = rec.get("generation")
+        if not isinstance(proof_gen, int) or not isinstance(record_gen, int) or proof_gen > record_gen:
+            raise StopUnattested(run_id)
+        member_ids = attestation.get("member_ids")
+        if not isinstance(member_ids, list):
+            raise StopUnattested(run_id)
+        proved = set(member_ids)
+        for member in rec.get("members") or []:
+            # A member still on the row must be one the proof named, and must no longer be alive.
+            # A proof may name members the row has already dropped; that history stays valid.
+            if not isinstance(member, dict) or member.get("member_id") not in proved or self.process_alive(member.get("pid")):
+                raise StopUnattested(run_id)
 
     def process_alive(self, pid: int | None) -> bool:
         """True when ``pid`` is a member we cannot show is gone."""

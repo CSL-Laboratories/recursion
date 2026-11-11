@@ -12,6 +12,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -364,6 +365,65 @@ class ReadHelpTest(unittest.TestCase):
             pid = int((home / "pid").read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+    def test_child_that_closes_stdout_early_is_not_killed(self) -> None:
+        # Closing stdout is EOF, not failure. The child may still be exiting.
+        # Killing it there turns a successful help read into unknown.
+        argv = [sys.executable, "-B", "-c",
+                'import os, time; os.write(1, b"help-ok\\n"); os.close(1); time.sleep(0.2)']
+        done = bd._bounded_run(argv, env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=2, check=False, shell=False)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, b"help-ok\n")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "POSIX fork")
+    def test_forked_descendant_cannot_hold_the_help_timeout(self) -> None:
+        # A grandchild that inherits the stdout pipe must not stretch a 0.1 s
+        # timeout out to the grandchild's lifetime.
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            bd._bounded_run(
+                [sys.executable, "-B", "-c", "import os, time; os.fork(); time.sleep(7)"],
+                env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=0.1, check=False, shell=False)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(caught.exception.output)
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX setsid")
+    def test_setsid_descendant_cannot_hold_the_help_timeout(self) -> None:
+        # A descendant that leaves the session still holds the pipe. The read
+        # has to hit its deadline anyway; the test then stops that leftover.
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    open(os.environ['HOME'] + '/gpid', 'w').write(str(os.getpid()))\n"
+            "    time.sleep(7)\n"
+            "else:\n"
+            "    time.sleep(7)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            env = {"HOME": str(home), "PATH": os.environ.get("PATH", "")}
+            started = time.monotonic()
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", code],
+                        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, timeout=0.1, check=False, shell=False)
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertIsNone(caught.exception.output)
+            finally:
+                deadline = time.monotonic() + 1.0
+                pid_path = home / "gpid"
+                while time.monotonic() < deadline and not pid_path.exists():
+                    time.sleep(0.02)
+                if pid_path.exists():
+                    try:
+                        os.kill(int(pid_path.read_text()), 9)
+                    except ProcessLookupError:
+                        pass
 
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")

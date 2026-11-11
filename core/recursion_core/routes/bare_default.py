@@ -14,9 +14,11 @@ import argparse
 import hashlib
 import os
 import re
+import select
+import signal
 import subprocess
 import sys
-import threading
+import time
 from collections.abc import Callable, Mapping
 
 STATES = ("absent", "present", "unknown")
@@ -202,14 +204,81 @@ def _help_bytes(text: object) -> bytes | None:
 
 
 def _reap(proc: subprocess.Popen) -> None:
-    """Kill a child that is still running, then wait so it is not left behind."""
-    if proc.poll() is None:
-        proc.kill()
+    """Kill the child and every process still in its session, then wait.
+
+    The child is started in its own session, so its pid is the process-group id.
+    A grandchild that inherited the stdout pipe stays in that group. Killing only
+    the direct child leaves the pipe open. A descendant that has called ``setsid``
+    is no longer in the group; the read loop stops on its deadline instead.
+    """
+    if proc.poll() is not None:
+        return
+    if os.name != "nt" and isinstance(proc.pid, int) and proc.pid > 0:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    elif proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            proc.kill()
+        except OSError:
+            pass
         proc.wait(timeout=5)
+
+
+def _readable(fd: int, remain: float) -> bool:
+    """Wait until ``fd`` can be read, or until ``remain`` seconds have passed."""
+    if remain <= 0:
+        return False
+    # select() does not accept pipes on Windows, and poll() is not there either.
+    if os.name == "nt" or not hasattr(select, "poll"):
+        time.sleep(min(remain, 0.02))
+        return True
+    try:
+        waiter = select.poll()
+        waiter.register(fd, select.POLLIN)
+        return bool(waiter.poll(remain * 1000.0))
+    except InterruptedError:
+        return True
+
+
+def _read_capped(fd: int, deadline: float) -> tuple[bytes, str]:
+    """Read at most one byte past the help cap. Status is eof, overflow, or timeout.
+
+    The fd is non-blocking. Nothing here waits past ``deadline``, including when a
+    descendant still holds the write end.
+    """
+    os.set_blocking(fd, False)
+    chunks: list[bytes] = []
+    total = 0
+    limit = HELP_MAX_BYTES + 1
+    while total < limit:
+        try:
+            chunk = os.read(fd, min(65536, limit - total))
+        except BlockingIOError:
+            remain = deadline - time.monotonic()
+            if remain <= 0 or not _readable(fd, remain):
+                return b"".join(chunks), "timeout"
+            continue
+        except InterruptedError:
+            continue
+        if not chunk:
+            return b"".join(chunks), "eof"
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks), "overflow"
 
 
 def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeout=None,
@@ -217,71 +286,77 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
     """Run one argv with ``timeout`` and stop reading after the help cap.
 
     ``subprocess.run`` buffers all of stdout before the cap can apply. This reads at most
-    ``HELP_MAX_BYTES + 1`` and then kills and reaps the child, including on timeout.
+    ``HELP_MAX_BYTES + 1`` from the raw pipe. The read shares one deadline with the wait
+    for the child to exit.
 
-    A timeout discards bytes already written. The child did not exit, so the buffer is
-    not a finished ``--help`` and is not classified. That is fail-closed (unknown).
+    Overflow (one byte past the cap) kills the session and returns those bytes with a
+    non-zero code. A timeout also kills the session and discards bytes already read:
+    the child did not finish, so the buffer is not a finished ``--help``. An under-cap
+    EOF does not kill. The child may close its output and still be exiting; it is
+    killed only if it is still running when the deadline hits.
 
-    ``stderr`` is ignored. The child always gets ``DEVNULL``. A ``PIPE`` is not drained,
-    and a flood on it would block the child before stdout closed.
+    ``stdout`` and ``stderr`` are ignored. The child always gets a pipe we own and
+    ``stderr=DEVNULL``. A stderr ``PIPE`` is not drained, and a flood on it would block
+    the child before stdout closed.
     """
     if shell:
         raise ValueError("shell")
     # Never inherit os.environ. An omitted env is empty, not the parent process.
     child_env = {} if env is None else dict(env)
-    # Accept the keyword so callers can pass the subprocess.run shape, then drop it.
-    # STDOUT would mix into the help text; a pipe is not drained.
-    del stderr
-    proc = subprocess.Popen(
-        list(argv),
-        env=child_env,
-        stdin=subprocess.DEVNULL if stdin is None else stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        shell=False,
-    )
-    limit = HELP_MAX_BYTES + 1
-    wait = HELP_TIMEOUT_S if timeout is None else timeout
-    box: dict = {}
-
-    def reader() -> None:
-        try:
-            stream = proc.stdout
-            box["out"] = b"" if stream is None else stream.read(limit)
-        except Exception as exc:
-            box["err"] = exc
-
-    thread = threading.Thread(target=reader, daemon=True)
-    timed_out = False
+    # Accept the keywords so callers can pass the subprocess.run shape, then drop them.
+    del stdout, stderr
+    popen_kwargs: dict = {
+        "env": child_env,
+        "stdin": subprocess.DEVNULL if stdin is None else stdin,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "shell": False,
+    }
+    # Own session so a grandchild stays in this process group. Windows rejects the flag.
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(list(argv), **popen_kwargs)
+    fd: int | None = None
     try:
-        thread.start()
-        thread.join(wait)
-        if thread.is_alive():
-            timed_out = True
+        if proc.stdout is None:
+            raise OSError("stdout")
+        # Dup first, then close the buffered stream. Nothing else is reading it, so
+        # close() cannot block on another thread's read lock. The dup is what we read.
+        fd = os.dup(proc.stdout.fileno())
+        proc.stdout.close()
+        waited = HELP_TIMEOUT_S if timeout is None else timeout
+        deadline = time.monotonic() + waited
+        out, why = _read_capped(fd, deadline)
+        if why == "overflow":
             _reap(proc)
-            thread.join(5)
-        else:
+            code = proc.returncode if isinstance(proc.returncode, int) and proc.returncode != 0 else 1
+            return subprocess.CompletedProcess(list(argv), code, stdout=out)
+        if why == "timeout":
             _reap(proc)
-    finally:
-        if proc.stdout is not None and not proc.stdout.closed:
-            proc.stdout.close()
+            # Drop whatever was already read. A partial page is not help text:
+            # classifying it could report absent or present for a read that never finished.
+            raise subprocess.TimeoutExpired(list(argv), waited)
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _reap(proc)
+            raise subprocess.TimeoutExpired(list(argv), waited) from None
+        code = proc.returncode if isinstance(proc.returncode, int) else 1
+        if check and code != 0:
+            raise subprocess.CalledProcessError(code, list(argv), output=out)
+        return subprocess.CompletedProcess(list(argv), code, stdout=out)
+    except BaseException:
         if proc.poll() is None:
             _reap(proc)
-    if timed_out:
-        # box["out"] may now hold what the child wrote before the kill closed the
-        # pipe. Leave it off the exception. A partial page is not help text: classifying
-        # it could report absent or present for a read that never finished.
-        raise subprocess.TimeoutExpired(list(argv), wait)
-    err = box.get("err")
-    if isinstance(err, Exception):
-        raise err
-    out = box.get("out")
-    if not isinstance(out, bytes):
-        out = b""
-    code = proc.returncode if isinstance(proc.returncode, int) else 1
-    if check and code != 0:
-        raise subprocess.CalledProcessError(code, list(argv), output=out)
-    return subprocess.CompletedProcess(list(argv), code, stdout=out)
+        raise
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
 
 
 def _capture(binary: str, flag: str, parent_env: Mapping[str, str], run: Runner) -> str | None:
@@ -311,7 +386,9 @@ def read_help(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded
     ``os.environ``), so no credential variable reaches it. A non-zero exit, timeout, launch failure,
     output over the byte cap, or non-UTF-8 output is ``None`` (classified ``"unknown"``). The read
     stops at the cap and the child is reaped. A timeout is unknown even when the child already
-    wrote a short page and then hung: that page is not a finished ``--help``.
+    wrote a short page and then hung: that page is not a finished ``--help``. A grandchild that
+    keeps the pipe open cannot stretch that timeout. Closing stdout is not itself a failure:
+    the child is allowed to exit within the time still left.
     """
     return _capture(binary, "--help", parent_env, run)
 

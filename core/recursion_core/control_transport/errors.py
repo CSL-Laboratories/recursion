@@ -23,6 +23,13 @@ class PeerRefused(TransportRefused, PermissionError):
     """The other end's uid is not ours, or its credentials could not be read."""
 
 
+class PeerNotAdmitted(TransportRefused, PermissionError):
+    """The server's admission check refused this peer at accept and sent a typed frame.
+
+    The request was not delivered: no handler saw it, and the peer never held a connection slot.
+    """
+
+
 class FrameError(TransportRefused, ValueError):
     """A frame is malformed, oversized or truncated."""
 

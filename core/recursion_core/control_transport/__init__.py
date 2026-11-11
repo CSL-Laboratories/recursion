@@ -13,6 +13,7 @@ from typing import Any
 from .errors import (
     FrameError,
     InsecureSocketPath,
+    PeerNotAdmitted,
     PeerRefused,
     PlatformNotSupported,
     RemoteBindRefused,
@@ -48,6 +49,7 @@ __all__ = [
     "FrameError",
     "InsecureSocketPath",
     "PeerCred",
+    "PeerNotAdmitted",
     "PeerRefused",
     "PlatformNotSupported",
     "RemoteBindRefused",

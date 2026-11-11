@@ -243,12 +243,38 @@ class SocketAttackTest(ComposedBase):
         self.assertTrue(wait_for(lambda: api.call('run.status', {'run_id': run_id})['run']['state'] == 'stopped', 20))
         self.assertIsNotNone(self.units.procs[f'recursion-run-{run_id}.service'].poll())
 
-    @unittest.expectedFailure  # ADV1-4
+    def test_an_engine_peer_is_closed_at_accept_and_never_holds_a_slot(self):
+        """ADV1-4 (fixed): the scope check runs at accept, before a slot is taken."""
+        _, composed = self.boot()
+        hog = subprocess.Popen([sys.executable, '-c',
+                                'import socket, sys, time\n'
+                                'sys.stdin.readline()\n'
+                                'socks = []\n'
+                                'for _ in range(%d):\n'
+                                '    s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); socks.append(s)\n'
+                                'time.sleep(0.5)\n'
+                                's = socks[0]; s.settimeout(5)\n'
+                                'print(s.recv(4096).decode("utf-8", "replace"), flush=True)\n'
+                                'time.sleep(60)\n' % (MAX_CONNECTIONS * 2), composed.server.path],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (hog.kill(), hog.wait()))
+        real = adapter.peer_is_engine
+        with mock.patch.object(adapter, 'peer_is_engine', side_effect=lambda pid: pid == hog.pid or real(pid)):
+            hog.stdin.write('go\n')
+            hog.stdin.flush()
+            self.assertIn('"scope_refused"', hog.stdout.readline())  # one typed frame, then closed
+            self.assertEqual(composed.server.refused, ['not_admitted'] * (MAX_CONNECTIONS * 2))
+            self.assertEqual(composed.server.accepted, 0)
+            for _ in range(MAX_CONNECTIONS + 2):  # every ordinary slot is still free for the operator
+                self.assertEqual(self.api(composed).call('run.list')['code'], 'ok')
+
     def test_an_engine_peer_cannot_hold_every_connection_slot_and_starve_stop(self):
-        """ADV1-4: a peer inside a run unit is refused only after a frame, so it can hold all 16 slots."""
+        """ADV1-4 (fixed): a peer inside a run unit was refused only after a frame, so it could hold all 16
+        slots. Stop now has reserved connections, served when every ordinary one is taken."""
         _, composed = self.boot()
         api = self.api(composed)
         run_id = self.start(api)
+        accepted = composed.server.accepted
         hog = subprocess.Popen([sys.executable, '-c',
                                 'import socket, sys, time\n'
                                 'socks = []\n'
@@ -259,14 +285,22 @@ class SocketAttackTest(ComposedBase):
                                stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (hog.kill(), hog.wait()))
         self.assertEqual(hog.stdout.readline().strip(), 'held')
+        # Every ordinary slot is really held (the hog got in before anything called it an engine).
+        self.assertTrue(wait_for(lambda: composed.server.accepted == accepted + MAX_CONNECTIONS, 10))
         engine_pids = {hog.pid}
         real = adapter.peer_is_engine
         # The hog stands for an engine: the daemon would refuse it scope_refused if it ever sent a frame.
         with mock.patch.object(adapter, 'peer_is_engine', side_effect=lambda pid: pid in engine_pids or real(pid)):
             time.sleep(0.3)
             receipt = SocketAPI(composed.server.path, timeout_s=10).call('run.stop', {'run_id': run_id})
+            # Anything but Stop on a reserved connection is "busy, not delivered", as over the cap before.
+            listed = SocketAPI(composed.server.path, timeout_s=10).call('run.list')
+            self.assertEqual((listed['code'], listed.get('delivered'), listed.get('detail')),
+                             ('control_api_unavailable', False, 'busy'), listed)
+            again = SocketAPI(composed.server.path, timeout_s=10).call('run.stop', {'run_id': run_id})
         self.assertNotEqual(receipt.get('detail'), 'busy', receipt)
         self.assertEqual(receipt['code'], 'stopped', receipt)
+        self.assertEqual((again['code'], again.get('repeat')), ('stopped', True), again)
 
     @unittest.expectedFailure  # ADV1-5
     def test_run_list_still_answers_after_a_thousand_runs(self):

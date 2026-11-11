@@ -60,6 +60,8 @@ ENDED, LOST_REBOOT = 'ended', 'lost_reboot'
 # reconcile() asks again for a Stop whose request never got through only after a wait that doubles
 # from the base to the cap (ADV1-6).
 STOP_RETRY_BASE_S, STOP_RETRY_MAX_S = 30.0, 600.0
+# Socket connections kept for run.stop when every ordinary one is taken (ADV1-4).
+STOP_RESERVED_CONNECTIONS = 4
 
 
 # -- registry ------------------------------------------------------------------------------------
@@ -476,6 +478,15 @@ class DaemonControl:
         return 404, b'{"error": "not_found"}'
 
 
+def admit_peer(cred):
+    """Asked by the socket at accept, before a slot: a peer inside a run unit is closed at once (ADV1-4)."""
+    return not peer_is_engine(cred.pid)
+
+
+def is_stop_request(message):
+    return message.get('op') == 'control' and message.get('method') == 'run.stop'
+
+
 def peer_is_engine(pid):
     """True when the peer is inside a ``recursion-run-*`` unit, or its cgroup cannot be read."""
     if not isinstance(pid, int) or pid <= 0:
@@ -593,7 +604,8 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     control = DaemonControl(api, registry, daemon, starter, state_dir)
     directory = socket_directory(environ)
     door = DeviceDoor(directory, publish=False)
-    server = UnixControlServer(directory, with_ping_health(control.handle))
+    server = UnixControlServer(directory, with_ping_health(control.handle), admit=admit_peer,
+                               priority=is_stop_request, reserved_connections=STOP_RESERVED_CONNECTIONS)
     server.start()
     try:
         door.publish()  # only now: the socket lock is ours, so no live daemon's token file is replaced

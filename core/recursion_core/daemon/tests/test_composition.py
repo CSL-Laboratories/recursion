@@ -359,7 +359,14 @@ class ComposedDaemonTest(unittest.TestCase):
         _, composed = self.boot()
         with mock.patch.object(adapter, 'peer_is_engine', return_value=True):
             answer = self.api(composed).call('run.list')
-        self.assertEqual(answer, {'code': 'control_api_unavailable', 'delivered': True, 'detail': 'daemon:scope_refused'})
+            # Refused at accept, before a connection slot or a frame (ADV1-4): the request was never delivered.
+            self.assertEqual(answer, {'code': 'control_api_unavailable', 'delivered': False,
+                                      'detail': 'daemon:scope_refused'})
+            self.assertEqual(composed.server.refused, ['not_admitted'])
+            # The per-request check stays: a peer that is inside a run unit by the time it sends a frame.
+            conn = mock.Mock(peer=mock.Mock(pid=os.getpid()))
+            self.assertEqual(composed.control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, conn),
+                             {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}})
         self.assertFalse(adapter.peer_is_engine(os.getpid()))
         for unreadable in (None, 0, -1, 2 ** 22 + 12345):
             self.assertTrue(adapter.peer_is_engine(unreadable))  # fail closed

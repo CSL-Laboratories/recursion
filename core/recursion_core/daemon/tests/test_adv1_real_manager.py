@@ -56,10 +56,18 @@ path, out = sys.argv[1], sys.argv[2]
 def call():
     s = socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(path)
     body = json.dumps({"op": "control", "method": "run.list", "params": {}}).encode()
-    s.sendall(struct.pack(">I", len(body)) + body)
-    n = struct.unpack(">I", s.recv(4))[0]; data = b""
-    while len(data) < n: data += s.recv(n - len(data))
-    s.close(); return json.loads(data)
+    try:
+        s.sendall(struct.pack(">I", len(body)) + body)
+    except OSError:
+        pass  # refused at accept: the daemon sent its refusal frame and closed before this write
+    try:
+        n = struct.unpack(">I", s.recv(4))[0]; data = b""
+        while len(data) < n: data += s.recv(n - len(data))
+        return json.loads(data)
+    except (OSError, struct.error) as exc:
+        return {"error": {"code": "closed:" + type(exc).__name__}}
+    finally:
+        s.close()
 inside = call()
 own = open("/proc/self/cgroup").read().split("0::", 1)[1].strip()
 target = os.path.join(os.path.dirname("/sys/fs/cgroup" + own), "adv1-peer-%d" % os.getpid())

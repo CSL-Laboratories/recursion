@@ -105,9 +105,13 @@ are unaffected:
   absent or empty cgroup is `terminated`; otherwise the run stays `stopping`. A Stop
   brings the cgroup path its receipt will name, and that path is walked the same way
   when the control record carries none (a launch whose record was never written).
-  `run.stop` answers `stopped` only after that very path read absent or empty in the
-  same call, whatever the row already says: a row a sweep or a fence ended with no
-  path to walk is not a receipt. A scripted observation that the unit ended, or a listener that is
+  With no path at all the row ends on systemd's word only for a run that has no
+  control record; a run whose control record exists and carries no cgroup stays
+  `unknown` (`unit gone; the control record carries no cgroup to walk`) through every
+  sweep and fence, until a Stop brings the path or the record gains it. A launch
+  that never started a unit waits there too: nothing durable tells the two apart yet.
+  `run.stop` answers `stopped` only after the path it names read absent or empty in
+  the same call, whatever the row says. A scripted observation that the unit ended, or a listener that is
   still alive, is not `terminated`. A read of `cgroup.procs` or `/proc/<pid>/stat`
   that fails with anything other than ENOENT or ESRCH is unknown, not an empty
   cgroup and not a dead process, and is not `terminated`. A run with a recorded

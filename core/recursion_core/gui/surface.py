@@ -57,6 +57,10 @@ _VISIBILITY = (
     ("reconciliation", ("reconciled", "unreconciled_visible")),
 )
 _VISIBILITY_KEYS = frozenset(k for k, _ in _VISIBILITY)
+# status_code values in tests/fixtures/o7-responses.json. A venue panel may show these
+# fixed words from the unfiltered response. Any other status text must have passed the
+# venue filter; it is not echoed from the raw response.
+_O7_STATUS = frozenset({"ok", "refused", "stale_or_unreconciled", "unavailable"})
 # Codes the client raises before anything is sent; every other failure is after sending.
 _REFUSED_BEFORE_SENDING = frozenset({"command_not_in_operator_contract", "confirmation_required"})
 _LABELS = {
@@ -155,13 +159,34 @@ class Application:
 
     @staticmethod
     def _send(start_response, status: str, html: str) -> list[bytes]:
-        raw = html.encode("utf-8")
+        # Unpaired surrogates are legal JSON and illegal UTF-8. Replace them so one bad
+        # string cannot crash the page after it has been escaped.
+        raw = html.encode("utf-8", "xmlcharrefreplace")
         start_response(status, [
             ("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(raw))),
             ("Cache-Control", "no-store"), ("Content-Security-Policy", _CSP),
             ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "same-origin"),
             ("X-Frame-Options", "DENY")])
         return [raw]
+
+    @staticmethod
+    def _read_body(stream, length: int) -> bytes:
+        """Read exactly ``length`` bytes. A WSGI ``read(n)`` may return fewer than ``n``."""
+        chunks = []
+        remaining = length
+        while remaining > 0:
+            chunk = stream.read(remaining)
+            if not chunk:
+                break
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise _BadRequest("form")
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+            chunks.append(bytes(chunk))
+            remaining -= len(chunk)
+        if remaining:
+            raise _BadRequest("form")
+        return b"".join(chunks)
 
     # -- pages --------------------------------------------------------------------------
     @staticmethod
@@ -248,9 +273,9 @@ class Application:
         if (env.get("CONTENT_TYPE") or "").split(";")[0].strip() != "application/x-www-form-urlencoded":
             raise _BadRequest("content type")
         try:
-            raw = env["wsgi.input"].read(length).decode("utf-8")
+            raw = self._read_body(env["wsgi.input"], length).decode("utf-8")
             form = parse_qs(raw, strict_parsing=True)
-        except (KeyError, UnicodeError, ValueError):
+        except (KeyError, UnicodeError, ValueError, _BadRequest):
             raise _BadRequest("form") from None
         if set(form) != fields or any(len(v) != 1 for v in form.values()):
             raise _BadRequest("fields")
@@ -263,6 +288,16 @@ class Application:
 
     def _o7_view(self, command: str, data: dict, shown: object = None) -> str:
         status = data.get("status_code") if type(data.get("status_code")) is str else "not reported"
+        if shown is not None:
+            # A venue panel prints the response's own text only where the venue filter kept
+            # it. status_code is not one of the filter's response-level exceptions, so an
+            # unfiltered status is shown only as one of the fixed O7 status words, like the
+            # visibility block. Any other text is withheld, never echoed.
+            kept = shown.get("status_code") if isinstance(shown, dict) else None
+            if type(kept) is str:
+                status = kept
+            elif status != "not reported" and status not in _O7_STATUS:
+                status = "withheld by this panel's venue filter"
         result = data.get("result") if type(data.get("result")) is dict else {}
         warn = ""
         if result.get("order_submitted") is not False and command in ACTIONS:

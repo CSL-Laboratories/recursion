@@ -443,3 +443,68 @@ class PanelTests(GuiHarness):
         self.assertEqual(kept["provenance"]["inputs"], [{"venue": "kalshi_demo", "source": "KX-PROV-SECRET"},
                                                         {"source": "PROV-INPUT-636363"}])
         self.assertNotIn("result", kept)
+
+    def test_venue_panel_does_not_echo_unfiltered_status_text(self):
+        # status_code is not a response-level exception. The filter drops an unlabelled
+        # status string; the status line must not print that text. O7's fixed status
+        # words stay, as the visibility block does. A status the filter kept is shown.
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"}])
+        secret = "LEAK-STATUS-OTHER-VENUE-717171"
+        self.api.extra[READS[0]] = {
+            "status_code": secret,
+            "result": {"rows": [{"venue": "kalshi", "symbol": "K-VISIBLE"}]},
+        }
+        body = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("K-VISIBLE", body)
+        self.assertNotIn(secret, body)
+        self.assertIn("withheld by this panel&#x27;s venue filter", body)
+        read = self.request("GET", "/read", query="command=%s" % READS[0])[2]
+        self.assertIn(secret, read)  # an unscoped read still shows the control API's text
+        for status in ("ok", "refused", "stale_or_unreconciled", "unavailable"):
+            self.api.extra[READS[0]] = {
+                "status_code": status,
+                "result": {"rows": [{"venue": "other", "symbol": "X-HIDDEN"}]},
+            }
+            page = self.request("GET", "/panel", query="id=k")[2]
+            self.assertIn("<strong>%s</strong>" % status, page)
+            self.assertNotIn("X-HIDDEN", page)
+            self.assertNotIn("withheld by this panel", page)
+        self.api.extra[READS[0]] = {
+            "venue": "kalshi", "status_code": "PANEL-OWN-STATUS-818181", "symbol": "OWN-ROW",
+        }
+        page = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("PANEL-OWN-STATUS-818181", page)
+        self.assertIn("OWN-ROW", page)
+
+    def test_empty_unlabelled_containers_count_as_withheld(self):
+        # An empty unlabelled container is dropped. withheld must say so, or the panel
+        # shows {} and no note. An empty input, a kept paper_* list, and unlabelled
+        # response-level errors are unchanged.
+        self.assertEqual(filter_venue_rows({"result": {"rows": []}}, "kalshi"), ({}, True))
+        self.assertEqual(filter_venue_rows({}, "kalshi"), ({}, False))
+        self.assertEqual(
+            filter_venue_rows({"errors": [{"code": "E"}], "provenance": {"source": "P"}}, "kalshi"),
+            ({"errors": [{"code": "E"}], "provenance": {"source": "P"}}, False))
+        self.assertEqual(filter_venue_rows({"paper_empty": []}, "paper"), ({"paper_empty": []}, False))
+        kept, withheld = filter_venue_rows(
+            {"result": {"rows": [], "positions": [{"venue": "kalshi", "symbol": "K"}]}}, "kalshi")
+        self.assertTrue(withheld)
+        self.assertEqual(kept["result"]["positions"], [{"venue": "kalshi", "symbol": "K"}])
+        self.assertNotIn("rows", kept["result"])
+
+        def operator(command, confirmed=False):
+            return {"status_code": "ok", "result": {"rows": []}}
+
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"}])
+        self.app._client.operator = operator
+        body = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("<strong>ok</strong>", body)
+        self.assertIn("Withheld: data not labelled <code>kalshi</code>.", body)
+
+    def test_filter_venue_rows_accepts_a_list_of_rows(self):
+        kept, withheld = filter_venue_rows(
+            [{"venue": "kalshi", "symbol": "A"}, {"venue": "paper", "symbol": "B"}], "kalshi")
+        self.assertEqual(kept, [{"venue": "kalshi", "symbol": "A"}])
+        self.assertTrue(withheld)
+        self.assertEqual(filter_venue_rows([{"venue": "paper", "symbol": "B"}], "kalshi"), ([], True))
+        self.assertEqual(filter_venue_rows([], "kalshi"), ([], False))

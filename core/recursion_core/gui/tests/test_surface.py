@@ -55,11 +55,15 @@ class GuiHarness(unittest.TestCase):
                                frozenset({HOST}), frozenset({ORIGIN}))
 
     def request(self, method: str, path: str, form: dict | list | None = None, *, query: str = "",
-                headers: dict | None = None, raw: bytes | None = None) -> tuple[str, dict, str]:
+                headers: dict | None = None, raw: bytes | None = None,
+                stream=None, length: int | None = None) -> tuple[str, dict, str]:
         body = raw if raw is not None else (urlencode(form, doseq=True).encode() if form is not None else b"")
+        if stream is None:
+            stream, length = io.BytesIO(body), len(body)
         env = {"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": query, "HTTP_HOST": HOST,
-               "CONTENT_LENGTH": str(len(body)), "CONTENT_TYPE": "application/x-www-form-urlencoded",
-               "wsgi.input": io.BytesIO(body), "wsgi.errors": sys.stderr}
+               "CONTENT_LENGTH": str(len(body) if length is None else length),
+               "CONTENT_TYPE": "application/x-www-form-urlencoded",
+               "wsgi.input": stream, "wsgi.errors": sys.stderr}
         if method == "POST":
             env["HTTP_ORIGIN"] = ORIGIN
             env["HTTP_SEC_FETCH_SITE"] = "same-origin"
@@ -166,6 +170,43 @@ class NoOrderPathTests(GuiHarness):
             with self.subTest(case=str(case)[:60]):
                 self.assertEqual(self.request("POST", "/stop", **case)[0], "400 Bad Request")
         self.assertEqual([c for c in self.api.calls if c[1] == "/v1/runs/stop"], [])
+
+    def test_form_body_is_read_to_content_length(self) -> None:
+        # wsgi.input.read(n) may return fewer than n bytes. A single read of a valid
+        # prefix must not accept a body that continues with another field, and a body
+        # that arrives in one-byte reads must still be the whole form.
+        class Split:
+            def __init__(self, parts: list[bytes]) -> None:
+                self.parts = list(parts)
+
+            def read(self, n: int = -1) -> bytes:
+                if not self.parts:
+                    return b""
+                part = self.parts.pop(0)
+                if n is None or n < 0 or len(part) <= n:
+                    return part
+                self.parts.insert(0, part[n:])
+                return part[:n]
+
+        prefix = b"run_id=run-1&confirm=explicit"
+        rest = b"&extra=1"
+        status, _, _ = self.request(
+            "POST", "/stop", stream=Split([prefix, rest]), length=len(prefix + rest))
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual([c for c in self.api.calls if c[1] == "/v1/runs/stop"], [])
+        body = b"run_id=run-42&confirm=explicit"
+        status, _, page = self.request(
+            "POST", "/stop", stream=Split([body[i:i + 1] for i in range(len(body))]), length=len(body))
+        self.assertEqual(status, "200 OK")
+        self.assertIn("pending", page)
+        self.assertEqual(self.api.calls[-1], ("POST", "/v1/runs/stop", {"run_id": "run-42"}))
+
+    def test_unpaired_surrogate_in_a_response_does_not_crash_the_page(self) -> None:
+        self.api.extra[READS[0]] = {"status_code": "ok\ud800"}
+        status, _, body = self.request("GET", "/read", query="command=%s" % READS[0])
+        self.assertEqual(status, "200 OK")
+        self.assertIn("<strong>ok", body)
+        self.assertNotIn("\ud800", body)
 
 
 class StopTests(GuiHarness):

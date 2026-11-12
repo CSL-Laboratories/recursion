@@ -88,7 +88,16 @@ def filter_venue_rows(value, venue):
                     passed[key] = shown
         value = {key: item for key, item in value.items() if key not in _RESPONSE_LEVEL}
     kept = _venue_only(value, venue, False, withheld)
-    return {**({} if kept is _DROP else kept), **passed}, bool(withheld)
+    # A list of rows stays a list. A dropped object still keeps response-level errors
+    # and provenance that were pulled out above; anything else dropped is {}.
+    if isinstance(value, list):
+        if kept is _DROP:
+            kept = []
+    elif kept is _DROP:
+        kept = dict(passed)
+    elif isinstance(kept, dict):
+        kept = {**kept, **passed}
+    return kept, bool(withheld)
 
 
 def _without_other_venues(value, owned, withheld):
@@ -107,6 +116,7 @@ def _without_other_venues(value, owned, withheld):
 
 def _venue_only(value, venue, scoped, withheld):
     owned = _owned_labels(venue)
+    dropped = False
     if isinstance(value, dict):
         if "venue" in value:
             label = value["venue"]
@@ -118,13 +128,29 @@ def _venue_only(value, venue, scoped, withheld):
         for key, item in value.items():
             # What sits under a paper_* / stock_* key is the book's own, like a labelled row.
             child = _venue_only(item, venue, scoped or _paper_book_key(key, venue), withheld)
-            if child is not _DROP:
+            if child is _DROP:
+                dropped = True
+            else:
                 out[key] = child
     elif isinstance(value, list):
-        out = [item for item in (_venue_only(v, venue, scoped, withheld) for v in value) if item is not _DROP]
+        out = []
+        for item in value:
+            child = _venue_only(item, venue, scoped, withheld)
+            if child is _DROP:
+                dropped = True
+            else:
+                out.append(child)
     elif scoped:
         return value
     else:
         withheld.append(value)
         return _DROP
-    return out if out or scoped else _DROP
+    if out or scoped:
+        # A kept parent can still have lost an empty child. Say so, once.
+        if dropped and not withheld:
+            withheld.append(True)
+        return out
+    # An empty unlabelled container is not a complete read: if it held anything, withheld.
+    if dropped:
+        withheld.append(True)
+    return _DROP

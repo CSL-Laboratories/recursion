@@ -30,8 +30,15 @@ MEASURED_HELP = (
 )
 HELP_FLOOR = (2, 1, 314)
 
-# An option line: two leading spaces, then the flag (optionally after a short flag).
-_OPTION = re.compile(r"^[ \t]{1,8}(?:-\w,[ \t]*)?(--[a-z0-9][a-z0-9-]*)", re.MULTILINE)
+# An option header is indented exactly two spaces or one tab and starts with a flag.
+# Every long name on that header shares the block, including comma and pipe aliases
+# and a ``=<type>`` suffix. Wrapped description lines are indented further.
+_HEADER = re.compile(r"^(?:  |\t)(?=-)", re.MULTILINE)
+_LONG = re.compile(r"--[a-z0-9][a-z0-9-]*")
+_FLAG_GAP = re.compile(r" {2,}|\t")
+# A component longer than this is not a build number. int() raises past 4300 digits,
+# and a shorter oversized token would be copied into the refusal.
+_BUILD_PART_MAX = 9
 # Present-tense "default for -p" wording in the --bare block. Future-tense notes are filtered first.
 _DEFAULT_NOW = re.compile(
     r"(?:\bis\s+(?:now\s+)?(?:the\s+)?default\b[^.]*(?:-p\b|--print\b|print\s+mode|headless)"
@@ -61,14 +68,24 @@ _OPT_OUT = ("--no-bare",)
 
 
 def _option_raw_blocks(text: str) -> dict[str, str]:
-    """Map each long option to its raw help lines (the option line plus its wrapped description)."""
+    """Map each long option to its raw help lines (the option line plus its wrapped description).
 
-    blocks: dict[str, str] = {}
-    matches = list(_OPTION.finditer(text))
-    for i, m in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        blocks.setdefault(m.group(1), text[m.start():end])
-    return blocks
+    A later header for the same flag is kept. The first block must not hide a later one.
+    """
+
+    if not isinstance(text, str) or not text:
+        return {}
+    headers = list(_HEADER.finditer(text))
+    parts: dict[str, list[str]] = {}
+    for i, header in enumerate(headers):
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        raw = text[header.start():end]
+        content = raw.split("\n", 1)[0].lstrip(" \t")
+        gap = _FLAG_GAP.search(content)
+        flag_area = content[:gap.start()] if gap else content
+        for name in _LONG.findall(flag_area):
+            parts.setdefault(name, []).append(raw)
+    return {name: "".join(chunks) for name, chunks in parts.items()}
 
 
 def _option_blocks(text: str) -> dict[str, str]:
@@ -145,9 +162,32 @@ def parse_build(build: object) -> str | None:
     return token
 
 
-def _build_key(version: str) -> tuple[int, int, int]:
-    major, minor, patch = (int(part) for part in version.split("."))
-    return major, minor, patch
+def _build_key(version: str) -> tuple[int, int, int] | None:
+    parts = version.split(".")
+    if len(parts) != 3 or any(len(part) > _BUILD_PART_MAX for part in parts):
+        return None
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+def _help_utf8(help_text: object) -> bytes | None:
+    """UTF-8 bytes of help text, or None when it is missing, too long, or not encodable.
+
+    The text itself is not copied into the refusal. A lone surrogate raises
+    ``UnicodeEncodeError``; that exception's ``repr`` would include the text.
+    """
+
+    if not isinstance(help_text, str) or help_text == "":
+        return None
+    try:
+        raw = help_text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(raw) > HELP_MAX_BYTES:
+        return None
+    return raw
 
 
 def subscription_beta(build: object, help_text: object) -> dict:
@@ -163,14 +203,18 @@ def subscription_beta(build: object, help_text: object) -> dict:
     if version is None:
         return {"disposition": "refuse", "label": None, "build": None, "help_sha256": None,
                 "detail": "claude build is unknown; unknown is not safe"}
-    if _build_key(version) < HELP_FLOOR:
+    key = _build_key(version)
+    if key is None:
+        return {"disposition": "refuse", "label": None, "build": None, "help_sha256": None,
+                "detail": "claude build is unknown; unknown is not safe"}
+    if key < HELP_FLOOR:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": None,
                 "detail": f"claude {version} is below the 2.1.314 floor"}
-    if (not isinstance(help_text, str) or help_text == ""
-            or len(help_text.encode("utf-8")) > HELP_MAX_BYTES):
+    raw = _help_utf8(help_text)
+    if raw is None:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": None,
                 "detail": f"claude {version} help is unknown; unknown is not safe"}
-    digest = help_sha256(help_text)
+    digest = hashlib.sha256(raw).hexdigest()
     entry = next((row for row in MEASURED_HELP if row["help_sha256"] == digest), None)
     if entry is None:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": digest,

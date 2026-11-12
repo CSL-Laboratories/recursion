@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -367,6 +368,65 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
         self.assertNotEqual(res["detail"], "beta")
         self.assertEqual(len(h.launcher.calls), 1)
         self.assertEqual(res["limit_notice"]["attempts"][-1]["connection"], "subscription:login-B")
+
+    def test_alias_and_abbreviation_headers_are_read(self) -> None:
+        # Real help lists aliases as `--bg, --background`. The same spelling of an
+        # opt-out, including an `=<type>` suffix, is an advertised opt-out.
+        cases = (
+            "  --bare, --no-bare                     Minimal mode. default: false\n",
+            "  --bare=<bool>, --no-bare=<bool>       Minimal mode. default: false\n",
+        )
+        for line in cases:
+            with self.subTest(line=line):
+                text = HEAD + line + "  -p, --print                           Print response and exit\n"
+                self.assertEqual(bd.classify_help(text), "present")
+                self.assertEqual(bd.auth_mode(text)["bare_opt_out"], "--no-bare")
+        text = HEAD + "  -b|--bare                             This is the default for -p.\n" + (
+            "  -p, --print                           Print response and exit\n")
+        self.assertEqual(bd.classify_help(text), "present")
+
+    def test_a_later_block_for_the_same_flag_is_kept(self) -> None:
+        text = (HEAD
+                + "  --bare                                Minimal mode. default: false\n"
+                + "  --bare                                This is the default for -p.\n"
+                + "  -p, --print                           Print response and exit\n")
+        self.assertEqual(bd.classify_help(text), "present")
+
+    def test_wrapped_argv_example_stays_in_the_block(self) -> None:
+        # Description lines in the measured help are indented further than the header.
+        # An argv example there is not a new option.
+        text = (HEAD
+                + "  --bare                                Minimal mode. default: false\n"
+                + "      --bare is now the default for -p.\n"
+                + "  -p, --print                           Print response and exit\n")
+        self.assertEqual(bd.classify_help(text), "present")
+
+    def test_unencodable_help_refuses_without_the_text(self) -> None:
+        secret = "sk-live-SECRETVALUE"
+        text = "help " + secret + " \ud800 tail"
+        decision = bd.subscription_beta("2.1.321", text)
+        self.assertEqual(decision["disposition"], "refuse")
+        self.assertNotIn(secret, json.dumps(decision))
+        self.assertEqual(decision["detail"], "claude 2.1.321 help is unknown; unknown is not safe")
+        h = Harness([])
+        res = h.handle(request(help_text=text))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertNotIn(secret, json.dumps(res))
+        self.assertEqual(res["breaker_effect"], "none")
+        self.assertEqual(h.launcher.calls, [])
+
+    def test_oversized_build_token_is_not_copied_into_the_refusal(self) -> None:
+        for size in (4000, 5000):
+            with self.subTest(size=size):
+                blob = "9" * size
+                decision = bd.subscription_beta("0.1." + blob, MEASURED_HELP_TEXT)
+                self.assertEqual(decision["disposition"], "refuse")
+                self.assertNotIn(blob, json.dumps(decision))
+                h = Harness([])
+                res = h.handle(request(claude_build="2.1." + blob, help_text=MEASURED_HELP_TEXT))
+                self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+                self.assertNotIn(blob, json.dumps(res))
+                self.assertEqual(h.launcher.calls, [])
 
     def test_a_later_refusal_does_not_keep_the_beta_label(self) -> None:
         h = Harness([claude_ok(), claude_ok()])

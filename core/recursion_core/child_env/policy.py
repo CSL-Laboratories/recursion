@@ -57,6 +57,7 @@ import ipaddress
 import os
 import re
 import shutil
+import socket
 import stat
 import tempfile
 import threading
@@ -337,7 +338,7 @@ def build_child_env(
     route_env = _route_env(profile, auth_mode, route)  # refuses before anything is read from the parent
     if not _private_dir(home):
         raise EnvRefused("HOME", "home_unsafe")
-    source = dict(os.environ if parent is None else parent)
+    source = _copy_parent(parent)
     env = {name: source[name] for name in profile.allowed if name in source and name != "HOME"}
     passed = {name: source[name] for name in profile.passthrough if name in source}
     dropped = tuple(sorted(name for name in source if name not in env and name not in passed and name != "HOME"))
@@ -356,28 +357,42 @@ def build_child_env(
             raise EnvRefused(name, "override_denied")
         env[name] = value
 
+    # A null in a value that is kept (including NO_PROXY with no proxy set, and the sign-in token
+    # below) makes Popen raise ValueError. Refuse before any stat or spawn. Temp values are replaced
+    # and are not read.
+    for name, value in env.items():
+        if name not in TEMP_NAMES:
+            _require_text(name, value)
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:
         cause = _unsafe_value(name, env[name]) if env[name] else None  # empty: no path or URL to check
         if cause is not None:
             raise EnvRefused(name, cause)
     if "PATH" in env and (cause := _unsafe_path(env["PATH"])) is not None:
         raise EnvRefused("PATH", cause)
-    # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
+    # A bypass only matters when a proxy is set. "*" skips every host. An entry that matches an engine
+    # endpoint, or the route's own base host, skips the proxy for the host the credential is sent to.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
+        hosts = profile.hosts
+        if profile.base_url_name and (base := route_env.get(profile.base_url_name)):
+            hosts = hosts + (_origin(base)[1],)
         for name in [name for name in NO_PROXY_NAMES if name in env]:
-            if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
+            if (cause := _no_proxy_bypass(env[name], hosts)) is not None:
                 raise EnvRefused(name, cause)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
     if present:
         env.update(dict.fromkeys(present, _route_tmp()))
     env["HOME"] = home
+    for name, value in passed.items():
+        _require_text(name, value)  # not interpreted; Popen still rejects a null in it
     env.update(passed)  # after every check: the user's own sign-in value is passed as it is, never read here
 
     leaked = sorted(name for name in env if name in profile.scrub
                     or (name not in profile.allowed and name not in profile.passthrough and _DENIED.search(name)))
     if leaked:  # unreachable by construction; kept so a later edit to the allowlist fails closed
         raise EnvRefused(leaked[0], "scrub_failed")
+    for name, value in route_env.items():
+        _require_text(name, value)
     env.update(route_env)  # last: only what this call's route named, never a parent or override value
     return ValidatedEnv(env, engine, dropped, auth_mode=auth_mode, _seal=ValidatedEnv._seal)
 
@@ -636,24 +651,185 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
-def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
+def _copy_parent(parent: Mapping[str, str] | None) -> dict[str, str]:
+    """The parent environment as strings. A non-string name or value is not an environment Popen can take."""
 
-    for entry in re.split(r"[,\s]+", value.strip().lower()):
-        entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry).strip("[]")
-        entry = re.sub(r":[0-9]*$", "", entry).rstrip(".")
-        if not entry:
+    raw = os.environ if parent is None else parent
+    if not isinstance(raw, Mapping):
+        raise EnvRefused(None, "value_malformed")
+    source: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise EnvRefused(name if isinstance(name, str) else None, "value_malformed")
+        source[name] = value
+    return source
+
+
+def _require_text(name: str | None, value: object) -> None:
+    """Refuse a null. ``Popen`` raises ``ValueError`` for one, after this function has returned."""
+
+    if not isinstance(value, str) or "\0" in value:
+        raise EnvRefused(name, "value_malformed")
+
+
+def _no_proxy_host(host: str) -> str:
+    """Host text compared with a NO_PROXY entry: lower case, one pair of brackets removed, no trailing dot."""
+
+    host = host.lower()
+    if len(host) >= 2 and host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host.rstrip(".")
+
+
+def _no_proxy_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def _same_ip(left: ipaddress.IPv4Address | ipaddress.IPv6Address | None,
+             right: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
+    """True when both are the same address, including ``::ffff:10.1.2.3`` and ``10.1.2.3``."""
+
+    if left is None or right is None:
+        return False
+    if left == right:
+        return True
+    mapped = getattr(left, "ipv4_mapped", None)
+    if mapped is not None and mapped == right:
+        return True
+    mapped = getattr(right, "ipv4_mapped", None)
+    return mapped is not None and mapped == left
+
+
+def _no_proxy_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """A CIDR entry, or None. Host bits may be set. ``10.0/8`` is requests' ``inet_aton`` shorthand."""
+
+    if entry.count("/") != 1:
+        return None
+    try:
+        return ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        pass
+    addr, bits = entry.split("/", 1)
+    try:
+        mask = int(bits)
+    except ValueError:
+        return None
+    if not 0 <= mask <= 32:
+        return None
+    try:
+        text = socket.inet_ntoa(socket.inet_aton(addr))
+    except OSError:
+        return None
+    try:
+        return ipaddress.ip_network(f"{text}/{mask}", strict=False)
+    except ValueError:
+        return None
+
+
+def _network_covers(network: ipaddress.IPv4Network | ipaddress.IPv6Network, hosts: tuple[str, ...]) -> bool:
+    for host in hosts:
+        address = _no_proxy_ip(host)
+        if address is None:
             continue
-        if entry.strip("*.") == "":
-            return "no_proxy_wildcard"
-        if "*" in entry:
-            pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-            hit = any(pattern.match(host) for host in hosts)
-        else:
-            bare = entry.lstrip(".")
-            hit = any(host == bare or host.endswith("." + bare) for host in hosts)
-        if hit:
+        candidates = [address]
+        mapped = getattr(address, "ipv4_mapped", None)
+        if mapped is not None:
+            candidates.append(mapped)
+        for candidate in candidates:
+            if candidate.version == network.version and candidate in network:
+                return True
+    return False
+
+
+# urllib.parse._splitport: the last :digits of the host being requested are a port, so ``::1`` is host ``:``.
+_SPLIT_PORT = re.compile(r"(.*):([0-9]+)\Z")
+
+
+def _urllib_hostonly(host: str) -> str:
+    match = _SPLIT_PORT.fullmatch(host)
+    return match.group(1) if match else host
+
+
+def _checked_hosts(hosts: tuple[str, ...]) -> tuple[str, ...]:
+    checked: list[str] = []
+    for host in hosts:
+        bare = _no_proxy_host(host)
+        if bare and bare not in checked:
+            checked.append(bare)
+        extra = _urllib_hostonly(bare)
+        if extra and extra not in checked:
+            checked.append(extra)
+    return tuple(checked)
+
+
+def _normalize_no_proxy_entry(entry: str) -> str:
+    """Drop a trailing port from a name, an IPv4 address, or a bracketed IPv6 address.
+
+    A bare IPv6 address keeps every hextet. The old ``:[0-9]*$`` strip turned ``::1`` into ``:``.
+    """
+
+    bracket = re.fullmatch(r"\[([^]]*)\](?::[0-9]*)?", entry)
+    if bracket:
+        return bracket.group(1).rstrip(".")
+    if entry.count(":") > 1:
+        return entry.rstrip(".")
+    return re.sub(r":[0-9]*$", "", entry.strip("[]")).rstrip(".")
+
+
+def _name_hit(entry: str, checked: tuple[str, ...]) -> str | None:
+    if entry.strip("*.") == "":
+        return "no_proxy_wildcard"
+    if "*" in entry:
+        pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
+        return "no_proxy_engine_host" if any(pattern.match(host) for host in checked) else None
+    bare = entry.lstrip(".")
+    if not bare:
+        return None
+    address = _no_proxy_ip(bare)
+    for host in checked:
+        if host == bare or host.endswith("." + bare) or _same_ip(address, _no_proxy_ip(host)):
             return "no_proxy_engine_host"
+    return None
+
+
+def _entry_hits(entry: str, checked: tuple[str, ...]) -> str | None:
+    entry = entry.rstrip(".")
+    if not entry:
+        return None
+    network = _no_proxy_network(entry)
+    if network is not None:
+        # A CIDR matches an address it contains. It does not match a domain name: requests does not resolve DNS.
+        return "no_proxy_engine_host" if _network_covers(network, checked) else None
+    if (cause := _name_hit(entry, checked)) is not None:
+        return cause
+    normalized = _normalize_no_proxy_entry(entry)
+    if normalized and normalized != entry:
+        return _name_hit(normalized, checked)
+    return None
+
+
+def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
+    """N5i: the union of curl, requests, urllib, hyper-util, undici and Codex matchers.
+
+    ``hosts`` is the engine's own endpoints plus the route base host, when the route has one. Comma and
+    whitespace split, and requests' reading that deletes spaces before the split, are both applied. A CIDR
+    matches an IP it contains. Two spellings of one IP match. urllib's last-colon split is applied to an
+    IPv6 host, so ``:`` exempts ``::1`` and ``2001:db8:`` exempts ``2001:db8::1``.
+    """
+
+    checked = _checked_hosts(hosts)
+    readings = [value]
+    squashed = value.replace(" ", "")
+    if squashed != value:
+        readings.append(squashed)
+    for reading in readings:
+        for raw in re.split(r"[,\s]+", reading.strip().lower()):
+            entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw)
+            if (cause := _entry_hits(entry, checked)) is not None:
+                return cause
     return None
 
 
@@ -711,9 +887,12 @@ def _lexical_dir(path: str) -> str:
 
 
 def _private_dir(path: str | None) -> bool:
-    if not isinstance(path, str) or not os.path.isabs(path):
+    if not isinstance(path, str) or "\0" in path or not os.path.isabs(path):
         return False
-    entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling
+    try:
+        entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling
+    except (OSError, ValueError):
+        return False  # a null or a path this process cannot encode is not a private home
     if os.path.basename(entry) == "..":  # link/sub/.. names the link's target without naming an entry: refused
         return False
     real, missing, cause = _resolve(entry)
@@ -723,7 +902,7 @@ def _private_dir(path: str | None) -> bool:
         if not stat.S_ISDIR(os.lstat(entry).st_mode):
             return False
         st = os.lstat(real)
-    except OSError:
+    except (OSError, ValueError):
         return False
     # The home is ours and 0700. Its parents follow the chain rule on the resolved path, so an accepted link
     # above it (macOS /var -> private/var) is fine, and a root sticky /tmp above it is fine.
@@ -770,5 +949,12 @@ def _route_tmp() -> str:
             st = None
         if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077
                 or not _owned_chain(path)):
+            # The old root failed the check. Remove it when it is still an empty directory of ours; leaving
+            # it behind leaks a recursion-child-tmp-* directory on every failed check.
+            if path and st is not None and stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
             path = _TMP[key] = _make_route_tmp()
         return path

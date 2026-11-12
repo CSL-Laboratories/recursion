@@ -800,7 +800,7 @@ class AuthRouteTests(unittest.TestCase):
 
     def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
-        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "stat", "subprocess", "tempfile", "threading", "collections.abc",
+        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile", "threading", "collections.abc",
                    "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))

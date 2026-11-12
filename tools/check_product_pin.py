@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -33,6 +34,17 @@ PINNED_FIELDS = ("path", "commit", "sha256", "claim")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 GIT_TIMEOUT_SECONDS = 60
+# These override `git -C <vault>` and would hash a different object store than the one named.
+_GIT_REDIRECTS = ("GIT_DIR", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR")
+
+
+def _git_env() -> dict[str, str]:
+    """Environment for the vault read: the named clone, with no promisor fetch."""
+    env = os.environ.copy()
+    for key in _GIT_REDIRECTS:
+        env.pop(key, None)
+    env["GIT_NO_LAZY_FETCH"] = "1"
+    return env
 
 
 def _unsafe_text(text: str) -> bool:
@@ -98,10 +110,12 @@ def vault_errors(pin: dict, vault: Path) -> list[str]:
     spec = f"{pin['commit']}:{pin['path']}"
     try:
         blob = subprocess.run(
-            ["git", "-C", str(vault), "show", spec],
+            # Replace refs would hash a different object than the pinned commit.
+            ["git", "--no-replace-objects", "-C", str(vault), "show", spec],
             check=True,
             capture_output=True,
             timeout=GIT_TIMEOUT_SECONDS,
+            env=_git_env(),
         ).stdout
     except subprocess.TimeoutExpired:
         return [f"cannot read {spec!a} from {str(vault)!a}: git timed out after {GIT_TIMEOUT_SECONDS} seconds"]
@@ -109,12 +123,19 @@ def vault_errors(pin: dict, vault: Path) -> list[str]:
         # A NUL byte or a lone surrogate in the path or the vault cannot be passed to git.
         return [f"cannot read {spec!a} from {str(vault)!a}: {_printable(exc)}"]
     except (OSError, subprocess.CalledProcessError) as exc:
-        detail = exc.stderr.decode("utf-8", "replace").strip() if hasattr(exc, "stderr") else exc
+        # CalledProcessError always has stderr, and it is None unless output was captured.
+        stderr = getattr(exc, "stderr", None)
+        if isinstance(stderr, bytes):
+            detail = stderr.decode("utf-8", "replace").strip()
+        elif isinstance(stderr, str):
+            detail = stderr.strip()
+        else:
+            detail = exc
         # Windows hands a lone surrogate to git instead of raising ValueError, so escape here too.
         return [_printable(f"cannot read {spec} from {vault}: {detail}")]
     digest = hashlib.sha256(blob).hexdigest()
     if digest != pin["sha256"]:
-        return [f"sha256 mismatch for {spec}: pinned {pin['sha256']}, vault has {digest}"]
+        return [_printable(f"sha256 mismatch for {spec}: pinned {pin['sha256']}, vault has {digest}")]
     return []
 
 

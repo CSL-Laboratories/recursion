@@ -940,12 +940,48 @@ def _urllib_hostonly(host: str) -> str:
     return match.group(1) if match else host
 
 
-def _client_hit(entry: str, host: str, port: int | None) -> bool:
+def _urllib_request_host(host: str, port: int | None) -> str:
+    """``Request.host`` for this route host, as CPython 3.12's ProxyHandler passes it.
+
+    ``host`` is already lowercased and unbracketed. An IPv6 address is wrapped again: the handler compares
+    ``NO_PROXY`` to ``[::ffff:10.1.2.3]:443``, not to ``::ffff:10.1.2.3``. The port is included only when the
+    URL spells one. ``_splitport`` then leaves the brackets on the host-only part (``[::ffff:10.1.2.3]``).
+    """
+
+    shown = f"[{host}]" if ":" in host else host
+    return f"{shown}:{port}" if port is not None else shown
+
+
+def _urllib_environment_hit(entry: str, request_host: str) -> bool:
+    """One entry, matched as CPython 3.12 ``proxy_bypass_environment`` matches it against ``request_host``.
+
+    Leading dots are removed, then the name is equal to ``Request.host`` or to its host-only part, or a dotted
+    suffix of either (``name = '.' + name`` before ``endswith``). ``2.3]:443`` is a suffix of
+    ``[::ffff:10.1.2.3]:443``; ``2.3]`` is a suffix of the host-only ``[::ffff:10.1.2.3]``. The port in the
+    entry is part of that string: ``2.3]:80`` does not match port 443.
+    """
+
+    name = entry.strip().lstrip(".").lower()
+    if not name:
+        return False
+    hostonly = _urllib_hostonly(request_host)
+    if hostonly == name or request_host == name:
+        return True
+    dotted = "." + name
+    return hostonly.endswith(dotted) or request_host.endswith(dotted)
+
+
+def _client_hit(entry: str, host: str, port: int | None, *, urllib_host: bool = True) -> bool:
     """Whether urllib or requests 2.31 would bypass ``host`` for this one entry.
 
     urllib compares the entry, with leading dots removed, to the host and to the hostonly of its last-colon
     split (``:`` equals the hostonly of ``::1``; ``2001:db8:`` equals the hostonly of ``2001:db8::1``), and to
     ``Request.host`` (``[2001:db8::1]:8443`` splits to ``[2001:db8::1]``, so ``.[2001:db8::1]`` matches).
+    ProxyHandler passes ``Request.host`` with brackets and an explicit port still on it, and the suffix check
+    is dotted: ``2.3]:443`` and ``3]:443`` match ``[::ffff:10.1.2.3]:443``, and the same shape matches
+    ``[2001:db8::10.1.2.3]:8443``, ``[64:ff9b::10.1.2.3]:443`` and port 80. That comparison is
+    ``_urllib_environment_hit`` (CPython 3.12 ``proxy_bypass_environment``). ``urllib_host`` is false only for
+    a port-stripped name: stripping ``:80`` from ``2.3]:80`` leaves ``2.3]``, which would match every port.
     requests deletes spaces before this is called and then uses ``hostname.endswith(entry)`` with no dot
     boundary, and the same on ``hostname:port`` when the URL spells a port. Leading dots are removed first so
     ``.2001:db8::1:8443`` is that host:port and ``.2001:db8::1:9`` is not. A ``*``, ``%`` or ``/`` entry is left
@@ -973,7 +1009,8 @@ def _client_hit(entry: str, host: str, port: int | None) -> bool:
     for text in texts:
         if text in equal or any(target.endswith(text) for target in bare):
             return True
-    return False
+    # Raw entry against Request.host. Not applied to a name whose :port was already stripped.
+    return urllib_host and _urllib_environment_hit(entry, _urllib_request_host(host, port))
 
 
 def _ipv6_with_port(entry: str) -> tuple[str, str] | None:
@@ -1276,8 +1313,10 @@ def _no_proxy_route_bypass(value: str, host: str, port: int | None = None) -> tu
     An entry that is an address or a block is decided as one and not also as a name, so the port strip cannot
     turn ``::1:0`` into ``::1``. An entry that is an IPv6 address plus a decimal field (``2001:db8::1:8443``,
     including a leading dot) is not that strip: the field is a port for requests' ``host:port``, so
-    ``.2001:db8::1:9`` does not match port 8443. ``_client_hit`` also applies urllib's last-colon split and
-    requests' endswith with no dot boundary. A loopback host never gets here: ``build_child_env`` exempts it
+    ``.2001:db8::1:9`` does not match port 8443. ``_client_hit`` also applies urllib's last-colon split,
+    requests' endswith with no dot boundary, and CPython 3.12's dotted suffix of the raw entry against
+    ``Request.host`` and its host-only part, brackets included (``2.3]:443`` matches
+    ``[::ffff:10.1.2.3]:443``; ``2.3]:80`` does not). A loopback host never gets here: ``build_child_env`` exempts it
     (``_loopback_host``). Neither does an all-address cover, a ``/`` entry that is no CIDR block or a ``%``
     entry: ``_no_proxy_bypass`` refused those first.
 
@@ -1305,9 +1344,11 @@ def _no_proxy_route_bypass(value: str, host: str, port: int | None = None) -> tu
             # A name's :port is dropped and then matched with no dot boundary ("pic.com" in "epic.com").
             # Two or more colons is an IPv6 spelling: dropping the last field would turn "2001:db8::2" into
             # "2001:db8:", which is urllib's hostonly of the different address "2001:db8::1".
+            # urllib_host is off here. "2.3]:80" strips to "2.3]", and that host-only suffix matches
+            # Request.host on every port; ProxyHandler only matches the port still written in the entry.
             if not hit and raw.lstrip(".").count(":") < 2:
                 named = _no_proxy_name(raw)
-                hit = bool(named) and _client_hit(named, host, port)
+                hit = bool(named) and _client_hit(named, host, port, urllib_host=False)
             if hit:
                 return position, "no_proxy_route_host", "matches the route's base URL host"
         if any(first <= address <= last for first, last in reading.ranges for address in v4):

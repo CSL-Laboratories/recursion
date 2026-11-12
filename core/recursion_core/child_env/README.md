@@ -127,7 +127,11 @@ Foundry switches are dropped. The child gets one only from the route:
     requests ignore the port, so the entry is treated as a match (fail closed). An IPv6 entry that is an
     address plus a decimal field (`2001:db8::1:8443`, `.2001:db8::1:8443`) is compared to `host:port` as
     requests does, so a different port (`.2001:db8::1:9`) may launch. urllib's last-colon split is applied
-    (`2001:db8:` matches `2001:db8::1`; `:` is the hostonly of `::1`). A loopback route stays exempt.
+    (`2001:db8:` matches `2001:db8::1`; `:` is the hostonly of `::1`). ProxyHandler also dotted-suffixes the
+    raw entry against `Request.host`, which keeps brackets and an explicit port: `2.3]:443` and `3]:443`
+    match `https://[::ffff:10.1.2.3]:443/v1`, and the same shape matches `[2001:db8::10.1.2.3]:8443`,
+    `[64:ff9b::10.1.2.3]:443` and port 80 (`2.3]:80`). `2.3]:443` does not match port 80. A loopback route
+    stays exempt.
     Leading dots are ignored (`.2001:db8::1`, `.[2001:db8::1]`).
   - requests matches with no dot boundary: after spaces are deleted, an entry refuses when a protected
     host or `host:port` ends with it (`pi.anthropic.com` and `p i.anthropic.com` match `api.anthropic.com`;

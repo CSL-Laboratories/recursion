@@ -213,6 +213,84 @@ class NoProxyClientTests(unittest.TestCase):
         env = _build(home, {"NO_PROXY": "10.0/8"}, ChildRoute(api_key=KEY, base_url="http://10.1.2.3:4000"))
         self.assertEqual("10.0/8", env["NO_PROXY"])
 
+    def test_bracketed_request_host_suffix_refuses(self) -> None:
+        """CPython 3.12 ProxyHandler suffix-matches NO_PROXY against Request.host, brackets and port included.
+
+        ``proxy_bypass_environment`` dotted-suffixes the raw entry onto ``Request.host`` and onto the host-only
+        part ``_splitport`` leaves (brackets stay). ``2.3]:443`` and ``3]:443`` bypass
+        ``https://[::ffff:10.1.2.3]:443/v1``; the same shape hits ``[2001:db8::10.1.2.3]:8443``,
+        ``[64:ff9b::10.1.2.3]:443`` and port 80. ``_no_proxy_name`` turns ``2.3]:443`` into ``2.3]`` and
+        ``_client_hit`` only endswith-compares the unbracketed host, so those entries used to launch.
+        """
+
+        import urllib.request
+
+        why = "matches the route's base URL host; the entry is not shown"
+        rows = (
+            ("https://[::ffff:10.1.2.3]:443/v1", "2.3]:443"),
+            ("https://[::ffff:10.1.2.3]:443/v1", "3]:443"),
+            ("https://[::ffff:10.1.2.3]:443/v1", "2.3]"),
+            ("https://[2001:db8::10.1.2.3]:8443/v1", "2.3]:8443"),
+            ("https://[2001:db8::10.1.2.3]:8443/v1", "3]:8443"),
+            ("https://[2001:db8::10.1.2.3]:8443/v1", "2.3]"),
+            ("https://[64:ff9b::10.1.2.3]:443/v1", "2.3]:443"),
+            ("https://[64:ff9b::10.1.2.3]:443/v1", "3]:443"),
+            ("https://[64:ff9b::10.1.2.3]:443/v1", "2.3]"),
+            ("http://[::ffff:10.1.2.3]:80/v1", "2.3]:80"),
+            ("http://[::ffff:10.1.2.3]:80/v1", "3]:80"),
+            ("http://[::ffff:10.1.2.3]:80/v1", "2.3]"),
+            ("http://[2001:db8::10.1.2.3]:80/v1", "2.3]:80"),
+            ("http://[2001:db8::10.1.2.3]:80/v1", "3]:80"),
+            ("http://[64:ff9b::10.1.2.3]:80/v1", "2.3]:80"),
+            ("http://[64:ff9b::10.1.2.3]:80/v1", "3]:80"),
+        )
+        proxies = {"https": PROXY, "http": PROXY}
+        for base_url, entry in rows:
+            with self.subTest(base_url=base_url, entry=entry):
+                host = urllib.request.Request(base_url).host
+                self.assertTrue(urllib.request.proxy_bypass_environment(host, {**proxies, "no": entry}), host)
+                refused = self._refused(entry, base_url)
+                self.assertEqual(("NO_PROXY", "no_proxy_route_host", 1), (refused.name, refused.cause, refused.position))
+                self.assertEqual(f"entry 1 of NO_PROXY {why}", refused.detail)
+        # "3]" is the host-only suffix too, but _no_proxy_name strips the trailing bracket to "3", and requests'
+        # endswith then matches the engine host's spelled :443. That prior fix refuses first, as engine host.
+        engine_why = "matches one of the engine's own hosts; the entry is not shown"
+        for base_url in (
+            "https://[::ffff:10.1.2.3]:443/v1",
+            "https://[2001:db8::10.1.2.3]:8443/v1",
+            "https://[64:ff9b::10.1.2.3]:443/v1",
+            "http://[::ffff:10.1.2.3]:80/v1",
+            "http://[2001:db8::10.1.2.3]:80/v1",
+            "http://[64:ff9b::10.1.2.3]:80/v1",
+        ):
+            with self.subTest(base_url=base_url, entry="3]"):
+                host = urllib.request.Request(base_url).host
+                self.assertTrue(urllib.request.proxy_bypass_environment(host, {**proxies, "no": "3]"}), host)
+                refused = self._refused("3]", base_url)
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host", 1), (refused.name, refused.cause, refused.position))
+                self.assertEqual(f"entry 1 of NO_PROXY {engine_why}", refused.detail)
+        # A different explicit port is not that Request.host. The raw entry must not be rewritten to its
+        # host-only suffix and then matched on every port.
+        home = _home(self)
+        for base_url, entry in (
+            ("http://[::ffff:10.1.2.3]:80/v1", "2.3]:443"),
+            ("https://[::ffff:10.1.2.3]:443/v1", "2.3]:80"),
+            ("https://[2001:db8::10.1.2.3]:8443/v1", "3]:443"),
+            ("https://[64:ff9b::10.1.2.3]:443/v1", "3]:80"),
+        ):
+            with self.subTest(kept=entry, base_url=base_url):
+                host = urllib.request.Request(base_url).host
+                self.assertFalse(urllib.request.proxy_bypass_environment(host, {**proxies, "no": entry}), host)
+                env = _build(home, {**_PROXY, "NO_PROXY": entry}, ChildRoute(api_key=KEY, base_url=base_url))
+                self.assertEqual(entry, env["NO_PROXY"])
+        # Loopback and the usual allow list still launch, on the bracketed route and on loopback itself.
+        allowed = ("localhost", "127.0.0.1", "::1", ".localhost", "127.0.0.0/8", ":", ".internal")
+        for entry in allowed:
+            for base_url in ("https://[::ffff:10.1.2.3]:443/v1", "http://127.0.0.1:4000", "http://[::1]:4000"):
+                with self.subTest(kept=entry, base_url=base_url):
+                    env = _build(home, {**_PROXY, "NO_PROXY": entry}, ChildRoute(api_key=KEY, base_url=base_url))
+                    self.assertEqual((entry, base_url), (env["NO_PROXY"], env["ANTHROPIC_BASE_URL"]))
+
 
 class ProxyClearedTests(unittest.TestCase):
     def test_empty_lowercase_proxy_clears_uppercase(self) -> None:

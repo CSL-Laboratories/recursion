@@ -25,7 +25,6 @@ import random
 import sys
 import threading
 import time
-from pathlib import Path
 
 import _harness as h
 
@@ -186,9 +185,13 @@ def one_iteration(mod, c, rng, args, v: h.Violations, counters: dict) -> None:
 
 def main() -> int:
     args = h.parse_args()
-    sys.path.insert(0, str(Path(args.tree) / "core"))
+    h.prepare_tree_import(args.tree)
     from recursion_core.routes import breaker as mod
     from recursion_core.routes import contract as c
+    h.verify_loaded(args.tree, [
+        (mod, "core/recursion_core/routes/breaker.py"),
+        (c, "core/recursion_core/routes/contract.py"),
+    ])
 
     started = time.monotonic()
     v = h.Violations()

@@ -55,6 +55,26 @@ def ref_root(env: str) -> Path:
     return root
 
 
+def origin_error(module, root: Path, parts: list[str]) -> str | None:
+    """Why ``module`` is not the source file under ``root``, or None when it is.
+
+    If ``foo.py`` exists, a ``foo/`` package is a shadow and is refused. A bytecode
+    cache next to the loaded file is refused: an unchecked-hash ``.pyc`` is executed
+    under ``-B`` while ``__file__`` still names the ``.py``.
+    """
+    py = root.joinpath(*parts).with_suffix(".py")
+    init = root.joinpath(*parts, "__init__.py")
+    expected = py if py.is_file() else init
+    origin = getattr(module, "__file__", None)
+    name = getattr(module, "__name__", module)
+    if origin is None or Path(origin).resolve() != expected.resolve():
+        return f"{name} loaded from {origin}, not pinned source {expected}"
+    cached = getattr(module, "__cached__", None)
+    if cached and Path(cached).is_file():
+        return f"{name} loaded with bytecode cache {cached}"
+    return None
+
+
 def load_stacked(env: str, dotted: str, src: str = "core") -> types.ModuleType:
     """Import ``dotted`` from the head named by ``env`` with its packages' ``__init__`` skipped."""
     root = ref_root(env) / src
@@ -74,7 +94,12 @@ def load_stacked(env: str, dotted: str, src: str = "core") -> types.ModuleType:
                 sys.modules[name] = pkg
             if not (root.joinpath(*parts).with_suffix(".py").is_file() or root.joinpath(*parts).is_dir()):
                 raise unittest.SkipTest(f"{dotted} not found under {root}")
+            sys.dont_write_bytecode = True
+            importlib.invalidate_caches()
             module = importlib.import_module(dotted)
+            problem = origin_error(module, root, parts)
+            if problem:
+                raise RuntimeError(problem)
         finally:
             for k in [k for k in sys.modules if k == top or k.startswith(top + ".")]:
                 del sys.modules[k]

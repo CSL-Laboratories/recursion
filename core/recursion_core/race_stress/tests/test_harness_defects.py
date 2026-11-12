@@ -9,9 +9,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import importlib.machinery
+import importlib.util
 import io
 import json
 import os
+import py_compile
 import random
 import shutil
 import sqlite3
@@ -134,8 +137,15 @@ class PinTests(unittest.TestCase):
             self.assertNotEqual(head_a, head_b)
 
     def test_untracked_files_under_a_directory_pin_are_not_refused(self) -> None:
-        # #324 pins the daemon directory. Porcelain status refuses the checkout for any
-        # untracked file under it, including ones the measured import never loads.
+        """A file PathFinder cannot load, sitting in the pinned directory, stays allowed.
+
+        ``scratch.txt`` and ``notes.txt`` have no source, bytecode, or extension suffix
+        and do not create a directory, so they are not modules. ``scratch.py`` is not
+        on that allowlist: it is a source module (``recursion_core.daemon.scratch``)
+        even when no tracked file imports it. A new directory is not either: it is a
+        namespace package. Those two are refused by
+        ``test_untracked_importable_sources_under_a_directory_pin_are_refused``.
+        """
         rel = "core/recursion_core/daemon"
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -147,22 +157,285 @@ class PinTests(unittest.TestCase):
             self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
             ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
             self.assertTrue(ok, message)
-            (repo / rel / "scratch.py").write_text("# local scratch\n")
-            note = repo / rel / "tests" / "local_note.py"
-            note.parent.mkdir()
-            note.write_text("# local note\n")
+            (repo / rel / "scratch.txt").write_text("not a module\n")
             (repo / rel / "notes.txt").write_text("not imported\n")
             status = subprocess.check_output(
                 ["git", "status", "--porcelain", "--untracked-files=all", "--", rel],
                 cwd=repo, env=_git_env(), text=True)
-            self.assertIn("scratch.py", status)
-            self.assertIn("local_note.py", status)
+            self.assertIn("scratch.txt", status)
+            self.assertIn("notes.txt", status)
             ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
             self.assertTrue(ok, message)
             (repo / rel / "registry.py").write_text("VALUE = 2\n")
             ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
             self.assertFalse(ok, message)
             self.assertIn(rel, message)
+
+    def test_untracked_importable_sources_under_a_directory_pin_are_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            (repo / rel / "scratch.py").write_text("VALUE = 'scratch'\n")
+            note = repo / rel / "tests" / "local_note.py"
+            note.parent.mkdir(parents=True)
+            note.write_text("VALUE = 'note'\n")
+            # notes.txt is not a module suffix, but tests/ is a new namespace package.
+            (repo / rel / "tests" / "notes.txt").write_text("not a module\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("scratch.py", message)
+            self.assertIn("local_note.py", message)
+            self.assertIn("notes.txt", message)
+
+    def test_pycache_under_a_directory_pin_is_refused(self) -> None:
+        # An unchecked-hash .pyc is what Python executes under -B; __file__ stays the .py.
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            src = repo / rel / "registry.py"
+            src.write_text("VALUE = 'cache'\n")
+            py_compile.compile(
+                str(src), doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+            src.write_text("VALUE = 1\n")
+            cache = Path(importlib.util.cache_from_source(str(src)))
+            self.assertTrue(cache.is_file(), cache)
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.daemon.registry import VALUE; print(VALUE)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "cache")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("__pycache__", message)
+
+    def test_ignored_importables_under_a_directory_pin_are_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+                ".gitignore": "__pycache__/\n*.ignored.py\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ignored = repo / rel / "evil.ignored.py"
+            ignored.write_text("VALUE = 'ignored'\n")
+            src = repo / rel / "registry.py"
+            py_compile.compile(str(src), doraise=True)
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--", rel],
+                cwd=repo, env=_git_env(), text=True)
+            self.assertEqual(status.strip(), "", status)
+            self.assertEqual(
+                subprocess.call(["git", "check-ignore", "-q", "--", str(ignored.relative_to(repo))],
+                                 cwd=repo, env=_git_env()), 0)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("evil.ignored.py", message)
+            self.assertIn("__pycache__", message)
+
+    def test_extension_module_under_a_directory_pin_is_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+            ext = repo / rel / f"registry{suffix}"
+            ext.write_bytes(b"not a real extension")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(ext.name, message)
+
+    def test_package_dir_shadowing_a_tracked_module_is_refused(self) -> None:
+        # FileFinder selects foo/__init__.py before foo.py.
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            pkg = repo / rel / "registry" / "__init__.py"
+            pkg.parent.mkdir()
+            pkg.write_text("VALUE = 'pkg'\n")
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.daemon.registry import VALUE; print(VALUE)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "pkg")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("registry/__init__.py", message)
+
+    def _pinned_file(self, tmp: str, *, gitignore: str | None = None) -> tuple[Path, str]:
+        rel = "core/recursion_core/routes/breaker.py"
+        repo = Path(tmp) / "repo"
+        files = {rel: "v1\n", "core/recursion_core/routes/contract.py": "v1\n"}
+        if gitignore is not None:
+            files[".gitignore"] = gitignore
+        head = _repo(repo, files)
+        self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+        ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+        self.assertTrue(ok, message)
+        return repo, rel
+
+    def test_file_pin_refuses_sibling_pycache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, rel = self._pinned_file(tmp, gitignore="__pycache__/\n")
+            sibling = repo / "core/recursion_core/routes/scratch.txt"
+            sibling.write_text("not a module\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            src = repo / rel
+            py_compile.compile(str(src), doraise=True)
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--",
+                 "core/recursion_core/routes"],
+                cwd=repo, env=_git_env(), text=True)
+            self.assertNotIn("__pycache__", status)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("__pycache__", message)
+
+    def test_file_pin_refuses_extension_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, rel = self._pinned_file(tmp)
+            suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+            ext = (repo / rel).with_name("breaker" + suffix)
+            ext.write_bytes(b"not a real extension")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(ext.name, message)
+
+    def test_file_pin_refuses_package_dir_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, rel = self._pinned_file(tmp)
+            init = repo / "core/recursion_core/routes/breaker" / "__init__.py"
+            init.parent.mkdir()
+            init.write_text("VALUE = 'pkg'\n")
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.routes.breaker import VALUE; print(VALUE)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "pkg")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("breaker/__init__.py", message)
+
+    def test_untracked_toplevel_name_on_inserted_core_path_is_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            shadow = repo / "core" / "dataclasses.py"
+            shadow.write_text("SHADOW = True\n")
+            pkg = repo / "core" / "json" / "__init__.py"
+            pkg.parent.mkdir()
+            pkg.write_text("SHADOW = True\n")
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "import dataclasses, json; print(dataclasses.SHADOW, json.SHADOW)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "True True")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("core/dataclasses.py", message)
+            self.assertIn("core/json/__init__.py", message)
+
+    def test_ignored_toplevel_name_on_inserted_core_path_is_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+                ".gitignore": "dataclasses.py\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            shadow = repo / "core" / "dataclasses.py"
+            shadow.write_text("SHADOW = True\n")
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--", "core"],
+                cwd=repo, env=_git_env(), text=True)
+            self.assertNotIn("dataclasses.py", status)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("core/dataclasses.py", message)
+
+    def test_path_git_cannot_make_a_dirty_tree_look_pinned(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        lie = "0" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            head = _repo(repo, {rel: "v1\n"})
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            clean = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(repo), "hash-object", "--no-filters", "--", rel],
+                text=True).strip()
+            real_head = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            (repo / rel).write_text("v1\ndirty\n")
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            fake = bindir / "git"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "prev=\n"
+                "for arg in \"$@\"; do\n"
+                f"  if [ \"$arg\" = \"hash-object\" ]; then printf '%s\\n' '{clean}'; exit 0; fi\n"
+                f"  if [ \"$prev\" = \"rev-parse\" ] && [ \"$arg\" = \"HEAD\" ]; then printf '%s\\n' '{lie}'; exit 0; fi\n"
+                "  prev=$arg\n"
+                "done\n"
+                "exec /usr/bin/git \"$@\"\n")
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bindir) + os.pathsep + old
+            try:
+                lied = subprocess.check_output(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+                self.assertEqual(lied, lie)
+                info = h.tree_info(str(repo), rel)
+                ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            finally:
+                os.environ["PATH"] = old
+            self.assertEqual(info["tree_head"], real_head)
+            self.assertFalse(ok, message)
+            self.assertEqual(pins.GIT, "/usr/bin/git")
 
     def test_skip_worktree_and_assume_unchanged_cannot_hide_edits(self) -> None:
         rel = "core/recursion_core/routes/breaker.py"
@@ -326,6 +599,8 @@ class DaemonResourceTests(unittest.TestCase):
             finish(2)
         if hasattr(daemon_324, "CLEANUP_WAIT"):
             daemon_324.CLEANUP_WAIT = 5.0
+        if hasattr(daemon_324, "OBSERVER_JOIN"):
+            daemon_324.OBSERVER_JOIN = 30.0
         reset = getattr(daemon_324, "reset_harness_state", None)
         if reset is not None:
             reset()
@@ -437,6 +712,221 @@ class DaemonResourceTests(unittest.TestCase):
         self.assertEqual(_race324_db_fds(), [])
         self.assertEqual(closed_after_release, [True])
 
+    def test_blocked_userlock_is_not_torn_down(self) -> None:
+        release = threading.Event()
+        saw: dict[str, bool] = {}
+
+        class AlreadyRunning(Exception):
+            pass
+
+        class UserLock:
+            def __init__(self, runtime):
+                self.runtime = Path(runtime)
+
+            def __enter__(self):
+                release.wait(30)
+                saw["exists"] = self.runtime.is_dir()
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        mod = argparse.Namespace(UserLock=UserLock, AlreadyRunning=AlreadyRunning)
+        orig = daemon_324.h.hammer
+
+        def quick(workers, timeout=60.0, **kwargs):
+            return orig(workers, timeout=0.3, **kwargs)
+
+        parent = Path(tempfile.mkdtemp(prefix="rs-lock-"))
+        old = tempfile.tempdir
+        tempfile.tempdir = str(parent)
+        daemon_324.h.hammer = quick
+        daemon_324.reset_harness_state()
+        try:
+            daemon_324.lock_iteration(mod, argparse.Namespace(threads=1), h.Violations())
+            left = sorted(p.name for p in parent.iterdir())
+            self.assertTrue(left, "runtime directory removed while UserLock.__enter__ is blocked")
+            self.assertTrue(daemon_324.aborted())
+            alive, _fds = daemon_324.finish_pending(0.05)
+            self.assertGreater(alive, 0)
+        finally:
+            release.set()
+            daemon_324.h.hammer = orig
+            daemon_324.finish_pending(2)
+            tempfile.tempdir = old
+            shutil.rmtree(parent, ignore_errors=True)
+        self.assertTrue(saw.get("exists"), saw)
+
+    def test_stuck_observer_is_not_torn_down(self) -> None:
+        release = threading.Event()
+        saw: dict[str, bool] = {}
+
+        class Registry:
+            def __init__(self, path):
+                self.path = Path(path)
+                self.path.mkdir(parents=True, exist_ok=True)
+
+            def get(self, rid):
+                raise KeyError(rid)
+
+            def state(self, *args):
+                return None
+
+            def all(self):
+                release.wait(30)
+                saw["exists"] = self.path.is_dir()
+                return []
+
+            def close(self):
+                pass
+
+        class Daemon:
+            def __init__(self, registry, manager, boot_id=None):
+                self.lock = threading.Lock()
+                self.registry = registry
+
+            def start(self, rid, argv):
+                return None
+
+            def stop(self, rid):
+                return None
+
+            def sweep(self):
+                return None
+
+            def close(self):
+                self.registry.close()
+
+        class AlreadyRunning(Exception):
+            pass
+
+        class UserLock:
+            def __init__(self, runtime):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        mod = argparse.Namespace(
+            Registry=Registry, Daemon=Daemon, UserLock=UserLock,
+            AlreadyRunning=AlreadyRunning, TERMINAL=frozenset())
+        orig_join = threading.Thread.join
+
+        def quick_join(self, timeout=None):
+            if timeout == 30 or timeout == 30.0:
+                timeout = 0.25
+            return orig_join(self, timeout)
+
+        parent = Path(tempfile.mkdtemp(prefix="rs-obs-"))
+        old_temp = tempfile.tempdir
+        tempfile.tempdir = str(parent)
+        threading.Thread.join = quick_join
+        if hasattr(daemon_324, "OBSERVER_JOIN"):
+            daemon_324.OBSERVER_JOIN = 0.25
+        daemon_324.reset_harness_state()
+        v = h.Violations()
+        try:
+            daemon_324.one_iteration(
+                mod, random.Random(1), argparse.Namespace(mutant=False, threads=1), v,
+                {"runs": 0, "closed_mid_run": 0, "boot_flips": 0, "terminal": 0, "stop_requested": 0})
+            left = sorted(p.name for p in parent.iterdir())
+            self.assertTrue(left, "temp directory removed while the observer is still inside it")
+            self.assertTrue(daemon_324.aborted())
+            self.assertTrue(any("observer did not finish" in m for m in v.first), v.first)
+            alive, _fds = daemon_324.finish_pending(0.05)
+            self.assertGreater(alive, 0)
+        finally:
+            release.set()
+            threading.Thread.join = orig_join
+            if hasattr(daemon_324, "OBSERVER_JOIN"):
+                daemon_324.OBSERVER_JOIN = 30.0
+            daemon_324.finish_pending(2)
+            tempfile.tempdir = old_temp
+            shutil.rmtree(parent, ignore_errors=True)
+        self.assertTrue(saw.get("exists"), saw)
+
+    def test_drive_stops_after_a_hung_lock(self) -> None:
+        release = threading.Event()
+        registries: list[str] = []
+
+        class Registry:
+            def __init__(self, path):
+                registries.append(str(path))
+                Path(path).mkdir(parents=True, exist_ok=True)
+
+            def get(self, rid):
+                raise KeyError(rid)
+
+            def state(self, *args):
+                return None
+
+            def all(self):
+                return []
+
+            def close(self):
+                pass
+
+        class Daemon:
+            def __init__(self, registry, manager, boot_id=None):
+                self.lock = threading.Lock()
+                self.registry = registry
+
+            def start(self, rid, argv):
+                raise RuntimeError("boom")
+
+            def stop(self, rid):
+                raise RuntimeError("boom")
+
+            def sweep(self):
+                raise RuntimeError("boom")
+
+            def close(self):
+                self.registry.close()
+
+        class AlreadyRunning(Exception):
+            pass
+
+        class UserLock:
+            def __init__(self, runtime):
+                self.runtime = Path(runtime)
+
+            def __enter__(self):
+                release.wait(30)
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        mod = argparse.Namespace(
+            Registry=Registry, Daemon=Daemon, UserLock=UserLock,
+            AlreadyRunning=AlreadyRunning, TERMINAL=frozenset())
+        orig = daemon_324.h.hammer
+
+        def quick(workers, timeout=60.0, **kwargs):
+            return orig(workers, timeout=0.4, **kwargs)
+
+        daemon_324.h.hammer = quick
+        daemon_324.CLEANUP_WAIT = 0.2
+        daemon_324.reset_harness_state()
+        try:
+            leaked_threads, _fds = daemon_324.drive(
+                mod, random.Random(1),
+                argparse.Namespace(mutant=False, threads=1, iters=2, seed=1),
+                h.Violations(),
+                {"runs": 0, "closed_mid_run": 0, "boot_flips": 0, "terminal": 0, "stop_requested": 0})
+            # One finished iteration opens the registry and reopens it; a second must not start.
+            self.assertEqual(len(registries), 2, registries)
+            self.assertTrue(daemon_324.aborted())
+            self.assertGreater(leaked_threads, 0)
+        finally:
+            release.set()
+            daemon_324.h.hammer = orig
+            daemon_324.CLEANUP_WAIT = 5.0
+            daemon_324.finish_pending(2)
+
 
 def _race324_db_fds() -> list[str]:
     found = []
@@ -524,6 +1014,62 @@ class DriverExitTests(unittest.TestCase):
             from recursion_core.race_stress.tests.test_race_stress import run_driver
             result = run_driver(script, str(root), iters=1)
             self.assertGreater(result["violation_count"], 0)
+
+    def test_driver_rejects_a_loaded_toplevel_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, {
+                "core/recursion_core/__init__.py": "",
+                "core/recursion_core/daemon/__init__.py": "import dataclasses\n" + DAEMON_FAKE,
+                "core/dataclasses.py": "SHADOW = True\n",
+            })
+            proc = subprocess.run(
+                [sys.executable, "-B", str(DRIVERS / "daemon_324.py"), "--tree", str(root),
+                 "--iters", "1", "--threads", "1", "--seed", "1"],
+                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("shadows the import", proc.stderr)
+        self.assertNotIn("violation_count", proc.stdout)
+
+    def test_driver_rejects_a_loaded_package_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, {
+                "core/recursion_core/__init__.py": "",
+                "core/recursion_core/routes/__init__.py": "",
+                "core/recursion_core/routes/breaker.py": "VALUE = 'file'\n",
+                "core/recursion_core/routes/breaker/__init__.py": "VALUE = 'pkg'\n",
+                "core/recursion_core/routes/contract.py": "PLAN_LIMIT='PLAN_LIMIT'\nSHORT_FAULT='SHORT_FAULT'\n",
+            })
+            proc = subprocess.run(
+                [sys.executable, "-B", str(DRIVERS / "breaker_326.py"), "--tree", str(root),
+                 "--iters", "1", "--threads", "1", "--seed", "1"],
+                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("not pinned source", proc.stderr)
+        self.assertNotIn("violation_count", proc.stdout)
+
+    def test_loaded_origin_rejects_package_shadow_and_bytecode_cache(self) -> None:
+        from recursion_core.race_stress.tests.interleave_support import origin_error
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            py = root / "breaker.py"
+            py.write_text("VALUE = 'file'\n")
+            init = root / "breaker" / "__init__.py"
+            init.parent.mkdir()
+            init.write_text("VALUE = 'pkg'\n")
+            pkg = argparse.Namespace(__name__="breaker", __file__=str(init), __cached__=None)
+            self.assertIn("not pinned source", origin_error(pkg, root, ["breaker"]))
+            source = argparse.Namespace(__name__="breaker", __file__=str(py), __cached__=None)
+            # The sibling package is still on disk; the loaded file is the .py only when
+            # the package dir is absent. Remove it and require the source path.
+            shutil.rmtree(init.parent)
+            self.assertIsNone(origin_error(source, root, ["breaker"]))
+            cache = Path(importlib.util.cache_from_source(str(py)))
+            cache.parent.mkdir()
+            cache.write_bytes(b"pyc")
+            cached = argparse.Namespace(__name__="breaker", __file__=str(py), __cached__=str(cache))
+            self.assertIn("bytecode cache", origin_error(cached, root, ["breaker"]))
 
 
 class LeaseAndDeadlineTests(unittest.TestCase):

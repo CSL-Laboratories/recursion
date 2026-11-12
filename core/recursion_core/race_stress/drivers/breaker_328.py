@@ -30,7 +30,6 @@ import sys
 import tempfile
 import threading
 import time
-from pathlib import Path
 
 import _harness as h
 
@@ -203,9 +202,14 @@ def stale_probe(mod, Refused, rng, args, v: h.Violations, counters: dict, tmp: s
 
 def main() -> int:
     args = h.parse_args()
-    sys.path.insert(0, str(Path(args.tree) / "core"))
+    h.prepare_tree_import(args.tree)
     from recursion_core.plugin_security import breaker as mod
+    from recursion_core.plugin_security import errors as errors_mod
     from recursion_core.plugin_security.errors import Refused
+    h.verify_loaded(args.tree, [
+        (mod, "core/recursion_core/plugin_security/breaker.py"),
+        (errors_mod, "core/recursion_core/plugin_security/errors.py"),
+    ])
 
     started = time.monotonic()
     v = h.Violations()

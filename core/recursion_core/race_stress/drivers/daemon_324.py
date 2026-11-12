@@ -17,7 +17,9 @@ Invariants checked every iteration:
   sqlite error from a closed connection, and the file reopens with every committed row;
 * a hang aborts the run: ``close`` is not taken while a worker still holds the daemon
   lock, no later iteration starts in this process, and the registry is closed once those
-  threads finish (fds still open at driver exit are counted in the result);
+  threads finish (fds still open at driver exit are counted in the result). A stuck
+  observer or a ``UserLock`` contender still inside its runtime directory is the same:
+  the directory stays until that thread leaves, and the thread counts in the exit total;
 * ``UserLock``: of N threads racing for the lock, exactly one holds it.
 """
 
@@ -100,6 +102,8 @@ ALLOWED = (KeyError, sqlite3.IntegrityError, OSError)
 
 # How long driver exit waits for hung threads before reporting the fds they still hold.
 CLEANUP_WAIT = 5.0
+# How long one iteration waits for the observer after the workers have been joined.
+OBSERVER_JOIN = 30.0
 _aborted = False
 _pending: list["_Reap"] = []
 
@@ -144,12 +148,14 @@ class _Reap:
     def _run(self) -> None:
         for thread in self.threads:
             thread.join()
-        try:
-            self._daemon.close()
-        except Exception:
-            # The connection may already be closed. Leftover fds are counted at driver exit.
-            pass
+        daemon = self._daemon
         self._daemon = None
+        if daemon is not None:
+            try:
+                daemon.close()
+            except Exception:
+                # The connection may already be closed. Leftover fds are counted at driver exit.
+                pass
         shutil.rmtree(self._tmp, ignore_errors=True)
         self.finished.set()
 
@@ -268,14 +274,15 @@ def _one_iteration(mod, rng, args, v: h.Violations, counters: dict, tmp: str) ->
     for problem in problems:
         v.add(problem)
     done.set()
-    watcher.join(30)
+    watcher.join(OBSERVER_JOIN)
+    if watcher.is_alive():
+        threads.append(watcher)
     v.check(not watcher.is_alive(), "observer did not finish")
-    if any("still running" in problem for problem in problems):
+    if any(thread.is_alive() for thread in threads):
         # close() takes the daemon lock a hung worker still holds across the service call,
-        # so calling it here deadlocks the iteration. Abort instead: nothing else starts
-        # in this process, and _Reap closes the registry once that worker has returned.
-        if watcher.is_alive():
-            threads.append(watcher)
+        # so calling it here deadlocks the iteration. A stuck observer is the same: deleting
+        # the temp directory now races the thread still inside it. Abort instead: nothing
+        # else starts in this process, and _Reap closes the registry once those threads return.
         _mark_aborted(threads, daemon, tmp, v)
         return True
 
@@ -316,13 +323,15 @@ def _mark_aborted(threads: list, daemon, tmp: str, v: h.Violations) -> None:
 
 def lock_iteration(mod, args, v: h.Violations) -> None:
     runtime = Path(tempfile.mkdtemp(prefix="race324lock-"))
+    keep = False
     try:
-        _lock_iteration(mod, args, v, runtime)
+        keep = _lock_iteration(mod, args, v, runtime)
     finally:
-        shutil.rmtree(runtime, ignore_errors=True)
+        if not keep:
+            shutil.rmtree(runtime, ignore_errors=True)
 
 
-def _lock_iteration(mod, args, v: h.Violations, runtime: Path) -> None:
+def _lock_iteration(mod, args, v: h.Violations, runtime: Path) -> bool:
     os.chmod(runtime, 0o700)
     held, refused = [], []
     hold = threading.Barrier(args.threads, timeout=30)
@@ -342,10 +351,17 @@ def _lock_iteration(mod, args, v: h.Violations, runtime: Path) -> None:
         hold.wait()  # everyone has tried while the winner still holds it
         lock.__exit__(None, None, None)
 
-    for problem in h.hammer([contender] * args.threads):
+    threads: list = []
+    for problem in h.hammer([contender] * args.threads, threads_out=threads):
         v.add(problem)
+    if any(thread.is_alive() for thread in threads):
+        # The contender is still inside UserLock.__enter__. Deleting the runtime
+        # directory here races that thread. Hand it to the reaper and stop the run.
+        _mark_aborted(threads, None, str(runtime), v)
+        return True
     v.check(len(held) == 1 and len(refused) == args.threads - 1,
             f"UserLock: {len(held)} holders, {len(refused)} refused of {args.threads}")
+    return False
 
 
 def drive(mod, rng, args, v: h.Violations, counters: dict) -> tuple[int, int]:
@@ -356,6 +372,8 @@ def drive(mod, rng, args, v: h.Violations, counters: dict) -> tuple[int, int]:
         if aborted():
             break
         lock_iteration(mod, args, v)
+        if aborted():
+            break
     leaked_threads, leaked_fds = finish_pending(CLEANUP_WAIT)
     if leaked_threads or leaked_fds:
         v.add(f"hung past driver exit: {leaked_threads} thread(s), {leaked_fds} db fd(s) still open")
@@ -364,8 +382,9 @@ def drive(mod, rng, args, v: h.Violations, counters: dict) -> tuple[int, int]:
 
 def main() -> int:
     args = h.parse_args()
-    sys.path.insert(0, str(Path(args.tree) / "core"))
+    h.prepare_tree_import(args.tree)
     from recursion_core import daemon as mod
+    h.verify_loaded(args.tree, [(mod, "core/recursion_core/daemon/__init__.py")])
 
     logging.disable(logging.CRITICAL)  # the injected manager faults are logged by design
     started = time.monotonic()

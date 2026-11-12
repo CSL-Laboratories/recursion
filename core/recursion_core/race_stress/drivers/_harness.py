@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.machinery
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -59,15 +62,81 @@ def _git_env() -> dict:
             if k not in _GIT_REPO_ENV and not k.startswith("GIT_CONFIG_")}
 
 
+def _resolve_git() -> str:
+    """Absolute git. Prefer ``/usr/bin/git`` over ``PATH``. Same rule as ``pins.GIT``.
+
+    Residual: the bytes at that path are not pinned, and ``GIT_EXEC_PATH`` can still
+    redirect git's subcommands.
+    """
+    trusted = "/usr/bin/git"
+    if os.path.isfile(trusted) and os.access(trusted, os.X_OK):
+        return trusted
+    found = shutil.which("git")
+    if found and os.path.isabs(found) and os.access(found, os.X_OK):
+        return found
+    return trusted
+
+
+_GIT = _resolve_git()
+_EXTENSION_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+
+
 def tree_info(tree: str, relpath: str) -> dict:
     """Pin what was measured: the tree's git HEAD and the target file's SHA-256."""
     path = Path(tree) / relpath
     try:
-        head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], check=False, capture_output=True, text=True,
+        head = subprocess.run([_GIT, "-C", tree, "rev-parse", "HEAD"], check=False, capture_output=True, text=True,
                               timeout=15, env=_git_env()).stdout.strip() or None
     except (OSError, subprocess.SubprocessError):
         head = None
     return {"tree_head": head, "file": relpath, "file_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def prepare_tree_import(tree: str) -> None:
+    """Put ``tree/core`` first on ``sys.path`` and do not write bytecode for it."""
+    sys.dont_write_bytecode = True
+    importlib.invalidate_caches()
+    core = str(Path(tree) / "core")
+    sys.path[:] = [entry for entry in sys.path if entry != core]
+    sys.path.insert(0, core)
+    importlib.invalidate_caches()
+
+
+def verify_loaded(tree: str, expected: list[tuple[object, str]]) -> None:
+    """Exit when an imported module is not the pinned source.
+
+    ``expected`` is ``(module, path relative to tree)``. A package directory or extension
+    that took the place of that source, a bytecode cache beside a loaded file, or any other
+    loaded module whose file sits at the top of the inserted ``core/`` directory
+    (``core/dataclasses.py`` shadowing the standard library) is refused.
+    """
+    core = (Path(tree) / "core").resolve()
+    for module, relpath in expected:
+        wanted = (Path(tree) / relpath).resolve()
+        origin = getattr(module, "__file__", None)
+        got = None if origin is None else Path(origin).resolve()
+        if got != wanted:
+            name = getattr(module, "__name__", module)
+            raise SystemExit(f"{name} loaded from {origin}, not pinned source {wanted}")
+    for name, module in list(sys.modules.items()):
+        origin = getattr(module, "__file__", None)
+        if not origin:
+            continue
+        try:
+            got = Path(origin).resolve()
+        except OSError:
+            continue
+        if core not in got.parents:
+            continue
+        rel = got.relative_to(core)
+        if not rel.parts or rel.parts[0] != "recursion_core":
+            raise SystemExit(
+                f"{name} loaded from {got}; that top-level name on the inserted core/ path shadows the import")
+        if any(got.name.endswith(suffix) for suffix in _EXTENSION_SUFFIXES):
+            raise SystemExit(f"{name} loaded extension {got}, not the pinned source")
+        cached = getattr(module, "__cached__", None)
+        if cached and Path(cached).is_file():
+            raise SystemExit(f"{name} loaded with bytecode cache {cached}")
 
 
 class Violations:

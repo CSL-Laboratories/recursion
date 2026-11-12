@@ -21,14 +21,20 @@ import json
 import os
 import sys
 import tempfile
-from pathlib import Path
+
+import _harness as h
 
 
 def main() -> None:
     tree = sys.argv[sys.argv.index("--tree") + 1]
-    sys.path.insert(0, str(Path(tree) / "core"))
+    h.prepare_tree_import(tree)
     from recursion_core.plugin_security import breaker as mod
+    from recursion_core.plugin_security import errors as errors_mod
     from recursion_core.plugin_security.errors import Refused
+    h.verify_loaded(tree, [
+        (mod, "core/recursion_core/plugin_security/breaker.py"),
+        (errors_mod, "core/recursion_core/plugin_security/errors.py"),
+    ])
 
     if not hasattr(mod.ConnectionBreaker, "begin_probe"):
         print(json.dumps({"lease_api": False, "error": "tree predates the #328 lease API"}))

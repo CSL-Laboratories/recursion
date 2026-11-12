@@ -20,9 +20,11 @@ import json
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import unicodedata
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -64,6 +66,18 @@ class _StoreRefusal(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class _ObjectMissing(Exception):
+    """The pinned object is not a regular object in the vault's own store."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class _NotPresent(Exception):
+    """A lookup path is absent. Distinct from a symlink or an unreadable file."""
 
 
 def _ceiling_directories(vault: Path) -> str:
@@ -140,7 +154,10 @@ def _objects_problem(vault: Path, objects: Path) -> str | None:
         return f"vault object store is not self-contained: {resolved} is outside {vault}"
     if objects.is_symlink():
         return f"vault object store is not self-contained: {objects} is a symlink"
-    return _walk_objects(objects)
+    walked = _walk_objects(objects)
+    if walked:
+        return walked
+    return _outside_reference_problem(objects)
 
 
 def _walk_objects(objects: Path) -> str | None:
@@ -169,6 +186,621 @@ def _walk_objects(objects: Path) -> str | None:
             if not resolved.is_relative_to(root):
                 return f"vault object store is not self-contained: {resolved} is outside {objects}"
     return None
+
+
+def _objects_snapshot(objects: Path) -> tuple[tuple, ...]:
+    """Identity of every entry under objects. Taken before and after the read."""
+    if not _points_at_a_path(objects):
+        return ()
+    rows = []
+
+    def fail_closed(err: OSError) -> None:
+        raise err
+
+    for dirpath, dirnames, filenames in os.walk(objects, followlinks=False, onerror=fail_closed):
+        dirnames.sort()
+        for name in (*dirnames, *sorted(filenames)):
+            entry = Path(dirpath) / name
+            st = os.lstat(entry)
+            rows.append(
+                (
+                    os.path.relpath(entry, objects),
+                    st.st_mode,
+                    st.st_ino,
+                    st.st_size,
+                    st.st_mtime_ns,
+                    st.st_ctime_ns,
+                )
+            )
+    return tuple(rows)
+
+
+_HASH_BYTES = {1: 20, 2: 32}
+_OBJ_TYPE = {1: b"commit", 2: b"tree", 3: b"blob", 4: b"tag"}
+_TREE_MODES = {b"40000", b"040000"}
+_BLOB_MODES = {b"100644", b"100755", b"120000", b"100664"}
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+_HEX_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _plain_basename(name: str, suffix: str) -> bool:
+    """True for one path component, with no '..' and the given suffix."""
+    if not name.endswith(suffix) or "/" in name or "\\" in name or ".." in name:
+        return False
+    if name.startswith(".") or not _PLAIN_NAME.fullmatch(name):
+        return False
+    return len(name) > len(suffix)
+
+
+def _read_nofollow(root: Path, relative: str) -> bytes:
+    """Read a regular file under root. Symlinks and '..' components are refused."""
+    parts = [part for part in relative.split("/") if part != ""]
+    if not parts or any(part in {".", ".."} or "\x00" in part for part in parts):
+        raise _StoreRefusal(f"vault object store is not self-contained: {root / relative}")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for index, part in enumerate(parts):
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if index != len(parts) - 1:
+                flags |= os.O_DIRECTORY
+            try:
+                nxt = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError as exc:
+                raise _NotPresent(str(root / relative)) from exc
+            except OSError as exc:
+                raise _StoreRefusal(
+                    f"vault object store is not self-contained: {root / relative} ({exc})"
+                ) from exc
+            os.close(fd)
+            fd = nxt
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _StoreRefusal(
+                f"vault object store is not self-contained: {root / relative} is not a regular file"
+            )
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _regular_basename(directory: Path, name: str) -> bool:
+    """True when name is a regular, non-symlink file whose realpath stays in directory."""
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        return False
+    path = directory / name
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        resolved = Path(os.path.realpath(path))
+        root = Path(os.path.realpath(directory))
+    except (OSError, ValueError):
+        return False
+    return resolved.is_relative_to(root)
+
+
+def _midx_pack_names(data: bytes) -> list[str]:
+    """Pack names from a version-1 multi-pack-index. Unknown layouts are refused."""
+    if len(data) < 12 or data[:4] != b"MIDX":
+        raise _StoreRefusal("not a multi-pack-index")
+    version = data[4]
+    hash_version = data[5]
+    num_chunks = data[6]
+    num_base = data[7]
+    if version != 1 or hash_version not in _HASH_BYTES or num_base != 0 or num_chunks < 1:
+        raise _StoreRefusal(f"unsupported multi-pack-index version {version}")
+    hash_len = _HASH_BYTES[hash_version]
+    toc_bytes = (num_chunks + 1) * 12
+    if len(data) < 12 + toc_bytes + hash_len:
+        raise _StoreRefusal("truncated multi-pack-index")
+    chunks: list[tuple[bytes, int]] = []
+    for index in range(num_chunks + 1):
+        off = 12 + index * 12
+        chunks.append((data[off : off + 4], int.from_bytes(data[off + 4 : off + 12], "big")))
+    if chunks[-1][0] != b"\x00\x00\x00\x00":
+        raise _StoreRefusal("multi-pack-index chunk table is truncated")
+    end = chunks[-1][1]
+    if end < 12 + toc_bytes or end + hash_len != len(data):
+        raise _StoreRefusal("multi-pack-index trailer does not match its chunks")
+    digest = data[-hash_len:]
+    body = data[:-hash_len]
+    expect = hashlib.sha1(body).digest() if hash_version == 1 else hashlib.sha256(body).digest()
+    if digest != expect:
+        raise _StoreRefusal("multi-pack-index checksum does not match")
+    ordered = sorted(chunks[:-1], key=lambda item: item[1])
+    bounds = [start for _, start in ordered] + [end]
+    pnam = None
+    for index, (cid, start) in enumerate(ordered):
+        stop = bounds[index + 1]
+        if start < 12 + toc_bytes or stop < start or stop > end:
+            raise _StoreRefusal("multi-pack-index chunk offset is out of range")
+        if cid == b"PNAM":
+            if pnam is not None:
+                raise _StoreRefusal("multi-pack-index has more than one PNAM chunk")
+            pnam = data[start:stop]
+    if pnam is None:
+        raise _StoreRefusal("multi-pack-index has no PNAM chunk")
+    num_packs = int.from_bytes(data[8:12], "big")
+    if num_packs > len(pnam):
+        raise _StoreRefusal("multi-pack-index pack count does not fit the PNAM chunk")
+    names: list[str] = []
+    pos = 0
+    for _ in range(num_packs):
+        nul = pnam.find(b"\x00", pos)
+        if nul < 0:
+            raise _StoreRefusal("multi-pack-index PNAM chunk is truncated")
+        try:
+            names.append(pnam[pos:nul].decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise _StoreRefusal("multi-pack-index PNAM chunk is not utf-8") from exc
+        pos = nul + 1
+    if any(byte != 0 for byte in pnam[pos:]):
+        raise _StoreRefusal("multi-pack-index PNAM chunk has trailing data")
+    return names
+
+
+def _require_pack_pair(pack_dir: Path, idx_name: str) -> None:
+    """idx_name must be a plain basename, and both the idx and pack must sit in pack_dir."""
+    if not _plain_basename(idx_name, ".idx"):
+        raise _StoreRefusal(f"names {idx_name!r}")
+    pack_name = idx_name[: -len(".idx")] + ".pack"
+    if not _plain_basename(pack_name, ".pack"):
+        raise _StoreRefusal(f"names {idx_name!r}")
+    for name in (idx_name, pack_name):
+        if not _regular_basename(pack_dir, name):
+            raise _StoreRefusal(f"names {name!r}")
+
+
+def _check_midx_file(pack_dir: Path, relative: str, root: Path) -> None:
+    try:
+        data = _read_nofollow(root, relative)
+    except _NotPresent as exc:
+        raise _StoreRefusal(f"vault object store is not self-contained: {root / relative} is missing") from exc
+    except _StoreRefusal as refusal:
+        if refusal.message.startswith("vault object store is not self-contained:"):
+            raise
+        raise _StoreRefusal(f"vault object store is not self-contained: {root / relative} ({refusal.message})") from refusal
+    try:
+        names = _midx_pack_names(data)
+    except _StoreRefusal as refusal:
+        detail = refusal.message
+        if detail.startswith("vault object store is not self-contained:"):
+            raise
+        raise _StoreRefusal(f"vault object store is not self-contained: {root / relative} ({detail})") from refusal
+    for name in names:
+        try:
+            _require_pack_pair(pack_dir, name)
+        except _StoreRefusal as refusal:
+            detail = refusal.message
+            if detail.startswith("vault object store is not self-contained:"):
+                raise
+            raise _StoreRefusal(f"vault object store is not self-contained: {root / relative} {detail}") from refusal
+
+
+def _outside_reference_problem(objects: Path) -> str | None:
+    """Refuse index files whose recorded names can point outside objects/pack."""
+    try:
+        return _outside_reference_problem_raised(objects)
+    except _StoreRefusal as refusal:
+        return refusal.message
+
+
+def _outside_reference_problem_raised(objects: Path) -> None:
+    pack_dir = objects / "pack"
+    root = objects
+    midx = pack_dir / "multi-pack-index"
+    if _points_at_a_path(midx):
+        _check_midx_file(pack_dir, "pack/multi-pack-index", root)
+    midx_d = pack_dir / "multi-pack-index.d"
+    if _points_at_a_path(midx_d):
+        if midx_d.is_symlink() or not midx_d.is_dir():
+            raise _StoreRefusal(f"vault object store is not self-contained: {midx_d} is not a directory")
+        chain_rel = "pack/multi-pack-index.d/multi-pack-index-chain"
+        if _points_at_a_path(midx_d / "multi-pack-index-chain"):
+            try:
+                text = _read_nofollow(root, chain_rel)
+            except _NotPresent as exc:
+                raise _StoreRefusal(f"vault object store is not self-contained: {midx_d} chain is missing") from exc
+            try:
+                lines = text.decode("utf-8").splitlines()
+            except UnicodeDecodeError as exc:
+                raise _StoreRefusal(f"vault object store is not self-contained: {midx_d} chain is not utf-8") from exc
+            for line in lines:
+                if not _HEX_NAME.fullmatch(line):
+                    raise _StoreRefusal(f"vault object store is not self-contained: {midx_d} names {line!r}")
+                layer = f"multi-pack-index-{line}.midx"
+                if not _regular_basename(midx_d, layer):
+                    raise _StoreRefusal(f"vault object store is not self-contained: {midx_d} names {layer!r}")
+                _check_midx_file(pack_dir, f"pack/multi-pack-index.d/{layer}", root)
+    graphs = objects / "info" / "commit-graphs"
+    chain = graphs / "commit-graph-chain"
+    if _points_at_a_path(chain):
+        try:
+            text = _read_nofollow(root, "info/commit-graphs/commit-graph-chain")
+        except _NotPresent as exc:
+            raise _StoreRefusal(f"vault object store is not self-contained: {chain} is missing") from exc
+        try:
+            lines = text.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise _StoreRefusal(f"vault object store is not self-contained: {chain} is not utf-8") from exc
+        for line in lines:
+            if not _HEX_NAME.fullmatch(line):
+                raise _StoreRefusal(f"vault object store is not self-contained: {chain} names {line!r}")
+            graph = f"graph-{line}.graph"
+            if not _regular_basename(graphs, graph):
+                raise _StoreRefusal(f"vault object store is not self-contained: {chain} names {graph!r}")
+    packs_file = objects / "info" / "packs"
+    if _points_at_a_path(packs_file):
+        try:
+            text = _read_nofollow(root, "info/packs")
+        except _NotPresent as exc:
+            raise _StoreRefusal(f"vault object store is not self-contained: {packs_file} is missing") from exc
+        try:
+            lines = text.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise _StoreRefusal(f"vault object store is not self-contained: {packs_file} is not utf-8") from exc
+        for line in lines:
+            if line == "":
+                continue
+            if not line.startswith("P "):
+                raise _StoreRefusal(f"vault object store is not self-contained: {packs_file} names {line!r}")
+            name = line[2:]
+            if not _plain_basename(name, ".pack"):
+                raise _StoreRefusal(f"vault object store is not self-contained: {packs_file} names {name!r}")
+            idx_name = name[: -len(".pack")] + ".idx"
+            if not _regular_basename(pack_dir, name) or not _regular_basename(pack_dir, idx_name):
+                raise _StoreRefusal(f"vault object store is not self-contained: {packs_file} names {name!r}")
+    return None
+
+
+def _inflate(buf: bytes, offset: int) -> bytes:
+    decompressor = zlib.decompressobj()
+    try:
+        data = decompressor.decompress(buf[offset:])
+        data += decompressor.flush()
+    except zlib.error as exc:
+        raise _ObjectMissing(f"pack zlib stream is unreadable ({exc})") from exc
+    if not decompressor.eof:
+        raise _ObjectMissing("pack zlib stream is truncated")
+    return data
+
+
+def _delta_size(buf: bytes, pos: int) -> tuple[int, int]:
+    size = 0
+    shift = 0
+    while True:
+        if pos >= len(buf):
+            raise _ObjectMissing("delta header is truncated")
+        byte = buf[pos]
+        pos += 1
+        size |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return size, pos
+        shift += 7
+
+
+def _apply_delta(base: bytes, delta: bytes) -> bytes:
+    base_size, pos = _delta_size(delta, 0)
+    result_size, pos = _delta_size(delta, pos)
+    if base_size != len(base):
+        raise _ObjectMissing("delta base size does not match")
+    out = bytearray()
+    while pos < len(delta):
+        cmd = delta[pos]
+        pos += 1
+        if cmd & 0x80:
+            offset = 0
+            size = 0
+            for bit in range(4):
+                if cmd & (1 << bit):
+                    if pos >= len(delta):
+                        raise _ObjectMissing("delta copy is truncated")
+                    offset |= delta[pos] << (8 * bit)
+                    pos += 1
+            for bit in range(3):
+                if cmd & (1 << (4 + bit)):
+                    if pos >= len(delta):
+                        raise _ObjectMissing("delta copy is truncated")
+                    size |= delta[pos] << (8 * bit)
+                    pos += 1
+            if size == 0:
+                size = 0x10000
+            if offset + size > len(base):
+                raise _ObjectMissing("delta copy extends past the base")
+            out += base[offset : offset + size]
+        elif cmd:
+            if pos + cmd > len(delta):
+                raise _ObjectMissing("delta insert is truncated")
+            out += delta[pos : pos + cmd]
+            pos += cmd
+        else:
+            raise _ObjectMissing("delta opcode 0")
+    if len(out) != result_size:
+        raise _ObjectMissing("delta result size does not match")
+    return bytes(out)
+
+
+def _pack_object_at(pack: bytes, offset: int) -> tuple[int, bytes, int | bytes]:
+    """Return type, inflated payload, and ofs-delta base offset or ref-delta oid."""
+    if pack[:4] != b"PACK":
+        raise _ObjectMissing("pack signature is not PACK")
+    if offset < 12 or offset >= len(pack) - 20:
+        raise _ObjectMissing("pack offset is outside the pack")
+    pos = offset
+    byte = pack[pos]
+    pos += 1
+    obj_type = (byte >> 4) & 7
+    size = byte & 15
+    shift = 4
+    while byte & 0x80:
+        if pos >= len(pack):
+            raise _ObjectMissing("pack object header is truncated")
+        byte = pack[pos]
+        pos += 1
+        size |= (byte & 0x7F) << shift
+        shift += 7
+    extra: int | bytes = 0
+    if obj_type == 6:
+        if pos >= len(pack):
+            raise _ObjectMissing("ofs-delta header is truncated")
+        byte = pack[pos]
+        pos += 1
+        relative = byte & 0x7F
+        while byte & 0x80:
+            if pos >= len(pack):
+                raise _ObjectMissing("ofs-delta header is truncated")
+            byte = pack[pos]
+            pos += 1
+            relative = ((relative + 1) << 7) | (byte & 0x7F)
+        extra = offset - relative
+    elif obj_type == 7:
+        if pos + 20 > len(pack):
+            raise _ObjectMissing("ref-delta oid is truncated")
+        extra = pack[pos : pos + 20]
+        pos += 20
+    elif obj_type not in _OBJ_TYPE:
+        raise _ObjectMissing(f"unsupported pack object type {obj_type}")
+    payload = _inflate(pack, pos)
+    if len(payload) != size:
+        raise _ObjectMissing("pack object size does not match its header")
+    return obj_type, payload, extra
+
+
+class _PackIndex:
+    def __init__(self, idx: bytes, pack: bytes) -> None:
+        self.pack = pack
+        self._names, self._offsets = _parse_idx(idx)
+        if hashlib.sha1(pack[:-20]).digest() != pack[-20:]:
+            raise _ObjectMissing("pack checksum does not match")
+
+    def offset(self, oid: bytes) -> int | None:
+        lo = 0
+        hi = len(self._names)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            name = self._names[mid]
+            if name < oid:
+                lo = mid + 1
+            elif name > oid:
+                hi = mid
+            else:
+                return self._offsets[mid]
+        return None
+
+
+def _parse_idx(data: bytes) -> tuple[list[bytes], list[int]]:
+    if data[:4] == b"\xfftOc":
+        version = struct.unpack(">I", data[4:8])[0]
+        if version != 2:
+            raise _ObjectMissing(f"unsupported pack index version {version}")
+        fanout_at = 8
+        names, offsets, count = _idx_v2_tables(data, fanout_at)
+        return names, offsets
+    fanout_at = 0
+    if len(data) < 256 * 4 + 40:
+        raise _ObjectMissing("pack index is truncated")
+    count = struct.unpack(">I", data[fanout_at + 255 * 4 : fanout_at + 256 * 4])[0]
+    entries_at = fanout_at + 256 * 4
+    need = entries_at + count * 24 + 40
+    if len(data) != need:
+        raise _ObjectMissing("pack index size does not match its fanout")
+    names = []
+    offsets = []
+    for index in range(count):
+        at = entries_at + index * 24
+        offsets.append(struct.unpack(">I", data[at : at + 4])[0])
+        names.append(data[at + 4 : at + 24])
+    if names != sorted(names):
+        raise _ObjectMissing("pack index is not sorted")
+    return names, offsets
+
+
+def _idx_v2_tables(data: bytes, fanout_at: int) -> tuple[list[bytes], list[int], int]:
+    if len(data) < fanout_at + 256 * 4:
+        raise _ObjectMissing("pack index is truncated")
+    count = struct.unpack(">I", data[fanout_at + 255 * 4 : fanout_at + 256 * 4])[0]
+    names_at = fanout_at + 256 * 4
+    crc_at = names_at + count * 20
+    off_at = crc_at + count * 4
+    large_at = off_at + count * 4
+    if len(data) < large_at + 40:
+        raise _ObjectMissing("pack index is truncated")
+    large_count = (len(data) - 40 - large_at) // 8
+    if large_at + large_count * 8 + 40 != len(data):
+        raise _ObjectMissing("pack index size does not match its tables")
+    names = [data[names_at + index * 20 : names_at + (index + 1) * 20] for index in range(count)]
+    if names != sorted(names):
+        raise _ObjectMissing("pack index is not sorted")
+    offsets = []
+    for index in range(count):
+        at = off_at + index * 4
+        value = struct.unpack(">I", data[at : at + 4])[0]
+        if value & 0x80000000:
+            slot = value & 0x7FFFFFFF
+            if slot >= large_count:
+                raise _ObjectMissing("pack index large offset is out of range")
+            at = large_at + slot * 8
+            value = struct.unpack(">Q", data[at : at + 8])[0]
+        offsets.append(value)
+    return names, offsets, count
+
+
+class _ObjectStore:
+    """Objects read from loose files and pack files inside one objects directory."""
+
+    def __init__(self, objects: Path) -> None:
+        self.objects = objects
+        self.packs = _load_packs(objects / "pack", objects)
+        self.cache: dict[bytes, tuple[bytes, bytes]] = {}
+
+    def get(self, oid: bytes, depth: int = 0) -> tuple[bytes, bytes]:
+        if depth > 64:
+            raise _ObjectMissing("delta chain is too deep")
+        cached = self.cache.get(oid)
+        if cached is not None:
+            return cached
+        found = self._loose(oid)
+        if found is None:
+            for pack in self.packs:
+                offset = pack.offset(oid)
+                if offset is not None:
+                    found = self._at(pack, offset, depth)
+                    break
+        if found is None:
+            raise _ObjectMissing(oid.hex())
+        typ, content = found
+        header = typ + b" " + str(len(content)).encode("ascii") + b"\0"
+        if hashlib.sha1(header + content).digest() != oid:
+            raise _ObjectMissing(f"object {oid.hex()} does not match its bytes")
+        self.cache[oid] = (typ, content)
+        return typ, content
+
+    def _loose(self, oid: bytes) -> tuple[bytes, bytes] | None:
+        hex_oid = oid.hex()
+        try:
+            raw = _read_nofollow(self.objects, f"{hex_oid[:2]}/{hex_oid[2:]}")
+        except _NotPresent:
+            return None
+        try:
+            data = zlib.decompress(raw)
+        except zlib.error as exc:
+            raise _ObjectMissing(f"loose object {hex_oid} is unreadable ({exc})") from exc
+        if hashlib.sha1(data).digest() != oid:
+            raise _ObjectMissing(f"loose object {hex_oid} does not match its name")
+        nul = data.find(b"\0")
+        if nul < 0 or b" " not in data[:nul]:
+            raise _ObjectMissing(f"loose object {hex_oid} has no header")
+        typ, size_text = data[:nul].split(b" ", 1)
+        try:
+            size = int(size_text.decode("ascii"))
+        except ValueError as exc:
+            raise _ObjectMissing(f"loose object {hex_oid} has a bad size") from exc
+        content = data[nul + 1 :]
+        if size != len(content) or typ not in {b"commit", b"tree", b"blob", b"tag"}:
+            raise _ObjectMissing(f"loose object {hex_oid} header does not match")
+        return typ, content
+
+    def _at(self, pack: _PackIndex, offset: int, depth: int) -> tuple[bytes, bytes]:
+        if depth > 64:
+            raise _ObjectMissing("delta chain is too deep")
+        obj_type, payload, extra = _pack_object_at(pack.pack, offset)
+        if obj_type in _OBJ_TYPE:
+            return _OBJ_TYPE[obj_type], payload
+        if obj_type == 6:
+            base_type, base = self._at(pack, extra, depth + 1)  # type: ignore[arg-type]
+            return base_type, _apply_delta(base, payload)
+        base_type, base = self.get(extra, depth + 1)  # type: ignore[arg-type]
+        return base_type, _apply_delta(base, payload)
+
+
+def _load_packs(pack_dir: Path, objects: Path) -> list[_PackIndex]:
+    if not pack_dir.is_dir():
+        return []
+    packs = []
+    try:
+        entries = sorted(pack_dir.iterdir())
+    except OSError as exc:
+        raise _StoreRefusal(f"vault object store is not self-contained: {pack_dir} ({exc})") from exc
+    for entry in entries:
+        name = entry.name
+        if not name.endswith(".idx"):
+            continue
+        try:
+            mode = os.lstat(entry).st_mode
+        except OSError as exc:
+            raise _StoreRefusal(f"vault object store is not self-contained: {entry} ({exc})") from exc
+        if not stat.S_ISREG(mode):
+            raise _StoreRefusal(f"vault object store is not self-contained: {entry} is not a regular file")
+        pack_name = name[: -len(".idx")] + ".pack"
+        if not _regular_basename(pack_dir, pack_name):
+            raise _StoreRefusal(f"vault object store is not self-contained: {pack_dir / pack_name} is not a regular file")
+        try:
+            idx = _read_nofollow(objects, f"pack/{name}")
+            pack = _read_nofollow(objects, f"pack/{pack_name}")
+        except _NotPresent as exc:
+            raise _StoreRefusal(f"vault object store is not self-contained: {entry} disappeared") from exc
+        try:
+            packs.append(_PackIndex(idx, pack))
+        except _ObjectMissing as exc:
+            raise _StoreRefusal(f"vault object store is not self-contained: {entry} ({exc})") from exc
+    return packs
+
+
+def _tree_entries(data: bytes) -> dict[bytes, tuple[bytes, bytes]]:
+    entries: dict[bytes, tuple[bytes, bytes]] = {}
+    pos = 0
+    while pos < len(data):
+        space = data.find(b" ", pos)
+        nul = data.find(b"\0", space + 1 if space >= 0 else pos)
+        if space < 0 or nul < 0 or nul + 20 > len(data):
+            raise _ObjectMissing("tree object is truncated")
+        mode = data[pos:space]
+        name = data[space + 1 : nul]
+        oid = data[nul + 1 : nul + 21]
+        pos = nul + 21
+        entries[name] = (mode, oid)
+    return entries
+
+
+def _blob_at(objects: Path, commit_hex: str, path: str) -> bytes:
+    """Bytes of path in the commit, read only from objects. Git is not asked."""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit_hex):
+        raise _ObjectMissing("commit is not a 40-hex object name")
+    parts = path.split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise _ObjectMissing("path is not inside the commit")
+    encoded = [part.encode("utf-8") for part in parts]
+    store = _ObjectStore(objects)
+    typ, content = store.get(bytes.fromhex(commit_hex))
+    if typ != b"commit" or not content.startswith(b"tree ") or content[45:46] != b"\n":
+        raise _ObjectMissing("commit object has no tree line")
+    tree_hex = content[5:45]
+    if not re.fullmatch(rb"[0-9a-f]{40}", tree_hex):
+        raise _ObjectMissing("commit tree is not a 40-hex object name")
+    oid = bytes.fromhex(tree_hex.decode("ascii"))
+    for index, name in enumerate(encoded):
+        typ, content = store.get(oid)
+        if typ != b"tree":
+            raise _ObjectMissing("path walks through a non-tree")
+        mode, oid = _tree_entries(content).get(name, (b"", b""))
+        if not oid:
+            raise _ObjectMissing("path is not in the commit")
+        last = index == len(encoded) - 1
+        if last:
+            if mode not in _BLOB_MODES:
+                raise _ObjectMissing("path is not a blob")
+            typ, content = store.get(oid)
+            if typ != b"blob":
+                raise _ObjectMissing("path is not a blob")
+            return content
+        if mode not in _TREE_MODES:
+            raise _ObjectMissing("path walks through a non-tree")
+    raise _ObjectMissing("path is not in the commit")
 
 
 def _run_git(vault: Path, args: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -252,6 +884,11 @@ def _contained_git_dir(vault: Path) -> Path:
     redirected = _store_redirect_problem(vault)
     if redirected:
         raise _StoreRefusal(redirected)
+    # Git commands above run after the first walk. An alternates file or a
+    # rewritten multi-pack-index written in that window is refused here.
+    layout = _layout_problem(vault, git_dir)
+    if layout:
+        raise _StoreRefusal(layout)
     return git_dir
 
 
@@ -364,7 +1001,18 @@ def vault_errors(pin: dict, vault: Path) -> list[str]:
     spec = f"{pin['commit']}:{pin['path']}"
     try:
         git_dir = _contained_git_dir(vault)
-        blob = _run_git(vault, ["--git-dir", str(git_dir), "show", spec]).stdout
+        objects = git_dir / "objects"
+        before = _objects_snapshot(objects)
+        blob = _blob_at(objects, str(pin["commit"]), str(pin["path"]))
+        changed = _layout_problem(vault, git_dir)
+        if changed:
+            raise _StoreRefusal(changed)
+        if _objects_snapshot(objects) != before:
+            raise _StoreRefusal(
+                f"vault object store is not self-contained: {objects} changed during the read"
+            )
+    except _ObjectMissing as missing:
+        return [_printable(f"cannot read {spec} from {vault}: {missing}")]
     except _StoreRefusal as refusal:
         return [_printable(refusal.message)]
     except subprocess.TimeoutExpired:

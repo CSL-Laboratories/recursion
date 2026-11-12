@@ -422,20 +422,11 @@ class VaultTests(unittest.TestCase):
         problems[0].encode("utf-8")
 
     def test_mismatch_message_escapes_lone_surrogate(self) -> None:
-        # Windows can return the blob for a surrogate path. The mismatch line must still encode.
+        # The path cannot be encoded as a tree name. The cannot-read line must still encode.
         pin = {**self.pin("0" * 64), "path": "contracts/PRO\ud800DUCT.md"}
-        completed = subprocess.CompletedProcess(args=["git"], returncode=0, stdout=b"not-the-pin", stderr=b"")
-        real_run = pin_check.subprocess.run
-
-        def fake_run(args, **kwargs):
-            if "rev-parse" in args:
-                return real_run(args, **kwargs)
-            return completed
-
-        with mock.patch.object(pin_check.subprocess, "run", side_effect=fake_run):
-            problems = pin_check.vault_errors(pin, self.vault)
+        problems = pin_check.vault_errors(pin, self.vault)
         self.assertEqual(len(problems), 1)
-        self.assertTrue(problems[0].startswith("sha256 mismatch"), problems[0])
+        self.assertTrue(problems[0].startswith("cannot read"), problems[0])
         self.assertNotIn("\ud800", problems[0])
         problems[0].encode("utf-8")
 
@@ -745,6 +736,211 @@ class VaultTests(unittest.TestCase):
             ceiling = env.get("GIT_CEILING_DIRECTORIES", "")
             self.assertIn(parent, ceiling.split(os.pathsep))
             self.assertNotIn("/", ceiling.split(os.pathsep))
+
+    def _craft_midx(self, names: list[str]) -> bytes:
+        """A version-1 multi-pack-index whose PNAM chunk lists names, NUL-padded to 4 bytes."""
+        raw = b"".join(name.encode("utf-8") + b"\0" for name in names)
+        raw += b"\0" * ((4 - (len(raw) % 4)) % 4)
+        num_chunks = 1
+        header = b"MIDX" + bytes([1, 1, num_chunks, 0]) + len(names).to_bytes(4, "big")
+        pnam_off = 12 + (num_chunks + 1) * 12
+        end = pnam_off + len(raw)
+        toc = b"PNAM" + pnam_off.to_bytes(8, "big") + (0).to_bytes(4, "big") + end.to_bytes(8, "big")
+        body = header + toc + raw
+        return body + hashlib.sha1(body).digest()
+
+    def _rewrite_midx_pnam(self, midx: Path, names: list[str]) -> None:
+        """Replace the PNAM chunk of a git-written multi-pack-index, shifting later chunks."""
+        data = midx.read_bytes()
+        if data[:4] != b"MIDX":
+            raise AssertionError(f"not a multi-pack-index: {midx}")
+        num_chunks = data[6]
+        chunks = []
+        for index in range(num_chunks + 1):
+            off = 12 + index * 12
+            chunks.append((data[off : off + 4], int.from_bytes(data[off + 4 : off + 12], "big")))
+        raw = b"".join(name.encode("utf-8") + b"\0" for name in names)
+        raw += b"\0" * ((4 - (len(raw) % 4)) % 4)
+        toc_size = (num_chunks + 1) * 12
+        body = bytearray()
+        offsets = []
+        for index in range(num_chunks):
+            cid, start = chunks[index]
+            end = chunks[index + 1][1]
+            offsets.append(12 + toc_size + len(body))
+            body += raw if cid == b"PNAM" else data[start:end]
+        end_off = 12 + toc_size + len(body)
+        toc = bytearray()
+        for index in range(num_chunks):
+            toc += chunks[index][0] + offsets[index].to_bytes(8, "big")
+        toc += b"\0\0\0\0" + end_off.to_bytes(8, "big")
+        rebuilt = bytes(data[:12]) + bytes(toc) + bytes(body)
+        midx.write_bytes(rebuilt + hashlib.sha1(rebuilt).digest())
+
+    def test_midx_relative_pnam_cannot_supply_the_blob(self) -> None:
+        """A multi-pack-index may name a pack with '..'. The pack file is not in objects/pack."""
+        repo = Path(self.tmp.name) / "midx-escape"
+        commit = self._commit_repo(repo)
+        subprocess.run(["git", "-C", str(repo), "repack", "-ad"], check=True)
+        subprocess.run(["git", "-C", str(repo), "multi-pack-index", "write"], check=True)
+        packdir = repo / ".git" / "objects" / "pack"
+        outside = Path(self.tmp.name) / "midx-escape-out"
+        outside.mkdir()
+        idx_name = None
+        for entry in list(packdir.iterdir()):
+            if entry.name.startswith("pack-"):
+                if entry.suffix == ".idx":
+                    idx_name = entry.name
+                shutil.move(str(entry), str(outside / entry.name))
+        self.assertIsNotNone(idx_name)
+        self.assertEqual([path.name for path in packdir.iterdir()], ["multi-pack-index"])
+        relative = os.path.relpath(outside / idx_name, packdir)
+        self.assertIn("..", relative)
+        self._rewrite_midx_pnam(packdir / "multi-pack-index", [relative])
+        self._assert_git_reads_body(repo, commit)
+        problems = self._assert_refused(repo, self._pin_for(commit))
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn("multi-pack-index", problems[0])
+
+    def test_incremental_midx_relative_pnam_is_refused(self) -> None:
+        """An incremental chain under multi-pack-index.d is the same PNAM rule."""
+        repo = Path(self.tmp.name) / "inc-midx-bad"
+        commit = self._commit_repo(repo)
+        packdir = repo / ".git" / "objects" / "pack"
+        packdir.mkdir(parents=True, exist_ok=True)
+        layer = self._craft_midx(["../../../../out/pack-" + "ab" * 20 + ".idx"])
+        layer_hash = hashlib.sha1(layer[:-20]).hexdigest()
+        midx_d = packdir / "multi-pack-index.d"
+        midx_d.mkdir()
+        (midx_d / f"multi-pack-index-{layer_hash}.midx").write_bytes(layer)
+        (midx_d / "multi-pack-index-chain").write_text(layer_hash + "\n", encoding="utf-8")
+        self._assert_git_reads_body(repo, commit)
+        problems = self._assert_refused(repo, self._pin_for(commit))
+        self.assertIn("multi-pack-index", problems[0])
+
+    def test_unknown_midx_is_refused(self) -> None:
+        """A multi-pack-index we cannot parse is refused even when loose objects hold the blob."""
+        repo = Path(self.tmp.name) / "midx-unknown"
+        commit = self._commit_repo(repo)
+        packdir = repo / ".git" / "objects" / "pack"
+        packdir.mkdir(parents=True, exist_ok=True)
+        (packdir / "multi-pack-index").write_bytes(b"MIDX" + bytes([99, 1, 0, 0]) + b"\0" * 8)
+        problems = self._assert_refused(repo, self._pin_for(commit))
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn("multi-pack-index", problems[0])
+
+    def test_incremental_midx_with_local_packs_passes(self) -> None:
+        repo = Path(self.tmp.name) / "inc-midx-ok"
+        commit = self._commit_repo(repo)
+        subprocess.run(["git", "-C", str(repo), "repack", "-ad"], check=True)
+        subprocess.run(["git", "-C", str(repo), "multi-pack-index", "write"], check=True)
+        packdir = repo / ".git" / "objects" / "pack"
+        midx = packdir / "multi-pack-index"
+        data = midx.read_bytes()
+        layer_hash = hashlib.sha1(data[:-20]).hexdigest()
+        midx_d = packdir / "multi-pack-index.d"
+        midx_d.mkdir()
+        (midx_d / f"multi-pack-index-{layer_hash}.midx").write_bytes(data)
+        (midx_d / "multi-pack-index-chain").write_text(layer_hash + "\n", encoding="utf-8")
+        midx.unlink()
+        self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+
+    def test_repack_midx_gc_and_split_commit_graph_still_pass(self) -> None:
+        cases = (
+            ("repack", [["repack", "-ad"]]),
+            ("midx", [["repack", "-ad"], ["multi-pack-index", "write"]]),
+            ("gc", [["gc", "--quiet"]]),
+            ("split-graph", [["commit-graph", "write", "--split", "--reachable"]]),
+        )
+        for name, commands in cases:
+            with self.subTest(name=name):
+                repo = Path(self.tmp.name) / f"keep-{name}"
+                commit = self._commit_repo(repo)
+                for args in commands:
+                    subprocess.run(["git", "-C", str(repo), *args], check=True)
+                self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+
+    def test_info_packs_outside_name_is_refused(self) -> None:
+        repo = Path(self.tmp.name) / "info-packs-out"
+        commit = self._commit_repo(repo)
+        info = repo / ".git" / "objects" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "packs").write_text("P ../../../../out/pack-" + "ab" * 20 + ".pack\n\n", encoding="utf-8")
+        self._assert_git_reads_body(repo, commit)
+        problems = self._assert_refused(repo, self._pin_for(commit))
+        self.assertIn("packs", problems[0])
+
+    def test_commit_graph_chain_outside_name_is_refused(self) -> None:
+        repo = Path(self.tmp.name) / "cg-chain-out"
+        commit = self._commit_repo(repo)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit-graph", "write", "--split", "--reachable"],
+            check=True,
+        )
+        chain = repo / ".git" / "objects" / "info" / "commit-graphs" / "commit-graph-chain"
+        os.chmod(chain, 0o644)
+        line = chain.read_text(encoding="utf-8").strip()
+        self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+        chain.write_text(line + "/../../../../out/evil\n", encoding="utf-8")
+        self._assert_git_reads_body(repo, commit)
+        problems = self._assert_refused(repo, self._pin_for(commit))
+        self.assertIn("commit-graph", problems[0])
+
+    def test_alternates_written_after_walk_cannot_supply_the_blob(self) -> None:
+        """The alternates file appears on the first git call, after the object walk."""
+        digest = hashlib.sha256(self.body).hexdigest()
+        real_run = pin_check.subprocess.run
+        for name in ("alternates", "http-alternates"):
+            with self.subTest(name=name):
+                repo = Path(self.tmp.name) / f"toctou-late-{name}"
+                commit = self._commit_repo(repo)
+                pin = self._pin_for(commit)
+                state = {"armed": True}
+
+                def spy(args, **kwargs):
+                    if state["armed"]:
+                        state["armed"] = False
+                        info = repo / ".git" / "objects" / "info"
+                        info.mkdir(parents=True, exist_ok=True)
+                        (info / name).write_text(str(self.vault / ".git" / "objects") + "\n", encoding="utf-8")
+                    return real_run(args, **kwargs)
+
+                with mock.patch.object(pin_check.subprocess, "run", side_effect=spy):
+                    problems = pin_check.vault_errors(pin, repo)
+                self.assertFalse(state["armed"], "hook did not run between the walk and the git call")
+                self.assertTrue(problems, f"false PASS for {name}: {problems!r}")
+                self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+                self.assertIn(name, problems[0])
+                self.assertFalse(any(line.startswith("PASS:") for line in "\n".join(problems).splitlines()))
+                problems[0].encode("utf-8")
+                state["armed"] = True
+
+    def test_alternates_written_before_show_cannot_import_donor_bytes(self) -> None:
+        """An empty vault must not pass when alternates is planted on the git show call."""
+        empty = self.empty_repo("toctou-donor")
+        digest = hashlib.sha256(self.body).hexdigest()
+        real_run = pin_check.subprocess.run
+        donor = self.vault / ".git" / "objects"
+        state = {"planted": False}
+
+        def spy(args, **kwargs):
+            if isinstance(args, (list, tuple)) and "show" in args and not state["planted"]:
+                state["planted"] = True
+                alt = empty / ".git" / "objects" / "info" / "alternates"
+                alt.parent.mkdir(parents=True, exist_ok=True)
+                alt.write_text(str(donor) + "\n", encoding="utf-8")
+            return real_run(args, **kwargs)
+
+        with mock.patch.object(pin_check.subprocess, "run", side_effect=spy):
+            problems = pin_check.vault_errors(self.pin(digest), empty)
+        self.assertTrue(problems, f"false PASS: vault_errors returned {problems!r}")
+        self.assertFalse(any(line.startswith("PASS:") for line in "\n".join(problems).splitlines()))
+        problems[0].encode("utf-8")
+        alt = empty / ".git" / "objects" / "info" / "alternates"
+        if not alt.exists():
+            alt.parent.mkdir(parents=True, exist_ok=True)
+            alt.write_text(str(donor) + "\n", encoding="utf-8")
+        self._assert_git_reads_body(empty, self.commit)
 
     def test_main_failure_cannot_print_a_pass_line(self) -> None:
         pin_file = self.write_pin("")

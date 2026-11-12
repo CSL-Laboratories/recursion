@@ -1,12 +1,16 @@
 """Real loopback HTTP requests through the daemon's GUI composition root."""
 from http.client import HTTPConnection
 import importlib
+import os
 from pathlib import Path
+import signal
+import tempfile
 from unittest import TestCase, mock
 import socket
 from types import SimpleNamespace
 from wsgiref.simple_server import WSGIServer
 
+from recursion_core.daemon import AlreadyRunning, UserLock
 from recursion_core.daemon import __main__ as entry
 from recursion_core.daemon.gui import LoopbackGUI
 from recursion_core.gui.client import ControlClient
@@ -242,3 +246,53 @@ class LoopbackTests(TestCase):
         self.assertEqual(daemon.return_value.sweep.call_count, 1)
         threads.Event.return_value.wait.assert_not_called()
         daemon.return_value.close.assert_called_once()
+
+
+class SignalHandlerTests(TestCase):
+    def setUp(self):
+        self.previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for sig, handler in self.previous.items():
+            signal.signal(sig, handler)
+
+    def assert_handlers_restored(self):
+        for sig, handler in self.previous.items():
+            self.assertIs(signal.getsignal(sig), handler)
+
+    def test_startup_failure_restores_signal_handlers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Path(temp) / "runtime"
+            with UserLock(runtime):
+                with mock.patch.object(entry, "require_free_threaded"), \
+                     mock.patch.object(entry, "check_operator_linger"), \
+                     mock.patch.object(entry, "refuse_engine_user"), \
+                     mock.patch.dict(entry.os.environ, {
+                         "XDG_RUNTIME_DIR": str(runtime),
+                         "XDG_STATE_HOME": str(Path(temp) / "state"),
+                         "RECURSION_ENGINE_USER": ""}):
+                    with self.assertRaises(AlreadyRunning):
+                        entry.main()
+        self.assert_handlers_restored()
+
+    def test_clean_stop_restores_signal_handlers(self):
+        class Stopper:
+            def sweep(self):
+                os.kill(os.getpid(), signal.SIGTERM)
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(entry, "require_free_threaded"), \
+                 mock.patch.object(entry, "check_operator_linger"), \
+                 mock.patch.object(entry, "refuse_engine_user"), \
+                 mock.patch.object(entry, "SystemdUserManager"), \
+                 mock.patch.object(entry, "Daemon", lambda *a, **k: Stopper()), \
+                 mock.patch.dict(entry.os.environ, {
+                     "XDG_RUNTIME_DIR": str(Path(temp) / "runtime"),
+                     "XDG_STATE_HOME": str(Path(temp) / "state"),
+                     "RECURSION_ENGINE_USER": ""}):
+                entry.main(port=0)
+        self.assert_handlers_restored()

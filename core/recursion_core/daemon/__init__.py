@@ -82,29 +82,48 @@ class RegistryDurabilityError(OSError):
 
 
 class UserLock:
-    """A kernel lease, not a stale PID/token-file check. Never unlink the inode."""
+    """A kernel lease, not a stale PID/token-file check. Never unlink the inode.
+
+    The exclusive lease is the runtime directory, not only the lock file. flock
+    follows an open file description: after the lock file is removed, a new
+    file at the same path is a different inode and the two flocks do not
+    conflict. Holding the directory keeps a second daemon out until this
+    process releases the lease or dies.
+    """
     def __init__(self, runtime: Path):
         self.path = runtime / 'recursion-daemon.lock'
         self.fd = None
+        self.dirfd = None
 
     def __enter__(self):
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        dirfd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
-            if os.fstat(fd).st_uid != os.getuid():
-                raise PermissionError('Runtime lock must be owned by operator')
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(dirfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                if os.fstat(fd).st_uid != os.getuid():
+                    raise PermissionError('Runtime lock must be owned by operator')
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
         except BaseException as exc:
-            os.close(fd)
+            os.close(dirfd)
             if isinstance(exc, BlockingIOError):
                 raise AlreadyRunning('One daemon per user per machine') from exc
             raise
         self.fd = fd
+        self.dirfd = dirfd
         return self
 
     def __exit__(self, *args):
-        os.close(self.fd)
-        self.fd = None
+        try:
+            os.close(self.fd)
+        finally:
+            self.fd = None
+            os.close(self.dirfd)
+            self.dirfd = None
 
 
 @dataclass(frozen=True)
@@ -338,10 +357,19 @@ class Registry:
         self._discard(tmp)
         _create_private_file(tmp)
         dest = sqlite3.connect(tmp, check_same_thread=False, isolation_level=None)
-        dest.execute('PRAGMA synchronous=FULL')
-        # No rollback journal and no WAL sidecar. The temp file is discarded
-        # unless the publish below renames it, so a crash cannot tear the live file.
-        dest.execute('PRAGMA journal_mode=OFF')
+        try:
+            dest.execute('PRAGMA synchronous=FULL')
+            # No rollback journal and no WAL sidecar. The temp file is discarded
+            # unless the publish below renames it, so a crash cannot tear the live file.
+            dest.execute('PRAGMA journal_mode=OFF')
+        except BaseException:
+            # connect has already returned. Close before the traceback can keep
+            # this connection, and its fd, alive.
+            try:
+                dest.close()
+            except Exception:
+                pass
+            raise
         return tmp, dest
 
     def _require_intact(self, conn):
@@ -504,13 +532,22 @@ class Registry:
             self.db = None
         if drop_sidecars:
             self._drop_live_sidecars()
+        conn = None
         try:
             conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
             conn.execute('PRAGMA synchronous=FULL')
             conn.execute('PRAGMA query_only=ON')
-        except sqlite3.Error as exc:
+        except BaseException as exc:
+            # A failed reopen must not leave the new connection open for as
+            # long as the caller's traceback keeps this frame reachable.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self.db = None
-            self._open_error = exc
+            if isinstance(exc, sqlite3.Error):
+                self._open_error = exc
             raise
         self.db = conn
         self._open_error = None

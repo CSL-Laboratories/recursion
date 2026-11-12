@@ -638,6 +638,86 @@ class DaemonTests(unittest.TestCase):
             with UserLock(self.path):
                 pass
 
+    def test_removed_lock_file_does_not_admit_a_second_daemon(self):
+        # The lease is the inode, not the directory entry. Removing the lock
+        # file and creating a new one must not let a second daemon run.
+        runtime = self.path / 'lock-runtime'
+        before = set(os.listdir('/proc/self/fd'))
+        first = UserLock(runtime)
+        first.__enter__()
+        try:
+            os.unlink(first.path)
+            with self.assertRaises(AlreadyRunning):
+                with UserLock(runtime):
+                    pass
+        finally:
+            first.__exit__(None, None, None)
+        with UserLock(runtime):
+            pass
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+
+    def test_failed_registry_open_closes_the_connection(self):
+        # A file under 100 bytes is refused before sqlite opens it. This one
+        # passes that size gate and the header check, then fails inside sqlite.
+        # The traceback is kept, and it must not keep a connection fd.
+        directory = self.path / 'corrupt'
+        directory.mkdir(mode=0o700)
+        bad = b'SQLite format 3\x00' + bytes(200)
+        self.assertGreaterEqual(len(bad), 100)
+        path = directory / 'runs.sqlite3'
+        path.write_bytes(bad)
+        path.chmod(0o600)
+        before = set(os.listdir('/proc/self/fd'))
+        caught = None
+        try:
+            Registry(directory)
+        except RegistryIntegrityError:
+            caught = sys.exc_info()
+        self.assertIsNotNone(caught)
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+        del caught
+
+        # _reopen can raise after sqlite3.connect and leave self.db None.
+        live = self.path / 'reopen'
+        registry = Registry(live)
+        self.addCleanup(registry.close)
+        registry.db.close()
+        registry.db = None
+        (live / 'runs.sqlite3').write_bytes(bad)
+        before = set(os.listdir('/proc/self/fd'))
+        caught = None
+        try:
+            registry._reopen()
+        except sqlite3.DatabaseError:
+            caught = sys.exc_info()
+        self.assertIsNone(registry.db)
+        self.assertIsNotNone(caught)
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+        del caught
+
+        # _open_temp can raise after sqlite3.connect, before it returns.
+        from recursion_core import daemon as daemon_module
+        real_create = daemon_module._create_private_file
+
+        def plant(created):
+            real_create(created)
+            fd = os.open(created, os.O_WRONLY | os.O_CLOEXEC)
+            try:
+                os.write(fd, bad)
+            finally:
+                os.close(fd)
+
+        before = set(os.listdir('/proc/self/fd'))
+        caught = None
+        try:
+            with patch('recursion_core.daemon._create_private_file', plant):
+                self.registry._open_temp()
+        except sqlite3.DatabaseError:
+            caught = sys.exc_info()
+        self.assertIsNotNone(caught)
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+        del caught
+
 
 class RuntimeTests(unittest.TestCase):
     def test_gil_build_refused(self):

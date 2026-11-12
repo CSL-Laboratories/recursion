@@ -411,9 +411,15 @@ class HermesHomeReuseTests(_Calls):
         real_rename = os.rename
         with mock.patch.object(policy.os, "rename", side_effect=real_rename) as rename:
             self.launch("hermes")
-        (staging, dest), _ = rename.call_args
-        self.assertEqual(str(self.home / ".hermes"), dest)
-        self.assertEqual(str(self.home), os.path.dirname(staging))
+        (staging, dest), kwargs = rename.call_args
+        # The staged directory is renamed onto .hermes. A dirfd rename stays inside the held route home.
+        if kwargs.get("dst_dir_fd") is None:
+            self.assertEqual(str(self.home / ".hermes"), dest)
+            self.assertEqual(str(self.home), os.path.dirname(staging))
+        else:
+            self.assertEqual(".hermes", os.path.basename(dest))
+            self.assertEqual(kwargs.get("src_dir_fd"), kwargs.get("dst_dir_fd"))
+            self.assertGreaterEqual(kwargs["dst_dir_fd"], 0)
         self.assertTrue(os.path.basename(staging).startswith(".hermes.recursion-"))
         self.assert_switch_written()
         self.assertEqual(1, self.launcher.call_count)
@@ -507,8 +513,16 @@ class HermesHomeReuseTests(_Calls):
         real_link = os.link
 
         def overwrite(src: str, dst: str, *args: object, **kwargs: object) -> None:
-            with open(src, "wb") as handle:
-                handle.write(evil)
+            src_dir_fd = kwargs.get("src_dir_fd")
+            if src_dir_fd is None:
+                with open(src, "wb") as handle:
+                    handle.write(evil)
+            else:
+                fd = os.open(src, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, dir_fd=src_dir_fd)
+                try:
+                    os.write(fd, evil)
+                finally:
+                    os.close(fd)
             real_link(src, dst, *args, **kwargs)
 
         with mock.patch.object(policy.os, "link", side_effect=overwrite):
@@ -521,8 +535,13 @@ class HermesHomeReuseTests(_Calls):
         target.write_bytes(evil)
 
         def relink(src: str, dst: str, *args: object, **kwargs: object) -> None:
-            os.unlink(src)
-            os.symlink(target, src)
+            src_dir_fd = kwargs.get("src_dir_fd")
+            if src_dir_fd is None:
+                os.unlink(src)
+                os.symlink(target, src)
+            else:
+                os.unlink(src, dir_fd=src_dir_fd)
+                os.symlink(os.path.realpath(target), src, dir_fd=src_dir_fd)
             real_link(src, dst, *args, **kwargs)
 
         with mock.patch.object(policy.os, "link", side_effect=relink):
@@ -535,10 +554,23 @@ class HermesHomeReuseTests(_Calls):
         self.assertEqual(len(ADOPT_YAML), len(evil))
         real_rename = os.rename
 
-        def overwrite(src: str, dst: str) -> None:
-            with open(os.path.join(src, "config.yaml"), "wb") as handle:
-                handle.write(evil)
-            real_rename(src, dst)
+        def overwrite(src: str, dst: str, *args: object, **kwargs: object) -> None:
+            src_dir_fd = kwargs.get("src_dir_fd")
+            if src_dir_fd is None:
+                with open(os.path.join(src, "config.yaml"), "wb") as handle:
+                    handle.write(evil)
+                real_rename(src, dst)
+                return
+            staging_fd = os.open(src, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src_dir_fd)
+            try:
+                fd = os.open("config.yaml", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, dir_fd=staging_fd)
+                try:
+                    os.write(fd, evil)
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(staging_fd)
+            real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=kwargs.get("dst_dir_fd"))
 
         with mock.patch.object(policy.os, "rename", side_effect=overwrite):
             self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
@@ -592,6 +624,124 @@ class HermesHomeReuseTests(_Calls):
             self.refused("route_home_not_private", self.launch, "hermes")
         self.assertFalse((self.home / ".hermes").exists())
         self.launcher.assert_not_called()
+
+    def _route_home_fsync(self, directory: str | int) -> bool:
+        if isinstance(directory, str):
+            return os.path.abspath(directory) == str(self.home)
+        if isinstance(directory, int):
+            try:
+                st, home = os.fstat(directory), os.lstat(self.home)
+            except OSError:
+                return False
+            return stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == (home.st_dev, home.st_ino)
+        return False
+
+    def test_true_rewrite_during_route_home_fsync_after_the_link_check_does_not_launch(self) -> None:
+        # The link check is not the last step: a same-length true switch written during the
+        # route-home fsync that follows it must not launch, and must not be left behind.
+        (self.home / ".hermes").mkdir(mode=0o700)
+        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+        evil = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(evil))
+        real_fsync_dir = policy._fsync_dir
+
+        def fsync_dir(directory: str | int) -> None:
+            real_fsync_dir(directory)
+            if self._route_home_fsync(directory) and self.config().is_file() and self.config().read_bytes() == ADOPT_YAML:
+                self.config().write_bytes(evil)
+
+        with mock.patch.object(policy, "_fsync_dir", side_effect=fsync_dir):
+            self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+        self.launcher.assert_not_called()
+        self.assertEqual(b"hermes-state", (self.home / ".hermes" / "state.db").read_bytes())
+        if self.config().exists():
+            self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+
+    def test_true_rewrite_after_stage_returns_does_not_launch(self) -> None:
+        evil = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(evil))
+        real_stage = policy._stage_hermes_dir
+
+        def stage(engine: str, route_home: str, parent: str) -> None:
+            real_stage(engine, route_home, parent)
+            with open(os.path.join(parent, "config.yaml"), "wb") as handle:
+                handle.write(evil)
+
+        with mock.patch.object(policy, "_stage_hermes_dir", side_effect=stage):
+            self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.launcher.assert_not_called()
+        if self.config().exists():
+            self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+
+    def test_replaced_switch_inode_is_not_launched(self) -> None:
+        # Same bytes in a new inode are not the file this launch wrote.
+        real_stage = policy._stage_hermes_dir
+
+        def stage(engine: str, route_home: str, parent: str) -> None:
+            real_stage(engine, route_home, parent)
+            cfg = os.path.join(parent, "config.yaml")
+            # Keep the written inode allocated so the kernel cannot hand that number out again.
+            os.link(cfg, os.path.join(route_home, "kept-inode"))
+            os.unlink(cfg)
+            fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, ADOPT_YAML)
+            finally:
+                os.close(fd)
+
+        with mock.patch.object(policy, "_stage_hermes_dir", side_effect=stage):
+            self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.launcher.assert_not_called()
+
+    def test_route_home_swapped_during_verify_is_not_stamped_or_launched(self) -> None:
+        # A 0700 directory swapped in during the pin check is not the home that was checked.
+        real_verify = policy.verify_package_pin
+        decoy = self.root / "decoy-0700"
+        decoy.mkdir(mode=0o700)
+        os.chmod(decoy, 0o700)
+
+        def swap_for_directory(*args: object, **kwargs: object):
+            os.rename(self.home, self.root / "route-home.real")
+            os.rename(decoy, self.home)
+            return real_verify(*args, **kwargs)
+
+        with mock.patch.object(policy, "verify_package_pin", side_effect=swap_for_directory):
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.launcher.assert_not_called()
+        self.assertFalse((self.home / ".hermes").exists())
+        self.assertFalse((self.root / "route-home.real" / ".hermes").exists())
+
+    def test_operator_home_swapped_in_during_verify_is_not_launched(self) -> None:
+        real_verify = policy.verify_package_pin
+        os.chmod(self.operator, 0o700)
+
+        def swap_for_operator(*args: object, **kwargs: object):
+            os.rename(self.home, self.root / "route-home.real")
+            os.rename(self.operator, self.home)
+            return real_verify(*args, **kwargs)
+
+        with mock.patch.object(policy, "verify_package_pin", side_effect=swap_for_operator):
+            self.refused("route_home_is_operator_home", self.launch, "hermes")
+        self.launcher.assert_not_called()
+        self.assertFalse((self.home / ".hermes").exists())
+        self.assertFalse((self.root / "route-home.real" / ".hermes").exists())
+
+    def test_swap_after_the_home_recheck_does_not_write_the_replacement(self) -> None:
+        decoy = self.root / "decoy-apply"
+        decoy.mkdir(mode=0o700)
+        os.chmod(decoy, 0o700)
+        real_apply = policy._apply_hermes_adopt_override
+
+        def swap(decision: object, route_home: str) -> None:
+            os.rename(self.home, self.root / "route-home.real")
+            os.rename(decoy, self.home)
+            return real_apply(decision, route_home)
+
+        with mock.patch.object(policy, "_apply_hermes_adopt_override", side_effect=swap):
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.launcher.assert_not_called()
+        self.assertFalse((self.home / ".hermes").exists())
+        self.assertFalse((self.root / "route-home.real" / ".hermes").exists())
 
     def test_config_that_appears_before_the_link_is_not_replaced(self) -> None:
         (self.home / ".hermes").mkdir(mode=0o700)
@@ -659,7 +809,8 @@ class HermesHomeReuseTests(_Calls):
         with mock.patch.object(policy.os, "fstat", side_effect=other_owner), \
                 mock.patch.object(policy.os, "close", side_effect=spy_close):
             self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
-        self.assertEqual(2, len(closed))
+        # .hermes, config.yaml, and the route-home directory held from _check_home.
+        self.assertEqual(3, len(closed))
         self.launcher.assert_not_called()
 
     def test_other_engines_still_refuse_a_hermes_dir_that_holds_the_switch(self) -> None:

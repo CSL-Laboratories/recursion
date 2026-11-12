@@ -61,6 +61,7 @@ calls it yet. Provider ids marked unverified below were not read from the engine
 
 from __future__ import annotations
 
+import contextvars
 import errno
 import os
 import secrets
@@ -417,10 +418,12 @@ def _finish(
         beta = True
     elif wrapper is not None:
         raise SubscriptionRouteRefused(engine, "wrapper_pin_not_applicable")
-    return RouteDecision(
+    decision = RouteDecision(
         engine, provider, credential, flags + checked.flags, auth, method, engine_config, model, beta,
         tuple(sorted(env.items())), pin_version,
     )
+    _release_route_home_unless_kept()
+    return decision
 
 
 def _check_subscription(
@@ -526,15 +529,18 @@ def guard_then_spawn(
     refuse ``launch_option_denied`` and any other name refuses ``launch_option_unknown``.
     """
 
-    name = engine if isinstance(engine, str) else None
-    forward = _reject_launch_shape(name, argv, launch_kwargs, requirements, full_access_acknowledged)
-    decision = check_route(
-        engine, profile, child_env, route_home=route_home, parent_env=parent_env,
-        operator_home=operator_home, wrapper=wrapper, requirements=requirements,
-        full_access_acknowledged=full_access_acknowledged,
-    )
-    pinned = (wrapper.launcher_path,) if decision.beta and wrapper is not None else ()
-    return _launch_checked(launcher, list(argv), decision, route_home, pinned, forward)
+    def launch() -> tuple[RouteDecision, object]:
+        name = engine if isinstance(engine, str) else None
+        forward = _reject_launch_shape(name, argv, launch_kwargs, requirements, full_access_acknowledged)
+        decision = check_route(
+            engine, profile, child_env, route_home=route_home, parent_env=parent_env,
+            operator_home=operator_home, wrapper=wrapper, requirements=requirements,
+            full_access_acknowledged=full_access_acknowledged,
+        )
+        pinned = (wrapper.launcher_path,) if decision.beta and wrapper is not None else ()
+        return _launch_checked(launcher, list(argv), decision, route_home, pinned, forward)
+
+    return _call_kept(launch)
 
 
 def _looks_like_claude_login(provider: str) -> bool:
@@ -563,7 +569,20 @@ def _check_home(
     if env.get("HOME") != route_home:
         raise SubscriptionRouteRefused(engine, "child_home_not_route_home")
     real = os.path.realpath(route_home)
-    operator = {os.path.realpath(path) for path in _operator_homes(parent_env, operator_home)}
+    homes = _operator_homes(parent_env, operator_home)
+    operator: set[str] = set()
+    operator_ids: list[tuple[int, int]] = []
+    for path in homes:
+        try:
+            operator.add(os.path.realpath(path))
+        except OSError:
+            pass
+        try:
+            ost = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISDIR(ost.st_mode):  # the directory itself, so a later rename onto the route path still matches
+            operator_ids.append((ost.st_dev, ost.st_ino))
     # A home of "/" must not use the prefix "/": that matches every absolute path, so a
     # container whose passwd home is missing (HOME=/) could launch no route.
     if any(_operator_contains(real, home) for home in operator):
@@ -574,6 +593,24 @@ def _check_home(
         raise SubscriptionRouteRefused(engine, "route_home_missing") from None
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
         raise SubscriptionRouteRefused(engine, "route_home_not_private")
+    # Stamp and hold the directory on this lstat. Later path swaps are not this inode.
+    try:
+        home_fd = os.open(route_home, _DIR_OPEN_FLAGS)
+    except OSError:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+    try:
+        opened = os.fstat(home_fd)
+    except OSError:
+        os.close(home_fd)
+        raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+    if ((opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino)
+            or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(st.st_mode)):
+        os.close(home_fd)
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
+    _set_route_home(_RouteHome(
+        route_home, home_fd, st.st_dev, st.st_ino, st.st_uid, st.st_mode,
+        tuple(operator), tuple(operator_ids),
+    ))
     for entry in CLAUDE_STORE_ENTRIES:
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "claude_store_in_route_home", entry)
@@ -684,6 +721,80 @@ _HERMES_ADOPT_YAML = b"auth:\n  adopt_external_logins: false\n"  # 37 bytes
 # (a crash between mkdir and rename) is never read as Hermes state.
 _HERMES_STAGING_PREFIX = ".hermes.recursion-"
 _DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_HERMES_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                      | getattr(os, "O_NOCTTY", 0))
+
+
+class _RouteHome:
+    """The route directory held open from the ``lstat`` in ``_check_home`` until launch."""
+
+    __slots__ = ("path", "fd", "dev", "ino", "uid", "mode", "operator_reals", "operator_ids",
+                 "config_dev", "config_ino")
+
+    def __init__(
+        self,
+        path: str,
+        fd: int,
+        dev: int,
+        ino: int,
+        uid: int,
+        mode: int,
+        operator_reals: tuple[str, ...],
+        operator_ids: tuple[tuple[int, int], ...],
+    ) -> None:
+        self.path, self.fd = path, fd
+        self.dev, self.ino, self.uid, self.mode = dev, ino, uid, mode
+        self.operator_reals, self.operator_ids = operator_reals, operator_ids
+        self.config_dev: int | None = None
+        self.config_ino: int | None = None
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+_ROUTE_HOME: contextvars.ContextVar[_RouteHome | None] = contextvars.ContextVar("route_home", default=None)
+# guard_* keeps the hold until after launch. check_route alone drops it before returning.
+_KEEP_ROUTE_HOME: contextvars.ContextVar[bool] = contextvars.ContextVar("keep_route_home", default=False)
+
+
+def _set_route_home(hold: _RouteHome) -> None:
+    prev = _ROUTE_HOME.get()
+    if prev is not None and prev is not hold:
+        prev.close()
+    _ROUTE_HOME.set(hold)
+
+
+def _drop_route_home() -> None:
+    hold = _ROUTE_HOME.get()
+    _ROUTE_HOME.set(None)
+    if hold is not None:
+        hold.close()
+
+
+def _release_route_home_unless_kept() -> None:
+    if not _KEEP_ROUTE_HOME.get():
+        _drop_route_home()
+
+
+def _call_kept(fn: Callable[[], tuple[RouteDecision, object]]) -> tuple[RouteDecision, object]:
+    token = _KEEP_ROUTE_HOME.set(True)
+    try:
+        return fn()
+    finally:
+        _drop_route_home()
+        _KEEP_ROUTE_HOME.reset(token)
+
+
+def _route_home_for(engine: str, route_home: str) -> _RouteHome:
+    hold = _ROUTE_HOME.get()
+    if hold is None or hold.fd < 0 or hold.path != route_home:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
+    return hold
 
 
 @dataclass(frozen=True)
@@ -785,7 +896,53 @@ def _refuse_hermes_config(engine: str, detail: str) -> SubscriptionRouteRefused:
     return SubscriptionRouteRefused(engine, "hermes_config_blocks_adopt_override", detail)
 
 
-def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
+def _is_true_variant(data: bytes) -> bool:
+    """Same-length (or any read) rewrite that turns the adopt switch on."""
+
+    return b"adopt_external_logins: true" in data
+
+
+def _neutralize_true_variant(hermes_fd: int, seen: tuple[int, int]) -> None:
+    """The refusal must not leave ``adopt_external_logins: true`` at ``.hermes/config.yaml``.
+
+    Restore the false switch when the opened inode is still the one just read; otherwise remove the name.
+    """
+
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
+    fd = -1
+    try:
+        fd = os.open("config.yaml", flags, dir_fd=hermes_fd)
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) == seen and stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            if os.write(fd, _HERMES_ADOPT_YAML) == len(_HERMES_ADOPT_YAML):
+                os.fsync(fd)
+                return
+    except OSError:
+        pass
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        os.unlink("config.yaml", dir_fd=hermes_fd)
+    except OSError:
+        pass
+
+
+def _remember_switch_inode(route_home: str, opened: os.stat_result) -> None:
+    hold = _ROUTE_HOME.get()
+    if hold is not None and hold.path == route_home:
+        hold.config_dev, hold.config_ino = opened.st_dev, opened.st_ino
+
+
+def _hermes_config_is_ours(
+    engine: str,
+    route_home: str,
+    *,
+    dir_fd: int | None = None,
+    scrub_true: bool = False,
+) -> bool:
     """False when ``.hermes/config.yaml`` is absent, True when it is exactly Recursion's adopt switch.
 
     Anything else refuses: a link, a non-regular file, another owner or any other content. A file
@@ -793,8 +950,16 @@ def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
     than the switch (it might hold a credential) is not read. A file of exactly that size (37 bytes)
     is opened relative to a ``.hermes`` opened as a real directory, never as a controlling terminal,
     and its type, size and owner are checked again on the opened file before the read.
+    With ``dir_fd``, ``.hermes`` is opened under that route-home descriptor (``O_NOFOLLOW``).
+    ``scrub_true`` restores or removes a same-read true switch before refusing, so a race that
+    rewrote the file this launch just wrote does not leave adoption on.
     """
 
+    hold = _ROUTE_HOME.get()
+    if dir_fd is None and hold is not None and hold.fd >= 0 and hold.path == route_home:
+        dir_fd = hold.fd
+    if dir_fd is not None:
+        return _hermes_config_is_ours_at(engine, route_home, dir_fd, scrub_true)
     parent = os.path.join(route_home, ".hermes")
     dest = os.path.join(parent, "config.yaml")
     try:
@@ -810,28 +975,71 @@ def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
     if not stat.S_ISREG(st.st_mode) or st.st_size != len(_HERMES_ADOPT_YAML) or st.st_uid != os.geteuid():
         raise _refuse_hermes_config(engine, "config.yaml")
     try:
-        dir_fd = os.open(parent, _DIR_OPEN_FLAGS)
+        hermes_fd = os.open(parent, _DIR_OPEN_FLAGS)
     except OSError:
         raise _refuse_hermes_config(engine, ".hermes") from None
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
-        try:
-            fd = os.open("config.yaml", flags, dir_fd=dir_fd)
-        except OSError:
-            raise _refuse_hermes_config(engine, "config.yaml") from None
-        try:
-            opened = os.fstat(fd)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
-                    or opened.st_uid != os.geteuid()):
-                raise _refuse_hermes_config(engine, "config.yaml")
-            data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
-        finally:
-            os.close(fd)
+        return _read_adopt_switch(engine, route_home, hermes_fd, scrub_true, st)
     finally:
-        os.close(dir_fd)
-    if data != _HERMES_ADOPT_YAML:
-        raise _refuse_hermes_config(engine, "config.yaml")
-    return True
+        os.close(hermes_fd)
+
+
+def _hermes_config_is_ours_at(engine: str, route_home: str, dir_fd: int, scrub_true: bool) -> bool:
+    """The route-home descriptor's ``.hermes``, not whatever the path names now."""
+
+    try:
+        parent_st = os.stat(".hermes", dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(parent_st.st_mode):
+        raise _refuse_hermes_config(engine, ".hermes")
+    try:
+        hermes_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    try:
+        try:
+            st = os.stat("config.yaml", dir_fd=hermes_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode) or st.st_size != len(_HERMES_ADOPT_YAML) or st.st_uid != os.geteuid():
+            raise _refuse_hermes_config(engine, "config.yaml")
+        return _read_adopt_switch(engine, route_home, hermes_fd, scrub_true, st)
+    finally:
+        os.close(hermes_fd)
+
+
+def _read_adopt_switch(
+    engine: str,
+    route_home: str,
+    hermes_fd: int,
+    scrub_true: bool,
+    st: os.stat_result,
+) -> bool:
+    fd = -1
+    try:
+        fd = os.open("config.yaml", _HERMES_OPEN_FLAGS, dir_fd=hermes_fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    try:
+        opened = os.fstat(fd)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
+                or opened.st_uid != os.geteuid()
+                or (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino)):
+            raise _refuse_hermes_config(engine, "config.yaml")
+        data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+        if data != _HERMES_ADOPT_YAML:
+            if scrub_true and _is_true_variant(data):
+                seen = (opened.st_dev, opened.st_ino)
+                os.close(fd)
+                fd = -1
+                _neutralize_true_variant(hermes_fd, seen)
+            raise _refuse_hermes_config(engine, "config.yaml")
+        _remember_switch_inode(route_home, opened)
+        return True
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _hermes_dir_is_only_ours(engine: str, route_home: str) -> bool:
@@ -907,34 +1115,46 @@ def _stage_hermes_dir(engine: str, route_home: str, parent: str) -> None:
 
     The rename replaces only a missing or empty directory. If something appeared in ``.hermes``
     meanwhile (``ENOTEMPTY`` or ``EEXIST``) the launch refuses and the staging directory is removed.
+    Every create and rename is relative to the route-home descriptor held in ``_check_home``.
     """
 
-    staging = os.path.join(route_home, _HERMES_STAGING_PREFIX + secrets.token_hex(8))
-    os.mkdir(staging, 0o700)
+    if os.path.basename(parent) != ".hermes":
+        raise _refuse_hermes_config(engine, ".hermes")
+    hold = _route_home_for(engine, route_home)
+    name = _HERMES_STAGING_PREFIX + secrets.token_hex(8)
+    os.mkdir(name, 0o700, dir_fd=hold.fd)
     try:
-        staging_fd = os.open(staging, _DIR_OPEN_FLAGS)
+        staging_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=hold.fd)
         try:
             _create_adopt_switch("config.yaml", dir_fd=staging_fd)
             _fsync_dir(staging_fd)
         finally:
             os.close(staging_fd)
         try:
-            os.rename(staging, parent)
+            os.rename(name, ".hermes", src_dir_fd=hold.fd, dst_dir_fd=hold.fd)
         except OSError as exc:
             if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
                 raise _refuse_hermes_config(engine, ".hermes") from None
             raise
     except BaseException:
-        for remove, path in ((os.unlink, os.path.join(staging, "config.yaml")), (os.rmdir, staging)):
-            try:
-                remove(path)
-            except OSError:
-                pass
+        cleanup = -1
+        try:
+            cleanup = os.open(name, _DIR_OPEN_FLAGS, dir_fd=hold.fd)
+            os.unlink("config.yaml", dir_fd=cleanup)
+        except OSError:
+            pass
+        finally:
+            if cleanup >= 0:
+                os.close(cleanup)
+        try:
+            os.rmdir(name, dir_fd=hold.fd)
+        except OSError:
+            pass
         raise
-    _fsync_dir(route_home)
     # A swap of the staged file between the write and the rename is not the switch.
-    if not _hermes_config_is_ours(engine, route_home):
+    if not _hermes_config_is_ours(engine, route_home, dir_fd=hold.fd, scrub_true=True):
         raise _refuse_hermes_config(engine, "config.yaml")
+    _fsync_dir(hold.fd)
 
 
 def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
@@ -942,27 +1162,31 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
 
     The switch is written to a temp file in the route home and hard-linked into ``.hermes``. A link
     never overwrites, so a ``config.yaml`` that appeared meanwhile refuses instead of being replaced.
+    Both the temp file and the link are created under the held route-home descriptor.
     """
 
-    temp = os.path.join(route_home, _HERMES_STAGING_PREFIX + secrets.token_hex(8))
+    if os.path.basename(parent) != ".hermes":
+        raise _refuse_hermes_config(engine, ".hermes")
+    hold = _route_home_for(engine, route_home)
+    name = _HERMES_STAGING_PREFIX + secrets.token_hex(8)
     try:
-        _create_adopt_switch(temp)
+        _create_adopt_switch(name, dir_fd=hold.fd)
         try:
-            parent_fd = os.open(parent, _DIR_OPEN_FLAGS)
+            parent_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=hold.fd)
             try:
-                os.link(temp, "config.yaml", dst_dir_fd=parent_fd)
+                os.link(name, "config.yaml", src_dir_fd=hold.fd, dst_dir_fd=parent_fd)
                 _fsync_dir(parent_fd)
             finally:
                 os.close(parent_fd)
         finally:
-            os.unlink(temp)
+            os.unlink(name, dir_fd=hold.fd)
     except OSError:
         raise _refuse_hermes_config(engine, "config.yaml") from None
     # A swap of the temp file between the write and the link is not the switch. The link's
     # success only means the new name exists; launch only when that name is exactly ours.
-    if not _hermes_config_is_ours(engine, route_home):
+    if not _hermes_config_is_ours(engine, route_home, dir_fd=hold.fd, scrub_true=True):
         raise _refuse_hermes_config(engine, "config.yaml")
-    _fsync_dir(route_home)
+    _fsync_dir(hold.fd)
 
 
 def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> None:
@@ -972,8 +1196,12 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
         return
     if decision.engine_config != ((HERMES_ADOPT_EXTERNAL_LOGINS, False),):
         raise SubscriptionRouteRefused(decision.engine, "hermes_adopt_external_logins_not_off")
+    # A swap after the caller's recheck still has to miss this write. The descriptor, not the path,
+    # is what mkdir and openat use.
+    _recheck_route_home(decision.engine, route_home)
+    hold = _route_home_for(decision.engine, route_home)
     parent = os.path.join(route_home, ".hermes")
-    if _hermes_config_is_ours(decision.engine, route_home):
+    if _hermes_config_is_ours(decision.engine, route_home, dir_fd=hold.fd):
         return
     if not os.path.lexists(parent) or _hermes_dir_is_empty(route_home):
         _stage_hermes_dir(decision.engine, route_home, parent)
@@ -983,32 +1211,69 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
         _link_hermes_config(decision.engine, route_home, parent)
 
 
-def _route_home_stamp(route_home: str) -> tuple[int, int] | None:
-    """Device and inode of a real directory, or None when the path is not one."""
+def _recheck_route_home(engine: str, route_home: str) -> None:
+    """The path still names the directory ``_check_home`` held, and it is still not an operator home.
 
-    try:
-        st = os.lstat(route_home)
-    except OSError:
-        return None
-    if not stat.S_ISDIR(st.st_mode):
-        return None
-    return (st.st_dev, st.st_ino)
-
-
-def _require_route_home_unchanged(engine: str, route_home: str, stamp: tuple[int, int] | None) -> None:
-    """The directory about to be written is still the private one just observed.
-
-    A path swap after the home check — a symlink, a different directory, or a widened mode — refuses
-    before the adopt switch is written.
+    The stamp is that lstat's device, inode, owner and mode. The held descriptor must still be that
+    inode. A 0700 replacement, a widened mode, or the operator directory renamed onto the path refuses.
     """
 
+    hold = _ROUTE_HOME.get()
+    if hold is None or hold.fd < 0 or hold.path != route_home:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
     try:
         st = os.lstat(route_home)
+        opened = os.fstat(hold.fd)
+        real = os.path.realpath(route_home)
     except OSError:
         raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
-    if (stamp is None or (st.st_dev, st.st_ino) != stamp or not stat.S_ISDIR(st.st_mode)
-            or st.st_uid != os.geteuid() or st.st_mode & 0o077):
+    if (st.st_dev, st.st_ino) in hold.operator_ids or any(
+        _operator_contains(real, home) for home in hold.operator_reals
+    ):
+        raise SubscriptionRouteRefused(engine, "route_home_is_operator_home")
+    if ((opened.st_dev, opened.st_ino) != (hold.dev, hold.ino)
+            or (st.st_dev, st.st_ino, st.st_uid, st.st_mode) != (hold.dev, hold.ino, hold.uid, hold.mode)
+            or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077):
         raise SubscriptionRouteRefused(engine, "route_home_not_private")
+
+
+def _reverify_hermes_switch(engine: str, route_home: str) -> None:
+    """Last step before launch: the switch bytes, read from the inode this launch accepted.
+
+    ``config.yaml`` is opened ``O_NOFOLLOW`` under the held route home. Its device and inode must be
+    the ones recorded when the switch was written or reused, and the bytes must still be the false
+    switch. A true switch is restored or removed before the refusal.
+    """
+
+    hold = _route_home_for(engine, route_home)
+    if hold.config_dev is None or hold.config_ino is None:
+        raise _refuse_hermes_config(engine, "config.yaml")
+    try:
+        hermes_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=hold.fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    fd = -1
+    try:
+        try:
+            fd = os.open("config.yaml", _HERMES_OPEN_FLAGS, dir_fd=hermes_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        opened = os.fstat(fd)
+        data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+        if (stat.S_ISREG(opened.st_mode) and opened.st_uid == os.geteuid()
+                and (opened.st_dev, opened.st_ino) == (hold.config_dev, hold.config_ino)
+                and data == _HERMES_ADOPT_YAML):
+            return
+        if _is_true_variant(data):
+            seen = (opened.st_dev, opened.st_ino)
+            os.close(fd)
+            fd = -1
+            _neutralize_true_variant(hermes_fd, seen)
+        raise _refuse_hermes_config(engine, "config.yaml")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(hermes_fd)
 
 
 def _launch_checked(
@@ -1019,16 +1284,18 @@ def _launch_checked(
     pinned: tuple[str, ...],
     forward: Mapping[str, object],
 ) -> tuple[RouteDecision, object]:
-    # Taken before argv checks: those run after the home check, and a swap during them must not
-    # be the directory the adopt switch is written into.
-    home_stamp = _route_home_stamp(route_home) if decision.engine == "hermes" else None
+    # The stamp was taken in _check_home, before the pin check. A swap during argv checks or the
+    # pin check must not be the directory the adopt switch is written into, or the HOME that launches.
     if pinned and not _argv0_is_pinned(argv, pinned):
         raise SubscriptionRouteRefused(decision.engine, "argv0_not_pinned")
     if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model):
         raise SubscriptionRouteRefused(decision.engine, "model_not_bound", decision.model)
-    if decision.engine == "hermes":
-        _require_route_home_unchanged(decision.engine, route_home, home_stamp)
+    _recheck_route_home(decision.engine, route_home)
     _apply_hermes_adopt_override(decision, route_home)
+    _recheck_route_home(decision.engine, route_home)
+    if decision.engine == "hermes":
+        # Final step: nothing between this read and the launcher call.
+        _reverify_hermes_switch(decision.engine, route_home)
     # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
     # launch options _reject_launch_shape let through; none can replace env, shell or the model.
     return decision, launcher(
@@ -1082,7 +1349,9 @@ def check_cursor_route(
         raise SubscriptionRouteRefused(engine, "wrapper_pin_missing")
     frozen = _checked_baseline(engine, child_env, route_home, parent_env, operator_home)
     _verify_wrapper(engine, wrapper, checked)
-    return RouteDecision(engine, "", "", checked.flags, "wrapper", "", (), "", True, frozen)
+    decision = RouteDecision(engine, "", "", checked.flags, "wrapper", "", (), "", True, frozen)
+    _release_route_home_unless_kept()
+    return decision
 
 
 def guard_cursor_then_spawn(
@@ -1104,12 +1373,16 @@ def guard_cursor_then_spawn(
     Launch options follow the same rules as ``guard_then_spawn``.
     """
 
-    forward = _reject_launch_shape("cursor", argv, launch_kwargs, requirements, full_access_acknowledged)
-    decision = check_cursor_route(
-        child_env, route_home=route_home, wrapper=wrapper, parent_env=parent_env, operator_home=operator_home,
-        requirements=requirements, full_access_acknowledged=full_access_acknowledged,
-    )
-    return _launch_checked(launcher, list(argv), decision, route_home, (wrapper.launcher_path,), forward)
+    def launch() -> tuple[RouteDecision, object]:
+        forward = _reject_launch_shape("cursor", argv, launch_kwargs, requirements, full_access_acknowledged)
+        decision = check_cursor_route(
+            child_env, route_home=route_home, wrapper=wrapper, parent_env=parent_env,
+            operator_home=operator_home, requirements=requirements,
+            full_access_acknowledged=full_access_acknowledged,
+        )
+        return _launch_checked(launcher, list(argv), decision, route_home, (wrapper.launcher_path,), forward)
+
+    return _call_kept(launch)
 
 
 def check_antigravity_route(
@@ -1139,8 +1412,10 @@ def check_antigravity_route(
         measured = verify_antigravity_pin(version, binary_path, launcher_path, pin)
     except WrapperPinRefused as exc:
         raise SubscriptionRouteRefused(engine, exc.cause, exc.detail) from None
-    return RouteDecision(engine, "antigravity", "", checked.flags, "wrapper", "", (), "", True, frozen,
-                         measured.version)
+    decision = RouteDecision(engine, "antigravity", "", checked.flags, "wrapper", "", (), "", True, frozen,
+                             measured.version)
+    _release_route_home_unless_kept()
+    return decision
 
 
 def guard_antigravity_then_spawn(
@@ -1165,10 +1440,15 @@ def guard_antigravity_then_spawn(
     that resolves to one of those two files. Launch options follow the same rules as ``guard_then_spawn``.
     """
 
-    forward = _reject_launch_shape("antigravity", argv, launch_kwargs, requirements, full_access_acknowledged)
-    decision = check_antigravity_route(
-        child_env, version=version, binary_path=binary_path, launcher_path=launcher_path, pin=pin,
-        route_home=route_home, parent_env=parent_env, operator_home=operator_home,
-        requirements=requirements, full_access_acknowledged=full_access_acknowledged,
-    )
-    return _launch_checked(launcher, list(argv), decision, route_home, (binary_path, launcher_path), forward)
+    def launch() -> tuple[RouteDecision, object]:
+        forward = _reject_launch_shape(
+            "antigravity", argv, launch_kwargs, requirements, full_access_acknowledged,
+        )
+        decision = check_antigravity_route(
+            child_env, version=version, binary_path=binary_path, launcher_path=launcher_path, pin=pin,
+            route_home=route_home, parent_env=parent_env, operator_home=operator_home,
+            requirements=requirements, full_access_acknowledged=full_access_acknowledged,
+        )
+        return _launch_checked(launcher, list(argv), decision, route_home, (binary_path, launcher_path), forward)
+
+    return _call_kept(launch)

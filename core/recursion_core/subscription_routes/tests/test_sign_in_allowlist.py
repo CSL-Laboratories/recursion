@@ -278,10 +278,17 @@ class AllowlistTests(_Base):
         (self.home / ".hermes").mkdir()
         (self.home / ".hermes" / "auth.json").write_text(FAKE_OAUTH)
         real_open = builtins.open
+        real_os_open = os.open
 
         def guard(path, *args, **kwargs):
-            if str(self.home) in str(path):
+            # Holding the route directory (O_DIRECTORY) does not read a store entry under it.
+            flags = args[0] if args else kwargs.get("flags", 0)
+            if str(self.home) in str(path) and not (
+                isinstance(flags, int) and flags & os.O_DIRECTORY and os.path.abspath(str(path)) == str(self.home)
+            ):
                 raise AssertionError(f"opened {path}")
+            if isinstance(flags, int):
+                return real_os_open(path, *args, **kwargs)
             return real_open(path, *args, **kwargs)
         with mock.patch.object(builtins, "open", guard), mock.patch.object(os, "open", guard):
             decision = check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: False},

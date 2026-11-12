@@ -143,6 +143,33 @@ def check_copilot_own_loop(
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
+def _safe_proxy_address(parts: object) -> str:
+    """``scheme://host:port`` only. Path, query, fragment and userinfo are never rendered."""
+
+    try:
+        host = parts.hostname  # type: ignore[attr-defined]
+    except ValueError:
+        return ""
+    scheme = getattr(parts, "scheme", "")
+    if not isinstance(host, str) or not host or not isinstance(scheme, str) or not scheme:
+        return ""
+    shown = f"[{host}]" if ":" in host else host
+    try:
+        port = parts.port  # type: ignore[attr-defined]
+    except ValueError:
+        return f"{scheme}://{shown}"
+    if port is None:
+        return f"{scheme}://{shown}"
+    return f"{scheme}://{shown}:{port}"
+
+
+def _has_query_or_fragment(text: str, parts: object) -> bool:
+    if getattr(parts, "query", "") or getattr(parts, "fragment", ""):
+        return True
+    tail = text.split("://", 1)[-1]
+    return "?" in tail or "#" in tail
+
+
 def _loopback_url(base_url: object) -> str:
     if not isinstance(base_url, str) or not base_url.strip():
         raise OwnLoopRouteRefused("nous", "proxy_address_missing")
@@ -152,16 +179,20 @@ def _loopback_url(base_url: object) -> str:
     except ValueError:
         raise OwnLoopRouteRefused("nous", "proxy_address_malformed") from None
     # Userinfo is a held token even when the rest of the URL is not a loopback http(s) address.
-    # The raw URL stays out of the refusal: it would echo the secret.
+    # Nothing from the raw URL is repeated: a path, query or fragment can hold a secret too.
     if parts.username or parts.password:
         raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
+    safe = _safe_proxy_address(parts)
     try:
         host = parts.hostname
         parts.port  # noqa: B018 - raises on a bad port
-    except ValueError as exc:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", str(exc)) from None
+    except ValueError:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", safe) from None
     if parts.scheme not in _NOUS_SCHEMES or not host:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", text)
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", safe)
+    # A query or fragment is not part of the proxy origin. /v1 is the proxy's own base path and stays.
+    if _has_query_or_fragment(text, parts):
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", safe)
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
@@ -171,7 +202,7 @@ def _loopback_url(base_url: object) -> str:
         addr = addr.ipv4_mapped
     if not addr.is_loopback:
         raise OwnLoopRouteRefused("nous", "proxy_not_loopback", host)
-    return base_url.strip()
+    return text
 
 
 def _adapters(value: object) -> tuple[str, ...]:
@@ -197,7 +228,10 @@ def _other_users(current_user: str | None, interactive_users: Iterable[str]) -> 
 
 
 def _report_address(base_url: object) -> str:
-    """An address a doctor line may show. A URL with userinfo is omitted: it holds a secret."""
+    """An address a doctor line may show: ``scheme://host:port`` only.
+
+    A URL with userinfo is omitted. Path, query and fragment are dropped so a secret there is not echoed.
+    """
 
     if not isinstance(base_url, str):
         return ""
@@ -208,7 +242,7 @@ def _report_address(base_url: object) -> str:
         return ""
     if parts.username or parts.password:
         return ""
-    return base_url
+    return _safe_proxy_address(parts)
 
 
 def nous_proxy_doctor(
@@ -230,7 +264,7 @@ def nous_proxy_doctor(
     except OwnLoopRouteRefused as exc:
         return {"ok": False, "address": _report_address(base_url), "cause": exc.cause,
                 "warnings": warnings}
-    return {"ok": True, "address": url, "cause": "", "warnings": warnings}
+    return {"ok": True, "address": _report_address(url), "cause": "", "warnings": warnings}
 
 
 def _shared_host_warning(current_user: str | None, interactive_users: Iterable[str] | None) -> tuple[str, ...]:

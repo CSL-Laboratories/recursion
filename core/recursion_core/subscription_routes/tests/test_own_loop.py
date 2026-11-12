@@ -158,6 +158,58 @@ class NousTests(unittest.TestCase):
                 self.assertNotIn(secret, str(report))
                 self.assertNotIn(secret, report["address"])
 
+    def test_proxy_secrets_outside_userinfo_are_not_echoed(self) -> None:
+        # A path, query or fragment is not userinfo, and it is still a secret. Reports and
+        # refusals show scheme://host:port only. /v1 stays a legal proxy path on the decision.
+        secret = "s3cret-proxy-password"
+        ftp = f"ftp://127.0.0.1/{secret}"
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=ftp), BASE)
+        self.assertEqual(caught.exception.cause, "proxy_address_malformed")
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn(secret, caught.exception.detail)
+        self.assertEqual(caught.exception.detail, "ftp://127.0.0.1")
+        report = nous_proxy_doctor(ftp)
+        self.assertNotIn(secret, str(report))
+        self.assertEqual(report["address"], "ftp://127.0.0.1")
+
+        query = f"http://10.1.2.3/?password={secret}"
+        report = nous_proxy_doctor(query)
+        self.assertFalse(report["ok"])
+        self.assertNotIn(secret, str(report))
+        self.assertNotIn("?", report["address"])
+        self.assertEqual(report["address"], "http://10.1.2.3")
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=query), BASE)
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn(secret, caught.exception.detail)
+        self.assertNotIn("?", caught.exception.detail)
+
+        loopback_query = f"http://127.0.0.1:8645/v1?token={secret}"
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=loopback_query), BASE)
+        self.assertEqual(caught.exception.cause, "proxy_address_malformed")
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertEqual(caught.exception.detail, "http://127.0.0.1:8645")
+
+        frag = f"http://127.0.0.1:8645/v1#{secret}"
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=frag), BASE)
+        self.assertEqual(caught.exception.cause, "proxy_address_malformed")
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn(secret, caught.exception.detail)
+        self.assertNotIn("#", caught.exception.detail)
+        self.assertEqual(caught.exception.detail, "http://127.0.0.1:8645")
+        report = nous_proxy_doctor(frag)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["address"], "http://127.0.0.1:8645")
+        self.assertNotIn(secret, str(report))
+
+        # The Nous proxy contract keeps a non-empty path (/v1). Doctor text still drops it.
+        decided = check_nous_own_loop(nous(base_url="http://127.0.0.1:8645/v1"), BASE)
+        self.assertEqual(decided.base_url, "http://127.0.0.1:8645/v1")
+        self.assertEqual(nous_proxy_doctor("http://127.0.0.1:8645/v1")["address"], "http://127.0.0.1:8645")
+
     def test_xai_adapter_stays_off_and_only_nous_runs(self) -> None:
         self.refused("adapter_must_stay_off", nous(adapters=["nous", "xai"]))
         self.refused("adapter_must_stay_off", nous(adapters=["XAI"]))
@@ -190,7 +242,7 @@ class NousTests(unittest.TestCase):
 class DoctorTests(unittest.TestCase):
     def test_doctor_reports_address_and_never_raises(self) -> None:
         self.assertEqual(nous_proxy_doctor("http://127.0.0.1:8645/v1", current_user="u", interactive_users=["u"]),
-                         {"ok": True, "address": "http://127.0.0.1:8645/v1", "cause": "", "warnings": ()})
+                         {"ok": True, "address": "http://127.0.0.1:8645", "cause": "", "warnings": ()})
         bad = nous_proxy_doctor("http://10.1.2.3:8645")
         self.assertEqual((bad["ok"], bad["address"], bad["cause"]), (False, "http://10.1.2.3:8645", "proxy_not_loopback"))
         self.assertEqual(nous_proxy_doctor(None)["cause"], "proxy_address_missing")

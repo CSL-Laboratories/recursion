@@ -70,6 +70,18 @@ class CodexSnippetTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             codex_operator_snippet("a.b", "x")
 
+    def test_args_are_not_built_by_iterating_a_string_or_a_mapping(self) -> None:
+        # A string is a sequence of characters; a mapping iterates its keys. Either
+        # would write an argv that is not the launch the caller named.
+        with self.assertRaises(ValueError):
+            codex_operator_snippet("rc", "recursion-control-mcp", "--stdio")
+        with self.assertRaises(ValueError):
+            codex_operator_snippet("rc", "recursion-control-mcp", {"--stdio": "1"})
+        with self.assertRaises(ValueError):
+            codex_operator_snippet("rc", "recursion-control-mcp", ["--stdio", 1])
+        with self.assertRaises(ValueError):
+            codex_operator_snippet("rc", None, ["--stdio"])
+
 
 if __name__ == "__main__":
     unittest.main()

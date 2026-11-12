@@ -80,8 +80,10 @@ recorded on F60, CSL-762).
   (`destructiveHint: false` only), B (`destructiveHint: false` and `openWorldHint: false`)
   and C (read tools), plus `approval_mode = "approve"` on start. `strict_auto_review` is not
   a refusal: it skips the approve and full-access shortcuts and sends the call to Codex's
-  automatic reviewer, which approves outright under a full-access profile and otherwise
-  runs a model review that can approve or deny (`"auto_review"`). A managed approval
+  automatic reviewer, which approves outright only for the Disabled profile
+  (`has_full_access`) and otherwise runs a model review that can approve or deny
+  (`"auto_review"`). External and managed full-disk are not that case under strict.
+  A managed approval
   requirement sends only calls that still need approval to that reviewer. Status: grounded
   in a source reading of `e0aa0434f415b0c5bc0fb64abd7f03c5510f9ed6`, unmeasured; no Codex
   is spawned, no `codex exec` run backs it, and the live binary version is unmeasured.

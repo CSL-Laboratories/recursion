@@ -104,12 +104,14 @@ class OverrideAndExceptionTests(unittest.TestCase):
         self.assertEqual(exec_outcome(start, "approve", strict_auto_review=True), "auto_review")
         self.assertEqual(exec_outcome(ARM_C, strict_auto_review=True), "auto_review")
 
-    def test_strict_auto_review_with_full_access_is_approved_without_model_review(self) -> None:
+    def test_strict_auto_review_with_disabled_profile_is_approved_without_model_review(self) -> None:
+        # Guardian has_full_access is Disabled only. External and managed full-disk stay
+        # on the reviewer under strict (test_strict_does_not_auto_approve_external_or_managed_full_disk).
         start = next(t["annotations"] for t in mcp_tools.TOOLS if t["name"] == "recursion_run_start")
-        for profile in ("disabled", "external", "managed_full_disk"):
-            self.assertEqual(
-                exec_outcome(start, profile=profile, strict_auto_review=True), "allowed", profile
-            )
+        self.assertEqual(exec_outcome(start, profile="disabled", strict_auto_review=True), "allowed")
+        self.assertEqual(
+            exec_outcome(start, "prompt", profile="disabled", strict_auto_review=True), "allowed"
+        )
 
     def test_managed_approval_reviews_only_calls_that_still_need_approval(self) -> None:
         # A managed requirement does not skip the shortcuts; a call that still needs
@@ -119,6 +121,26 @@ class OverrideAndExceptionTests(unittest.TestCase):
         self.assertEqual(exec_outcome(start, "approve", managed_approval=True), "allowed")
         self.assertEqual(exec_outcome(start, profile="external", managed_approval=True), "allowed")
         self.assertEqual(exec_outcome(ARM_C, managed_approval=True), "allowed")
+
+    def test_strict_does_not_auto_approve_external_or_managed_full_disk(self) -> None:
+        # e0aa0434 has_full_access is AskForApproval::Never plus PermissionProfile::Disabled
+        # only. External and managed full-disk are shortcuts that strict skips, so the
+        # guardian model-reviews and can deny. Reporting them as allowed is a bypass.
+        start = next(t["annotations"] for t in mcp_tools.TOOLS if t["name"] == "recursion_run_start")
+        for profile in ("external", "managed_full_disk"):
+            with self.subTest(profile=profile):
+                self.assertEqual(
+                    exec_outcome(start, profile=profile, strict_auto_review=True), "auto_review"
+                )
+                self.assertEqual(
+                    exec_outcome(start, "approve", profile=profile, strict_auto_review=True),
+                    "auto_review",
+                )
+                self.assertEqual(
+                    exec_outcome(ARM_C, profile=profile, strict_auto_review=True), "auto_review"
+                )
+        self.assertEqual(exec_outcome(start, profile="disabled", strict_auto_review=True), "allowed")
+        self.assertEqual(exec_outcome(start, profile="external"), "allowed")
 
     def test_unknown_mode_is_rejected_on_every_path(self) -> None:
         with self.assertRaises(ValueError):

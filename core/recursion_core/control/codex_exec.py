@@ -13,8 +13,12 @@ This module is an offline reading of openai/codex ``e0aa0434f415b0c5bc0fb64abd7f
 neither exception is a plain refusal under exec: ``strict_auto_review`` skips the
 auto-approve shortcuts and sends the call to Codex's automatic reviewer
 (``tools/approvals.rs`` ``request_guardian_approval``, ``require_guardian``), which
-approves without a model review under a full-access profile and otherwise runs a model
-review that can approve or deny. A managed requirement (``guardian/decision.rs``,
+approves without a model review only when ``has_full_access`` is true
+(``protocol/src/environment.rs``: approval policy never and ``PermissionProfile::Disabled``,
+and every selected environment Disabled). This reading treats ``profile="disabled"`` as that
+case and takes no environment list. External and managed full-disk write are
+auto-approved only by the shortcut that strict skips (``mcp_permission_prompt_is_auto_approved``),
+so under strict they are model-reviewed and can be denied. A managed requirement (``guardian/decision.rs``,
 ``auto_review_required_for_model`` or a reviewer that cannot be set to the user) does not
 skip the shortcuts; a call that still needs approval goes to the same reviewer. The
 outcome ``"auto_review"`` names that case: the call is neither known to run nor known to be
@@ -37,7 +41,8 @@ CODEX_BINARY_VERSION: str | None = None
 ApprovalMode = Literal["auto", "prompt", "writes", "approve"]
 ExecOutcome = Literal["allowed", "refused", "auto_review"]
 
-# PRODUCT.md O41: full-access profiles that auto-approve a prompt under exec.
+# Non-strict shortcut under policy never (mcp_permission_prompt_is_auto_approved).
+# strict_auto_review skips this set. Guardian has_full_access is "disabled" only.
 FULL_ACCESS_PROFILES = frozenset({"disabled", "external", "managed_full_disk"})
 
 _MODES = frozenset({"auto", "prompt", "writes", "approve"})
@@ -108,8 +113,9 @@ def exec_outcome(
     needs_approval = requires_approval_for_mode(annotations, approval_mode)
     full_access = profile in FULL_ACCESS_PROFILES
     if strict_auto_review:
-        # Shortcuts skipped; the reviewer approves outright only under full access.
-        return "allowed" if full_access else "auto_review"
+        # Shortcuts skipped, including External and managed full-disk. The guardian
+        # approves without a model review only for Disabled (has_full_access).
+        return "allowed" if profile == "disabled" else "auto_review"
     if full_access or not needs_approval:  # per-tool approve never needs approval
         return "allowed"
     if managed_approval:

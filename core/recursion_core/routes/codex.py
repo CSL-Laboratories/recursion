@@ -13,12 +13,14 @@ Typed limit signals:
   when that same window's ``usedPercent`` is a number under 100. An omitted window, or a percent
   that is not a number, is not a healthy reading and leaves the earlier window in place. Primary
   and secondary are separate windows, and a connection bucket does not erase a model bucket.
-  An exhausted window with no numeric ``resetsAt`` is not cleared when the other window's reset
-  passes: the breaker fences it with its cooldown and a probe. Snapshots are ordered only when
+  An exhausted window with no numeric ``resetsAt`` does not erase a sibling's known reset. The
+  grouped instant is the latest known reset, and at least the default cooldown when any sibling
+  reset is unknown. Snapshots are ordered only when
   they carry the same stamp kind (``generation``, or else ``seq``, ``sequence``, ``timestamp``,
   ``capturedAt``, ``updatedAt``, ``asOf``; names unverified). A generation is not compared with a
   timestamp. A healthy reading replaces an exhausted window only when it is strictly newer by that
-  same kind. A tie keeps the exhausted window. When neither snapshot carries a stamp, an
+  same kind. A tie on that kind keeps the exhausted window. An exhausted snapshot of a different
+  kind keeps the later reset and does not shorten a known one. When neither snapshot carries a stamp, an
   ``account/rateLimits/updated`` received after ``account/rateLimits/read`` was sent wins over
   that read's result. Codex's default bucket (``limitId``
   ``codex``) is credential-wide. Any other ``limitId`` is the breaker model key itself: the requested
@@ -229,16 +231,24 @@ class _Rpc:
             key = (bucket, name)
             prev = self._window_order.get(key)
             rank = 0 if prev is None else _stamp_rank(stamp, local, prev[0], prev[1])
-            # Healthy replaces exhausted only when this snapshot is strictly newer by the same
-            # stamp kind. A tie, or a different kind, keeps the exhausted window.
+            # A healthy reading replaces an exhausted window only when it is strictly newer by the
+            # same stamp kind. A same-kind tie keeps the exhausted window. A strictly older snapshot
+            # changes nothing.
             if prev is not None and rank <= 0 and (percent < 100 or rank < 0):
+                continue
+            signal = _window_signal(snapshot, source, self.adapter.vendor_reset(raw.get("resetsAt")))
+            # Incomparable exhausted snapshots (different stamp kind, or only one side stamped)
+            # merge by the later reset. Replacing the window here would shorten a known one.
+            # The existing stamp stays the order, so a later reading of that kind is still comparable.
+            if prev is not None and percent >= 100 and _kinds_differ(stamp, prev[0]) and key in self._open_windows:
+                self._open_windows[key] = _later_reset(self._open_windows[key], signal)
                 continue
             self._window_order[key] = (stamp, local)
             if percent >= 100:
-                self._open_windows[key] = _window_signal(snapshot, source, self.adapter.vendor_reset(raw.get("resetsAt")))
+                self._open_windows[key] = signal
             else:
                 self._open_windows.pop(key, None)
-        self.limit = _reported(self._open_windows)
+        self.limit = _reported(self._open_windows, now=self.adapter._clock())
 
     def limit_result(self, rid: str, detail: str) -> dict:
         return self.finish(c.result(rid, c.PLAN_LIMIT, limit=self.limit, events=self.events, detail=detail))
@@ -248,7 +258,7 @@ class _Rpc:
 
         if res.get("code") != c.PLAN_LIMIT:
             return res
-        windows = _grouped(self._open_windows)
+        windows = _grouped(self._open_windows, now=self.adapter._clock())
         primary = res.get("limit")
         if isinstance(primary, dict) and all(window != primary for window in windows):
             windows.append(primary)
@@ -279,11 +289,11 @@ def _window_signal(snapshot: dict, source: str, reset_at: float | None) -> dict:
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
-def _grouped(open_windows: dict[tuple[str, str], dict]) -> list[dict]:
-    """One signal per scope and model. The reset is the latest still-exhausted window on that key.
+def _grouped(open_windows: dict[tuple[str, str], dict], *, now: float) -> list[dict]:
+    """One signal per scope and model. The reset is the latest known instant on that key.
 
-    A window with no numeric reset is not given its sibling's instant. The grouped signal then
-    carries no reset, and the breaker fences it with its cooldown and a probe.
+    A window with no numeric reset does not erase a sibling's known instant. The fence is the
+    later of that instant and ``now + PAST_RESET_FENCE_S`` (the breaker's default cooldown).
     """
 
     grouped: dict[tuple, list[dict]] = {}
@@ -295,25 +305,53 @@ def _grouped(open_windows: dict[tuple[str, str], dict]) -> list[dict]:
         unknown = False
         source = sigs[-1]["source"]
         for sig in sigs:
-            value = sig.get("reset_at")
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            value = _reset_value(sig)
+            if value is None:
                 unknown = True
                 continue
             if reset is None or value > reset:
                 reset = value
                 source = sig["source"]
         if unknown:
-            reset = None
+            floor = now + c.PAST_RESET_FENCE_S
+            if reset is None or reset < floor:
+                reset = floor
         scope, model = sigs[-1]["scope"], sigs[-1].get("model")
         out.append(c.limit_signal(scope, source, model=model, reset_at=reset))
     return out
 
 
-def _reported(open_windows: dict[tuple[str, str], dict]) -> dict | None:
+def _reported(open_windows: dict[tuple[str, str], dict], *, now: float) -> dict | None:
     chosen = None
-    for signal in _grouped(open_windows):
+    for signal in _grouped(open_windows, now=now):
         chosen = c.prefer_limit(chosen, signal)
     return chosen
+
+
+def _reset_value(signal: dict) -> float | None:
+    value = signal.get("reset_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _later_reset(kept: dict, incoming: dict) -> dict:
+    """The exhausted signal whose reset is later. A missing reset does not shorten a known one."""
+
+    new_at, old_at = _reset_value(incoming), _reset_value(kept)
+    if new_at is not None and (old_at is None or new_at > old_at):
+        return incoming
+    return kept
+
+
+def _kinds_differ(new: tuple[str, float] | None, old: tuple[str, float] | None) -> bool:
+    """True when the stamps are not one order. Two missing stamps compare by local sequence."""
+
+    if new is None and old is None:
+        return False
+    if new is None or old is None:
+        return True
+    return new[0] != old[0]
 
 
 # Unverified stamp names. The first one present is the snapshot's order; a higher value is newer.

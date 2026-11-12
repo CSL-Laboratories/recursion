@@ -184,6 +184,33 @@ class ClaudeCodeTest(unittest.TestCase):
         self.assertEqual(refused["code"], c.BREAKER_OPEN)
         self.assertEqual(refused["retry_at"], 1_000.0 + month)
 
+    def test_an_absurd_vendor_reset_is_capped_at_the_open_ceiling(self) -> None:
+        # Year 9999, a millisecond epoch, and 1e308 must not fence past the default ceiling.
+        # A 30-day translated reset still sits under that ceiling.
+        ceiling = 40 * 24 * 3600
+        year_9999 = 253370764800.0  # 9999-01-01T00:00:00Z
+        cases = ("year-9999", "millisecond-epoch", "huge")
+        epochs = {"year-9999": year_9999, "huge": 1e308}
+        for name in cases:
+            with self.subTest(name=name):
+                mono, wall = FakeClock(1_000.0), FakeClock(1_700_000_000.0)
+                epoch = wall.now * 1000 if name == "millisecond-epoch" else epochs[name]
+                launcher = FakeLauncher([claude_limit(reset_at=epoch), claude_ok("probed")], mono)
+                adapter = ClaudeCodeAdapter(launcher, mono, credentials, PARENT_ENV, wall_clock=wall)
+                service = RouteService({"claude_code": adapter}, ConnectionBreaker(mono), mono)
+                res = service.handle(request())
+                self.assertEqual(res["code"], c.PLAN_LIMIT)
+                self.assertEqual(res["retry_at"], 1_000.0 + ceiling)
+                mono.advance(ceiling - 1)
+                early = service.handle(request(rid="early"))
+                self.assertEqual(early["code"], c.BREAKER_OPEN)
+                self.assertEqual(len(launcher.calls), 1)
+                mono.advance(1)
+                probe = service.handle(request(rid="probe"))
+                self.assertEqual(probe["text"], "probed")
+                self.assertEqual(probe["breaker_effect"], "closed")
+                self.assertEqual(len(launcher.calls), 2)
+
     def test_limit_without_reset_tells_the_user_the_cooldown(self) -> None:
         h = Harness([[{"type": "result", "subtype": "error", "is_error": True, "error": "rate_limit"}]])
         res = h.handle(request(limits={"on_limit": "wait"}))

@@ -194,6 +194,44 @@ class BreakerTest(unittest.TestCase):
         self.assertEqual(refused["code"], c.BREAKER_OPEN)
         self.assertEqual(refused["retry_at"] - self.clock(), month - 8 * 24 * 3600)
 
+    def test_max_open_s_bounds_a_vendor_reset_and_keeps_a_shorter_one(self) -> None:
+        # The argument is the ceiling. A reset inside it is the window; a longer one is cut to it.
+        clock = FakeClock()
+        breaker = ConnectionBreaker(clock, cooldown_s=300, max_open_s=10)
+        now = clock()
+        short = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "t", reset_at=now + 5)}
+        breaker.record("subscription:S", "m", "t1", short)
+        self.assertEqual(breaker.admit("subscription:S", "m", "t1")["retry_at"], now + 5)
+        exact = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "t", reset_at=now + 10)}
+        breaker.record("subscription:E", "m", "t1", exact)
+        self.assertEqual(breaker.admit("subscription:E", "m", "t1")["retry_at"], now + 10)
+        long = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "t", reset_at=now + 5000)}
+        breaker.record("subscription:L", "m", "t1", long)
+        refused = breaker.admit("subscription:L", "m", "t1")
+        self.assertEqual(refused["retry_at"], now + 10)
+        clock.advance(9)
+        self.assertEqual(breaker.admit("subscription:L", "m", "t1")["code"], c.BREAKER_OPEN)
+        clock.advance(1)
+        self.assertTrue(breaker.admit("subscription:L", "m", "t1")["probe"])
+
+    def test_a_stale_absurd_reset_is_capped_and_a_probe_is_eventually_admitted(self) -> None:
+        # The replacement probe's success must not be stuck behind a stale token's unbounded reset.
+        clock = FakeClock()
+        breaker = ConnectionBreaker(clock, cooldown_s=300, max_open_s=10, probe_lease_s=150)
+        breaker.record("subscription:A", "m", "t1", LIMIT)
+        clock.advance(300)
+        first = breaker.admit("subscription:A", "m", "t1")["probe"]
+        clock.advance(150)
+        second = breaker.admit("subscription:A", "m", "t1")["probe"]
+        outcome = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "stale", reset_at=clock() + 1e12)}
+        self.assertEqual(breaker.record("subscription:A", "m", "t1", outcome, first), "opened")
+        self.assertEqual(outcome["retry_at"] - clock(), 10)
+        self.assertEqual(breaker.record("subscription:A", "m", "t1", {"code": None}, second), "probe_released")
+        clock.advance(9)
+        self.assertEqual(breaker.admit("subscription:A", "m", "t1")["code"], c.BREAKER_OPEN)
+        clock.advance(1)
+        self.assertTrue(breaker.admit("subscription:A", "m", "t1")["probe"])
+
     def test_connection_id_containing_the_model_marker_does_not_collide(self) -> None:
         # String keys "A" + "#model:" + "b#model:c" and "A#model:b" + "#model:" + "c" used to be one slot.
         model_limit = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("model", "t", model="b#model:c")}

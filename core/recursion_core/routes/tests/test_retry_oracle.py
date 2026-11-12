@@ -29,7 +29,9 @@ from recursion_core.routes.tests.fakes import (
 CONN = "subscription:A"
 COOLDOWN = 300
 MAX_COOLDOWN = 3600
-MAX_OPEN = 8 * 24 * 3600
+# Same bound as ConnectionBreaker's default max_open_s: above a 30-day translated
+# reset, so that window is not cut, and the clamp for an absurd instant.
+MAX_OPEN = 40 * 24 * 3600
 SHORT = 60
 # Consecutive limit incidents with no vendor reset. A repeat while the window is still open is not
 # a new incident, so it does not appear here.
@@ -114,6 +116,8 @@ class BreakerOracleTest(unittest.TestCase):
             (100, 500, 500),   # a later vendor reset extends the same incident
             (500, 100, 500),   # an earlier one does not shorten it
             (30 * 24 * 3600, None, 30 * 24 * 3600),  # a translated reset past 8 days is not cut down
+            (10**12, None, MAX_OPEN),  # an absurd reset is clamped to the ceiling
+            (100, 10**12, MAX_OPEN),  # a later absurd reset extends only up to the ceiling
         )
         for first, second, delay in rows:
             with self.subTest(first=first, second=second):

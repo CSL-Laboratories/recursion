@@ -17,7 +17,8 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   usage limit and never offered as a switch point. Open and half-open keys are checked first, so a
   short fault never hides a real limit on the same connection from that tenant.
 * It always recovers. An open key has a finite ``open_until`` (the signal's ``reset_at`` when that
-  instant is still in the future; otherwise a cooldown with backoff up to ``max_cooldown_s``).
+  instant is still in the future, capped at ``max_open_s``; otherwise a cooldown with backoff up to
+  ``max_cooldown_s``).
   Repeated typed limits while that window still holds are one incident: they do not stack the
   failure count or extend a cooldown that has no later vendor reset. A probe admitted after the
   window, whose own result is a limit, is the next incident and doubles the cooldown.
@@ -51,6 +52,11 @@ from recursion_core.routes import contract as c
 
 CLOSED, OPEN, HALF_OPEN = "closed", "open", "half_open"
 
+# Above a 30-day translated window, inside a 35-45 day band. A later vendor instant is clamped
+# here: a year-9999 reset, a 1e308 epoch, or a millisecond epoch (wall*1000) must not fence
+# until that instant. Callers override it with max_open_s, and that argument is the ceiling.
+_DEFAULT_MAX_OPEN_S = 40 * 24 * 3600.0
+
 
 class ConnectionBreaker:
     def __init__(
@@ -59,7 +65,7 @@ class ConnectionBreaker:
         *,
         cooldown_s: float = 300.0,
         max_cooldown_s: float = 3600.0,
-        max_open_s: float = 8 * 24 * 3600.0,  # retained for callers; a future reset_at is not clamped to it
+        max_open_s: float = _DEFAULT_MAX_OPEN_S,
         probe_lease_s: float = 150.0,
         short_fault_s: float = 60.0,
         probe_grace_s: float = 30.0,
@@ -189,18 +195,20 @@ class ConnectionBreaker:
         self._release(probe, now)
         rec = self._keys.setdefault(slot, {"state": CLOSED, "failures": 0, "probe": None, "lease_until": None})
         reset_at = signal.get("reset_at")
-        # reset_at is already on this clock. A future instant is the whole window, including one
-        # longer than max_open_s. Clamping a 30-day translated reset admitted a probe on day 8.
+        # reset_at is already on this clock. A future instant is the window, capped at max_open_s.
+        # The default sits above a 30-day translated reset. A later instant, including one that
+        # looks like a millisecond epoch, clamps to the ceiling so a probe is eventually admitted.
+        bounded = self._cap_reset(reset_at, now)
         open_until = rec.get("open_until")
         if rec["state"] == OPEN and isinstance(open_until, (int, float)) and now < open_until:
             # One incident per open window. A later vendor reset can extend it; a cooldown is not stacked.
-            if reset_at is not None and reset_at > open_until:
-                rec["open_until"] = reset_at
+            if bounded is not None and bounded > open_until:
+                rec["open_until"] = bounded
             rec["source"] = signal["source"]
             return rec["open_until"]
         rec["failures"] += 1
         backoff = self._backoff(rec["failures"])
-        until = reset_at if reset_at is not None and reset_at > now else now + backoff
+        until = bounded if bounded is not None else now + backoff
         # A probe that is still inside its deadline keeps its lease. Clearing it here would let the
         # next admit start a second probe while the first run is still going.
         if _live_lease(rec, now):
@@ -208,6 +216,16 @@ class ConnectionBreaker:
         else:
             rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
         return until
+
+    def _cap_reset(self, reset_at: object, now: float) -> float | None:
+        """A future vendor reset on this clock, clamped to ``max_open_s``. None when it is not ahead."""
+
+        if not _future(reset_at, now):
+            return None
+        cap = now + float(self._max_open_s)
+        if reset_at > cap:
+            return cap
+        return float(reset_at)
 
     def _backoff(self, failures: int) -> float:
         """Cooldown for this incident. Doubling stops at the cap, before ``2**1024`` overflows float."""

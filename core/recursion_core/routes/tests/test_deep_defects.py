@@ -423,8 +423,10 @@ class LimitSignalAccountingTest(unittest.TestCase):
         self.assertIn("thread/start", methods)
 
     def test_an_exhausted_window_with_no_reset_is_not_cleared_when_its_sibling_resets(self) -> None:
-        # Secondary is exhausted and names no resetsAt. Borrowing primary's reset would
-        # drop that window when primary's instant passes, and the next request would run.
+        # Secondary is exhausted and names no resetsAt. That must not drop primary's known
+        # instant, and the fence is at least the cooldown and at least that instant.
+        # Primary is only +100s, so the fence is the 300s cooldown. It still holds after
+        # +100s, and one probe runs when the cooldown elapses.
         notes = [
             {"method": "account/rateLimits/updated", "params": {"rateLimits": {
                 "limitId": "codex",
@@ -435,7 +437,11 @@ class LimitSignalAccountingTest(unittest.TestCase):
         h = Harness([codex_script(notes=notes, turn=turn), codex_script("should-not-run")])
         res = h.handle(request(engine="codex", model="gpt-5"))
         self.assertEqual(res["code"], c.PLAN_LIMIT)
-        self.assertIsNone(res["limit"]["reset_at"])
+        now = 1_000_000.0
+        for fence in (res["limit"]["reset_at"], res["retry_at"]):
+            self.assertIsInstance(fence, (int, float))
+            self.assertGreaterEqual(fence, now + 300)  # at least the cooldown
+            self.assertGreaterEqual(fence, 1_000_100.0)  # at least the known reset
         h.clock.advance(101)  # past primary's reset, inside the cooldown fence
         blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
         self.assertEqual(blocked["code"], c.BREAKER_OPEN)
@@ -444,6 +450,30 @@ class LimitSignalAccountingTest(unittest.TestCase):
         probe = h.handle(request(rid="probe", engine="codex", model="gpt-5"))
         self.assertEqual(probe["text"], "should-not-run")
         self.assertEqual(probe["breaker_effect"], "closed")
+
+    def test_an_unknown_sibling_does_not_erase_a_known_later_reset(self) -> None:
+        # Primary is exhausted for 30 days. Secondary is exhausted and names no resetsAt.
+        # Dropping the known reset fences for the cooldown only, and the next turn runs.
+        month = 30 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_000.0 + month},
+                "secondary": {"usedPercent": 100}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_000.0 + month)
+        self.assertEqual(res["retry_at"], 1_000_000.0 + month)
+        h.clock.advance(300)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(h.launcher.calls), 1)
 
     def test_a_timestamped_read_does_not_beat_an_in_flight_generation(self) -> None:
         # The read carries a timestamp and the update carries generation. Those stamps
@@ -512,6 +542,109 @@ class LimitSignalAccountingTest(unittest.TestCase):
         methods = [m.get("method") for m in h.launcher.processes[0].sent]
         self.assertNotIn("turn/start", methods)
         self.assertIn("thread/start", methods)
+
+    def test_an_incomparable_exhausted_snapshot_does_not_shorten_a_known_reset(self) -> None:
+        # generation=10 is 30 days out. A timestamped exhausted read at +10s is a different
+        # stamp kind. Replacing the window lets the next turn run at +11s.
+        month = 30 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_000.0 + month}}}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "timestamp": 1,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_010.0}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_000.0 + month)
+        self.assertEqual(res["retry_at"], 1_000_000.0 + month)
+        h.clock.advance(11)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_an_unstamped_exhausted_read_does_not_drop_a_known_reset(self) -> None:
+        # The in-flight generation is 30 days out. An unstamped exhausted read with no
+        # resetsAt must not replace it with the cooldown, or the turn runs at +300s.
+        month = 30 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_000.0 + month}}}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "primary": {"usedPercent": 100}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_000.0 + month)
+        self.assertEqual(res["retry_at"], 1_000_000.0 + month)
+        h.clock.advance(300)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_an_incomparable_later_reset_extends_the_exhausted_window(self) -> None:
+        # Different stamp kinds still take the later reset. They must not keep only the first.
+        month = 30 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_010.0}}}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "timestamp": 1,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_000.0 + month}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_000.0 + month)
+        h.clock.advance(11)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_an_incomparable_exhausted_year_9999_is_capped(self) -> None:
+        # A healthy generation does not clear an incomparable exhausted window, and a
+        # year-9999 reset is bounded by the same ceiling as any other absurd vendor instant.
+        ceiling = 40 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "generation": 4, "primary": {"usedPercent": 10}}}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "timestamp": 9,
+                "primary": {"usedPercent": 100, "resetsAt": 253370764800.0}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("probed")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["retry_at"], 1_000_000.0 + ceiling)
+        h.clock.advance(ceiling - 1)
+        early = h.handle(request(rid="early", engine="codex", model="gpt-5"))
+        self.assertEqual(early["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(h.launcher.calls), 1)
+        h.clock.advance(1)
+        probe = h.handle(request(rid="probe", engine="codex", model="gpt-5"))
+        self.assertEqual(probe["text"], "probed")
+        self.assertEqual(len(h.launcher.calls), 2)
 
 
 class DeadlineLaunchTest(unittest.TestCase):

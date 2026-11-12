@@ -232,13 +232,21 @@ def _profile_family(engine: object, provider: str) -> str:
     return known.family if known is not None else provider
 
 
+# Same length as ConnectionBreaker's default cooldown. A vendor instant the host clock places in
+# the past is fenced for at least this long. The breaker then admits one probe; it does not treat
+# that instant as already clear.
+PAST_RESET_FENCE_S = 300.0
+
+
 def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], float]) -> float | None:
     """Translate a vendor Unix-epoch ``resetsAt`` onto ``clock``.
 
     ``clock`` is the breaker and deadline clock and may be monotonic. ``wall`` reads Unix epoch
     seconds (``time.time``). The same function for both leaves the number unchanged, which is what
-    the fakes do. A non-finite value, or a reset that is already past on ``clock``, becomes None so
-    the breaker uses its own cooldown instead of treating a real epoch as eight days away.
+    the fakes do. A positive ``epoch - wall`` is the vendor-stated duration and is not shortened.
+    When the host wall is ahead of the vendor instant, that duration is not positive: the result
+    is ``clock + PAST_RESET_FENCE_S`` rather than None, so the window stays fenced for at least the
+    cooldown and recovery is still one probe after the fence. A non-finite value is None.
     Both clocks are read once: a second read would move a monotonic clock forward and could reject
     a reset that was still in the future at the first read.
     """
@@ -246,8 +254,14 @@ def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], f
     if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(float(epoch)):
         return None
     now_clock, now_wall = clock(), wall()
-    translated = now_clock + (float(epoch) - now_wall)
-    if not math.isfinite(translated) or translated <= now_clock:
+    remaining = float(epoch) - now_wall
+    if not math.isfinite(remaining):
+        return None
+    if remaining <= 0:
+        translated = now_clock + PAST_RESET_FENCE_S
+    else:
+        translated = now_clock + remaining
+    if not math.isfinite(translated):
         return None
     return translated
 

@@ -422,6 +422,97 @@ class LimitSignalAccountingTest(unittest.TestCase):
         self.assertNotIn("turn/start", methods)
         self.assertIn("thread/start", methods)
 
+    def test_an_exhausted_window_with_no_reset_is_not_cleared_when_its_sibling_resets(self) -> None:
+        # Secondary is exhausted and names no resetsAt. Borrowing primary's reset would
+        # drop that window when primary's instant passes, and the next request would run.
+        notes = [
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_100},
+                "secondary": {"usedPercent": 100}}}},
+        ]
+        turn = {"id": "tu-1", "status": "failed", "error": {"message": "upstream error"}}
+        h = Harness([codex_script(notes=notes, turn=turn), codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertIsNone(res["limit"]["reset_at"])
+        h.clock.advance(101)  # past primary's reset, inside the cooldown fence
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(h.launcher.calls), 1)
+        h.clock.advance(199)  # cooldown elapsed: one probe, not a free admit before it
+        probe = h.handle(request(rid="probe", engine="codex", model="gpt-5"))
+        self.assertEqual(probe["text"], "should-not-run")
+        self.assertEqual(probe["breaker_effect"], "closed")
+
+    def test_a_timestamped_read_does_not_beat_an_in_flight_generation(self) -> None:
+        # The read carries a timestamp and the update carries generation. Those stamps
+        # are not the same kind, so the larger timestamp must not clear the exhausted update.
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_800}}}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "timestamp": 1_700_000_000, "primary": {"usedPercent": 10}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {
+                "id": "tu-1", "status": "failed", "error": {"message": "upstream error"}}}},
+        ]
+        h = Harness([script])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_800.0)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertNotIn("thread/start", methods)
+
+    def test_an_unstamped_read_does_not_clear_an_earlier_generation(self) -> None:
+        # The exhausted update is generation 9 and arrived before the read was sent.
+        # Local sequence would let the later unstamped healthy read win. It must not:
+        # a healthy snapshot clears an exhausted one only when it is newer by the same stamp kind.
+        script = [
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 9,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_800}}}},
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"id": 2, "result": {"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 10}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {
+                "id": "tu-1", "status": "failed", "error": {"message": "upstream error"}}}},
+        ]
+        h = Harness([script])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_800.0)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertNotIn("thread/start", methods)
+
+    def test_an_equal_generation_exhausted_update_beats_an_earlier_healthy_read(self) -> None:
+        # Equal stamps are a tie. The exhausted update applies; the healthy read does not win it.
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "generation": 5, "primary": {"usedPercent": 10}}}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 5,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_800}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {
+                "id": "tu-1", "status": "failed", "error": {"message": "upstream error"}}}},
+        ]
+        h = Harness([script])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_800.0)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertIn("thread/start", methods)
+
 
 class DeadlineLaunchTest(unittest.TestCase):
     def test_a_launch_that_passes_the_deadline_does_not_write_stdin(self) -> None:

@@ -16,8 +16,8 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   that fence holds is itself ``SHORT_FAULT``, not ``BREAKER_OPEN``, so it is never reported as a
   usage limit and never offered as a switch point. Open and half-open keys are checked first, so a
   short fault never hides a real limit on the same connection from that tenant.
-* It always recovers. An open key has a finite ``open_until`` (the signal's ``reset_at`` when it
-  carries one, capped at ``max_open_s``; otherwise a cooldown with backoff up to ``max_cooldown_s``).
+* It always recovers. An open key has a finite ``open_until`` (the signal's ``reset_at`` when that
+  instant is still in the future; otherwise a cooldown with backoff up to ``max_cooldown_s``).
   Repeated typed limits while that window still holds are one incident: they do not stack the
   failure count or extend a cooldown that has no later vendor reset. A probe admitted after the
   window, whose own result is a limit, is the next incident and doubles the cooldown.
@@ -33,7 +33,8 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   window opened under the lease. A refusal reports the open window that lasts longest, so a probe
   on one slot cannot hide a longer limit on another. ``reset`` closes at once. A probe token is booked
   once. A second ``record`` for that token, or a record whose token is no longer the current probe,
-  changes nothing: a late limit must not clear the lease a newer probe holds.
+  does not release or replace the probe a newer lease holds. A limit on that stale token whose
+  ``reset_at`` is still in the future still opens or extends the window.
 
 The cooldown, lease and short-fault numbers are uncalibrated defaults (PRODUCT.md 11.2, B-10);
 this module does not claim to have measured anything. It is thread-safe: one lock guards all
@@ -58,7 +59,7 @@ class ConnectionBreaker:
         *,
         cooldown_s: float = 300.0,
         max_cooldown_s: float = 3600.0,
-        max_open_s: float = 8 * 24 * 3600.0,
+        max_open_s: float = 8 * 24 * 3600.0,  # retained for callers; a future reset_at is not clamped to it
         probe_lease_s: float = 150.0,
         short_fault_s: float = 60.0,
         probe_grace_s: float = 30.0,
@@ -153,9 +154,16 @@ class ConnectionBreaker:
         code = outcome.get("code")
         with self._lock:
             now = self._clock()
-            # Once, and only for the probe that still holds the lease. A replay or a stale token must
-            # not stack a failure or wipe the probe that replaced it.
+            # A replay or a stale token must not release the probe that replaced it or stack a
+            # failure that has no future vendor reset. A limit whose reset is still ahead still
+            # opens or extends that window; the token itself is not the current lease.
             if probe is not None and self._find_probe(probe) is None:
+                signal = outcome.get("limit")
+                reset_at = signal.get("reset_at") if isinstance(signal, dict) else None
+                if code == c.PLAN_LIMIT and _is_signal(signal) and _future(reset_at, now):
+                    until = self._open(connection, signal, now, None)
+                    outcome["retry_at"] = until
+                    return "opened"
                 return "none"
             if code == c.PLAN_LIMIT and _is_signal(outcome.get("limit")):
                 until = self._open(connection, outcome["limit"], now, probe)
@@ -181,18 +189,18 @@ class ConnectionBreaker:
         self._release(probe, now)
         rec = self._keys.setdefault(slot, {"state": CLOSED, "failures": 0, "probe": None, "lease_until": None})
         reset_at = signal.get("reset_at")
-        # reset_at is already on this clock. A raw vendor epoch that was not translated is far past
-        # now + max_open_s and is capped here; adapters translate so a real reset is not the cap.
+        # reset_at is already on this clock. A future instant is the whole window, including one
+        # longer than max_open_s. Clamping a 30-day translated reset admitted a probe on day 8.
         open_until = rec.get("open_until")
         if rec["state"] == OPEN and isinstance(open_until, (int, float)) and now < open_until:
             # One incident per open window. A later vendor reset can extend it; a cooldown is not stacked.
             if reset_at is not None and reset_at > open_until:
-                rec["open_until"] = min(reset_at, now + self._max_open_s)
+                rec["open_until"] = reset_at
             rec["source"] = signal["source"]
             return rec["open_until"]
         rec["failures"] += 1
         backoff = self._backoff(rec["failures"])
-        until = min(reset_at, now + self._max_open_s) if reset_at is not None and reset_at > now else now + backoff
+        until = reset_at if reset_at is not None and reset_at > now else now + backoff
         # A probe that is still inside its deadline keeps its lease. Clearing it here would let the
         # next admit start a second probe while the first run is still going.
         if _live_lease(rec, now):

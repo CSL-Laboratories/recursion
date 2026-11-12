@@ -178,17 +178,21 @@ class BreakerTest(unittest.TestCase):
         self.clock.advance(3600)
         self.assertTrue(self.b.admit("subscription:A", "m", "t1")["admitted"])
 
-    def test_vendor_reset_time_is_used_and_capped(self) -> None:
+    def test_vendor_reset_time_is_used_and_not_cut_at_eight_days(self) -> None:
         sig = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "t", reset_at=self.clock() + 5000)}
         self.b.record("subscription:A", "m", "t1", sig)
         self.clock.advance(4999)
         self.assertEqual(self.b.admit("subscription:A", "m", "t1")["code"], c.BREAKER_OPEN)
         self.clock.advance(1)
         self.assertTrue(self.b.admit("subscription:A", "m", "t1")["admitted"])
-        far = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "t", reset_at=self.clock() + 10**12)}
+        # A 30-day translated reset is the window. Cutting it to max_open_s admitted a probe on day 8.
+        month = 30 * 24 * 3600
+        far = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "t", reset_at=self.clock() + month)}
         self.b.record("subscription:B", "m", "t1", far)
         self.clock.advance(8 * 24 * 3600)
-        self.assertTrue(self.b.admit("subscription:B", "m", "t1")["admitted"])
+        refused = self.b.admit("subscription:B", "m", "t1")
+        self.assertEqual(refused["code"], c.BREAKER_OPEN)
+        self.assertEqual(refused["retry_at"] - self.clock(), month - 8 * 24 * 3600)
 
     def test_connection_id_containing_the_model_marker_does_not_collide(self) -> None:
         # String keys "A" + "#model:" + "b#model:c" and "A#model:b" + "#model:" + "c" used to be one slot.

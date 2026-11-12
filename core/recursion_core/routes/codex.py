@@ -13,8 +13,12 @@ Typed limit signals:
   when that same window's ``usedPercent`` is a number under 100. An omitted window, or a percent
   that is not a number, is not a healthy reading and leaves the earlier window in place. Primary
   and secondary are separate windows, and a connection bucket does not erase a model bucket.
-  Snapshots that carry ``generation`` (or ``seq``, ``sequence``, ``timestamp``, ``capturedAt``,
-  ``updatedAt``, ``asOf``; names unverified) are ordered by that stamp. Otherwise an
+  An exhausted window with no numeric ``resetsAt`` is not cleared when the other window's reset
+  passes: the breaker fences it with its cooldown and a probe. Snapshots are ordered only when
+  they carry the same stamp kind (``generation``, or else ``seq``, ``sequence``, ``timestamp``,
+  ``capturedAt``, ``updatedAt``, ``asOf``; names unverified). A generation is not compared with a
+  timestamp. A healthy reading replaces an exhausted window only when it is strictly newer by that
+  same kind. A tie keeps the exhausted window. When neither snapshot carries a stamp, an
   ``account/rateLimits/updated`` received after ``account/rateLimits/read`` was sent wins over
   that read's result. Codex's default bucket (``limitId``
   ``codex``) is credential-wide. Any other ``limitId`` is the breaker model key itself: the requested
@@ -204,7 +208,8 @@ class _Rpc:
         """Fold one rate-limit snapshot into the windows still open.
 
         Each of primary and secondary is its own window. A reading replaces a window only when it
-        is newer than the one already kept. Healthy means a numeric usedPercent under 100 for that
+        is strictly newer by the same stamp kind, or by local sequence when neither side is stamped.
+        A tie keeps an exhausted window. Healthy means a numeric usedPercent under 100 for that
         same window. An omitted window, or a percent that is not a number, changes nothing.
         """
 
@@ -215,7 +220,7 @@ class _Rpc:
         if not present:
             return
         bucket = _bucket(snapshot)
-        vendor = _vendor_stamp(snapshot)
+        stamp = _vendor_stamp(snapshot)
         local = self._seq if local_seq is None else local_seq
         for name, raw in present.items():
             percent = _percent(raw.get("usedPercent"))
@@ -223,9 +228,12 @@ class _Rpc:
                 continue
             key = (bucket, name)
             prev = self._window_order.get(key)
-            if prev is not None and not _newer(vendor, local, prev[0], prev[1]):
+            rank = 0 if prev is None else _stamp_rank(stamp, local, prev[0], prev[1])
+            # Healthy replaces exhausted only when this snapshot is strictly newer by the same
+            # stamp kind. A tie, or a different kind, keeps the exhausted window.
+            if prev is not None and rank <= 0 and (percent < 100 or rank < 0):
                 continue
-            self._window_order[key] = (vendor, local)
+            self._window_order[key] = (stamp, local)
             if percent >= 100:
                 self._open_windows[key] = _window_signal(snapshot, source, self.adapter.vendor_reset(raw.get("resetsAt")))
             else:
@@ -272,7 +280,11 @@ def _window_signal(snapshot: dict, source: str, reset_at: float | None) -> dict:
 
 
 def _grouped(open_windows: dict[tuple[str, str], dict]) -> list[dict]:
-    """One signal per scope and model. The reset is the latest still-exhausted window on that key."""
+    """One signal per scope and model. The reset is the latest still-exhausted window on that key.
+
+    A window with no numeric reset is not given its sibling's instant. The grouped signal then
+    carries no reset, and the breaker fences it with its cooldown and a probe.
+    """
 
     grouped: dict[tuple, list[dict]] = {}
     for signal in open_windows.values():
@@ -280,14 +292,18 @@ def _grouped(open_windows: dict[tuple[str, str], dict]) -> list[dict]:
     out: list[dict] = []
     for sigs in grouped.values():
         reset = None
+        unknown = False
         source = sigs[-1]["source"]
         for sig in sigs:
             value = sig.get("reset_at")
             if isinstance(value, bool) or not isinstance(value, (int, float)):
+                unknown = True
                 continue
             if reset is None or value > reset:
                 reset = value
                 source = sig["source"]
+        if unknown:
+            reset = None
         scope, model = sigs[-1]["scope"], sigs[-1].get("model")
         out.append(c.limit_signal(scope, source, model=model, reset_at=reset))
     return out
@@ -304,12 +320,14 @@ def _reported(open_windows: dict[tuple[str, str], dict]) -> dict | None:
 _STAMP_KEYS = ("generation", "seq", "sequence", "timestamp", "capturedAt", "updatedAt", "asOf")
 
 
-def _vendor_stamp(snapshot: dict) -> float | None:
+def _vendor_stamp(snapshot: dict) -> tuple[str, float] | None:
+    """The first numeric stamp and its field name. Different names are not one order."""
+
     for key in _STAMP_KEYS:
         value = snapshot.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             continue
-        return float(value)
+        return key, float(value)
     return None
 
 
@@ -321,10 +339,27 @@ def _percent(value: object) -> float | None:
     return float(value)
 
 
-def _newer(new_vendor: float | None, new_local: int, old_vendor: float | None, old_local: int) -> bool:
-    if new_vendor is not None and old_vendor is not None:
-        return new_vendor > old_vendor
-    return new_local > old_local
+def _stamp_rank(new: tuple[str, float] | None, new_local: int,
+                old: tuple[str, float] | None, old_local: int) -> int:
+    """1 when ``new`` is strictly newer, -1 when it is strictly older, 0 on a tie or a mismatch.
+
+    The same stamp kind is ordered by its value. Two snapshots with no stamp use local sequence.
+    A generation is not newer than a timestamp just because its number is larger, and the reverse.
+    """
+
+    if new is not None and old is not None and new[0] == old[0]:
+        if new[1] > old[1]:
+            return 1
+        if new[1] < old[1]:
+            return -1
+        return 0
+    if new is None and old is None:
+        if new_local > old_local:
+            return 1
+        if new_local < old_local:
+            return -1
+        return 0
+    return 0
 
 
 def _object(value: object, what: str) -> dict:

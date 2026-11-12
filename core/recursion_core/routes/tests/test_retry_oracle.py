@@ -113,7 +113,7 @@ class BreakerOracleTest(unittest.TestCase):
             (500, None, 500),
             (100, 500, 500),   # a later vendor reset extends the same incident
             (500, 100, 500),   # an earlier one does not shorten it
-            (10**12, None, MAX_OPEN),
+            (30 * 24 * 3600, None, 30 * 24 * 3600),  # a translated reset past 8 days is not cut down
         )
         for first, second, delay in rows:
             with self.subTest(first=first, second=second):
@@ -172,15 +172,25 @@ class BreakerOracleTest(unittest.TestCase):
         self.clock.advance(150)  # lease expired
         second = self._admit()["probe"]
         self.assertNotEqual(first, second)
-        # The late limit from the expired probe must not clear the live lease or stack a failure.
+        # A stale success, or a limit with no future reset, must not clear the live lease or stack a failure.
+        self.assertEqual(self.b.record(CONN, "m", "t1", {"code": None}, first), "none")
         self.assertEqual(self.b.record(CONN, "m", "t1", {"code": c.PLAN_LIMIT, "limit": _limit("connection")}, first),
                          "none")
         self.assertEqual(self._admit()["code"], c.PROBE_IN_FLIGHT)
-        # The live probe's success closes. A replay of that token does not reopen.
-        self.assertEqual(self.b.record(CONN, "m", "t1", {"code": None}, second), "closed")
+        # A limit with a future reset, booked on the expired probe's token, still opens the window.
+        # It must not release the probe the replacement holds.
+        reset_at = self.clock() + 500
+        effect, outcome = self._record(c.PLAN_LIMIT, _limit("connection", reset_at=reset_at), probe=first)
+        self.assertEqual(effect, "opened")
+        self.assertEqual(outcome["retry_at"], reset_at)
+        self.assertEqual(self.b.record(CONN, "m", "t1", {"code": None}, second), "probe_released")
         self.assertEqual(self.b.record(CONN, "m", "t1", {"code": None}, second), "none")
-        self.assertEqual(self.b.state(CONN), "closed")
-        self.assertIsNone(self._admit()["probe"])
+        refused = self._admit()
+        self.assertEqual((refused["code"], refused["retry_at"]), (c.BREAKER_OPEN, reset_at))
+        self.clock.advance(499)
+        self.assertEqual(self._admit()["code"], c.BREAKER_OPEN)
+        self.clock.advance(1)
+        self.assertTrue(self._admit()["probe"])
 
     def test_opus_family_is_a_token_not_a_substring(self) -> None:
         self._record(c.PLAN_LIMIT, _limit("model", model="opus"), model="claude-opus-4")

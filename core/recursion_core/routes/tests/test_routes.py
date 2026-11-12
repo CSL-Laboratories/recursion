@@ -148,6 +148,42 @@ class ClaudeCodeTest(unittest.TestCase):
         refused = service.handle(request(rid="r2"))
         self.assertEqual((refused["code"], refused["retry_at"]), (c.BREAKER_OPEN, 1_300.0))
 
+    def test_a_past_vendor_reset_stays_fenced_for_at_least_the_cooldown(self) -> None:
+        # The host wall is ahead of the vendor instant, so the translated reset is in the past.
+        # Dropping it would let the next probe close the key. Fence for the cooldown, then one probe.
+        mono, wall = FakeClock(1_000.0), FakeClock(1_700_000_000.0)
+        launcher = FakeLauncher([claude_limit(reset_at=wall.now - 100.0), claude_ok("probed")], mono)
+        adapter = ClaudeCodeAdapter(launcher, mono, credentials, PARENT_ENV, wall_clock=wall)
+        service = RouteService({"claude_code": adapter}, ConnectionBreaker(mono), mono)
+        res = service.handle(request())
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        floor = 1_000.0 + 300.0
+        self.assertGreaterEqual(res["limit"]["reset_at"], floor)
+        self.assertGreaterEqual(res["retry_at"], floor)
+        mono.advance(299)
+        early = service.handle(request(rid="early"))
+        self.assertEqual(early["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(launcher.calls), 1)
+        mono.advance(1)
+        probe = service.handle(request(rid="probe"))
+        self.assertEqual(probe["text"], "probed")
+        self.assertEqual(probe["breaker_effect"], "closed")
+        self.assertEqual(len(launcher.calls), 2)
+
+    def test_a_thirty_day_translated_reset_is_not_cut_to_eight_days(self) -> None:
+        mono, wall = FakeClock(1_000.0), FakeClock(1_700_000_000.0)
+        month = 30 * 24 * 3600
+        launcher = FakeLauncher([claude_limit(reset_at=wall.now + month)], mono)
+        adapter = ClaudeCodeAdapter(launcher, mono, credentials, PARENT_ENV, wall_clock=wall)
+        service = RouteService({"claude_code": adapter}, ConnectionBreaker(mono), mono)
+        res = service.handle(request())
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000.0 + month)
+        mono.advance(8 * 24 * 3600)
+        refused = service.handle(request(rid="r2"))
+        self.assertEqual(refused["code"], c.BREAKER_OPEN)
+        self.assertEqual(refused["retry_at"], 1_000.0 + month)
+
     def test_limit_without_reset_tells_the_user_the_cooldown(self) -> None:
         h = Harness([[{"type": "result", "subtype": "error", "is_error": True, "error": "rate_limit"}]])
         res = h.handle(request(limits={"on_limit": "wait"}))

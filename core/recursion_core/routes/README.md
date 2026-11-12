@@ -44,13 +44,15 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   short fault never hides a real limit on the same connection from that tenant.
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
   request only and the breaker is not told. Other engine failures are request-local too.
-- Recovery: an open key always has a finite end (`reset_at` on the breaker clock, capped; otherwise a
-  300 s cooldown doubling to 3600 s). Another typed limit while that window still holds is the same
+- Recovery: an open key always has a finite end (`reset_at` on the breaker clock when that instant
+  is still in the future, including one longer than eight days; otherwise a 300 s cooldown doubling
+  to 3600 s). Another typed limit while that window still holds is the same
   incident: it does not stack the cooldown. A probe that runs after the window and hits a limit again
-  is the next incident. A probe token is booked once; a late record for a token that is no longer
-  current does not change the key. Vendor `resetsAt` is Unix epoch and is translated onto that clock
-  (one sample of each clock) before it is stored, so a monotonic deadline clock does not turn one
-  limit into an 8-day fence.
+  is the next incident. A probe token is booked once. A late record for a token that is no longer
+  current does not release the probe that replaced it; a limit on that token with a future reset
+  still opens or extends the window. Vendor `resetsAt` is Unix epoch and is translated onto that clock
+  (one sample of each clock) before it is stored. A positive duration is not shortened. A reset the
+  host clock places in the past is fenced for at least the cooldown, then one probe.
   Then one leased half-open probe at a time (lease = the time still left on the request's deadline
   plus 30 s, 11.2 C1-18; 150 s only when no deadline is given); success closes, a limit
   reopens, a lease that expires lets the next request probe; `reset()` closes at once. These numbers are

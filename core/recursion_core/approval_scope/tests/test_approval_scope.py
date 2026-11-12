@@ -526,7 +526,9 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(len(auth._requests), requests_before)
                 self.assertEqual(len(auth._grants), grants_before)
                 if name == "show":
-                    self.assertNotIn(device.token_id, auth._requests[opened.request_id].shown)
+                    shown = auth._requests[opened.request_id].shown
+                    self.assertNotIn(device.serial, shown)
+                    self.assertEqual(shown, set())
 
     def test_revoked_token_id_is_not_reissued(self) -> None:
         scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)

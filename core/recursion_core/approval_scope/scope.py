@@ -95,21 +95,28 @@ class Credential:
 
 
 class CredentialRegistry:
-    """Mints credentials and resolves only the ones it minted and has not revoked."""
+    """Mints credentials and resolves only the ones it minted and has not revoked.
+
+    A token id is never minted again, including after ``revoke``. The registry lock
+    stays held across an authority commit so a revoke cannot land after a successful
+    check and before that commit.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._issued: dict[str, Credential] = {}
+        self._minted: set[str] = set()
 
     def issue(self, principal: str, kind: str, scopes: object) -> Credential:
         if type(scopes) not in (set, frozenset):
             raise Refused("credential_scopes")
         with self._lock:
             token_id = secrets.token_hex(16)
-            while token_id in self._issued:
+            while token_id in self._minted:
                 token_id = secrets.token_hex(16)
             credential = Credential(token_id=token_id, principal=principal, kind=kind,
                                     scopes=frozenset(scopes))
+            self._minted.add(token_id)
             self._issued[token_id] = credential
         return credential
 
@@ -122,19 +129,38 @@ class CredentialRegistry:
         if type(credential) is not Credential:
             raise Refused("credential_type")
         with self._lock:
-            # Identity, not equality: equal fields copied from a wire scope's holder do
-            # not make a credential this registry issued.
-            if self._issued.get(credential.token_id) is not credential:
-                raise Refused("credential_unknown")
+            self._require_current(credential)
         return credential
 
+    def _call_if_current(self, credential: object, fn):
+        """Call ``fn(credential)`` while revoke cannot retire that object.
 
-def _check_approver(registry: CredentialRegistry, credential: object) -> Credential:
-    credential = registry.resolve(credential)
+        The registry lock is held for the whole call. ``fn`` must not call back into
+        this registry: the lock is not reentrant.
+        """
+        if type(credential) is not Credential:
+            raise Refused("credential_type")
+        with self._lock:
+            self._require_current(credential)
+            return fn(credential)
+
+    def _require_current(self, credential: Credential) -> None:
+        # Identity, not equality: equal fields copied from a wire scope's holder do
+        # not make a credential this registry issued. Caller holds ``self._lock``.
+        if self._issued.get(credential.token_id) is not credential:
+            raise Refused("credential_unknown")
+
+
+def _require_approver(credential: Credential) -> None:
     if credential.kind not in APPROVER_KINDS:
         raise Refused("principal_not_approver", credential.kind)
     if "approve" not in credential.scopes:
         raise Refused("approval_scope_required")
+
+
+def _check_approver(registry: CredentialRegistry, credential: object) -> Credential:
+    credential = registry.resolve(credential)
+    _require_approver(credential)
     return credential
 
 
@@ -251,8 +277,10 @@ class ApprovalAuthority:
             raise Refused("open_scope_required")
         if type(request) is not ApprovalRequest:
             raise Refused("request_type")
-        with self._lock:
-            now = self._now()
+
+        def commit(opener: Credential, now: int) -> OpenedRequest:
+            if "control" not in opener.scopes:
+                raise Refused("open_scope_required")
             if request.expires_at <= now:
                 raise Refused("request_expired")
             held = sum(1 for e in self._requests.values()
@@ -264,41 +292,56 @@ class ApprovalAuthority:
             request_id = secrets.token_hex(16)
             while request_id in self._requests:
                 request_id = secrets.token_hex(16)
-            request = replace(request, request_id=request_id)
+            opened = replace(request, request_id=request_id)
             # Render before registering: a request whose prompt cannot be drawn is not open.
-            text = render_prompt(request, opener.principal)
-            self._requests[request_id] = _Request(request, opener.principal, text)
-        return OpenedRequest(request, text)
+            text = render_prompt(opened, opener.principal)
+            self._requests[request_id] = _Request(opened, opener.principal, text)
+            return OpenedRequest(opened, text)
+
+        with self._lock:
+            now = self._now()
+            return self._registry._call_if_current(credential, lambda opener: commit(opener, now))
 
     def pending(self, credential: object) -> list[dict]:
         """The approver's inbox: every open, unexpired request with the prompt the core drew.
 
         Each listed prompt counts as shown to ``credential``.
         """
-        viewer = _check_approver(self._registry, credential)
-        with self._lock:
-            now = self._now()
+        _check_approver(self._registry, credential)
+
+        def commit(viewer: Credential, now: int) -> list[dict]:
+            _require_approver(viewer)
             out = []
             for rid, entry in self._requests.items():
                 if entry.state != "pending" or entry.request.expires_at <= now:
                     continue
                 entry.shown.add(viewer.token_id)
                 out.append(self._inbox_item(rid, entry))
-        return out
+            return out
+
+        with self._lock:
+            now = self._now()
+            return self._registry._call_if_current(credential, lambda viewer: commit(viewer, now))
 
     def show(self, credential: object, request_id: object) -> dict:
         """Return one open request's core-drawn prompt to an approver and record it shown."""
-        viewer = _check_approver(self._registry, credential)
-        with self._lock:
+        _check_approver(self._registry, credential)
+
+        def commit(viewer: Credential, now: int) -> dict:
+            _require_approver(viewer)
             entry = self._requests.get(request_id) if type(request_id) is str else None
             if entry is None:
                 raise Refused("request_unknown")
             if entry.state != "pending":
                 raise Refused("request_answered")
-            if entry.request.expires_at <= self._now():
+            if entry.request.expires_at <= now:
                 raise Refused("request_expired")
             entry.shown.add(viewer.token_id)
             return self._inbox_item(request_id, entry)
+
+        with self._lock:
+            now = self._now()
+            return self._registry._call_if_current(credential, lambda viewer: commit(viewer, now))
 
     @staticmethod
     def _inbox_item(request_id: str, entry: _Request) -> dict:
@@ -312,13 +355,14 @@ class ApprovalAuthority:
         Each request's prompt must already have been shown to ``credential`` through
         ``pending`` or ``show``; otherwise the grant refuses with ``prompt_not_shown``.
         """
-        holder = _check_approver(self._registry, credential)
+        _check_approver(self._registry, credential)
         if type(ttl_seconds) is not int or ttl_seconds <= 0:
             raise Refused("scope_ttl")
         if type(request_ids) not in (list, tuple) or not request_ids:
             raise Refused("scope_bindings")
-        with self._lock:
-            now = self._now()
+
+        def commit(holder: Credential, now: int) -> ApprovalScope:
+            _require_approver(holder)
             pairs = []
             expires_at = now + ttl_seconds
             for rid in request_ids:
@@ -333,10 +377,17 @@ class ApprovalAuthority:
                     raise Refused("prompt_not_shown")
                 pairs.append((rid, entry.request.digest))
                 expires_at = min(expires_at, entry.request.expires_at)
-            scope = ApprovalScope(scope_id=secrets.token_hex(16), holder=holder.token_id,
+            scope_id = secrets.token_hex(16)
+            while scope_id in self._grants:
+                scope_id = secrets.token_hex(16)
+            scope = ApprovalScope(scope_id=scope_id, holder=holder.token_id,
                                   bindings=tuple(sorted(pairs)), expires_at=expires_at)
             self._grants[scope.scope_id] = _Grant(scope)
-        return scope
+            return scope
+
+        with self._lock:
+            now = self._now()
+            return self._registry._call_if_current(credential, lambda holder: commit(holder, now))
 
     def approve(self, credential: object, scope_id: str, request_id: str, digest: str) -> dict:
         return self._decide(credential, scope_id, request_id, digest, "approved")
@@ -355,11 +406,12 @@ class ApprovalAuthority:
 
     def _decide(self, credential: object, scope_id: object, request_id: object,
                 digest: object, outcome: str) -> dict:
-        holder = _check_approver(self._registry, credential)
+        _check_approver(self._registry, credential)
         if type(digest) is not str or not _HEX64.fullmatch(digest):
             raise Refused("digest_form")
-        with self._lock:
-            now = self._now()
+
+        def commit(holder: Credential, now: int) -> dict:
+            _require_approver(holder)
             grant = self._grants.get(scope_id) if type(scope_id) is str else None
             if grant is None:
                 raise Refused("scope_unknown")
@@ -383,5 +435,9 @@ class ApprovalAuthority:
             grant.used.add(request_id)
             entry.state = outcome
             return {"request_id": request_id, "digest": bound, "outcome": outcome,
-                    "principal": holder.principal, "requester": entry.requester, "scope_id": scope.scope_id,
-                    "decided_at": now}
+                    "principal": holder.principal, "requester": entry.requester,
+                    "scope_id": scope.scope_id, "decided_at": now}
+
+        with self._lock:
+            now = self._now()
+            return self._registry._call_if_current(credential, lambda holder: commit(holder, now))

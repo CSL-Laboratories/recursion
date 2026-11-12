@@ -14,6 +14,7 @@ from recursion_core.approval_scope import (ApprovalAuthority, ApprovalRequest, A
                                            Credential, CredentialRegistry, Refused,
                                            render_prompt, sanitize)
 from recursion_core.approval_scope import prompt as prompt_mod
+from recursion_core.approval_scope import scope as scope_mod
 from recursion_core.approval_scope.canonical import canonical
 from recursion_core.approval_scope.prompt import MAX_EFFECT_BYTES, MAX_EXPIRES_AT
 from recursion_core.approval_scope.scope import MAX_OPEN_PER_OPENER
@@ -477,6 +478,120 @@ class ScopeTests(unittest.TestCase):
         with self.assertRaises(Refused) as ctx:
             ApprovalAuthority(self.clock, object())
         self.assertEqual(ctx.exception.code, "registry_type")
+
+    def test_revoke_after_resolve_cannot_commit(self) -> None:
+        # resolve() releases the registry lock before the authority commits. A revoke in
+        # that window has to win: the call refuses and does not change authority state.
+        for name in ("approve", "deny", "open", "grant", "show", "pending"):
+            with self.subTest(name=name):
+                clock = Clock()
+                registry = CredentialRegistry()
+                auth = ApprovalAuthority(clock, registry)
+                plugin = cred(registry, "plugin", {"control"})
+                opened = auth.open(plugin, request())
+                device = cred(registry, "paired_device", {"approve"})
+                scope = None
+                if name in ("approve", "deny"):
+                    scope = grant(auth, device, [opened.request_id], ttl_seconds=60)
+                elif name == "grant":
+                    auth.show(device, opened.request_id)
+                requests_before = len(auth._requests)
+                grants_before = len(auth._grants)
+                real = registry.resolve
+
+                def resolve_then_revoke(credential, _real=real, _registry=registry):
+                    found = _real(credential)
+                    _registry.revoke(found.token_id)
+                    return found
+
+                registry.resolve = resolve_then_revoke
+                try:
+                    with self.assertRaises(Refused) as ctx:
+                        if name == "approve":
+                            auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+                        elif name == "deny":
+                            auth.deny(device, scope.scope_id, opened.request_id, opened.digest)
+                        elif name == "open":
+                            auth.open(plugin, request(effect={"n": 9}))
+                        elif name == "grant":
+                            auth.grant(device, [opened.request_id], ttl_seconds=60)
+                        elif name == "show":
+                            auth.show(device, opened.request_id)
+                        else:
+                            auth.pending(device)
+                    self.assertEqual(ctx.exception.code, "credential_unknown")
+                finally:
+                    registry.resolve = real
+                self.assertEqual(auth.state(opened.request_id), "pending")
+                self.assertEqual(len(auth._requests), requests_before)
+                self.assertEqual(len(auth._grants), grants_before)
+                if name == "show":
+                    self.assertNotIn(device.token_id, auth._requests[opened.request_id].shown)
+
+    def test_revoked_token_id_is_not_reissued(self) -> None:
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
+        old = self.device.token_id
+        self.registry.revoke(old)
+        newbie = self._issue_trying_id_first(old, "paired_device:2", "paired_device", {"approve"})
+        self.assertNotEqual(newbie.token_id, old)
+        with self.assertRaises(Refused) as ctx:
+            self.auth.approve(newbie, scope.scope_id, self.req.request_id, self.req.digest)
+        self.assertEqual(ctx.exception.code, "scope_not_delegable")
+        self.assertEqual(self.auth.state(self.req.request_id), "pending")
+
+    def test_reissued_token_id_is_not_treated_as_shown(self) -> None:
+        self.auth.show(self.device, self.req.request_id)
+        old = self.device.token_id
+        self.registry.revoke(old)
+        newbie = self._issue_trying_id_first(old, "paired_device:2", "paired_device", {"approve"})
+        with self.assertRaises(Refused) as ctx:
+            self.auth.grant(newbie, [self.req.request_id], ttl_seconds=60)
+        self.assertEqual(ctx.exception.code, "prompt_not_shown")
+        self.assertEqual(self.auth.state(self.req.request_id), "pending")
+
+    def test_scope_id_collision_does_not_replace_an_existing_grant(self) -> None:
+        other = self.auth.open(self.plugin, request(effect={"n": 2})).request
+        self.auth.show(self.device, self.req.request_id)
+        self.auth.show(self.device, other.request_id)
+        first = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        real = scope_mod.secrets.token_hex
+        fresh = real(16)
+        while fresh == first.scope_id:
+            fresh = real(16)
+        seq = iter((first.scope_id, fresh))
+
+        def fake(n, _seq=seq, _real=real):
+            try:
+                return next(_seq)
+            except StopIteration:
+                return _real(n)
+
+        scope_mod.secrets.token_hex = fake
+        try:
+            second = self.auth.grant(self.device, [other.request_id], ttl_seconds=60)
+        finally:
+            scope_mod.secrets.token_hex = real
+        self.assertNotEqual(first.scope_id, second.scope_id)
+        out = self.auth.approve(self.device, first.scope_id, self.req.request_id, self.req.digest)
+        self.assertEqual(out["outcome"], "approved")
+        out = self.auth.approve(self.device, second.scope_id, other.request_id, other.digest)
+        self.assertEqual(out["outcome"], "approved")
+
+    def _issue_trying_id_first(self, first_id: str, principal: str, kind: str, scopes: set[str]):
+        real = scope_mod.secrets.token_hex
+        state = {"first": True}
+
+        def fake(n, _real=real, _state=state, _old=first_id):
+            if _state["first"]:
+                _state["first"] = False
+                return _old
+            return _real(n)
+
+        scope_mod.secrets.token_hex = fake
+        try:
+            return self.registry.issue(principal, kind, scopes)
+        finally:
+            scope_mod.secrets.token_hex = real
 
 
 class ScopeExpiryTests(unittest.TestCase):

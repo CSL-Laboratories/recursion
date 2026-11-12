@@ -118,10 +118,10 @@ class LoadIsolationTests(unittest.TestCase):
             with self.assertRaises(Refused) as ctx:
                 loader.load(bad_raw, dev.sign(bad_raw), bad_src)
             self.assertEqual(ctx.exception.code, "plugin_import_failed")
-            # A name planted outside this plugin's namespace, and not under a
-            # plugin root, is left in place. Rollback still restores a replaced
-            # entry (``json``) and does not touch an earlier plugin's module.
-            self.assertIn("evil_helper", sys.modules)
+            # An assignment into ``sys.modules`` is not a genuine import, so the
+            # planted name is removed. Rollback still restores a replaced entry
+            # (``json``) and does not touch an earlier plugin's module.
+            self.assertNotIn("evil_helper", sys.modules)
             self.assertIs(sys.modules.get("json"), saved_json)
             self.assertEqual(getattr(sys.modules.get("good_helper"), "marker", None), "kept")
             self.assertEqual(loader.permissions("good.plugin"), ("read",))
@@ -195,6 +195,21 @@ class WindowsPathTests(unittest.TestCase):
         self.assertTrue(_untrusted_path("scripts/\0install.sh"))
         self.assertTrue(_untrusted_path("\0"))
 
+    def test_a_component_windows_strips_is_refused_on_every_host(self) -> None:
+        # Win32 drops trailing spaces and dots, so ``.. `` and ``...`` walk up.
+        dev = Key()
+        for script in (
+            "sub/.. /.. /etc/passwd",
+            "sub/.../etc/passwd",
+            "scripts/install.sh.",
+            "scripts/install.sh ",
+        ):
+            with self.subTest(script=script):
+                raw = manifest_bytes(dev.public, install_scripts=(script,))
+                with self.assertRaises(Refused) as ctx:
+                    parse_manifest(raw)
+                self.assertEqual(ctx.exception.code, "manifest_install_scripts")
+
 
 @needs_crypto
 class SharedImportRollbackTests(unittest.TestCase):
@@ -259,7 +274,7 @@ class SharedImportRollbackTests(unittest.TestCase):
             sys.modules.pop("netrc", None)
             sys.modules.pop("csl_coord_deep", None)
 
-    def test_a_failed_load_drops_modules_under_the_plugin_root_only(self) -> None:
+    def test_a_failed_load_drops_planted_modules_inside_and_outside_the_root(self) -> None:
         root = temp_dir(self)
         outside = temp_dir(self)
         inside = os.path.join(root, "planted.py")
@@ -285,10 +300,120 @@ class SharedImportRollbackTests(unittest.TestCase):
             self._load_failing(source, root=root)
             self.assertNotIn("under_root_mod", sys.modules)
             self.assertNotIn("under_root_spec", sys.modules)
-            self.assertIn("outside_mod", sys.modules)
+            self.assertNotIn("outside_mod", sys.modules)
         finally:
             for name in ("under_root_mod", "under_root_spec", "outside_mod"):
                 sys.modules.pop(name, None)
+
+    def test_a_failed_load_drops_assigned_names_and_keeps_a_real_import(self) -> None:
+        planted = (
+            "ossaudiodev",
+            "recursion_core.child_env.launch",
+            _module_name("other.plugin"),
+        )
+        saved = {name: sys.modules.pop(name) for name in planted if name in sys.modules}
+        saved_graphlib = sys.modules.pop("graphlib", None)
+        source = (
+            "import graphlib, sys, types\n"
+            "for name in (%r, %r, %r):\n"
+            "    planted = types.ModuleType(name)\n"
+            "    planted.marker = 'pwned'\n"
+            "    sys.modules[name] = planted\n"
+            "raise RuntimeError('boom')\n" % planted
+        ).encode()
+        try:
+            self._load_failing(source)
+            real = sys.modules.get("graphlib")
+            self.assertIsNotNone(real)
+            self.assertTrue(hasattr(real, "TopologicalSorter"))
+            self.assertNotEqual(getattr(real, "marker", None), "pwned")
+            import importlib
+            import warnings
+            for name in planted:
+                self.assertNotEqual(getattr(sys.modules.get(name), "marker", None), "pwned", name)
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        module = importlib.import_module(name)
+                except ImportError:
+                    self.assertNotIn(name, sys.modules, name)
+                else:
+                    self.assertNotEqual(getattr(module, "marker", None), "pwned", name)
+        finally:
+            sys.modules.pop("graphlib", None)
+            if saved_graphlib is not None:
+                sys.modules["graphlib"] = saved_graphlib
+            for name in planted:
+                sys.modules.pop(name, None)
+                if name in saved:
+                    sys.modules[name] = saved[name]
+
+    def test_a_failed_load_drops_an_assigned_module_that_copies_a_real_spec(self) -> None:
+        import importlib.util
+        sys.modules.pop("calendar", None)
+        spec = importlib.util.find_spec("calendar")
+        self.assertIsNotNone(spec)
+        self.assertIsInstance(spec.origin, str)
+        source = (
+            "import importlib.machinery, sys, types\n"
+            "fake = types.ModuleType('calendar')\n"
+            "fake.marker = 'pwned'\n"
+            "fake.__spec__ = importlib.machinery.ModuleSpec('calendar', None, origin=%r)\n"
+            "fake.__file__ = %r\n"
+            "fake.__loader__ = fake.__spec__.loader\n"
+            "fake.__name__ = 'calendar'\n"
+            "sys.modules['calendar'] = fake\n"
+            "raise RuntimeError('boom')\n" % (spec.origin, spec.origin)
+        ).encode()
+        try:
+            self._load_failing(source)
+            self.assertNotIn("calendar", sys.modules)
+            import importlib
+            real = importlib.import_module("calendar")
+            self.assertNotEqual(getattr(real, "marker", None), "pwned")
+            self.assertTrue(hasattr(real, "Calendar"))
+        finally:
+            sys.modules.pop("calendar", None)
+
+    def test_a_failed_load_keeps_a_genuine_core_import(self) -> None:
+        name = "recursion_core.child_env.launch"
+        saved = sys.modules.pop(name, None)
+        parent = sys.modules.get("recursion_core.child_env")
+        saved_attr = getattr(parent, "launch", None) if parent is not None else None
+        source = b"import recursion_core.child_env.launch\nraise RuntimeError('boom')\n"
+        try:
+            self._load_failing(source)
+            module = sys.modules.get(name)
+            self.assertIsNotNone(module)
+            self.assertTrue(hasattr(module, "spawn"))
+            self.assertNotEqual(getattr(module, "marker", None), "pwned")
+        finally:
+            if parent is not None and saved_attr is not None:
+                parent.launch = saved_attr
+            if saved is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = saved
+
+    def test_a_failed_load_drops_an_import_found_only_on_an_added_path(self) -> None:
+        outside = temp_dir(self)
+        with open(os.path.join(outside, "planted_helper.py"), "wb") as fh:
+            fh.write(b"marker = 'from-added-path'\n")
+        sys.modules.pop("planted_helper", None)
+        source = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import planted_helper\n"
+            "raise RuntimeError('boom')\n" % outside
+        ).encode()
+        try:
+            self._load_failing(source)
+            self.assertNotIn("planted_helper", sys.modules)
+            self.assertNotIn(outside, sys.path)
+        finally:
+            sys.modules.pop("planted_helper", None)
+            while outside in sys.path:
+                sys.path.remove(outside)
 
 
 class RevocationPublishTests(unittest.TestCase):
@@ -337,6 +462,28 @@ class RevocationPublishTests(unittest.TestCase):
         # Still the generation loaded from the row, not the speculative next value.
         self.assertEqual(during["value"], 2)
         self.assertEqual(fresh.generation(kid), written)
+
+    def test_a_publish_failure_still_treats_the_committed_key_as_revoked(self) -> None:
+        path = os.path.join(temp_dir(self), "revoked.db")
+        from recursion_core.plugin_security import create_revocation_store
+        create_revocation_store(path)
+        kid = "ed25519:" + "cd" * 16
+        store = TrustStore({}, revocation_store=path)
+        self.addCleanup(store.close)
+
+        def boom(kid_arg, generation):
+            raise RuntimeError("publish failed")
+
+        store._publish_generation = boom
+        with self.assertRaises(RuntimeError):
+            store.revoke(kid)
+        self.assertIn(kid, store.revoked)
+        self.assertEqual(store.generation(kid), 1)
+        db = sqlite3.connect(path)
+        self.addCleanup(db.close)
+        row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 1)
 
 
 class SymlinkedParentTests(unittest.TestCase):

@@ -219,12 +219,26 @@ def _alter_revoked_generation(db: sqlite3.Connection) -> None:
         raise
 
 
+def _stripped_script_component(part: str) -> bool:
+    """True when ``part`` is empty, ``.``, ``..``, or Win32 would make it one of those.
+
+    Windows strips trailing spaces and dots from every component, so ``.. `` and
+    ``...`` walk out of the plugin tree on that host. A component that ends in a
+    space or a dot is refused on every host.
+    """
+    if part in ("", ".", ".."):
+        return True
+    if part.endswith(" ") or part.endswith("."):
+        return True
+    return part.rstrip(" .") == ".."
+
+
 def _script_escapes(value: str) -> bool:
     """An install-script name that is absolute or walks out with ``..``."""
     if os.path.isabs(value) or "\\" in value:
         return True
     parts = value.split("/")
-    return not parts or any(part in ("", ".", "..") for part in parts)
+    return not parts or any(_stripped_script_component(part) for part in parts)
 
 
 def create_revocation_store(path: str) -> None:
@@ -275,7 +289,7 @@ class TrustStore:
         for label, hex_key in trusted_keys.items():
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Keep the absolute path resolved now. A later chdir must not make a
         # failed write reopen a different relative ``rev.db``.
         if revocation_store is not None:
@@ -323,11 +337,13 @@ class TrustStore:
 
     @property
     def revoked(self) -> frozenset:
-        return self._revoked
+        with self._lock:
+            return self._revoked
 
     def generation(self, kid: str) -> int | None:
         """Revocation generation for ``kid``, or ``None`` when that key is not revoked."""
-        return self._generation.get(kid)
+        with self._lock:
+            return self._generation.get(kid)
 
     def revoke(self, kid: str) -> int:
         """Revoke a key id and return its new generation (4.4).
@@ -336,16 +352,23 @@ class TrustStore:
         of the same key advances the generation again. An opener that still has an
         older generation in memory cannot write that older number back: the stored
         generation only moves forward. The in-memory generation is published from
-        the stored row after that write commits. A failed write leaves memory
-        unchanged, or refreshes it from the row, and then ``revocation_not_durable``
-        is raised. With no store the revocation is kept in memory and the same
-        refusal is raised. A ``sqlite3`` error is that refusal; it does not escape
-        the method.
+        the stored row after that write commits. Publishing updates the revoked
+        set first and then the generation, and that update still runs when
+        ``_publish_generation`` raises, so a committed row is not invisible.
+        ``generation`` and ``revoked`` take the same lock, so a reader blocks
+        until that update is in place and does not observe the pre-publish
+        value after commit. A failed write leaves memory unchanged, or refreshes
+        it from the row, and then ``revocation_not_durable`` is raised. With no
+        store the revocation is kept in memory and the same refusal is raised.
+        A ``sqlite3`` error is that refusal; it does not escape the method.
         """
         with self._lock:
             if self._db is None:
                 generation = self._generation.get(kid, 0) + 1
-                self._publish_generation(kid, generation)
+                try:
+                    self._publish_generation(kid, generation)
+                finally:
+                    self._install_revocation(kid, generation)
                 raise Refused("revocation_not_durable", kid)
             generation = self._generation.get(kid, 0) + 1
             row = None
@@ -378,14 +401,23 @@ class TrustStore:
             if row is None or type(row[0]) is not int or row[0] < generation:
                 self._refresh_generation(kid)
                 raise Refused("revocation_not_durable", kid)
-            self._publish_generation(kid, row[0])
+            try:
+                self._publish_generation(kid, row[0])
+            finally:
+                # Commit already succeeded. Record the row even if publish raised,
+                # revoked set first so the key is revoked if the generation write fails.
+                self._install_revocation(kid, row[0])
             return row[0]
 
     def _publish_generation(self, kid: str, generation: int) -> None:
+        self._install_revocation(kid, generation)
+
+    def _install_revocation(self, kid: str, generation: int) -> None:
+        """Record one committed revocation. The revoked set is updated first."""
+        self._revoked = frozenset(set(self._revoked) | {kid})
         updated = dict(self._generation)
         updated[kid] = generation
         self._generation = MappingProxyType(updated)
-        self._revoked = frozenset(updated)
 
     def _refresh_generation(self, kid: str) -> None:
         """Copy this key's stored generation into memory. A failed read leaves memory as it was."""
@@ -423,7 +455,9 @@ class TrustStore:
     def classify(self, manifest: Manifest, signature: object) -> tuple[str, str | None, str]:
         """Return ``(trust, signer_key_id, reason)``; trust is ``signed`` or ``unsigned``."""
         kid = key_id(manifest.developer_key)
-        if kid in self._revoked:  # checked first: revocation also holds for an untrusted key
+        with self._lock:
+            revoked = kid in self._revoked
+        if revoked:  # checked first: revocation also holds for an untrusted key
             return "unsigned", None, "signer_key_revoked"
         if kid not in self._keys:
             return "unsigned", None, "signer_not_on_trusted_list"

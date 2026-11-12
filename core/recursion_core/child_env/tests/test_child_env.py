@@ -474,6 +474,37 @@ class ProfileTests(unittest.TestCase):
         os.symlink("certs/../ca.pem", safe / "owned-via")
         self.assertIsNone(policy._unsafe_file(f"{safe}/owned-via"))
 
+    def test_an_embedded_nul_is_refused_instead_of_crashing(self) -> None:
+        """A NUL in a path is malformed. lstat raises ValueError; the build must still be EnvRefused."""
+
+        home = _home(self)
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env("codex", home=home + "\0", auth_mode=SUB, parent={"PATH": "/usr/bin"})
+        self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "SSL_CERT_FILE": f"{home}/ca\0.pem"})
+        self.assertEqual(("SSL_CERT_FILE", "value_malformed"), (caught.exception.name, caught.exception.cause))
+        self.assertEqual("value_malformed", policy._unsafe_file(f"{home}\0/ca.pem"))
+
+    def test_a_proxy_url_rejects_a_trailing_newline(self) -> None:
+        """The proxy grammar ends at the optional slash. A trailing newline is not part of the URL."""
+
+        home = _home(self)
+        plain = "http://127.0.0.1:3128"
+        socks = "socks5h://127.0.0.1:1080"
+        self.assertIsNone(policy._unsafe_proxy(plain))
+        self.assertIsNone(policy._unsafe_proxy(socks, policy._ALL_PROXY_SCHEMES))
+        for value in (plain + "\n", plain + "/\n", "http://evil.example\n"):
+            with self.subTest(value=value):
+                self.assertEqual("proxy_malformed", policy._unsafe_proxy(value))
+        self.assertEqual("proxy_malformed", policy._unsafe_proxy(socks + "\n", policy._ALL_PROXY_SCHEMES))
+        for name, value in (("HTTPS_PROXY", plain + "\n"), ("ALL_PROXY", socks + "\n"), ("http_proxy", plain + "/\n")):
+            with self.subTest(name=name), self.assertRaises(EnvRefused) as caught:
+                build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", name: value})
+            self.assertEqual((name, "proxy_malformed"), (caught.exception.name, caught.exception.cause))
+        env = build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "HTTPS_PROXY": plain})
+        self.assertEqual(plain, env["HTTPS_PROXY"])
+
     def test_validated_env_cannot_be_hand_made(self) -> None:
         with self.assertRaises(TypeError):
             ValidatedEnv({"PATH": "/usr/bin"}, "codex", ())
@@ -1127,6 +1158,9 @@ class LaunchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:/usr/bin"}), self.assertRaises(EnvRefused) as caught:
             spawn(["fake-engine"], env, popen=self.popen)
         self.assertEqual("argv0_not_found", caught.exception.cause)
+        with self.assertRaises(EnvRefused) as caught:
+            spawn(["/usr/bin/env\0x"], env, popen=self.popen)
+        self.assertEqual("argv0_value_malformed", caught.exception.cause)
         for argv0, cause in (("./fake-engine", "argv0_relative"), ("bin/fake-engine", "argv0_relative")):
             with self.subTest(argv0=argv0), self.assertRaises(EnvRefused) as caught:
                 spawn([argv0], env, popen=self.popen)

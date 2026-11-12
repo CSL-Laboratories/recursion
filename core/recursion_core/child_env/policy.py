@@ -162,9 +162,11 @@ _OVERRIDE_DENIED_NAMES = frozenset({"CLAUDE_CODE_CLIENT_KEY"})
 _CARRIED_ONLY_NAMES = frozenset({"CLAUDE_CODE_CLIENT_CERT"})
 # Paths that name a different file in the child than in this process (its own cwd, fds, root).
 _PERSPECTIVE = re.compile(r"^/(?:proc|dev/fd|dev/std(?:in|out|err))(?:/|$)")
+# ``\Z`` not ``$``: ``$`` also matches before a trailing newline, so ``http://host:1\n``
+# would pass and a client such as curl would then ignore the proxy.
 _PROXY_URL = re.compile(
     r"^(?:(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://)?(?P<userinfo>[^@/]*@)?"
-    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]{1,5}))?/?$"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]{1,5}))?/?\Z"
 )
 # A route base URL: http(s)://host[:port][/path]. No user name or password, no query, no fragment.
 _BASE_URL = re.compile(
@@ -544,6 +546,10 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
     component ends the walk: the rest cannot be a link yet, and the caller decides whether that is safe.
     """
 
+    # lstat raises ValueError on an embedded NUL. Refuse it, as ``_unsafe_value`` does,
+    # instead of letting the exception escape the build or the launch.
+    if "\0" in path:
+        return None, False, "value_malformed"
     if not os.path.isabs(path):
         return None, False, "value_relative"
     if _PERSPECTIVE.match(path):

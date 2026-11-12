@@ -67,7 +67,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 from recursion_core.control.registry import (
-    EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
+    EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration, StopUnattested,
 )
 
 STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
@@ -291,16 +291,19 @@ class ControlAPI:
             return False
 
     def _commit(self, rec: dict) -> str:
-        """``ok``, ``stale``, or raise ``_RegistryError``. A stale write leaves the registry untouched.
+        """``ok``, ``stale``, ``unattested``, or raise ``_RegistryError``.
 
-        On success ``rec`` becomes the snapshot this put stored, not a later read. A registry that does
-        not return that snapshot is refreshed in full, so a newer generation is never paired with an
-        older payload.
+        A stale write leaves the registry untouched. ``unattested`` is a proof the registry refused,
+        which is not a disk failure and not a stopped run. On success ``rec`` becomes the snapshot
+        this put stored, not a later read. A registry that does not return that snapshot is refreshed
+        in full, so a newer generation is never paired with an older payload.
         """
         try:
             stored = self._registry.put(dict(rec))
         except StaleGeneration:
             return "stale"
+        except StopUnattested:
+            return "unattested"
         except Exception as err:
             raise _RegistryError(f"put:{type(err).__name__}") from err
         if isinstance(stored, dict):
@@ -575,6 +578,51 @@ class ControlAPI:
         rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason=reason)
         return self._recorded({"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}, rec)
 
+    def _pending_instead(self, rec: dict, reason: str) -> tuple[str, dict]:
+        """Write ``rec`` as pending with ``reason``. The stored snapshot replaces ``rec`` on success."""
+        stop = rec.get("stop")
+        if not isinstance(stop, dict):
+            stop = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
+            rec["stop"] = stop
+        rec["state"] = "stop_pending"
+        rec["stop_attestation"] = None
+        stop["checks"] = stop.get("checks", 0) + 1
+        stop["reason"] = reason
+        res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}
+        try:
+            outcome = self._commit(rec)
+        except _RegistryError:
+            outcome = "down"
+        return outcome, res
+
+    def _unattested_to_pending(self, outcome: str, res: dict, rec: dict) -> tuple[str, dict]:
+        """A refused proof does not answer ``stopped``."""
+        if outcome != "unattested" or res.get("code") != STOPPED:
+            return outcome, res
+        blocked = self._block_stop(rec)
+        return self._pending_instead(rec, blocked or "stop_unattested")
+
+    def _lost_stop_is_pending(self, outcome: str, res: dict, rec: dict) -> tuple[str, dict]:
+        """The one retry lost. Pending, unless a later writer already stored ``stopped``."""
+        if outcome != "stale" or res.get("code") != STOPPED:
+            return outcome, res
+        latest = self._reread(rec)
+        if latest is None:
+            return outcome, res
+        if latest.get("state") == "stopped":
+            rec.clear()
+            rec.update(latest)
+            return "ok", {"code": STOPPED, "run_id": latest["run_id"], "state": "stopped", "repeat": True}
+        if self._cgroup_identity(latest) != self._cgroup_identity(rec):
+            reason = "cgroup_changed"
+        else:
+            reason = self._block_stop(latest) or "generation_conflict"
+        latest["stop"] = self._carry_stop(rec.get("stop"), rec, latest)
+        outcome, res = self._pending_instead(latest, reason)
+        rec.clear()
+        rec.update(latest)
+        return outcome, res
+
     def _recorded(self, res: dict, rec: dict, *, reconfirm: bool = False) -> dict:
         # The cleanup layer's answer is the truth; a failed write-back is reported, not raised. The next
         # stop then sees the old state and asks again, which is safe (cgroup.kill and pidfds repeat).
@@ -584,6 +632,9 @@ class ControlAPI:
             outcome = self._commit(rec)
         except _RegistryError:
             outcome = "down"
+        # A refused proof is not a stopped run. A lost disk write still answers with the cleanup
+        # result below; this is only the attestation refusal.
+        outcome, res = self._unattested_to_pending(outcome, res, rec)
         if outcome == "stale":
             fresh = self._reread(rec)
             if fresh is None:
@@ -636,6 +687,10 @@ class ControlAPI:
                     outcome = "down"
                 rec.clear()
                 rec.update(fresh)
+        # The one retry above can itself lose, or refuse the proof. A later member, or any later
+        # writer, then owns the row: answer pending unless that row is already stopped.
+        outcome, res = self._unattested_to_pending(outcome, res, rec)
+        outcome, res = self._lost_stop_is_pending(outcome, res, rec)
         if outcome != "ok":
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands

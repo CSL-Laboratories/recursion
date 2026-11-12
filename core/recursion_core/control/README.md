@@ -38,9 +38,11 @@ recorded on F60, CSL-762).
   a record against the host after a restart (the startup sweep) belongs to the durable-registry item,
   CSL-738.
 - Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
-  fails answers `registry_unavailable`. Once the cleanup layer has answered, Stop returns `stopped` or
-  `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
-  record and asks the cleanup layer again, which is safe to repeat. For a launch whose own write failed,
+  fails answers `registry_unavailable`. Once the cleanup layer has answered, a failed disk write still
+  returns `stopped` or `pending` with `"recorded": false`; the next stop then sees the old record and
+  asks the cleanup layer again, which is safe to repeat. A proof the registry refuses, or a stop whose
+  one retry loses the generation, answers `pending` unless the stored row is already `stopped`. A later
+  member that wins that race keeps the stop pending. For a launch whose own write failed,
   the API keeps the Stop decision with that launch, so a later Stop or a same-key retry continues it
   (re-sends a request that raised, writes back a confirmed `stopped`) and never records a bare `running`
   over it. A failed start whose record cannot be re-read writes nothing, so it never erases a Stop
@@ -74,11 +76,14 @@ recorded on F60, CSL-762).
   registry continues the `cg-N` sequence past every marker the snapshot already holds. A marker string
   that has been stored is not kept for a new path, and a same-path update keeps the marker already
   stored; a marker that has never been stored is still accepted, so an adopted launch proof matches.
+  A fresh stop whose proof names a marker that was already stored is kept, with the marker that put bound.
   A marker is recorded only when the put is stored: a refused proof or a dry run does not retire it.
   A `cg-` suffix that is not ASCII digits, or that is longer than 18 digits, does not move the counter.
   An empty result is confirmed again when the identity changed. `reap_orphans`
-  samples each member once, drops the members that sample says are gone, does not by itself record
-  `stopped`, and does not clear the proof of a run that is already stopped.
+  samples each pid once and applies that sample to every member with it, including a later member.
+  A sample that raises is not proof the member is gone, and a later run is still swept. It drops the
+  members that sample says are gone, does not by itself record `stopped`, and does not clear the proof
+  of a run that is already stopped.
   Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,
   not under a thread id. One `acquire` sorts its keys, and a start key sorts before a run key, so a start
   and a stop cannot deadlock by taking those locks in opposite orders. A key is deleted once nobody holds

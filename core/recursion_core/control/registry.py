@@ -357,16 +357,19 @@ class InMemoryRunRegistry:
 
         A reaped member bumps that run's generation and clears a stop attestation, so an in-flight
         stop has to be proved again. Reaping does not itself record ``stopped``, and it does not touch
-        a run that is already stopped: that proof stays.
+        a run that is already stopped: that proof stays. Each pid is sampled once and that sample
+        covers every member with it, including a later one. A sample that raises is not proof the
+        process is gone, and it does not skip a later run.
         """
         reaped: list[dict] = []
+        seen: dict[int, bool] = {}
         with self._lock:
             for run_id, rec in list(self._runs.items()):
                 if rec.get("state") == "stopped":
                     continue
                 live, dead = [], []
-                for member in rec.get("members") or []:  # one sample per pid; the receipt is that partition
-                    (dead if not is_alive(member["pid"]) else live).append(member)
+                for member in rec.get("members") or []:
+                    (live if _pid_still_alive(member, is_alive, seen) else dead).append(member)
                 if not dead:
                     continue
                 updated = copy.deepcopy(rec)
@@ -374,8 +377,10 @@ class InMemoryRunRegistry:
                 updated["generation"] = rec["generation"] + 1
                 updated["stop_attestation"] = None
                 self._store(updated)
-                reaped.extend({"run_id": run_id, "member_id": member["member_id"], "pid": member["pid"]}
-                              for member in dead)
+                for member in dead:
+                    if isinstance(member, dict) and "member_id" in member:
+                        reaped.append({"run_id": run_id, "member_id": member["member_id"],
+                                       "pid": member.get("pid")})
             reaped.extend(self._drop_dangling_index())
         return reaped
 
@@ -473,6 +478,7 @@ class InMemoryRunRegistry:
             stored["members"] = []
             stored["generation"] = expected + 1
             return stored
+        offered = stored.get("cgroup_marker")
         self._bind_cgroup(current, stored)
         if current is None:
             members = [_member(m) for m in stored.get("members") or []]
@@ -480,11 +486,15 @@ class InMemoryRunRegistry:
             members = [_member(m) for m in current.get("members") or []]
         if stored.get("state") == "stopped":
             attestation = stored.get("stop_attestation")
+            # A new path keeps a marker that was never stored, and mints one when the offered marker
+            # was already stored. The proof named this path, so it takes the marker this put bound.
             minted = current is None or current.get("cgroup") != stored.get("cgroup") or not current.get("cgroup_marker")
-            if (minted and isinstance(attestation, dict) and attestation.get("cgroup_marker") is None
-                    and attestation.get("cgroup") == stored.get("cgroup")):
-                attestation["cgroup_marker"] = stored.get("cgroup_marker")
-                stored["stop_attestation"] = attestation
+            bound = stored.get("cgroup_marker")
+            if (minted and isinstance(attestation, dict) and attestation.get("cgroup") == stored.get("cgroup")):
+                claimed = attestation.get("cgroup_marker")
+                if claimed is None or (claimed == offered and claimed != bound):
+                    attestation["cgroup_marker"] = bound
+                    stored["stop_attestation"] = attestation
             if not self._attestation_ok(stored, members, expected):
                 raise StopUnattested(stored.get("run_id", ""))
             stored["members"] = []  # proved gone; a stopped run does not keep member rows
@@ -542,6 +552,28 @@ class InMemoryRunRegistry:
                 if rec is not None:
                     return copy.deepcopy(rec)
             return None
+
+
+def _pid_still_alive(member: object, is_alive: Callable[[int], bool], seen: dict[int, bool]) -> bool:
+    """True when ``member`` is not proved gone.
+
+    An int pid is sampled once; a later member with that pid reuses the sample. A sample that
+    raises is not proof the process is gone. A member that is not a dict is kept.
+    """
+    if not isinstance(member, dict):
+        return True
+    pid = member.get("pid")
+    if isinstance(pid, int):
+        if pid not in seen:
+            try:
+                seen[pid] = bool(is_alive(pid))
+            except Exception:
+                seen[pid] = True
+        return seen[pid]
+    try:
+        return bool(is_alive(pid))  # type: ignore[arg-type]
+    except Exception:
+        return True
 
 
 def _marker_seq(marker: object) -> int:

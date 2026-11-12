@@ -67,7 +67,7 @@ class FakeCgroup(Cgroup2):
         text = (leaf / 'cgroup.procs').read_text().strip()
         return int(text) if text else None
 
-    def kill(self, leaf, deadline=None):
+    def kill(self, leaf, deadline=None, dirfd=None):
         if self.interrupts:
             self.interrupts -= 1
             raise KeyboardInterrupt('second interrupt during cleanup')
@@ -80,7 +80,7 @@ class FakeCgroup(Cgroup2):
             except ProcessLookupError:
                 pass
 
-    def populated(self, leaf, deadline=None):
+    def populated(self, leaf, deadline=None, dirfd=None):
         if self.events_broken:
             return None
         main = self.main(leaf)
@@ -296,7 +296,7 @@ class LeafTests(unittest.TestCase):
         with self.assertLogs(level='ERROR'), \
              self.assertRaisesRegex(ValueError, 'original') as caught:
             with self.root.launch('run-a', ['sleep', '60']) as run:
-                self.fs.populated = lambda leaf, deadline=None: 1 / 0
+                self.fs.populated = lambda leaf, deadline=None, dirfd=None: 1 / 0
                 raise ValueError('original')
         run.proc.wait(5)  # killed by cgroup.kill and pidfd before the observer raised
         self.assertTrue(any('ZeroDivisionError' in n for n in caught.exception.__notes__))
@@ -562,9 +562,9 @@ class TmpCgroup(Cgroup2):
         self.rmdir_calls = []
         self.killed = []
 
-    def kill(self, leaf, deadline=None):
+    def kill(self, leaf, deadline=None, dirfd=None):
         self.killed.append(Path(leaf).name)
-        return super().kill(leaf, deadline)
+        return super().kill(leaf, deadline, dirfd=dirfd)
 
     def _rmdir(self, directory):
         directory = Path(directory)
@@ -784,6 +784,113 @@ class RemovalContractTests(unittest.TestCase):
         self.assertTrue(kept.is_dir())
         self.assertEqual(self.fs.killed, ['run-ours'])
         self.assertEqual([path.name for path in self.fs.rmdir_calls], ['run-ours'])
+
+    def test_sweep_removes_unregistered_run_names_and_keeps_scopes(self):
+        # A run- name that is not a leaf id and not a systemd scope is a leftover.
+        # A scope, and a leftover whose procs still list an id, stay on disk.
+        free = self.root_path / 'run-not.valid'
+        busy = self.root_path / 'run-busy.name'
+        scope = self.root_path / 'run-1234.scope'
+        other = self.root_path / 'app.slice'
+        write_cgroup(free, procs='')
+        write_cgroup(busy, procs='5\n')
+        (busy / 'cgroup.events').write_text('populated 0\n')
+        write_cgroup(scope, procs='')
+        (scope / 'payload').write_text('systemd')
+        other.mkdir()
+        (other / 'payload').write_text('foreign')
+        root = DelegatedRoot(self.root_path, self.fs)
+        with self.assertLogs(cgroup_leaf.log.name, level='WARNING'):
+            result = root.sweep(keep=())
+        self.assertFalse(free.exists())
+        self.assertEqual(result.outcomes['run-not.valid'].state, 'empty')
+        self.assertFalse(result.outcomes['run-not.valid'].errors)
+        self.assertEqual((busy / 'cgroup.procs').read_text(), '5\n')
+        self.assertTrue(busy.is_dir())
+        self.assertNotIn('run-busy.name', [path.name for path in self.fs.rmdir_calls])
+        self.assertIn('run-busy.name', self.fs.killed)
+        self.assertIn('run-not.valid', self.fs.killed)
+        self.assertNotIn('run-1234.scope', self.fs.killed)
+        self.assertNotIn('app.slice', self.fs.killed)
+        self.assertEqual((scope / 'payload').read_text(), 'systemd')
+        self.assertEqual((scope / 'cgroup.kill').read_text(), '')
+        self.assertEqual((other / 'payload').read_text(), 'foreign')
+        self.assertIn(('run-1234.scope', 'foreign-name'), result.reported)
+        self.assertIn(('app.slice', 'foreign-name'), result.reported)
+        self.assertNotIn('run-not.valid', [name for name, _reason in result.reported])
+
+    def test_kill_does_not_write_a_replaced_cgroup(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        cgroup_leaf.mark_owned(leaf)
+        run = LeafRun(self.fs, leaf, 0.2)
+        real = run._same_cgroup
+
+        def swap():
+            ok = real()
+            old = self.root_path / 'run-a-old'
+            if ok and not old.exists():
+                leaf.rename(old)
+                write_cgroup(leaf, procs='')
+                (leaf / 'marker').write_text('foreign')
+            return ok
+
+        run._same_cgroup = swap
+        with self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+            outcome = run.close()
+        self.assertEqual(outcome.state, 'unknown')
+        self.assertEqual((leaf / 'marker').read_text(), 'foreign')
+        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        self.assertEqual((self.root_path / 'run-a-old' / 'cgroup.kill').read_text(), '1')
+        self.assertTrue(leaf.is_dir())
+
+    def test_replaced_child_cgroup_is_not_removed(self):
+        leaf = self.root_path / 'run-a'
+        child = leaf / 'sub'
+        write_cgroup(leaf, procs='')
+        write_cgroup(child, procs='')
+        real = Cgroup2._child_cgroups
+
+        def swap(fs, directory, deadline):
+            found = real(fs, directory, deadline)
+            if directory == leaf and found and not (leaf / 'sub-old').exists():
+                path = found[0][0] if isinstance(found[0], tuple) else found[0]
+                path.rename(leaf / 'sub-old')
+                write_cgroup(path, procs='')
+                (path / 'marker').write_text('foreign')
+            return found
+
+        self.fs._child_cgroups = swap.__get__(self.fs, TmpCgroup)
+        with self.assertRaises(OSError) as caught:
+            self.fs.remove(leaf, identity=cgroup_identity(leaf), deadline=time.monotonic() + 1)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertEqual((child / 'marker').read_text(), 'foreign')
+        self.assertTrue((leaf / 'sub-old').is_dir())
+        self.assertTrue(leaf.is_dir())
+        self.assertEqual(self.fs.rmdir_calls, [])
+
+    def test_rmdir_after_empty_check_does_not_remove_replacement(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        identity = cgroup_identity(leaf)
+        real = Cgroup2._confirmed_empty
+
+        def swap(fs, directory, deadline):
+            ok = real(fs, directory, deadline)
+            old = self.root_path / 'run-a-old'
+            if ok and directory == leaf and not old.exists():
+                leaf.rename(old)
+                write_cgroup(leaf, procs='')
+                (leaf / 'marker').write_text('foreign')
+            return ok
+
+        self.fs._confirmed_empty = swap.__get__(self.fs, TmpCgroup)
+        with self.assertRaises(OSError) as caught:
+            self.fs.remove(leaf, identity=identity, deadline=time.monotonic() + 1)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertEqual((leaf / 'marker').read_text(), 'foreign')
+        self.assertTrue((self.root_path / 'run-a-old').is_dir())
+        self.assertEqual(self.fs.rmdir_calls, [])
 
     def test_close_does_not_hang_on_slow_events_or_exit(self):
         leaf = self.root_path / 'run-a'

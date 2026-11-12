@@ -50,6 +50,20 @@ _READ_CAP = 1 << 20
 _MAX_CGROUP_DEPTH = 64
 
 
+def _unregistered_run_name(name):
+    """A ``run-`` directory that is neither a leaf id nor a systemd scope.
+
+    Leaf ids are ours only with the ownership marker. ``run-*.scope`` is
+    systemd's even when it sits in this root. Any other single ``run-``
+    component is an unregistered leftover and sweep may kill it.
+    """
+    if not isinstance(name, str) or '/' in name or '\x00' in name:
+        return False
+    if not name.startswith('run-') or name.endswith('.scope'):
+        return False
+    return LEAF_NAME.fullmatch(name) is None
+
+
 def mark_owned(path):
     """Record that this launcher created ``path``.
 
@@ -182,10 +196,14 @@ class Cgroup2:
     def open_procs(self, leaf: Path) -> int:
         return os.open(leaf / 'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
 
-    def kill(self, leaf: Path, deadline=None):
+    def kill(self, leaf: Path, deadline=None, dirfd=None):
         # O_NONBLOCK: a fifo or a stuck node must not hold the cleanup window open.
-        fd = os.open(leaf / 'cgroup.kill',
-                     os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # dirfd pins the directory this handle opened. A replaced path is not written.
+        flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        if dirfd is None:
+            fd = os.open(Path(leaf) / 'cgroup.kill', flags)
+        else:
+            fd = os.open('cgroup.kill', flags, dir_fd=dirfd)
         try:
             if not _wait_fd(fd, True, deadline):
                 raise OSError(errno.ETIMEDOUT, 'cgroup.kill not ready before deadline')
@@ -193,10 +211,14 @@ class Cgroup2:
         finally:
             os.close(fd)
 
-    def _read_text(self, path, deadline):
+    def _read_text(self, path, deadline, dirfd=None, name=None):
         """Read a cgroup file without blocking past ``deadline``. None if it cannot."""
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            if dirfd is None:
+                fd = os.open(path, flags)
+            else:
+                fd = os.open(name, flags, dir_fd=dirfd)
         except OSError:
             return None
         try:
@@ -218,8 +240,9 @@ class Cgroup2:
         finally:
             os.close(fd)
 
-    def populated(self, leaf: Path, deadline=None) -> bool | None:
-        text = self._read_text(Path(leaf) / 'cgroup.events', deadline)
+    def populated(self, leaf: Path, deadline=None, dirfd=None) -> bool | None:
+        text = self._read_text(Path(leaf) / 'cgroup.events', deadline,
+                               dirfd=dirfd, name='cgroup.events')
         if not text:
             return None
         try:
@@ -229,17 +252,25 @@ class Cgroup2:
         return {'0': False, '1': True}.get(value)
 
     def _child_cgroups(self, directory, deadline):
-        """Child directories, or None when the listing is unsafe or incomplete."""
+        """Child directories and the inode seen at the scan, or None if unsafe.
+
+        None means the listing was incomplete or contained a symlink. The inode
+        is what removal must still find: a path reused after the scan is not removed.
+        """
         children = []
         try:
             with os.scandir(directory) as scan:
                 for entry in scan:
                     if time.monotonic() >= deadline:
                         return None
-                    if entry.is_symlink():
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        return None
+                    if stat.S_ISLNK(info.st_mode):
                         return None  # do not follow or delete through a link
-                    if entry.is_dir(follow_symlinks=False):
-                        children.append(Path(entry.path))
+                    if stat.S_ISDIR(info.st_mode):
+                        children.append((Path(entry.path), (info.st_dev, info.st_ino)))
         except OSError:
             return None
         return children
@@ -275,7 +306,7 @@ class Cgroup2:
 
     def _identity_ok(self, directory, identity):
         if identity is None:
-            return True
+            return False
         return cgroup_identity(directory) == identity
 
     def member(self, pid: int) -> Path | None:
@@ -315,10 +346,10 @@ class Cgroup2:
         children = self._child_cgroups(directory, deadline)
         if children is None:
             raise OSError(errno.EBUSY, 'cgroup not confirmed empty')
-        for child in children:
+        for child, child_identity in children:
             if not self._identity_ok(directory, identity):
                 raise OSError(errno.EBUSY, 'cgroup identity changed')
-            self._remove_dir(child, deadline, None, depth + 1)
+            self._remove_dir(child, deadline, child_identity, depth + 1)
         self._rmdir_when_empty(directory, deadline, identity)
 
     def _rmdir_when_empty(self, directory, deadline, identity):
@@ -328,6 +359,10 @@ class Cgroup2:
                 raise OSError(errno.EBUSY, 'cgroup identity changed')
             if not self._confirmed_empty(directory, deadline):
                 raise OSError(errno.EBUSY, 'cgroup not empty')
+            # The empty read used the path. A directory swapped in after that
+            # read must not be the one rmdir removes.
+            if not self._identity_ok(directory, identity):
+                raise OSError(errno.EBUSY, 'cgroup identity changed')
             try:
                 self._rmdir(directory)
                 return
@@ -422,11 +457,13 @@ class DelegatedRoot:
         kill-everything default: a daemon restart or upgrade must not end live runs
         (PRODUCT.md 055cc7a5 section 3.1, grill Q38 / O53).
 
-        A directory is killed only when its name is a leaf id and the ownership
-        marker written at creation is on that inode. A systemd ``run-*.scope``,
-        any other name, a leaf id without the marker, and a symlink are left in
-        place and returned in ``reported``. Exits of swept leaves are unseen, so
-        they are never booked terminated.
+        A directory is killed when its name is a leaf id and the ownership
+        marker written at creation is on that inode, or when the name is an
+        unregistered ``run-`` component that is not a systemd ``run-*.scope``.
+        A scope, any other name, a leaf id without the marker, and a symlink
+        are left in place and returned in ``reported``. An unregistered name
+        whose ``cgroup.procs`` still lists an id is killed but not removed.
+        Exits of swept leaves are unseen, so they are never booked terminated.
         """
         if isinstance(keep, (str, bytes)):
             raise TypeError('keep must be a collection of leaf names, not a string')
@@ -453,14 +490,18 @@ class DelegatedRoot:
                 continue
             if not stat.S_ISDIR(info.st_mode):
                 continue
-            if LEAF_NAME.fullmatch(leaf.name) is None:
+            unregistered = _unregistered_run_name(leaf.name)
+            if LEAF_NAME.fullmatch(leaf.name) is None and not unregistered:
                 report(leaf.name, 'foreign-name')
                 continue
             # Open first, then read the marker through that dirfd, so a replaced
             # path cannot borrow a check done against an earlier inode.
             run = LeafRun(self.fs, leaf, kill_timeout)
             try:
-                if run.dirfd is None or not _marked_owned(run.dirfd):
+                if run.dirfd is None:
+                    report(leaf.name, 'unreadable')
+                    continue
+                if not unregistered and not _marked_owned(run.dirfd):
                     report(leaf.name, 'unmarked')
                     continue
                 outcomes[leaf.name] = run.close()
@@ -616,7 +657,7 @@ class LeafRun:
                 break
             attempted = True
             try:
-                self.fs.kill(self.leaf, deadline=deadline)
+                self.fs.kill(self.leaf, deadline=deadline, dirfd=self.dirfd)
             except OSError as exc:
                 errors.setdefault(f'cgroup.kill: {exc!r}')
             if not self._same_cgroup():
@@ -632,7 +673,7 @@ class LeafRun:
             if self.proc is not None:
                 self.proc.poll()
             try:
-                populated = self.fs.populated(self.leaf, deadline=deadline)
+                populated = self.fs.populated(self.leaf, deadline=deadline, dirfd=self.dirfd)
             except OSError:
                 populated = None
             seen = self.proc is not None and self.proc.returncode is not None

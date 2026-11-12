@@ -847,9 +847,21 @@ def _no_proxy_refused(name: str, position: int, cause: str, reason: str) -> EnvR
 
 
 def _no_proxy_name(entry: str) -> str:
-    """The name an entry is matched by: no brackets, no ``:port``, no trailing dot."""
+    """The name an entry is matched by: no brackets, no ``:port``, no trailing dot.
 
-    return re.sub(r":[0-9]*$", "", entry.strip("[]")).rstrip(".")
+    A trailing dot is removed first, so ``host:443.`` is ``host:443`` before the port is dropped.
+    A matched ``[host]:port`` pair is unwrapped as a pair: stripping ``[]`` first leaves ``host]``
+    when the port follows the brackets (``[gateway.example]:443``), and that name matches nothing.
+    A trailing dot inside the brackets is removed last. The port itself is never compared.
+    """
+
+    entry = entry.rstrip(".")
+    bracketed = re.fullmatch(r"\[([^\]]*)\](?::[0-9]*)?", entry)
+    if bracketed:
+        entry = bracketed[1]
+    else:
+        entry = re.sub(r":[0-9]*$", "", entry.strip("[]"))
+    return entry.rstrip(".")
 
 
 def _no_proxy_hit(entry: str, hosts: tuple[str, ...]) -> bool:

@@ -716,6 +716,45 @@ class AuthRouteTests(unittest.TestCase):
                     "claude_code", home, auth_mode=SUB, route=ChildRoute(base_url=gateway, **more),
                     parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "gateway.example"}))
 
+    def test_bracketed_no_proxy_name_with_a_port_or_a_trailing_dot_is_refused(self) -> None:
+        """``[host]:port`` and a dot after the port are the host. The port is not compared, including on http."""
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        # Brackets around an engine host, with a port or an empty port, still name that host.
+        for entry in ("[api.anthropic.com]:443", "[.anthropic.com]:443", "[api.anthropic.com]:", "[claude.ai]:443"):
+            with self.subTest(entry=entry), self.assertRaises(EnvRefused) as caught:
+                build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": entry})
+            self._assert_position_only(caught.exception, "NO_PROXY", "no_proxy_engine_host", 1, self.ENGINE_HOST_WHY)
+        https, http = "https://gateway.example/api", "http://gateway.example/api"
+        sub = "https://llm.gateway.example:8443"
+        # The route host, a parent of it, and a port other than the route's. A dot after the port is dropped too.
+        for base_url, entry in (
+            (https, "[gateway.example]:443"), (https, "[gateway.example]:80"),
+            (https, "[gateway.example]:8443"), (https, "[gateway.example]:"),
+            (http, "[gateway.example]:443"), (http, "[gateway.example]:80"), (http, "[gateway.example]:8443"),
+            (http, "[gateway.example]:"), (sub, "[.gateway.example]:443"), (https, "[.gateway.example]:443"),
+            (https, "gateway.example:443."), (https, "[gateway.example]:443."),
+            (http, "gateway.example:443."), (http, "[gateway.example]:443."),
+        ):
+            with self.subTest(base_url=base_url, entry=entry), self.assertRaises(EnvRefused) as caught:
+                self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
+            self._assert_position_only(caught.exception, "NO_PROXY", "no_proxy_route_host", 1, self.ROUTE_HOST_WHY)
+        # A suffix needs a dot before it. A lookalike, bracketed or with a trailing dot, still launches.
+        for base_url, entry in (
+            ("https://epic.com/api", "pic.com"), ("https://epic.com/api", "[pic.com]:443"),
+            ("https://epic.com/api", "pic.com:443."), (https, "notgateway.example"),
+            (https, "[notgateway.example]:443"), (https, "notgateway.example:443."),
+        ):
+            with self.subTest(base_url=base_url, kept=entry):
+                env = self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
+                self.assertEqual((entry, base_url), (env["NO_PROXY"], env[URL]))
+        # An address stays an address: the route-host check still refuses the bracketed IPv6 form by address.
+        v6 = "https://[2001:db8::1]:8443/v1"
+        with self.assertRaises(EnvRefused) as caught:
+            self._no_proxy_route(home, v6, {**proxy, "NO_PROXY": "[2001:db8::1]:8443"})
+        self._assert_position_only(caught.exception, "NO_PROXY", "no_proxy_route_host", 1, self.ROUTE_HOST_WHY)
+
     def test_no_proxy_ip_and_cidr_entries_match_an_ip_literal_route_host(self) -> None:
         home = _home(self)
         proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}

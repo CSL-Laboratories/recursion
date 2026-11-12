@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -97,6 +98,13 @@ ALLOWED = (KeyError, sqlite3.IntegrityError, OSError)
 
 def one_iteration(mod, rng, args, v: h.Violations, counters: dict) -> None:
     tmp = tempfile.mkdtemp(prefix="race324-")
+    try:
+        _one_iteration(mod, rng, args, v, counters, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _one_iteration(mod, rng, args, v: h.Violations, counters: dict, tmp: str) -> None:
     reg_dir = Path(tmp) / "reg"
     registry = mod.Registry(reg_dir)
     manager = FakeManager(registry, v, rng.randrange(2**32))
@@ -181,11 +189,16 @@ def one_iteration(mod, rng, args, v: h.Violations, counters: dict) -> None:
         workers.append(flipper)
     watcher = threading.Thread(target=observer, daemon=True)
     watcher.start()
-    for problem in h.hammer(workers, timeout=120):
+    problems = h.hammer(workers, timeout=120)
+    for problem in problems:
         v.add(problem)
     done.set()
     watcher.join(30)
     v.check(not watcher.is_alive(), "observer did not finish")
+    if any("still running" in problem for problem in problems):
+        # A worker is still inside Daemon/Registry, which hold their locks across the service
+        # call. close() takes that lock and would wait out the hang hammer already reported.
+        return
 
     if not closed.is_set():
         daemon.close()
@@ -216,6 +229,13 @@ def one_iteration(mod, rng, args, v: h.Violations, counters: dict) -> None:
 
 def lock_iteration(mod, args, v: h.Violations) -> None:
     runtime = Path(tempfile.mkdtemp(prefix="race324lock-"))
+    try:
+        _lock_iteration(mod, args, v, runtime)
+    finally:
+        shutil.rmtree(runtime, ignore_errors=True)
+
+
+def _lock_iteration(mod, args, v: h.Violations, runtime: Path) -> None:
     os.chmod(runtime, 0o700)
     held, refused = [], []
     hold = threading.Barrier(args.threads, timeout=30)
@@ -241,7 +261,7 @@ def lock_iteration(mod, args, v: h.Violations) -> None:
             f"UserLock: {len(held)} holders, {len(refused)} refused of {args.threads}")
 
 
-def main() -> None:
+def main() -> int:
     args = h.parse_args()
     sys.path.insert(0, str(Path(args.tree) / "core"))
     from recursion_core import daemon as mod
@@ -254,10 +274,10 @@ def main() -> None:
     for _ in range(args.iters):
         one_iteration(mod, rng, args, v, counters)
         lock_iteration(mod, args, v)
-    h.emit("daemon_324", args, v, started=started,
-           extra={"measured": h.tree_info(args.tree, "core/recursion_core/daemon/__init__.py"),
-                  "counters": counters})
+    return h.finish("daemon_324", args, v, started=started,
+                    extra={"measured": h.tree_info(args.tree, "core/recursion_core/daemon/__init__.py"),
+                           "counters": counters})
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

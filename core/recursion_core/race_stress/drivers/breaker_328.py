@@ -48,10 +48,20 @@ def _new_breaker(mod, tmp: str, name: str):
 
 def _store_state(breaker) -> tuple:
     db = breaker._db
+    # _leases is connection -> (lease id, expiry). Sorting the dict alone keeps the names
+    # and drops both, so two different owners with the same count compare equal.
+    leases = sorted((conn, lease, expiry) for conn, (lease, expiry) in breaker._leases.items())
     return (sorted(db.execute("SELECT * FROM runs").fetchall()),
             sorted(db.execute("SELECT * FROM faulted").fetchall()),
             sorted(db.execute("SELECT * FROM tripped").fetchall()),
-            sorted(breaker._leases))
+            leases)
+
+
+def _same_leases(concurrent, replay, lease_map: dict) -> bool:
+    """Map replay lease ids back to the concurrent ids, then compare connection and expiry too."""
+    inverse = {replay_id: conc_id for conc_id, replay_id in lease_map.items()}
+    mapped = sorted((conn, inverse.get(lease, lease), expiry) for conn, lease, expiry in replay)
+    return list(concurrent) == mapped
 
 
 def linearizability(mod, Refused, rng, args, v: h.Violations, counters: dict, tmp: str) -> None:
@@ -130,10 +140,9 @@ def linearizability(mod, Refused, rng, args, v: h.Violations, counters: dict, tm
             v.add(f"#{stamp} {name}{a}: concurrent {result!r} != sequential {got!r}")
     concurrent_state = _store_state(breaker)
     replay_state = _store_state(seq)
-    inverse = {r: c for c, r in lease_map.items()}
-    replay_state = replay_state[:3] + (sorted(inverse.get(k, k) for k in replay_state[3]),)
     v.check(concurrent_state[:3] == replay_state[:3], "final store state differs from replay")
-    v.check(len(concurrent_state[3]) == len(replay_state[3]), "final lease count differs from replay")
+    v.check(_same_leases(concurrent_state[3], replay_state[3], lease_map),
+            "final lease state differs from replay")
     counters["ops"] += len(history)
     counters["leases"] += sum(1 for e in history if e[1] == "begin_probe" and e[3][0] == "ok")
     counters["leased_resets"] += sum(1 for e in history if e[1] == "reset_after_probe" and e[3] == ("ok", True))
@@ -192,7 +201,7 @@ def stale_probe(mod, Refused, rng, args, v: h.Violations, counters: dict, tmp: s
     breaker.close()
 
 
-def main() -> None:
+def main() -> int:
     args = h.parse_args()
     sys.path.insert(0, str(Path(args.tree) / "core"))
     from recursion_core.plugin_security import breaker as mod
@@ -207,10 +216,10 @@ def main() -> None:
         with tempfile.TemporaryDirectory(prefix="rs328-") as tmp:
             linearizability(mod, Refused, rng, args, v, counters, tmp)
             stale_probe(mod, Refused, rng, args, v, counters, tmp)
-    h.emit("breaker_328", args, v, started=started,
-           extra={"measured": h.tree_info(args.tree, "core/recursion_core/plugin_security/breaker.py"),
-                  "counters": counters})
+    return h.finish("breaker_328", args, v, started=started,
+                    extra={"measured": h.tree_info(args.tree, "core/recursion_core/plugin_security/breaker.py"),
+                           "counters": counters})
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -21,6 +21,7 @@ import os
 import random
 import sys
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -29,7 +30,10 @@ from recursion_core.race_stress.pins import require_pinned
 
 ITERATIONS = int(os.environ.get("RACE_STRESS_ITERS", "20"))
 THREADS = int(os.environ.get("RACE_STRESS_THREADS", "8"))
-SEED = int(os.environ.get("RACE_STRESS_SEED", "0")) or random.SystemRandom().randrange(1, 2**31)
+# "0" is a real seed. Only a missing or blank value is random, and the draw happens at import.
+_seed_raw = os.environ.get("RACE_STRESS_SEED")
+SEED = (random.SystemRandom().randrange(1, 2**31)
+        if _seed_raw is None or _seed_raw.strip() == "" else int(_seed_raw))
 
 _load_lock = threading.Lock()
 _cache: dict[tuple[str, str], types.ModuleType] = {}
@@ -98,8 +102,9 @@ def run_threads(targets, *, timeout: float = 60.0) -> list[BaseException]:
     threads = [threading.Thread(target=wrap(fn), daemon=True) for fn in targets]
     for t in threads:
         t.start()
+    deadline = time.monotonic() + timeout
     for t in threads:
-        t.join(timeout)
+        t.join(max(0.0, deadline - time.monotonic()))
     hung = [t for t in threads if t.is_alive()]
     if hung:
         errors.append(TimeoutError(f"{len(hung)} thread(s) still running after {timeout}s"))

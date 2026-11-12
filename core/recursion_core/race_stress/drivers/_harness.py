@@ -47,13 +47,24 @@ def runtime() -> dict:
     }
 
 
+# Same overrides pins.git_env drops. Duplicated so a driver script does not import the test package.
+_GIT_REPO_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_INDEX_FILE",
+    "GIT_NAMESPACE", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES",
+)
+
+
+def _git_env() -> dict:
+    return {k: v for k, v in os.environ.items()
+            if k not in _GIT_REPO_ENV and not k.startswith("GIT_CONFIG_")}
+
+
 def tree_info(tree: str, relpath: str) -> dict:
     """Pin what was measured: the tree's git HEAD and the target file's SHA-256."""
     path = Path(tree) / relpath
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG_")}
     try:
         head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], check=False, capture_output=True, text=True,
-                              timeout=15, env=env).stdout.strip() or None
+                              timeout=15, env=_git_env()).stdout.strip() or None
     except (OSError, subprocess.SubprocessError):
         head = None
     return {"tree_head": head, "file": relpath, "file_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -185,3 +196,9 @@ def emit(target: str, args, violations: Violations, *, started: float, extra: di
     }
     out.update(extra or {})
     print(json.dumps(out, sort_keys=True))
+
+
+def finish(target: str, args, violations: Violations, *, started: float, extra: dict | None = None) -> int:
+    """Print the result line and return 1 when any violation was recorded."""
+    emit(target, args, violations, started=started, extra=extra)
+    return 1 if violations.count else 0

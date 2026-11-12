@@ -11,15 +11,17 @@ touched.
 | `drivers/breaker_328.py` | recursion #328 `core/recursion_core/plugin_security/breaker.py` (SQLite store, probe leases) | `54a2d771` |
 
 `pins.py` holds each pinned head and the git object ids of the measured paths. A test uses a
-`RACE_STRESS_TREE_*` checkout only when its HEAD is the pinned head, or when every measured
-path has the pinned object id (the PR moved but the measured code did not). Any other tree
-skips with a message naming both heads; `RACE_STRESS_UNPINNED=1` measures it anyway. Earlier
-heads of this PR measured #324 `55a31508`/`9aa03185`, #326 `82247cbc` and #328 `0264628b`.
+`RACE_STRESS_TREE_*` checkout only when every measured path's committed blob is that object
+and the worktree copy of the path is clean. A dirty file is refused even at the pinned HEAD,
+because the driver imports the worktree. `git` variables that select another repository
+(`GIT_DIR` and the rest) are ignored. Any other tree skips with a message naming both heads;
+`RACE_STRESS_UNPINNED=1` measures it anyway. Earlier heads of this PR measured #324
+`55a31508`/`9aa03185`, #326 `82247cbc` and #328 `0264628b`.
 
 Each driver prints one JSON line with the tree's git HEAD, the measured file's SHA-256, the
-interpreter (free-threaded build, GIL state), the seed, counters and any violations. It runs as
-its own script so it can put the measured tree first on `sys.path` without clashing with this
-checkout's `recursion_core`.
+interpreter (free-threaded build, GIL state), the seed, counters and any violations, and exits
+1 when `violation_count` is not zero. It runs as its own script so it can put the measured
+tree first on `sys.path` without clashing with this checkout's `recursion_core`.
 
 ## How races are detected
 

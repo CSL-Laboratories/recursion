@@ -47,9 +47,15 @@ def run_driver(script: str, tree: str, *, iters: int | None = None, mutant: bool
         # An unguarded mutant may take the interpreter down (a signal) before it can report.
         print(f"\n{script} --mutant: killed by signal {-out.returncode}", file=sys.stderr)
         return {"violation_count": 1, "crashed_by_signal": -out.returncode}
-    if out.returncode != 0:
-        raise AssertionError(f"{script} exited {out.returncode}: {out.stderr[-2000:]}")
-    result = json.loads(out.stdout.strip().splitlines()[-1])
+    text = out.stdout.strip()
+    try:
+        result = json.loads(text.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        raise AssertionError(f"{script} exited {out.returncode}: {out.stderr[-2000:]}") from None
+    # Violations are a result, not a crash: the driver exits 1 and still prints the JSON line.
+    if out.returncode != 0 and not result.get("violation_count"):
+        raise AssertionError(
+            f"{script} exited {out.returncode} with no violations: {out.stderr[-2000:]}")
     print(f"\n{script}: {json.dumps(result, sort_keys=True)}", file=sys.stderr)
     return result
 

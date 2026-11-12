@@ -40,6 +40,20 @@ def runtime() -> dict:
             "gil_enabled": True if check is None else bool(check())}
 
 
+_STATUS_RANK = {"skip": 0, "ok": 1, "fail": 2, "error": 3}
+
+
+def _remember(statuses: dict, test, status: str) -> None:
+    """Record ``status`` unless a more severe one is already stored for this test.
+
+    ``addSuccess`` runs for a passing test and must not wipe a subtest failure: unittest
+    reports those through ``addSubTest`` and does not call ``addFailure`` for the parent.
+    """
+    prev = statuses.get(test.id())
+    if prev is None or _STATUS_RANK[status] >= _STATUS_RANK[prev]:
+        statuses[test.id()] = status
+
+
 def child(target: str, out_path: str) -> int:
     """Run one unittest target in this process and write ``{test_id: status}`` as JSON.
 
@@ -56,31 +70,46 @@ def child(target: str, out_path: str) -> int:
     class Result(unittest.TextTestResult):
         def addSuccess(self, test):
             super().addSuccess(test)
-            statuses[test.id()] = "ok"
+            _remember(statuses, test, "ok")
 
         def addExpectedFailure(self, test, err):
             super().addExpectedFailure(test, err)
-            statuses[test.id()] = "ok"
+            _remember(statuses, test, "ok")
 
         def addFailure(self, test, err):
             super().addFailure(test, err)
-            statuses[test.id()] = "fail"
+            _remember(statuses, test, "fail")
 
         def addUnexpectedSuccess(self, test):
             super().addUnexpectedSuccess(test)
-            statuses[test.id()] = "fail"
+            _remember(statuses, test, "fail")
 
         def addError(self, test, err):
             super().addError(test, err)
-            statuses[test.id()] = "error"
+            _remember(statuses, test, "error")
 
         def addSkip(self, test, reason):
             super().addSkip(test, reason)
-            statuses[test.id()] = "skip"
+            _remember(statuses, test, "skip")
+
+        def addSubTest(self, test, subtest, err):
+            super().addSubTest(test, subtest, err)
+            if err is not None:
+                kind = "fail" if issubclass(err[0], test.failureException) else "error"
+                _remember(statuses, test, kind)
 
     result = unittest.TextTestRunner(verbosity=2, resultclass=Result).run(suite)
     Path(out_path).write_text(json.dumps(statuses, sort_keys=True), encoding="utf-8")
     return 0 if result.wasSuccessful() else 1
+
+
+def _captured(value) -> str:
+    """TimeoutExpired carries bytes even when the child was started with ``text=True``."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
 
 
 def run_once(argv: list[str], env: dict, timeout: float) -> tuple[int, str, float]:
@@ -89,7 +118,7 @@ def run_once(argv: list[str], env: dict, timeout: float) -> tuple[int, str, floa
         proc = subprocess.run(argv, cwd=CORE, env=env, capture_output=True, text=True, timeout=timeout)
         rc, text = proc.returncode, proc.stdout + proc.stderr
     except subprocess.TimeoutExpired as exc:
-        rc, text = -999, f"TIMEOUT after {timeout}s (possible deadlock)\n{exc.stdout or ''}{exc.stderr or ''}"
+        rc, text = -999, f"TIMEOUT after {timeout}s (possible deadlock)\n{_captured(exc.stdout)}{_captured(exc.stderr)}"
     return rc, text, round(time.monotonic() - started, 3)
 
 

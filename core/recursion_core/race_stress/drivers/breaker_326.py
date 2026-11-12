@@ -11,10 +11,12 @@ Checks:
 * linearizability: replaying the history in stamp order on a fresh breaker (each call given
   the clock values it read) reproduces every result and the final state;
 * one probe per key: in that order, no key leases a second half-open probe while an earlier
-  probe's lease is live and unresolved (closed, released, reopened or reset). A probe whose
-  holder reports a limit frees its lease on the key it held even when the limit opens a
-  different key (#326 ``_open`` releases the probe first);
-* no call raises.
+  probe's lease is live and unresolved (closed, released, reopened or reset). The lease is
+  ``probe_lease_s`` when ``admit`` is given no deadline, and ``deadline_s + probe_grace_s``
+  when it is (the length ``RouteService`` uses). A probe whose holder reports a limit frees
+  its lease on the key it held even when the limit opens a different key (#326 ``_open``
+  releases the probe first);
+* no call raises. The process exits 1 when any violation was recorded.
 """
 
 from __future__ import annotations
@@ -30,7 +32,15 @@ import _harness as h
 CONNECTIONS = ("sub:alice", "api:k1")
 MODELS = ("m-large", "m-small")
 TENANTS = ("t1", "t2")
-PARAMS = dict(cooldown_s=1.0, max_cooldown_s=4.0, max_open_s=10.0, probe_lease_s=2.0, short_fault_s=0.5)
+PARAMS = dict(cooldown_s=1.0, max_cooldown_s=4.0, max_open_s=10.0, probe_lease_s=2.0,
+              short_fault_s=0.5, probe_grace_s=30.0)
+
+
+def _lease_seconds(deadline_s) -> float:
+    """How long an admit keeps the key. ``None`` is the no-deadline branch."""
+    if deadline_s is None:
+        return PARAMS["probe_lease_s"]
+    return float(deadline_s) + PARAMS["probe_grace_s"]
 
 
 class FakeClock:
@@ -93,7 +103,9 @@ def one_iteration(mod, c, rng, args, v: h.Violations, counters: dict) -> None:
             clock.advance(wrng.uniform(0.0, 0.3))
             roll = wrng.random()
             if roll < 0.45:
-                got = call("admit", conn, model, tenant)
+                # Half the admits take the production lease: the run's own deadline plus grace.
+                deadline = None if wrng.random() < 0.5 else wrng.choice((1.0, 10.0))
+                got = call("admit", conn, model, tenant, deadline_s=deadline)
                 if got["admitted"] and got["probe"]:
                     held.append((conn, model, tenant, got["probe"]))
                     with hist_lock:
@@ -143,7 +155,7 @@ def one_iteration(mod, c, rng, args, v: h.Violations, counters: dict) -> None:
             if prior is not None and now is not None and now < prior[1]:
                 v.add(f"#{stamp} second live probe on {key}: {prior[0]} (lease to {prior[1]}) "
                       f"then {result['probe']} at {now}")
-            live[key] = (result["probe"], now + PARAMS["probe_lease_s"])
+            live[key] = (result["probe"], now + _lease_seconds(kw.get("deadline_s")))
             counters["probes"] += 1
         elif name == "record":
             probe = kw.get("probe")
@@ -172,7 +184,7 @@ def one_iteration(mod, c, rng, args, v: h.Violations, counters: dict) -> None:
     counters["refused"] += sum(1 for e in history if e[1] == "admit" and not e[5]["admitted"])
 
 
-def main() -> None:
+def main() -> int:
     args = h.parse_args()
     sys.path.insert(0, str(Path(args.tree) / "core"))
     from recursion_core.routes import breaker as mod
@@ -184,10 +196,10 @@ def main() -> None:
     counters = {"ops": 0, "probes": 0, "opened": 0, "refused": 0}
     for _ in range(args.iters):
         one_iteration(mod, c, rng, args, v, counters)
-    h.emit("breaker_326", args, v, started=started,
-           extra={"measured": h.tree_info(args.tree, "core/recursion_core/routes/breaker.py"),
-                  "counters": counters})
+    return h.finish("breaker_326", args, v, started=started,
+                    extra={"measured": h.tree_info(args.tree, "core/recursion_core/routes/breaker.py"),
+                           "counters": counters})
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

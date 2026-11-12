@@ -73,6 +73,23 @@ class RoutesBreakerCase(SeededCase):
 
 
 class HalfOpenStampedeTests(RoutesBreakerCase):
+    def test_deadline_lease_outlives_probe_lease_s(self) -> None:
+        """A probe admitted with deadline_s stays the only probe past probe_lease_s.
+
+        setUp uses probe_lease_s=5 and leaves probe_grace_s at the breaker default of 30.
+        deadline_s=1 therefore leases the key for 31s. Six seconds later, past the
+        no-deadline lease and inside the deadline lease, a stampede must still be refused.
+        """
+        self.br.reset(CONN)
+        self.assertEqual(self.br.record(CONN, MODEL, "t0", self.limit()), "opened")
+        self.clock.advance(10)  # cooldown over, so the next admit leases a probe
+        first = self.br.admit(CONN, MODEL, "t0", deadline_s=1.0)
+        self.assertIsNotNone(first["probe"])
+        self.clock.advance(6)
+        out = self.stampede()
+        self.assertEqual([r for r in out if r["probe"]], [], out)
+        self.assertTrue(all(not r["admitted"] and r["code"] == self.c.PROBE_IN_FLIGHT for r in out), out)
+
     def test_exactly_one_probe_when_cooldown_ends_under_a_stampede(self) -> None:
         for i in range(ITERATIONS):
             self.br.reset(CONN)

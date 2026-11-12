@@ -63,9 +63,11 @@ are unaffected:
 
 ## Behaviour
 
-- Singleton: `flock` on `$XDG_RUNTIME_DIR/recursion-daemon.lock`. The kernel drops
-  the lock when the process dies, so a stale file never blocks a restart. The file
-  is never unlinked. Different users have different runtime directories.
+- Singleton: `flock` on `$XDG_RUNTIME_DIR/recursion-daemon.lock` and on that
+  directory. The directory lease is what a second daemon blocks on, so removing
+  or replacing the lock file does not let another daemon start. The kernel drops
+  both locks when the process dies, so a stale file never blocks a restart. The
+  file is never unlinked. Different users have different runtime directories.
 - Registry: SQLite with `synchronous=FULL` in `$XDG_STATE_HOME/recursion/`
   (directory 0700, file 0600). A run row commits before `systemd-run`; a Stop
   intent commits before `systemctl stop`. Unknown schema versions are refused.

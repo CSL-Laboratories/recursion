@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -372,6 +373,39 @@ class DaemonTests(unittest.TestCase):
         with self.assertRaises(OSError):
             with UserLock(self.path):
                 pass
+
+    def test_removed_lock_file_does_not_admit_a_second_daemon(self):
+        # The lease is the inode, not the directory entry. Removing the lock
+        # file and creating a new one must not let a second daemon run.
+        runtime = self.path / 'lock-runtime'
+        before = set(os.listdir('/proc/self/fd'))
+        first = UserLock(runtime)
+        first.__enter__()
+        try:
+            os.unlink(first.path)
+            with self.assertRaises(AlreadyRunning):
+                with UserLock(runtime):
+                    pass
+        finally:
+            first.__exit__(None, None, None)
+        with UserLock(runtime):
+            pass
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+
+    def test_failed_registry_open_closes_the_connection(self):
+        directory = self.path / 'corrupt'
+        directory.mkdir(mode=0o700)
+        (directory / 'runs.sqlite3').write_bytes(b'not a database')
+        (directory / 'runs.sqlite3').chmod(0o600)
+        before = set(os.listdir('/proc/self/fd'))
+        caught = None
+        try:
+            Registry(directory)
+        except sqlite3.DatabaseError:
+            caught = sys.exc_info()
+        self.assertIsNotNone(caught)
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+        del caught
 
 
 class RuntimeTests(unittest.TestCase):

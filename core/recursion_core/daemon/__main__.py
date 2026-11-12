@@ -23,27 +23,32 @@ def main(*, client=None, door=None, plugins=(), port=8765):
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
     state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
     stopped = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
-    signal.signal(signal.SIGINT, lambda *_: stopped.set())
-    with UserLock(runtime):
-        daemon = Daemon(Registry(state), SystemdUserManager())
-        gui = None
-        try:
-            daemon.sweep()
-            gui = _start_gui(client, door, plugins, port, announced=False)
-            announced = gui is None
-            while not stopped.wait(5):
-                require_free_threaded()
-                daemon.sweep()
-                if gui is None:
-                    gui = _start_gui(client, door, plugins, port, announced=announced)
-                    announced = gui is None
-        finally:
+    previous_handlers = {}
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[sig] = signal.signal(sig, lambda *_: stopped.set())
+        with UserLock(runtime):
+            daemon = Daemon(Registry(state), SystemdUserManager())
+            gui = None
             try:
-                if gui is not None:
-                    gui.__exit__(None, None, None)
+                daemon.sweep()
+                gui = _start_gui(client, door, plugins, port, announced=False)
+                announced = gui is None
+                while not stopped.wait(5):
+                    require_free_threaded()
+                    daemon.sweep()
+                    if gui is None:
+                        gui = _start_gui(client, door, plugins, port, announced=announced)
+                        announced = gui is None
             finally:
-                daemon.close()  # Deliberately do not stop independent run services.
+                try:
+                    if gui is not None:
+                        gui.__exit__(None, None, None)
+                finally:
+                    daemon.close()  # Deliberately do not stop independent run services.
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 def _start_gui(client, door, plugins, port, *, announced):

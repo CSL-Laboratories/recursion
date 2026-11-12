@@ -54,29 +54,48 @@ class AlreadyRunning(RuntimeError):
 
 
 class UserLock:
-    """A kernel lease, not a stale PID/token-file check. Never unlink the inode."""
+    """A kernel lease, not a stale PID/token-file check. Never unlink the inode.
+
+    The exclusive lease is the runtime directory, not only the lock file. flock
+    follows an open file description: after the lock file is removed, a new
+    file at the same path is a different inode and the two flocks do not
+    conflict. Holding the directory keeps a second daemon out until this
+    process releases the lease or dies.
+    """
     def __init__(self, runtime: Path):
         self.path = runtime / 'recursion-daemon.lock'
         self.fd = None
+        self.dirfd = None
 
     def __enter__(self):
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        dirfd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
-            if os.fstat(fd).st_uid != os.getuid():
-                raise PermissionError('Runtime lock must be owned by operator')
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(dirfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                if os.fstat(fd).st_uid != os.getuid():
+                    raise PermissionError('Runtime lock must be owned by operator')
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
         except BaseException as exc:
-            os.close(fd)
+            os.close(dirfd)
             if isinstance(exc, BlockingIOError):
                 raise AlreadyRunning('One daemon per user per machine') from exc
             raise
         self.fd = fd
+        self.dirfd = dirfd
         return self
 
     def __exit__(self, *args):
-        os.close(self.fd)
-        self.fd = None
+        try:
+            os.close(self.fd)
+        finally:
+            self.fd = None
+            os.close(self.dirfd)
+            self.dirfd = None
 
 
 @dataclass(frozen=True)
@@ -99,21 +118,30 @@ class Registry:
             raise PermissionError('Registry directory must be operator-owned mode 0700')
         path = directory / 'runs.sqlite3'
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        os.chmod(path, 0o600)
         self.lock = threading.RLock()
         self.closed = False
-        self.db.execute('PRAGMA synchronous=FULL')
-        self.db.execute('PRAGMA journal_mode=WAL')
-        version = self.db.execute('PRAGMA user_version').fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
-            self.db.close()
-            raise RuntimeError(f'Unknown registry schema {version}; refusing to guess')
-        with self._tx():
-            self.db.execute('CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, '
-                            'unit TEXT UNIQUE NOT NULL, stop INTEGER NOT NULL, '
-                            'state TEXT NOT NULL, boot_id TEXT, detail TEXT NOT NULL, '
-                            'created REAL NOT NULL, updated REAL NOT NULL)')
-            self.db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+        try:
+            os.chmod(path, 0o600)
+            self.db.execute('PRAGMA synchronous=FULL')
+            self.db.execute('PRAGMA journal_mode=WAL')
+            version = self.db.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0, SCHEMA_VERSION):
+                raise RuntimeError(f'Unknown registry schema {version}; refusing to guess')
+            with self._tx():
+                self.db.execute('CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, '
+                                'unit TEXT UNIQUE NOT NULL, stop INTEGER NOT NULL, '
+                                'state TEXT NOT NULL, boot_id TEXT, detail TEXT NOT NULL, '
+                                'created REAL NOT NULL, updated REAL NOT NULL)')
+                self.db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+        except BaseException:
+            # A failed open must not leave the connection alive for as long as
+            # the caller's traceback keeps this object reachable.
+            self.closed = True
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            raise
 
     @contextmanager
     def _tx(self):

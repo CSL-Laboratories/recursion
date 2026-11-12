@@ -210,7 +210,8 @@ class InMemoryRunRegistry:
 
         A cgroup without a marker is given one. A stopped snapshot must name a non-empty cgroup. It is
         rejected when its attestation names another cgroup, a generation newer than the record, or a
-        membership that still lists someone the proof does not cover or who is still alive. Members
+        membership that still lists someone the proof does not cover or who is still alive. A probe
+        that fails raises ``LivenessUnknown`` and stores nothing. Members
         that pass that check are dropped, as they are when a stop is recorded. A proof older than the
         record, naming members the row has already dropped, is kept.
         """
@@ -247,7 +248,14 @@ class InMemoryRunRegistry:
         for member in rec.get("members") or []:
             # A member still on the row must be one the proof named, and must no longer be alive.
             # A proof may name members the row has already dropped; that history stays valid.
-            if not isinstance(member, dict) or member.get("member_id") not in proved or self.process_alive(member.get("pid")):
+            # A probe that fails is not proof the member is gone.
+            if not isinstance(member, dict) or member.get("member_id") not in proved:
+                raise StopUnattested(run_id)
+            try:
+                alive = self.process_alive(member.get("pid"))
+            except Exception as err:
+                raise LivenessUnknown(run_id) from err
+            if alive:
                 raise StopUnattested(run_id)
         rec["members"] = []  # proved gone; a stopped run does not keep member rows
 

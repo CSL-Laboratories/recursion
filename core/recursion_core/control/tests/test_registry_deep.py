@@ -6,10 +6,13 @@ a cgroup, or a real workload.
 
 from __future__ import annotations
 
+import io
+import json
 import unittest
 
 from recursion_core.control import api as a
-from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
+from recursion_core.control import cli
+from recursion_core.control.registry import InMemoryRunRegistry, LivenessUnknown, StaleGeneration
 from recursion_core.control.tests.fakes import make_api
 from recursion_core.control.tests.test_registry_cas import _running
 
@@ -68,6 +71,71 @@ class _LoseTwiceThenBlind(InMemoryRunRegistry):
             self.hidden = row
             raise OSError("disk")
         return row
+
+
+class _BlindBeforeSecondStop(InMemoryRunRegistry):
+    """The first stopped put joins a live member, then ``get`` cannot be read.
+
+    The re-read in ``_recorded`` is the one that fails, before any second stopped put.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(processes=lambda _pid: True)
+        self.stopped_puts = 0
+        self.blind = False
+        self.hidden: dict | None = None
+
+    def put(self, record: dict):
+        if record.get("state") == "stopped" and self.stopped_puts < 1:
+            self.stopped_puts += 1
+            current = super().get(record["run_id"])
+            assert current is not None
+            super().join_member(record["run_id"], current["generation"], "late", 9)
+            self.blind = True
+            fresh = super().get(record["run_id"])
+            assert fresh is not None
+            raise StaleGeneration(record["run_id"], record.get("generation"), fresh["generation"])
+        return super().put(record)
+
+    def get(self, run_id: str):
+        row = super().get(run_id)
+        if self.blind:
+            self.hidden = row
+            raise OSError("disk")
+        return row
+
+
+class _PlantStoppedOnFirstPut(InMemoryRunRegistry):
+    """The first stopped put loses to a stopped row the registry itself would not have stored."""
+
+    def __init__(self, *, blank_proof: bool, members: list[dict]) -> None:
+        super().__init__(processes=lambda _pid: True)
+        self._blank_proof = blank_proof
+        self._members = members
+        self.planted = False
+
+    def put(self, record: dict):
+        if record.get("state") == "stopped" and not self.planted:
+            current = super().get(record["run_id"])
+            assert current is not None
+            planted = dict(current)
+            planted["state"] = "stopped"
+            planted["generation"] = current["generation"] + 1
+            planted["members"] = [dict(member) for member in self._members]
+            if self._blank_proof:
+                planted["stop_attestation"] = {}
+            else:
+                planted["stop_attestation"] = {
+                    "proof": "empty",
+                    "cgroup": current.get("cgroup"),
+                    "cgroup_marker": current.get("cgroup_marker"),
+                    "member_ids": [member["member_id"] for member in self._members],
+                    "generation": planted["generation"],
+                }
+            self._runs[record["run_id"]] = planted
+            self.planted = True
+            raise StaleGeneration(record["run_id"], record.get("generation"), planted["generation"])
+        return super().put(record)
 
 
 class _PendingLosesToStopped(InMemoryRunRegistry):
@@ -177,6 +245,83 @@ class LastWriterStopTest(unittest.TestCase):
         self.assertIs(res["repeat"], True)
         self.assertIsNot(res.get("recorded"), False)
 
+    def test_a_blind_reread_before_the_second_stopped_put_is_pending(self) -> None:
+        # The stopped put loses to a live member, and the re-read before the retry cannot
+        # be done. That is not a stopped run, and the CLI must not exit 0.
+        reg = _BlindBeforeSecondStop()
+        api, _, _, _ = make_api(registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(["stop", run], api, out, err)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "unknown")
+        self.assertIs(res["recorded"], False)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cli.EXIT_PENDING)
+        assert reg.hidden is not None
+        self.assertEqual(reg.hidden["state"], "running")
+        self.assertEqual(reg.hidden["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+
+    def test_a_lost_stop_does_not_leave_a_stopped_launch_handle(self) -> None:
+        # The second loss answers pending, but the handle must not keep a stopped copy.
+        # The next stop, while get still fails, must not report stopped over the live member.
+        reg = _LoseTwiceThenBlind()
+        api, _, _, _ = make_api(registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        held = reg.get(run)
+        assert held is not None
+        api._launched[run] = dict(held)
+        first = api.call("run.stop", {"run_id": run})
+        self.assertEqual(first["code"], a.PENDING)
+        self.assertEqual(first["state"], "pending")
+        self.assertEqual(first["reason"], "unknown")
+        self.assertIs(first["recorded"], False)
+        self.assertNotEqual(api._launched[run].get("state"), "stopped")
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(["stop", run], api, out, err)
+        second = json.loads(out.getvalue())
+        self.assertEqual(second["code"], a.PENDING)
+        self.assertEqual(second["state"], "pending")
+        self.assertIs(second["recorded"], False)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cli.EXIT_PENDING)
+        assert reg.hidden is not None
+        self.assertEqual(reg.hidden["state"], "running")
+        self.assertEqual(reg.hidden["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+
+    def test_a_reread_stopped_row_with_an_empty_proof_is_pending(self) -> None:
+        reg = _PlantStoppedOnFirstPut(blank_proof=True, members=[])
+        api, _, _, _ = make_api(registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "generation_conflict")
+        self.assertIs(res["recorded"], False)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["stop_attestation"], {})
+        self.assertNotEqual(res.get("repeat"), True)
+
+    def test_a_reread_stopped_row_that_still_lists_a_live_member_is_pending(self) -> None:
+        reg = _PlantStoppedOnFirstPut(blank_proof=False, members=[{"member_id": "late", "pid": 9}])
+        api, _, _, _ = make_api(registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "generation_conflict")
+        self.assertIs(res["recorded"], False)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+
 
 class StopAttestationTest(unittest.TestCase):
     def test_a_member_alive_at_commit_is_not_reported_stopped(self) -> None:
@@ -235,6 +380,21 @@ class StopAttestationTest(unittest.TestCase):
         self.assertNotEqual(stored["cgroup_marker"], held)
         self.assertEqual(stored["stop_attestation"]["cgroup"], "A")
         self.assertEqual(stored["stop_attestation"]["cgroup_marker"], stored["cgroup_marker"])
+
+
+class LoadedStopProbeTest(unittest.TestCase):
+    def test_loading_a_stopped_snapshot_whose_probe_raises_is_liveness_unknown(self) -> None:
+        legacy = {"run_id": "run-1", "tenant": "t", "engine": "codex", "state": "stopped",
+                  "cgroup": "/cg/run-1", "generation": 2,
+                  "members": [{"member_id": "m", "pid": 7}],
+                  "stop_attestation": {"proof": "empty", "cgroup": "/cg/run-1", "member_ids": ["m"],
+                                       "generation": 1}}
+
+        def deny(_pid: int) -> bool:
+            raise PermissionError("proc")
+
+        with self.assertRaises(LivenessUnknown):
+            InMemoryRunRegistry([legacy], processes=deny)
 
 
 class LaterMemberOrphanTest(unittest.TestCase):

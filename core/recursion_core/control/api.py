@@ -557,7 +557,11 @@ class ControlAPI:
         if proof is None:  # cleanup ran, but this copy cannot name a generation: typed, not KeyError
             res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first, "recorded": False}
             if run_id in self._launched:
-                self._launched[run_id] = dict(rec, state="stopped")
+                # Not stored, so the handle must not become a stopped snapshot.
+                kept = dict(rec)
+                if isinstance(rec.get("stop"), dict):
+                    kept["stop"] = dict(rec["stop"])
+                self._launched[run_id] = kept
             return res
         rec["state"] = "stopped"
         rec["stop_attestation"] = proof
@@ -654,13 +658,24 @@ class ControlAPI:
         if outcome == "stale":
             fresh = self._reread(rec)
             if fresh is None:
+                # The lost write is not a stopped run. The row could not be read, so a live
+                # member may still be on it. Same answer as ``_lost_stop_is_pending``.
+                if res.get("code") == STOPPED:
+                    res = {"code": PENDING, "run_id": rec.get("run_id"), "state": "pending", "reason": "unknown"}
                 outcome = "down"
-            elif fresh.get("state") == "stopped":
+            elif fresh.get("state") == "stopped" and _recorded_stop(fresh):
                 # An older pending or populated result must not demote a stop that already committed.
                 rec.clear()
                 rec.update(fresh)
                 res = {"code": STOPPED, "run_id": fresh["run_id"], "state": "stopped", "repeat": True}
                 outcome = "ok"
+            elif fresh.get("state") == "stopped":
+                # ``state == stopped`` with an empty proof, or with a member still listed, is not
+                # a recorded stop. Answer pending instead of repeat-stopped.
+                fresh["stop"] = self._carry_stop(rec.get("stop"), rec, fresh)
+                outcome, res = self._pending_instead(fresh, "generation_conflict")
+                rec.clear()
+                rec.update(fresh)
             elif res.get("code") == STOPPED and self._cgroup_identity(fresh) != self._cgroup_identity(rec):
                 # The empty result belongs to the cgroup we confirmed, not to the one stored now.
                 fresh["stop"] = self._carry_stop(rec.get("stop"), rec, fresh)
@@ -710,7 +725,7 @@ class ControlAPI:
         if outcome != "ok":
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
-                self._launched[rec["run_id"]] = self._launch_snapshot(rec)
+                self._launched[rec["run_id"]] = self._unrecorded_launch(rec)
         else:
             # A pending row that lost the cgroup is not persistence. The retained handle stays until the
             # cgroup, or a stopped proof that names one, is what got stored.
@@ -728,6 +743,18 @@ class ControlAPI:
     def _forget_launch_if_persisted(self, rec: dict) -> None:
         if self._launch_persisted(rec):
             self._launched.pop(rec["run_id"], None)
+
+    def _unrecorded_launch(self, rec: dict) -> dict:
+        """The handle after a write that did not land.
+
+        A stopped copy is kept only when that stop was stored. This path did not store it, so the
+        next stop must not answer ``stopped`` from the handle while a member is still on the row.
+        """
+        snap = self._launch_snapshot(rec)
+        if snap.get("state") == "stopped":
+            snap["state"] = "stop_pending"
+            snap["stop_attestation"] = None
+        return snap
 
     def _launch_snapshot(self, rec: dict) -> dict:
         """The handle to keep after a failed write. A cgroup-less copy does not replace a retained cgroup."""

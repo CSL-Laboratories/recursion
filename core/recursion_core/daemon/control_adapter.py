@@ -205,15 +205,37 @@ def route_unsupported(entry):
     refused ``launch_refused`` before anything is bound or launched. The subscription route is not
     touched, and an API-key route with ``key_source: custody`` keeps its own refusal
     (``no credential``).
+
+    The same holds for the routes the entry would switch to. With ``limits.on_limit: fallback`` the
+    route service launches the next ``limits.fallback`` route once the primary connection is at a
+    limit, so an entry whose fallback list names such a route is refused whole, naming the fallback
+    by its place in the list. A fallback list that is only shown to the user (``ask``, ``wait``) is
+    never launched from and does not refuse the entry.
     """
     route = entry.get('route') if isinstance(entry, dict) else None
+    if not isinstance(route, dict):
+        return None
+    reason = _no_custody(route)
+    if reason is not None:
+        return f'no credential custody: {reason}'
+    limits = route.get('limits')
+    if isinstance(limits, dict) and limits.get('on_limit') == 'fallback' and isinstance(limits.get('fallback'), list):
+        for place, other in enumerate(limits['fallback'], 1):
+            reason = _no_custody(other)
+            if reason is not None:
+                return f'no credential custody: fallback {place}: {reason}'
+    return None
+
+
+def _no_custody(route):
+    """What kind of custody-less route ``route`` is, or None."""
     connection = route.get('connection') if isinstance(route, dict) else None
     if not isinstance(connection, dict):
         return None
     if connection.get('kind') == 'passthrough':
-        return 'no credential custody: a passthrough route is not launched'
+        return 'a passthrough route is not launched'
     if connection.get('key_source') == 'api_key_helper':
-        return 'no credential custody: a key_source api_key_helper route is not launched'
+        return 'a key_source api_key_helper route is not launched'
     return None
 
 

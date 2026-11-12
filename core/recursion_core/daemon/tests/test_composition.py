@@ -396,6 +396,61 @@ class ComposedDaemonTest(unittest.TestCase):
         self.start(self.api(composed))
         self.assertEqual(len(self.units.started), 1)
 
+    def test_a_fallback_route_without_custody_is_refused_with_the_route_that_lists_it(self):
+        """R1-3 through ``limits.fallback``: once the primary connection is at a limit the route service
+        launches the next fallback, so a helper-key or passthrough fallback would start under the sign-in
+        too. The route that lists one is refused whole, before anything is bound or launched."""
+        ran = self.probe_engine()
+        self.environ['CLAUDE_CODE_OAUTH_TOKEN'] = 'synthetic-oauth-test-value'
+        base = dict(self.environ)
+        for name, (connection, needs) in self.NO_CUSTODY_ROUTES.items():
+            with self.subTest(fallback=name):
+                self.environ = {**base, **needs}
+                self.routes = {'claude_code': {
+                    'route': {'engine': 'claude_code', 'model': 'm', 'api_key_helper': 'absent',
+                              'connection': {'kind': 'subscription', 'id': 'stand-in-login'},
+                              'limits': {'on_limit': 'fallback', 'fallback': [
+                                  {'engine': 'claude_code', 'model': 'm', 'connection': dict(connection)}]}},
+                    'deadline_s': 60.0, 'binary': str(self.engine)}}
+                try:
+                    with mock.patch.object(adapter.log, 'error') as logged:
+                        _, composed = self.boot()
+                    # The primary is at its limit, which is when the service would switch to the fallback.
+                    composed.breaker._stored.report('subscription:stand-in-login', 'plan_limit')
+                    composed.breaker.bind_run = binds = mock.Mock(return_value=None)
+                    api = self.api(composed)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi'})
+                    self.assertEqual(answer['code'], 'start_failed', answer)
+                    self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+                    self.assertTrue(answer['start_error']['detail'].startswith('no credential custody: fallback 1: '),
+                                    answer)
+                    self.assertEqual(self.units.started, [], 'a unit was started')
+                    self.assertFalse(ran.exists(), 'the engine was executed')
+                    binds.assert_not_called()
+                    row = next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+                    self.assertTrue(row['blocker'].startswith('launch_refused: no credential custody: fallback 1: '), row)
+                    said = [call.args[0] % call.args[1:] for call in logged.call_args_list]
+                    self.assertTrue(any('no credential custody: fallback 1: ' in line for line in said), said)
+                finally:
+                    self.shutdown()
+                    self.kill_units()
+                    self.units.started.clear()
+                    self.units.procs.clear()
+                    ran.unlink(missing_ok=True)
+        # The same list when it is only shown to the user (on_limit: ask): nothing is launched from it,
+        # so the subscription route starts as it did before.
+        self.environ = dict(base)
+        self.routes = {'claude_code': {
+            'route': {'engine': 'claude_code', 'model': 'm', 'api_key_helper': 'absent',
+                      'connection': {'kind': 'subscription', 'id': 'other-login'},
+                      'limits': {'on_limit': 'ask', 'fallback': [
+                          {'engine': 'claude_code', 'model': 'm',
+                           'connection': dict(self.NO_CUSTODY_ROUTES['api_key_helper'][0])}]}},
+            'deadline_s': 60.0, 'binary': str(self.engine)}}
+        _, composed = self.boot()
+        self.start(self.api(composed), 'hi')
+        self.assertEqual(len(self.units.started), 1)
+
     def test_route_unsupported_names_only_the_routes_without_custody(self):
         def entry(connection):
             return {'route': {'engine': 'claude_code', 'model': 'm', 'connection': connection}, 'deadline_s': 1.0}
@@ -408,6 +463,25 @@ class ComposedDaemonTest(unittest.TestCase):
             self.assertIsNone(adapter.route_unsupported(entry(allowed)), allowed)
         for malformed in (None, {}, {'route': None}, {'route': {}}, entry(None), entry('passthrough')):
             self.assertIsNone(adapter.route_unsupported(malformed), malformed)  # the route contract refuses these
+
+        def with_limits(limits):
+            listed = entry({'kind': 'subscription', 'id': 'login'})
+            listed['route']['limits'] = limits
+            return listed
+
+        helper = {'engine': 'claude_code', 'model': 'm', 'connection': self.NO_CUSTODY_ROUTES['api_key_helper'][0]}
+        other = {'engine': 'claude_code', 'model': 'm', 'connection': {'kind': 'subscription', 'id': 'other-login'}}
+        # A fallback the service would launch from refuses the entry, and is named by its place in the list.
+        self.assertEqual(adapter.route_unsupported(with_limits({'on_limit': 'fallback', 'fallback': [other, helper]})),
+                         'no credential custody: fallback 2: a key_source api_key_helper route is not launched')
+        self.assertIsNone(adapter.route_unsupported(with_limits({'on_limit': 'fallback', 'fallback': [other]})))
+        # A list that is only shown to the user is never launched from: the subscription route stays as it was.
+        for shown in ({'on_limit': 'ask', 'fallback': [helper]}, {'on_limit': 'wait', 'fallback': [helper]},
+                      {'fallback': [helper]}):
+            self.assertIsNone(adapter.route_unsupported(with_limits(shown)), shown)
+        for malformed in ('fallback', {'on_limit': 'fallback'}, {'on_limit': 'fallback', 'fallback': 'x'},
+                          {'on_limit': 'fallback', 'fallback': [None, 'x', {}]}):
+            self.assertIsNone(adapter.route_unsupported(with_limits(malformed)), malformed)  # the contract refuses these
 
     # -- CLI -------------------------------------------------------------------------------------
     def run_cli(self, argv, path):

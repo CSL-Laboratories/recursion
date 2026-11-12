@@ -10,6 +10,10 @@ listener, and any network-shaped address raises ``RemoteBindRefused``.
 
 Linux is the tested path. macOS uses the same AF_UNIX family and is designed in through
 ``peercred.get_peer_cred``; Windows is a labelled stub (``windows.py``, F40).
+
+A connect that fails with ``EACCES`` or ``EPERM`` does not reclaim the socket.
+Owner decision: that errno is not proof the file is stale, so a dead mode-000
+socket stays until the operator removes it.
 """
 
 from __future__ import annotations
@@ -63,13 +67,6 @@ BUSY_FRAME = encode_frame(
 _ACCEPT_POLL_S = 0.1
 # Linux sun_path is 108 bytes including the trailing NUL.
 _MAX_SUN_PATH = 107
-# Linux unix_seq_show reports TCP_LISTEN as 1 << 16 in /proc/net/unix Flags.
-# The Inode column is the sockfs inode, not the directory entry's st_ino.
-_UNIX_LISTENER_FLAG = 0x10000
-# Num: RefCount Protocol Flags Type St Inode [Path]
-_UNIX_ROW = re.compile(
-    r"^[0-9A-Fa-f]+:\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([0-9A-Fa-f]+)\s+\S+\s+\S+\s+\d+(?: (.*))?$"
-)
 _URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _HOST_PORT = re.compile(r"^\[?[^/\\]*\]?:\d+$")
 
@@ -254,44 +251,6 @@ def _probe_listener(path: str) -> int | None:
     return None
 
 
-def _proc_unix_path_state(path: str) -> str:
-    """``listening``, ``present``, ``absent`` or ``unknown`` for ``path``.
-
-    Match the Path column only. Do not compare the Inode column to ``lstat``
-    ``st_ino``: that column is the sockfs inode, so a live listener would
-    look absent and be unlinked.
-    """
-    try:
-        with open("/proc/net/unix", "rb") as fh:
-            blob = fh.read()
-    except OSError:
-        return "unknown"
-    lines = blob.decode("utf-8", "surrogateescape").splitlines()
-    if not lines or not lines[0].startswith("Num"):
-        return "unknown"
-    found = False
-    for line in lines[1:]:
-        if not line:
-            continue
-        matched = _UNIX_ROW.match(line)
-        if matched is None:
-            # A torn or unexpected row that names this path is not "absent".
-            if path in line:
-                return "unknown"
-            continue
-        row_path = matched.group(2)
-        if row_path != path:
-            continue
-        try:
-            flags = int(matched.group(1), 16)
-        except ValueError:
-            return "unknown"
-        if flags & _UNIX_LISTENER_FLAG:
-            return "listening"
-        found = True
-    return "present" if found else "absent"
-
-
 def _unlink_our_socket(path: str, ident: tuple[int, int]) -> None:
     """Unlink ``path`` only when a fresh lstat still shows socket inode ``ident``.
 
@@ -313,14 +272,20 @@ def _unlink_our_socket(path: str, ident: tuple[int, int]) -> None:
 
 
 def _clear_stale_socket(path: str) -> None:
-    """Drop a socket we own when nobody is listening. Leave a listener alone.
+    """Drop a socket we own only when connect proves nothing is listening.
 
-    ``EACCES`` and ``EPERM`` are not proof the file is stale. A same-uid
-    listener at mode 000 or 0070 fails ``connect`` the same way a closed
-    socket does. Do not chmod and do not unlink on that result: chmod would
-    leave the listener at 0600, and ``follow_symlinks=False`` still walks a
-    parent symlink. Reclaim the file only when ``/proc/net/unix`` has no row
-    for this path. Anything uncertain is refused and left untouched.
+    ``ECONNREFUSED`` means this namespace has no listener on that inode, so
+    the inode-checked unlink may reclaim it. ``EACCES`` and ``EPERM`` do not:
+    a live mode-000 or mode-070 listener fails connect the same way a dead
+    socket does. ``/proc/net/unix`` cannot separate those. Another net
+    namespace, a bind mount in another mount namespace, a symlink or ``..``
+    alias, and a path ``str.splitlines`` would split (newline, vertical tab)
+    all omit the listener while it is still live. Do not chmod on this path
+    either: chmod would leave a listener at 0600, and ``follow_symlinks=False``
+    still walks a parent symlink.
+
+    Owner decision: never unlink on ``EACCES`` or ``EPERM``. A dead mode-000
+    socket stays until the operator removes it.
     """
     st = _stat_our_socket(path)
     if st is None:
@@ -334,14 +299,10 @@ def _clear_stale_socket(path: str) -> None:
     if err == errno.ECONNREFUSED:
         _unlink_our_socket(path, ident)
         return
-    if err not in (errno.EACCES, errno.EPERM):
-        raise InsecureSocketPath(f"{path} is not connectable")
-    state = _proc_unix_path_state(path)
-    if state != "absent":
-        if state == "listening":
-            raise InsecureSocketPath(f"{path} is live: another server is listening")
-        raise InsecureSocketPath(f"{path} is not connectable")
-    _unlink_our_socket(path, ident)
+    code = errno.errorcode.get(err, str(err))
+    raise InsecureSocketPath(
+        f"{path} is not connectable ({code}). Left in place. Remove this socket if it is stale."
+    )
 
 
 def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -> PeerCred:
@@ -482,8 +443,16 @@ class UnixControlServer:
 
         The flock is released before any peer-observable shutdown. ``shutdown``
         wakes a client blocked in ``read``, and that client may start a successor
-        before ``close`` returns. Joins stay inside this cleanup: a handler that
-        stops the server is running on a worker, and joining that thread raises.
+        before ``close`` returns. Once the flock is gone that successor can also
+        bind while a handler from this server is still running: the lock
+        serialises listeners, not a handler already inside ``_serve``. That
+        overlap is accepted. This close still shuts the old connections down.
+        Joins stay inside this cleanup: a handler that stops the server is
+        running on a worker, and joining that thread raises.
+
+        Unlink can fail after the listen socket is closed (the directory is
+        not writable). Shutdown, the worker joins and abandon still run, then
+        the unlink error propagates.
         """
         self._stop.set()
         thread = self._thread
@@ -494,22 +463,26 @@ class UnixControlServer:
             with self._lock:
                 workers = list(self._workers)
                 conns = list(self._conns)
-            # Drop the listener and the flock before waking peers.
-            self._release_bound_socket()
-            for conn in conns:
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-            for worker in workers:
-                if worker is threading.current_thread() or worker.ident is None:
-                    continue
-                worker.join(timeout=self._requests.remaining())
-            # The wait is over. Cancel whoever is still inside a handler, even if the clock
-            # is a hair short of the deadline, and do not give the rest another timeout.
-            self._requests.abandon()
+            try:
+                # Drop the listener and the flock before waking peers.
+                # Unlink sits in that release and may raise; the flock close
+                # is in its own finally, so it has already happened.
+                self._release_bound_socket()
+            finally:
+                for conn in conns:
+                    try:
+                        conn.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                for worker in workers:
+                    if worker is threading.current_thread() or worker.ident is None:
+                        continue
+                    worker.join(timeout=self._requests.remaining())
+                # The wait is over. Cancel whoever is still inside a handler, even if the clock
+                # is a hair short of the deadline, and do not give the rest another timeout.
+                self._requests.abandon()
         finally:
-            # A join can raise before the release above. Drop whatever is left.
+            # A failure before the release above still has to drop the flock.
             # Do not shut peers down from here: that would run before the flock
             # is gone when the try did not reach the release.
             self._release_bound_socket()

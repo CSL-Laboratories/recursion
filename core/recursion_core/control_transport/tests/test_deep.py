@@ -1,14 +1,17 @@
 """Defects past the close-deadline and reply-correlation work (CSL-719).
 
 Each case failed on 7cfe77d8 before the fix in this file's sibling modules:
-permission swaps around bind, a mode-000 stale socket, lock-fd leaks (failed
-socket() and fork), a handler reply that cannot be encoded, a local encode
-error closing a healthy client, and close() that cannot cancel.
+permission swaps around bind, lock-fd leaks (failed socket() and fork), a
+handler reply that cannot be encoded, a local encode error closing a healthy
+client, and close() that cannot cancel. Unconnectable-socket cases and a
+close() that skips shutdown after a failed unlink failed on 1d0649c7.
 """
 
 from __future__ import annotations
 
+import builtins
 import errno
+import io
 import os
 import socket
 import stat
@@ -322,19 +325,98 @@ class LockAndPermissionTests(_TmpCase):
             pass
         self.assertIs(seen.get("free"), True)
 
-    def test_mode_000_stale_socket_is_replaced(self) -> None:
+    def test_unlink_error_still_shuts_peers_down(self) -> None:
+        """A failed unlink must not skip shutdown, the worker join, or abandon.
+
+        The directory is mode 0500, so ``os.unlink`` raises ``PermissionError``.
+        The flock is still released before that shutdown.
+        """
+        import fcntl
+
+        entered = threading.Event()
+        done = threading.Event()
+
+        def handler(message: dict, conn: ct.Connection) -> dict:
+            entered.set()
+            conn.cancelled.wait(3)
+            done.set()
+            return {"ok": True}
+
+        srv = UnixControlServer(self.sock_dir, handler, close_timeout_s=0.3)
+        srv.start()
+        self.addCleanup(os.chmod, self.sock_dir, 0o700)
+        self.addCleanup(srv.close)
+        client = UnixControlClient(srv.path, timeout_s=1)
+        self.addCleanup(client.close)
+
+        def run() -> None:
+            try:
+                client.request({"op": "hold", "id": "h1"})
+            except (ConnectionError, OSError, ct.FrameError):
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+        self.assertTrue(entered.wait(2))
+        with srv._lock:
+            self.assertTrue(srv._workers)
+            self.assertTrue(srv._conns)
+
+        lock_path = os.path.join(self.sock_dir, "control.sock.lock")
+        seen: dict = {}
+        orig_shutdown = socket.socket.shutdown
+
+        def spy(sock: socket.socket, how: int) -> None:
+            if "free" not in seen and os.path.exists(lock_path):
+                fd = os.open(lock_path, os.O_RDWR)
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        seen["free"] = False
+                    else:
+                        seen["free"] = True
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+            seen["n"] = seen.get("n", 0) + 1
+            orig_shutdown(sock, how)
+
+        socket.socket.shutdown = spy  # type: ignore[method-assign]
+        self.addCleanup(setattr, socket.socket, "shutdown", orig_shutdown)
+        os.chmod(self.sock_dir, 0o500)
+        with self.assertRaises(PermissionError) as caught:
+            srv.close()
+        self.assertEqual(caught.exception.errno, errno.EACCES)
+        self.assertGreaterEqual(seen.get("n", 0), 1)
+        self.assertIs(seen.get("free"), True)
+        self.assertTrue(done.wait(1))
+
+    def _refuse_and_keep(self, directory: str, path: str, inode: int, mode: int, *, name: str = "control.sock") -> None:
+        """Start must raise, and ``path`` must still be that socket inode and mode."""
+        srv = UnixControlServer(directory, ct.with_ping_health(), name=name)
+        self.addCleanup(srv.close)
+        with self.assertRaises(ct.InsecureSocketPath) as caught:
+            srv.start()
+        self.assertIn("Remove this socket if it is stale.", str(caught.exception))
+        listed = os.lstat(path)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual(listed.st_ino, inode)
+        self.assertEqual(stat.S_IMODE(listed.st_mode), mode)
+
+    def test_mode_000_dead_socket_is_left_for_the_operator(self) -> None:
+        """Owner decision: a dead mode-000 socket is not reclaimed.
+
+        ``connect`` returns EACCES for it and for a live mode-000 listener.
+        The operator removes the file. Nothing here unlinks or chmods it.
+        """
         os.mkdir(self.sock_dir, 0o700)
         path = os.path.join(self.sock_dir, "control.sock")
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(path)
         stale.close()
         os.chmod(path, 0)
-        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
-        srv.start()
-        self.addCleanup(srv.close)
-        self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o600)
-        with UnixControlClient(srv.path) as client:
-            self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+        inode = os.lstat(path).st_ino
+        self._refuse_and_keep(self.sock_dir, path, inode, 0)
 
     def test_live_mode_000_listener_is_not_removed(self) -> None:
         """A same-uid listener at mode 000 is not a stale socket.
@@ -399,6 +481,180 @@ class LockAndPermissionTests(_TmpCase):
         self.assertTrue(stat.S_ISSOCK(listed.st_mode))
         self.assertEqual(listed.st_ino, inode)
         self.assertEqual(stat.S_IMODE(listed.st_mode), 0)
+
+    def test_lingering_client_mode_000_is_not_removed(self) -> None:
+        """A connected client with the listener already closed is not stale.
+
+        ``connect`` is EACCES at mode 000. The file stays whether or not a
+        proc table still names this path.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(1)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(path)
+        accepted, _ = listener.accept()
+        self.addCleanup(accepted.close)
+        listener.close()
+        os.chmod(path, 0)
+        inode = os.lstat(path).st_ino
+        self._refuse_and_keep(self.sock_dir, path, inode, 0)
+
+    def test_unreadable_proc_does_not_reclaim(self) -> None:
+        """An unreadable ``/proc/net/unix`` is not proof the socket is dead."""
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(1)
+        os.chmod(path, 0)
+        inode = os.lstat(path).st_ino
+        real_open = builtins.open
+
+        def fake_open(file, *args, **kwargs):
+            if file == "/proc/net/unix":
+                raise OSError(errno.EIO, "unreadable")
+            return real_open(file, *args, **kwargs)
+
+        builtins.open = fake_open
+        self.addCleanup(setattr, builtins, "open", real_open)
+        try:
+            self._refuse_and_keep(self.sock_dir, path, inode, 0)
+        finally:
+            builtins.open = real_open
+
+    def test_poison_proc_row_does_not_reclaim(self) -> None:
+        """A row ``/proc/net/unix`` cannot parse must not be treated as absent."""
+        header = b"Num RefCount Protocol Flags Type St Inode Path\n"
+        os.mkdir(self.sock_dir, 0o700)
+        for label, extra in (
+            ("hidden", b"garbage-row\n"),
+            ("names-path", None),
+        ):
+            with self.subTest(row=label):
+                path = os.path.join(self.sock_dir, label + ".sock")
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.addCleanup(listener.close)
+                listener.bind(path)
+                listener.listen(1)
+                os.chmod(path, 0)
+                inode = os.lstat(path).st_ino
+                if extra is None:
+                    payload = header + b"garbage " + os.fsencode(path) + b"\n"
+                else:
+                    payload = header + extra
+                real_open = builtins.open
+
+                def fake_open(file, *args, **kwargs):
+                    if file == "/proc/net/unix":
+                        return io.BytesIO(payload)
+                    return real_open(file, *args, **kwargs)
+
+                builtins.open = fake_open
+                try:
+                    self._refuse_and_keep(self.sock_dir, path, inode, 0, name=os.path.basename(path))
+                finally:
+                    builtins.open = real_open
+
+    def test_symlink_alias_mode_000_listener_is_not_removed(self) -> None:
+        """A live listener bound on the real path survives a start through a parent symlink.
+
+        ``/proc/net/unix`` records the bind string. The alias is a different string
+        for the same inode, so a path compare would call the listener absent.
+        """
+        real_holder = os.path.join(self.base, "real_holder")
+        os.mkdir(real_holder, 0o700)
+        real = os.path.join(real_holder, "run")
+        os.mkdir(real, 0o700)
+        os.symlink(real_holder, os.path.join(self.base, "link"))
+        alias = os.path.join(self.base, "link", "run")
+        path = os.path.join(real, "control.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(1)
+        os.chmod(path, 0)
+        inode = os.lstat(path).st_ino
+        self.assertNotEqual(os.path.join(alias, "control.sock"), path)
+        self._refuse_and_keep(alias, path, inode, 0)
+
+    def test_dotdot_alias_mode_070_listener_is_not_removed(self) -> None:
+        """A ``..`` directory alias is a different string for the same listener."""
+        real = os.path.join(self.base, "run")
+        os.mkdir(real, 0o700)
+        alias = os.path.join(real, "..", "run")
+        path = os.path.join(real, "control.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(1)
+        os.chmod(path, 0o070)
+        inode = os.lstat(path).st_ino
+        self.assertNotEqual(os.path.join(alias, "control.sock"), path)
+        self._refuse_and_keep(alias, path, inode, 0o070)
+
+    def _odd_name_listener_is_not_removed(self, name: str) -> None:
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, name)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(1)
+        os.chmod(path, 0)
+        inode = os.lstat(path).st_ino
+        self._refuse_and_keep(self.sock_dir, path, inode, 0, name=name)
+
+    def test_newline_path_listener_is_not_removed(self) -> None:
+        """A newline in the path is a live socket. ``str.splitlines`` would hide it."""
+        self._odd_name_listener_is_not_removed("control\nsock")
+
+    def test_vertical_tab_path_listener_is_not_removed(self) -> None:
+        """A vertical tab in the path is a live socket. ``str.splitlines`` would hide it."""
+        self._odd_name_listener_is_not_removed("control\vsock")
+
+    def test_mocked_permission_error_leaves_a_live_listener(self) -> None:
+        """EACCES/EPERM from connect must not unlink, even when no proc row names the path.
+
+        Stands in for a listener in another net or mount namespace: this process
+        cannot connect, and this namespace's unix table does not list the path.
+        """
+        header = b"Num RefCount Protocol Flags Type St Inode Path\n"
+        for err in (errno.EACCES, errno.EPERM):
+            with self.subTest(err=errno.errorcode[err]):
+                directory = os.path.join(self.base, errno.errorcode[err])
+                os.mkdir(directory, 0o700)
+                path = os.path.join(directory, "control.sock")
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.addCleanup(listener.close)
+                listener.bind(path)
+                listener.listen(1)
+                listed = os.lstat(path)
+                inode = listed.st_ino
+                mode = stat.S_IMODE(listed.st_mode)
+                orig_connect = socket.socket.connect
+                real_open = builtins.open
+
+                def fake_connect(sock, addr, _path=path, _err=err, _orig=orig_connect):
+                    if addr == _path:
+                        raise OSError(_err, os.strerror(_err))
+                    return _orig(sock, addr)
+
+                def fake_open(file, *args, **kwargs):
+                    if file == "/proc/net/unix":
+                        return io.BytesIO(header)
+                    return real_open(file, *args, **kwargs)
+
+                socket.socket.connect = fake_connect  # type: ignore[method-assign]
+                builtins.open = fake_open
+                try:
+                    self._refuse_and_keep(directory, path, inode, mode)
+                finally:
+                    socket.socket.connect = orig_connect  # type: ignore[method-assign]
+                    builtins.open = real_open
 
     def test_eacces_does_not_chmod_a_swapped_file(self) -> None:
         """The EACCES path must not chmod. A file swapped in under that chmod used to land at 0600."""

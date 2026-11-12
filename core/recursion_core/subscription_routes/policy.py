@@ -618,9 +618,17 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
         if not _within(real_current, real_home):
             raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
         seen_dirs.add(real_current)
-        for top, dirs, files in os.walk(current, followlinks=False):
+
+        def refuse_unreadable(_err: OSError) -> None:
+            # os.walk skips a directory it cannot list. A link inside it would not be seen.
+            raise SubscriptionRouteRefused(engine, "own_store_unreadable", entry)
+
+        for top, dirs, files in os.walk(current, followlinks=False, onerror=refuse_unreadable):
             linked_dirs: list[str] = []
             for name in list(dirs):
+                seen += 1
+                if seen > _STORE_WALK_CAP:
+                    raise SubscriptionRouteRefused(engine, "own_store_too_large", entry)
                 item = os.path.join(top, name)
                 if os.path.islink(item):
                     dirs.remove(name)
@@ -633,9 +641,6 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
                 if os.path.islink(item) and not _within(os.path.realpath(item), real_home):
                     raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
             for item in linked_dirs:
-                seen += 1
-                if seen > _STORE_WALK_CAP:
-                    raise SubscriptionRouteRefused(engine, "own_store_too_large", entry)
                 target = os.path.realpath(item)
                 if not _within(target, real_home):
                     raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
@@ -927,6 +932,9 @@ def _stage_hermes_dir(engine: str, route_home: str, parent: str) -> None:
                 pass
         raise
     _fsync_dir(route_home)
+    # A swap of the staged file between the write and the rename is not the switch.
+    if not _hermes_config_is_ours(engine, route_home):
+        raise _refuse_hermes_config(engine, "config.yaml")
 
 
 def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
@@ -950,6 +958,10 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
             os.unlink(temp)
     except OSError:
         raise _refuse_hermes_config(engine, "config.yaml") from None
+    # A swap of the temp file between the write and the link is not the switch. The link's
+    # success only means the new name exists; launch only when that name is exactly ours.
+    if not _hermes_config_is_ours(engine, route_home):
+        raise _refuse_hermes_config(engine, "config.yaml")
     _fsync_dir(route_home)
 
 
@@ -971,6 +983,34 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
         _link_hermes_config(decision.engine, route_home, parent)
 
 
+def _route_home_stamp(route_home: str) -> tuple[int, int] | None:
+    """Device and inode of a real directory, or None when the path is not one."""
+
+    try:
+        st = os.lstat(route_home)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _require_route_home_unchanged(engine: str, route_home: str, stamp: tuple[int, int] | None) -> None:
+    """The directory about to be written is still the private one just observed.
+
+    A path swap after the home check — a symlink, a different directory, or a widened mode — refuses
+    before the adopt switch is written.
+    """
+
+    try:
+        st = os.lstat(route_home)
+    except OSError:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+    if (stamp is None or (st.st_dev, st.st_ino) != stamp or not stat.S_ISDIR(st.st_mode)
+            or st.st_uid != os.geteuid() or st.st_mode & 0o077):
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
+
+
 def _launch_checked(
     launcher: Callable[..., object],
     argv: list[str],
@@ -979,10 +1019,15 @@ def _launch_checked(
     pinned: tuple[str, ...],
     forward: Mapping[str, object],
 ) -> tuple[RouteDecision, object]:
+    # Taken before argv checks: those run after the home check, and a swap during them must not
+    # be the directory the adopt switch is written into.
+    home_stamp = _route_home_stamp(route_home) if decision.engine == "hermes" else None
     if pinned and not _argv0_is_pinned(argv, pinned):
         raise SubscriptionRouteRefused(decision.engine, "argv0_not_pinned")
     if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model):
         raise SubscriptionRouteRefused(decision.engine, "model_not_bound", decision.model)
+    if decision.engine == "hermes":
+        _require_route_home_unchanged(decision.engine, route_home, home_stamp)
     _apply_hermes_adopt_override(decision, route_home)
     # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
     # launch options _reject_launch_shape let through; none can replace env, shell or the model.

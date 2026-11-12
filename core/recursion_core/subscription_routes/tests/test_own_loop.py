@@ -145,6 +145,19 @@ class NousTests(unittest.TestCase):
                 self.refused("proxy_address_malformed", nous(base_url=url))
         self.refused("recursion_holds_no_token", nous(base_url=f"http://u:{FAKE}@127.0.0.1:8645"))
 
+    def test_proxy_url_credentials_are_not_echoed(self) -> None:
+        secret = "s3cret-proxy-password"
+        urls = (f"ftp://user:{secret}@127.0.0.1", f"http://user:{secret}@", f"http://user:{secret}@10.1.2.3:8645")
+        for url in urls:
+            with self.subTest(url=url.split(":", 1)[0]):
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    check_nous_own_loop(nous(base_url=url), BASE)
+                self.assertEqual(caught.exception.cause, "recursion_holds_no_token")
+                self.assertNotIn(secret, str(caught.exception))
+                report = nous_proxy_doctor(url)
+                self.assertNotIn(secret, str(report))
+                self.assertNotIn(secret, report["address"])
+
     def test_xai_adapter_stays_off_and_only_nous_runs(self) -> None:
         self.refused("adapter_must_stay_off", nous(adapters=["nous", "xai"]))
         self.refused("adapter_must_stay_off", nous(adapters=["XAI"]))

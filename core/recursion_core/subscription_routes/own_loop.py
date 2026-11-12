@@ -146,16 +146,22 @@ def check_copilot_own_loop(
 def _loopback_url(base_url: object) -> str:
     if not isinstance(base_url, str) or not base_url.strip():
         raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+    text = base_url.strip()
     try:
-        parts = urlsplit(base_url.strip())
+        parts = urlsplit(text)
+    except ValueError:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed") from None
+    # Userinfo is a held token even when the rest of the URL is not a loopback http(s) address.
+    # The raw URL stays out of the refusal: it would echo the secret.
+    if parts.username or parts.password:
+        raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
+    try:
         host = parts.hostname
         parts.port  # noqa: B018 - raises on a bad port
     except ValueError as exc:
         raise OwnLoopRouteRefused("nous", "proxy_address_malformed", str(exc)) from None
     if parts.scheme not in _NOUS_SCHEMES or not host:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", base_url)
-    if parts.username or parts.password:
-        raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", text)
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
@@ -190,6 +196,21 @@ def _other_users(current_user: str | None, interactive_users: Iterable[str]) -> 
     return tuple(sorted({u for u in interactive_users if u and u != current_user}))
 
 
+def _report_address(base_url: object) -> str:
+    """An address a doctor line may show. A URL with userinfo is omitted: it holds a secret."""
+
+    if not isinstance(base_url, str):
+        return ""
+    text = base_url.strip()
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return ""
+    if parts.username or parts.password:
+        return ""
+    return base_url
+
+
 def nous_proxy_doctor(
     base_url: object,
     *,
@@ -207,7 +228,7 @@ def nous_proxy_doctor(
     try:
         url = _loopback_url(base_url)
     except OwnLoopRouteRefused as exc:
-        return {"ok": False, "address": base_url if isinstance(base_url, str) else "", "cause": exc.cause,
+        return {"ok": False, "address": _report_address(base_url), "cause": exc.cause,
                 "warnings": warnings}
     return {"ok": True, "address": url, "cause": "", "warnings": warnings}
 

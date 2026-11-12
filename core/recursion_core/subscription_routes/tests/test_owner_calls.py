@@ -498,6 +498,101 @@ class HermesHomeReuseTests(_Calls):
                 self.config().unlink(missing_ok=True)
         self.launcher.assert_not_called()
 
+    def test_a_temp_file_swapped_before_the_link_is_not_launched(self) -> None:
+        # The link's success is not proof the new name holds the switch.
+        (self.home / ".hermes").mkdir(mode=0o700)
+        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+        evil = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(evil))
+        real_link = os.link
+
+        def overwrite(src: str, dst: str, *args: object, **kwargs: object) -> None:
+            with open(src, "wb") as handle:
+                handle.write(evil)
+            real_link(src, dst, *args, **kwargs)
+
+        with mock.patch.object(policy.os, "link", side_effect=overwrite):
+            self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+        self.assertEqual(b"hermes-state", (self.home / ".hermes" / "state.db").read_bytes())
+        self.launcher.assert_not_called()
+        self.config().unlink(missing_ok=True)
+
+        target = self.home / "not-the-switch.yaml"
+        target.write_bytes(evil)
+
+        def relink(src: str, dst: str, *args: object, **kwargs: object) -> None:
+            os.unlink(src)
+            os.symlink(target, src)
+            real_link(src, dst, *args, **kwargs)
+
+        with mock.patch.object(policy.os, "link", side_effect=relink):
+            self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+        self.launcher.assert_not_called()
+
+    def test_a_staged_switch_swapped_before_the_rename_is_not_launched(self) -> None:
+        # The rename's success is not proof the directory now holds the switch.
+        evil = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(evil))
+        real_rename = os.rename
+
+        def overwrite(src: str, dst: str) -> None:
+            with open(os.path.join(src, "config.yaml"), "wb") as handle:
+                handle.write(evil)
+            real_rename(src, dst)
+
+        with mock.patch.object(policy.os, "rename", side_effect=overwrite):
+            self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.launcher.assert_not_called()
+
+    def test_route_home_replaced_before_the_write_is_not_followed(self) -> None:
+        real_pinned = policy._argv0_is_pinned
+
+        outside = self.root / "outside-home"
+        outside.mkdir(mode=0o700)
+
+        def swap_for_symlink(argv: list[str], pinned: tuple[str, ...]) -> bool:
+            os.rename(self.home, self.root / "route-home.real")
+            os.symlink(outside, self.home)
+            return real_pinned(argv, pinned)
+
+        with mock.patch.object(policy, "_argv0_is_pinned", side_effect=swap_for_symlink):
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.assertFalse((outside / ".hermes").exists())
+        self.launcher.assert_not_called()
+
+        # Put the checked directory back, then replace it with a different real directory.
+        if self.home.is_symlink():
+            self.home.unlink()
+        moved = self.root / "route-home.real"
+        if moved.exists() and not self.home.exists():
+            os.rename(moved, self.home)
+        decoy = self.root / "decoy-home"
+        decoy.mkdir(mode=0o700)
+
+        def swap_for_directory(argv: list[str], pinned: tuple[str, ...]) -> bool:
+            os.rename(self.home, self.root / "route-home.real")
+            os.rename(decoy, self.home)
+            return real_pinned(argv, pinned)
+
+        with mock.patch.object(policy, "_argv0_is_pinned", side_effect=swap_for_directory):
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.assertFalse((self.home / ".hermes").exists())
+        self.assertFalse((self.root / "route-home.real" / ".hermes").exists())
+        self.launcher.assert_not_called()
+
+        if not self.home.exists() and (self.root / "route-home.real").exists():
+            os.rename(self.root / "route-home.real", self.home)
+        self.home.chmod(0o700)
+
+        def widen(argv: list[str], pinned: tuple[str, ...]) -> bool:
+            os.chmod(self.home, 0o777)
+            return real_pinned(argv, pinned)
+
+        with mock.patch.object(policy, "_argv0_is_pinned", side_effect=widen):
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.assertFalse((self.home / ".hermes").exists())
+        self.launcher.assert_not_called()
+
     def test_config_that_appears_before_the_link_is_not_replaced(self) -> None:
         (self.home / ".hermes").mkdir(mode=0o700)
         (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")

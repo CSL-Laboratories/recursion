@@ -232,6 +232,40 @@ class AllowlistTests(_Base):
         self.assertRefusedBeforeSpawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env(),
                                       "own_store_is_link")
 
+    def test_unlistable_directory_inside_the_own_store_refuses(self) -> None:
+        # Mode 0111 can be traversed by name but not listed. os.walk then skips it.
+        op_store = self.operator / ".pi"
+        op_store.mkdir(exist_ok=True)
+        hidden = self.home / ".pi" / "hidden"
+        hidden.mkdir(parents=True, mode=0o700)
+        (hidden / "escape").symlink_to(op_store)
+        hidden.chmod(0o111)
+        self.assertEqual(os.path.realpath(hidden / "escape"), str(op_store))
+        self.assertRefusedBeforeSpawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env(),
+                                      "own_store_unreadable")
+        hidden.chmod(0o700)
+        shutil.rmtree(self.home / ".pi")
+        side = self.home / "side"
+        side.mkdir(mode=0o700)
+        (side / "escape").symlink_to(op_store)
+        side.chmod(0o111)
+        (self.home / ".pi").mkdir(mode=0o700)
+        (self.home / ".pi" / "jump").symlink_to(side)
+        self.assertEqual(os.path.realpath(side / "escape"), str(op_store))
+        self.assertRefusedBeforeSpawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env(),
+                                      "own_store_unreadable")
+        side.chmod(0o700)
+
+    def test_own_store_directory_count_is_bounded(self) -> None:
+        store = self.home / ".pi"
+        store.mkdir(mode=0o700)
+        for index in range(10_001):
+            (store / f"d{index}").mkdir()
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            self.spawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env())
+        self.assertEqual(caught.exception.cause, "own_store_too_large")
+        self.launcher.assert_not_called()
+
     def test_claude_store_still_refused_on_a_sign_in(self) -> None:
         (self.home / ".claude").mkdir()
         self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in"), self.bare_env(),

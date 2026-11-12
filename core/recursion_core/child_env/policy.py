@@ -400,6 +400,10 @@ def build_child_env(
     # A bypass only matters when a proxy is set: "*" or an all-address CIDR block skips it for every host, an
     # engine-host entry for that engine, an entry for the route's base host for the route gateway.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
+        # urllib, requests and undici prefer a lowercase name with ``??`` / ``or``, so an empty ``https_proxy``
+        # drops ``HTTPS_PROXY`` and HTTPS goes direct. Go and curl still use the uppercase value. Refuse the pair.
+        if "https_proxy" in env and env["https_proxy"] == "" and env.get("HTTPS_PROXY"):
+            raise EnvRefused("https_proxy", "proxy_cleared")
         # NO_PROXY and no_proxy are one combined list here (owner call, 2026-11-10): the refusal names the variable
         # that holds the refusing entry and that entry's position in it, never any text of the entry.
         lists = [(name, env[name]) for name in NO_PROXY_NAMES if name in env]
@@ -1050,8 +1054,9 @@ def _loopback_host(host: str) -> bool:
 def _no_proxy_ip(entry: str):
     """The address or CIDR block (an ``ipaddress`` object) an entry is, or None when it is neither shape.
 
-    Read as ``ip``, ``ip:port``, ``[ip]``, ``[ip]:port`` or any of those with ``/prefix``; the port is dropped,
-    as for a name. Host bits may be set in a block: ``10.1.2.3/8``. The prefix is what follows the one ``/``
+    Read as ``ip``, ``ip:port``, ``[ip]``, ``[ip]:port`` or any of those with ``/prefix``, with leading dots
+    ignored (``.2001:db8::1`` is ``2001:db8::1``, as urllib reads it); the port is dropped, as for a name.
+    Host bits may be set in a block: ``10.1.2.3/8``. The prefix is what follows the one ``/``
     and must be a plain decimal length in the family's range: ASCII digits, no sign, no leading zero but ``0``
     itself. So a netmask or hostmask (``10.0.0.0/255.0.0.0``), ``/08`` and ``/0x0`` are no block, and neither is
     any entry with a ``%`` (owner calls, 2026-11-10). An entry with more than one ``/`` is no block either
@@ -1075,7 +1080,9 @@ def _no_proxy_ip(entry: str):
         text, port = text.split(":")
         if slash and not (re.fullmatch(r"[1-9][0-9]{0,4}", port) and int(port) < 65536):
             return None
-    text = text.rstrip(".")
+    # urllib strips every leading dot before comparing, so ``.2001:db8::1`` is the address ``2001:db8::1``.
+    # Left on, the name fallback reads the last hextet as a port and the route host is missed.
+    text = text.lstrip(".").rstrip(".")
     try:
         return ipaddress.ip_network(f"{text}/{prefix}", strict=False) if slash else ipaddress.ip_address(text)
     except ValueError:

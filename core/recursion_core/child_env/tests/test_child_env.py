@@ -765,6 +765,10 @@ class AuthRouteTests(unittest.TestCase):
             (v4, "::ffff:10.1.2.3"), (v4, "::ffff:10.0.0.0/104"), (v4, "localhost, 192.168.0.0/16, 10.1.0.0/16"),
             ("http://10.1.2.3", "10.1.2.3:8080"), ("http://10.1.2.3.", "10.1.2.3"),
             (v6, "[2001:db8::1]"), (v6, "[2001:db8::1]:8443"), (v6, "[2001:db8::1]:9"), (v6, "2001:db8::1"),
+            # urllib strips leading dots, then compares the address. A leading dot must not be read as part of
+            # the address, and the last hextet must not be dropped as a port (``.2001:db8::1``).
+            (v6, ".2001:db8::1"), (v6, "..2001:db8::1"), (v6, ".2001:DB8::1"),
+            ("https://[2001:db8::1]", ".2001:db8::1"), (v6, "localhost,.2001:db8::1"),
             (v6, "2001:DB8:0:0:0:0:0:1"), (v6, "https://[2001:db8::1]"), (v6, "2001:db8::/32"), (v6, "[2001:db8::]/32"),
             (v6, "2000::/3"), ("https://[2001:DB8:0:0:0:0:0:1]", "2001:db8::1"), ("https://[::2]", "::2"),
             ("https://[::2]", "[::2]:443"), ("https://[::2]", "::2/128"),
@@ -790,6 +794,38 @@ class AuthRouteTests(unittest.TestCase):
             with self.subTest(base_url=base_url, kept=entry):
                 env = self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
                 self.assertEqual((entry, base_url), (env["NO_PROXY"], env[URL]))
+
+    def test_empty_https_proxy_does_not_clear_https_proxy(self) -> None:
+        """urllib and requests drop HTTPS_PROXY when https_proxy is set and empty, so HTTPS goes direct.
+
+        Go and curl still use the uppercase value. An empty lowercase name next to a real HTTPS_PROXY is
+        refused (``https_proxy`` / ``proxy_cleared``) so the child is not launched with that pair. An empty
+        uppercase name does not clear a lowercase proxy, and both empty is no proxy.
+        """
+
+        home = _home(self)
+        upper = "http://127.0.0.1:3128"
+        for parent in ({"HTTPS_PROXY": upper, "https_proxy": ""},
+                       {"HTTPS_PROXY": upper, "https_proxy": "", "NO_PROXY": "localhost"},
+                       {"HTTPS_PROXY": upper, "https_proxy": "", "ALL_PROXY": "socks5://127.0.0.1:1080"}):
+            with self.subTest(parent=sorted(parent)), self.assertRaises(EnvRefused) as caught:
+                build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **parent})
+            self.assertEqual(("https_proxy", "proxy_cleared"), (caught.exception.name, caught.exception.cause))
+        # The same pair from an override is the same configuration after the merge.
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "HTTPS_PROXY": upper},
+                            overrides={"https_proxy": ""})
+        self.assertEqual(("https_proxy", "proxy_cleared"), (caught.exception.name, caught.exception.cause))
+        # Lowercase set, uppercase empty: the lowercase proxy is the one clients use.
+        env = build_child_env("claude_code", home=home, auth_mode=SUB,
+                              parent={"PATH": "/usr/bin", "https_proxy": upper, "HTTPS_PROXY": ""})
+        self.assertEqual((upper, ""), (env["https_proxy"], env["HTTPS_PROXY"]))
+        # Both empty, or no https name: nothing is cleared.
+        for parent in ({"HTTPS_PROXY": "", "https_proxy": ""}, {"HTTP_PROXY": upper, "http_proxy": ""},
+                       {"ALL_PROXY": "socks5://127.0.0.1:1080", "all_proxy": ""}):
+            with self.subTest(kept=sorted(parent)):
+                env = build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **parent})
+                self.assertEqual(parent, {name: env[name] for name in parent})
 
     def test_no_proxy_may_name_a_loopback_route_host(self) -> None:
         """Owner call, 2026-11-10: loopback only. A gateway on this machine is not refused; a lookalike still is."""

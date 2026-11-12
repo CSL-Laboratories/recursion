@@ -97,7 +97,9 @@ Foundry switches are dropped. The child gets one only from the route:
 - **`NO_PROXY` may not name the route host (CSL-839).** While a proxy is set (`HTTP_PROXY`,
   `HTTPS_PROXY`, `ALL_PROXY` or a lowercase name), a `NO_PROXY` / `no_proxy` entry that matches
   the host of the route's `base_url` refuses with `no_proxy_route_host`: the child would reach
-  the route gateway around the proxy.
+  the route gateway around the proxy. An empty `https_proxy` beside a non-empty `HTTPS_PROXY`
+  refuses with `https_proxy` / `proxy_cleared`: urllib, requests and undici drop the uppercase
+  value, so HTTPS would go direct. An empty `HTTPS_PROXY`, `http_proxy` or `all_proxy` does not.
   - No `NO_PROXY` refusal shows any text of an entry (owner call, 2026-11-10). That holds for all
     four causes: `no_proxy_wildcard`, `no_proxy_engine_host`, `no_proxy_route_host` and
     `no_proxy_unparseable`. Each names only the variable, the entry's position in it and the
@@ -127,7 +129,8 @@ Foundry switches are dropped. The child gets one only from the route:
     requests ignore the port, so the entry is treated as a match (fail closed).
   - An IP-literal host (`10.1.2.3`, `[2001:db8::1]`) is also matched as an address: by an entry
     that is that address (`10.1.2.3`, `10.1.2.3:4000`, `[2001:db8::1]`, `[2001:db8::1]:8443`,
-    `2001:db8::1`, another spelling of it such as `2001:db8:0:0:0:0:0:1`) and by a CIDR block
+    `2001:db8::1`, a leading dot as urllib strips it, `.2001:db8::1`, another spelling of it such
+    as `2001:db8:0:0:0:0:0:1`) and by a CIDR block
     that holds it (`10.0.0.0/8`, `2001:db8::/32`, `0.0.0.0/1`). `10.1.2.3` and
     `[::ffff:10.1.2.3]` are one address (so `::ffff:0:0/97` also holds an IPv4 host), and a short, hex or
     decimal IPv4 host (`10.1`, `0x0a.0.0.1`, `167772161`) is read as a URL parser reads it.

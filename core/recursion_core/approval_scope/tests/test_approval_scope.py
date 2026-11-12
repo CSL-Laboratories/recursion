@@ -549,6 +549,29 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "prompt_not_shown")
         self.assertEqual(self.auth.state(self.req.request_id), "pending")
 
+    def test_token_id_reused_after_the_revoked_window_matches_nothing_old(self) -> None:
+        # Once the id leaves the bounded revoked window it may be minted again.
+        # The new credential still must not satisfy the old scope or the old shown prompt.
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
+        old = self.device.token_id
+        self.registry.revoke(old)
+        for _ in range(scope_mod._MAX_RECENTLY_REVOKED):
+            padded = self.registry.issue("agent:pad", "agent", {"observe"})
+            self.registry.revoke(padded.token_id)
+        revoked = getattr(self.registry, "_revoked", None)
+        if revoked is not None:
+            self.assertNotIn(old, revoked)
+        newbie = self._issue_trying_id_first(old, "paired_device:2", "paired_device", {"approve"})
+        self.assertEqual(newbie.token_id, old)
+        self.assertNotEqual(newbie.serial, self.device.serial)
+        with self.assertRaises(Refused) as ctx:
+            self.auth.approve(newbie, scope.scope_id, self.req.request_id, self.req.digest)
+        self.assertEqual(ctx.exception.code, "scope_not_delegable")
+        with self.assertRaises(Refused) as ctx:
+            self.auth.grant(newbie, [self.req.request_id], ttl_seconds=60)
+        self.assertEqual(ctx.exception.code, "prompt_not_shown")
+        self.assertEqual(self.auth.state(self.req.request_id), "pending")
+
     def test_scope_id_collision_does_not_replace_an_existing_grant(self) -> None:
         other = self.auth.open(self.plugin, request(effect={"n": 2})).request
         self.auth.show(self.device, self.req.request_id)
@@ -698,6 +721,220 @@ class ScopeExpiryTests(unittest.TestCase):
         with self.assertRaises(Refused) as ctx:
             self.auth.approve(self.device, "00" * 16, self.req.request_id, self.req.digest)
         self.assertEqual(ctx.exception.code, "scope_unknown")
+
+
+def _jump_clock_on_nth_registry_lock(registry, clock: Clock, now: int, nth: int = 2):
+    """On the nth acquisition of ``registry._lock``, set ``clock.now``.
+
+    ``open`` / ``pending`` / ``show`` / ``grant`` / ``approve`` resolve the credential
+    (acquire 1) and later commit under ``_call_if_current`` (acquire 2). A clock
+    read between those two acquires is already stale when the commit runs.
+    """
+    real = registry._lock
+    seen = {"n": 0}
+
+    class _Lock:
+        def __enter__(self):
+            seen["n"] += 1
+            if seen["n"] == nth:
+                clock.now = now
+            real.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return real.__exit__(exc_type, exc, tb)
+
+    registry._lock = _Lock()
+    return real, seen
+
+
+class PostLockClockTests(unittest.TestCase):
+    """Expiry, decided_at and the open cap use the clock after both locks are held."""
+
+    def _world(self):
+        clock = Clock(1_800_000_000)
+        registry = CredentialRegistry()
+        auth = ApprovalAuthority(clock, registry)
+        plugin = cred(registry, "plugin", {"control"})
+        device = cred(registry, "paired_device", {"approve"})
+        return clock, registry, auth, plugin, device
+
+    def test_approve_refuses_when_the_clock_advances_on_the_second_lock(self) -> None:
+        # Repro: request and scope expire at 1_800_000_005. The second registry
+        # acquire moves the clock to 1_800_000_100. A clock read before that acquire
+        # approves with decided_at 1_800_000_000.
+        clock, registry, auth, plugin, device = self._world()
+        opened = auth.open(plugin, request(expires_at=1_800_000_005))
+        scope = grant(auth, device, [opened.request_id], ttl_seconds=60)
+        self.assertEqual(scope.expires_at, 1_800_000_005)
+        real, seen = _jump_clock_on_nth_registry_lock(registry, clock, 1_800_000_100)
+        try:
+            with self.assertRaises(Refused) as ctx:
+                auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+            self.assertEqual(ctx.exception.code, "scope_expired")
+        finally:
+            registry._lock = real
+        self.assertEqual(seen["n"], 2)
+        # The decision did not land. state() then reports expiry at the new time.
+        self.assertEqual(auth._requests[opened.request_id].state, "pending")
+        self.assertEqual(auth.state(opened.request_id), "expired")
+
+    def test_decided_at_is_the_time_after_both_locks(self) -> None:
+        clock, registry, auth, plugin, device = self._world()
+        opened = auth.open(plugin, request())
+        scope = grant(auth, device, [opened.request_id], ttl_seconds=60)
+        real, seen = _jump_clock_on_nth_registry_lock(registry, clock, T0 + 10)
+        try:
+            out = auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+        finally:
+            registry._lock = real
+        self.assertEqual(seen["n"], 2)
+        self.assertEqual(out["outcome"], "approved")
+        self.assertEqual(out["decided_at"], T0 + 10)
+
+    def test_grant_expiry_uses_the_time_after_both_locks(self) -> None:
+        clock, registry, auth, plugin, device = self._world()
+        opened = auth.open(plugin, request())
+        auth.show(device, opened.request_id)
+        real, seen = _jump_clock_on_nth_registry_lock(registry, clock, T0 + 10)
+        try:
+            scope = auth.grant(device, [opened.request_id], ttl_seconds=60)
+        finally:
+            registry._lock = real
+        self.assertEqual(seen["n"], 2)
+        self.assertEqual(scope.expires_at, T0 + 70)
+
+    def test_open_cap_counts_with_the_time_after_both_locks(self) -> None:
+        clock, registry, auth, plugin, _device = self._world()
+        for i in range(MAX_OPEN_PER_OPENER):
+            auth.open(plugin, request(expires_at=1_800_000_005, effect={"n": i}))
+        real, seen = _jump_clock_on_nth_registry_lock(registry, clock, 1_800_000_100)
+        try:
+            opened = auth.open(plugin, request(expires_at=1_800_000_500, effect={"n": "later"}))
+        finally:
+            registry._lock = real
+        self.assertEqual(seen["n"], 2)
+        self.assertEqual(auth.state(opened.request_id), "pending")
+
+    def test_open_pending_show_and_grant_see_expiry_after_both_locks(self) -> None:
+        cases = ("open", "pending", "show", "grant")
+        for name in cases:
+            with self.subTest(name=name):
+                clock, registry, auth, plugin, device = self._world()
+                opened = None
+                if name != "open":
+                    opened = auth.open(plugin, request(expires_at=1_800_000_005))
+                if name == "grant":
+                    auth.show(device, opened.request_id)
+                real, seen = _jump_clock_on_nth_registry_lock(registry, clock, 1_800_000_100)
+                try:
+                    if name == "open":
+                        with self.assertRaises(Refused) as ctx:
+                            auth.open(plugin, request(expires_at=1_800_000_005))
+                        self.assertEqual(ctx.exception.code, "request_expired")
+                        self.assertEqual(len(auth._requests), 0)
+                    elif name == "pending":
+                        self.assertEqual(auth.pending(device), [])
+                        self.assertEqual(auth._requests[opened.request_id].shown, set())
+                    elif name == "show":
+                        with self.assertRaises(Refused) as ctx:
+                            auth.show(device, opened.request_id)
+                        self.assertEqual(ctx.exception.code, "request_expired")
+                        self.assertEqual(auth._requests[opened.request_id].shown, set())
+                    else:
+                        with self.assertRaises(Refused) as ctx:
+                            auth.grant(device, [opened.request_id], ttl_seconds=60)
+                        self.assertEqual(ctx.exception.code, "request_expired")
+                        self.assertEqual(len(auth._grants), 0)
+                finally:
+                    registry._lock = real
+                self.assertEqual(seen["n"], 2)
+
+
+class CredentialRetentionTests(unittest.TestCase):
+    def test_issue_revoke_cycles_keep_internal_sets_bounded(self) -> None:
+        registry = CredentialRegistry()
+        for _ in range(20_000):
+            minted = registry.issue("agent:cycle", "agent", {"observe"})
+            registry.revoke(minted.token_id)
+        sizes = [len(value) for value in vars(registry).values() if hasattr(value, "__len__")]
+        self.assertTrue(sizes)
+        self.assertLessEqual(max(sizes), scope_mod._MAX_RECENTLY_REVOKED)
+        self.assertNotIn("_minted", vars(registry))
+
+    def test_id_regeneration_stops_after_eight_draws(self) -> None:
+        for kind in ("credential", "request", "scope"):
+            with self.subTest(kind=kind):
+                self._assert_id_loop_capped(kind)
+
+    def test_eighth_id_draw_can_succeed(self) -> None:
+        registry = CredentialRegistry()
+        taken = registry.issue("agent:held", "agent", {"observe"}).token_id
+        fresh = "cd" * 16
+        self.assertNotEqual(fresh, taken)
+        calls = {"n": 0}
+        real = scope_mod.secrets.token_hex
+
+        def fake(n, _real=real):
+            calls["n"] += 1
+            if calls["n"] < scope_mod._ID_ATTEMPTS:
+                return taken
+            if calls["n"] == scope_mod._ID_ATTEMPTS:
+                return fresh
+            raise RuntimeError("id loop uncapped")
+
+        scope_mod.secrets.token_hex = fake
+        try:
+            minted = registry.issue("agent:next", "agent", {"observe"})
+        finally:
+            scope_mod.secrets.token_hex = real
+        self.assertEqual(calls["n"], scope_mod._ID_ATTEMPTS)
+        self.assertEqual(minted.token_id, fresh)
+
+    def _assert_id_loop_capped(self, kind: str) -> None:
+        clock = Clock()
+        registry = CredentialRegistry()
+        auth = ApprovalAuthority(clock, registry)
+        plugin = cred(registry, "plugin", {"control"})
+        opened = auth.open(plugin, request())
+        device = cred(registry, "paired_device", {"approve"})
+        scope = grant(auth, device, [opened.request_id], ttl_seconds=60)
+        taken = {"credential": device.token_id, "request": opened.request_id,
+                 "scope": scope.scope_id}[kind]
+        calls = {"n": 0}
+        real = scope_mod.secrets.token_hex
+        # Build the draft before patching: create() also draws an id.
+        draft = request(effect={"n": 2})
+
+        def fake(n, _real=real):
+            calls["n"] += 1
+            if calls["n"] > scope_mod._ID_ATTEMPTS:
+                raise RuntimeError("id loop uncapped")
+            return taken
+
+        scope_mod.secrets.token_hex = fake
+        try:
+            with self.assertRaises(Refused) as ctx:
+                if kind == "credential":
+                    registry.issue("agent:next", "agent", {"observe"})
+                elif kind == "request":
+                    auth.open(plugin, draft)
+                else:
+                    auth.grant(device, [opened.request_id], ttl_seconds=60)
+            self.assertEqual(ctx.exception.code, "id_exhausted")
+        finally:
+            scope_mod.secrets.token_hex = real
+        self.assertEqual(calls["n"], scope_mod._ID_ATTEMPTS)
+        scope_mod.secrets.token_hex = real
+        if kind == "credential":
+            self.assertEqual(len(registry._issued), 2)  # plugin and device; the draw added none
+            registry.issue("agent:next", "agent", {"observe"})
+        elif kind == "request":
+            self.assertEqual(len(auth._requests), 1)
+            auth.open(plugin, request(effect={"n": 3}))
+        else:
+            self.assertEqual(len(auth._grants), 1)
+            auth.grant(device, [opened.request_id], ttl_seconds=60)
 
 
 if __name__ == "__main__":

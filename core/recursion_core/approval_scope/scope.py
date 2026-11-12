@@ -66,10 +66,29 @@ SCOPES = frozenset({"observe", "control", "manage", "approve"})
 MAX_BINDINGS = 16
 # Open (pending, unexpired) requests one opener principal may hold at once.
 MAX_OPEN_PER_OPENER = 32
+# Draws for a fresh id. Past this, refuse instead of spinning under the locks.
+_ID_ATTEMPTS = 8
+# Revoked token ids retained so a just-revoked id is not minted on the next draw.
+# After this many later revokes the id may recur. Shown prompts and grants bind to
+# the per-credential serial, so recurrence does not revive the revoked credential.
+_MAX_RECENTLY_REVOKED = 1024
 _ID = re.compile(r"[0-9a-f]{32}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _WIRE_FIELDS = frozenset({"schema", "scope_id", "holder", "bindings", "expires_at",
                           "delegable"})
+
+
+def _mint_id(taken: Callable[[str], bool]) -> str:
+    """A 128-bit hex id for which ``taken`` is false.
+
+    Stops after ``_ID_ATTEMPTS`` so a collision loop cannot spin while the
+    registry lock, the authority lock, or both are held.
+    """
+    for _ in range(_ID_ATTEMPTS):
+        candidate = secrets.token_hex(16)
+        if not taken(candidate):
+            return candidate
+    raise Refused("id_exhausted")
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,9 @@ class Credential:
     principal: str
     kind: str
     scopes: frozenset[str]
+    # One per mint, ignored by equality. Shown prompts and grants bind to this
+    # rather than to token_id, so a reused token id is a different credential.
+    serial: int = field(default=0, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         if type(self.token_id) is not str or not _ID.fullmatch(self.token_id):
@@ -97,32 +119,42 @@ class Credential:
 class CredentialRegistry:
     """Mints credentials and resolves only the ones it minted and has not revoked.
 
-    A token id is never minted again, including after ``revoke``. The registry lock
-    stays held across an authority commit so a revoke cannot land after a successful
-    check and before that commit.
+    A token id is not minted again while it sits in a bounded recently-revoked
+    window. Each mint takes a new serial. Shown prompts and grants bind to that
+    serial, so a token id reused after it leaves the window does not match the
+    revoked credential. The registry lock stays held across an authority commit
+    so a revoke cannot land after a successful check and before that commit.
+    The commit reads the clock while that lock is held. ``ApprovalAuthority._now``
+    must not call this registry or the authority: the lock is not reentrant.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._issued: dict[str, Credential] = {}
-        self._minted: set[str] = set()
+        self._revoked: set[str] = set()
+        self._revoked_fifo: list[str] = []
+        self._next_serial = 0
 
     def issue(self, principal: str, kind: str, scopes: object) -> Credential:
         if type(scopes) not in (set, frozenset):
             raise Refused("credential_scopes")
         with self._lock:
-            token_id = secrets.token_hex(16)
-            while token_id in self._minted:
-                token_id = secrets.token_hex(16)
+            token_id = _mint_id(lambda candidate: candidate in self._issued
+                                or candidate in self._revoked)
+            self._next_serial += 1
             credential = Credential(token_id=token_id, principal=principal, kind=kind,
-                                    scopes=frozenset(scopes))
-            self._minted.add(token_id)
+                                    scopes=frozenset(scopes), serial=self._next_serial)
             self._issued[token_id] = credential
         return credential
 
     def revoke(self, token_id: str) -> None:
         with self._lock:
-            self._issued.pop(token_id, None)
+            if self._issued.pop(token_id, None) is None:
+                return
+            self._revoked.add(token_id)
+            self._revoked_fifo.append(token_id)
+            if len(self._revoked_fifo) > _MAX_RECENTLY_REVOKED:
+                self._revoked.discard(self._revoked_fifo.pop(0))
 
     def resolve(self, credential: object) -> Credential:
         """Return ``credential`` if this registry issued that very object; else refuse."""
@@ -136,7 +168,8 @@ class CredentialRegistry:
         """Call ``fn(credential)`` while revoke cannot retire that object.
 
         The registry lock is held for the whole call. ``fn`` must not call back into
-        this registry: the lock is not reentrant.
+        this registry: the lock is not reentrant. A commit reads the clock from
+        inside ``fn``; that clock must not call the registry or the authority either.
         """
         if type(credential) is not Credential:
             raise Refused("credential_type")
@@ -235,13 +268,14 @@ class _Request:
     requester: str
     prompt: str
     state: str = "pending"  # pending -> approved | denied
-    # Token ids of approver credentials the core has handed this prompt to.
-    shown: set[str] = field(default_factory=set)
+    # Serials of approver credentials the core has handed this prompt to.
+    shown: set[int] = field(default_factory=set)
 
 
 @dataclass
 class _Grant:
     scope: ApprovalScope
+    holder_serial: int
     used: set[str] = field(default_factory=set)
 
 
@@ -258,6 +292,14 @@ class ApprovalAuthority:
         self._grants: dict[str, _Grant] = {}
 
     def _now(self) -> int:
+        """The clock's current instant.
+
+        Called with this authority's lock held. A commit also calls it while the
+        registry lock is held, so the expiry check and ``decided_at`` see the time
+        after both locks, not a sample taken while waiting on the registry.
+        The clock must not call this authority or its registry: neither lock is
+        reentrant, and a clock that did would deadlock.
+        """
         now = self._clock()
         if type(now) is not int:
             raise Refused("clock")
@@ -278,7 +320,9 @@ class ApprovalAuthority:
         if type(request) is not ApprovalRequest:
             raise Refused("request_type")
 
-        def commit(opener: Credential, now: int) -> OpenedRequest:
+        def commit(opener: Credential) -> OpenedRequest:
+            # After both locks: the registry lock is held by _call_if_current.
+            now = self._now()
             if "control" not in opener.scopes:
                 raise Refused("open_scope_required")
             if request.expires_at <= now:
@@ -289,9 +333,7 @@ class ApprovalAuthority:
             if held >= MAX_OPEN_PER_OPENER:
                 raise Refused("open_cap_reached")
             # The core picks the id; the caller's draft id is discarded.
-            request_id = secrets.token_hex(16)
-            while request_id in self._requests:
-                request_id = secrets.token_hex(16)
+            request_id = _mint_id(self._requests.__contains__)
             opened = replace(request, request_id=request_id)
             # Render before registering: a request whose prompt cannot be drawn is not open.
             text = render_prompt(opened, opener.principal)
@@ -299,8 +341,7 @@ class ApprovalAuthority:
             return OpenedRequest(opened, text)
 
         with self._lock:
-            now = self._now()
-            return self._registry._call_if_current(credential, lambda opener: commit(opener, now))
+            return self._registry._call_if_current(credential, commit)
 
     def pending(self, credential: object) -> list[dict]:
         """The approver's inbox: every open, unexpired request with the prompt the core drew.
@@ -309,25 +350,26 @@ class ApprovalAuthority:
         """
         _check_approver(self._registry, credential)
 
-        def commit(viewer: Credential, now: int) -> list[dict]:
+        def commit(viewer: Credential) -> list[dict]:
+            now = self._now()
             _require_approver(viewer)
             out = []
             for rid, entry in self._requests.items():
                 if entry.state != "pending" or entry.request.expires_at <= now:
                     continue
-                entry.shown.add(viewer.token_id)
+                entry.shown.add(viewer.serial)
                 out.append(self._inbox_item(rid, entry))
             return out
 
         with self._lock:
-            now = self._now()
-            return self._registry._call_if_current(credential, lambda viewer: commit(viewer, now))
+            return self._registry._call_if_current(credential, commit)
 
     def show(self, credential: object, request_id: object) -> dict:
         """Return one open request's core-drawn prompt to an approver and record it shown."""
         _check_approver(self._registry, credential)
 
-        def commit(viewer: Credential, now: int) -> dict:
+        def commit(viewer: Credential) -> dict:
+            now = self._now()
             _require_approver(viewer)
             entry = self._requests.get(request_id) if type(request_id) is str else None
             if entry is None:
@@ -336,12 +378,11 @@ class ApprovalAuthority:
                 raise Refused("request_answered")
             if entry.request.expires_at <= now:
                 raise Refused("request_expired")
-            entry.shown.add(viewer.token_id)
+            entry.shown.add(viewer.serial)
             return self._inbox_item(request_id, entry)
 
         with self._lock:
-            now = self._now()
-            return self._registry._call_if_current(credential, lambda viewer: commit(viewer, now))
+            return self._registry._call_if_current(credential, commit)
 
     @staticmethod
     def _inbox_item(request_id: str, entry: _Request) -> dict:
@@ -361,7 +402,8 @@ class ApprovalAuthority:
         if type(request_ids) not in (list, tuple) or not request_ids:
             raise Refused("scope_bindings")
 
-        def commit(holder: Credential, now: int) -> ApprovalScope:
+        def commit(holder: Credential) -> ApprovalScope:
+            now = self._now()
             _require_approver(holder)
             pairs = []
             expires_at = now + ttl_seconds
@@ -373,21 +415,18 @@ class ApprovalAuthority:
                     raise Refused("request_answered")
                 if entry.request.expires_at <= now:
                     raise Refused("request_expired")
-                if holder.token_id not in entry.shown:
+                if holder.serial not in entry.shown:
                     raise Refused("prompt_not_shown")
                 pairs.append((rid, entry.request.digest))
                 expires_at = min(expires_at, entry.request.expires_at)
-            scope_id = secrets.token_hex(16)
-            while scope_id in self._grants:
-                scope_id = secrets.token_hex(16)
+            scope_id = _mint_id(self._grants.__contains__)
             scope = ApprovalScope(scope_id=scope_id, holder=holder.token_id,
                                   bindings=tuple(sorted(pairs)), expires_at=expires_at)
-            self._grants[scope.scope_id] = _Grant(scope)
+            self._grants[scope.scope_id] = _Grant(scope, holder.serial)
             return scope
 
         with self._lock:
-            now = self._now()
-            return self._registry._call_if_current(credential, lambda holder: commit(holder, now))
+            return self._registry._call_if_current(credential, commit)
 
     def approve(self, credential: object, scope_id: str, request_id: str, digest: str) -> dict:
         return self._decide(credential, scope_id, request_id, digest, "approved")
@@ -410,13 +449,15 @@ class ApprovalAuthority:
         if type(digest) is not str or not _HEX64.fullmatch(digest):
             raise Refused("digest_form")
 
-        def commit(holder: Credential, now: int) -> dict:
+        def commit(holder: Credential) -> dict:
+            now = self._now()
             _require_approver(holder)
             grant = self._grants.get(scope_id) if type(scope_id) is str else None
             if grant is None:
                 raise Refused("scope_unknown")
             scope = grant.scope
-            if not hmac.compare_digest(scope.holder, holder.token_id):
+            if (not hmac.compare_digest(scope.holder, holder.token_id)
+                    or holder.serial != grant.holder_serial):
                 raise Refused("scope_not_delegable")
             if now >= scope.expires_at:
                 raise Refused("scope_expired")
@@ -439,5 +480,4 @@ class ApprovalAuthority:
                     "scope_id": scope.scope_id, "decided_at": now}
 
         with self._lock:
-            now = self._now()
-            return self._registry._call_if_current(credential, lambda holder: commit(holder, now))
+            return self._registry._call_if_current(credential, commit)

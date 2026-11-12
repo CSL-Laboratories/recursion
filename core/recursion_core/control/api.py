@@ -67,7 +67,8 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 from recursion_core.control.registry import (
-    EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration, StopUnattested,
+    EMPTY, POPULATED, TIMEOUT, KillTree, LivenessUnknown, OwnerLockTable, RunRegistry, StaleGeneration,
+    StopUnattested,
 )
 
 STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
@@ -291,12 +292,13 @@ class ControlAPI:
             return False
 
     def _commit(self, rec: dict) -> str:
-        """``ok``, ``stale``, ``unattested``, or raise ``_RegistryError``.
+        """``ok``, ``stale``, ``unattested``, ``liveness``, or raise ``_RegistryError``.
 
         A stale write leaves the registry untouched. ``unattested`` is a proof the registry refused,
-        which is not a disk failure and not a stopped run. On success ``rec`` becomes the snapshot
-        this put stored, not a later read. A registry that does not return that snapshot is refreshed
-        in full, so a newer generation is never paired with an older payload.
+        which is not a disk failure and not a stopped run. ``liveness`` is a probe that failed inside
+        the put: that is not proof the member is gone, and not a disk failure. On success ``rec``
+        becomes the snapshot this put stored, not a later read. A registry that does not return that
+        snapshot is refreshed in full, so a newer generation is never paired with an older payload.
         """
         try:
             stored = self._registry.put(dict(rec))
@@ -304,6 +306,8 @@ class ControlAPI:
             return "stale"
         except StopUnattested:
             return "unattested"
+        except LivenessUnknown:
+            return "liveness"
         except Exception as err:
             raise _RegistryError(f"put:{type(err).__name__}") from err
         if isinstance(stored, dict):
@@ -596,7 +600,9 @@ class ControlAPI:
         return outcome, res
 
     def _unattested_to_pending(self, outcome: str, res: dict, rec: dict) -> tuple[str, dict]:
-        """A refused proof does not answer ``stopped``."""
+        """A refused proof, or a probe that failed inside the put, does not answer ``stopped``."""
+        if outcome == "liveness" and res.get("code") == STOPPED:
+            return self._pending_instead(rec, "liveness_unknown")
         if outcome != "unattested" or res.get("code") != STOPPED:
             return outcome, res
         blocked = self._block_stop(rec)
@@ -608,7 +614,10 @@ class ControlAPI:
             return outcome, res
         latest = self._reread(rec)
         if latest is None:
-            return outcome, res
+            # The lost write is not a stopped run. The row could not be read, so a live member
+            # may still be on it.
+            run_id = rec.get("run_id")
+            return "down", {"code": PENDING, "run_id": run_id, "state": "pending", "reason": "unknown"}
         if latest.get("state") == "stopped":
             rec.clear()
             rec.update(latest)
@@ -619,6 +628,13 @@ class ControlAPI:
             reason = self._block_stop(latest) or "generation_conflict"
         latest["stop"] = self._carry_stop(rec.get("stop"), rec, latest)
         outcome, res = self._pending_instead(latest, reason)
+        if outcome == "stale":
+            # The pending put lost. A writer may have stored a real stop in that window.
+            stored = self._reread(latest)
+            if stored is not None and _recorded_stop(stored):
+                rec.clear()
+                rec.update(stored)
+                return "ok", {"code": STOPPED, "run_id": stored["run_id"], "state": "stopped", "repeat": True}
         rec.clear()
         rec.update(latest)
         return outcome, res
@@ -724,6 +740,24 @@ class ControlAPI:
             if not kept.get("cgroup_marker"):
                 kept["cgroup_marker"] = retained.get("cgroup_marker")
         return kept
+
+
+def _recorded_stop(row: dict) -> bool:
+    """True when ``row`` stores a stop whose attestation names this cgroup and generation."""
+    proof = row.get("stop_attestation")
+    if row.get("state") != "stopped" or not isinstance(proof, dict) or proof.get("proof") != "empty":
+        return False
+    cgroup = row.get("cgroup")
+    if not isinstance(cgroup, str) or not cgroup or proof.get("cgroup") != cgroup:
+        return False
+    if proof.get("cgroup_marker") != row.get("cgroup_marker"):
+        return False
+    proof_gen, row_gen = proof.get("generation"), row.get("generation")
+    if not isinstance(proof_gen, int) or not isinstance(row_gen, int) or proof_gen > row_gen:
+        return False
+    if not isinstance(proof.get("member_ids"), list) or row.get("members"):
+        return False
+    return True
 
 
 def _start_lock_key(slot: tuple[str, str]) -> str:

@@ -59,6 +59,14 @@ class StopUnattested(Exception):
         super().__init__(run_id)
 
 
+class LivenessUnknown(Exception):
+    """A process-table probe failed, so a member was not shown to be gone."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(run_id)
+
+
 class JoinRefused(Exception):
     """A member join onto a stopped run, an unknown run, or a conflicting member id."""
 
@@ -301,7 +309,8 @@ class InMemoryRunRegistry:
         An update that omits ``generation``, carries an older one, or would leave ``stopped``,
         raises ``StaleGeneration`` and leaves the stored record unchanged. A transition to
         ``stopped`` raises ``StopUnattested`` unless the attestation names this generation, the
-        cgroup path and its marker, and every current member is gone. Returns the stored copy.
+        cgroup path and its marker, and every current member is gone. A probe that fails while
+        checking those members raises ``LivenessUnknown`` and stores nothing. Returns the stored copy.
         """
         if self.commit_gate is None:
             with self._lock:
@@ -357,16 +366,17 @@ class InMemoryRunRegistry:
 
         A reaped member bumps that run's generation and clears a stop attestation, so an in-flight
         stop has to be proved again. Reaping does not itself record ``stopped``, and it does not touch
-        a run that is already stopped: that proof stays. Each pid is sampled once and that sample
-        covers every member with it, including a later one. A sample that raises is not proof the
-        process is gone, and it does not skip a later run.
+        a run that is already stopped: that proof stays. Each pid is sampled once per run, and that
+        sample covers every member of that run, including a later one. A dead sample is not reused
+        for another run. A sample that raises is not proof the process is gone, and it does not skip
+        a later run.
         """
         reaped: list[dict] = []
-        seen: dict[int, bool] = {}
         with self._lock:
             for run_id, rec in list(self._runs.items()):
                 if rec.get("state") == "stopped":
                     continue
+                seen: dict[int, bool] = {}
                 live, dead = [], []
                 for member in rec.get("members") or []:
                     (live if _pid_still_alive(member, is_alive, seen) else dead).append(member)
@@ -515,7 +525,11 @@ class InMemoryRunRegistry:
         member_ids = attestation.get("member_ids")
         if member_ids != sorted(member["member_id"] for member in members):
             return False
-        return not any(self.process_alive(member.get("pid")) for member in members)
+        try:
+            alive = any(self.process_alive(member.get("pid")) for member in members)
+        except Exception as err:
+            raise LivenessUnknown(str(record.get("run_id") or "")) from err
+        return not alive
 
     def _join_locked(self, run_id: str, expected_generation: int, member_id: str, pid: int,
                      *, store: bool = True) -> dict:
@@ -557,8 +571,9 @@ class InMemoryRunRegistry:
 def _pid_still_alive(member: object, is_alive: Callable[[int], bool], seen: dict[int, bool]) -> bool:
     """True when ``member`` is not proved gone.
 
-    An int pid is sampled once; a later member with that pid reuses the sample. A sample that
-    raises is not proof the process is gone. A member that is not a dict is kept.
+    An int pid is sampled once for the ``seen`` cache the caller passes; a later member of that
+    same run reuses the sample. A sample that raises is not proof the process is gone. A member
+    that is not a dict is kept.
     """
     if not isinstance(member, dict):
         return True

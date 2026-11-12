@@ -582,6 +582,14 @@ class ControlAPI:
             return self._pending(rec, blocked)
         proof = self._attestation(rec)
         if proof is None:  # cleanup ran, but this copy cannot name a generation: typed, not KeyError
+            if run_id in self._stale_stops:
+                # An earlier write of this run's Stop came back stale and none has landed since, so
+                # this copy may be behind the record: its empty result is not answered as stopped.
+                res = self._held(rec, "cgroup_changed")
+                res["recorded"] = False
+                if run_id in self._launched:
+                    self._launched[run_id] = dict(rec, stop=dict(rec["stop"]))
+                return res
             res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first, "recorded": False}
             if run_id in self._launched:
                 self._launched[run_id] = dict(rec, state="stopped")
@@ -661,6 +669,9 @@ class ControlAPI:
                 elif self._cgroup_identity(fresh) != self._cgroup_identity(confirmed):
                     # The empty result belongs to the cgroup we confirmed, not to the one stored now.
                     if reconfirm:
+                        # The cleanup of the new cgroup starts from a stale write too: until one of
+                        # its writes lands, it answers pending like any other unlanded stale Stop.
+                        self._stale_stops.add(run_id)
                         rec.clear()
                         rec.update(fresh)
                         return {"_reconfirm": True}

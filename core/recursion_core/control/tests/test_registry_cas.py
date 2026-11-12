@@ -1226,6 +1226,82 @@ class RoundThreeTest(unittest.TestCase):
         self.assertEqual((fourth["code"], fourth.get("recorded")), (a.STOPPED, False), fourth)
 
 
+class StaleReconfirmTest(unittest.TestCase):
+    """Found by the Codex review of this PR: the ways out of a Stop that the "until a write lands" rule
+    did not cover."""
+
+    def test_a_reconfirm_after_a_stale_write_keeps_the_rule_until_a_write_lands(self) -> None:
+        """The stale write found the run on a second cgroup, so the Stop goes round once more and confirms
+        that one. That cleanup starts from a stale write too: when the disk refuses its own write, the
+        answer is pending, not stopped, whatever the record holds by then."""
+        for joins in (True, False):
+            with self.subTest(a_member_joins=joins):
+                procs = FakeProcesses()
+                live_pid = procs.spawn()
+
+                class MovesThenFails(InMemoryRunRegistry):
+                    def __init__(self) -> None:
+                        super().__init__(processes=procs.is_alive)
+                        self.stopped_writes = 0
+
+                    def put(self, record: dict):
+                        if record.get("state") == "stopped":
+                            self.stopped_writes += 1
+                            cur = super().get(record["run_id"])
+                            assert cur is not None
+                            if self.stopped_writes == 1:  # another writer moved the run: this write is stale
+                                cur["cgroup"] = "/cg/B"
+                                super().put(cur)
+                            elif self.stopped_writes == 2:  # the disk refuses this one
+                                if joins:
+                                    self.join_member(record["run_id"], cur["generation"], "live-child", live_pid)
+                                raise OSError(28, "No space left on device")
+                        return super().put(record)
+
+                reg = MovesThenFails()
+                kill = FakeKillTree([EMPTY])
+                api, _, _, _ = make_api(kill, registry=reg)
+                run = _start(api)
+                res = api.call("run.stop", {"run_id": run})
+                self.assertEqual((kill.requests[-1], kill.confirms[-1]), ("/cg/B", "/cg/B"))  # it did go round
+                self.assertEqual((res["code"], res.get("reason"), res.get("recorded")),
+                                 (a.PENDING, "member_alive" if joins else "cgroup_changed", False), res)
+                stored = reg.get(run)
+                assert stored is not None
+                self.assertEqual((stored["state"], stored["stop_attestation"]), ("running", None))
+                # The disk is back. With a live member the next Stop lands as pending; once it is gone
+                # (or if none ever joined) the Stop is attested, for the second cgroup.
+                if joins:
+                    again = api.call("run.stop", {"run_id": run})
+                    self.assertEqual((again["code"], again.get("reason")), (a.PENDING, "member_alive"), again)
+                    self.assertIsNot(again.get("recorded"), False)
+                    procs.exit(live_pid)
+                last = api.call("run.stop", {"run_id": run})
+                self.assertEqual((last["code"], reg.get(run)["stop_attestation"]["cgroup"]), (a.STOPPED, "/cg/B"), last)
+                self.assertIsNot(last.get("recorded"), False)
+
+    def test_a_kept_launch_with_no_generation_is_pending_after_an_unlanded_stale_stop(self) -> None:
+        """A kept launch record that cannot name a generation skips the write altogether. Its empty result
+        is still the cleanup's answer on its own, but not once an earlier write of that run's Stop came
+        back stale and nothing has landed since: that copy may be behind the record."""
+        class Unreadable(InMemoryRunRegistry):
+            def get(self, run_id: str):
+                raise OSError("registry read failed")
+
+        handle = {"run_id": "run-1", "tenant": "t", "engine": "e", "state": "running", "cgroup": "/cg/run-1",
+                  "stop": None, "start_key": None}  # no generation: the registry never returned one
+        api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=Unreadable())
+        api._launched["run-1"] = dict(handle)
+        plain = api.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual((plain["code"], plain.get("recorded")), (a.STOPPED, False), plain)  # unchanged
+        api._launched["run-1"] = dict(handle)
+        api._stale_stops.add("run-1")
+        held = api.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual((held["code"], held.get("reason"), held.get("recorded")),
+                         (a.PENDING, "cgroup_changed", False), held)
+        self.assertEqual(api._launched["run-1"]["state"], "stop_pending")
+
+
 class StaleOutageTest(unittest.TestCase):
     """From the cross-family review of the R2-1 patch: a stale write-back followed by a registry outage."""
 

@@ -23,8 +23,9 @@ only when ``record["generation"]`` is the generation ``get`` returned and the wr
 or that would reopen a stopped run, raises ``StaleGeneration`` and does not overwrite the stop.
 ``state == "stopped"`` is terminal. It is stored only with an attestation that names this generation,
 the cgroup path and its marker, and the current member ids, and only when none of those members is
-still alive. A later update that changes that cgroup identity is refused. A member join after that
-stop is refused.
+still alive. A later update that changes that cgroup identity is refused. That update does not drop
+a member unless the process table shows it is gone. A probe that fails stores nothing. A member join
+after that stop is refused.
 """
 
 from __future__ import annotations
@@ -318,7 +319,9 @@ class InMemoryRunRegistry:
         raises ``StaleGeneration`` and leaves the stored record unchanged. A transition to
         ``stopped`` raises ``StopUnattested`` unless the attestation names this generation, the
         cgroup path and its marker, and every current member is gone. A probe that fails while
-        checking those members raises ``LivenessUnknown`` and stores nothing. Returns the stored copy.
+        checking those members raises ``LivenessUnknown`` and stores nothing. An update of a row
+        that is already stopped uses the same member check before it drops anyone. Returns the
+        stored copy.
         """
         if self.commit_gate is None:
             with self._lock:
@@ -493,6 +496,18 @@ class InMemoryRunRegistry:
             stored["cgroup"] = current["cgroup"]
             stored["cgroup_marker"] = current["cgroup_marker"]
             stored["stop_attestation"] = copy.deepcopy(attestation)
+            # Never drop a member the process table has not shown is gone. A probe error is not
+            # that proof, and a live member is not a clean stop.
+            raw_members = list(current.get("members") or [])
+            run_id = str(stored.get("run_id") or "")
+            if any(not isinstance(member, dict) for member in raw_members):
+                raise StopUnattested(run_id)
+            try:
+                alive = any(self.process_alive(member.get("pid")) for member in raw_members)
+            except Exception as err:
+                raise LivenessUnknown(run_id) from err
+            if alive:
+                raise StopUnattested(run_id)
             stored["members"] = []
             stored["generation"] = expected + 1
             return stored

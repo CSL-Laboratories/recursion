@@ -20,7 +20,9 @@ A registry error never escapes ``call``: a read or a start that cannot reach the
 answer even if writing it back fails, with ``"recorded": false``, when a re-read shows no live member.
 If that re-read fails, the stopped answer holds only when the pre-put row had no members. A live member,
 or a probe that cannot say, answers ``pending``. A put that returns no snapshot answers ``stopped``
-only when the re-read row is a recorded stop.
+only when the re-read row is a recorded stop. A put that returns a dict answers ``stopped`` only when
+that dict is itself a recorded stop of the cgroup that was written; otherwise Stop re-reads and
+answers ``pending`` when a member is alive or the probe cannot say.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
@@ -295,7 +297,7 @@ class ControlAPI:
             return False
 
     def _commit(self, rec: dict) -> str:
-        """``ok``, ``stale``, ``unattested``, ``liveness``, or raise ``_RegistryError``.
+        """``ok``, ``stale``, ``unattested``, ``liveness``, ``snapshot``, or raise ``_RegistryError``.
 
         A stale write leaves the registry untouched. ``unattested`` is a proof the registry refused,
         which is not a disk failure and not a stopped run. ``liveness`` is a probe that failed inside
@@ -305,6 +307,9 @@ class ControlAPI:
         This thread's ``put_snapshot`` is ``returned`` when ``put`` returned the row, ``reread`` when
         a later read supplied it, and ``missing`` when that read failed. A missing or reread snapshot
         is not by itself a recorded stop.
+
+        A stopped write whose returned dict is not itself a recorded stop of the cgroup that was
+        written is ``snapshot``, not success. ``rec`` is then the re-read when that read worked.
         """
         self._local.put_snapshot = "returned"
         try:
@@ -318,9 +323,15 @@ class ControlAPI:
         except Exception as err:
             raise _RegistryError(f"put:{type(err).__name__}") from err
         if isinstance(stored, dict):
-            rec.clear()
-            rec.update(stored)
-            return "ok"
+            if rec.get("state") != "stopped" or _stop_snapshot_ok(rec, stored):
+                rec.clear()
+                rec.update(stored)
+                return "ok"
+            if self._refresh(rec):
+                self._local.put_snapshot = "reread"
+            else:
+                self._local.put_snapshot = "missing"
+            return "snapshot"
         if self._refresh(rec):
             self._local.put_snapshot = "reread"
         else:
@@ -516,16 +527,19 @@ class ControlAPI:
         """
         # A recorded stop stays stopped. Adoption is for a launch that has not been recorded, and it
         # must not turn that recorded stop into a pending cgroup-unknown answer.
-        # Fail-closed (owner decision, revertible): ``state == stopped`` is not enough for the early
-        # return. A planted stopped row that still lists a live member is not a recorded stop, so it
-        # falls through and answers pending. A stopped row with no cgroup fails the same predicate.
+        # Round 5, revertible: ``state == stopped`` is not a recorded stop, and an id still held in
+        # ``_launched`` is not a separate path. The proof has to name the cgroup, and the row must
+        # not still list a member. A live member, or a probe that cannot say, answers pending and
+        # is not cleared. A proof that names the cgroup still counts after the stored cgroup field
+        # was cleared.
         if rec.get("state") == "stopped":
-            res = {"code": STOPPED, "run_id": rec["run_id"], "state": "stopped", "repeat": True}
-            if rec["run_id"] in self._launched:
-                # A stopped launch this process still holds was never written: try again now.
-                return self._recorded(res, rec)
             if _recorded_stop(rec):
-                return res
+                self._forget_launch_if_persisted(rec)
+                return {"code": STOPPED, "run_id": rec["run_id"], "state": "stopped", "repeat": True}
+            blocked = self._row_liveness(rec)
+            if blocked:
+                return {"code": PENDING, "run_id": rec["run_id"], "state": "pending",
+                        "reason": blocked, "recorded": False}
         reconfirms_left = 1
         while True:
             adopted = self._adopt_unrecorded_launch(rec)
@@ -822,6 +836,11 @@ class ControlAPI:
         outcome, res = self._unattested_to_pending(outcome, res, rec)
         outcome, res = self._lost_stop_is_pending(outcome, res, rec)
         outcome, res = self._down_stop(outcome, res, rec, pre_members)
+        if outcome == "snapshot":
+            # The put returned a dict that was not the stop we wrote. The re-read, or its
+            # failure, decides. A recorded stop stays stopped; a live member stays pending.
+            snap = getattr(self._local, "put_snapshot", "missing")
+            outcome, res = self._blind_snapshot_stop("ok", res, rec, snap)
         if outcome != "ok":
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
@@ -870,20 +889,47 @@ class ControlAPI:
 
 
 def _recorded_stop(row: dict) -> bool:
-    """True when ``row`` stores a stop whose attestation names this cgroup and generation."""
+    """True when ``row`` stores a stop the proof attests.
+
+    The proof has to name the cgroup. The row's cgroup field may have been cleared afterwards;
+    the proof is then the cgroup identity (round 5, revertible). A proof that does not name a
+    cgroup is not a recorded stop. Members still listed on the row are not, including when this
+    process still holds the id in ``_launched``.
+    """
     proof = row.get("stop_attestation")
     if row.get("state") != "stopped" or not isinstance(proof, dict) or proof.get("proof") != "empty":
         return False
-    cgroup = row.get("cgroup")
-    if not isinstance(cgroup, str) or not cgroup or proof.get("cgroup") != cgroup:
+    proof_cgroup = proof.get("cgroup")
+    if not isinstance(proof_cgroup, str) or not proof_cgroup:
         return False
-    if proof.get("cgroup_marker") != row.get("cgroup_marker"):
+    row_cgroup = row.get("cgroup")
+    if isinstance(row_cgroup, str) and row_cgroup:
+        if proof_cgroup != row_cgroup or proof.get("cgroup_marker") != row.get("cgroup_marker"):
+            return False
+    elif row.get("cgroup_marker") not in (None, proof.get("cgroup_marker")):
         return False
     proof_gen, row_gen = proof.get("generation"), row.get("generation")
     if not isinstance(proof_gen, int) or not isinstance(row_gen, int) or proof_gen > row_gen:
         return False
     if not isinstance(proof.get("member_ids"), list) or row.get("members"):
         return False
+    return True
+
+
+def _stop_snapshot_ok(written: dict, stored: dict) -> bool:
+    """True when ``stored`` is a recorded stop of the cgroup ``written`` asked to store."""
+    if not _recorded_stop(stored) or stored.get("run_id") != written.get("run_id"):
+        return False
+    written_cgroup = written.get("cgroup")
+    proof = stored.get("stop_attestation")
+    if not isinstance(proof, dict):
+        return False
+    if isinstance(written_cgroup, str) and written_cgroup:
+        if proof.get("cgroup") != written_cgroup:
+            return False
+        stored_cgroup = stored.get("cgroup")
+        if isinstance(stored_cgroup, str) and stored_cgroup and stored_cgroup != written_cgroup:
+            return False
     return True
 
 

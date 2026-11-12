@@ -13,7 +13,9 @@ import unittest
 from recursion_core.control import api as a
 from recursion_core.control import cli
 from recursion_core.control import mcp_tools
-from recursion_core.control.registry import InMemoryRunRegistry, LivenessUnknown, StaleGeneration
+from recursion_core.control.registry import (
+    InMemoryRunRegistry, LivenessUnknown, StaleGeneration, StopUnattested,
+)
 from recursion_core.control.tests.fakes import make_api
 from recursion_core.control.tests.test_registry_cas import _running
 
@@ -585,6 +587,7 @@ class _BlindAfterStoppedPut(InMemoryRunRegistry):
     def __init__(self, *, processes=None) -> None:
         super().__init__(processes=processes or (lambda _pid: False))
         self.blind = False
+        self.reads_while_blind = 0
 
     def put(self, record: dict):
         if record.get("state") == "stopped":
@@ -594,6 +597,7 @@ class _BlindAfterStoppedPut(InMemoryRunRegistry):
 
     def get(self, run_id: str):
         if self.blind:
+            self.reads_while_blind += 1
             raise OSError("disk")
         return super().get(run_id)
 
@@ -735,12 +739,17 @@ class ReviewDeepFourTest(unittest.TestCase):
         # (test_failed_write_after_confirmed_stop_still_answers_stopped) only if the
         # pre-put row had no members and the stop was confirmed. A member joined
         # inside the failed put is invisible, and this path does not invent one.
+        # The code/recorded pair also passed on 387e5ea3 without observing the re-read:
+        # a failed put of a confirmed stop with no pre-put members answers stopped
+        # either way. ``reads_while_blind`` is that re-read. It has to run, and fail,
+        # before the stopped answer is kept.
         reg = _BlindAfterStoppedPut()
         api, _, _, _ = make_api(registry=reg)
         run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
         out, err = io.StringIO(), io.StringIO()
         code = cli.main(["stop", run], api, out, err)
         res = json.loads(out.getvalue())
+        self.assertGreaterEqual(reg.reads_while_blind, 1)
         self.assertEqual((res["code"], res["recorded"]), (a.STOPPED, False))
         self.assertEqual(code, 0)
         self.assertIn(res["code"], a.SUCCESS_CODES)
@@ -789,6 +798,195 @@ class ReviewDeepFourTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(res["code"], a.SUCCESS_CODES)
         self.assertEqual(reg.phase, 2)
+
+
+class _PlantStoppedMemberOnRunningPut(InMemoryRunRegistry):
+    """The running put loses to a stored stopped row that still lists late/9.
+
+    Start still returns started, and the id stays in ``_launched``. The first stop
+    must not answer stopped or clear that member.
+    """
+
+    def __init__(self, *, processes) -> None:
+        super().__init__(processes=processes)
+        self.planted = False
+
+    def put(self, record: dict):
+        if record.get("state") == "running" and not self.planted:
+            current = super().get(record["run_id"])
+            assert current is not None
+            planted = dict(current)
+            planted["state"] = "stopped"
+            planted["generation"] = current["generation"] + 1
+            planted["cgroup"] = record.get("cgroup")
+            planted["cgroup_marker"] = record.get("cgroup_marker")
+            planted["members"] = [{"member_id": "late", "pid": 9}]
+            planted["stop_attestation"] = {
+                "proof": "empty",
+                "cgroup": planted.get("cgroup"),
+                "cgroup_marker": planted.get("cgroup_marker"),
+                "member_ids": ["late"],
+                "generation": planted["generation"],
+            }
+            self._runs[record["run_id"]] = planted
+            self.planted = True
+            raise StaleGeneration(record["run_id"], record.get("generation"), planted["generation"])
+        return super().put(record)
+
+
+class _ReturnRunningRowOnStop(InMemoryRunRegistry):
+    """A stopped put returns the stored running row, with late/9, and stores no stop."""
+
+    def __init__(self) -> None:
+        super().__init__(processes=lambda _pid: True)
+        self.returned_running = 0
+
+    def put(self, record: dict):
+        if record.get("state") == "stopped":
+            current = super().get(record["run_id"])
+            assert current is not None
+            if not any(member.get("member_id") == "late" for member in current.get("members") or []):
+                super().join_member(record["run_id"], current["generation"], "late", 9)
+            self.returned_running += 1
+            fresh = super().get(record["run_id"])
+            assert fresh is not None
+            return fresh
+        return super().put(record)
+
+
+class ReviewDeepFiveTest(unittest.TestCase):
+    def test_a_launched_stop_does_not_clear_a_live_member(self) -> None:
+        # The running put loses to a stopped row that still lists late/9. Start returns
+        # started and the id stays in _launched. The first stop used to take the
+        # _launched shortcut, and the already-stopped put cleared the member with no
+        # liveness check. CLI must not exit 0, and MCP must set isError.
+        reg = _PlantStoppedMemberOnRunningPut(processes=lambda _pid: True)
+        api, _, _, _ = make_api(registry=reg)
+        started = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})
+        run = started["run"]["run_id"]
+        self.assertEqual(started["code"], a.STARTED)
+        self.assertIn(run, api._launched)
+        self.assertEqual(reg.get(run)["members"], [{"member_id": "late", "pid": 9}])
+        res, code, tool = _stop_surfaces(api, run)
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "member_alive")
+        self.assertIs(res["recorded"], False)
+        self.assertNotEqual(res["code"], a.STOPPED)
+        self.assertIsNot(res.get("repeat"), True)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cli.EXIT_PENDING)
+        self.assertTrue(tool["isError"])
+        self.assertEqual(tool["structuredContent"]["code"], a.PENDING)
+        self.assertNotEqual(tool["structuredContent"]["code"], a.STOPPED)
+        self.assertNotIn(res["code"], a.SUCCESS_CODES)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+        self.assertTrue(reg.planted)
+
+    def test_a_launched_stop_treats_a_probe_error_as_pending(self) -> None:
+        # PermissionError is not proof the member is gone. The already-stopped put
+        # must not clear late/9, and the answer is pending, not stopped.
+        def deny(_pid: int) -> bool:
+            raise PermissionError("proc")
+
+        reg = _PlantStoppedMemberOnRunningPut(processes=deny)
+        api, _, _, _ = make_api(registry=reg)
+        started = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})
+        run = started["run"]["run_id"]
+        self.assertEqual(started["code"], a.STARTED)
+        self.assertIn(run, api._launched)
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(["stop", run], api, out, err)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["reason"], "liveness_unknown")
+        self.assertIs(res["recorded"], False)
+        self.assertNotEqual(code, 0)
+        self.assertNotIn(res["code"], a.SUCCESS_CODES)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertNotEqual(stored["state"], "running")
+
+    def test_a_returned_running_row_is_not_a_recorded_stop(self) -> None:
+        # put may return any dict. A running row that still lists late/9 is not the
+        # stop that was written, so the answer is pending and the member stays.
+        reg = _ReturnRunningRowOnStop()
+        api, _, _, _ = make_api(registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        res, code, tool = _stop_surfaces(api, run)
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "member_alive")
+        self.assertNotEqual(res["code"], a.STOPPED)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cli.EXIT_PENDING)
+        self.assertTrue(tool["isError"])
+        self.assertNotEqual(tool["structuredContent"]["code"], a.STOPPED)
+        self.assertNotIn(res["code"], a.SUCCESS_CODES)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertNotEqual(stored["state"], "stopped")
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+        self.assertGreaterEqual(reg.returned_running, 1)
+
+
+def _stopped_row_with_member(reg: InMemoryRunRegistry) -> dict:
+    reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+             "cgroup": "/cg/r", "stop": None, "start_key": None})
+    row = reg._runs["r"]
+    row["state"] = "stopped"
+    row["members"] = [{"member_id": "late", "pid": 9}]
+    row["stop_attestation"] = {
+        "proof": "empty",
+        "cgroup": row["cgroup"],
+        "cgroup_marker": row.get("cgroup_marker"),
+        "member_ids": ["late"],
+        "generation": row["generation"],
+    }
+    fresh = reg.get("r")
+    assert fresh is not None
+    fresh["engine"] = "other"
+    return fresh
+
+
+class AlreadyStoppedMemberTest(unittest.TestCase):
+    def test_an_already_stopped_put_does_not_drop_a_live_member(self) -> None:
+        reg = InMemoryRunRegistry(processes=lambda _pid: True)
+        update = _stopped_row_with_member(reg)
+        with self.assertRaises(StopUnattested):
+            reg.put(update)
+        stored = reg.get("r")
+        assert stored is not None
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+        self.assertEqual(stored["state"], "stopped")
+
+    def test_an_already_stopped_put_does_not_drop_a_member_when_the_probe_fails(self) -> None:
+        def deny(_pid: int) -> bool:
+            raise PermissionError("proc")
+
+        reg = InMemoryRunRegistry(processes=deny)
+        update = _stopped_row_with_member(reg)
+        with self.assertRaises(LivenessUnknown):
+            reg.put(update)
+        stored = reg.get("r")
+        assert stored is not None
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertEqual(stored["state"], "stopped")
+
+    def test_an_already_stopped_put_drops_a_member_that_is_gone(self) -> None:
+        reg = InMemoryRunRegistry(processes=lambda _pid: False)
+        update = _stopped_row_with_member(reg)
+        stored = reg.put(update)
+        self.assertEqual(stored["members"], [])
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["engine"], "other")
+        self.assertEqual(reg.get("r")["members"], [])
 
 
 if __name__ == "__main__":

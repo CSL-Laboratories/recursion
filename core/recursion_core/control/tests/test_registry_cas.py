@@ -1024,27 +1024,77 @@ class RoundFourTest(unittest.TestCase):
             InMemoryRunRegistry([legacy])
 
     def test_stop_does_not_demote_a_stopped_run_that_has_no_cgroup(self) -> None:
-        # The loader rejects this shape. The row is stopped, but it is not a recorded stop:
-        # the cgroup was cleared, so the early return no longer answers stopped (fail-closed,
-        # owner decision on the planted-live-member early return; revert that predicate to
-        # restore the old stopped/repeat answer). Stop falls through to pending/cgroup_unknown.
-        # The registry still refuses to reopen the row, so the stored state stays stopped.
-        reg = InMemoryRunRegistry()
+        # Decision (round 5, revertible). A stopped row whose cgroup field was cleared
+        # is a recorded stop when its proof names that cgroup and attests the stop
+        # (empty proof, generation not newer than the row, no member still listed).
+        # Stop answers stopped for that shape whether or not the id is in ``_launched``.
+        # The same None-cgroup shape whose proof does not name a cgroup is not a
+        # recorded stop. Stop answers pending, including when start left the id in
+        # ``_launched``. That launched path must not answer stopped unless the proof
+        # and member checks pass. A listed live member fails those checks.
+        # The loader still rejects a snapshot whose proof names no cgroup.
+        self._assert_cleared_cgroup(launched=False, proof_cgroup=None, members=[],
+                                    reason="cgroup_unknown")
+        self._assert_cleared_cgroup(launched=True, proof_cgroup=None, members=[],
+                                    clear_marker=True)
+        self._assert_cleared_cgroup(launched=False, proof_cgroup="/cg/r1", members=[],
+                                    recorded_stop=True)
+        self._assert_cleared_cgroup(launched=True, proof_cgroup="/cg/r1", members=[],
+                                    recorded_stop=True)
+        self._assert_cleared_cgroup(launched=False, proof_cgroup="/cg/r1",
+                                    members=[{"member_id": "late", "pid": 9}],
+                                    reason="member_alive")
+        self._assert_cleared_cgroup(launched=True, proof_cgroup="/cg/r1",
+                                    members=[{"member_id": "late", "pid": 9}],
+                                    reason="member_alive")
+
+    def _assert_cleared_cgroup(self, *, launched: bool, proof_cgroup: str | None,
+                               members: list[dict], recorded_stop: bool = False,
+                               clear_marker: bool = False, reason: str | None = None) -> None:
+        reg = InMemoryRunRegistry(processes=lambda _pid: True)
         reg.put({"run_id": "r1", "tenant": "t", "engine": "codex", "state": "running",
                  "cgroup": "/cg/r1", "stop": None, "start_key": None})
-        reg._runs["r1"]["state"] = "stopped"
-        reg._runs["r1"]["cgroup"] = None
-        reg._runs["r1"]["stop_attestation"] = {"proof": "empty", "cgroup": None, "member_ids": [],
-                                               "generation": reg._runs["r1"]["generation"]}
+        row = reg._runs["r1"]
+        marker = None if clear_marker else row.get("cgroup_marker")
+        row["state"] = "stopped"
+        row["cgroup"] = None
+        row["cgroup_marker"] = marker
+        row["members"] = [dict(member) for member in members]
+        proof = {"proof": "empty", "cgroup": proof_cgroup,
+                 "member_ids": [member["member_id"] for member in members],
+                 "generation": row["generation"]}
+        if marker is not None or clear_marker:
+            proof["cgroup_marker"] = marker
+        row["stop_attestation"] = proof
         api, _, _, _ = make_api(registry=reg)
+        if launched:
+            held = reg.get("r1")
+            assert held is not None
+            api._launched["r1"] = dict(held)
         res = api.call("run.stop", {"run_id": "r1"})
-        self.assertEqual((res["code"], res.get("state"), res.get("reason"), res.get("recorded")),
-                         (a.PENDING, "pending", "cgroup_unknown", False))
-        self.assertIsNot(res.get("repeat"), True)
         stored = reg.get("r1")
         assert stored is not None
         self.assertEqual(stored["state"], "stopped")
         self.assertIsNone(stored.get("cgroup"))
+        self.assertEqual(stored["members"], members)
+        if recorded_stop:
+            self.assertTrue(a._recorded_stop(stored))
+            self.assertEqual((res["code"], res.get("state"), res.get("repeat")),
+                             (a.STOPPED, "stopped", True))
+            self.assertIsNot(res.get("recorded"), False)
+            self.assertIn(res["code"], a.SUCCESS_CODES)
+            return
+        self.assertFalse(a._recorded_stop(stored))
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertNotEqual(res["code"], a.STOPPED)
+        self.assertIsNot(res.get("repeat"), True)
+        self.assertNotIn(res["code"], a.SUCCESS_CODES)
+        if reason is not None:
+            self.assertEqual(res.get("reason"), reason)
+        if reason == "member_alive":
+            self.assertIs(res.get("recorded"), False)
+            self.assertIs(reg.process_alive(9), True)
 
 
 class RoundFiveTest(unittest.TestCase):

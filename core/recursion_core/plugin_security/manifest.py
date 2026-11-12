@@ -20,6 +20,7 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import sqlite3
 import threading
@@ -74,6 +75,20 @@ class Manifest:
     raw: bytes = field(repr=False)
 
 
+def _untrusted_path(value: str) -> bool:
+    """True when a manifest path is absolute or not its own canonical relative form.
+
+    ``a/../venue:live-key`` normalizes to the reserved name ``venue:live-key``.
+    ``../outside.sh`` and ``/tmp/install.sh`` leave the plugin tree. The declared
+    string has to be that canonical relative path. ``posixpath`` is used so the
+    check does not change with the host's separator.
+    """
+    if "\\" in value or posixpath.isabs(value):
+        return True
+    norm = posixpath.normpath(value)
+    return norm != value or norm == ".." or norm.startswith("../")
+
+
 def _str_list(value: object, pattern: re.Pattern, code: str, ordered: bool = True) -> tuple:
     if type(value) is not list or any(type(v) is not str or not pattern.fullmatch(v) for v in value):
         raise Refused(code)
@@ -108,12 +123,16 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_permission_order")
     nets = _str_list(data["network_destinations"], _HOST, "manifest_network_destinations")
     creds = _str_list(data["credential_refs"], _CRED, "manifest_credential_refs")
+    if any(_untrusted_path(ref) for ref in creds):
+        raise Refused("manifest_credential_refs", "path escapes")
     if bool(nets) != ("network" in perms):
         raise Refused("manifest_network_mismatch")
     if bool(creds) != ("credential" in perms):
         raise Refused("manifest_credential_mismatch")
     scripts = _str_list(data["install_scripts"], re.compile(r"[ -~]{1,200}"), "manifest_install_scripts",
                         ordered=False)
+    if any(_untrusted_path(script) for script in scripts):
+        raise Refused("manifest_install_scripts", "path escapes")
     return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
                     data["developer_key"], tuple(perms), nets, creds, raw)
 
@@ -220,7 +239,9 @@ class TrustStore:
         """Revoke a key id and return its new generation (4.4).
 
         Later loads, including after a restart, classify it unsigned. A repeat revoke
-        of the same key advances the generation again. The in-memory generation is
+        of the same key advances the generation again. An opener that still has an
+        older generation in memory cannot write that older number back: the stored
+        generation only moves forward. The in-memory generation is
         updated even when the durable write fails or there is no store, and then
         ``revocation_not_durable`` is raised. A ``sqlite3`` error is that refusal; it
         does not escape the method.
@@ -234,18 +255,38 @@ class TrustStore:
             if self._db is None:
                 raise Refused("revocation_not_durable", kid)
             try:
-                self._db.execute(
-                    "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
-                    "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
-                    (kid, generation),
-                )
-                row = self._db.execute(
-                    "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                # A store opened before a later revoke still holds the old number.
+                # Writing that number would roll the row backward and let a grant
+                # for the older generation turn order back on. The row only moves
+                # forward: one past what is stored, or this opener's generation,
+                # whichever is higher.
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    self._db.execute(
+                        "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
+                        "ON CONFLICT(key_id) DO UPDATE SET "
+                        "generation = MAX(revoked.generation + 1, excluded.generation)",
+                        (kid, generation),
+                    )
+                    row = self._db.execute(
+                        "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                    self._db.execute("COMMIT")
+                except BaseException:
+                    try:
+                        self._db.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
             except sqlite3.Error:
                 raise Refused("revocation_not_durable", kid) from None
-            if row is None or row[0] != generation:
+            if row is None or type(row[0]) is not int or row[0] < generation:
                 raise Refused("revocation_not_durable", kid)
-            return generation
+            if row[0] != generation:
+                updated = dict(self._generation)
+                updated[kid] = row[0]
+                self._generation = MappingProxyType(updated)
+                self._revoked = frozenset(updated)
+            return row[0]
 
     def close(self) -> None:
         db = self._db
@@ -294,7 +335,10 @@ class ReservedEffects:
         return any(host == r or host.endswith("." + r) for r in self.hosts)
 
     def credential_reserved(self, ref: str) -> bool:
-        return any(ref.startswith(p) for p in self.credential_prefixes)
+        # A prefix check on the raw string misses ``a/../venue:key``, which is
+        # the reserved name once the ``..`` is folded.
+        folded = posixpath.normpath(ref.replace("\\", "/"))
+        return any(name.startswith(prefix) for name in (ref, folded) for prefix in self.credential_prefixes)
 
 
 def _order_cites_this_revocation(grant: Grant, revoked_key_id: str, generation: int) -> bool:

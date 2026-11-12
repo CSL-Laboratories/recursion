@@ -76,6 +76,27 @@ def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
     return {"stage": stage, "code": code, "severity": severity, "detail": detail}
 
 
+def _module_name(plugin_id: str) -> str:
+    """One import name per plugin id.
+
+    Replacing both ``.`` and ``-`` with ``_`` mapped ``ab.cd``, ``ab-cd`` and
+    ``ab_cd`` onto ``csl_plugin_ab_cd``. A plugin loaded earlier could plant
+    ``sys.modules[__name__]`` and the one loaded later would import it.
+    """
+    encoded = plugin_id.replace("_", "__").replace(".", "_d").replace("-", "_h")
+    return "csl_plugin_" + encoded
+
+
+def _restore_sys_modules(before: dict) -> None:
+    """Drop modules a load added and put back any it replaced. ``before`` is a snapshot."""
+    for name, module in before.items():
+        if sys.modules.get(name) is not module:
+            sys.modules[name] = module
+    for name in list(sys.modules):
+        if name not in before:
+            sys.modules.pop(name, None)
+
+
 class PluginLoader:
     def __init__(self, trust: TrustStore, grants: dict[str, Grant], reserved: ReservedEffects,
                  health: CoreHealth, gil_probe: GilProbe | None = None) -> None:
@@ -215,20 +236,23 @@ class PluginLoader:
         return True
 
     def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings) -> LoadedPlugin:
-        before = set(sys.modules)
-        module = types.ModuleType("csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_"))
+        before = dict(sys.modules)
+        module = types.ModuleType(_module_name(manifest.plugin_id))
         failure: BaseException | None = None
         try:
             exec(code, module.__dict__)
         except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
             failure = exc
         finally:
-            for name in sorted(set(sys.modules) - before):
+            for name in sorted(set(sys.modules) - set(before)):
                 origin = getattr(sys.modules.get(name), "__file__", None) or ""
                 if origin.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
                     findings.append(_finding("active", "extension_module_loaded", "warn", name))
             gil_on = self._gil_gate(manifest.plugin_id, findings)
             self.last_findings = tuple(findings)
+        # A load that does not become active must not leave imports behind for the next one.
+        if gil_on or failure is not None:
+            _restore_sys_modules(before)
         if gil_on:
             raise Refused("core_poisoned_gil_enabled", manifest.plugin_id) from failure
         if failure is not None:

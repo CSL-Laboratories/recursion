@@ -138,6 +138,49 @@ class _PlantStoppedOnFirstPut(InMemoryRunRegistry):
         return super().put(record)
 
 
+class _PlantStoppedOnRetry(InMemoryRunRegistry):
+    """The retry's stopped put loses to a stopped row the registry itself would not have stored.
+
+    The first stopped put only bumps a running row, so ``_recorded``'s own re-read does not see
+    ``stopped``. The planted row is what ``_lost_stop_is_pending`` reads first.
+    """
+
+    def __init__(self, *, blank_proof: bool, members: list[dict]) -> None:
+        super().__init__(processes=lambda _pid: True)
+        self._blank_proof = blank_proof
+        self._members = members
+        self.stopped_puts = 0
+
+    def put(self, record: dict):
+        if record.get("state") == "stopped" and self.stopped_puts < 2:
+            self.stopped_puts += 1
+            current = super().get(record["run_id"])
+            assert current is not None
+            if self.stopped_puts == 1:
+                current["note"] = "later-writer"
+                super().put(current)
+            else:
+                planted = dict(current)
+                planted["state"] = "stopped"
+                planted["generation"] = current["generation"] + 1
+                planted["members"] = [dict(member) for member in self._members]
+                if self._blank_proof:
+                    planted["stop_attestation"] = {}
+                else:
+                    planted["stop_attestation"] = {
+                        "proof": "empty",
+                        "cgroup": current.get("cgroup"),
+                        "cgroup_marker": current.get("cgroup_marker"),
+                        "member_ids": [member["member_id"] for member in self._members],
+                        "generation": planted["generation"],
+                    }
+                self._runs[record["run_id"]] = planted
+            fresh = super().get(record["run_id"])
+            assert fresh is not None
+            raise StaleGeneration(record["run_id"], record.get("generation"), fresh["generation"])
+        return super().put(record)
+
+
 class _PendingLosesToStopped(InMemoryRunRegistry):
     """Two stopped puts lose. The following pending put loses to a real stopped attestation."""
 
@@ -321,6 +364,38 @@ class LastWriterStopTest(unittest.TestCase):
         self.assertEqual(stored["state"], "stopped")
         self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
         self.assertIs(reg.process_alive(9), True)
+
+    def test_a_retry_reread_stopped_row_with_an_empty_proof_is_pending(self) -> None:
+        # The first loss leaves the row running. The retry loses to a stopped row whose proof
+        # is {}. That re-read is inside _lost_stop_is_pending, and it is not a recorded stop.
+        reg = _PlantStoppedOnRetry(blank_proof=True, members=[])
+        api, _, _, _ = make_api(registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "generation_conflict")
+        self.assertIs(res["recorded"], False)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["stop_attestation"], {})
+        self.assertEqual(reg.stopped_puts, 2)
+
+    def test_a_retry_reread_stopped_row_that_still_lists_a_live_member_is_pending(self) -> None:
+        reg = _PlantStoppedOnRetry(blank_proof=False, members=[{"member_id": "late", "pid": 9}])
+        api, _, _, _ = make_api(registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "generation_conflict")
+        self.assertIs(res["recorded"], False)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+        self.assertEqual(reg.stopped_puts, 2)
 
 
 class StopAttestationTest(unittest.TestCase):

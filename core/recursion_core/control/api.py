@@ -613,7 +613,7 @@ class ControlAPI:
         return self._pending_instead(rec, blocked or "stop_unattested")
 
     def _lost_stop_is_pending(self, outcome: str, res: dict, rec: dict) -> tuple[str, dict]:
-        """The one retry lost. Pending, unless a later writer already stored ``stopped``."""
+        """The one retry lost. Pending, unless a later writer stored a recorded stop."""
         if outcome != "stale" or res.get("code") != STOPPED:
             return outcome, res
         latest = self._reread(rec)
@@ -622,11 +622,14 @@ class ControlAPI:
             # may still be on it.
             run_id = rec.get("run_id")
             return "down", {"code": PENDING, "run_id": run_id, "state": "pending", "reason": "unknown"}
-        if latest.get("state") == "stopped":
+        if latest.get("state") == "stopped" and _recorded_stop(latest):
             rec.clear()
             rec.update(latest)
             return "ok", {"code": STOPPED, "run_id": latest["run_id"], "state": "stopped", "repeat": True}
-        if self._cgroup_identity(latest) != self._cgroup_identity(rec):
+        if latest.get("state") == "stopped":
+            # An empty proof, or a member still listed, is not a recorded stop.
+            reason = "generation_conflict"
+        elif self._cgroup_identity(latest) != self._cgroup_identity(rec):
             reason = "cgroup_changed"
         else:
             reason = self._block_stop(latest) or "generation_conflict"

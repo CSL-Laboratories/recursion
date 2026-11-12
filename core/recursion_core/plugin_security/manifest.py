@@ -19,11 +19,13 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
 
 from __future__ import annotations
 
+import ntpath
 import os
 import posixpath
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -59,6 +61,7 @@ RESERVED_PLUGIN_IDS = frozenset({"host"})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+(:[0-9]{1,5})?")
 _CRED = re.compile(r"[a-z][a-z0-9_.:/-]{1,127}")
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 
 
 @dataclass(frozen=True)
@@ -75,18 +78,46 @@ class Manifest:
     raw: bytes = field(repr=False)
 
 
+def _folded_names(value: str) -> tuple[str, ...]:
+    """Posix and Windows folds of ``value``, including the tail after a drive prefix."""
+    slash = value.replace("\\", "/")
+    windows = ntpath.normpath(value).replace("\\", "/")
+    names = [value, slash, posixpath.normpath(slash), windows, posixpath.normpath(windows)]
+    for candidate in (slash, windows):
+        if _DRIVE_PREFIX.match(candidate):
+            tail = candidate[2:]
+            names.append(tail)
+            names.append(posixpath.normpath(tail))
+            names.append(ntpath.normpath(tail).replace("\\", "/"))
+    return tuple(dict.fromkeys(names))
+
+
+def _fold_escapes(value: str) -> bool:
+    """True when a posix or Windows fold walks out with a ``../`` prefix."""
+    for name in _folded_names(value):
+        folded = name.replace("\\", "/")
+        if folded == ".." or folded.startswith("../"):
+            return True
+    return False
+
+
 def _untrusted_path(value: str) -> bool:
-    """True when a manifest path is absolute or not its own canonical relative form.
+    """True when a manifest path is absolute, drive-prefixed, or not its canonical relative form.
 
     ``a/../venue:live-key`` normalizes to the reserved name ``venue:live-key``.
-    ``../outside.sh`` and ``/tmp/install.sh`` leave the plugin tree. The declared
-    string has to be that canonical relative path. ``posixpath`` is used so the
-    check does not change with the host's separator.
+    ``../outside.sh`` and ``/tmp/install.sh`` leave the plugin tree. ``C:/Windows/...``
+    and ``c:../outside.sh`` are absolute or drive-relative on Windows; both are
+    refused on every host. A NUL byte is refused here. The declared string has
+    to be that canonical relative path.
     """
-    if "\\" in value or posixpath.isabs(value):
+    if "\0" in value or "\\" in value or posixpath.isabs(value) or ntpath.isabs(value):
+        return True
+    if _DRIVE_PREFIX.match(value):
         return True
     norm = posixpath.normpath(value)
-    return norm != value or norm == ".." or norm.startswith("../")
+    if norm != value or norm == ".." or norm.startswith("../"):
+        return True
+    return _fold_escapes(value)
 
 
 def _str_list(value: object, pattern: re.Pattern, code: str, ordered: bool = True) -> tuple:
@@ -131,7 +162,7 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_credential_mismatch")
     scripts = _str_list(data["install_scripts"], re.compile(r"[ -~]{1,200}"), "manifest_install_scripts",
                         ordered=False)
-    if any(_untrusted_path(script) for script in scripts):
+    if any(_untrusted_path(script) or _script_escapes(script) for script in scripts):
         raise Refused("manifest_install_scripts", "path escapes")
     return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
                     data["developer_key"], tuple(perms), nets, creds, raw)
@@ -140,19 +171,80 @@ def parse_manifest(raw: bytes) -> Manifest:
 _REVOCATION_MAGIC = "csl-revocation-store/v0"
 
 
+def _schema_locked(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "database table is locked" in text or "database schema is locked" in text or text == "database is locked"
+
+
+def _migrate_revoked_generation(db: sqlite3.Connection) -> None:
+    """Add ``generation`` to a revocation store created before that column existed.
+
+    The schema is read inside ``BEGIN IMMEDIATE``, then migrated there. A second
+    opener waits and reads again, so it does not repeat the ``ALTER TABLE``.
+    ``duplicate column name: generation`` means the other opener already added it.
+    """
+    deadline = time.monotonic() + 30.0
+    while True:
+        try:
+            _alter_revoked_generation(db)
+            return
+        except sqlite3.OperationalError as exc:
+            if _schema_locked(exc) and time.monotonic() < deadline:
+                time.sleep(0.01)
+                continue
+            db.close()
+            raise Refused("revocation_store_invalid") from None
+        except sqlite3.DatabaseError:
+            db.close()
+            raise Refused("revocation_store_invalid") from None
+
+
+def _alter_revoked_generation(db: sqlite3.Connection) -> None:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
+        if "generation" not in columns:
+            try:
+                db.execute(
+                    "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.DatabaseError as exc:
+                if "duplicate column name: generation" not in str(exc).lower():
+                    raise
+        db.execute("COMMIT")
+    except BaseException:
+        try:
+            db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _script_escapes(value: str) -> bool:
+    """An install-script name that is absolute or walks out with ``..``."""
+    if os.path.isabs(value) or "\\" in value:
+        return True
+    parts = value.split("/")
+    return not parts or any(part in ("", ".", "..") for part in parts)
+
+
 def create_revocation_store(path: str) -> None:
     """Installer step: create the durable revoked-key store. Refuses if it exists."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
-    db = sqlite3.connect(path, isolation_level=None)
+    from .paths import abandon_store, init_created_store, open_new_store
+    path = open_new_store(path)
     try:
+        db = sqlite3.connect(path, isolation_level=None)
+    except (sqlite3.Error, OSError, UnicodeEncodeError):
+        abandon_store(path)
+        raise Refused("store_path_too_long") from None
+
+    def build() -> None:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         db.execute(
             "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
         db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
-    finally:
-        db.close()
+
+    init_created_store(path, db, build)
 
 
 class TrustStore:
@@ -170,9 +262,10 @@ class TrustStore:
     back as revoked when the trust store is built. Each ``revoke`` advances that key's
     generation, including a repeat, so a grant that turned order back on after an
     earlier revocation does not apply to the later one. The daemon never creates the
-    store; a named store that is missing or invalid refuses. Without a store, or when
-    the SQLite write fails, ``revoke`` still revokes in memory but refuses
-    ``revocation_not_durable`` (the SQLite error does not escape). The same-uid limit
+    store; a named store that is missing or invalid refuses. Without a store,
+    ``revoke`` still revokes in memory and refuses ``revocation_not_durable``.
+    When the SQLite write fails, memory is left unchanged or refreshed from the
+    row, and the same refusal is raised (the SQLite error does not escape). The same-uid limit
     in ``authority.py`` applies: in-process plugin code can rewrite this file (B17).
     """
 
@@ -183,6 +276,12 @@ class TrustStore:
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
+        # Keep the absolute path resolved now. A later chdir must not make a
+        # failed write reopen a different relative ``rev.db``.
+        if revocation_store is not None:
+            from .paths import check_store_path
+            revocation_store = check_store_path(revocation_store)
+        self._store_path = revocation_store
         self._db = None if revocation_store is None else self._open_store(revocation_store)
         generations = {}
         if self._db is not None:
@@ -203,6 +302,8 @@ class TrustStore:
 
     @staticmethod
     def _open_store(path: str) -> sqlite3.Connection:
+        from .paths import check_store_path
+        path = check_store_path(path)
         if not os.path.isfile(path):
             raise Refused("revocation_store_missing")
         db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
@@ -217,14 +318,7 @@ class TrustStore:
         if meta.get("magic") != _REVOCATION_MAGIC:
             db.close()
             raise Refused("revocation_store_invalid")
-        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
-        if "generation" not in columns:
-            try:
-                db.execute(
-                    "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
-            except sqlite3.DatabaseError:
-                db.close()
-                raise Refused("revocation_store_invalid") from None
+        _migrate_revoked_generation(db)
         return db
 
     @property
@@ -241,25 +335,25 @@ class TrustStore:
         Later loads, including after a restart, classify it unsigned. A repeat revoke
         of the same key advances the generation again. An opener that still has an
         older generation in memory cannot write that older number back: the stored
-        generation only moves forward. The in-memory generation is
-        updated even when the durable write fails or there is no store, and then
-        ``revocation_not_durable`` is raised. A ``sqlite3`` error is that refusal; it
-        does not escape the method.
+        generation only moves forward. The in-memory generation is published from
+        the stored row after that write commits. A failed write leaves memory
+        unchanged, or refreshes it from the row, and then ``revocation_not_durable``
+        is raised. With no store the revocation is kept in memory and the same
+        refusal is raised. A ``sqlite3`` error is that refusal; it does not escape
+        the method.
         """
         with self._lock:
-            generation = self._generation.get(kid, 0) + 1
-            updated = dict(self._generation)
-            updated[kid] = generation
-            self._generation = MappingProxyType(updated)
-            self._revoked = frozenset(updated)
             if self._db is None:
+                generation = self._generation.get(kid, 0) + 1
+                self._publish_generation(kid, generation)
                 raise Refused("revocation_not_durable", kid)
+            generation = self._generation.get(kid, 0) + 1
+            row = None
             try:
-                # A store opened before a later revoke still holds the old number.
-                # Writing that number would roll the row backward and let a grant
-                # for the older generation turn order back on. The row only moves
-                # forward: one past what is stored, or this opener's generation,
-                # whichever is higher.
+                # Memory stays as it was until COMMIT. The value published is the
+                # row read back in this transaction. The row only moves forward:
+                # one past what is stored, or this opener's generation, whichever
+                # is higher.
                 self._db.execute("BEGIN IMMEDIATE")
                 try:
                     self._db.execute(
@@ -278,15 +372,47 @@ class TrustStore:
                         pass
                     raise
             except sqlite3.Error:
+                self._reopen_store()
+                self._refresh_generation(kid)
                 raise Refused("revocation_not_durable", kid) from None
             if row is None or type(row[0]) is not int or row[0] < generation:
+                self._refresh_generation(kid)
                 raise Refused("revocation_not_durable", kid)
-            if row[0] != generation:
-                updated = dict(self._generation)
-                updated[kid] = row[0]
-                self._generation = MappingProxyType(updated)
-                self._revoked = frozenset(updated)
+            self._publish_generation(kid, row[0])
             return row[0]
+
+    def _publish_generation(self, kid: str, generation: int) -> None:
+        updated = dict(self._generation)
+        updated[kid] = generation
+        self._generation = MappingProxyType(updated)
+        self._revoked = frozenset(updated)
+
+    def _refresh_generation(self, kid: str) -> None:
+        """Copy this key's stored generation into memory. A failed read leaves memory as it was."""
+        db = self._db
+        if db is None:
+            return
+        try:
+            row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+        except sqlite3.Error:
+            return
+        if row is not None and type(row[0]) is int and row[0] >= 1:
+            self._publish_generation(kid, row[0])
+
+    def _reopen_store(self) -> None:
+        """Drop a connection a failed write left unusable and open a fresh one."""
+        db = self._db
+        self._db = None
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+        if self._store_path is not None:
+            try:
+                self._db = self._open_store(self._store_path)
+            except (Refused, sqlite3.Error, OSError):
+                self._db = None
 
     def close(self) -> None:
         db = self._db
@@ -335,10 +461,12 @@ class ReservedEffects:
         return any(host == r or host.endswith("." + r) for r in self.hosts)
 
     def credential_reserved(self, ref: str) -> bool:
-        # A prefix check on the raw string misses ``a/../venue:key``, which is
-        # the reserved name once the ``..`` is folded.
-        folded = posixpath.normpath(ref.replace("\\", "/"))
-        return any(name.startswith(prefix) for name in (ref, folded) for prefix in self.credential_prefixes)
+        # Fold both posix and Windows forms. ``a/../venue:key`` is the reserved
+        # name once ``..`` is folded, and a ``../`` prefix left after either fold
+        # is refused. A drive prefix is folded away first (``c:../venue:live-key``).
+        if type(ref) is not str or "\0" in ref or _fold_escapes(ref):
+            return True
+        return any(form.startswith(prefix) for form in _folded_names(ref) for prefix in self.credential_prefixes)
 
 
 def _order_cites_this_revocation(grant: Grant, revoked_key_id: str, generation: int) -> bool:

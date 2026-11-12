@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.machinery
+import os
 import sys
 import threading
 import types
@@ -70,6 +71,9 @@ class LoadedPlugin:
     module: types.ModuleType
     findings: tuple
     developer_key_id: str | None = None
+    manifest_raw: bytes = b""
+    # SHA-256 of the bytes that were compiled. Signed trust belongs to this digest.
+    code_sha256: str = ""
 
 
 def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
@@ -87,13 +91,52 @@ def _module_name(plugin_id: str) -> str:
     return "csl_plugin_" + encoded
 
 
-def _restore_sys_modules(before: dict) -> None:
-    """Drop modules a load added and put back any it replaced. ``before`` is a snapshot."""
+def _module_origins(module: object) -> tuple[str, ...]:
+    if module is None:
+        return ()
+    origins: list[str] = []
+    file_origin = getattr(module, "__file__", None)
+    if type(file_origin) is str and file_origin:
+        origins.append(file_origin)
+    spec = getattr(module, "__spec__", None)
+    spec_origin = getattr(spec, "origin", None) if spec is not None else None
+    if type(spec_origin) is str and spec_origin and spec_origin not in origins:
+        origins.append(spec_origin)
+    return tuple(origins)
+
+
+def _under_plugin_root(module: object, root: str | None) -> bool:
+    if type(root) is not str or not root:
+        return False
+    try:
+        root_real = os.path.realpath(root)
+    except (OSError, ValueError):
+        return False
+    for origin in _module_origins(module):
+        try:
+            if os.path.commonpath([root_real, os.path.realpath(origin)]) == root_real:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _restore_sys_modules(before: dict, plugin_id: str, root: str | None) -> None:
+    """Put back entries this load replaced.
+
+    Only this plugin's own namespace, and modules whose ``__file__`` or
+    ``__spec__.origin`` lies under the plugin root, are removed. A stdlib module
+    first imported during the load, or a module another thread imported, stays.
+    """
     for name, module in before.items():
         if sys.modules.get(name) is not module:
             sys.modules[name] = module
+    own = _module_name(plugin_id)
+    prefix = own + "."
     for name in list(sys.modules):
-        if name not in before:
+        if name in before:
+            continue
+        if name == own or name.startswith(prefix) or _under_plugin_root(sys.modules.get(name), root):
             sys.modules.pop(name, None)
 
 
@@ -156,17 +199,18 @@ class PluginLoader:
         return None if plugin is None else plugin.artifact_sha256
 
     def doctor(self, manifest_bytes: bytes, signature: object, artifact: bytes,
-               registry_label: str | None = None) -> list[dict]:
+               registry_label: str | None = None, *, root: str | None = None) -> list[dict]:
         """Run verify and admit only (no code executes) and return every finding."""
         findings: list[dict] = []
         try:
-            self._verify_admit(manifest_bytes, signature, artifact, registry_label, findings)
+            self._verify_admit(manifest_bytes, signature, artifact, registry_label, findings, root)
         except Refused as exc:
             findings.append(_finding(findings[-1]["stage"] if findings else "verify",
                                      exc.code, "refuse", exc.detail))
         return findings
 
-    def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings):
+    def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings,
+                      root: str | None = None):
         if type(artifact) is not bytes:
             raise Refused("artifact_not_bytes")
         manifest = parse_manifest(manifest_bytes)
@@ -196,6 +240,14 @@ class PluginLoader:
                 findings.append(_finding("admit", perm + "_granted", "warn",
                                          "in-process code is not confined to this grant"))
         if manifest.install_scripts:
+            # A declared script is only admitted once it has been read from a root.
+            # Without that root the name is never checked against the filesystem.
+            if root is None:
+                raise Refused("plugin_root_required")
+            from .paths import read_within_root
+            for script in manifest.install_scripts:
+                read_within_root(root, script)
+        if manifest.install_scripts:
             findings.append(_finding("admit", "install_scripts_present", "warn",
                                      "re-consent on change; scripts are not run by the loader"))
         if manifest.dependency_lock_sha256 is None:
@@ -204,17 +256,39 @@ class PluginLoader:
         return manifest, trust, kid, label, perms
 
     def load(self, manifest_bytes: bytes, signature: object, artifact: bytes,
-             registry_label: str | None = None) -> LoadedPlugin:
+             registry_label: str | None = None, *, root: str | None = None) -> LoadedPlugin:
         with self._lock:
             self._health.require_healthy()
             findings: list[dict] = []
+            active: LoadedPlugin | None = None
             try:
+                if type(artifact) is bytes:
+                    try:
+                        preview = parse_manifest(manifest_bytes)
+                    except Refused:
+                        preview = None
+                    if preview is not None:
+                        active = self._active.get(preview.plugin_id)
+                        # Trust is for the bytes that were compiled. Different bytes with
+                        # the same manifest are not that digest, so the recorded signature
+                        # and its permissions no longer apply.
+                        if active is not None and hashlib.sha256(artifact).hexdigest() != active.code_sha256:
+                            findings.append(_finding("verify", "artifact_digest_mismatch", "refuse"))
+                            cleared = replace(
+                                active, trust="unsigned", signer_key_id=None, permissions=(),
+                                findings=tuple(findings), manifest_raw=b"")
+                            self._active[preview.plugin_id] = cleared
+                            self.last_findings = cleared.findings
+                            raise Refused("artifact_digest_mismatch", preview.plugin_id)
                 manifest, trust, kid, label, perms = self._verify_admit(
-                    manifest_bytes, signature, artifact, registry_label, findings)
-                if manifest.plugin_id in self._active:
+                    manifest_bytes, signature, artifact, registry_label, findings, root)
+                active = self._active.get(manifest.plugin_id)
+                if active is not None and active.manifest_raw == manifest.raw and (
+                        active.artifact_sha256 == manifest.artifact_sha256):
                     raise Refused("plugin_already_active", manifest.plugin_id)
-                code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
-                findings.append(_finding("stage", "compiled", "info"))
+                if active is None:
+                    code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
+                    findings.append(_finding("stage", "compiled", "info"))
             except (Refused, SyntaxError, ValueError) as exc:
                 # No plugin code ran, but the rule is a GIL read after every load attempt.
                 if self._gil_gate("refused_load", findings):
@@ -223,7 +297,29 @@ class PluginLoader:
                 if isinstance(exc, Refused):
                     raise
                 raise Refused("plugin_compile_failed", type(exc).__name__) from None
-            return self._activate(manifest, trust, kid, label, perms, code, findings)
+            if active is not None:
+                # The running module is the old artifact. A changed manifest is classified
+                # again and replaces the recorded trust. A changed artifact is not executed;
+                # the recorded trust is dropped because it no longer describes the bytes running.
+                if self._gil_gate(manifest.plugin_id, findings):
+                    raise Refused("core_poisoned_gil_enabled", manifest.plugin_id)
+                if manifest.artifact_sha256 != active.artifact_sha256:
+                    cleared = replace(
+                        active, trust="unsigned", signer_key_id=None, permissions=(),
+                        findings=tuple(findings) + (_finding("verify", "plugin_artifact_changed", "refuse"),),
+                        manifest_raw=manifest.raw)
+                    self._active[manifest.plugin_id] = cleared
+                    self.last_findings = cleared.findings
+                    raise Refused("plugin_artifact_changed", manifest.plugin_id)
+                updated = replace(
+                    active, trust=trust, signer_key_id=kid, registry_label=label, permissions=perms,
+                    findings=tuple(findings), developer_key_id=key_id(manifest.developer_key),
+                    manifest_raw=manifest.raw)
+                self._active[manifest.plugin_id] = updated
+                self.last_findings = updated.findings
+                return updated
+            return self._activate(manifest, trust, kid, label, perms, code, findings,
+                                  hashlib.sha256(artifact).hexdigest(), root)
 
     def _gil_gate(self, name: str, findings: list) -> bool:
         """Read the GIL; if it is on, poison the core and drop every active plugin."""
@@ -235,7 +331,8 @@ class PluginLoader:
         self.last_findings = tuple(findings)
         return True
 
-    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings) -> LoadedPlugin:
+    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
+                  code_sha256: str, root: str | None = None) -> LoadedPlugin:
         before = dict(sys.modules)
         module = types.ModuleType(_module_name(manifest.plugin_id))
         failure: BaseException | None = None
@@ -250,9 +347,10 @@ class PluginLoader:
                     findings.append(_finding("active", "extension_module_loaded", "warn", name))
             gil_on = self._gil_gate(manifest.plugin_id, findings)
             self.last_findings = tuple(findings)
-        # A load that does not become active must not leave imports behind for the next one.
+        # Drop this plugin's own modules and restore anything it replaced. Other
+        # new modules, including ones another thread imported, stay.
         if gil_on or failure is not None:
-            _restore_sys_modules(before)
+            _restore_sys_modules(before, manifest.plugin_id, root)
         if gil_on:
             raise Refused("core_poisoned_gil_enabled", manifest.plugin_id) from failure
         if failure is not None:
@@ -261,7 +359,8 @@ class PluginLoader:
             raise Refused("plugin_import_failed", type(failure).__name__) from None
         findings.append(_finding("active", "active", "info", "in_process_not_contained"))
         loaded = LoadedPlugin(manifest.plugin_id, manifest.artifact_sha256, trust, kid, label,
-                              perms, module, tuple(findings), key_id(manifest.developer_key))
+                              perms, module, tuple(findings), key_id(manifest.developer_key),
+                              manifest.raw, code_sha256)
         self._active[manifest.plugin_id] = loaded
         self.last_findings = loaded.findings
         return loaded

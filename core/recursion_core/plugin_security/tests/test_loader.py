@@ -7,13 +7,14 @@ GIL checks are in ``test_runtime.py``.
 from __future__ import annotations
 
 import hashlib
+import os
 import unittest
 
 from recursion_core.plugin_security import (
     CoreHealth, Grant, PluginLoader, Refused, ReservedEffects, TrustStore, canonical, parse,
 )
 from recursion_core.plugin_security.tests.support import (
-    PLUGIN_SOURCE, FakeGilProbe, Key, manifest_bytes, needs_crypto,
+    PLUGIN_SOURCE, FakeGilProbe, Key, manifest_bytes, needs_crypto, temp_dir,
 )
 
 DIGEST = hashlib.sha256(PLUGIN_SOURCE).hexdigest()
@@ -178,7 +179,7 @@ class GrantTests(unittest.TestCase):
             "manifest_artifact_digest": {"artifact_sha256": "ab"},
             "malformed_public_key": {"developer_key": "zz"},
             "manifest_network_mismatch": {"network_destinations": ["a.example.org"]},
-            "manifest_credential_mismatch": {"credential_refs": ["x:y"]},
+            "manifest_credential_mismatch": {"credential_refs": ["acct:name"]},
         }
         for code, change in mutations.items():
             with self.subTest(code=code), self.assertRaises(Refused) as ctx:
@@ -206,7 +207,12 @@ class DoctorAndGilTests(unittest.TestCase):
         clean = loader.doctor(self.raw, self.dev.sign(self.raw), PLUGIN_SOURCE)
         self.assertFalse([f for f in clean if f["severity"] in ("warn", "refuse")])
         bad_raw = manifest_bytes(self.dev.public, install_scripts=("postinstall.sh",), lock=None)
-        bad = loader.doctor(bad_raw, "00" * 64, PLUGIN_SOURCE)
+        root = temp_dir(self)
+        with open(os.path.join(root, "postinstall.sh"), "wb") as fh:
+            fh.write(b"#!/bin/sh\n")
+        refused = loader.doctor(bad_raw, "00" * 64, PLUGIN_SOURCE)
+        self.assertIn("plugin_root_required", _codes(refused))
+        bad = loader.doctor(bad_raw, "00" * 64, PLUGIN_SOURCE, root=root)
         self.assertTrue({"signature_invalid", "install_scripts_present", "no_dependency_lock"}
                         <= set(_codes(bad)))
 

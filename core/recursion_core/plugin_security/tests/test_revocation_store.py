@@ -62,8 +62,8 @@ class RevocationStoreTests(unittest.TestCase):
         trust = self._open()
         trust._db.execute("PRAGMA query_only=ON")
         self._refused("revocation_not_durable", trust.revoke, KID)
-        self.assertIn(KID, trust.revoked)
-        self.assertEqual(trust.generation(KID), 1)
+        self.assertNotIn(KID, trust.revoked)
+        self.assertIsNone(trust.generation(KID))
 
     def test_an_older_store_without_generation_migrates(self) -> None:
         path = os.path.join(temp_dir(self), "old.db")

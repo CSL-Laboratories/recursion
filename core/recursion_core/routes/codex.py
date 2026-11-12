@@ -9,7 +9,14 @@ Typed limit signals:
 
 * ``account/rateLimits/read`` result and ``account/rateLimits/updated`` notifications: a window whose
   ``usedPercent`` is at least 100 is a limit, with its ``resetsAt`` (fields unverified; ``resetsAt``
-  is translated from Unix epoch onto the breaker clock). Codex's default bucket (``limitId``
+  is translated from Unix epoch onto the breaker clock). A later snapshot clears one window only
+  when that same window's ``usedPercent`` is a number under 100. An omitted window, or a percent
+  that is not a number, is not a healthy reading and leaves the earlier window in place. Primary
+  and secondary are separate windows, and a connection bucket does not erase a model bucket.
+  Snapshots that carry ``generation`` (or ``seq``, ``sequence``, ``timestamp``, ``capturedAt``,
+  ``updatedAt``, ``asOf``; names unverified) are ordered by that stamp. Otherwise an
+  ``account/rateLimits/updated`` received after ``account/rateLimits/read`` was sent wins over
+  that read's result. Codex's default bucket (``limitId``
   ``codex``) is credential-wide. Any other ``limitId`` is the breaker model key itself: the requested
   route model is not used, so a notice for one bucket does not fence a different model. An
   ``api_key`` route that is told this read needs ChatGPT auth ignores that one error and continues
@@ -29,6 +36,7 @@ app-server daemon mode is ever used, its config must hold ``updater.autoUpdateEn
 from __future__ import annotations
 
 import json
+import math
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter, _Protocol, scalar
@@ -93,27 +101,29 @@ class CodexAdapter(RouteAdapter):
                 # ChatGPT auth is required for this read. An API-key session is rejected with wording
                 # that sounds like a quota ("rate limits"), which would short-fault every such request
                 # before a turn. Ignore that one error on an api_key route and continue.
-                if kind != "api_key":
+                # A typed usage limit or an auth failure is not that error: it still stops the turn.
+                if kind != "api_key" or _typed_limit_or_auth(err.error):
                     raise
                 events.append(c.event("usage", "codex.account/rateLimits/read", {
                     "ignored": scalar(err.error.get("message"))}))
                 limits = None
             rpc._apply_snapshot(limits.get("rateLimits") if isinstance(limits, dict) else None,
-                                "codex.account/rateLimits/read")
+                                "codex.account/rateLimits/read", local_seq=rpc._read_sent_seq)
             if rpc.limit is not None:
-                return c.result(rid, c.PLAN_LIMIT, limit=rpc.limit, events=events, detail="limit before turn")
+                return rpc.limit_result(rid, "limit before turn")
             thread = rpc.call("thread/start", {"model": model})
-            thread_id = thread.get("thread", {}).get("id") if isinstance(thread, dict) else None
+            inner = thread.get("thread") if isinstance(thread, dict) else None
+            thread_id = inner.get("id") if isinstance(inner, dict) else None
             if not isinstance(thread_id, str):
                 raise _Protocol("thread/start returned no thread id")
             # A limit learned while the thread was starting is already a typed signal. Do not start
             # the turn on a bucket the vendor has said is exhausted.
             if rpc.limit is not None:
-                return c.result(rid, c.PLAN_LIMIT, limit=rpc.limit, events=events, detail="limit before turn")
+                return rpc.limit_result(rid, "limit before turn")
             rpc.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": request["prompt"]}]})
             return rpc.until_turn_completed(rid)
         except _RpcError as err:
-            return _classify_error(rid, err.error, rpc.limit, events, model)
+            return rpc.finish(_classify_error(rid, err.error, rpc.limit, events, model))
         finally:
             try:
                 process.close_stdin()
@@ -131,16 +141,27 @@ class _Rpc:
     def __init__(self, adapter: CodexAdapter, process, deadline_at: float, events: list, model: str) -> None:
         self.adapter, self.process, self.deadline_at = adapter, process, deadline_at
         self.events, self.model = events, model
-        self.next_id, self.limit, self._bucket, self.text = 1, None, None, []
+        self.next_id, self.limit, self.text = 1, None, []
+        self._seq = 0
+        self._read_sent_seq: int | None = None
+        # (bucket, window) -> signal still exhausted, and the newest stamp applied to that window.
+        self._open_windows: dict[tuple[str, str], dict] = {}
+        self._window_order: dict[tuple[str, str], tuple] = {}
 
     def notify(self, method: str, params: dict | None = None) -> None:
         self.process.send(json.dumps({"method": method, **({"params": params} if params else {})}))
 
     def call(self, method: str, params: dict) -> object:
         rid, self.next_id = self.next_id, self.next_id + 1
+        self._seq += 1
+        if method == "account/rateLimits/read":
+            # The result belongs to this request, not to the moment it arrives. An update received
+            # after the send is newer than the result when neither side carries a stamp.
+            self._read_sent_seq = self._seq
         self.process.send(json.dumps({"id": rid, "method": method, "params": params}))
         while True:
             msg = self._next()
+            self._seq += 1
             if msg.get("id") == rid and "method" not in msg:
                 if isinstance(msg.get("error"), dict):
                     raise _RpcError(msg["error"])
@@ -151,11 +172,13 @@ class _Rpc:
         while True:
             msg = self._next()
             if msg.get("method") == "turn/completed":
-                turn = (msg.get("params") or {}).get("turn") or {}
+                params = _object(msg.get("params"), "turn/completed params")
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                 if turn.get("status") == "completed":
                     return c.result(rid, None, text="".join(self.text), events=self.events)
                 error = turn.get("error") if isinstance(turn.get("error"), dict) else {}
-                return _classify_error(rid, error, self.limit, self.events, self.model)
+                return self.finish(_classify_error(rid, error, self.limit, self.events, self.model))
+            self._seq += 1
             self._notification(msg)
 
     def _next(self) -> dict:
@@ -165,38 +188,65 @@ class _Rpc:
         return msg
 
     def _notification(self, msg: dict) -> None:
-        method, params = msg.get("method"), msg.get("params") or {}
+        method = msg.get("method")
+        params = _object(msg.get("params"), "notification params")
         if "id" in msg and isinstance(method, str):  # a server request (e.g. an approval): not supported here
             self.process.send(json.dumps({"id": msg["id"], "error": {"code": -32601, "message": "unsupported"}}))
             self.events.append(c.event("server_request_refused", "codex.jsonrpc", {"method": method}))
         elif method == "account/rateLimits/updated":
             self._apply_snapshot(params.get("rateLimits"), "codex.account/rateLimits/updated")
         elif method == "item/completed":
-            item = params.get("item") or {}
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                 self.text.append(item["text"])  # model payload: kept as the answer, never classified
 
-    def _apply_snapshot(self, snapshot: object, source: str) -> None:
-        """Book one rate-limit snapshot. The newest reading of a bucket replaces that bucket.
+    def _apply_snapshot(self, snapshot: object, source: str, *, local_seq: int | None = None) -> None:
+        """Fold one rate-limit snapshot into the windows still open.
 
-        A snapshot under 100% clears the limit kept for that same bucket. It does not clear a
-        different bucket. A model bucket does not replace a connection window already booked.
+        Each of primary and secondary is its own window. A reading replaces a window only when it
+        is newer than the one already kept. Healthy means a numeric usedPercent under 100 for that
+        same window. An omitted window, or a percent that is not a number, changes nothing.
         """
 
         if not isinstance(snapshot, dict):
             return
-        windows = any(isinstance(snapshot.get(name), dict) for name in ("primary", "secondary"))
-        signal = _exhausted(snapshot, source, self.events, self.adapter.vendor_reset)
-        if not windows:
+        _note_usage(snapshot, source, self.events)
+        present = {name: snapshot[name] for name in ("primary", "secondary") if isinstance(snapshot.get(name), dict)}
+        if not present:
             return
         bucket = _bucket(snapshot)
-        if signal is None:
-            if self._bucket == bucket:
-                self.limit, self._bucket = None, None
-            return
-        if self.limit is not None and self.limit.get("scope") == "connection" and signal.get("scope") != "connection":
-            return
-        self.limit, self._bucket = signal, bucket
+        vendor = _vendor_stamp(snapshot)
+        local = self._seq if local_seq is None else local_seq
+        for name, raw in present.items():
+            percent = _percent(raw.get("usedPercent"))
+            if percent is None:
+                continue
+            key = (bucket, name)
+            prev = self._window_order.get(key)
+            if prev is not None and not _newer(vendor, local, prev[0], prev[1]):
+                continue
+            self._window_order[key] = (vendor, local)
+            if percent >= 100:
+                self._open_windows[key] = _window_signal(snapshot, source, self.adapter.vendor_reset(raw.get("resetsAt")))
+            else:
+                self._open_windows.pop(key, None)
+        self.limit = _reported(self._open_windows)
+
+    def limit_result(self, rid: str, detail: str) -> dict:
+        return self.finish(c.result(rid, c.PLAN_LIMIT, limit=self.limit, events=self.events, detail=detail))
+
+    def finish(self, res: dict) -> dict:
+        """Attach every open window so the service books each, not only the reported signal."""
+
+        if res.get("code") != c.PLAN_LIMIT:
+            return res
+        windows = _grouped(self._open_windows)
+        primary = res.get("limit")
+        if isinstance(primary, dict) and all(window != primary for window in windows):
+            windows.append(primary)
+        if windows:
+            res["_windows"] = windows
+        return res
 
 
 def _bucket(snapshot: dict) -> str:
@@ -206,30 +256,101 @@ def _bucket(snapshot: dict) -> str:
     return "connection"
 
 
-def _exhausted(snapshot: object, source: str, events: list, translate) -> dict | None:
-    if not isinstance(snapshot, dict):
-        return None
-    windows = {name: snapshot.get(name) for name in ("primary", "secondary") if isinstance(snapshot.get(name), dict)}
-    limit_id = snapshot.get("limitId")
+def _note_usage(snapshot: dict, source: str, events: list) -> None:
+    windows = {name: snapshot[name] for name in ("primary", "secondary") if isinstance(snapshot.get(name), dict)}
     events.append(c.event("usage", source, {
-        "limitId": scalar(limit_id),
+        "limitId": scalar(snapshot.get("limitId")),
         **{f"{name}.usedPercent": scalar(w.get("usedPercent")) for name, w in windows.items()},
     }))
-    hit = [w for w in windows.values() if isinstance(w.get("usedPercent"), (int, float)) and w["usedPercent"] >= 100]
-    if not hit:
-        return None
-    resets = [w["resetsAt"] for w in hit if isinstance(w.get("resetsAt"), (int, float))]
-    reset_at = translate(max(resets)) if resets else None
+
+
+def _window_signal(snapshot: dict, source: str, reset_at: float | None) -> dict:
+    limit_id = snapshot.get("limitId")
     if isinstance(limit_id, str) and limit_id and limit_id != DEFAULT_LIMIT_ID:
         return c.limit_signal("model", source, model=limit_id, reset_at=reset_at)
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
-def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+def _grouped(open_windows: dict[tuple[str, str], dict]) -> list[dict]:
+    """One signal per scope and model. The reset is the latest still-exhausted window on that key."""
+
+    grouped: dict[tuple, list[dict]] = {}
+    for signal in open_windows.values():
+        grouped.setdefault((signal.get("scope"), signal.get("model")), []).append(signal)
+    out: list[dict] = []
+    for sigs in grouped.values():
+        reset = None
+        source = sigs[-1]["source"]
+        for sig in sigs:
+            value = sig.get("reset_at")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if reset is None or value > reset:
+                reset = value
+                source = sig["source"]
+        scope, model = sigs[-1]["scope"], sigs[-1].get("model")
+        out.append(c.limit_signal(scope, source, model=model, reset_at=reset))
+    return out
+
+
+def _reported(open_windows: dict[tuple[str, str], dict]) -> dict | None:
+    chosen = None
+    for signal in _grouped(open_windows):
+        chosen = c.prefer_limit(chosen, signal)
+    return chosen
+
+
+# Unverified stamp names. The first one present is the snapshot's order; a higher value is newer.
+_STAMP_KEYS = ("generation", "seq", "sequence", "timestamp", "capturedAt", "updatedAt", "asOf")
+
+
+def _vendor_stamp(snapshot: dict) -> float | None:
+    for key in _STAMP_KEYS:
+        value = snapshot.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            continue
+        return float(value)
+    return None
+
+
+def _percent(value: object) -> float | None:
+    """A real usedPercent. A bool or a non-numeric value such as the string 100 is unreadable."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
+def _newer(new_vendor: float | None, new_local: int, old_vendor: float | None, old_local: int) -> bool:
+    if new_vendor is not None and old_vendor is not None:
+        return new_vendor > old_vendor
+    return new_local > old_local
+
+
+def _object(value: object, what: str) -> dict:
+    """A JSON object field. ``None`` is an empty object; a list or a string is a protocol error."""
+
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    raise _Protocol(f"{what} is not an object")
+
+
+def _error_info(error: dict) -> object:
     data = error.get("data") if isinstance(error.get("data"), dict) else {}
     info = error.get("codexErrorInfo", data.get("codexErrorInfo"))
     if isinstance(info, dict):  # a tagged variant: {"usageLimitExceeded": {...}} (shape unverified)
         info = next(iter(info), None)
+    return info
+
+
+def _typed_limit_or_auth(error: dict) -> bool:
+    return _error_info(error) in (*_LIMIT_ERRORS, *_AUTH_ERRORS)
+
+
+def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+    info = _error_info(error)
     if info in _AUTH_ERRORS:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=str(info))
     if info in _LIMIT_ERRORS:

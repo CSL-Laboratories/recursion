@@ -198,11 +198,13 @@ class ClaudeCodeAdapter(RouteAdapter):
             {"type": "text", "text": request["prompt"]}]}}))
         process.close_stdin()
         limit = None
+        windows: list[dict] = []
         while True:
             msg = self.read_message(process, deadline_at)
             if msg is None:
                 if limit is not None:
-                    return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="exit after limit")
+                    return _with_windows(
+                        c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="exit after limit"), windows)
                 return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before result")
             kind, sub = msg.get("type"), msg.get("subtype")
             if kind == "system" and sub == "api_retry":
@@ -213,9 +215,11 @@ class ClaudeCodeAdapter(RouteAdapter):
             elif kind == "rate_limit_event":
                 info = msg.get("rate_limit_info")
                 events.append(c.event("usage", "claude.rate_limit_event", _info_fields(info)))
-                limit = c.prefer_limit(limit, _rejected(info, "claude.rate_limit_event", self.vendor_reset))
+                signal = _rejected(info, "claude.rate_limit_event", self.vendor_reset)
+                windows = c.retain_windows(windows, signal)
+                limit = c.prefer_limit(limit, signal)
             elif kind == "result":
-                return _classify_result(rid, msg, limit, events, model, self.vendor_reset)
+                return _classify_result(rid, msg, limit, windows, events, model, self.vendor_reset)
             # assistant / user / other system envelopes: model payload or progress, never classified
 
 
@@ -244,21 +248,37 @@ def _rate_limit_info(params: object, source: str, translate) -> dict | None:
     return _rejected(info, source, translate)
 
 
-def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, model: str, translate) -> dict:
+def _with_windows(res: dict, windows: list[dict]) -> dict:
+    if res.get("code") == c.PLAN_LIMIT and windows:
+        res["_windows"] = windows
+    return res
+
+
+def _classify_result(rid: str, msg: dict, limit: dict | None, windows: list[dict], events: list,
+                     model: str, translate) -> dict:
     if msg.get("is_error") is not True and msg.get("subtype") == "success":
         text = msg.get("result")
         return c.result(rid, None, text=text if isinstance(text, str) else "", events=events)
-    limit = c.prefer_limit(limit, _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info", translate))
+    signal = _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info", translate)
+    windows = c.retain_windows(windows, signal)
+    limit = c.prefer_limit(limit, signal)
     if msg.get("error") == "rate_limit" and (limit is None or limit.get("scope") != "connection"):
-        # The envelope says the login is limited. A model window seen earlier does not narrow that.
-        reset = limit.get("reset_at") if isinstance(limit, dict) else None
-        limit = c.limit_signal("connection", "claude.result.error", reset_at=reset)
+        # The envelope says the login is limited. Keep the model window, and fence the connection
+        # with the connection's own reset. This error carries none, so the breaker uses its cooldown.
+        # Copying the model reset onto the connection would shorten that fence and drop the model window.
+        widened = c.limit_signal("connection", "claude.result.error")
+        windows = c.retain_windows(windows, widened)
+        limit = widened
     if limit is not None:
-        return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="typed limit")
+        return _with_windows(c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="typed limit"), windows)
     # Auth error names and api_error_status are unverified field names.
     if msg.get("error") in ("authentication_failed", "oauth_token_expired") or msg.get("api_error_status") == 401:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=str(msg.get("error") or "401"))
     text = msg.get("result")
-    if c.sounds_like_quota(text) or any(c.sounds_like_quota(e) for e in msg.get("errors") or [] if isinstance(e, str)):
+    errors = msg.get("errors")
+    # A non-list `errors` (a number, a string, an object) is not a list of messages. Treating it as
+    # iterable raises, skips the fence, and leaves the child running.
+    lines = errors if isinstance(errors, list) else ()
+    if c.sounds_like_quota(text) or any(c.sounds_like_quota(e) for e in lines if isinstance(e, str)):
         return c.result(rid, c.SHORT_FAULT, events=events, detail=f"untyped quota-like text on {model}")
     return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(scalar(msg.get("subtype")) or "error"))

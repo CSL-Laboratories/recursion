@@ -32,7 +32,7 @@ MAX_FALLBACK = 8
 # for one tenant for a minute (grill Q23), not a subscription limit, so it is not offered as a switch
 # point, including the breaker's refusal while that short fence holds.
 LIMIT_CODES = (c.PLAN_LIMIT, c.BREAKER_OPEN, c.PROBE_IN_FLIGHT)
-_ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack"}
+_ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack", "wrapper"}
 
 
 def validate_limits(limits: object) -> dict:
@@ -50,7 +50,7 @@ def validate_limits(limits: object) -> dict:
         raise c.RouteError(c.REQUEST_INVALID, "route.limits.fallback is empty: nothing the user chose to switch to")
     routes = []
     for entry in fallback:
-        if not isinstance(entry, Mapping) or set(entry) - _ROUTE_KEYS:
+        if not isinstance(entry, Mapping) or set(entry) - _ROUTE_KEYS or not valid_wrapper(entry.get("wrapper")):
             raise c.RouteError(c.REQUEST_INVALID, "route.limits.fallback entry")
         probe = {"contract": c.CONTRACT_VERSION, "request_id": "limits", "tenant": "limits", "prompt": "-",
                  "deadline_s": 1.0, "route": dict(entry)}
@@ -70,10 +70,11 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
     if result.get("code") not in LIMIT_CODES:
         return None
     signal = result.get("limit") or {}
-    reset_at = signal.get("reset_at") if isinstance(signal, Mapping) else None
-    if reset_at is None:
-        # A typed limit with no vendor reset still has the breaker's finite open_until on retry_at.
-        reset_at = result.get("retry_at")
+    vendor = signal.get("reset_at") if isinstance(signal, Mapping) else None
+    hold = result.get("retry_at")
+    # Wait for the breaker hold. A vendor reset that is earlier than the open window is still on
+    # the signal; advertising it would tell the user to retry while the breaker still refuses.
+    reset_at = hold if isinstance(hold, (int, float)) and not isinstance(hold, bool) else vendor
     here = describe(route)
     choices = [{"action": "wait", "until": reset_at}]
     choices += [{"action": "switch", "route": describe(r)} for r in limits["fallback"]]
@@ -90,6 +91,34 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
         "switched_to": None,
         "attempts": [here],
     }
+
+
+def valid_wrapper(value: object) -> bool:
+    """A fallback may carry the Pi/Hermes pin: the in-process object, or the same fields as JSON."""
+
+    if value is None:
+        return True
+    if isinstance(value, Mapping):
+        pin = value.get("pin")
+        files = pin.get("package_files") if isinstance(pin, Mapping) else None
+        return (
+            isinstance(value.get("launcher_path"), str) and bool(value["launcher_path"])
+            and isinstance(value.get("install_root"), str) and bool(value["install_root"])
+            and isinstance(pin, Mapping)
+            and isinstance(pin.get("launcher_sha256"), str) and bool(pin["launcher_sha256"])
+            and isinstance(files, list)
+            and all(
+                isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(part, str) and part for part in item)
+                for item in files
+            )
+        )
+    pin = getattr(value, "pin", None)
+    return (
+        isinstance(getattr(value, "launcher_path", None), str) and bool(value.launcher_path)
+        and isinstance(getattr(value, "install_root", None), str) and bool(value.install_root)
+        and isinstance(getattr(pin, "launcher_sha256", None), str) and bool(pin.launcher_sha256)
+        and isinstance(getattr(pin, "package_files", None), tuple)
+    )
 
 
 def _refusal_scope(result: Mapping) -> str:

@@ -27,9 +27,21 @@ not the operator's home and holds no Claude Code store and no Pi, Hermes or Open
 login entry. No credential file is opened or read. The one file read is a Hermes
 ``.hermes/config.yaml`` that is already exactly the size of the adopt switch Recursion writes there
 (37 bytes), to confirm it is that switch; a config of any other size refuses unread. Immediately
-before a Hermes launch, ``lstat`` (no follow) checks that the route home, ``.hermes`` and
-``config.yaml`` are still the inodes that read used. A same-inode rewrite after that read cannot
-be bound: the child opens the file by path, and this check does not try to close that window.
+before a Hermes launch the real path is walked from ``/`` with ``openat`` and ``O_NOFOLLOW`` on
+each component, and ``.hermes`` is listed through the directory fd held since the home check
+(``listdir`` on that fd). ``.env`` and ``.op.env`` are opened ``O_NOFOLLOW`` and not read, and
+refuse as a file, a symlink or a directory: Hermes ``load_hermes_dotenv`` loads ``~/.hermes/.env``
+over the process environment, and ``.op.env`` beside it, before ``config.yaml``, so ``HERMES_HOME``
+there selects a different config that defaults ``adopt_external_logins`` to true. An API-key
+``.hermes`` may contain only ``config.yaml``. A subscription route may still hold other names;
+those stay ``own_login_store_not_inspected`` (whether to read them is open for Lucas, PRODUCT.md
+055cc7a5 section 2). The launcher receives ``route_home_fd``, a dup of the held directory, valid
+only during that call. ``env["HOME"]`` stays the path the profile named. ``HOME=/proc/self/fd/N``
+is not set: that path would name this process, not a child. A same-uid swap of the path after the
+walk returns is not closed here; a child that re-opens ``env["HOME"]`` is outside this bind. A
+same-inode rewrite of ``config.yaml`` after the read is still unbound. A ``.env`` created in the
+held directory after the listing returns is not re-listed. ``PROJECT_ROOT/.env`` in the Hermes
+install tree is a separate file ``load_hermes_dotenv`` can load and is not checked here.
 
 ``guard_then_spawn`` takes the launcher and argv as trusted, core-owned inputs: it does not parse
 argv, so an engine flag that selects a provider or config is the caller's responsibility. On a
@@ -159,7 +171,7 @@ _FORBIDDEN_LAUNCH = frozenset(
     {"env", "shell", "executable", "preexec_fn", "close_fds", "pass_fds", "user", "group", "extra_groups", "cwd_fd"}
 )
 # Names the guard itself passes to the launcher; a caller may not pass or configure them.
-_RESERVED_LAUNCH = frozenset({"engine_config", "model"})
+_RESERVED_LAUNCH = frozenset({"engine_config", "model", "route_home_fd"})
 # Launch options forwarded to the launcher by default. Anything else that is not forbidden refuses
 # ``launch_option_unknown`` unless the caller lists it in ``RouteRequirements.extra_launch_options``.
 # The full-access profile adds none.
@@ -527,7 +539,10 @@ def guard_then_spawn(
     ``.hermes/config.yaml`` before the launcher runs; a config already there is reused only when it is
     exactly that file. A missing or empty ``.hermes`` is built in a ``.hermes.recursion-*`` staging
     directory and renamed into place; a ``.hermes`` that already holds entries gets the file by a
-    hard link that never overwrites. ``launch_kwargs`` may not replace the env or widen the launch:
+    hard link that never overwrites. The Hermes launcher also receives ``route_home_fd``, a dup of
+    the held route-home directory, valid only for that call. The child must use that descriptor as
+    its home. Re-opening ``env["HOME"]`` by path is not bound to the directory that was checked.
+    ``launch_kwargs`` may not replace the env or widen the launch:
     ``cwd`` and the names in ``requirements.extra_launch_options`` are forwarded, forbidden names
     refuse ``launch_option_denied`` and any other name refuses ``launch_option_unknown``.
     """
@@ -720,6 +735,13 @@ _MODEL_FLAGS = ("--model", "-m")
 # Hermes reads auth.adopt_external_logins from ~/.hermes/config.yaml and defaults it to true
 # (NousResearch/hermes-agent, auth.adopt_external_logins). The route home is the child HOME.
 _HERMES_ADOPT_YAML = b"auth:\n  adopt_external_logins: false\n"  # 37 bytes
+# API-key Hermes launches may leave only the adopt switch in ``.hermes``.
+# Subscription launches may also leave the engine's own store; that store is not read.
+_HERMES_LAUNCH_ALLOW = frozenset({"config.yaml"})
+# ``load_hermes_dotenv`` reads these from the Hermes home before ``config.yaml``.
+# ``.env`` overrides the process environment. ``.op.env`` is loaded next and can set
+# ``HERMES_HOME`` when the child env has not. Neither name is the adopt switch.
+_HERMES_DOTENV_NAMES = frozenset({".env", ".op.env"})
 # Staging names the adopt-switch write makes in the route home. Not a store entry: a leftover one
 # (a crash between mkdir and rename) is never read as Hermes state.
 _HERMES_STAGING_PREFIX = ".hermes.recursion-"
@@ -1299,7 +1321,9 @@ def _bind_hermes_launch_path(engine: str, route_home: str, hermes_dev: int, herm
 
     A same-inode rewrite after the read cannot be bound: the child opens ``config.yaml``
     by path, and ``lstat`` cannot see new bytes in the inode just read. This check does
-    not try to close that window.
+    not try to close that window. The caller walks the ancestors and lists ``.hermes``
+    through the held directory fd after this returns; a swap that lands after those
+    later checks is still outside this function.
     """
 
     hold = _route_home_for(engine, route_home)
@@ -1331,6 +1355,117 @@ def _bind_hermes_launch_path(engine: str, route_home: str, hermes_dev: int, herm
         raise _refuse_hermes_config(engine, "config.yaml")
 
 
+def _bind_route_home_from_root(engine: str, route_home: str) -> None:
+    """The path still names the held directory, walked from ``/`` without following a symlink.
+
+    ``os.lstat`` of the final path follows ancestor symlinks, so a retargeted ancestor can
+    still report the held inode until the next look. Each real-path component is opened
+    ``O_NOFOLLOW``. A symlink component, a replaced parent, or a final inode other than
+    the held directory refuses. This does not cover a swap that happens after it returns.
+    """
+
+    hold = _route_home_for(engine, route_home)
+    try:
+        real = os.path.realpath(route_home)
+        named = os.lstat(route_home)
+        held = os.fstat(hold.fd)
+    except OSError:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+    if ((named.st_dev, named.st_ino) != (hold.dev, hold.ino)
+            or (held.st_dev, held.st_ino) != (hold.dev, hold.ino)
+            or not stat.S_ISDIR(named.st_mode) or not stat.S_ISDIR(held.st_mode)):
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
+    parts = [part for part in real.split(os.sep) if part]
+    dir_fd = -1
+    opened: tuple[int, int] | None = None
+    try:
+        dir_fd = os.open(os.sep, _DIR_OPEN_FLAGS)
+        for part in parts:
+            try:
+                st = os.stat(part, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError:
+                raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                raise SubscriptionRouteRefused(engine, "route_home_not_private")
+            try:
+                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+            except OSError:
+                raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+            os.close(dir_fd)
+            dir_fd = next_fd
+        final = os.fstat(dir_fd)
+        opened = (final.st_dev, final.st_ino)
+    except SubscriptionRouteRefused:
+        raise
+    except OSError:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+    finally:
+        if dir_fd >= 0:
+            os.close(dir_fd)
+    if opened != (hold.dev, hold.ino):
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
+
+
+def _reject_hermes_dotenv(engine: str, hermes_fd: int, name: str) -> None:
+    """``name`` is in the held ``.hermes``. Refuse a file, symlink or directory. Do not follow or read it."""
+
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
+    fd = -1
+    try:
+        # Open and close only. A file, a directory and a symlink all refuse, and the bytes are not read.
+        fd = os.open(name, flags, dir_fd=hermes_fd)
+    except OSError:
+        # O_NOFOLLOW on a symlink is ELOOP where O_PATH is absent. The name was listed.
+        raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name) from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name)
+
+
+def _refuse_hermes_dir_entries(engine: str, route_home: str, auth: str, hermes_dev: int, hermes_ino: int) -> None:
+    """List the held ``.hermes`` and refuse a dotenv name, or any other name on an API-key route.
+
+    The directory is opened from the route-home descriptor (``O_NOFOLLOW``). ``listdir`` uses
+    that fd. A ``.env`` planted after an earlier listing is still in this one. A subscription
+    route may keep other names; those are the uninspected own store. This does not see a name
+    created after it returns.
+    """
+
+    hold = _route_home_for(engine, route_home)
+    try:
+        hermes_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=hold.fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    try:
+        try:
+            hermes_st = os.fstat(hermes_fd)
+            names = os.listdir(hermes_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        if (not stat.S_ISDIR(hermes_st.st_mode)
+                or (hermes_st.st_dev, hermes_st.st_ino) != (hermes_dev, hermes_ino)):
+            raise _refuse_hermes_config(engine, ".hermes")
+        for name in sorted(names):
+            if name in _HERMES_DOTENV_NAMES:
+                _reject_hermes_dotenv(engine, hermes_fd, name)
+        if "config.yaml" not in names:
+            raise _refuse_hermes_config(engine, "config.yaml")
+        try:
+            cfg = os.stat("config.yaml", dir_fd=hermes_fd, follow_symlinks=False)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        if (hold.config_dev is None or hold.config_ino is None or not stat.S_ISREG(cfg.st_mode)
+                or (cfg.st_dev, cfg.st_ino) != (hold.config_dev, hold.config_ino)):
+            raise _refuse_hermes_config(engine, "config.yaml")
+        if auth != "subscription":
+            extra = sorted(set(names) - _HERMES_LAUNCH_ALLOW)
+            if extra:
+                raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", extra[0])
+    finally:
+        os.close(hermes_fd)
+
+
 def _launch_checked(
     launcher: Callable[..., object],
     argv: list[str],
@@ -1348,17 +1483,36 @@ def _launch_checked(
     _recheck_route_home(decision.engine, route_home)
     _apply_hermes_adopt_override(decision, route_home)
     _recheck_route_home(decision.engine, route_home)
-    if decision.engine == "hermes":
-        # Descriptor read first (the held dirfd). The path lstat is the last step before launch.
-        # A same-inode rewrite after that read cannot be bound: the child opens config.yaml by path.
-        hermes_dev, hermes_ino = _reverify_hermes_switch(decision.engine, route_home)
-        _bind_hermes_launch_path(decision.engine, route_home, hermes_dev, hermes_ino)
     # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
     # launch options _reject_launch_shape let through; none can replace env, shell or the model.
-    return decision, launcher(
-        list(argv), env=dict(decision.child_env), shell=False,
-        engine_config=decision.engine_config, model=decision.model, **forward,
-    )
+    # route_home_fd is a dup of the held directory. It is closed when this call returns, so a
+    # real launcher must dup it or spawn before returning. Re-opening env HOME by path is not
+    # bound: a same-uid rename after the walk below can make that path a different directory.
+    home_fd = -1
+    try:
+        forwarded = dict(forward)
+        if decision.engine == "hermes":
+            # Read the switch through the held dirfd, then lstat the paths, then walk every
+            # ancestor from / and list .hermes through the held fd. The walk runs again after
+            # the listing so a path swapped during the listing still refuses. A swap after
+            # that second walk, and a .env created after the listing, are not seen here.
+            hermes_dev, hermes_ino = _reverify_hermes_switch(decision.engine, route_home)
+            _bind_hermes_launch_path(decision.engine, route_home, hermes_dev, hermes_ino)
+            _bind_route_home_from_root(decision.engine, route_home)
+            _refuse_hermes_dir_entries(decision.engine, route_home, decision.auth, hermes_dev, hermes_ino)
+            _bind_route_home_from_root(decision.engine, route_home)
+            try:
+                home_fd = os.dup(_route_home_for(decision.engine, route_home).fd)
+            except OSError:
+                raise SubscriptionRouteRefused(decision.engine, "route_home_not_private") from None
+            forwarded["route_home_fd"] = home_fd
+        return decision, launcher(
+            list(argv), env=dict(decision.child_env), shell=False,
+            engine_config=decision.engine_config, model=decision.model, **forwarded,
+        )
+    finally:
+        if home_fd >= 0:
+            os.close(home_fd)
 
 
 def _checked_baseline(

@@ -768,6 +768,181 @@ class HermesHomeReuseTests(_Calls):
         self.assertNotEqual(os.lstat(self.home).st_ino, os.lstat(moved).st_ino)
         self.assertEqual(ADOPT_YAML, (moved / ".hermes" / "config.yaml").read_bytes())
 
+    def _private(self, path: Path) -> None:
+        path.mkdir(mode=0o700)
+        os.chmod(path, 0o700)
+
+    def _after_last_bind(self, mutate):
+        """Run ``mutate`` after ``_bind_hermes_launch_path`` returns.
+
+        That function's path ``lstat`` is the last check on 76a11a0c. A mutation
+        here is invisible to that check and is what the child would open.
+        """
+
+        real = policy._bind_hermes_launch_path
+
+        def wrapped(*args: object, **kwargs: object) -> None:
+            real(*args, **kwargs)
+            mutate()
+
+        return mock.patch.object(policy, "_bind_hermes_launch_path", side_effect=wrapped)
+
+    def _hermes_at(self, home: Path, *, subscription: bool = False):
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
+        if subscription:
+            profile = {**self.sub(), HERMES_ADOPT_EXTERNAL_LOGINS: False}
+            argv = [self.launcher_path, "run", "grok/test-model"]
+        else:
+            profile = {**self.profile(), HERMES_ADOPT_EXTERNAL_LOGINS: False}
+            argv = [self.launcher_path, "run", "anthropic/m"]
+            env["ANTHROPIC_API_KEY"] = FAKE_KEY
+        return guard_then_spawn(
+            self.launcher, argv, "hermes", profile, env, route_home=str(home),
+            parent_env=self.parent(), operator_home=str(self.operator), wrapper=self.wrapper,
+        )
+
+    def test_subscription_refuses_hermes_dotenv_file_symlink_and_directory(self) -> None:
+        # load_hermes_dotenv() reads route_home/.hermes/.env (override) before config.yaml.
+        # A pre-created file is only flagged own_login_store_not_inspected on the parent.
+        # The symlink target stays inside the route home, so the own-store link walk allows it.
+        # .op.env is the same loader's second file. A directory of either name refuses too.
+        inside = self.home / "note.txt"
+        inside.write_text("HERMES_HOME=/not-the-route\n", encoding="ascii")
+        for name in (".env", ".op.env"):
+            for kind in ("file", "symlink", "dir"):
+                with self.subTest(name=name, kind=kind):
+                    shutil.rmtree(self.home / ".hermes", ignore_errors=True)
+                    self._private(self.home / ".hermes")
+                    entry = self.home / ".hermes" / name
+                    if kind == "file":
+                        entry.write_text("HERMES_HOME=/not-the-route\nHERMES_DATA_DIR_SUFFIX=x\n", encoding="ascii")
+                    elif kind == "symlink":
+                        os.symlink(inside, entry)
+                    else:
+                        self._private(entry)
+                    exc = self.refused("hermes_dotenv_in_home", self.launch_sub)
+                    self.assertEqual(name, exc.detail)
+                    self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
+        self.launcher.assert_not_called()
+
+    def test_api_key_dotenv_planted_after_the_listing_does_not_launch(self) -> None:
+        # The early listdir accepts a .hermes that holds only config.yaml. The file
+        # created after that listing is what Hermes would load before the switch.
+        def plant() -> None:
+            fd = os.open(self.home / ".hermes" / ".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, b"HERMES_HOME=/not-the-route\n")
+            finally:
+                os.close(fd)
+
+        with self._after_last_bind(plant):
+            exc = self.refused("hermes_dotenv_in_home", self.launch, "hermes")
+        self.assertEqual(".env", exc.detail)
+        self.launcher.assert_not_called()
+
+    def test_api_key_refuses_a_non_allowlisted_entry_planted_after_the_listing(self) -> None:
+        def plant() -> None:
+            fd = os.open(self.home / ".hermes" / "state.db", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.close(fd)
+
+        with self._after_last_bind(plant):
+            exc = self.refused("engine_store_in_route_home", self.launch, "hermes")
+        self.assertEqual("state.db", exc.detail)
+        self.launcher.assert_not_called()
+
+    def test_route_home_replaced_after_last_lstat_does_not_launch(self) -> None:
+        # Empty 0700 directory swapped onto the route path after the last lstat.
+        # Hermes would default adopt_external_logins to true with no config.yaml.
+        moved = self.root / "route-home.real"
+
+        def swap() -> None:
+            os.rename(self.home, moved)
+            self._private(self.home)
+
+        with self._after_last_bind(swap):
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.launcher.assert_not_called()
+        self.assertFalse((self.home / ".hermes").exists())
+        self.assertEqual(ADOPT_YAML, (moved / ".hermes" / "config.yaml").read_bytes())
+
+    def test_parent_swapped_after_last_lstat_does_not_launch(self) -> None:
+        parent = self.root / "parent"
+        self._private(parent)
+        home = parent / "home"
+        self._private(home)
+        moved = self.root / "parent.real"
+
+        def swap() -> None:
+            os.rename(parent, moved)
+            self._private(parent)
+            self._private(parent / "home")
+
+        with self._after_last_bind(swap):
+            self.refused("route_home_not_private", self._hermes_at, home)
+        self.launcher.assert_not_called()
+        self.assertFalse((parent / "home" / ".hermes").exists())
+        self.assertEqual(ADOPT_YAML, (moved / "home" / ".hermes" / "config.yaml").read_bytes())
+
+    def test_symlink_ancestor_retargeted_after_last_lstat_does_not_launch(self) -> None:
+        real_parent = self.root / "real-parent"
+        self._private(real_parent)
+        home = real_parent / "home"
+        self._private(home)
+        link = self.root / "via-link"
+        os.symlink(real_parent, link)
+        decoy = self.root / "decoy-parent"
+        self._private(decoy)
+        self._private(decoy / "home")
+
+        def swap() -> None:
+            os.unlink(link)
+            os.symlink(decoy, link)
+
+        with self._after_last_bind(swap):
+            self.refused("route_home_not_private", self._hermes_at, link / "home")
+        self.launcher.assert_not_called()
+        self.assertFalse((decoy / "home" / ".hermes").exists())
+        self.assertEqual(ADOPT_YAML, (home / ".hermes" / "config.yaml").read_bytes())
+
+    def test_launcher_gets_the_held_route_home_fd_and_not_a_proc_self_home(self) -> None:
+        # The fake launcher does not spawn. HOME=/proc/self/fd/N would name this
+        # process, not a child. The contract is the held directory fd, valid
+        # during the call. A swap inside the launcher is still after every check:
+        # the path in HOME is then the empty directory, and the fd is not.
+        seen: dict[str, object] = {}
+
+        def spy(_argv: list[str], **kwargs: object) -> str:
+            self.assertIn("route_home_fd", kwargs)
+            fd = kwargs["route_home_fd"]
+            self.assertIsInstance(fd, int)
+            env = kwargs["env"]
+            self.assertIsInstance(env, dict)
+            self.assertEqual(str(self.home), env["HOME"])
+            self.assertNotIn("/proc/", env["HOME"])
+            before = os.fstat(fd)
+            home_st = os.lstat(self.home)
+            self.assertEqual((home_st.st_dev, home_st.st_ino), (before.st_dev, before.st_ino))
+            os.rename(self.home, self.root / "route-home.real")
+            self._private(self.home)
+            self.assertEqual((before.st_dev, before.st_ino), (os.fstat(fd).st_dev, os.fstat(fd).st_ino))
+            self.assertNotEqual(os.lstat(self.home).st_ino, before.st_ino)
+            self.assertFalse((self.home / ".hermes").exists())
+            hermes_fd = os.open(".hermes", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                cfg = os.open("config.yaml", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=hermes_fd)
+                try:
+                    seen["yaml"] = os.read(cfg, 64)
+                finally:
+                    os.close(cfg)
+            finally:
+                os.close(hermes_fd)
+            return "launched"
+
+        self.launcher.side_effect = spy
+        self.launch("hermes")
+        self.assertEqual(ADOPT_YAML, seen["yaml"])
+        self.assertEqual(1, self.launcher.call_count)
+
     def test_config_renamed_inside_final_open_before_fstat_does_not_launch(self) -> None:
         # The final check fstats the fd it opened. Another file renamed onto
         # config.yaml inside that open, before fstat, is the name the child opens.
@@ -931,7 +1106,7 @@ class LaunchOptionForwardTests(_Calls):
         for engine in self.guards():
             for key, value in (("env", {"ANTHROPIC_OAUTH_TOKEN": FAKE_OAUTH}), ("shell", True), ("executable", "/bin/sh"),
                                ("preexec_fn", print), ("pass_fds", (0,)), ("user", 0), ("cwd_fd", 3),
-                               ("model", "anthropic/other"), ("engine_config", ())):
+                               ("route_home_fd", 3), ("model", "anthropic/other"), ("engine_config", ())):
                 for full in (False, True):
                     with self.subTest(engine=engine, key=key, full=full):
                         exc = self.refused("launch_option_denied", self.launch, engine,
@@ -963,7 +1138,8 @@ class LaunchOptionForwardTests(_Calls):
 
     def test_caller_cannot_configure_a_forbidden_option(self) -> None:
         for engine in self.guards():
-            for name in ("env", "shell", "executable", "preexec_fn", "close_fds", "model", "engine_config"):
+            for name in ("env", "shell", "executable", "preexec_fn", "close_fds", "model", "engine_config",
+                          "route_home_fd"):
                 for full in (False, True):
                     with self.subTest(engine=engine, name=name, full=full):
                         requirements = RouteRequirements(extra_launch_options=("start_new_session", name))
@@ -1013,7 +1189,10 @@ class FullAccessTests(_Calls):
                 self.launcher.assert_not_called()
                 decision, _ = self.launch(engine, full_access_acknowledged=True)
                 self.assertIn("full_access_profile_acknowledged", decision.flags)
-                self.assertEqual({"env", "shell", "engine_config", "model"}, set(self.launcher.call_args.kwargs))
+                expected = {"env", "shell", "engine_config", "model"}
+                if engine == "hermes":
+                    expected.add("route_home_fd")
+                self.assertEqual(expected, set(self.launcher.call_args.kwargs))
                 self.launcher.reset_mock()
                 decision, _ = self.launch(engine)
                 self.assertNotIn("full_access_profile_acknowledged", decision.flags)

@@ -63,6 +63,13 @@ BUSY_FRAME = encode_frame(
 _ACCEPT_POLL_S = 0.1
 # Linux sun_path is 108 bytes including the trailing NUL.
 _MAX_SUN_PATH = 107
+# Linux unix_seq_show reports TCP_LISTEN as 1 << 16 in /proc/net/unix Flags.
+# The Inode column is the sockfs inode, not the directory entry's st_ino.
+_UNIX_LISTENER_FLAG = 0x10000
+# Num: RefCount Protocol Flags Type St Inode [Path]
+_UNIX_ROW = re.compile(
+    r"^[0-9A-Fa-f]+:\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([0-9A-Fa-f]+)\s+\S+\s+\S+\s+\d+(?: (.*))?$"
+)
 _URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _HOST_PORT = re.compile(r"^\[?[^/\\]*\]?:\d+$")
 
@@ -247,59 +254,94 @@ def _probe_listener(path: str) -> int | None:
     return None
 
 
-def _unlink_refused(path: str) -> None:
+def _proc_unix_path_state(path: str) -> str:
+    """``listening``, ``present``, ``absent`` or ``unknown`` for ``path``.
+
+    Match the Path column only. Do not compare the Inode column to ``lstat``
+    ``st_ino``: that column is the sockfs inode, so a live listener would
+    look absent and be unlinked.
+    """
     try:
-        os.unlink(path)
+        with open("/proc/net/unix", "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return "unknown"
+    lines = blob.decode("utf-8", "surrogateescape").splitlines()
+    if not lines or not lines[0].startswith("Num"):
+        return "unknown"
+    found = False
+    for line in lines[1:]:
+        if not line:
+            continue
+        matched = _UNIX_ROW.match(line)
+        if matched is None:
+            # A torn or unexpected row that names this path is not "absent".
+            if path in line:
+                return "unknown"
+            continue
+        row_path = matched.group(2)
+        if row_path != path:
+            continue
+        try:
+            flags = int(matched.group(1), 16)
+        except ValueError:
+            return "unknown"
+        if flags & _UNIX_LISTENER_FLAG:
+            return "listening"
+        found = True
+    return "present" if found else "absent"
+
+
+def _unlink_our_socket(path: str, ident: tuple[int, int]) -> None:
+    """Unlink ``path`` only when a fresh lstat still shows socket inode ``ident``.
+
+    A symlink or a different inode is refused and left in place. ``_unlink_inode``
+    checks again at the unlink, so a swap between the lstat and the unlink misses.
+    """
+    try:
+        st = os.lstat(path)
     except FileNotFoundError:
-        pass
+        return
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or not stat.S_ISSOCK(st.st_mode)
+        or st.st_uid != os.geteuid()
+        or (st.st_dev, st.st_ino) != ident
+    ):
+        raise InsecureSocketPath(f"{path} exists and is not our socket")
+    _unlink_inode(path, ident)
 
 
 def _clear_stale_socket(path: str) -> None:
     """Drop a socket we own when nobody is listening. Leave a listener alone.
 
-    Mode 000 and 0100 make ``connect`` return EACCES for a live same-uid
-    listener and for a closed socket. That is not a reason to unlink. When
-    ``lstat`` still shows a socket we own, chmod it to 0600 and connect once
-    more. Only ECONNREFUSED on that retry means the file is stale.
+    ``EACCES`` and ``EPERM`` are not proof the file is stale. A same-uid
+    listener at mode 000 or 0070 fails ``connect`` the same way a closed
+    socket does. Do not chmod and do not unlink on that result: chmod would
+    leave the listener at 0600, and ``follow_symlinks=False`` still walks a
+    parent symlink. Reclaim the file only when ``/proc/net/unix`` has no row
+    for this path. Anything uncertain is refused and left untouched.
     """
-    if _stat_our_socket(path) is None:
-        return
-    err = _probe_listener(path)
-    if err is None:
-        raise InsecureSocketPath(f"{path} is live: another server is listening")
-    if err == errno.ENOENT:
-        return
-    if err == errno.ECONNREFUSED:
-        _unlink_refused(path)
-        return
-    # EACCES or EPERM. Do not unlink: a listener at mode 000 looks the same.
     st = _stat_our_socket(path)
     if st is None:
         return
-    try:
-        os.chmod(path, 0o600, follow_symlinks=False)
-    except (OSError, NotImplementedError) as exc:
-        raise InsecureSocketPath(f"{path} is not connectable") from exc
-    try:
-        after = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if (
-        stat.S_ISLNK(after.st_mode)
-        or not stat.S_ISSOCK(after.st_mode)
-        or after.st_uid != os.geteuid()
-        or (after.st_dev, after.st_ino) != (st.st_dev, st.st_ino)
-    ):
-        raise InsecureSocketPath(f"{path} exists and is not our socket")
+    ident = (st.st_dev, st.st_ino)
     err = _probe_listener(path)
     if err is None:
         raise InsecureSocketPath(f"{path} is live: another server is listening")
-    if err == errno.ECONNREFUSED:
-        _unlink_refused(path)
-        return
     if err == errno.ENOENT:
         return
-    raise InsecureSocketPath(f"{path} is not connectable")
+    if err == errno.ECONNREFUSED:
+        _unlink_our_socket(path, ident)
+        return
+    if err not in (errno.EACCES, errno.EPERM):
+        raise InsecureSocketPath(f"{path} is not connectable")
+    state = _proc_unix_path_state(path)
+    if state != "absent":
+        if state == "listening":
+            raise InsecureSocketPath(f"{path} is live: another server is listening")
+        raise InsecureSocketPath(f"{path} is not connectable")
+    _unlink_our_socket(path, ident)
 
 
 def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -> PeerCred:
@@ -437,11 +479,14 @@ class UnixControlServer:
         Each join waits only for the time still left on that deadline, so N blocked
         handlers do not cost N timeouts. Handlers still running when the deadline
         passes are cancelled. ``_serve`` does not write a result that arrives after that.
+
+        The flock is released before any peer-observable shutdown. ``shutdown``
+        wakes a client blocked in ``read``, and that client may start a successor
+        before ``close`` returns. Joins stay inside this cleanup: a handler that
+        stops the server is running on a worker, and joining that thread raises.
         """
         self._stop.set()
         thread = self._thread
-        # Joins sit inside the cleanup. A handler that stops the server is running
-        # on a worker, and joining that thread raises. The flock still has to close.
         try:
             self._requests.begin_close()
             if thread is not None and thread is not threading.current_thread():
@@ -449,6 +494,8 @@ class UnixControlServer:
             with self._lock:
                 workers = list(self._workers)
                 conns = list(self._conns)
+            # Drop the listener and the flock before waking peers.
+            self._release_bound_socket()
             for conn in conns:
                 try:
                     conn.shutdown(socket.SHUT_RDWR)
@@ -462,15 +509,26 @@ class UnixControlServer:
             # is a hair short of the deadline, and do not give the rest another timeout.
             self._requests.abandon()
         finally:
-            # Always drop the listen socket and the flock, even when a join fails.
-            with self._lock:
-                sock, self._sock = self._sock, None
-                lock_fd, self._lock_fd = self._lock_fd, None
-                bound, self._bound = self._bound, None
+            # A join can raise before the release above. Drop whatever is left.
+            # Do not shut peers down from here: that would run before the flock
+            # is gone when the try did not reach the release.
+            self._release_bound_socket()
+
+    def _release_bound_socket(self) -> None:
+        """Close the listen socket, unlink that inode, then drop the flock.
+
+        Unlink is inode-checked, so a successor that already bound this path
+        stays. The flock is last: once it is gone, a peer may be woken.
+        """
+        with self._lock:
+            sock, self._sock = self._sock, None
+            lock_fd, self._lock_fd = self._lock_fd, None
+            bound, self._bound = self._bound, None
+        try:
             if sock is not None:
                 sock.close()
-                # Unlink only the inode we bound: a successor at this path stays.
                 _unlink_inode(self._path, bound)
+        finally:
             if lock_fd is not None:
                 os.close(lock_fd)
 

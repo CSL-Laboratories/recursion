@@ -122,6 +122,13 @@ class TuiApp:
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
         self.outputs: dict[str, _Output] = {}
         self.in_flight: dict[str, int] = collections.defaultdict(int)
+        # When the read lane and the Stop lane overlap, a read that started before a Stop answer
+        # must not paint that run as it was. ``_read_at`` is the newest fact applied for a run
+        # (a Stop, or a read that started after it). ``_answer_started`` is set by Loop for the
+        # answer currently being applied; a synchronous call leaves it None.
+        self._answer_started: float | None = None
+        self._read_at: dict[str, float] = {}
+        self._stop_mark: dict[str, tuple[float, str, object]] = {}
 
     # -- the event log --------------------------------------------------------------------------
     def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
@@ -186,7 +193,19 @@ class TuiApp:
         code = answer.get("code")
         if method == "run.list":
             if code == "ok" and isinstance(answer.get("runs"), list):
-                self.runs = [r for r in answer["runs"] if isinstance(r, dict)]
+                incoming = [r for r in answer["runs"] if isinstance(r, dict)]
+                merged, seen = [], set()
+                for run in incoming:
+                    chosen = self._consider(run)
+                    merged.append(chosen)
+                    seen.add(chosen.get("run_id"))
+                # A list that started before a Stop does not drop the run the Stop just named.
+                if self._answer_started is not None:
+                    for old in self.runs:
+                        rid = old.get("run_id")
+                        if rid not in seen and isinstance(rid, str) and self._answer_started < self._read_at.get(rid, -1):
+                            merged.append(old)
+                self.runs = merged
                 self.snapshot_at, self.refresh_failed = self._clock(), None
                 # A stale list stays stale until a later list is not. A status answer must not clear it
                 # (bot review 4503920848).
@@ -208,9 +227,14 @@ class TuiApp:
         elif code == "ok" and isinstance(answer.get("run"), dict):
             self._merge(answer["run"])
         elif code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
+            rid = answer["run_id"]
+            state = "stopped" if code == "stopped" else "stop_pending"
+            # Applied now, so any read that started earlier is older than this Stop.
+            self._read_at[rid] = time.monotonic()
+            self._stop_mark[rid] = (self._read_at[rid], state, answer.get("reason"))
             for run in self.runs:
-                if run.get("run_id") == answer["run_id"]:
-                    run["state"] = "stopped" if code == "stopped" else "stop_pending"
+                if run.get("run_id") == rid:
+                    run["state"] = state
                     run["stop"] = {**(run.get("stop") or {}), "reason": answer.get("reason")}
         elif code == "started" and isinstance(answer.get("run"), dict):
             self._merge(answer["run"])
@@ -237,7 +261,32 @@ class TuiApp:
             self._notice(f"stop run={field(params.get('run_id'))}: control API answered {field(code)}", speech="")
         self.sync_conditions()
 
+    def _consider(self, run: dict) -> dict:
+        """The run record a read may store. A read that started before a newer Stop keeps the local row."""
+
+        started = self._answer_started
+        rid = run.get("run_id")
+        if started is None or not isinstance(rid, str):
+            return run
+        if started < self._read_at.get(rid, -1):
+            old = next((known for known in self.runs if known.get("run_id") == rid), None)
+            if old is not None:
+                return old
+            return self._overlay_stop(run, started)
+        self._read_at[rid] = started
+        return self._overlay_stop(run, started)
+
+    def _overlay_stop(self, run: dict, started: float) -> dict:
+        mark = self._stop_mark.get(run.get("run_id"))
+        if mark is None or started >= mark[0] or run.get("state") in ("stopped", mark[1]):
+            return run
+        over = dict(run)
+        over["state"] = mark[1]
+        over["stop"] = {**(over.get("stop") or {}), "reason": mark[2]}
+        return over
+
     def _merge(self, run: dict) -> None:
+        run = self._consider(run)
         for i, known in enumerate(self.runs):
             if known.get("run_id") == run.get("run_id"):
                 self.runs[i] = run
@@ -629,8 +678,16 @@ class TuiApp:
         self.last_error = self._emit("error", "recursion", f"error {len(self.errors)}: {line}")
 
 
+def _json_copy(value):
+    return json.loads(json.dumps(value, default=str))
+
+
 def call_api(api, method: str, params: dict) -> dict:
-    """One control API call. A transport failure becomes a typed answer, not a crash."""
+    """One control API call. A transport failure becomes a typed answer, not a crash.
+
+    The copy is private so the view never aliases API state. A value that cannot be copied (a cycle,
+    a non-text key) is dropped; scalar fields such as ``code`` and ``run_id`` are kept, so a Stop
+    result is not thrown away and the caller's lane keeps running."""
 
     try:
         answer = api.call(method, dict(params))
@@ -638,7 +695,21 @@ def call_api(api, method: str, params: dict) -> dict:
         return {"code": p.UNAVAILABLE, "detail": type(err).__name__}
     if not isinstance(answer, dict):
         return {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
-    return json.loads(json.dumps(answer, default=str))  # a private copy: the view never aliases API state
+    try:
+        return _json_copy(answer)
+    except (TypeError, ValueError):
+        safe = {}
+        for key, value in answer.items():
+            if not isinstance(key, str):
+                continue
+            try:
+                safe[key] = _json_copy(value)
+            except (TypeError, ValueError):
+                continue
+        if "code" not in safe:
+            safe["code"] = p.UNAVAILABLE
+            safe["detail"] = "answer_not_serializable"
+        return safe
 
 
 class Loop:
@@ -690,7 +761,12 @@ class Loop:
             if item is None:
                 return
             method, params, done = item
-            self._answers.put((done, method, params, call_api(self._api, method, params)))
+            started = time.monotonic()
+            try:
+                answer = call_api(self._api, method, params)
+            except Exception as err:  # one bad answer must not end this lane; Stop lives on its own lane
+                answer = {"code": p.UNAVAILABLE, "detail": type(err).__name__}
+            self._answers.put((done, method, params, answer, started))
             self._wake.set()
 
     def start(self) -> None:
@@ -726,10 +802,16 @@ class Loop:
                 break
         while True:  # 2. API answers
             try:
-                done, method, params, answer = self._answers.get_nowait()
+                done, method, params, answer, started = self._answers.get_nowait()
             except queue.Empty:
                 break
-            done(method, params, answer)
+            app._answer_started = started
+            try:
+                done(method, params, answer)
+            except Exception as err:
+                app._error(f"answer {method} dropped: {type(err).__name__}")
+            finally:
+                app._answer_started = None
         deadline = time.monotonic() + self.drain_budget_s  # 3. engine output, time-sliced
         while time.monotonic() < deadline:
             with self._events_lock:
@@ -737,7 +819,10 @@ class Loop:
             if not batch:
                 break
             for event in batch:
-                app.on_event(event)
+                try:
+                    app.on_event(event)
+                except Exception as err:  # one bad chunk must not kill the thread that handles keys and Stop
+                    app._error(f"output event dropped: {type(err).__name__}")
             if not self._keys.empty():
                 break
         if self.dropped_events:

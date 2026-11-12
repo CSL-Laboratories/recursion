@@ -34,6 +34,12 @@ from recursion_core.tui.view import InlinePainter, to_ansi
 
 _KEYS = {"\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace", "\x1b": "esc",
          "\x1b[A": "up", "\x1b[B": "down"}
+# Longer sequences first. Bare ESC is not here: it is also the prefix of an arrow key, so it is only
+# taken once the rest of the read shows it is not one of those.
+_KEY_SEQS = tuple(sorted(
+    ((key.encode("latin1"), name) for key, name in _KEYS.items() if key != "\x1b"),
+    key=lambda item: len(item[0]), reverse=True))
+_ESC_SEQS = tuple(raw for raw, _name in _KEY_SEQS if raw.startswith(b"\x1b"))
 FLAGS = {"--plain": "plain", "--screen-reader": "plain", "--no-alt-screen": "no_alt_screen", "--no-color": "no_color"}
 USAGE = "usage: recursion-tui [--plain | --screen-reader] [--no-alt-screen] [--no-color]"
 
@@ -79,11 +85,44 @@ def plain(api, stdin: Iterable[str], stdout: TextIO, environ: Mapping[str, str],
     return 0
 
 
+def _utf8_len(lead: int) -> int:
+    if lead < 0x80:
+        return 1
+    if 0xC2 <= lead < 0xE0:
+        return 2
+    if 0xE0 <= lead < 0xF0:
+        return 3
+    if 0xF0 <= lead < 0xF8:
+        return 4
+    return 1
+
+
+def _take_key(buf: bytes, *, final: bool) -> tuple[str | None, bytes]:
+    """One key from the front of ``buf``. ``final`` decides an incomplete escape or UTF-8 sequence."""
+
+    if not buf:
+        return None, b""
+    for raw, name in _KEY_SEQS:
+        if buf.startswith(raw):
+            return name, buf[len(raw):]
+    if buf[:1] == b"\x1b":
+        if not final and any(seq.startswith(buf) and len(buf) < len(seq) for seq in _ESC_SEQS):
+            return None, buf
+        return "esc", buf[1:]
+    need = _utf8_len(buf[0])
+    if len(buf) < need and not final:
+        return None, buf
+    take = buf if final and len(buf) < need else buf[:need]
+    return take.decode("utf-8", "replace"), buf[len(take):]
+
+
 class Tty:
     """The real terminal: cbreak mode, key reads and size. Tests pass a fake with the same methods."""
 
     def __init__(self, stdin: TextIO) -> None:
         self.fd = stdin.fileno()
+        self._buf = b""
+        self._eof = False
 
     def size(self) -> os.terminal_size:
         return shutil.get_terminal_size()
@@ -101,11 +140,35 @@ class Tty:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
 
     def read_key(self, timeout: float) -> str | None:
-        ready, _, _ = select.select([self.fd], [], [], timeout)
+        """One key. Bytes already read stay queued, and a hangup raises ``EOFError`` instead of spinning."""
+
+        if self._eof and not self._buf:
+            raise EOFError
+        key, self._buf = _take_key(self._buf, final=False)
+        if key is not None:
+            return key
+        try:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+        except OSError:
+            self._eof = True
+            raise EOFError from None
         if not ready:
-            return None
-        data = os.read(self.fd, 16).decode("utf-8", "replace")
-        return _KEYS.get(data, data[:1] if data[:1] != "\x1b" else "esc")
+            key, self._buf = _take_key(self._buf, final=True)
+            return key
+        try:
+            data = os.read(self.fd, 64)
+        except OSError:
+            self._eof = True
+            raise EOFError from None
+        if data == b"":
+            self._eof = True
+            key, self._buf = _take_key(self._buf, final=True)
+            if key is not None:
+                return key
+            raise EOFError
+        self._buf += data
+        key, self._buf = _take_key(self._buf, final=False)
+        return key
 
 
 def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, alt_screen: bool = True,
@@ -142,7 +205,11 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
         with terminal.cbreak():
             loop.start()
             while not app.closed:
-                key = terminal.read_key(0.1)
+                try:
+                    key = terminal.read_key(0.1)
+                except EOFError:  # the terminal hung up; an empty read must not spin
+                    app.close()
+                    break
                 if key:
                     loop.press(key)
     except KeyboardInterrupt:

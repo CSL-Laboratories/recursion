@@ -80,8 +80,17 @@ class OutputSanitizer:
         self._cr = False
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-    def feed(self, chunk: str | bytes) -> str:
-        text = self._decoder.decode(chunk) if isinstance(chunk, (bytes, bytearray)) else chunk
+    def feed(self, chunk: str | bytes | None) -> str:
+        # A missing or non-text chunk is empty display text. It must not raise: the caller is the
+        # terminal loop, and one bad engine event would otherwise stop keys and Stop.
+        if isinstance(chunk, (bytes, bytearray)):
+            text = self._decoder.decode(chunk)
+        elif isinstance(chunk, str):
+            text = chunk
+        elif chunk is None:
+            text = ""
+        else:
+            text = str(chunk)
         out: list[str] = []
         i, n = 0, len(text)
         while i < n:

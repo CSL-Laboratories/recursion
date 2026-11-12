@@ -11,9 +11,10 @@ touched.
 | `drivers/breaker_328.py` | recursion #328 `core/recursion_core/plugin_security/breaker.py` (SQLite store, probe leases) | `54a2d771` |
 
 `pins.py` holds each pinned head and the git object ids of the measured paths. A test uses a
-`RACE_STRESS_TREE_*` checkout only when every measured path's committed blob is that object
-and the worktree copy of the path is clean. A dirty file is refused even at the pinned HEAD,
-because the driver imports the worktree. `git` variables that select another repository
+`RACE_STRESS_TREE_*` checkout only when every measured path's committed object is that id and
+every tracked file under it has those bytes in the worktree. Those bytes are what the driver
+imports, so a skip-worktree or assume-unchanged edit is refused, a staged blob whose worktree
+was restored is not, and untracked files are not compared. `git` variables that select another repository
 (`GIT_DIR` and the rest) are ignored. Any other tree skips with a message naming both heads;
 `RACE_STRESS_UNPINNED=1` measures it anyway. Earlier heads of this PR measured #324
 `55a31508`/`9aa03185`, #326 `82247cbc` and #328 `0264628b`.

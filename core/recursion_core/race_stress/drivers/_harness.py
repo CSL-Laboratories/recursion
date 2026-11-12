@@ -150,11 +150,12 @@ class StampLock:
         return stamp
 
 
-def hammer(workers, *, timeout: float = 60.0) -> list[str]:
+def hammer(workers, *, timeout: float = 60.0, threads_out: list | None = None) -> list[str]:
     """Run each callable on its own thread, released together by a barrier.
 
     Returns a list of problems: uncaught exceptions (with traceback tails) and threads that did
-    not finish within ``timeout`` (a hang is reported, never waited out).
+    not finish within ``timeout`` (a hang is reported, never waited out). When ``threads_out``
+    is given, the started threads are appended to it so the caller can join them later.
     """
     barrier = threading.Barrier(len(workers))
     problems: list[str] = []
@@ -171,6 +172,8 @@ def hammer(workers, *, timeout: float = 60.0) -> list[str]:
         return run
 
     threads = [threading.Thread(target=wrap(fn), daemon=True) for fn in workers]
+    if threads_out is not None:
+        threads_out.extend(threads)
     for thread in threads:
         thread.start()
     deadline = time.monotonic() + timeout

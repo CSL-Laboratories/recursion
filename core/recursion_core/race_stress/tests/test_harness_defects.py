@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import io
 import json
 import os
 import random
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -74,12 +76,21 @@ class SeedTests(unittest.TestCase):
 
 class PinTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._saved = dict(pins.PINS["RACE_STRESS_TREE_326"])
-        self._saved_objects = dict(self._saved["objects"])
+        self._saved = {}
+        for env in ("RACE_STRESS_TREE_324", "RACE_STRESS_TREE_326"):
+            cur = pins.PINS[env]
+            self._saved[env] = {"pr": cur["pr"], "head": cur["head"], "objects": dict(cur["objects"])}
 
     def tearDown(self) -> None:
-        pins.PINS["RACE_STRESS_TREE_326"] = {
-            "pr": self._saved["pr"], "head": self._saved["head"], "objects": self._saved_objects}
+        for env, saved in self._saved.items():
+            pins.PINS[env] = {"pr": saved["pr"], "head": saved["head"], "objects": saved["objects"]}
+
+    def _pin(self, env: str, repo: Path, head: str, rels: list[str]) -> None:
+        objects = {}
+        for rel in rels:
+            objects[rel] = subprocess.check_output(
+                ["git", "rev-parse", f"HEAD:{rel}"], cwd=repo, env=_git_env(), text=True).strip()
+        pins.PINS[env] = {"pr": "test", "head": head, "objects": objects}
 
     def test_dirty_worktree_at_the_pinned_head_is_refused(self) -> None:
         rel = "core/recursion_core/routes/breaker.py"
@@ -121,6 +132,80 @@ class PinTests(unittest.TestCase):
             self.assertFalse(ok, message)
             self.assertEqual(info["tree_head"], head_b)
             self.assertNotEqual(head_a, head_b)
+
+    def test_untracked_files_under_a_directory_pin_are_not_refused(self) -> None:
+        # #324 pins the daemon directory. Porcelain status refuses the checkout for any
+        # untracked file under it, including ones the measured import never loads.
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            (repo / rel / "scratch.py").write_text("# local scratch\n")
+            note = repo / rel / "tests" / "local_note.py"
+            note.parent.mkdir()
+            note.write_text("# local note\n")
+            (repo / rel / "notes.txt").write_text("not imported\n")
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--", rel],
+                cwd=repo, env=_git_env(), text=True)
+            self.assertIn("scratch.py", status)
+            self.assertIn("local_note.py", status)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            (repo / rel / "registry.py").write_text("VALUE = 2\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(rel, message)
+
+    def test_skip_worktree_and_assume_unchanged_cannot_hide_edits(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            head = _repo(repo, {rel: "v1\n"})
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            for flag in ("--skip-worktree", "--assume-unchanged"):
+                subprocess.check_call(
+                    ["git", "update-index", "--no-skip-worktree", "--no-assume-unchanged", "--", rel],
+                    cwd=repo, env=_git_env())
+                (repo / rel).write_text("v1\n")
+                subprocess.check_call(["git", "update-index", flag, "--", rel], cwd=repo, env=_git_env())
+                ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+                self.assertTrue(ok, message)
+                (repo / rel).write_text("v1\nhidden\n")
+                status = subprocess.check_output(
+                    ["git", "status", "--porcelain", "--", rel], cwd=repo, env=_git_env(), text=True)
+                self.assertEqual(status.strip(), "", flag)
+                ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+                self.assertFalse(ok, message)
+                self.assertIn(rel, message)
+
+    def test_staged_blob_is_ignored_when_worktree_bytes_match_head(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            head = _repo(repo, {rel: "v1\n"})
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            original = (repo / rel).read_text()
+            (repo / rel).write_text(original + "staged\n")
+            subprocess.check_call(["git", "add", "--", rel], cwd=repo, env=_git_env())
+            (repo / rel).write_text(original)
+            work = subprocess.check_output(
+                ["git", "hash-object", "--no-filters", "--", rel], cwd=repo, env=_git_env(), text=True)
+            blob = subprocess.check_output(
+                ["git", "rev-parse", f"HEAD:{rel}"], cwd=repo, env=_git_env(), text=True)
+            self.assertEqual(work.strip(), blob.strip())
+            cached = subprocess.check_output(
+                ["git", "diff", "--cached", "--name-only", "--", rel], cwd=repo, env=_git_env(), text=True)
+            self.assertIn(rel, cached)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
 
 
 class DaemonResourceTests(unittest.TestCase):
@@ -208,8 +293,8 @@ class DaemonResourceTests(unittest.TestCase):
         held = threading.Lock()
         orig = daemon_324.h.hammer
 
-        def quick(workers, timeout=60.0):
-            return orig(workers, timeout=0.2)
+        def quick(workers, timeout=60.0, **kwargs):
+            return orig(workers, timeout=0.2, **kwargs)
 
         daemon_324.h.hammer = quick
         box: dict = {}
@@ -234,6 +319,138 @@ class DaemonResourceTests(unittest.TestCase):
             thread.join(5)
         self.assertFalse(alive)
         self.assertTrue(box.get("done"))
+
+    def tearDown(self) -> None:
+        finish = getattr(daemon_324, "finish_pending", None)
+        if finish is not None:
+            finish(2)
+        if hasattr(daemon_324, "CLEANUP_WAIT"):
+            daemon_324.CLEANUP_WAIT = 5.0
+        reset = getattr(daemon_324, "reset_harness_state", None)
+        if reset is not None:
+            reset()
+
+    def test_hang_aborts_the_run_and_drops_db_fds_after_release(self) -> None:
+        # Seed 12: the first worker operation is start, and neither the closer nor the
+        # boot flipper is scheduled. manager.start blocks, so hammer reports a hang.
+        release = threading.Event()
+        registries: list[str] = []
+        closed_after_release: list[bool] = []
+
+        class Registry:
+            def __init__(self, path):
+                registries.append(str(path))
+                reg = Path(path)
+                reg.mkdir(parents=True, exist_ok=True)
+                self.db = sqlite3.connect(reg / "runs.sqlite3", check_same_thread=False)
+                self.db.execute("PRAGMA journal_mode=WAL")
+                self.db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT)")
+                self.db.commit()
+
+            def get(self, rid):
+                raise KeyError(rid)
+
+            def state(self, *args):
+                return None
+
+            def all(self):
+                return []
+
+            def close(self):
+                self.db.close()
+
+        class Daemon:
+            def __init__(self, registry, manager, boot_id=None):
+                self.lock = threading.Lock()
+                self.registry = registry
+                self.manager = manager
+
+            def start(self, rid, argv):
+                with self.lock:
+                    self.manager.start(f"recursion-run-{rid}.service", argv)
+
+            def stop(self, rid):
+                return None
+
+            def sweep(self):
+                return None
+
+            def close(self):
+                closed_after_release.append(release.is_set())
+                with self.lock:
+                    self.registry.close()
+
+        class AlreadyRunning(Exception):
+            pass
+
+        class UserLock:
+            inits = 0
+
+            def __init__(self, runtime):
+                UserLock.inits += 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        mod = argparse.Namespace(
+            Registry=Registry, Daemon=Daemon, UserLock=UserLock,
+            AlreadyRunning=AlreadyRunning, TERMINAL=frozenset())
+        orig_start = daemon_324.FakeManager.start
+        orig_hammer = daemon_324.h.hammer
+
+        def blocking(self, unit, argv):
+            release.wait()
+
+        def quick(workers, timeout=60.0, **kwargs):
+            return orig_hammer(workers, timeout=0.2, **kwargs)
+
+        daemon_324.FakeManager.start = blocking
+        daemon_324.h.hammer = quick
+        if hasattr(daemon_324, "CLEANUP_WAIT"):
+            daemon_324.CLEANUP_WAIT = 0.25
+        v = h.Violations()
+        try:
+            leaked_threads, leaked_fds = daemon_324.drive(
+                mod, random.Random(12),
+                argparse.Namespace(mutant=False, threads=1, iters=2, seed=12),
+                v, {"runs": 0, "closed_mid_run": 0, "boot_flips": 0, "terminal": 0, "stop_requested": 0})
+            self.assertTrue(any("still running" in m for m in v.first), v.first)
+            self.assertEqual(len(registries), 1, registries)
+            self.assertEqual(UserLock.inits, 0)
+            self.assertTrue(daemon_324.aborted())
+            self.assertTrue(any("no further iteration" in m for m in v.first), v.first)
+            self.assertGreater(leaked_threads, 0, v.first)
+            self.assertGreater(leaked_fds, 0, v.first)
+            self.assertEqual(closed_after_release, [])
+            self.assertNotEqual(_race324_db_fds(), [])
+        finally:
+            release.set()
+            daemon_324.FakeManager.start = orig_start
+            daemon_324.h.hammer = orig_hammer
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and _race324_db_fds():
+                gc.collect()
+                time.sleep(0.05)
+        self.assertEqual(_race324_db_fds(), [])
+        self.assertEqual(closed_after_release, [True])
+
+
+def _race324_db_fds() -> list[str]:
+    found = []
+    fd_dir = "/proc/self/fd"
+    if not os.path.isdir(fd_dir):
+        return found
+    for name in os.listdir(fd_dir):
+        try:
+            target = os.readlink(os.path.join(fd_dir, name))
+        except OSError:
+            continue
+        if "race324-" in target and "runs.sqlite3" in target:
+            found.append(target)
+    return found
 
 
 class FlakeRunnerTests(unittest.TestCase):

@@ -2,9 +2,14 @@
 
 The measured code lives on other draft PRs, so each test points at a checkout through
 ``RACE_STRESS_TREE_324`` / ``_326`` / ``_328``. A checkout is used only when every measured
-path's committed blob is the object pinned below and the worktree copy of that path is clean.
-A dirty file is refused even when ``HEAD`` is the pinned commit, because the driver imports
-the worktree. Environment variables that point ``git`` at a different repository are ignored.
+path's committed object is the one pinned below and the worktree bytes of every tracked file
+under that path hash to that object's blobs. Those bytes are what the driver imports. A dirty
+tracked file is refused even when ``HEAD`` is the pinned commit. ``skip-worktree`` and
+``assume-unchanged`` do not hide an edit, and a staged blob is accepted when the worktree
+bytes were restored to the pinned bytes. Untracked files are not compared: the measured
+import executes the tracked modules, so a scratch file under the pin is not imported unless
+a tracked module names it. Environment variables that point ``git`` at a different repository
+are ignored.
 Anything else skips with a message naming both heads, instead of measuring code nobody pinned.
 Set ``RACE_STRESS_UNPINNED=1`` to run against an unpinned tree anyway (the run then reports
 which tree it measured).
@@ -73,12 +78,54 @@ def _git_text(root: Path, *args: str) -> str | None:
     return out.stdout.strip() or None
 
 
+def _tracked_blobs(root: Path, path: str) -> list[tuple[str, str]] | None:
+    """``(path, blob)`` for every file at ``HEAD`` under ``path``. None if that list is unusable."""
+    out = _git(root, "ls-tree", "-r", "-z", "HEAD", "--", path)
+    if out is None or out.returncode != 0:
+        return None
+    blobs: list[tuple[str, str]] = []
+    for rec in out.stdout.split("\0"):
+        if not rec:
+            continue
+        try:
+            meta, name = rec.split("\t", 1)
+            mode, kind, oid = meta.split(" ")
+        except ValueError:
+            return None
+        if (kind != "blob" or mode not in ("100644", "100755")
+                or Path(name).is_absolute() or ".." in Path(name).parts):
+            return None
+        blobs.append((name, oid))
+    return blobs
+
+
 def _worktree_matches(root: Path, path: str, oid: str) -> bool:
-    """True when ``HEAD:path`` is ``oid`` and the worktree copy of ``path`` has no edits."""
+    """True when ``HEAD:path`` is ``oid`` and every tracked file's worktree bytes match.
+
+    Untracked files are not compared. Importing the pinned package executes the tracked
+    modules; an untracked ``scratch.py`` or ``tests/local_note.py`` is not on that path
+    unless a tracked module names it, and that tracked file is hashed here. ``git status``
+    refuses any untracked file and misses edits hidden by ``skip-worktree`` or
+    ``assume-unchanged``. ``git hash-object --no-filters`` reads the bytes Python imports,
+    which also matches a worktree restored to ``HEAD`` while the index still holds another
+    blob.
+    """
     if _git_text(root, "rev-parse", f"HEAD:{path}") != oid:
         return False
-    out = _git(root, "status", "--porcelain", "--untracked-files=all", "--", path)
-    return out is not None and out.returncode == 0 and out.stdout.strip() == ""
+    blobs = _tracked_blobs(root, path)
+    if not blobs:
+        return False
+    for name, _blob in blobs:
+        file = root / name
+        if not file.is_file() or file.is_symlink():
+            return False
+    out = _git(root, "hash-object", "--no-filters", "--", *[name for name, _blob in blobs])
+    if out is None or out.returncode != 0:
+        return False
+    hashed = out.stdout.splitlines()
+    if len(hashed) != len(blobs):
+        return False
+    return all(got == blob for (_name, blob), got in zip(blobs, hashed))
 
 
 def pin_status(env: str, root: Path) -> tuple[bool, str]:

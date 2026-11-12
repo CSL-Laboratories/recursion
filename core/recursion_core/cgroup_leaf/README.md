@@ -45,13 +45,27 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   fd, so a directory swapped onto the path is not written or read. `rmdir`
   is issued on the child name through the parent directory fd, after that
   name is checked against the inode the handle holds. The leaf is booked
-  removed only when that inode then has `st_nlink == 0`. If it is still
-  linked, or the check cannot be made, the outcome is `unknown` with an
-  error. A name swapped into the parent in the gap before `rmdir` can still
-  be deleted; that race is not closed. If the identity was never known, or a
-  different directory is now at the path, the result stays `unknown` and that
-  directory is left in place. A child cgroup is removed only when it is still
-  the inode seen when its parent was listed.
+  removed only when that held inode is shown to be gone. On tmpfs, `fstat`
+  of the held fd then reports `st_nlink == 0`. Linux 6.12 cgroupfs does not
+  do that: `kernfs_refresh_inode` sets a directory's nlink to `subdirs + 2`
+  on every getattr, and this kernel's `__kernfs_remove` does not
+  `clear_nlink`, so `fstat` still reports nlink >= 2 after a successful
+  `rmdir`. Removal there is the parent name no longer being that inode, no
+  remaining parent entry having it, and `open` of `cgroup.procs` through the
+  held fd failing with `ENODEV` (`kernfs_get_active` fails once the node is
+  deactivated). `ENOENT` from that open counts only together with `st_nlink
+  == 0` or with `/proc/self/fd/<fd>` ending in ` (deleted)` (`vfs_rmdir`
+  unhashes the dentry; a rename does not). A later kernel that does report
+  nlink 0 is accepted by the same check. If the inode is still linked
+  anywhere, or that cannot be shown, the outcome is `unknown`
+  and the directory fd is kept. A retry uses that held inode, not the path:
+  a name swapped in during `rmdir` can be deleted while the original inode
+  lives under another name, and a missing path is not removal. A name swapped
+  into the parent in the gap before `rmdir` can still be deleted; that race
+  is not closed. If the identity was never known, or a different directory is
+  now at the path, the result stays `unknown` and that directory is left in
+  place. A child cgroup is removed only when it is still the inode seen when
+  its parent was listed.
 - Restart: `sweep(keep)` returns a `SweepResult`. It kills a leftover directory
   only when the name is a leaf id and the opened inode is still the one just
   classified and still has the ownership marker. The `run-` prefix alone is
@@ -62,8 +76,12 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   those leaves are untouched. A `run-*` name that is not a leaf id (including
   `run-*.scope`, `run-*.service`, `run-*.slice`, `run-*.SCOPE`,
   `run-*.scope.bak`, and `run-`), any other name, a leaf id without the
-  marker, an opened inode that is not the one just classified, and a symlink
-  are left in place and listed in `reported`. They are not killed.
+  marker (`ENODATA`, or a different value), an opened inode that is not the
+  one just classified, and a symlink are left in place and listed in
+  `reported`. They are not killed. A leaf id whose marker cannot be read
+  (`EOPNOTSUPP`, or any error other than `ENODATA`) is reported as
+  `marker-unreadable:<errno>` and is not killed: an unreadable marker is not
+  proof the leaf is unmarked.
   `adopt(name)` returns a handle for a kept, marked leaf so the restarted
   daemon can kill it later; its best outcome is `empty`. As a context manager that `empty` outcome is success.
   `CleanupIncomplete` is still raised when the adopted cleanup does not finish

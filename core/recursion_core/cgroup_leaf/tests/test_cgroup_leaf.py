@@ -810,6 +810,65 @@ class RemovalContractTests(unittest.TestCase):
         self.assertEqual(self.fs.killed, ['run-ours'])
         self.assertEqual([path.name for path in self.fs.rmdir_calls], ['run-ours'])
 
+    def _sweep_with_marker_errno(self, name, err):
+        leaf = self.root_path / name
+        write_cgroup(leaf, procs='')
+        (leaf / 'payload').write_text(name)
+        cgroup_leaf.mark_owned(leaf)
+        real = os.getxattr
+
+        def fail(target, attr, *args, **kwargs):
+            if attr == cgroup_leaf.OWNERSHIP_XATTR:
+                raise OSError(err, os.strerror(err))
+            return real(target, attr, *args, **kwargs)
+
+        root = DelegatedRoot(self.root_path, self.fs)
+        with patch.object(cgroup_leaf.os, 'getxattr', fail), \
+             self.assertLogs(cgroup_leaf.log.name, level='WARNING'):
+            result = root.sweep(keep=())
+        self.assertEqual(result.outcomes, {})
+        self.assertEqual(self.fs.killed, [])
+        self.assertEqual(self.fs.rmdir_calls, [])
+        self.assertEqual((leaf / 'payload').read_text(), name)
+        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        self.assertEqual(os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False),
+                         cgroup_leaf.OWNERSHIP_VALUE)
+        return result
+
+    def test_sweep_enodata_on_a_marked_leaf_is_unmarked(self):
+        # ENODATA means the attribute is absent. A leaf whose marker was just
+        # set, then read back as ENODATA, is unmarked and is not killed.
+        result = self._sweep_with_marker_errno('run-nodata', errno.ENODATA)
+        self.assertEqual(result.reported, (('run-nodata', 'unmarked'),))
+
+    def test_sweep_eopnotsupp_is_marker_unreadable(self):
+        # EOPNOTSUPP is not "unmarked". The leaf may still be ours, so sweep
+        # must not kill it and must report the errno.
+        err = errno.EOPNOTSUPP
+        result = self._sweep_with_marker_errno('run-noxattr', err)
+        self.assertEqual(result.reported, (('run-noxattr', f'marker-unreadable:{err}'),))
+
+    def test_adopt_refuses_unreadable_marker_without_removing(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        (leaf / 'payload').write_text('kept')
+        cgroup_leaf.mark_owned(leaf)
+        real = os.getxattr
+
+        def fail(target, attr, *args, **kwargs):
+            if attr == cgroup_leaf.OWNERSHIP_XATTR:
+                raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+            return real(target, attr, *args, **kwargs)
+
+        root = DelegatedRoot(self.root_path, self.fs)
+        with patch.object(cgroup_leaf.os, 'getxattr', fail):
+            with self.assertRaises(PermissionError) as caught:
+                root.adopt('run-a')
+        self.assertIn('unreadable', str(caught.exception))
+        self.assertIn(str(errno.EOPNOTSUPP), str(caught.exception))
+        self.assertEqual((leaf / 'payload').read_text(), 'kept')
+        self.assertTrue((leaf / 'cgroup.kill').is_file())
+
     def test_sweep_leaves_unmarked_non_id_run_names(self):
         # The run- prefix is not ownership. These names are not leaf ids, and
         # none of them carry the marker, so sweep must not kill or remove them.
@@ -976,6 +1035,88 @@ class RemovalContractTests(unittest.TestCase):
         self.assertFalse(run.removed)
         self.assertEqual(outcome.state, 'unknown')
         self.assertTrue(outcome.errors)
+
+    def test_rmdir_books_removed_when_fstat_nlink_stays_linked(self):
+        # Linux 6.12 cgroupfs: kernfs_refresh_inode sets a directory's nlink to
+        # subdirs+2 on every getattr, and __kernfs_remove does not clear_nlink.
+        # fstat of a held fd therefore stays >= 2 after a real rmdir. tmpfs
+        # drops nlink to 0, which is why a suite on tmpfs stays green. This
+        # replaces that 0 with 2 after the inode is really unlinked.
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        run = LeafRun(self.fs, leaf, 0.2)
+        run.adopted = True
+        real_fstat = os.fstat
+
+        def kernfs_fstat(fd):
+            info = real_fstat(fd)
+            if stat.S_ISDIR(info.st_mode) and info.st_nlink == 0:
+                fields = list(info)
+                fields[3] = 2
+                return os.stat_result(fields)
+            return info
+
+        with patch.object(cgroup_leaf.os, 'fstat', kernfs_fstat):
+            with run:
+                pass
+        self.assertTrue(run.removed)
+        self.assertEqual(run.outcome.state, 'empty')
+        self.assertEqual(run.outcome.errors, ())
+        self.assertFalse(leaf.exists())
+
+    def test_second_close_after_swap_inside_rmdir_keeps_held_inode(self):
+        # During os.rmdir the held leaf is renamed to escaped.scope and an
+        # empty directory is put at run-a. rmdir deletes that empty directory.
+        # The first close must not book the original removed. A second close
+        # must not book it either: the path is missing, but the held inode
+        # is still escaped.scope. The fd stays open, and sweep leaves the
+        # foreign name in place.
+        leaf = self.root_path / 'run-a'
+        escaped = self.root_path / 'escaped.scope'
+        write_cgroup(leaf, procs='')
+        cgroup_leaf.mark_owned(leaf)
+        run = LeafRun(self.fs, leaf, 0.2)
+        held = run.identity
+        real_rmdir = os.rmdir
+        swapped = {'done': False}
+
+        def swap_rmdir(path, *, dir_fd=None):
+            if (not swapped['done'] and dir_fd is not None
+                    and os.fsdecode(path) == leaf.name):
+                swapped['done'] = True
+                os.rename(leaf.name, escaped.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                os.mkdir(leaf.name, dir_fd=dir_fd)
+            return real_rmdir(path, dir_fd=dir_fd)
+
+        with patch.object(cgroup_leaf.os, 'rmdir', swap_rmdir), \
+             self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+            first = run.close()
+        self.assertTrue(swapped['done'])
+        self.assertFalse(leaf.exists())
+        self.assertFalse(run.removed)
+        self.assertEqual(first.state, 'unknown')
+        self.assertTrue(first.errors)
+        self.assertIsNotNone(run.dirfd)
+        self.assertEqual(cgroup_identity(escaped), held)
+        self.assertEqual(os.fstat(run.dirfd).st_ino, held[1])
+        self.assertEqual(os.getxattr(escaped, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False),
+                         cgroup_leaf.OWNERSHIP_VALUE)
+        held_fd = run.dirfd
+        second = run.close()
+        self.assertFalse(run.removed)
+        self.assertEqual(second.state, 'unknown')
+        self.assertTrue(second.errors)
+        self.assertIs(run.dirfd, held_fd)
+        self.assertEqual(os.fstat(run.dirfd).st_ino, held[1])
+        self.assertEqual(cgroup_identity(escaped), held)
+        root = DelegatedRoot(self.root_path, self.fs)
+        with self.assertLogs(cgroup_leaf.log.name, level='WARNING'):
+            result = root.sweep(keep=())
+        self.assertEqual(result.outcomes, {})
+        self.assertIn((escaped.name, 'foreign-name'), result.reported)
+        self.assertEqual(cgroup_identity(escaped), held)
+        self.assertEqual(self.fs.killed, ['run-a'])
+        self.assertNotIn(escaped.name, [path.name for path in self.fs.rmdir_calls])
 
     def test_rmdir_after_empty_check_does_not_remove_replacement(self):
         leaf = self.root_path / 'run-a'

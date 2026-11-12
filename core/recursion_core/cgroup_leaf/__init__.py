@@ -68,6 +68,10 @@ def _marked_owned(target):
     A dirfd is read with ``fgetxattr`` (no ``follow_symlinks``: CPython rejects
     that pair, and the fd was opened with ``O_NOFOLLOW``). A path uses
     ``lgetxattr`` so a symlink cannot borrow the target's marker.
+
+    ``ENODATA`` means the attribute is absent: the target is unmarked.
+    ``EOPNOTSUPP`` and every other ``OSError`` are raised. Those are not
+    "unmarked"; the caller must report them and must not kill the directory.
     """
     if target is None:
         return False
@@ -76,8 +80,10 @@ def _marked_owned(target):
             value = os.getxattr(target, OWNERSHIP_XATTR)
         else:
             value = os.getxattr(os.fspath(target), OWNERSHIP_XATTR, follow_symlinks=False)
-    except OSError:
-        return False
+    except OSError as exc:
+        if exc.errno == errno.ENODATA:
+            return False
+        raise
     return value == OWNERSHIP_VALUE
 
 
@@ -109,6 +115,171 @@ def cgroup_identity(path):
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return None
     return (info.st_dev, info.st_ino)
+
+
+# vfs_rmdir unhashes the dentry, and d_path then appends this suffix.
+_DELETED_SUFFIX = ' (deleted)'
+
+
+def _directory_entry_inode(parent_fd, name):
+    """``(st_dev, st_ino)`` when ``name`` in ``parent_fd`` is that directory.
+
+    ``False`` when the name is missing or is not a directory (a symlink is
+    not the directory inode). ``None`` when the lookup itself failed.
+    """
+    try:
+        info = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False
+    return (info.st_dev, info.st_ino)
+
+
+def _parent_contains_inode(parent_fd, identity):
+    """True when any entry of ``parent_fd`` is ``identity``.
+
+    ``False`` when the scan finishes without it. ``None`` when the scan
+    cannot be trusted (a lookup failed with something other than ``ENOENT``).
+    """
+    try:
+        names = os.listdir(parent_fd)
+    except OSError:
+        return None
+    for name in names:
+        found = _directory_entry_inode(parent_fd, name)
+        if found is None:
+            return None
+        if found == identity:
+            return True
+    return False
+
+
+def _held_fd_unlinked(held, info):
+    """Whether the held directory inode is unlinked.
+
+    ``True`` or ``False`` when that is known. ``None`` when it is not.
+
+    tmpfs and the other POSIX filesystems drop ``st_nlink`` to 0 while an fd
+    is still open. Linux 6.12 cgroupfs does not. ``kernfs_iop_getattr`` calls
+    ``kernfs_refresh_inode``, which sets a directory nlink to ``subdirs + 2``
+    on every getattr (``fs/kernfs/inode.c`` in v6.12, no ``KERNFS_REMOVING``
+    guard). ``__kernfs_remove`` deactivates the node and does not call
+    ``clear_nlink``; that clear landed later, with the 2026 kernfs inotify
+    series, and is not in 6.12. ``fstat`` of a removed cgroup directory
+    therefore still reports nlink >= 2.
+
+    ``vfs_rmdir`` still ``d_delete``s the dentry on success, so
+    ``/proc/self/fd/<fd>`` gains a `` (deleted)`` suffix. A rename does not:
+    the fd follows the inode to its new name. A path whose real name ends
+    with that suffix is still linked, and ``lstat`` of the readlink target
+    finds it; the kernel suffix is only trusted when that full string is not
+    this inode.
+    """
+    if info.st_nlink == 0:
+        return True
+    try:
+        link = os.readlink(f'/proc/self/fd/{held}')
+    except OSError:
+        return None
+    if not link.endswith(_DELETED_SUFFIX):
+        return False
+    try:
+        named = os.lstat(link)
+    except FileNotFoundError:
+        named = None
+    except OSError:
+        return None
+    if (named is not None and stat.S_ISDIR(named.st_mode)
+            and (named.st_dev, named.st_ino) == (info.st_dev, info.st_ino)):
+        return False
+    stripped = link[:-len(_DELETED_SUFFIX)]
+    try:
+        still = os.lstat(stripped)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return None
+    if stat.S_ISDIR(still.st_mode) and (still.st_dev, still.st_ino) == (info.st_dev, info.st_ino):
+        return False
+    return True
+
+
+def _held_procs_state(held):
+    """How ``cgroup.procs`` looks through the held directory fd.
+
+    ``live`` when the open succeeds. ``dead`` on ``ENODEV``: Linux 6.12
+    kernfs returns that from ``kernfs_get_active`` once ``__kernfs_remove``
+    has deactivated the node. ``absent`` on ``ENOENT``: the name is gone,
+    which is also what the tmpfs test hook produces by unlinking interface
+    files before ``rmdir`` while the directory inode is still linked.
+    ``unknown`` on any other error. ``absent`` is not, by itself, proof.
+    """
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        probe = os.open('cgroup.procs', flags, dir_fd=held)
+    except OSError as exc:
+        if exc.errno == errno.ENODEV:
+            return 'dead'
+        if exc.errno == errno.ENOENT:
+            return 'absent'
+        return 'unknown'
+    try:
+        os.close(probe)
+    except OSError:
+        pass
+    return 'live'
+
+
+def _held_directory_removed(parent_fd, name, held, identity):
+    """True only when ``held`` is positively shown to be the removed inode.
+
+    The name in the parent must no longer be this inode, and no remaining
+    parent entry may be it (a rename aside, including to ``escaped.scope``,
+    stays visible). The inode is then removed when any of these hold:
+
+    * ``st_nlink == 0`` (tmpfs and any filesystem that keeps a real link count)
+    * the held fd is unlinked (`` (deleted)``) and ``cgroup.procs`` is not
+      still openable
+    * ``open`` of ``cgroup.procs`` fails with ``ENODEV``, the 6.12 kernfs
+      signal that the node is deactivated, even though nlink stays >= 2
+
+    ``ENOENT`` from that open is not enough on its own: the tmpfs test hook
+    unlinks interface files before ``rmdir``, so a directory that was only
+    renamed aside looks the same until the parent scan or the link count
+    says it is still there. Anything that cannot be shown returns False.
+    The caller must not book the directory removed and must not drop the fd.
+    """
+    try:
+        info = os.fstat(held)
+    except OSError:
+        return False
+    identity = tuple(identity)
+    if (info.st_dev, info.st_ino) != identity or not stat.S_ISDIR(info.st_mode):
+        return False
+    if parent_fd is None:
+        # No parent to scan. nlink 0 is enough; otherwise only ENODEV
+        # (a deactivated kernfs node) proves the inode is not linked elsewhere.
+        if info.st_nlink != 0 and _held_procs_state(held) != 'dead':
+            return False
+    else:
+        named = _directory_entry_inode(parent_fd, name)
+        if named is None or named == identity:
+            return False
+        present = _parent_contains_inode(parent_fd, identity)
+        if present is None or present is True:
+            return False
+    unlinked = _held_fd_unlinked(held, info)
+    procs = _held_procs_state(held)
+    if info.st_nlink == 0 and unlinked is True:
+        return True
+    if procs == 'dead':
+        return True
+    if unlinked is True and procs == 'absent':
+        return True
+    return False
 
 
 def _wait_fd(fd, write, deadline):
@@ -162,7 +333,10 @@ class SweepResult:
     """``outcomes`` are leaves this launcher killed. ``reported`` were left in place.
 
     Each report is ``(name, reason)``. Reasons are ``foreign-name``, ``unmarked``,
-    ``symlink`` and ``unreadable``. A report is not a kill and not a removal.
+    ``symlink``, ``unreadable`` and ``marker-unreadable:<errno>``. ``ENODATA``
+    is ``unmarked``: the attribute is absent. ``EOPNOTSUPP`` and any other
+    error while reading the marker are ``marker-unreadable`` with that errno.
+    A report is not a kill and not a removal.
     """
     outcomes: dict
     reported: tuple
@@ -320,10 +494,15 @@ class Cgroup2:
         ``deadline`` (or a short bound when the caller did not pass one).
         Interface files are never unlinked; on cgroupfs, ``rmdir`` drops them.
         ``dirfd`` is that same inode when the caller still holds it. ``rmdir``
-        uses the parent directory fd. The inode is booked gone only when its
-        ``st_nlink`` is 0 afterwards. If it is still linked, or that cannot be
-        checked, this raises. A name swapped into the parent in the gap before
-        ``rmdir`` can still be deleted; that race is not closed.
+        uses the parent directory fd. The inode is booked gone only when
+        ``_held_directory_removed`` can show it: the parent name is not this
+        inode, the parent has no entry for it, and the inode is unlinked.
+        ``st_nlink == 0`` is that proof on tmpfs. On Linux 6.12 cgroupfs,
+        ``fstat`` still reports nlink >= 2 after a successful ``rmdir``; the
+        unlinked dentry and a failed ``open`` of ``cgroup.procs`` through the
+        held fd are the proof instead. If the inode is still linked, or that
+        cannot be shown, this raises. A name swapped into the parent in the
+        gap before ``rmdir`` can still be deleted; that race is not closed.
         """
         if identity is None or cgroup_identity(leaf) != identity:
             raise OSError(errno.EBUSY, 'cgroup identity unknown or changed')
@@ -386,8 +565,11 @@ class Cgroup2:
 
         ``dirfd``, when the caller still holds it, is that inode. The name is
         opened through the parent fd and must be the same inode before
-        ``rmdir``. Afterwards that inode must have ``st_nlink == 0``. Anything
-        else raises, and the caller must not book the directory removed.
+        ``rmdir``. Afterwards ``_held_directory_removed`` must be true.
+        ``st_nlink == 0`` is enough on tmpfs. On Linux 6.12 cgroupfs it is
+        not: getattr keeps reporting ``subdirs + 2``. Anything short of the
+        removal proof raises, and the caller must not book the directory
+        removed.
         """
         directory = Path(directory)
         if identity is None:
@@ -430,11 +612,7 @@ class Cgroup2:
                     os.rmdir(directory.name, dir_fd=parent_fd)
                 except FileNotFoundError:
                     pass
-            try:
-                after = os.fstat(held)
-            except OSError as exc:
-                raise OSError(errno.EBUSY, 'cgroup identity could not be verified') from exc
-            if after.st_nlink != 0 or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+            if not _held_directory_removed(parent_fd, directory.name, held, identity):
                 raise OSError(errno.EBUSY, 'cgroup identity still present after rmdir')
         finally:
             os.close(parent_fd)
@@ -500,7 +678,12 @@ class DelegatedRoot:
             raise PermissionError('Leaf is not an operator-owned directory')
         run = LeafRun(self.fs, leaf, kill_timeout)
         run.adopted = True
-        if run.dirfd is None or not _marked_owned(run.dirfd):
+        try:
+            owned = run.dirfd is not None and _marked_owned(run.dirfd)
+        except OSError as exc:
+            run._close_dirfd()
+            raise PermissionError(f'Leaf ownership marker unreadable: {exc.errno}') from exc
+        if run.dirfd is None or not owned:
             run._close_dirfd()
             raise PermissionError('Leaf has no recursion ownership marker')
         return run
@@ -518,11 +701,11 @@ class DelegatedRoot:
         directory fd opened afterwards is still that inode and carries the
         ownership marker. The ``run-`` prefix alone is not ownership. A
         ``run-*`` name that is not a leaf id, any other name, a leaf id
-        without the marker, an opened inode that is not the one just
-        classified, and a symlink are left in place and returned in
-        ``reported``. They are not killed. A leaf whose ``cgroup.procs``
-        still lists an id is not removed. Exits of swept leaves are unseen,
-        so they are never booked terminated.
+        without the marker, a leaf id whose marker cannot be read, an opened
+        inode that is not the one just classified, and a symlink are left in
+        place and returned in ``reported``. They are not killed. A leaf whose
+        ``cgroup.procs`` still lists an id is not removed. Exits of swept leaves
+        are unseen, so they are never booked terminated.
         """
         if isinstance(keep, (str, bytes)):
             raise TypeError('keep must be a collection of leaf names, not a string')
@@ -573,7 +756,15 @@ class DelegatedRoot:
                         or not stat.S_ISDIR(opened.st_mode)):
                     report(leaf.name, 'foreign-name')
                     continue
-                if not _marked_owned(run.dirfd):
+                try:
+                    owned = _marked_owned(run.dirfd)
+                except OSError as exc:
+                    # ENODATA is unmarked, inside _marked_owned. Anything else
+                    # (EOPNOTSUPP, EIO, ...) must stay visible. Do not kill a
+                    # leaf whose marker could not be read.
+                    report(leaf.name, f'marker-unreadable:{exc.errno}')
+                    continue
+                if not owned:
                     report(leaf.name, 'unmarked')
                     continue
                 outcomes[leaf.name] = run.close()
@@ -702,9 +893,38 @@ class LeafRun:
                 self.outcome = self._terminate()
             return self.outcome
 
+    def _held_inode_removed(self):
+        """True only when the inode this handle opened is proven gone.
+
+        The path is not consulted as proof. A missing path can be a directory
+        that was swapped in and deleted while this inode was renamed aside.
+        """
+        if self.dirfd is None or self.identity is None:
+            return False
+        parent_fd = None
+        try:
+            try:
+                parent_fd = os.open(self.leaf.parent,
+                                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            except OSError:
+                parent_fd = None
+            return _held_directory_removed(parent_fd, self.leaf.name, self.dirfd, self.identity)
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+
     def _terminate(self):
-        if self.removing and not os.path.lexists(self.leaf):
-            self.removed = True  # interrupted inside or after the rmdir
+        if self.removing and not self.removed:
+            if self._held_inode_removed():
+                self.removed = True  # interrupted after the inode was removed
+            elif not self._same_cgroup():
+                # The path is missing or names another directory. That does
+                # not prove the held inode is gone, and it must not be dropped.
+                seen = self.proc is not None and self.proc.returncode is not None
+                outcome = Outcome('unknown', self.proc.returncode if self.proc else None,
+                                  None, seen, ('cgroup identity still present after rmdir',))
+                log.error('leaf %s: %s', self.leaf, outcome)
+                return outcome
         if self.removed:  # the leaf was empty and is gone: rebuild the outcome
             self._close_dirfd()
             seen = self.proc is not None and self.proc.returncode is not None

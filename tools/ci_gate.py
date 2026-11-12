@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ast
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -250,12 +251,50 @@ UNITTEST_FILE_RUNNER = (
     "raise SystemExit(0 if result.wasSuccessful() else 1)\n"
 )
 
+# Used only when core/ contains os.pathsep and cannot be one PYTHONPATH entry.
+# Popping the injected path leaves the test path in sys.argv[1] for the runner.
+_CORE_PATH_POP = "import sys\nsys.path.insert(0, sys.argv.pop(1))\n"
+_CORE_SCRIPT_RUNNER = (
+    "import runpy, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "script = sys.argv[2]\n"
+    "sys.argv = [script, *sys.argv[3:]]\n"
+    "runpy.run_path(script, run_name='__main__')\n"
+)
+
+
+def _compileall_skip_regex() -> str:
+    """Directories the inventory walk does not descend into, as a compileall -x regex."""
+    names = "|".join(re.escape(name) for name in sorted(SKIP_DIR_NAMES))
+    return rf"(?:^|[/\\])(?:{names})(?:[/\\]|$)"
+
+
+def _core_test_env(base: Path) -> tuple[dict[str, str], str | None]:
+    """Environment for a core/ test.
+
+    The second value is a directory to insert on sys.path when it contains
+    os.pathsep. Joining that path into PYTHONPATH would split it, so a
+    different directory would be searched first.
+    """
+    env = dict(os.environ)
+    core_path = str((base / CORE_ROOT).resolve())
+    inherited = env.get("PYTHONPATH", "")
+    if os.pathsep in core_path:
+        if inherited:
+            env["PYTHONPATH"] = inherited
+        else:
+            env.pop("PYTHONPATH", None)
+        return env, core_path
+    env["PYTHONPATH"] = os.pathsep.join(part for part in (core_path, inherited) if part)
+    return env, None
+
 
 def run_test_file(rel: str, *, root: Path | None = None, timeout: int = RUN_TIMEOUT) -> None:
     """Run a discovered test. Script-style files keep their entry point; others use unittest."""
     base = root or ROOT
     path = base / rel
-    if has_script_entry(path):
+    script = has_script_entry(path)
+    if script:
         cmd = [rel]
         display = rel
     else:
@@ -263,10 +302,12 @@ def run_test_file(rel: str, *, root: Path | None = None, timeout: int = RUN_TIME
         display = f"unittest {rel}"
     env = None
     if rel.startswith(CORE_ROOT + "/"):
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(
-            part for part in (str((base / CORE_ROOT).resolve()), env.get("PYTHONPATH", "")) if part
-        )
+        env, inject = _core_test_env(base)
+        if inject is not None:
+            if script:
+                cmd = ["-c", _CORE_SCRIPT_RUNNER, inject, rel]
+            else:
+                cmd = ["-c", _CORE_PATH_POP + UNITTEST_FILE_RUNNER, inject, rel]
     print(f"RUN {display}", flush=True)
     result = subprocess.run(
         [sys.executable, "-X", "utf8", "-B", *cmd],
@@ -408,7 +449,7 @@ def byte_compile() -> None:
     targets = [name for name in names if (ROOT / name).is_dir()]
     print("RUN python -m compileall " + " ".join(targets), flush=True)
     result = subprocess.run(
-        [sys.executable, "-m", "compileall", "-q", *targets],
+        [sys.executable, "-m", "compileall", "-q", "-x", _compileall_skip_regex(), *targets],
         cwd=ROOT,
         timeout=120,
         check=False,

@@ -300,6 +300,60 @@ class CoreGateTests(unittest.TestCase):
             ci_gate.byte_compile()
         self.assertEqual(str(raised.exception), "byte-compile failed")
 
+    def test_byte_compile_skips_syntax_errors_in_skipped_directories(self) -> None:
+        # Same directories glob_suite_tests refuses to run. A syntax error in a
+        # virtualenv or site-packages tree must not fail the core compile.
+        write(self.repo / "core" / "recursion_core" / "ok.py", "VALUE = 1\n")
+        (self.repo / "tools").mkdir()
+        skipped = (
+            "core/.venv/lib/python3.12/site-packages/widget/bad.py",
+            "core/venv/lib/bad.py",
+            "core/recursion_core/site-packages/bad.py",
+            "core/.tox/py/bad.py",
+            "core/node_modules/pkg/bad.py",
+        )
+        for rel in skipped:
+            write(self.repo / rel, "def (:\n")
+        with mock.patch.object(ci_gate, "ROOT", self.repo):
+            ci_gate.byte_compile()
+        compiled = self.repo / "core" / "recursion_core" / "__pycache__"
+        self.assertTrue(list(compiled.glob("ok*.pyc")))
+        for rel in skipped:
+            self.assertFalse(list((self.repo / rel).parent.rglob("*.pyc")))
+        # A directory whose name only contains a skipped word is still product code.
+        write(self.repo / "core" / "recursion_core" / "notvenv" / "bad.py", "def (:\n")
+        with mock.patch.object(ci_gate, "ROOT", self.repo), self.assertRaises(SystemExit) as raised:
+            ci_gate.byte_compile()
+        self.assertEqual(str(raised.exception), "byte-compile failed")
+
+    def test_core_path_separator_does_not_import_the_split_prefix(self) -> None:
+        # PYTHONPATH splits on os.pathsep. A checkout at ".../aaa:bbb" must not
+        # import ".../aaa" ahead of core/.
+        parent = Path(tempfile.mkdtemp(prefix="ci-gate-sep-"))
+        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        decoy = parent / "aaa"
+        decoy.mkdir()
+        (decoy / "pkg.py").write_text("VALUE = 'DECOY'\n")
+        repo = parent / "aaa:bbb"
+        write(repo / "core" / "pkg" / "__init__.py", "VALUE = 'REAL'\n")
+        body = (
+            "import unittest\n"
+            "import pkg\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        self.assertEqual(pkg.VALUE, 'REAL')\n"
+        )
+        write(repo / "core" / "pkg" / "tests" / "test_plain.py", body)
+        write(
+            repo / "core" / "pkg" / "tests" / "test_script.py",
+            body + "if __name__ == '__main__':\n    unittest.main()\n",
+        )
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            for rel in ("core/pkg/tests/test_plain.py", "core/pkg/tests/test_script.py"):
+                with self.subTest(rel=rel):
+                    ci_gate.run_test_file(rel, root=repo)
+
 
 class TestInventoryTests(unittest.TestCase):
     def test_repo_test_files_are_run_or_excluded(self) -> None:

@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import unicodedata
@@ -48,9 +49,46 @@ def _git_env() -> dict[str, str]:
     GIT_NO_LAZY_FETCH is unenforced on upstream git 2.43.0-2.43.3 without the
     CVE-2024-32465 backport. The --no-lazy-fetch flag exits 129 on git 2.43, so
     only this variable is set.
+
+    HOME and XDG_* stay. Vault commands then set GIT_CEILING_DIRECTORIES to the
+    vault's parent; an operator ceiling is not kept.
     """
     env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
     env["GIT_NO_LAZY_FETCH"] = "1"
+    return env
+
+
+class _StoreRefusal(Exception):
+    """The vault's git dir or object store is not the directory we were given."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def _ceiling_directories(vault: Path) -> str:
+    """Absolute parents git must not search. Joined with os.pathsep."""
+    texts: list[str] = []
+    parents = [os.path.dirname(os.path.abspath(vault))]
+    try:
+        parents.append(os.path.dirname(os.path.realpath(vault)))
+    except (OSError, ValueError):
+        pass
+    for text in parents:
+        if not text or text in texts:
+            continue
+        if os.pathsep in text or any(char in text for char in "\r\n\x00"):
+            raise OSError("cannot bound git discovery for this vault path")
+        texts.append(text)
+    if not texts:
+        raise OSError("cannot bound git discovery for this vault path")
+    return os.pathsep.join(texts)
+
+
+def _git_env_for_vault(vault: Path) -> dict[str, str]:
+    """Stripped environment plus a ceiling at the vault's parent."""
+    env = _git_env()
+    env["GIT_CEILING_DIRECTORIES"] = _ceiling_directories(vault)
     return env
 
 
@@ -73,17 +111,11 @@ def _inside_vault(vault: Path, raw: str) -> bool:
         return False
 
 
-def _foreign_store_problem(vault: Path) -> str | None:
-    """Reason the vault's objects live outside that directory, if they do.
+def _layout_problem(vault: Path, git_dir: Path) -> str | None:
+    """Refuse commondir, alternates, or an object store that leaves git_dir.
 
-    A missing .git is not this case: git show reports that as a failed read.
-    A gitdir file, a symlink, commondir, or an alternates file is.
+    git_dir is vault/.git for a non-bare repository and the vault itself when bare.
     """
-    git_dir = vault / ".git"
-    if git_dir.is_symlink() or (_points_at_a_path(git_dir) and not git_dir.is_dir()):
-        return f"vault object store is not self-contained: {git_dir} is not a directory"
-    if not git_dir.is_dir():
-        return None
     commondir = git_dir / "commondir"
     if _points_at_a_path(commondir):
         return f"vault object store is not self-contained: {commondir} exists"
@@ -92,6 +124,11 @@ def _foreign_store_problem(vault: Path) -> str | None:
         alternate = objects / "info" / name
         if _points_at_a_path(alternate):
             return f"vault object store is not self-contained: {alternate} exists"
+    return _objects_problem(vault, objects)
+
+
+def _objects_problem(vault: Path, objects: Path) -> str | None:
+    """Refuse an objects directory that is linked or resolves outside the vault."""
     if not _points_at_a_path(objects):
         return None
     try:
@@ -101,29 +138,132 @@ def _foreign_store_problem(vault: Path) -> str | None:
         return f"vault object store is not self-contained: {objects} ({exc})"
     if not resolved.is_relative_to(root):
         return f"vault object store is not self-contained: {resolved} is outside {vault}"
+    if objects.is_symlink():
+        return f"vault object store is not self-contained: {objects} is a symlink"
+    return _walk_objects(objects)
+
+
+def _walk_objects(objects: Path) -> str | None:
+    """Refuse any symlink under objects, or any entry whose realpath leaves it.
+
+    lstat only: symlinks are not followed.
+    """
+    root = Path(os.path.realpath(objects))
+
+    def fail_closed(err: OSError) -> None:
+        raise err
+
+    for dirpath, dirnames, filenames in os.walk(objects, followlinks=False, onerror=fail_closed):
+        for name in (*dirnames, *filenames):
+            entry = Path(dirpath) / name
+            try:
+                mode = os.lstat(entry).st_mode
+            except OSError as exc:
+                return f"vault object store is not self-contained: {entry} ({exc})"
+            if stat.S_ISLNK(mode):
+                return f"vault object store is not self-contained: {entry} is a symlink"
+            try:
+                resolved = Path(os.path.realpath(entry))
+            except (OSError, ValueError) as exc:
+                return f"vault object store is not self-contained: {entry} ({exc})"
+            if not resolved.is_relative_to(root):
+                return f"vault object store is not self-contained: {resolved} is outside {objects}"
     return None
+
+
+def _run_git(vault: Path, args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(vault), *args],
+        check=True,
+        capture_output=True,
+        timeout=GIT_TIMEOUT_SECONDS,
+        env=_git_env_for_vault(vault),
+    )
+
+
+def _rev_parse_lines(vault: Path, *args: str) -> list[str]:
+    done = _run_git(vault, ["rev-parse", *args])
+    return [line.strip() for line in done.stdout.decode("utf-8", "replace").splitlines()]
+
+
+def _require_git_identity(vault: Path) -> Path:
+    """Return the git dir when it is vault/.git, or the vault itself when bare.
+
+    Discovery uses GIT_CEILING_DIRECTORIES, so a child directory cannot see a
+    repository above the vault.
+    """
+    lines = _rev_parse_lines(vault, "--is-bare-repository", "--absolute-git-dir")
+    if len(lines) != 2 or lines[0] not in {"true", "false"} or not lines[1]:
+        raise OSError(f"git rev-parse returned {lines!r}")
+    bare = lines[0] == "true"
+    absolute_git_dir = lines[1]
+    try:
+        git_real = Path(os.path.realpath(absolute_git_dir))
+        vault_real = Path(os.path.realpath(vault))
+    except (OSError, ValueError) as exc:
+        raise OSError(f"cannot resolve git dir for {vault}: {exc}") from exc
+    git_link = vault / ".git"
+    if bare:
+        if git_real != vault_real or _points_at_a_path(git_link):
+            raise _StoreRefusal(
+                "vault object store is not self-contained: "
+                f"git dir {absolute_git_dir} is not {vault}"
+            )
+        return git_real
+    link_is_dir = git_link.is_dir() and not git_link.is_symlink()
+    try:
+        expected = Path(os.path.realpath(git_link)) if link_is_dir else None
+    except (OSError, ValueError) as exc:
+        raise OSError(f"cannot resolve {git_link}: {exc}") from exc
+    if expected is None or git_real != expected:
+        raise _StoreRefusal(
+            "vault object store is not self-contained: "
+            f"git dir {absolute_git_dir} is not {git_link}"
+        )
+    top = _rev_parse_lines(vault, "--show-toplevel")
+    if len(top) != 1 or not top[0]:
+        raise OSError(f"git rev-parse --show-toplevel returned {top!r}")
+    try:
+        top_real = Path(os.path.realpath(top[0]))
+    except (OSError, ValueError) as exc:
+        raise OSError(f"cannot resolve git toplevel: {exc}") from exc
+    if top_real != vault_real:
+        raise _StoreRefusal(
+            "vault object store is not self-contained: "
+            f"git toplevel {top[0]} is not {vault}"
+        )
+    return git_real
+
+
+def _contained_git_dir(vault: Path) -> Path:
+    """Git dir of a self-contained vault, or a refusal if bytes could come from elsewhere."""
+    git_link = vault / ".git"
+    if git_link.is_symlink() or (_points_at_a_path(git_link) and not git_link.is_dir()):
+        raise _StoreRefusal(f"vault object store is not self-contained: {git_link} is not a directory")
+    if git_link.is_dir():
+        layout = _layout_problem(vault, git_link)
+        if layout:
+            raise _StoreRefusal(layout)
+    git_dir = _require_git_identity(vault)
+    if not git_link.is_dir():
+        layout = _layout_problem(vault, git_dir)
+        if layout:
+            raise _StoreRefusal(layout)
+    redirected = _store_redirect_problem(vault)
+    if redirected:
+        raise _StoreRefusal(redirected)
+    return git_dir
 
 
 def _rev_parse_store(vault: Path) -> tuple[str, str]:
     """Return absolute common-dir and objects paths from the vault itself."""
-    done = subprocess.run(
-        [
-            "git",
-            "--no-replace-objects",
-            "-C",
-            str(vault),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-            "--git-path",
-            "objects",
-        ],
-        check=True,
-        capture_output=True,
-        timeout=GIT_TIMEOUT_SECONDS,
-        env=_git_env(),
+    lines = _rev_parse_lines(
+        vault,
+        "--path-format=absolute",
+        "--git-common-dir",
+        "--git-path",
+        "objects",
     )
-    lines = done.stdout.decode("utf-8", "replace").splitlines()
     if len(lines) != 2:
         raise OSError(f"git rev-parse returned {len(lines)} paths")
     return lines[0], lines[1]
@@ -196,9 +336,11 @@ def errors(pin: object) -> list[str]:
 
 
 def _store_redirect_problem(vault: Path) -> str | None:
-    """Ask git where the common dir and objects are, and refuse anything outside vault."""
-    if not (vault / ".git").is_dir() or (vault / ".git").is_symlink():
-        return None
+    """Ask git where the common dir and objects are, and refuse anything outside vault.
+
+    The vault's own ceiling is set, so this cannot discover a parent repository.
+    Bare and non-bare layouts both answer.
+    """
     common, objects = _rev_parse_store(vault)
     outside = []
     if not _inside_vault(vault, common):
@@ -211,24 +353,20 @@ def _store_redirect_problem(vault: Path) -> str | None:
 
 
 def vault_errors(pin: dict, vault: Path) -> list[str]:
-    """Compare the pinned blob in a local csl-research clone with the pinned SHA-256."""
+    """Compare the pinned blob in a local csl-research clone with the pinned SHA-256.
+
+    The vault must be the repository git reads: non-bare with git dir vault/.git,
+    or bare with git dir the vault itself. Discovery stops at the vault's parent,
+    and the object store must not redirect outside that git dir.
+    """
     if pin.get("status") != "pinned":
         return []
     spec = f"{pin['commit']}:{pin['path']}"
     try:
-        foreign = _foreign_store_problem(vault)
-        if foreign:
-            return [_printable(foreign)]
-        redirected = _store_redirect_problem(vault)
-        if redirected:
-            return [_printable(redirected)]
-        blob = subprocess.run(
-            ["git", "--no-replace-objects", "-C", str(vault), "show", spec],
-            check=True,
-            capture_output=True,
-            timeout=GIT_TIMEOUT_SECONDS,
-            env=_git_env(),
-        ).stdout
+        git_dir = _contained_git_dir(vault)
+        blob = _run_git(vault, ["--git-dir", str(git_dir), "show", spec]).stdout
+    except _StoreRefusal as refusal:
+        return [_printable(refusal.message)]
     except subprocess.TimeoutExpired:
         return [_printable(
             f"cannot read {spec!a} from {str(vault)!a}: git timed out after {GIT_TIMEOUT_SECONDS} seconds"

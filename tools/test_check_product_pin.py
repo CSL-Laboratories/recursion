@@ -480,6 +480,272 @@ class VaultTests(unittest.TestCase):
         self.assertEqual(env.get("PATH"), "/usr/bin")
         self.assertFalse(any(key.upper().startswith("GIT_") and key != "GIT_NO_LAZY_FETCH" for key in env))
 
+    def _commit_repo(self, path: Path) -> str:
+        path.mkdir(parents=True, exist_ok=True)
+        git = ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+        target = path / "contracts" / "recursion" / "PRODUCT.md"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.body)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "contract"], check=True)
+        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+
+    def _blob_oid(self, repo: Path, commit: str) -> str:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", f"{commit}:contracts/recursion/PRODUCT.md"],
+            text=True,
+        ).strip()
+
+    def _pin_for(self, commit: str) -> dict:
+        return {**PINNED, "commit": commit, "sha256": hashlib.sha256(self.body).hexdigest()}
+
+    def _assert_git_reads_body(self, vault: Path, commit: str) -> None:
+        """git show from vault returns the donor bytes. No ceiling is set here."""
+        done = subprocess.run(
+            ["git", "-C", str(vault), "show", f"{commit}:contracts/recursion/PRODUCT.md"],
+            capture_output=True,
+            timeout=60,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, self.body)
+
+    def _assert_refused(self, vault: Path, pin: dict) -> list[str]:
+        problems = pin_check.vault_errors(pin, vault)
+        self.assertTrue(problems, f"false PASS for {vault}: vault_errors returned {problems!r}")
+        self.assertTrue(
+            problems[0].startswith("vault object store is not self-contained")
+            or problems[0].startswith("cannot read"),
+            problems,
+        )
+        self.assertFalse(any(line.startswith("PASS:") for line in "\n".join(problems).splitlines()))
+        problems[0].encode("utf-8")
+        return problems
+
+    def _replace_with_symlink(self, entry: Path, absolute: bool) -> None:
+        outside = Path(self.tmp.name) / "donor-bytes" / f"{'abs' if absolute else 'rel'}-{entry.parent.name}-{entry.name}"
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(entry, outside)
+        target = outside if absolute else Path(os.path.relpath(outside, entry.parent))
+        entry.symlink_to(target, target_is_directory=outside.is_dir())
+
+    def test_child_of_donor_cannot_supply_the_blob(self) -> None:
+        """An empty directory inside a donor repo is not that repo."""
+        pin = self.pin(hashlib.sha256(self.body).hexdigest())
+        child = self.vault / "empty-child"
+        child.mkdir()
+        for ceiling in (None, "/"):
+            with self.subTest(operator_ceiling=ceiling):
+                env = {} if ceiling is None else {"GIT_CEILING_DIRECTORIES": ceiling}
+                with mock.patch.dict(os.environ, env):
+                    self._assert_git_reads_body(child, self.commit)
+                    self._assert_refused(child, pin)
+
+    def test_child_after_root_refusal_cannot_supply_the_blob(self) -> None:
+        """Refusing the attacked root must also refuse a child of that root."""
+        pin = self.pin(hashlib.sha256(self.body).hexdigest())
+        for name in ("alternates", "commondir", "gitdir-file", "symlinked-git"):
+            with self.subTest(name=name):
+                root = Path(self.tmp.name) / f"root-{name}"
+                if name == "gitdir-file":
+                    root.mkdir()
+                    (root / ".git").write_text(f"gitdir: {self.vault / '.git'}\n", encoding="utf-8")
+                elif name == "symlinked-git":
+                    root.mkdir()
+                    (root / ".git").symlink_to(self.vault / ".git", target_is_directory=True)
+                else:
+                    root = self.empty_repo(f"root-{name}")
+                    if name == "alternates":
+                        alt = root / ".git" / "objects" / "info" / "alternates"
+                        alt.parent.mkdir(parents=True, exist_ok=True)
+                        alt.write_text(str(self.vault / ".git" / "objects") + "\n", encoding="utf-8")
+                    else:
+                        (root / ".git" / "commondir").write_text(str(self.vault / ".git") + "\n", encoding="utf-8")
+                child = root / "child"
+                child.mkdir()
+                root_problems = pin_check.vault_errors(pin, root)
+                self.assertTrue(
+                    root_problems and root_problems[0].startswith("vault object store is not self-contained"),
+                    root_problems,
+                )
+                self._assert_git_reads_body(child, self.commit)
+                self._assert_refused(child, pin)
+
+    def test_linked_worktree_child_cannot_supply_the_blob(self) -> None:
+        """worktree/child must not pass, and the main repo with worktrees/ still does."""
+        repo = Path(self.tmp.name) / "worktree-main"
+        commit = self._commit_repo(repo)
+        pin = self._pin_for(commit)
+        self.assertEqual(pin_check.vault_errors(pin, repo), [])
+        worktree = Path(self.tmp.name) / "linked-wt"
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(worktree), "HEAD"], check=True)
+        self.assertEqual(pin_check.vault_errors(pin, repo), [])
+        child = worktree / "child"
+        child.mkdir()
+        root_problems = pin_check.vault_errors(pin, worktree)
+        self.assertTrue(
+            root_problems and root_problems[0].startswith("vault object store is not self-contained"),
+            root_problems,
+        )
+        self._assert_git_reads_body(child, commit)
+        self._assert_refused(child, pin)
+
+    def _assert_object_symlink_refused(self, repo: Path, commit: str, entry: Path, absolute: bool) -> None:
+        self._replace_with_symlink(entry, absolute)
+        pin = self._pin_for(commit)
+        self._assert_git_reads_body(repo, commit)
+        problems = self._assert_refused(repo, pin)
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn("symlink", problems[0])
+
+    def test_symlinked_loose_object_cannot_supply_the_blob(self) -> None:
+        for absolute in (True, False):
+            with self.subTest(absolute=absolute):
+                repo = Path(self.tmp.name) / f"loose-{absolute}"
+                commit = self._commit_repo(repo)
+                oid = self._blob_oid(repo, commit)
+                entry = repo / ".git" / "objects" / oid[:2] / oid[2:]
+                self.assertTrue(entry.is_file(), entry)
+                self._assert_object_symlink_refused(repo, commit, entry, absolute)
+
+    def test_symlinked_fanout_dir_cannot_supply_the_blob(self) -> None:
+        for absolute in (True, False):
+            with self.subTest(absolute=absolute):
+                repo = Path(self.tmp.name) / f"fanout-{absolute}"
+                commit = self._commit_repo(repo)
+                oid = self._blob_oid(repo, commit)
+                entry = repo / ".git" / "objects" / oid[:2]
+                self.assertTrue(entry.is_dir(), entry)
+                self._assert_object_symlink_refused(repo, commit, entry, absolute)
+
+    def test_symlinked_pack_dir_cannot_supply_the_blob(self) -> None:
+        for absolute in (True, False):
+            with self.subTest(absolute=absolute):
+                repo = Path(self.tmp.name) / f"pack-{absolute}"
+                commit = self._commit_repo(repo)
+                subprocess.run(["git", "-C", str(repo), "repack", "-ad"], check=True)
+                entry = repo / ".git" / "objects" / "pack"
+                self.assertTrue(entry.is_dir(), entry)
+                self._assert_object_symlink_refused(repo, commit, entry, absolute)
+
+    def test_symlinked_objects_info_cannot_supply_the_blob(self) -> None:
+        for absolute in (True, False):
+            with self.subTest(absolute=absolute):
+                repo = Path(self.tmp.name) / f"info-{absolute}"
+                commit = self._commit_repo(repo)
+                entry = repo / ".git" / "objects" / "info"
+                self.assertTrue(entry.is_dir(), entry)
+                self._assert_object_symlink_refused(repo, commit, entry, absolute)
+
+    def test_bare_alternates_cannot_supply_the_blob(self) -> None:
+        pin = self.pin(hashlib.sha256(self.body).hexdigest())
+        donor_objects = self.vault / ".git" / "objects"
+        for absolute in (True, False):
+            with self.subTest(absolute=absolute):
+                bare = Path(self.tmp.name) / f"bare-alt-{absolute}"
+                subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+                alt = bare / "objects" / "info" / "alternates"
+                alt.parent.mkdir(parents=True, exist_ok=True)
+                text = str(donor_objects) if absolute else os.path.relpath(donor_objects, bare / "objects")
+                alt.write_text(text + "\n", encoding="utf-8")
+                self._assert_git_reads_body(bare, self.commit)
+                problems = self._assert_refused(bare, pin)
+                self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+                self.assertIn(str(alt), problems[0])
+
+    def test_bare_http_alternates_are_refused(self) -> None:
+        pin = self.pin(hashlib.sha256(self.body).hexdigest())
+        bare = Path(self.tmp.name) / "bare-http-alternates"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        alt = bare / "objects" / "info" / "http-alternates"
+        alt.parent.mkdir(parents=True, exist_ok=True)
+        alt.write_text(str(self.vault / ".git" / "objects") + "\n", encoding="utf-8")
+        problems = self._assert_refused(bare, pin)
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn(str(alt), problems[0])
+
+    def test_bare_commondir_cannot_supply_the_blob(self) -> None:
+        pin = self.pin(hashlib.sha256(self.body).hexdigest())
+        bare = Path(self.tmp.name) / "bare-commondir"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        (bare / "commondir").write_text(str(self.vault / ".git") + "\n", encoding="utf-8")
+        self._assert_git_reads_body(bare, self.commit)
+        problems = self._assert_refused(bare, pin)
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+
+    def test_bare_symlinked_objects_cannot_supply_the_blob(self) -> None:
+        pin = self.pin(hashlib.sha256(self.body).hexdigest())
+        bare = Path(self.tmp.name) / "bare-objects-symlink"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        donor_objects = self.vault / ".git" / "objects"
+        shutil.rmtree(bare / "objects")
+        (bare / "objects").symlink_to(os.path.relpath(donor_objects, bare), target_is_directory=True)
+        self._assert_git_reads_body(bare, self.commit)
+        problems = self._assert_refused(bare, pin)
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn(str(donor_objects.resolve()), problems[0])
+
+    def test_bare_clone_and_shared_repository_pass(self) -> None:
+        digest = hashlib.sha256(self.body).hexdigest()
+        bare = Path(self.tmp.name) / "bare-clone"
+        subprocess.run(
+            ["git", "clone", "-q", "--bare", "--no-hardlinks", str(self.vault), str(bare)],
+            check=True,
+        )
+        self.assertEqual(pin_check.vault_errors(self.pin(digest), bare), [])
+
+        shared = Path(self.tmp.name) / "shared repo"
+        subprocess.run(["git", "init", "-q", "--shared=group", str(shared)], check=True)
+        target = shared / "contracts" / "recursion" / "PRODUCT.md"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.body)
+        git = ["git", "-C", str(shared), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "contract"], check=True)
+        commit = subprocess.check_output(["git", "-C", str(shared), "rev-parse", "HEAD"], text=True).strip()
+        reported = subprocess.check_output(
+            ["git", "-C", str(shared), "config", "--get", "core.sharedRepository"],
+            text=True,
+        ).strip()
+        self.assertIn(reported, {"1", "true", "group"})
+        self.assertTrue((shared / ".git" / "objects").stat().st_mode & 0o2000)
+        self.assertEqual(pin_check.vault_errors(self._pin_for(commit), shared), [])
+
+    def test_git_invocation_bounds_discovery_and_keeps_home(self) -> None:
+        digest = hashlib.sha256(self.body).hexdigest()
+        seen: list[dict[str, str]] = []
+        real_run = pin_check.subprocess.run
+
+        def spy(args, **kwargs):
+            env = kwargs.get("env")
+            if isinstance(env, dict):
+                seen.append(env)
+            return real_run(args, **kwargs)
+
+        home = "/tmp/pin-home"
+        xdg = "/tmp/pin-xdg"
+        with mock.patch.object(pin_check.subprocess, "run", side_effect=spy):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_CEILING_DIRECTORIES": "/",
+                    "GIT_DIR": "/tmp/not-the-vault",
+                    "HOME": home,
+                    "XDG_CONFIG_HOME": xdg,
+                },
+            ):
+                self.assertEqual(pin_check.vault_errors(self.pin(digest), self.vault), [])
+        self.assertTrue(seen)
+        parent = str(self.vault.resolve().parent)
+        for env in seen:
+            self.assertEqual(env.get("GIT_NO_LAZY_FETCH"), "1")
+            self.assertNotIn("GIT_DIR", env)
+            self.assertEqual(env.get("HOME"), home)
+            self.assertEqual(env.get("XDG_CONFIG_HOME"), xdg)
+            ceiling = env.get("GIT_CEILING_DIRECTORIES", "")
+            self.assertIn(parent, ceiling.split(os.pathsep))
+            self.assertNotIn("/", ceiling.split(os.pathsep))
+
     def test_main_failure_cannot_print_a_pass_line(self) -> None:
         pin_file = self.write_pin("")
         cases = (

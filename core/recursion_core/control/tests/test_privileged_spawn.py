@@ -116,8 +116,22 @@ def _sudo_policy(allowed: dict[tuple[str, ...], str]):
     return run
 
 
+def _stand_in_gid() -> int:
+    """A primary gid that is neither root nor this process's gid."""
+
+    for gid in (65534, 65533, 65532, 65531):
+        if gid not in {0, os.getgid()}:
+            return gid
+    return 65531
+
+
 def _nobody_allows(*argvs: tuple[str, ...]) -> dict[tuple[str, ...], str]:
-    out = {("sudo", "-n", "-u", "nobody", "--", "id", "-u"): "65534\n"}
+    gid = _stand_in_gid()
+    out = {
+        ("sudo", "-n", "-u", "nobody", "--", "id", "-u"): "65534\n",
+        ("sudo", "-n", "-u", "nobody", "--", "id", "-g"): f"{gid}\n",
+        ("sudo", "-n", "-u", "nobody", "--", "id", "-G"): f"{gid}\n",
+    }
     for argv in argvs:
         out[("sudo", "-n", "-u", "nobody", "--", *argv)] = ""
     return out
@@ -432,7 +446,12 @@ class EngineUserDetectionTests(unittest.TestCase):
 
     def _policy(self, user: str = ENGINE_USER, uid: int = ENGINE_UID):
         allowed = _nobody_allows(*ALL_REQUIRED)
+        gid = _stand_in_gid()
+        if gid == uid:
+            gid = 991 if uid != 991 else 992
         allowed[("sudo", "-n", "-u", user, "--", "id", "-u")] = f"{uid}\n"
+        allowed[("sudo", "-n", "-u", user, "--", "id", "-g")] = f"{gid}\n"
+        allowed[("sudo", "-n", "-u", user, "--", "id", "-G")] = f"{gid}\n"
         for argv in ALL_REQUIRED:
             allowed[("sudo", "-n", "-u", user, "--", *argv)] = ""
         return _sudo_policy(allowed)
@@ -504,8 +523,16 @@ class EngineUserDetectionTests(unittest.TestCase):
 
         def run(cmd, timeout: float) -> ProcResult:
             seen.append(tuple(cmd))
-            if cmd[0] == "systemd-run" and cmd[1] == f"--uid={ENGINE_USER}":
+            if tuple(cmd[:2]) != ("systemd-run", f"--uid={ENGINE_USER}"):
+                return ProcResult(1, "", "denied")
+            gid = _stand_in_gid()
+            tail = tuple(cmd[-2:])
+            if tail == ("/usr/bin/id", "-u"):
                 return ProcResult(0, f"{ENGINE_UID}\n", "")
+            if tail == ("/usr/bin/id", "-g"):
+                return ProcResult(0, f"{gid}\n", "")
+            if tail == ("/usr/bin/id", "-G"):
+                return ProcResult(0, f"{gid}\n", "")
             return ProcResult(1, "", "denied")
 
         backends = detect_backends(
@@ -564,8 +591,16 @@ class EngineUserDetectionTests(unittest.TestCase):
         # Bot review 4512091152 at da749a72: systemd-run refused --uid=<engine user> but allowed
         # --uid=nobody, and detection reported systemd-run unavailable without trying the stand-in.
         def run(cmd, timeout: float) -> ProcResult:
-            if cmd[0] == "systemd-run" and cmd[1] == "--uid=nobody":
+            if tuple(cmd[:2]) != ("systemd-run", "--uid=nobody"):
+                return ProcResult(1, "", "denied")
+            gid = _stand_in_gid()
+            tail = tuple(cmd[-2:])
+            if tail == ("/usr/bin/id", "-u"):
                 return ProcResult(0, "65534\n", "")
+            if tail == ("/usr/bin/id", "-g"):
+                return ProcResult(0, f"{gid}\n", "")
+            if tail == ("/usr/bin/id", "-G"):
+                return ProcResult(0, f"{gid}\n", "")
             return ProcResult(1, "", "denied")
 
         measured: list[str] = []
@@ -804,7 +839,13 @@ class ProbeTargetTests(unittest.TestCase):
         uids = {100: (1000, 0, 0, 0), 101: (0, 0, 0, 0), 102: (65534,) * 4}
         children = {100: [101], 101: [102], 102: []}
         pid = find_target_uid_pid(
-            100, 65534, timeout_s=0.0, uids_fn=uids.get, children_fn=lambda p: children[p]
+            100,
+            65534,
+            timeout_s=0.0,
+            uids_fn=uids.get,
+            gids_fn=lambda p: (65534,) * 4 if p == 102 else (0,) * 4,
+            groups_fn=lambda p: (65534,) if p == 102 else (0,),
+            children_fn=lambda p: children[p],
         )
         self.assertEqual(pid, 102)
 
@@ -831,7 +872,13 @@ class ProbeTargetTests(unittest.TestCase):
             return ProcResult(0, "4242\n", "")
 
         pid = systemd_unit_main_pid(
-            "csl734-probe-x", 65534, run_fn=run, timeout_s=0.0, uids_fn={4242: (65534,) * 4}.get
+            "csl734-probe-x",
+            65534,
+            run_fn=run,
+            timeout_s=0.0,
+            uids_fn={4242: (65534,) * 4}.get,
+            gids_fn=lambda p: (65534,) * 4,
+            groups_fn=lambda p: (65534,),
         )
         self.assertEqual(pid, 4242)
         self.assertEqual(
@@ -1169,6 +1216,273 @@ class DevinReview5818620711Tests(unittest.TestCase):
         self.assertEqual(created_modes, [0o600])
         self.assertTrue(sudo.available, sudo.reason)
         self.assertEqual(sudo.target_user, "nobody")
+
+
+class SpawnBoundaryTests(unittest.TestCase):
+    """Checked exec, scrubbed environment, and uid/gid edges.
+
+    These do not call sudo, setuid helpers, or ptrace. Children are ``true``,
+    ``python3``, or ``unshare --user`` under a temporary ``PATH``.
+    """
+
+    def _facts(self) -> HostFacts:
+        return _facts(
+            sudo_n_true=False,
+            subuid_lines=(),
+            subgid_lines=(),
+            newuidmap_path=None,
+            newuidmap_is_setuid_root=False,
+            unshare_user_works=False,
+            unshare_host_uid=None,
+            systemd_is_pid1=False,
+        )
+
+    def _sudo(self, id_u: str, *, gid: str | None = None, groups: str | None = None) -> Backend:
+        safe = f"{_stand_in_gid()}\n"
+        gid_out = safe if gid is None else gid
+        groups_out = safe if groups is None else groups
+
+        def run(cmd, timeout: float) -> ProcResult:
+            key = tuple(cmd)
+            if key[:4] != ("sudo", "-n", "-u", "engine"):
+                return ProcResult(1, "", "denied")
+            if key == ("sudo", "-n", "-u", "engine", "--", "id", "-u"):
+                return ProcResult(0, id_u, "")
+            if key == ("sudo", "-n", "-u", "engine", "--", "id", "-g"):
+                return ProcResult(0, gid_out, "")
+            if key == ("sudo", "-n", "-u", "engine", "--", "id", "-G"):
+                return ProcResult(0, groups_out, "")
+            if key[:6] == ("sudo", "-n", "-u", "engine", "--", "id"):
+                return ProcResult(1, "", "denied")
+            return ProcResult(0, "", "")
+
+        backends = detect_backends(
+            facts=self._facts(),
+            run_fn=run,
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+            engine_user="engine",
+        )
+        return next(b for b in backends if b.name == "sudo")
+
+    def test_path_true_is_not_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bindir = os.path.join(td, "bin")
+            os.mkdir(bindir)
+            marker = os.path.join(td, "ran")
+            script = os.path.join(bindir, "true")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(f"#!/bin/sh\necho hijacked > {marker}\n")
+            os.chmod(script, 0o755)
+            old = os.environ.get("PATH")
+            os.environ["PATH"] = bindir + os.pathsep + (old or "")
+            try:
+                result = privileged_spawn._default_run(("true",), 5)
+            finally:
+                if old is None:
+                    os.environ.pop("PATH", None)
+                else:
+                    os.environ["PATH"] = old
+            self.assertFalse(os.path.exists(marker))
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_child_does_not_inherit_stdin_env_or_session(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            site = os.path.join(td, "sitecustomize.py")
+            leaked = os.path.join(td, "leaked")
+            with open(site, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "import os\n"
+                    f"open({leaked!r}, 'w').write(os.environ.get('CSL734_SECRET', ''))\n"
+                )
+            report = os.path.join(td, "report")
+            code = (
+                "import os, sys\n"
+                f"open({report!r}, 'w').write("
+                "repr(sys.stdin.read()) + '\\n' +"
+                "repr(os.environ.get('CSL734_SECRET')) + '\\n' +"
+                "repr(os.environ.get('LD_PRELOAD')) + '\\n' +"
+                "repr(os.environ.get('PYTHONPATH')) + '\\n' +"
+                "str(os.getsid(0)) + '\\n'"
+                ")\n"
+            )
+            read_fd, write_fd = os.pipe()
+            os.write(write_fd, b"STDIN-SECRET\n")
+            os.close(write_fd)
+            saved = os.dup(0)
+            os.dup2(read_fd, 0)
+            os.close(read_fd)
+            old = {
+                key: os.environ.get(key)
+                for key in ("CSL734_SECRET", "LD_PRELOAD", "PYTHONPATH")
+            }
+            os.environ["CSL734_SECRET"] = "env-secret-value"
+            os.environ["LD_PRELOAD"] = "/tmp/csl734-not-a-library.so"
+            os.environ["PYTHONPATH"] = td
+            try:
+                result = privileged_spawn._default_run(("python3", "-c", code), 8)
+            finally:
+                os.dup2(saved, 0)
+                os.close(saved)
+                for key, value in old.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(os.path.exists(leaked))
+            text = open(report, encoding="utf-8").read().splitlines()
+            self.assertEqual(text[0], "''")
+            self.assertEqual(text[1], "None")
+            self.assertEqual(text[2], "None")
+            self.assertEqual(text[3], "None")
+            self.assertNotEqual(int(text[4]), os.getsid(0))
+
+    def test_unshare_probe_does_not_exec_a_path_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bindir = os.path.join(td, "bin")
+            os.mkdir(bindir)
+            marker = os.path.join(td, "marker")
+            script = os.path.join(bindir, "unshare")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    f"cat > {marker}\n"
+                    f"printf '%s' \"$CSL734_SECRET\" >> {marker}\n"
+                )
+            os.chmod(script, 0o755)
+            read_fd, write_fd = os.pipe()
+            os.write(write_fd, b"STDIN-SECRET")
+            os.close(write_fd)
+            saved = os.dup(0)
+            os.dup2(read_fd, 0)
+            os.close(read_fd)
+            old_path = os.environ.get("PATH")
+            old_secret = os.environ.get("CSL734_SECRET")
+            os.environ["PATH"] = bindir + os.pathsep + "/usr/bin"
+            os.environ["CSL734_SECRET"] = "env-secret-value"
+            try:
+                privileged_spawn.collect_host_facts(
+                    run_fn=lambda cmd, timeout: ProcResult(1, "", "skipped")
+                )
+            finally:
+                os.dup2(saved, 0)
+                os.close(saved)
+                if old_path is None:
+                    os.environ.pop("PATH", None)
+                else:
+                    os.environ["PATH"] = old_path
+                if old_secret is None:
+                    os.environ.pop("CSL734_SECRET", None)
+                else:
+                    os.environ["CSL734_SECRET"] = old_secret
+            self.assertFalse(os.path.exists(marker))
+
+    def test_same_uid_store_writer_still_roundtrips(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, detail = probe_abs_store_read((), tmp, expected_owner=os.getuid())
+        self.assertIs(result, False, detail)
+        self.assertIn("read ", detail)
+
+    def _assert_sudo_rejected(self, backend: Backend) -> None:
+        self.assertFalse(backend.available, backend.reason)
+        self.assertIsNone(backend.target_uid)
+        self.assertIsNone(backend.target_user)
+
+    def test_uid_aliases_of_root_and_non_canonical_ids_are_rejected(self) -> None:
+        cases = {
+            "wrap": "4294967296\n",
+            "negative": "-1\n",
+            "overflow": "4294967295\n",
+            "hidden-root": "0\n990\n",
+            "unicode": "²\n",
+            "overlong": ("1" * 11) + "\n",
+        }
+        for name, stdout in cases.items():
+            with self.subTest(name=name):
+                self._assert_sudo_rejected(self._sudo(stdout))
+
+    def test_root_primary_gid_caller_gid_and_supplementary_root_are_rejected(self) -> None:
+        caller = f"{os.getgid()}\n"
+        safe = f"{_stand_in_gid()}\n"
+        cases = {
+            "gid-0": ("0\n", "0\n"),
+            "gid-caller": (caller, caller),
+            "supplementary-0": (safe, safe.rstrip("\n") + " 0\n"),
+            "gid-wrap": ("4294967296\n", "4294967296\n"),
+        }
+        for name, (gid, groups) in cases.items():
+            with self.subTest(name=name):
+                self._assert_sudo_rejected(self._sudo("990\n", gid=gid, groups=groups))
+
+    def test_supplementary_caller_gid_with_its_own_primary_gid_is_accepted(self) -> None:
+        gid = _stand_in_gid()
+        backend = self._sudo("990\n", gid=f"{gid}\n", groups=f"{gid} {os.getgid()}\n")
+        self.assertTrue(backend.available, backend.reason)
+        self.assertEqual(backend.target_uid, 990)
+
+    def test_process_with_root_gid_is_not_the_engine(self) -> None:
+        def field(pid: int, key: str) -> str | None:
+            if pid != 40:
+                return None
+            if key == "Uid":
+                return "990 990 990 990"
+            if key == "Gid":
+                return "0 0 0 0"
+            if key == "Groups":
+                return "0"
+            return None
+
+        with mock.patch.object(privileged_spawn, "_proc_field", side_effect=field):
+            found = find_target_uid_pid(
+                1, 990, timeout_s=0.05, children_fn=lambda pid: [40] if pid == 1 else []
+            )
+        self.assertIsNone(found)
+
+    def test_main_pid_with_root_gid_is_not_the_engine(self) -> None:
+        def field(pid: int, key: str) -> str | None:
+            if pid != 40:
+                return None
+            if key == "Uid":
+                return "990 990 990 990"
+            if key == "Gid":
+                return "990 0 990 990"
+            if key == "Groups":
+                return "990"
+            return None
+
+        with mock.patch.object(privileged_spawn, "_proc_field", side_effect=field):
+            pid = systemd_unit_main_pid(
+                "u.service",
+                990,
+                run_fn=lambda cmd, timeout: ProcResult(0, "40\n", ""),
+                timeout_s=0.05,
+            )
+        self.assertIsNone(pid)
+
+    def test_systemd_root_gid_is_rejected(self) -> None:
+        def run(cmd, timeout: float) -> ProcResult:
+            if tuple(cmd[:2]) != ("systemd-run", f"--uid={ENGINE_USER}"):
+                return ProcResult(1, "", "denied")
+            tail = tuple(cmd[-2:])
+            if tail == ("/usr/bin/id", "-u"):
+                return ProcResult(0, f"{ENGINE_UID}\n", "")
+            if tail == ("/usr/bin/id", "-g"):
+                return ProcResult(0, "0\n", "")
+            if tail == ("/usr/bin/id", "-G"):
+                return ProcResult(0, "0\n", "")
+            return ProcResult(1, "", "denied")
+
+        backends = detect_backends(
+            facts=self._facts(),
+            run_fn=run,
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+            engine_user=ENGINE_USER,
+        )
+        systemd = next(b for b in backends if b.name == "systemd_run")
+        self.assertFalse(systemd.available, systemd.reason)
+        self.assertIsNone(systemd.target_uid)
 
 
 @unittest.skipUnless(LIVE, f"live host probes run only with {LIVE_ENV}=1")

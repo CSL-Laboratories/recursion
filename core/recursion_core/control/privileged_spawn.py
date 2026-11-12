@@ -373,19 +373,203 @@ def select_path(
     )
 
 
-def _default_run(cmd: Sequence[str], timeout: float) -> ProcResult:
+# Directories whose root-owned binaries this module may execute. ``/bin`` is
+# not opened: on merged-/usr hosts it is a symlink, and opening it would
+# follow that link. Callers that name ``/bin/<tool>`` are resolved in
+# ``/usr/bin`` instead. The caller's ``PATH`` is never searched.
+_TRUSTED_BIN_DIRS = ("/usr/bin", "/usr/sbin")
+
+
+def _safe_leaf(name: str) -> bool:
+    return bool(name) and name not in {".", ".."} and "/" not in name and "\x00" not in name
+
+
+def _trusted_locations(name: str) -> tuple[tuple[str, str], ...]:
+    """``(directory, leaf)`` pairs that may name the executable ``name``."""
+
+    if not name or "\x00" in name:
+        raise OSError(errno.EINVAL, "refusing to execute an empty path")
+    if name.startswith("/"):
+        parent, leaf = name.rsplit("/", 1)
+        if parent == "/bin":
+            parent = "/usr/bin"
+        if parent not in _TRUSTED_BIN_DIRS or not _safe_leaf(leaf):
+            raise OSError(errno.EPERM, "executable is outside the trusted directories")
+        return ((parent, leaf),)
+    if not _safe_leaf(name):
+        raise OSError(errno.EPERM, "refusing to execute a relative path")
+    return tuple((base, name) for base in _TRUSTED_BIN_DIRS)
+
+
+def _require_trusted_inode(fd: int) -> None:
+    """The inode behind ``fd`` is a root-owned regular executable, not writable."""
+
+    st = os.fstat(fd)
+    if (
+        not stat.S_ISREG(st.st_mode)
+        or st.st_uid != 0
+        or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        or not (st.st_mode & stat.S_IXUSR)
+    ):
+        raise OSError(errno.EPERM, "executable is not a root-owned regular file")
+
+
+def _open_trusted_symlink(dirfd: int, leaf: str) -> int:
+    """Open the same-directory target of a root-owned symlink, and pin that inode.
+
+    ``O_NOFOLLOW`` on ``leaf`` returns ``ELOOP``. The link itself must be
+    owned by root and its target must be a single leaf of this directory
+    (``python3`` -> ``python3.12``). The fd that is returned is the target
+    inode, checked again after the name is re-read, so a replacement of
+    either name is not what gets executed.
+    """
+
+    link_fd = os.open(leaf, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
     try:
-        proc = subprocess.run(
-            list(cmd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        link_stat = os.fstat(link_fd)
+        if not stat.S_ISLNK(link_stat.st_mode) or link_stat.st_uid != 0:
+            raise OSError(errno.EPERM, "refusing to follow an untrusted symlink")
+        target = os.readlink(leaf, dir_fd=dirfd)
+        if not _safe_leaf(target):
+            raise OSError(errno.ELOOP, "symlink target leaves the trusted directory")
+        bin_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
+        try:
+            if (
+                os.fstat(link_fd).st_ino != link_stat.st_ino
+                or os.fstat(link_fd).st_dev != link_stat.st_dev
+                or os.readlink(leaf, dir_fd=dirfd) != target
+            ):
+                raise OSError(errno.EAGAIN, "symlink changed between check and exec")
+            opened = os.fstat(bin_fd)
+            named = os.stat(target, dir_fd=dirfd, follow_symlinks=False)
+            if (named.st_ino, named.st_dev) != (opened.st_ino, opened.st_dev):
+                raise OSError(errno.EAGAIN, "executable changed between check and exec")
+            _require_trusted_inode(bin_fd)
+        except BaseException:
+            os.close(bin_fd)
+            raise
+        return bin_fd
+    finally:
+        os.close(link_fd)
+
+
+def _open_in_dir(dirfd: int, leaf: str) -> int:
+    try:
+        return os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+        return _open_trusted_symlink(dirfd, leaf)
+
+
+def _open_trusted_executable(name: str) -> int:
+    """Return an ``O_CLOEXEC`` fd for the inode ``name`` resolves to in a trusted dir.
+
+    The child executes this fd (``executable=/proc/self/fd/N``), not the path,
+    so a change to the directory entry after the check does not change the
+    program that runs.
+    """
+
+    last: OSError | None = None
+    for base, leaf in _trusted_locations(name):
+        try:
+            dirfd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            last = exc
+            continue
+        try:
+            try:
+                fd = _open_in_dir(dirfd, leaf)
+            except OSError as exc:
+                last = exc
+                continue
+        finally:
+            os.close(dirfd)
+        try:
+            _require_trusted_inode(fd)
+        except OSError as exc:
+            os.close(fd)
+            last = exc
+            continue
+        return fd
+    if last is not None and last.errno == errno.ENOENT:
+        raise FileNotFoundError(name) from last
+    if last is None:
+        raise FileNotFoundError(name)
+    raise last
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Environment passed to every child.
+
+    Nothing from the parent environment is copied. A parent ``PATH``,
+    ``LD_PRELOAD``, ``PYTHONPATH`` or secret variable therefore cannot select
+    the binary, inject code, or be read by the other uid via ``/proc``.
+    """
+
+    return {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+
+
+def _popen_checked(
+    argv: Sequence[str],
+    *,
+    stdout: int,
+    stderr: int,
+) -> subprocess.Popen[bytes]:
+    """Spawn ``argv`` from a pinned trusted inode.
+
+    stdin is ``DEVNULL``, the child is in a new session (it does not keep the
+    caller's terminal), and only the executable fd is passed across the fork.
+    """
+
+    if not argv:
+        raise FileNotFoundError("empty command")
+    bin_fd = _open_trusted_executable(argv[0])
+    try:
+        return subprocess.Popen(
+            list(argv),
+            executable=f"/proc/self/fd/{bin_fd}",
+            pass_fds=(bin_fd,),
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            env=_scrubbed_env(),
+            start_new_session=True,
         )
+    finally:
+        os.close(bin_fd)
+
+
+def _default_run(cmd: Sequence[str], timeout: float) -> ProcResult:
+    if not cmd:
+        return ProcResult(127, "", "empty command")
+    try:
+        proc = _popen_checked(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError as exc:
         return ProcResult(127, "", str(exc))
-    except subprocess.TimeoutExpired as exc:
-        return ProcResult(124, exc.stdout or "", exc.stderr or "timeout")
-    return ProcResult(proc.returncode, proc.stdout or "", proc.stderr or "")
+    except OSError as exc:
+        return ProcResult(127, "", str(exc))
+    timed_out = False
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            out, err = proc.communicate()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+    text_out = (out or b"").decode("utf-8", "replace")
+    text_err = (err or b"").decode("utf-8", "replace")
+    if timed_out:
+        return ProcResult(124, text_out, text_err or "timeout")
+    return ProcResult(proc.returncode if proc.returncode is not None else 1, text_out, text_err)
 
 
 def _read_text(path: str) -> str | None:
@@ -395,20 +579,130 @@ def _read_text(path: str) -> str | None:
         return None
 
 
-def _parse_uid_output(text: str) -> int | None:
-    stripped = (text or "").strip().splitlines()
-    if not stripped:
+# Linux uid_t/gid_t are 32-bit. 0 is root. 0xFFFFFFFF is (uid_t)-1, which
+# setuid/setgid treat as "do not change" and which is not a host account.
+_HOST_ID_MAX = 0xFFFFFFFF
+
+
+def _parse_host_id(token: str) -> int | None:
+    """One canonical host uid or gid, or ``None``.
+
+    Only ASCII digits, at most ten of them (``2**32-1``), and only values that
+    fit in 32 bits. ``²``, ``-1`` and ``4294967296`` are rejected here so a
+    later ``int()`` cannot raise or accept a value that truncates to root.
+    """
+
+    if not token or not token.isascii() or not token.isdigit() or len(token) > 10:
         return None
-    token = stripped[-1].strip()
-    if token.isdigit() or (token.startswith("-") and token[1:].isdigit()):
-        return int(token)
-    # ``id`` full form: uid=65534(nobody) ...
-    if token.startswith("uid="):
-        body = token.split()[0][4:]
+    try:
+        value = int(token)
+    except ValueError:
+        return None
+    if value > _HOST_ID_MAX:
+        return None
+    return value
+
+
+def _parse_uid_output(text: str) -> int | None:
+    """Parse one line of ``id -u`` or ``id -g``.
+
+    More than one line is rejected. A trailing line such as ``990`` must not
+    hide an earlier ``0``.
+    """
+
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    token = lines[0]
+    if token.startswith("uid=") or token.startswith("gid="):
+        body = token.split()[0].split("=", 1)[1]
         body = body.split("(", 1)[0]
-        if body.isdigit():
-            return int(body)
+        return _parse_host_id(body)
+    return _parse_host_id(token)
+
+
+def _parse_id_list(text: str) -> tuple[int, ...] | None:
+    """Parse one line of ``id -G`` or a ``/proc`` id field. ``None`` if any token is bad."""
+
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    values: list[int] = []
+    for part in lines[0].split():
+        value = _parse_host_id(part)
+        if value is None:
+            return None
+        values.append(value)
+    if not values:
+        return None
+    return tuple(values)
+
+
+def _unusable_host_id(value: int | None) -> bool:
+    """True for missing, root, the overflow sentinel, and non-canonical ids."""
+
+    if value is None:
+        return True
+    if value < 0 or value > _HOST_ID_MAX:
+        return True
+    return value in {0, _HOST_ID_MAX}
+
+
+def _rejected_target_uid(uid: int | None, our_uid: int) -> bool:
+    """True when ``uid`` must not be the engine user."""
+
+    return uid is None or uid == our_uid or _unusable_host_id(uid)
+
+
+def _gid_set_rejected(
+    primary: int | None,
+    groups: tuple[int, ...] | None,
+    *,
+    caller_gid: int | None,
+) -> str | None:
+    """Return a rejection when these gids must not own the engine.
+
+    ``caller_gid`` is the caller's primary gid. The engine's primary gid must
+    not be that gid (group-readable engine files would be the caller's).
+    Supplementary group 0 is root's group. Pass ``caller_gid=None`` when the
+    process under test is the caller's own control process.
+    """
+
+    if _unusable_host_id(primary):
+        return f"rejected: primary gid {primary} is root or not a host gid"
+    if caller_gid is not None and primary == caller_gid:
+        return f"rejected: primary gid {primary} is the caller's gid"
+    if groups is None:
+        return "rejected: group list missing"
+    if primary not in groups:
+        return f"rejected: primary gid {primary} is not in the group list"
+    if any(_unusable_host_id(gid) for gid in groups):
+        return "rejected: a group id is root or not a host gid"
     return None
+
+
+def _target_gids_rejected(
+    run_fn: RunFn,
+    prefix: Sequence[str],
+    id_bin: str,
+    *,
+    caller_gid: int | None,
+) -> str | None:
+    """``id -g`` and ``id -G`` under ``prefix``. A reason, or ``None`` when usable."""
+
+    gid_result = run_fn((*prefix, id_bin, "-g"), 8.0)
+    groups_result = run_fn((*prefix, id_bin, "-G"), 8.0)
+    gid = _parse_uid_output(gid_result.stdout) if gid_result.returncode == 0 else None
+    groups = _parse_id_list(groups_result.stdout) if groups_result.returncode == 0 else None
+    if gid_result.returncode != 0 or groups_result.returncode != 0:
+        err = (
+            gid_result.stderr or groups_result.stderr or gid_result.stdout or ""
+        ).strip().replace("\n", " ")
+        return (
+            f"id -g/-G failed rc={gid_result.returncode}/{groups_result.returncode} "
+            f"err={err[:160]}"
+        )
+    return _gid_set_rejected(gid, groups, caller_gid=caller_gid)
 
 
 def _helper_paths(env: Mapping[str, str] | None) -> tuple[str, ...]:
@@ -509,11 +803,20 @@ def _probe_sudo_target(
     for user in candidates:
         result = run_fn(("sudo", "-n", "-u", user, "--", "id", "-u"), 8.0)
         uid = _parse_uid_output(result.stdout)
-        if result.returncode != 0 or uid is None or uid == our_uid or uid == 0:
+        if result.returncode != 0 or _rejected_target_uid(uid, our_uid):
             err = (result.stderr or result.stdout).strip().replace("\n", " ")
             notes.append(
                 f"sudo -n -u {user} -- id -u rc={result.returncode} uid={uid} err={err[:160]}"
             )
+            continue
+        gid_reason = _target_gids_rejected(
+            run_fn,
+            ("sudo", "-n", "-u", user, "--"),
+            "id",
+            caller_gid=os.getgid(),
+        )
+        if gid_reason is not None:
+            notes.append(f"sudo -n -u {user} {gid_reason}")
             continue
         notes.append(f"sudo -n -u {user} -- id -u -> {uid}")
         denied = None
@@ -561,32 +864,36 @@ def _probe_sudo_target(
 
 
 def _probe_systemd_run(run_fn: RunFn, user: str, our_uid: int) -> tuple[bool, int | None, str]:
-    result = run_fn(
-        (
-            "systemd-run",
-            f"--uid={user}",
-            "--wait",
-            "--pipe",
-            "--collect",
-            "/usr/bin/id",
-            "-u",
-        ),
-        8.0,
+    prefix = (
+        "systemd-run",
+        f"--uid={user}",
+        "--wait",
+        "--pipe",
+        "--collect",
     )
+    result = run_fn((*prefix, "/usr/bin/id", "-u"), 8.0)
     uid = _parse_uid_output(result.stdout)
     err = (result.stderr or "").strip().replace("\n", " ")
-    # Like the sudo target: never root, never our own uid. Root passes every
-    # F21 probe from uid 1000, so the gate cannot catch it later.
-    ok = result.returncode == 0 and uid is not None and uid != our_uid and uid != 0
+    # Like the sudo target: never root, never our own uid, never an id that
+    # truncates to root or is the overflow sentinel. Root passes every F21
+    # probe from uid 1000, so the gate cannot catch it later.
+    ok = result.returncode == 0 and not _rejected_target_uid(uid, our_uid)
     reason = (
         f"systemd-run --uid={user} --wait --pipe --collect /usr/bin/id -u "
         f"rc={result.returncode} uid={uid}"
     )
     if err:
         reason = f"{reason} err={err[:240]}"
-    if result.returncode == 0 and uid in (0, our_uid):
+    if result.returncode == 0 and uid is not None and _rejected_target_uid(uid, our_uid):
         reason = f"{reason}; rejected: engine user must not be root or the calling uid"
-    return ok, uid if ok else None, reason
+    if not ok:
+        return False, None, reason
+    gid_reason = _target_gids_rejected(
+        run_fn, prefix, "/usr/bin/id", caller_gid=os.getgid()
+    )
+    if gid_reason is not None:
+        return False, None, f"{reason}; {gid_reason}"
+    return True, uid, reason
 
 
 def _subid_lines(username: str, text: str | None) -> tuple[str, ...]:
@@ -612,16 +919,52 @@ def _proc_field(pid: int, key: str) -> str | None:
     return None
 
 
+def _proc_ids(pid: int, key: str) -> tuple[int, ...] | None:
+    """Parsed ``Uid`` or ``Gid`` line. ``None`` when missing or not canonical host ids."""
+
+    field = _proc_field(pid, key)
+    if not field:
+        return None
+    return _parse_id_list(field)
+
+
 def host_uids_of(pid: int) -> tuple[int, ...] | None:
     """Real, effective, saved and filesystem uid of ``pid`` (``/proc`` Uid line)."""
 
-    field = _proc_field(pid, "Uid")
+    return _proc_ids(pid, "Uid")
+
+
+def host_gids_of(pid: int) -> tuple[int, ...] | None:
+    """Real, effective, saved and filesystem gid of ``pid`` (``/proc`` Gid line)."""
+
+    return _proc_ids(pid, "Gid")
+
+
+def host_groups_of(pid: int) -> tuple[int, ...] | None:
+    """Supplementary groups of ``pid``. ``()`` when the line is present but empty.
+
+    ``None`` when the line is missing or a token is not a host gid. An empty
+    supplementary list is not root. A missing line is not evidence.
+    """
+
+    field = _proc_field(pid, "Groups")
+    if field is None:
+        return None
     if not field:
-        return None
-    tokens = field.split()
-    if not tokens or not all(token.isdigit() for token in tokens):
-        return None
-    return tuple(int(token) for token in tokens)
+        return ()
+    return _parse_id_list(field)
+
+
+def _process_gids_ok(
+    gids: tuple[int, ...] | None, groups: tuple[int, ...] | None
+) -> bool:
+    """False when any credential gid is root, overflow, or unknown."""
+
+    if not gids or any(_unusable_host_id(gid) for gid in gids):
+        return False
+    if groups is None or any(_unusable_host_id(gid) for gid in groups):
+        return False
+    return True
 
 
 def host_uid_of(pid: int) -> int | None:
@@ -650,14 +993,17 @@ def find_target_uid_pid(
     *,
     timeout_s: float = 1.5,
     uids_fn: Callable[[int], tuple[int, ...] | None] = host_uids_of,
+    gids_fn: Callable[[int], tuple[int, ...] | None] = host_gids_of,
+    groups_fn: Callable[[int], tuple[int, ...] | None] = host_groups_of,
     children_fn: Callable[[int], list[int]] = _children_of,
 ) -> int | None:
     """Walk ``root_pid`` and its descendants for the engine process.
 
     Matches only a process whose real, effective, saved and filesystem uids
-    all equal ``target_uid``, so a launcher such as sudo (real uid = caller,
-    effective uid = 0) is never returned. ``None`` when nothing matches before
-    the timeout; callers record that as an error and never probe another pid.
+    all equal ``target_uid``, and whose gids are not root or the overflow
+    sentinel, so a launcher such as sudo (real uid = caller, effective uid = 0)
+    is never returned. ``None`` when nothing matches before the timeout;
+    callers record that as an error and never probe another pid.
     """
 
     deadline = time.monotonic() + timeout_s
@@ -670,7 +1016,12 @@ def find_target_uid_pid(
                 continue
             seen.add(pid)
             uids = uids_fn(pid)
-            if uids and all(uid == target_uid for uid in uids):
+            if (
+                uids
+                and not _unusable_host_id(target_uid)
+                and all(uid == target_uid for uid in uids)
+                and _process_gids_ok(gids_fn(pid), groups_fn(pid))
+            ):
                 return pid
             stack.extend(children_fn(pid))
         if time.monotonic() >= deadline:
@@ -685,6 +1036,8 @@ def systemd_unit_main_pid(
     run_fn: RunFn,
     timeout_s: float = 3.0,
     uids_fn: Callable[[int], tuple[int, ...] | None] = host_uids_of,
+    gids_fn: Callable[[int], tuple[int, ...] | None] = host_gids_of,
+    groups_fn: Callable[[int], tuple[int, ...] | None] = host_groups_of,
 ) -> int | None:
     """MainPID of a transient systemd-run unit, if it runs entirely as ``target_uid``.
 
@@ -699,7 +1052,12 @@ def systemd_unit_main_pid(
         if result.returncode == 0 and token.isdigit() and int(token) > 0:
             pid = int(token)
             uids = uids_fn(pid)
-            if uids and all(uid == target_uid for uid in uids):
+            if (
+                uids
+                and not _unusable_host_id(target_uid)
+                and all(uid == target_uid for uid in uids)
+                and _process_gids_ok(gids_fn(pid), groups_fn(pid))
+            ):
                 return pid
         if time.monotonic() >= deadline:
             return None
@@ -967,7 +1325,7 @@ def run_same_uid_probes(
             if backend.name == "systemd_run":
                 unit = f"csl734-probe-{uuid.uuid4().hex[:12]}"
             cmd = spawn_command(backend, SLEEP_PROBE_ARGV, unit=unit)
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = _popen_checked(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 if unit is not None:
                     pid = systemd_unit_main_pid(unit, target_uid, run_fn=run_fn)
@@ -998,7 +1356,7 @@ def run_same_uid_control_probes(n: int = DEFAULT_N) -> tuple[ProbeSummary, ...]:
                 probe_abs_store_read((), tmp, expected_owner=our_uid),
                 f"0600 store owner uid={our_uid}",
             )
-            proc = subprocess.Popen(
+            proc = _popen_checked(
                 list(SLEEP_PROBE_ARGV), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             try:
@@ -1035,7 +1393,7 @@ def collect_host_facts(*, run_fn: RunFn | None = None) -> HostFacts:
     unshare_host_uid = None
     proc = None
     try:
-        proc = subprocess.Popen(
+        proc = _popen_checked(
             ["unshare", "--user", "sleep", "3"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1167,7 +1525,7 @@ def detect_backends(
         child_host_uid = None
         proc = None
         try:
-            proc = subprocess.Popen(
+            proc = _popen_checked(
                 ["unshare", "--user", "--map-auto", "--setuid", "1", "--setgid", "1", "sleep", "3"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

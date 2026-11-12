@@ -123,8 +123,24 @@ Foundry switches are dropped. The child gets one only from the route:
     a parent domain with or without the leading dot (`.gateway.example`, `gateway.example`,
     `example`), a `*` pattern, in any case, with a scheme prefix, brackets, a `:port` and a
     trailing dot stripped. The host's own trailing dot is ignored too.
-  - Ports are not compared. `gateway.example:8080` refuses a route on port 443: curl and
-    requests ignore the port, so the entry is treated as a match (fail closed).
+  - Ports are not compared for a name. `gateway.example:8080` refuses a route on port 443: curl and
+    requests ignore the port, so the entry is treated as a match (fail closed). An IPv6 entry that is an
+    address plus a decimal field (`2001:db8::1:8443`, `.2001:db8::1:8443`) is compared to `host:port` as
+    requests does, so a different port (`.2001:db8::1:9`) may launch. urllib's last-colon split is applied
+    (`2001:db8:` matches `2001:db8::1`; `:` is the hostonly of `::1`). A loopback route stays exempt.
+    Leading dots are ignored (`.2001:db8::1`, `.[2001:db8::1]`).
+  - requests matches with no dot boundary: after spaces are deleted, an entry refuses when a protected
+    host or `host:port` ends with it (`pi.anthropic.com` and `p i.anthropic.com` match `api.anthropic.com`;
+    `443` matches `api.anthropic.com:443` and a route URL that spells port 443). The entry text is still
+    not shown.
+  - An empty lowercase proxy name beside a non-empty uppercase one (`https_proxy=""` with `HTTPS_PROXY`
+    set, and the same for `http_proxy` / `HTTP_PROXY` and `all_proxy` / `ALL_PROXY`) refuses with
+    `proxy_cleared`. Empty uppercase beside a set lowercase, and both empty, still launch.
+  - A null in `HOME` refuses `home_unsafe` before any stat. A null or a non-string in a kept value, a
+    passthrough token, `NO_PROXY`, argv or cwd refuses `value_malformed` or `argv_malformed` before
+    spawn. A non-string name or value anywhere in the parent mapping refuses `value_malformed`.
+  - A cached route temp root that later fails the mode check is removed when it is still that same empty
+    directory and it is ours, then created again.
   - An IP-literal host (`10.1.2.3`, `[2001:db8::1]`) is also matched as an address: by an entry
     that is that address (`10.1.2.3`, `10.1.2.3:4000`, `[2001:db8::1]`, `[2001:db8::1]:8443`,
     `2001:db8::1`, another spelling of it such as `2001:db8:0:0:0:0:0:1`) and by a CIDR block

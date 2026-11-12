@@ -566,7 +566,9 @@ def cells(s: Scratch) -> list[Cell]:
         ("lookalike", base_url, "notgateway.invalid,gateway.invalid.evil", True),
         ("child_of_host", base_url, "llm.gateway.invalid", True), ("empty", base_url, "", True),
         ("cidr_is_not_a_name", base_url, "10.0.0.0/8,0.0.0.0/1,2000::/3", True), ("cidr_other_net", v4_url, "192.168.0.0/16", True),
-        ("v4_other", v4_url, "10.1.2.30,110.1.2.3,10.1.2.4:4000", True), ("v6_other", v6_url, "[2001:db8::2],2001:db8::1:0,::1,10.0.0.0/8", True),
+        ("v4_other", v4_url, "10.1.2.30,110.1.2.3,10.1.2.4:4000", True),
+        # "::1" is a requests endswith of "2001:db8::1" (no dot boundary), so it is not in this launch list.
+        ("v6_other", v6_url, "[2001:db8::2],2001:db8::1:0,10.0.0.0/8", True),
     ]
     for name, value, entry, with_proxy in route_ok:
         parent = {"NO_PROXY": entry, **({"HTTPS_PROXY": PROXY} if with_proxy else {})}

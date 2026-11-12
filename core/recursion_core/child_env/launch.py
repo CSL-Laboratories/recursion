@@ -40,8 +40,10 @@ def spawn(
 
     if type(env) is not ValidatedEnv:
         raise TypeError("spawn needs the ValidatedEnv build_child_env returned, not a plain mapping")
-    if isinstance(argv, (str, bytes)) or not argv or not all(isinstance(item, str) for item in argv):
+    if isinstance(argv, (str, bytes)) or not argv or not all(isinstance(item, str) and "\0" not in item for item in argv):
         raise EnvRefused(None, "argv_malformed")
+    if cwd is not None and (not isinstance(cwd, str) or "\0" in cwd):
+        raise EnvRefused(None, "value_malformed")
     bad = sorted(_FORBIDDEN.intersection(popen_kwargs))
     if "start_new_session" in popen_kwargs and popen_kwargs["start_new_session"] is not True:
         bad.append("start_new_session")  # the child always gets its own session (cleanup signals its group)
@@ -49,6 +51,9 @@ def spawn(
         raise EnvRefused(None, "launch_option_denied:" + ",".join(bad))
     executable = _resolve_executable(argv[0], env)
     child_env = env.to_dict()
+    for name, value in child_env.items():
+        if not isinstance(name, str) or not isinstance(value, str) or "\0" in name or "\0" in value:
+            raise EnvRefused(name if isinstance(name, str) else None, "value_malformed")
     kwargs: dict[str, object] = dict(popen_kwargs)
     kwargs.update(env=child_env, cwd=cwd, close_fds=True, shell=False)
     if os.name != "nt":

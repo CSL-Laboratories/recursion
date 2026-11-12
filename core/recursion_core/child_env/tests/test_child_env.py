@@ -740,10 +740,14 @@ class AuthRouteTests(unittest.TestCase):
             with self.subTest(base_url=base_url, entry=entry), self.assertRaises(EnvRefused) as caught:
                 self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
             self._assert_position_only(caught.exception, "NO_PROXY", "no_proxy_route_host", 1, self.ROUTE_HOST_WHY)
-        # A suffix needs a dot before it. A lookalike, bracketed or with a trailing dot, still launches.
+        # requests endswith has no dot boundary, so "pic.com" is a suffix of "api.anthropic.com" and of
+        # "epic.com". A lookalike that is not a suffix, bracketed or with a trailing dot, still launches.
+        for entry in ("pic.com", "[pic.com]:443", "pic.com:443."):
+            with self.subTest(entry=entry), self.assertRaises(EnvRefused) as caught:
+                self._no_proxy_route(home, "https://epic.com/api", {**proxy, "NO_PROXY": entry})
+            self._assert_position_only(caught.exception, "NO_PROXY", "no_proxy_engine_host", 1, self.ENGINE_HOST_WHY)
         for base_url, entry in (
-            ("https://epic.com/api", "pic.com"), ("https://epic.com/api", "[pic.com]:443"),
-            ("https://epic.com/api", "pic.com:443."), (https, "notgateway.example"),
+            (https, "notgateway.example"),
             (https, "[notgateway.example]:443"), (https, "notgateway.example:443."),
         ):
             with self.subTest(base_url=base_url, kept=entry):
@@ -781,7 +785,7 @@ class AuthRouteTests(unittest.TestCase):
             self.assertEqual(("NO_PROXY", "no_proxy_route_host"), (caught.exception.name, caught.exception.cause))
         kept = (
             (v4, "10.1.2.4,10.1.2.30,110.1.2.3,10.1.2.4:4000"), (v4, "192.168.0.0/16,10.2.0.0/16,::1/128"),
-            (v4, "[::1],::1"), (v6, "2001:db8::2,[2001:db8::10]:8443,2001:db9::/32,0.0.0.0/1"), (v6, "db8::1"),
+            (v4, "[::1],::1"), (v6, "2001:db8::2,[2001:db8::10]:8443,2001:db9::/32,0.0.0.0/1"),
             ("https://[::1]", "127.0.0.1,localhost,::2/128"), ("http://127.1.example", "127.0.0.1"),
             ("http://1.2.3.4.5", "1.2.3.4,1.2.3.0/24"), ("http://256.1.1.1", "0.0.0.0/1"), ("http://127.0.0.08", "127.0.0.8"),
             ("https://gateway.example", "10.0.0.0/8,0.0.0.0/1,2000::/3,127.0.0.1"),  # a block never matches a name
@@ -1309,12 +1313,18 @@ class AuthRouteTests(unittest.TestCase):
             "NO_PROXY: no_proxy_unparseable: entry 1 of NO_PROXY is unparseable: a path, a second '/', or a prefix length that "
             "isn't plain decimal isn't allowed in a NO_PROXY entry; the entry is not shown", str(caught.exception))
         # No text of the entry is shown, so a control character, a direction override or a quote in it cannot dress the line up.
-        for entry in ("example.com/\x1b[2K", "evil/‮gnp", "a'b/", "x/\x00", "a" * 5000 + "/", "10.0.0.0/" + "9" * 5000):
+        for entry in ("example.com/\x1b[2K", "evil/‮gnp", "a'b/", "a" * 5000 + "/", "10.0.0.0/" + "9" * 5000):
             with self.subTest(entry=entry[:20]), self.assertRaises(EnvRefused) as caught:
                 build_child_env("codex", home=home, auth_mode=API, route=ROUTES[API],
                                 parent={"PATH": "/usr/bin", **proxy, "no_proxy": f"localhost,{entry}"})
             self._assert_unparseable(caught.exception, "no_proxy", 2, self.SLASH_WHY)
             self.assertLess(len(str(caught.exception)), 200)  # the same short line, however long the entry
+        with self.subTest(entry="nul"), self.assertRaises(EnvRefused) as caught:
+            build_child_env("codex", home=home, auth_mode=API, route=ROUTES[API],
+                            parent={"PATH": "/usr/bin", **proxy, "no_proxy": "localhost,x/\x00"})
+        self.assertEqual((caught.exception.name, caught.exception.cause), ("no_proxy", "value_malformed"))
+        self.assertNotIn("\0", str(caught.exception))
+        self.assertLess(len(str(caught.exception)), 200)
         with self.assertRaises(EnvRefused) as caught:  # a line break ends the entry: the detail holds none
             build_child_env("codex", home=home, auth_mode=API, route=ROUTES[API],
                             parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "example.com/\nNO_PROXY: ok"})

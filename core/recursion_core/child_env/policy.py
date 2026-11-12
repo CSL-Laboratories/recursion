@@ -372,7 +372,7 @@ def build_child_env(
     route_env = _route_env(profile, auth_mode, route)  # refuses before anything is read from the parent
     if not _private_dir(home):
         raise EnvRefused("HOME", "home_unsafe")
-    source = dict(os.environ if parent is None else parent)
+    source = _copy_parent(parent)
     env = {name: source[name] for name in profile.allowed if name in source and name != "HOME"}
     passed = {name: source[name] for name in profile.passthrough if name in source}
     dropped = tuple(sorted(name for name in source if name not in env and name not in passed and name != "HOME"))
@@ -391,6 +391,13 @@ def build_child_env(
             raise EnvRefused(name, "override_denied")
         env[name] = value
 
+    # A null in a value that is kept (including NO_PROXY with no proxy set) makes Popen raise ValueError.
+    # Refuse before any stat or spawn. Temp values are replaced and are not read.
+    for name, value in env.items():
+        if name not in TEMP_NAMES:
+            _require_text(name, value)
+    for name, value in passed.items():
+        _require_text(name, value)  # the sign-in token is not interpreted; Popen still rejects a null in it
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:
         cause = _unsafe_value(name, env[name]) if env[name] else None  # empty: no path or URL to check
         if cause is not None:
@@ -400,6 +407,12 @@ def build_child_env(
     # A bypass only matters when a proxy is set: "*" or an all-address CIDR block skips it for every host, an
     # engine-host entry for that engine, an entry for the route's base host for the route gateway.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
+        # urllib and requests prefer a lowercase name and drop the uppercase one when the lowercase is set but
+        # empty (getproxies_environment pops it; undici's ``https_proxy ?? HTTPS_PROXY`` keeps the empty string).
+        # HTTPS then goes direct. The same for http and all. Empty uppercase beside a non-empty lowercase still
+        # uses the lowercase value, and both empty is no proxy.
+        if (cleared := _proxy_cleared(env)) is not None:
+            raise EnvRefused(cleared, "proxy_cleared")
         # NO_PROXY and no_proxy are one combined list here (owner call, 2026-11-10): the refusal names the variable
         # that holds the refusing entry and that entry's position in it, never any text of the entry.
         lists = [(name, env[name]) for name in NO_PROXY_NAMES if name in env]
@@ -411,8 +424,9 @@ def build_child_env(
         # only (owner call, 2026-11-10): NO_PROXY may name a gateway on this machine.
         base = route_env.get(profile.base_url_name) if profile.base_url_name else None
         if base is not None and not _loopback_host(host := _BASE_URL.match(base)["host"]):
+            port = _BASE_URL.match(base)["port"]
             for name in [name for name in NO_PROXY_NAMES if name in env]:
-                if (found := _no_proxy_route_bypass(env[name], host)) is not None:
+                if (found := _no_proxy_route_bypass(env[name], host, int(port) if port else None)) is not None:
                     raise _no_proxy_refused(name, *found)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
@@ -420,6 +434,8 @@ def build_child_env(
         env.update(dict.fromkeys(present, _route_tmp()))
     env["HOME"] = home
     env.update(passed)  # after every check: the user's own sign-in value is passed as it is, never read here
+    for name, value in route_env.items():
+        _require_text(name, value)
 
     leaked = sorted(name for name in env if name in profile.scrub
                     or (name not in profile.allowed and name not in profile.passthrough and _DENIED.search(name)))
@@ -683,6 +699,40 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
+def _copy_parent(parent: Mapping[str, str] | None) -> dict[str, str]:
+    """The parent environment as strings. A non-string name or value is not an environment Popen can take."""
+
+    raw = os.environ if parent is None else parent
+    if not isinstance(raw, Mapping):
+        raise EnvRefused(None, "value_malformed")
+    source: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise EnvRefused(name if isinstance(name, str) else None, "value_malformed")
+        source[name] = value
+    return source
+
+
+def _require_text(name: str | None, value: object) -> None:
+    """Refuse a null or a non-string. ``Popen`` raises ``ValueError`` or ``TypeError`` for one."""
+
+    if not isinstance(value, str) or "\0" in value:
+        raise EnvRefused(name, "value_malformed")
+
+
+def _proxy_cleared(env: Mapping[str, str]) -> str | None:
+    """The lowercase proxy name whose empty value drops a non-empty uppercase one, or None.
+
+    urllib ``getproxies_environment`` and requests return no proxy for that scheme (direct). undici keeps the
+    empty string via ``https_proxy ?? HTTPS_PROXY``. Empty uppercase beside a set lowercase is not this case.
+    """
+
+    for lower, upper in (("http_proxy", "HTTP_PROXY"), ("https_proxy", "HTTPS_PROXY"), ("all_proxy", "ALL_PROXY")):
+        if lower in env and env[lower] == "" and env.get(upper):
+            return lower
+    return None
+
+
 def _no_proxy_entries(value: str) -> list[str]:
     """A NO_PROXY value as lowercased entries, comma and whitespace split, each without its scheme prefix.
 
@@ -879,6 +929,74 @@ def _name_hit(entry: str, hosts: tuple[str, ...]) -> bool:
     return any(host == bare or host.endswith("." + bare) for host in hosts)
 
 
+# urllib.parse._splitport: the last ":digits" of the host being requested are a port, so "::1" is host ":".
+_SPLIT_PORT = re.compile(r"(.*):([0-9]+)\Z")
+
+
+def _urllib_hostonly(host: str) -> str:
+    """The host ``urllib.request.proxy_bypass_environment`` compares, after its last-colon split."""
+
+    match = _SPLIT_PORT.fullmatch(host)
+    return match.group(1) if match else host
+
+
+def _client_hit(entry: str, host: str, port: int | None) -> bool:
+    """Whether urllib or requests 2.31 would bypass ``host`` for this one entry.
+
+    urllib compares the entry, with leading dots removed, to the host and to the hostonly of its last-colon
+    split (``:`` equals the hostonly of ``::1``; ``2001:db8:`` equals the hostonly of ``2001:db8::1``), and to
+    ``Request.host`` (``[2001:db8::1]:8443`` splits to ``[2001:db8::1]``, so ``.[2001:db8::1]`` matches).
+    requests deletes spaces before this is called and then uses ``hostname.endswith(entry)`` with no dot
+    boundary, and the same on ``hostname:port`` when the URL spells a port. Leading dots are removed first so
+    ``.2001:db8::1:8443`` is that host:port and ``.2001:db8::1:9`` is not. A ``*``, ``%`` or ``/`` entry is left
+    to the rules that already judge those. Nothing here resolves a name.
+    """
+
+    if not entry or any(mark in entry for mark in "*/%"):
+        return False
+    host = host.lower().strip("[]").rstrip(".")
+    texts: list[str] = []
+    for text in (entry.lower(), entry.lower().lstrip(".")):
+        if text and text not in texts:
+            texts.append(text)
+    bare = [host]
+    if port is not None:
+        bare.append(f"{host}:{port}")
+    equal = list(bare)
+    if ":" in host:
+        bracketed = f"[{host}]"
+        equal.append(f"{bracketed}:{port}" if port is not None else bracketed)
+    for form in list(equal):
+        only = _urllib_hostonly(form)
+        if only not in equal:
+            equal.append(only)
+    for text in texts:
+        if text in equal or any(target.endswith(text) for target in bare):
+            return True
+    return False
+
+
+def _ipv6_with_port(entry: str) -> tuple[str, str] | None:
+    """An IPv6 address plus a trailing decimal field, after leading dots, or None.
+
+    ``2001:db8::1:8443`` is a different address from ``2001:db8::1`` and also ``host:port`` for requests.
+    Parsing it with ``ip_address`` and stopping there misses the port; dropping the field and ignoring the
+    port matches a route on every port, including ``:9``. The field is kept and compared as ``host:port``.
+    """
+
+    text = entry.lstrip(".")
+    if text.count(":") < 2:
+        return None
+    head, sep, tail = text.rpartition(":")
+    if not sep or not tail.isascii() or not tail.isdecimal():
+        return None
+    try:
+        ipaddress.ip_address(head)
+    except ValueError:
+        return None
+    return head, tail
+
+
 def _idna_hosts(hosts: tuple[str, ...]) -> bool:
     """Whether a host has a punycode (``xn--``) label, the only kind a ``foreign`` reading could match in Go."""
 
@@ -984,6 +1102,14 @@ def _no_proxy_bypass(lists: list[tuple[str, str]], hosts: tuple[str, ...]) -> En
             return _no_proxy_refused(name, position, "no_proxy_wildcard", "completes a cover of every IPv4 address"
                                      if reading.ranges else "completes a CIDR cover of every IPv4 address")
         if (entry and _no_proxy_hit(entry, hosts)) or any(text and _name_hit(text, hosts) for text in others):
+            return _no_proxy_refused(name, position, "no_proxy_engine_host", "matches one of the engine's own hosts")
+        # requests endswith (no dot boundary) and urllib's last-colon host, including host:443 as spelled in a URL.
+        raws = [text for text in reading.checked + reading.matched + reading.joined if text]
+        # The name form drops brackets and a :port. An IPv6 address-plus-port is left whole: stripping the
+        # last field would compare a different address. requests has no dot boundary, so "pic.com" matches
+        # "api.anthropic.com" and "443" matches "host:443".
+        named = [_no_proxy_name(text) for text in raws if _ipv6_with_port(text) is None]
+        if any(_client_hit(text, host, 443) for text in raws + named if text for host in hosts):
             return _no_proxy_refused(name, position, "no_proxy_engine_host", "matches one of the engine's own hosts")
         if reading.foreign and _idna_hosts(hosts):
             return _no_proxy_refused(name, position, "no_proxy_unparseable", _FOREIGN_WHY)
@@ -1138,7 +1264,7 @@ def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
     return bool(_ip_forms(parsed) & addresses)
 
 
-def _no_proxy_route_bypass(value: str, host: str) -> tuple[int, str, str] | None:
+def _no_proxy_route_bypass(value: str, host: str, port: int | None = None) -> tuple[int, str, str] | None:
     """CSL-839: the first NO_PROXY entry that matches the route's base URL host, by position from 1, or None.
 
     The same matcher as ``_no_proxy_bypass``, over the one host: the host itself, a parent domain with or
@@ -1148,7 +1274,10 @@ def _no_proxy_route_bypass(value: str, host: str) -> tuple[int, str, str] | None
     also matched as an address: by an entry that is that address, and by a CIDR block that holds it (curl
     7.86+, requests, undici and Go honour CIDR). A CIDR entry never matches a name: no matcher resolves DNS.
     An entry that is an address or a block is decided as one and not also as a name, so the port strip cannot
-    turn ``::1:0`` into ``::1``. A loopback host never gets here: ``build_child_env`` exempts it
+    turn ``::1:0`` into ``::1``. An entry that is an IPv6 address plus a decimal field (``2001:db8::1:8443``,
+    including a leading dot) is not that strip: the field is a port for requests' ``host:port``, so
+    ``.2001:db8::1:9`` does not match port 8443. ``_client_hit`` also applies urllib's last-colon split and
+    requests' endswith with no dot boundary. A loopback host never gets here: ``build_child_env`` exempts it
     (``_loopback_host``). Neither does an all-address cover, a ``/`` entry that is no CIDR block or a ``%``
     entry: ``_no_proxy_bypass`` refused those first.
 
@@ -1163,11 +1292,22 @@ def _no_proxy_route_bypass(value: str, host: str) -> tuple[int, str, str] | None
     v4 = [int(address) for address in addresses if address.version == 4]
     for position, reading in enumerate(_no_proxy_readings(value), 1):
         for index, entry in enumerate(reading.checked + reading.matched + reading.joined):
+            raw = entry
             hit = _no_proxy_ip_hit(entry, addresses)
-            if hit is None:
-                entry = _no_proxy_name(entry)
+            # An IPv6 address with a trailing decimal field is also a different address. Keep the field and
+            # compare host:port; dropping it would match every port, and stopping at ip_address would match none.
+            if hit is None and _ipv6_with_port(entry) is None:
+                named = _no_proxy_name(entry)
                 matcher = _no_proxy_hit if index == 0 else _name_hit  # only the entry itself is a "*" pattern
-                hit = bool(entry) and entry.strip("*.") != "" and matcher(entry, (host,))
+                hit = bool(named) and named.strip("*.") != "" and matcher(named, (host,))
+            if not hit and _client_hit(raw, host, port):
+                hit = True
+            # A name's :port is dropped and then matched with no dot boundary ("pic.com" in "epic.com").
+            # Two or more colons is an IPv6 spelling: dropping the last field would turn "2001:db8::2" into
+            # "2001:db8:", which is urllib's hostonly of the different address "2001:db8::1".
+            if not hit and raw.lstrip(".").count(":") < 2:
+                named = _no_proxy_name(raw)
+                hit = bool(named) and _client_hit(named, host, port)
             if hit:
                 return position, "no_proxy_route_host", "matches the route's base URL host"
         if any(first <= address <= last for first, last in reading.ranges for address in v4):
@@ -1231,9 +1371,13 @@ def _lexical_dir(path: str) -> str:
 
 
 def _private_dir(path: str | None) -> bool:
-    if not isinstance(path, str) or not os.path.isabs(path):
+    # A null is refused before Path or lstat: both raise ValueError ("embedded null byte") instead of EnvRefused.
+    if not isinstance(path, str) or "\0" in path or not os.path.isabs(path):
         return False
-    entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling
+    try:
+        entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling
+    except (OSError, ValueError):
+        return False
     if os.path.basename(entry) == "..":  # link/sub/.. names the link's target without naming an entry: refused
         return False
     real, missing, cause = _resolve(entry)
@@ -1290,5 +1434,18 @@ def _route_tmp() -> str:
             st = None
         if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077
                 or not _owned_chain(path)):
+            # The cached root failed the mode check. Remove it only when a second lstat still sees the same
+            # empty directory of ours (st_dev, st_ino): a path replaced in between is left alone. os.rmdir
+            # deletes a directory only when it is empty.
+            if path and st is not None and stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
+                try:
+                    again = os.lstat(path)
+                except OSError:
+                    again = None
+                if again is not None and (again.st_dev, again.st_ino) == (st.st_dev, st.st_ino):
+                    try:
+                        os.rmdir(path)
+                    except OSError:
+                        pass
             path = _TMP[key] = _make_route_tmp()
         return path

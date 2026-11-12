@@ -262,14 +262,17 @@ class IdnaFoldTests(unittest.TestCase):
 class LoopbackStaysAllowedTests(unittest.TestCase):
     def test_the_usual_loopback_list_launches_on_every_route(self) -> None:
         home = _home(self)
-        for value in ("localhost,127.0.0.1,::1", "localhost 127.0.0.1 ::1", ".localhost,127.0.0.0/8", "localhost\ufeff,\ufeff127.0.0.1",
-                      "127.0.0.1-127.0.0.255"):
+        # requests matches with no dot boundary, so a standalone "::1" is a suffix of "2001:db8::1".
+        # That list still launches on every other route, including loopback.
+        v6_suffix = {"localhost,127.0.0.1,::1", "localhost 127.0.0.1 ::1"}
+        for value in (*v6_suffix, ".localhost,127.0.0.0/8", "localhost\ufeff,\ufeff127.0.0.1", "127.0.0.1-127.0.0.255"):
             for base_url in (None, GATEWAY, V4_GATEWAY, V6_GATEWAY, LOOPBACK, "http://localhost:4000", "http://[::1]:4000"):
                 for engine in ("claude_code", "codex"):
                     if engine == "codex" and base_url is not None:
                         continue
+                    expected = ("NO_PROXY", "no_proxy_route_host", 3) if value in v6_suffix and base_url == V6_GATEWAY else "launched"
                     with self.subTest(value=ascii(value), base_url=base_url, engine=engine):
-                        self.assertEqual("launched", _outcome(home, {"NO_PROXY": value}, base_url, engine))
+                        self.assertEqual(expected, _outcome(home, {"NO_PROXY": value}, base_url, engine))
 
     def test_a_loopback_route_may_still_be_named_in_any_reading(self) -> None:
         home = _home(self)

@@ -50,26 +50,14 @@ _READ_CAP = 1 << 20
 _MAX_CGROUP_DEPTH = 64
 
 
-def _unregistered_run_name(name):
-    """A ``run-`` directory that is neither a leaf id nor a systemd scope.
-
-    Leaf ids are ours only with the ownership marker. ``run-*.scope`` is
-    systemd's even when it sits in this root. Any other single ``run-``
-    component is an unregistered leftover and sweep may kill it.
-    """
-    if not isinstance(name, str) or '/' in name or '\x00' in name:
-        return False
-    if not name.startswith('run-') or name.endswith('.scope'):
-        return False
-    return LEAF_NAME.fullmatch(name) is None
-
-
 def mark_owned(path):
     """Record that this launcher created ``path``.
 
-    The mark sits on the directory inode. A shared delegated root can hold a
-    systemd ``run-*.scope`` or another tool's ``run-<id>``; neither gets this
-    attribute from us, and sweep does not treat the name as permission to kill.
+    The mark sits on the directory inode. Sweep and adopt trust a directory
+    only when its name is a leaf id and this attribute is present. A shared
+    delegated root can hold a systemd ``run-*.scope`` or another tool's
+    ``run-<id>``; the ``run-`` prefix alone is not ownership, and sweep does
+    not kill from the name.
     """
     os.setxattr(os.fspath(path), OWNERSHIP_XATTR, OWNERSHIP_VALUE, follow_symlinks=False)
 
@@ -319,7 +307,7 @@ class Cgroup2:
             pass
         return None
 
-    def remove(self, leaf: Path, deadline=None, identity=None):
+    def remove(self, leaf: Path, deadline=None, identity=None, dirfd=None):
         """rmdir ``leaf`` bottom-up only when it is still ``identity`` and empty.
 
         ``identity`` is the ``(st_dev, st_ino)`` from when the handle opened the
@@ -331,14 +319,19 @@ class Cgroup2:
         while it still reads empty is the dying-task race and is retried until
         ``deadline`` (or a short bound when the caller did not pass one).
         Interface files are never unlinked; on cgroupfs, ``rmdir`` drops them.
+        ``dirfd`` is that same inode when the caller still holds it. ``rmdir``
+        uses the parent directory fd. The inode is booked gone only when its
+        ``st_nlink`` is 0 afterwards. If it is still linked, or that cannot be
+        checked, this raises. A name swapped into the parent in the gap before
+        ``rmdir`` can still be deleted; that race is not closed.
         """
         if identity is None or cgroup_identity(leaf) != identity:
             raise OSError(errno.EBUSY, 'cgroup identity unknown or changed')
         if deadline is None:
             deadline = time.monotonic() + 0.25
-        self._remove_dir(Path(leaf), deadline, identity, 0)
+        self._remove_dir(Path(leaf), deadline, identity, 0, dirfd)
 
-    def _remove_dir(self, directory, deadline, identity, depth):
+    def _remove_dir(self, directory, deadline, identity, depth, dirfd=None):
         if depth > _MAX_CGROUP_DEPTH:
             raise OSError(errno.EBUSY, 'cgroup tree too deep')
         if not self._identity_ok(directory, identity):
@@ -350,9 +343,9 @@ class Cgroup2:
             if not self._identity_ok(directory, identity):
                 raise OSError(errno.EBUSY, 'cgroup identity changed')
             self._remove_dir(child, deadline, child_identity, depth + 1)
-        self._rmdir_when_empty(directory, deadline, identity)
+        self._rmdir_when_empty(directory, deadline, identity, dirfd)
 
-    def _rmdir_when_empty(self, directory, deadline, identity):
+    def _rmdir_when_empty(self, directory, deadline, identity, dirfd=None):
         attempts = 0
         while True:
             if not self._identity_ok(directory, identity):
@@ -364,12 +357,15 @@ class Cgroup2:
             if not self._identity_ok(directory, identity):
                 raise OSError(errno.EBUSY, 'cgroup identity changed')
             try:
-                self._rmdir(directory)
+                self._rmdir(directory, identity=identity, dirfd=dirfd)
                 return
             except FileNotFoundError:
-                return
+                raise OSError(errno.EBUSY, 'cgroup identity could not be verified') from None
             except OSError as exc:
                 if exc.errno != errno.EBUSY:
+                    raise
+                # An identity miss is not the dying-task race.
+                if exc.strerror and 'identity' in exc.strerror:
                     raise
                 attempts += 1
                 if not self._confirmed_empty(directory, deadline):
@@ -381,8 +377,69 @@ class Cgroup2:
                     raise
                 time.sleep(min(0.01, remaining))
 
-    def _rmdir(self, directory):
-        os.rmdir(directory)
+    def _prepare_rmdir(self, dirfd):
+        """Test hook. On cgroupfs, ``rmdir`` drops interface files itself."""
+        return
+
+    def _rmdir(self, directory, identity=None, dirfd=None):
+        """``rmdir`` the name in its parent, then require ``identity`` to be gone.
+
+        ``dirfd``, when the caller still holds it, is that inode. The name is
+        opened through the parent fd and must be the same inode before
+        ``rmdir``. Afterwards that inode must have ``st_nlink == 0``. Anything
+        else raises, and the caller must not book the directory removed.
+        """
+        directory = Path(directory)
+        if identity is None:
+            raise OSError(errno.EBUSY, 'cgroup identity unknown or changed')
+        parent_fd = os.open(directory.parent,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        held = dirfd
+        close_held = False
+        try:
+            if held is None:
+                try:
+                    held = os.open(directory.name,
+                                   os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                                   dir_fd=parent_fd)
+                except FileNotFoundError:
+                    raise OSError(errno.EBUSY, 'cgroup identity could not be verified') from None
+                close_held = True
+            try:
+                info = os.fstat(held)
+            except OSError as exc:
+                raise OSError(errno.EBUSY, 'cgroup identity could not be verified') from exc
+            if ((info.st_dev, info.st_ino) != tuple(identity)
+                    or not stat.S_ISDIR(info.st_mode)):
+                raise OSError(errno.EBUSY, 'cgroup identity changed')
+            try:
+                probe = os.open(directory.name,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                                dir_fd=parent_fd)
+            except FileNotFoundError:
+                probe = None
+            if probe is not None:
+                try:
+                    named = os.fstat(probe)
+                finally:
+                    os.close(probe)
+                if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+                    raise OSError(errno.EBUSY, 'cgroup identity changed')
+                self._prepare_rmdir(held)
+                try:
+                    os.rmdir(directory.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            try:
+                after = os.fstat(held)
+            except OSError as exc:
+                raise OSError(errno.EBUSY, 'cgroup identity could not be verified') from exc
+            if after.st_nlink != 0 or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                raise OSError(errno.EBUSY, 'cgroup identity still present after rmdir')
+        finally:
+            os.close(parent_fd)
+            if close_held and held is not None:
+                os.close(held)
 
 
 class DelegatedRoot:
@@ -457,13 +514,15 @@ class DelegatedRoot:
         kill-everything default: a daemon restart or upgrade must not end live runs
         (PRODUCT.md 055cc7a5 section 3.1, grill Q38 / O53).
 
-        A directory is killed when its name is a leaf id and the ownership
-        marker written at creation is on that inode, or when the name is an
-        unregistered ``run-`` component that is not a systemd ``run-*.scope``.
-        A scope, any other name, a leaf id without the marker, and a symlink
-        are left in place and returned in ``reported``. An unregistered name
-        whose ``cgroup.procs`` still lists an id is killed but not removed.
-        Exits of swept leaves are unseen, so they are never booked terminated.
+        A directory is killed only when its name is a leaf id and the
+        directory fd opened afterwards is still that inode and carries the
+        ownership marker. The ``run-`` prefix alone is not ownership. A
+        ``run-*`` name that is not a leaf id, any other name, a leaf id
+        without the marker, an opened inode that is not the one just
+        classified, and a symlink are left in place and returned in
+        ``reported``. They are not killed. A leaf whose ``cgroup.procs``
+        still lists an id is not removed. Exits of swept leaves are unseen,
+        so they are never booked terminated.
         """
         if isinstance(keep, (str, bytes)):
             raise TypeError('keep must be a collection of leaf names, not a string')
@@ -490,18 +549,31 @@ class DelegatedRoot:
                 continue
             if not stat.S_ISDIR(info.st_mode):
                 continue
-            unregistered = _unregistered_run_name(leaf.name)
-            if LEAF_NAME.fullmatch(leaf.name) is None and not unregistered:
+            # The run- prefix is not ownership. Only a leaf id can be ours,
+            # and only together with the marker on the inode we just saw.
+            if LEAF_NAME.fullmatch(leaf.name) is None:
                 report(leaf.name, 'foreign-name')
                 continue
-            # Open first, then read the marker through that dirfd, so a replaced
-            # path cannot borrow a check done against an earlier inode.
+            classified = (info.st_dev, info.st_ino)
             run = LeafRun(self.fs, leaf, kill_timeout)
             try:
                 if run.dirfd is None:
                     report(leaf.name, 'unreadable')
                     continue
-                if not unregistered and not _marked_owned(run.dirfd):
+                # The name can be replaced between the classification lstat
+                # and this open. fstat and the marker both go through the fd
+                # (getxattr on the fd), and both must still describe the
+                # classified inode. Otherwise leave it in place.
+                try:
+                    opened = os.fstat(run.dirfd)
+                except OSError:
+                    report(leaf.name, 'unreadable')
+                    continue
+                if ((opened.st_dev, opened.st_ino) != classified
+                        or not stat.S_ISDIR(opened.st_mode)):
+                    report(leaf.name, 'foreign-name')
+                    continue
+                if not _marked_owned(run.dirfd):
                     report(leaf.name, 'unmarked')
                     continue
                 outcomes[leaf.name] = run.close()
@@ -702,10 +774,14 @@ class LeafRun:
         if state in ('leaf_empty', 'empty'):
             self.removing = True
             try:
-                self.fs.remove(self.leaf, deadline=deadline, identity=self.identity)
+                self.fs.remove(self.leaf, deadline=deadline, identity=self.identity,
+                               dirfd=self.dirfd)
                 self.removed = True
             except OSError as exc:
                 errors.setdefault(f'rmdir: {exc!r}')
+                # Identity not confirmed gone: do not book empty/removed.
+                if not self.removed and exc.strerror and 'identity' in exc.strerror:
+                    state = 'unknown'
             if self.removed:
                 self._close_dirfd()
         outcome = Outcome(state, self.proc.returncode if self.proc else None, populated,

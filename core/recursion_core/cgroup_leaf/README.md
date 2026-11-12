@@ -43,20 +43,27 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   place. The handle remembers the directory's device and inode and keeps that
   directory fd open. `cgroup.kill` and `cgroup.events` are used through that
   fd, so a directory swapped onto the path is not written or read. `rmdir`
-  checks the inode again after the empty read and before the call. If the
-  identity was never known, or a different directory is now at the path, the
-  result stays `unknown` and that directory is left in place. A child cgroup
-  is removed only when it is still the inode seen when its parent was listed.
+  is issued on the child name through the parent directory fd, after that
+  name is checked against the inode the handle holds. The leaf is booked
+  removed only when that inode then has `st_nlink == 0`. If it is still
+  linked, or the check cannot be made, the outcome is `unknown` with an
+  error. A name swapped into the parent in the gap before `rmdir` can still
+  be deleted; that race is not closed. If the identity was never known, or a
+  different directory is now at the path, the result stays `unknown` and that
+  directory is left in place. A child cgroup is removed only when it is still
+  the inode seen when its parent was listed.
 - Restart: `sweep(keep)` returns a `SweepResult`. It kills a leftover directory
-  when the name is a leaf id and the directory still has the ownership marker
-  written at creation, and also when the name is an unregistered `run-`
-  component that is not a systemd `run-*.scope`. Swept leaves are booked
-  `empty`, not `terminated`, because the exit was not seen. A name whose
-  `cgroup.procs` still lists an id is not removed. `keep` is required (no
-  kill-everything default) and must name every leaf the registry still owns,
-  including another launcher's on the same root; those leaves are untouched.
-  A systemd `run-*.scope`, any other name, a leaf id without the marker, and a
-  symlink are left in place and listed in `reported`. They are not killed.
+  only when the name is a leaf id and the opened inode is still the one just
+  classified and still has the ownership marker. The `run-` prefix alone is
+  not ownership. Swept leaves are booked `empty`, not `terminated`, because
+  the exit was not seen. A leaf whose `cgroup.procs` still lists an id is not
+  removed. `keep` is required (no kill-everything default) and must name every
+  leaf the registry still owns, including another launcher's on the same root;
+  those leaves are untouched. A `run-*` name that is not a leaf id (including
+  `run-*.scope`, `run-*.service`, `run-*.slice`, `run-*.SCOPE`,
+  `run-*.scope.bak`, and `run-`), any other name, a leaf id without the
+  marker, an opened inode that is not the one just classified, and a symlink
+  are left in place and listed in `reported`. They are not killed.
   `adopt(name)` returns a handle for a kept, marked leaf so the restarted
   daemon can kill it later; its best outcome is `empty`. As a context manager that `empty` outcome is success.
   `CleanupIncomplete` is still raised when the adopted cleanup does not finish

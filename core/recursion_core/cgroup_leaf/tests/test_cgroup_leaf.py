@@ -9,6 +9,7 @@ import errno
 import inspect
 import os
 from pathlib import Path
+import stat
 import signal
 import subprocess
 import tempfile
@@ -104,12 +105,18 @@ class FakeCgroup(Cgroup2):
                 return leaf.parent
         return None
 
-    def remove(self, leaf, deadline=None, identity=None):
+    def remove(self, leaf, deadline=None, identity=None, dirfd=None):
         if identity is not None and cgroup_identity(leaf) != identity:
             raise OSError(errno.EBUSY, 'cgroup identity changed')
+        if dirfd is not None:
+            info = os.fstat(dirfd)
+            if identity is not None and (info.st_dev, info.st_ino) != identity:
+                raise OSError(errno.EBUSY, 'cgroup identity changed')
         for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
             (leaf / name).unlink(missing_ok=True)
         os.rmdir(leaf)
+        if dirfd is not None and os.fstat(dirfd).st_nlink != 0:
+            raise OSError(errno.EBUSY, 'cgroup identity still present after rmdir')
         if self.interrupt_after_remove:
             self.interrupt_after_remove = False
             raise KeyboardInterrupt('interrupt right after rmdir')
@@ -566,19 +573,37 @@ class TmpCgroup(Cgroup2):
         self.killed.append(Path(leaf).name)
         return super().kill(leaf, deadline, dirfd=dirfd)
 
-    def _rmdir(self, directory):
+    def _rmdir(self, directory, identity=None, dirfd=None):
         directory = Path(directory)
         self.rmdir_calls.append(directory)
-        procs = directory / 'cgroup.procs'
-        if procs.is_file() and procs.read_text().strip():
-            raise OSError(errno.EBUSY, 'procs not empty')
-        if any(entry.is_dir() and not entry.is_symlink() for entry in directory.iterdir()):
-            raise OSError(errno.EBUSY, 'child cgroup remains')
-        for entry in list(directory.iterdir()):
-            if entry.is_dir() or entry.is_symlink():
-                raise OSError(errno.EBUSY, 'not an interface file')
-            entry.unlink()
-        os.rmdir(directory)
+        return super()._rmdir(directory, identity=identity, dirfd=dirfd)
+
+    def _prepare_rmdir(self, dirfd):
+        # A tmpdir is not cgroupfs: interface files block rmdir. Drop the ones
+        # on this inode, not whatever path now uses the name.
+        procs = None
+        try:
+            procs = os.open('cgroup.procs', os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                            dir_fd=dirfd)
+        except FileNotFoundError:
+            pass
+        if procs is not None:
+            try:
+                chunks = []
+                while True:
+                    chunk = os.read(procs, 4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                os.close(procs)
+            if b''.join(chunks).strip():
+                raise OSError(errno.EBUSY, 'procs not empty')
+        for name in os.listdir(dirfd):
+            info = os.lstat(name, dir_fd=dirfd)
+            if stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(errno.EBUSY, 'child cgroup remains')
+            os.unlink(name, dir_fd=dirfd)
 
 
 class RemovalContractTests(unittest.TestCase):
@@ -626,7 +651,7 @@ class RemovalContractTests(unittest.TestCase):
         write_cgroup(leaf, procs='')
         real = TmpCgroup._rmdir
 
-        def always_busy(fs, directory):
+        def always_busy(fs, directory, identity=None, dirfd=None):
             fs.rmdir_calls.append(Path(directory))
             raise OSError(errno.EBUSY, 'dying task')
 
@@ -650,12 +675,12 @@ class RemovalContractTests(unittest.TestCase):
         remaining = {'n': 2}
         real = TmpCgroup._rmdir.__get__(self.fs, TmpCgroup)
 
-        def flaky(directory):
+        def flaky(directory, identity=None, dirfd=None):
             if remaining['n']:
                 remaining['n'] -= 1
                 self.fs.rmdir_calls.append(Path(directory))
                 raise OSError(errno.EBUSY, 'dying task')
-            real(directory)
+            real(directory, identity=identity, dirfd=dirfd)
 
         self.fs._rmdir = flaky
         self.fs.remove(leaf, identity=cgroup_identity(leaf),
@@ -785,39 +810,88 @@ class RemovalContractTests(unittest.TestCase):
         self.assertEqual(self.fs.killed, ['run-ours'])
         self.assertEqual([path.name for path in self.fs.rmdir_calls], ['run-ours'])
 
-    def test_sweep_removes_unregistered_run_names_and_keeps_scopes(self):
-        # A run- name that is not a leaf id and not a systemd scope is a leftover.
-        # A scope, and a leftover whose procs still list an id, stay on disk.
-        free = self.root_path / 'run-not.valid'
-        busy = self.root_path / 'run-busy.name'
-        scope = self.root_path / 'run-1234.scope'
-        other = self.root_path / 'app.slice'
-        write_cgroup(free, procs='')
-        write_cgroup(busy, procs='5\n')
-        (busy / 'cgroup.events').write_text('populated 0\n')
-        write_cgroup(scope, procs='')
-        (scope / 'payload').write_text('systemd')
-        other.mkdir()
-        (other / 'payload').write_text('foreign')
+    def test_sweep_leaves_unmarked_non_id_run_names(self):
+        # The run- prefix is not ownership. These names are not leaf ids, and
+        # none of them carry the marker, so sweep must not kill or remove them.
+        names = (
+            'run-app.slice',
+            'run-1234.service',
+            'run-1234.SCOPE',
+            'run-1234.scope.bak',
+            'run-',
+            'run-not.valid',
+            'run-1234.scope',
+            'run-busy.name',
+            'app.slice',
+        )
+        for name in names:
+            path = self.root_path / name
+            if name == 'run-busy.name':
+                write_cgroup(path, procs='5\n')
+            elif name == 'app.slice':
+                path.mkdir()
+            else:
+                write_cgroup(path, procs='')
+            (path / 'payload').write_text(name)
         root = DelegatedRoot(self.root_path, self.fs)
+        start = time.monotonic()
         with self.assertLogs(cgroup_leaf.log.name, level='WARNING'):
-            result = root.sweep(keep=())
-        self.assertFalse(free.exists())
-        self.assertEqual(result.outcomes['run-not.valid'].state, 'empty')
-        self.assertFalse(result.outcomes['run-not.valid'].errors)
-        self.assertEqual((busy / 'cgroup.procs').read_text(), '5\n')
-        self.assertTrue(busy.is_dir())
-        self.assertNotIn('run-busy.name', [path.name for path in self.fs.rmdir_calls])
-        self.assertIn('run-busy.name', self.fs.killed)
-        self.assertIn('run-not.valid', self.fs.killed)
-        self.assertNotIn('run-1234.scope', self.fs.killed)
-        self.assertNotIn('app.slice', self.fs.killed)
-        self.assertEqual((scope / 'payload').read_text(), 'systemd')
-        self.assertEqual((scope / 'cgroup.kill').read_text(), '')
-        self.assertEqual((other / 'payload').read_text(), 'foreign')
-        self.assertIn(('run-1234.scope', 'foreign-name'), result.reported)
-        self.assertIn(('app.slice', 'foreign-name'), result.reported)
-        self.assertNotIn('run-not.valid', [name for name, _reason in result.reported])
+            result = root.sweep(keep=(), kill_timeout=0.6)
+        self.assertLess(time.monotonic() - start, 0.3)
+        self.assertEqual(result.outcomes, {})
+        self.assertEqual(self.fs.killed, [])
+        self.assertEqual(self.fs.rmdir_calls, [])
+        self.assertEqual(
+            [name for name, reason in result.reported],
+            sorted(names),
+        )
+        self.assertTrue(all(reason == 'foreign-name' for _name, reason in result.reported))
+        for name in names:
+            path = self.root_path / name
+            self.assertEqual((path / 'payload').read_text(), name)
+            if name != 'app.slice':
+                self.assertEqual((path / 'cgroup.kill').read_text(), '')
+
+    def test_sweep_does_not_kill_scope_renamed_onto_classified_leaf(self):
+        # Classification saw run-ours. Before the directory fd is opened, that
+        # inode is moved aside and run-1.scope (marker copied) takes the name.
+        # The opened inode is not the classified one, so it must not be killed.
+        leaf = self.root_path / 'run-ours'
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-ours-aside'
+        write_cgroup(leaf, procs='')
+        write_cgroup(scope, procs='')
+        (leaf / 'marker').write_text('ours')
+        (scope / 'marker').write_text('systemd')
+        cgroup_leaf.mark_owned(leaf)
+        cgroup_leaf.mark_owned(scope)
+        classified = cgroup_identity(leaf)
+        swapped = {'done': False}
+        real_open = os.open
+
+        def swap_open(path, flags, *args, **kwargs):
+            if (not swapped['done'] and not isinstance(path, int)
+                    and Path(path) == leaf):
+                swapped['done'] = True
+                leaf.rename(aside)
+                scope.rename(leaf)
+            return real_open(path, flags, *args, **kwargs)
+
+        root = DelegatedRoot(self.root_path, self.fs)
+        with patch.object(cgroup_leaf.os, 'open', swap_open), \
+             self.assertLogs(cgroup_leaf.log.name, level='WARNING'):
+            result = root.sweep(keep=(), kill_timeout=0.4)
+        self.assertTrue(swapped['done'])
+        self.assertNotEqual(cgroup_identity(leaf), classified)
+        self.assertTrue((leaf / 'marker').is_file())
+        self.assertEqual((leaf / 'marker').read_text(), 'systemd')
+        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        self.assertEqual((aside / 'marker').read_text(), 'ours')
+        self.assertEqual((aside / 'cgroup.kill').read_text(), '')
+        self.assertNotIn('run-ours', result.outcomes)
+        self.assertNotIn('run-1.scope', result.outcomes)
+        self.assertEqual(self.fs.killed, [])
+        self.assertEqual(self.fs.rmdir_calls, [])
 
     def test_kill_does_not_write_a_replaced_cgroup(self):
         leaf = self.root_path / 'run-a'
@@ -847,27 +921,61 @@ class RemovalContractTests(unittest.TestCase):
     def test_replaced_child_cgroup_is_not_removed(self):
         leaf = self.root_path / 'run-a'
         child = leaf / 'sub'
+        old = leaf / 'sub-old'
         write_cgroup(leaf, procs='')
         write_cgroup(child, procs='')
+        (child / 'marker').write_text('original')
         real = Cgroup2._child_cgroups
 
         def swap(fs, directory, deadline):
             found = real(fs, directory, deadline)
-            if directory == leaf and found and not (leaf / 'sub-old').exists():
+            if directory == leaf and found and not old.exists():
                 path = found[0][0] if isinstance(found[0], tuple) else found[0]
-                path.rename(leaf / 'sub-old')
+                path.rename(old)
                 write_cgroup(path, procs='')
                 (path / 'marker').write_text('foreign')
             return found
 
         self.fs._child_cgroups = swap.__get__(self.fs, TmpCgroup)
-        with self.assertRaises(OSError) as caught:
+        raised = None
+        try:
             self.fs.remove(leaf, identity=cgroup_identity(leaf), deadline=time.monotonic() + 1)
-        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        except OSError as exc:
+            raised = exc
+        self.assertTrue((old / 'marker').is_file())
+        self.assertEqual((old / 'marker').read_text(), 'original')
+        self.assertIsInstance(raised, OSError)
+        self.assertEqual(raised.errno, errno.EBUSY)
         self.assertEqual((child / 'marker').read_text(), 'foreign')
-        self.assertTrue((leaf / 'sub-old').is_dir())
         self.assertTrue(leaf.is_dir())
         self.assertEqual(self.fs.rmdir_calls, [])
+
+    def test_rmdir_swap_after_identity_check_is_not_booked_removed(self):
+        # The empty and identity checks have passed. A swap inside rmdir must
+        # not delete the replacement and must not book the original as removed.
+        leaf = self.root_path / 'run-a'
+        aside = self.root_path / 'run-a-old'
+        write_cgroup(leaf, procs='')
+        (leaf / 'marker').write_text('original')
+        run = LeafRun(self.fs, leaf, 0.2)
+        real = TmpCgroup._rmdir
+
+        def swap(fs, directory, *args, **kwargs):
+            if Path(directory) == leaf and not aside.exists():
+                leaf.rename(aside)
+                write_cgroup(leaf, procs='')
+                (leaf / 'marker').write_text('foreign')
+            return real(fs, directory, *args, **kwargs)
+
+        self.fs._rmdir = swap.__get__(self.fs, TmpCgroup)
+        outcome = run.close()
+        self.assertTrue((aside / 'marker').is_file())
+        self.assertEqual((aside / 'marker').read_text(), 'original')
+        self.assertTrue((leaf / 'marker').is_file())
+        self.assertEqual((leaf / 'marker').read_text(), 'foreign')
+        self.assertFalse(run.removed)
+        self.assertEqual(outcome.state, 'unknown')
+        self.assertTrue(outcome.errors)
 
     def test_rmdir_after_empty_check_does_not_remove_replacement(self):
         leaf = self.root_path / 'run-a'

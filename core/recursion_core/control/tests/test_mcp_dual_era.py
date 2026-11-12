@@ -16,6 +16,7 @@ from recursion_core.control.mcp_dual_era import (
     LIVE_WIRE_CAPTURE,
     MCP_SPEC_COMMIT,
     MCP_SPEC_FILE,
+    META_PROTOCOL,
     MODERN_PROTOCOL,
     TASKS_EXTENSION,
     DualEraServer,
@@ -645,6 +646,207 @@ class SameRunAndStopTests(unittest.TestCase):
             "params": modern_params(taskId="a" * 129),
         })
         self.assertIn("error", too_long)
+
+
+class ProtocolNegotiationTests(unittest.TestCase):
+    """An explicit protocol version this server does not speak must not run a tool or a Stop."""
+
+    def test_unsupported_version_does_not_start_a_run(self) -> None:
+        server, api, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": modern_params(
+                protocol="1900-01-01", tasks=True, name="recursion_run_start",
+                arguments={"tenant": "t1", "engine": "codex", "prompt": "p"},
+            ),
+        })
+        self.assertEqual(reply["id"], 7)
+        self.assertNotIn("result", reply)
+        self.assertEqual(reply["error"]["code"], -32022)
+        self.assertEqual(reply["error"]["message"], "Unsupported protocol version")
+        self.assertEqual(reply["error"]["data"]["requested"], "1900-01-01")
+        self.assertEqual(reply["error"]["data"]["supported"], [MODERN_PROTOCOL, LEGACY_PROTOCOL])
+        self.assertEqual(api.call("run.list", {})["runs"], [])
+
+    def test_unsupported_version_does_not_cancel_a_run(self) -> None:
+        server, api, registry, kill, _ = _server()
+        run_id = started(api)
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "c-1", "method": "tasks/cancel",
+            "params": modern_params(protocol="2025-11-25", taskId=run_id),
+        })
+        self.assertEqual(reply["id"], "c-1")
+        self.assertEqual(reply["error"]["code"], -32022)
+        self.assertEqual(reply["error"]["data"]["requested"], "2025-11-25")
+        self.assertEqual(registry.get(run_id)["state"], "running")
+        self.assertEqual(kill.requests, [])
+
+    def test_discover_rejects_an_unsupported_version(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "d", "method": "server/discover",
+            "params": modern_params(protocol="1900-01-01"),
+        })
+        self.assertEqual(reply["id"], "d")
+        self.assertNotIn("result", reply)
+        self.assertEqual(reply["error"]["code"], -32022)
+        self.assertEqual(reply["error"]["data"]["supported"], [MODERN_PROTOCOL, LEGACY_PROTOCOL])
+        self.assertEqual(server.legacy_sessions, 0)
+
+    def test_non_string_or_empty_protocol_version_does_not_start(self) -> None:
+        server, api, *_ = _server()
+        params = modern_params(
+            name="recursion_run_start",
+            arguments={"tenant": "t1", "engine": "codex", "prompt": "p"},
+        )
+        params["_meta"][META_PROTOCOL] = 20260728
+        numbered = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": params})
+        self.assertEqual(numbered["id"], 2)
+        self.assertEqual(numbered["error"]["code"], -32602)
+        blank = server.handle({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": modern_params(
+                protocol="", name="recursion_run_start",
+                arguments={"tenant": "t1", "engine": "codex", "prompt": "p"},
+            ),
+        })
+        self.assertEqual(blank["error"]["code"], -32602)
+        junk_meta = server.handle({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"_meta": "1900-01-01", "name": "recursion_run_start",
+                       "arguments": {"tenant": "t1", "engine": "codex", "prompt": "p"}},
+        })
+        self.assertEqual(junk_meta["id"], 4)
+        self.assertEqual(junk_meta["error"]["code"], -32602)
+        self.assertEqual(api.call("run.list", {})["runs"], [])
+
+    def test_supported_legacy_version_still_calls_the_tool(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "L", "method": "tools/call",
+            "params": modern_params(protocol=LEGACY_PROTOCOL, name="recursion_run_list", arguments={}),
+        })
+        self.assertEqual(reply["id"], "L")
+        self.assertNotIn("error", reply)
+        self.assertNotIn("resultType", reply["result"])
+        self.assertEqual(reply["result"]["structuredContent"]["code"], "ok")
+
+
+class MalformedFrameTests(unittest.TestCase):
+    def _start(self, **fields) -> tuple[dict, list]:
+        server, api, *_ = _server()
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "recursion_run_start",
+                       "arguments": {"tenant": "t1", "engine": "codex", "prompt": "p"}},
+        }
+        body.update(fields)
+        reply = server.handle(body)
+        return reply, api.call("run.list", {})["runs"]
+
+    def test_wrong_jsonrpc_version_does_not_start_a_run(self) -> None:
+        reply, runs = self._start(jsonrpc="1.0")
+        self.assertEqual(runs, [])
+        self.assertEqual(reply["id"], 1)
+        self.assertEqual(reply["error"]["code"], -32600)
+        self.assertNotIn("result", reply)
+        server, api, *_ = _server()
+        missing = server.handle({
+            "id": 8, "method": "tools/call",
+            "params": {"name": "recursion_run_start",
+                       "arguments": {"tenant": "t1", "engine": "codex", "prompt": "p"}},
+        })
+        self.assertEqual(api.call("run.list", {})["runs"], [])
+        self.assertEqual(missing["id"], 8)
+        self.assertEqual(missing["error"]["code"], -32600)
+        self.assertNotIn("result", missing)
+
+    def test_non_scalar_id_does_not_start_a_run(self) -> None:
+        reply, runs = self._start(id={"x": 1})
+        self.assertEqual(runs, [])
+        self.assertIsNone(reply["id"])
+        self.assertEqual(reply["error"]["code"], -32600)
+        listed, listed_runs = self._start(id=[1, 2])
+        self.assertEqual(listed_runs, [])
+        self.assertIsNone(listed["id"])
+        self.assertEqual(listed["error"]["code"], -32600)
+
+    def test_boolean_and_fractional_ids_do_not_start_a_run(self) -> None:
+        for bad in (True, False, 1.5, float("nan"), float("inf")):
+            with self.subTest(bad=bad):
+                reply, runs = self._start(id=bad)
+                self.assertEqual(runs, [])
+                self.assertIsNone(reply["id"])
+                self.assertEqual(reply["error"]["code"], -32600)
+
+    def test_non_object_params_do_not_open_a_session_or_start(self) -> None:
+        server, api, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": 6, "method": "initialize", "params": ["2025-06-18"],
+        })
+        self.assertEqual(reply["id"], 6)
+        self.assertEqual(reply["error"]["code"], -32600)
+        self.assertEqual(server.legacy_sessions, 0)
+        started_reply = server.handle({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": "recursion_run_start",
+        })
+        self.assertEqual(started_reply["error"]["code"], -32600)
+        self.assertEqual(api.call("run.list", {})["runs"], [])
+
+    def test_non_string_method_is_an_invalid_request(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({"jsonrpc": "2.0", "id": 5, "method": None, "params": {}})
+        self.assertEqual(reply["id"], 5)
+        self.assertEqual(reply["error"], {"code": -32600, "message": "Invalid Request"})
+        blank = server.handle({"jsonrpc": "2.0", "id": "m", "method": "", "params": {}})
+        self.assertEqual(blank["id"], "m")
+        self.assertEqual(blank["error"]["code"], -32600)
+
+    def test_zero_null_and_whole_number_ids_stay_correlated(self) -> None:
+        server, *_ = _server()
+        for req_id in (0, None, 1.0, "abc"):
+            with self.subTest(req_id=req_id):
+                reply = server.handle({"jsonrpc": "2.0", "id": req_id, "method": "tools/list", "params": {}})
+                self.assertEqual(reply["id"], req_id)
+                self.assertIs(type(reply["id"]), type(req_id))
+                self.assertIn("tools", reply["result"])
+
+
+class CredentialFrameTests(unittest.TestCase):
+    def test_non_ascii_authorization_returns_unauthorized_and_keeps_the_id(self) -> None:
+        api, registry, kill, _ = make_api(FakeKillTree())
+        run_id = started(api)
+        server = DualEraServer(api, auth_token="secret")
+        listed = server.handle({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/list",
+            "params": {"authorization": "caf\u00e9"},
+        })
+        self.assertEqual(listed["id"], 9)
+        self.assertEqual(listed["error"], {"code": -32001, "message": "unauthorized"})
+        cancelled = server.handle({
+            "jsonrpc": "2.0", "id": "stop-1", "method": "tasks/cancel",
+            "params": modern_params(taskId=run_id, meta={"authorization": "a\ud800b"}),
+        })
+        self.assertEqual(cancelled["id"], "stop-1")
+        self.assertEqual(cancelled["error"], {"code": -32001, "message": "unauthorized"})
+        self.assertEqual(registry.get(run_id)["state"], "running")
+        self.assertEqual(kill.requests, [])
+
+    def test_non_ascii_configured_token_matches_and_a_mismatch_stays_unauthorized(self) -> None:
+        api, *_ = make_api(FakeKillTree())
+        server = DualEraServer(api, auth_token="s\u00e9cret")
+        ok = server.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+            "params": {"_meta": {"authorization": "s\u00e9cret"}},
+        })
+        self.assertEqual(ok["id"], 1)
+        self.assertIn("tools", ok["result"])
+        denied = server.handle({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": {"authorization": "secret"},
+        })
+        self.assertEqual(denied["id"], 2)
+        self.assertEqual(denied["error"], {"code": -32001, "message": "unauthorized"})
 
 
 if __name__ == "__main__":

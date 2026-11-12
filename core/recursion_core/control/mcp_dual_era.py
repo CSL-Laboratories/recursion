@@ -32,6 +32,7 @@ Deferred (O60 / A45): no pinned pre-release conformance tool has checked the
 from __future__ import annotations
 
 import hmac
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -104,12 +105,46 @@ def claude_code_negotiate(
     return Negotiation("legacy", LEGACY_PROTOCOL, "initialize", True, mode)
 
 
+def _utf8(value: str) -> bytes | None:
+    """UTF-8 bytes, or ``None`` when ``value`` contains a lone surrogate."""
+
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+
+
 def _same_token(expected: str, presented: object) -> bool:
-    """Constant-time match. A non-string presented value is not the token."""
+    """Constant-time match of the UTF-8 bytes.
+
+    A non-string presented value is not the token. ``hmac.compare_digest``
+    rejects non-ASCII ``str`` and would abort the request before a JSON-RPC
+    error could carry its id, so both sides are compared as bytes. A lone
+    surrogate cannot be the token.
+    """
 
     if not isinstance(presented, str):
         return False
-    return hmac.compare_digest(presented, expected)
+    left, right = _utf8(expected), _utf8(presented)
+    if left is None or right is None:
+        return False
+    return hmac.compare_digest(left, right)
+
+
+def _valid_request_id(value: object) -> bool:
+    """A JSON-RPC id this server can echo: string, number, or null.
+
+    Booleans are not numbers here. A non-integral or non-finite float is not
+    an id. ``0`` and ``1.0`` are, and ``null`` is an id the caller included.
+    """
+
+    if value is None or isinstance(value, str):
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer()
+    return True
 
 
 def _meta(params: Mapping | None) -> dict:
@@ -172,6 +207,12 @@ class DualEraServer:
     on every result, and ``CreateTaskResult`` from ``tools/call`` only when that
     request lists the Tasks extension. ``tasks/list`` and
     ``notifications/cancelled`` / ``notifications/tasks`` are not emitted.
+    An explicit ``_meta`` protocol version other than the two this server
+    speaks is JSON-RPC ``-32022`` and does not reach ``ControlAPI``. A missing
+    version stays the legacy shape. A frame that is not JSON-RPC 2.0, whose
+    id is not a string, number, or null, whose method is not a string, or
+    whose params are not an object, is ``-32600`` and does not reach
+    ``ControlAPI``.
     A "list runs" call stays the plain ``recursion_run_list`` tool in both eras.
 
     ``tools/list`` returns the control tool descriptors in both eras. When
@@ -191,9 +232,17 @@ class DualEraServer:
         self.legacy_sessions = 0
 
     def handle(self, message: Mapping) -> dict:
+        if not isinstance(message, Mapping):
+            return self._error(None, -32600, "Invalid Request")
+        frame = self._frame_error(message)
+        if frame is not None:
+            return frame
         method = message.get("method")
         req_id = message.get("id")
-        params = message.get("params") if isinstance(message.get("params"), Mapping) else {}
+        params = message["params"] if "params" in message else {}
+        rejected = self._protocol_rejection(req_id, params)
+        if rejected is not None:
+            return rejected
         if method == "initialize":
             return self._ok(req_id, self._initialize(params))
         if method == "server/discover":
@@ -215,8 +264,53 @@ class DualEraServer:
     def _ok(self, req_id, result: dict) -> dict:
         return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
-    def _error(self, req_id, code: int, message: str) -> dict:
-        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+    def _error(self, req_id, code: int, message: str, data: dict | None = None) -> dict:
+        error: dict = {"code": code, "message": message}
+        if data is not None:
+            error["data"] = data
+        return {"jsonrpc": "2.0", "id": req_id, "error": error}
+
+    def _frame_error(self, message: Mapping) -> dict | None:
+        """Reject a frame that is not a JSON-RPC 2.0 request or notification.
+
+        An id that cannot be echoed becomes ``null`` on the error, and the
+        method is not run. A missing id is still a notification and is handled
+        below.
+        """
+
+        if "id" in message and not _valid_request_id(message.get("id")):
+            return self._error(None, -32600, "Invalid Request")
+        reply_id = message.get("id") if "id" in message else None
+        if message.get("jsonrpc") != "2.0":
+            return self._error(reply_id, -32600, "Invalid Request")
+        method = message.get("method")
+        if not isinstance(method, str) or not method:
+            return self._error(reply_id, -32600, "Invalid Request")
+        if "params" in message and not isinstance(message.get("params"), Mapping):
+            return self._error(reply_id, -32600, "Invalid Request")
+        return None
+
+    def _protocol_rejection(self, req_id, params: Mapping) -> dict | None:
+        """Refuse a version the request names and this server does not speak.
+
+        No version means the legacy callers, which never send one. Either
+        supported version proceeds. Anything else stops before ``ControlAPI``.
+        """
+
+        if "_meta" in params and not isinstance(params.get("_meta"), Mapping):
+            return self._error(req_id, -32602, "invalid _meta")
+        meta = _meta(params)
+        if META_PROTOCOL not in meta:
+            return None
+        version = meta[META_PROTOCOL]
+        if not isinstance(version, str) or not version:
+            return self._error(req_id, -32602, "invalid protocol version")
+        if version not in {LEGACY_PROTOCOL, MODERN_PROTOCOL}:
+            return self._error(req_id, -32022, "Unsupported protocol version", {
+                "supported": [MODERN_PROTOCOL, LEGACY_PROTOCOL],
+                "requested": version,
+            })
+        return None
 
     def _initialize(self, params: Mapping) -> dict:
         requested = params.get("protocolVersion")
@@ -228,11 +322,9 @@ class DualEraServer:
             "serverInfo": {"name": "recursion-control", "version": "candidate"},
         }
 
-    def _discover(self, params: Mapping) -> dict:
-        meta = _meta(params)
-        if meta.get(META_PROTOCOL) not in {None, MODERN_PROTOCOL}:
-            # Still answer; a dual-era server advertises what it speaks.
-            pass
+    def _discover(self, _params: Mapping) -> dict:
+        # An explicit unsupported version never reaches here. A missing version
+        # and either supported version both advertise what this server speaks.
         return {
             "resultType": "complete",
             "supportedVersions": [MODERN_PROTOCOL, LEGACY_PROTOCOL],

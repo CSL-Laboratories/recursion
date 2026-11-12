@@ -274,6 +274,21 @@ How the switch is written:
   it. This package does not remove one today; the driver can, or it goes with the route
   home.
 
+The last check before the launcher is a path bind after that descriptor read. `lstat`
+(it does not follow links) must show that `route_home` is still the held directory, that
+`route_home/.hermes` is still the directory opened under it, and that
+`route_home/.hermes/config.yaml` is still the inode the read accepted. Otherwise the
+launch refuses (`route_home_not_private` or `hermes_config_blocks_adopt_override`). A
+0700 directory with no `config.yaml` renamed onto the route path during the read would
+otherwise launch with that path as HOME, and Hermes would default
+`auth.adopt_external_logins` to true. A different file renamed onto `config.yaml` after
+the open, before `fstat`, would otherwise be what the child reads. The read checks the
+fd it opened; the path `lstat` is what runs last.
+
+A same-inode rewrite after that read cannot be bound. The child opens `config.yaml` by
+path, and `lstat` cannot see new bytes in the inode just read. The check does not try to
+close that window.
+
 ## Configured requirements
 
 Secure defaults first. What a user or a plugin configures comes in as explicit inputs to

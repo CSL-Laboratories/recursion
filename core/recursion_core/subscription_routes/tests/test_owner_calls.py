@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import errno
 import importlib
+import inspect
 import os
 import shutil
 import stat
@@ -742,6 +743,63 @@ class HermesHomeReuseTests(_Calls):
         self.launcher.assert_not_called()
         self.assertFalse((self.home / ".hermes").exists())
         self.assertFalse((self.root / "route-home.real" / ".hermes").exists())
+
+    def test_decoy_home_renamed_during_final_reread_does_not_launch(self) -> None:
+        # The final re-read opens the held dirfd. A 0700 directory with no
+        # .hermes/config.yaml, renamed onto the route path at the start of that
+        # read, is the HOME the child would get, and Hermes then defaults
+        # adopt_external_logins to true.
+        decoy = self.root / "decoy-0700-reread"
+        decoy.mkdir(mode=0o700)
+        os.chmod(decoy, 0o700)
+        real = policy._reverify_hermes_switch
+        moved = self.root / "route-home.real"
+
+        def hook(engine: str, route_home: str):
+            os.rename(self.home, moved)
+            os.rename(decoy, self.home)
+            return real(engine, route_home)
+
+        with mock.patch.object(policy, "_reverify_hermes_switch", side_effect=hook):
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.launcher.assert_not_called()
+        self.assertEqual(0o700, stat.S_IMODE(os.lstat(self.home).st_mode))
+        self.assertFalse((self.home / ".hermes").exists())
+        self.assertNotEqual(os.lstat(self.home).st_ino, os.lstat(moved).st_ino)
+        self.assertEqual(ADOPT_YAML, (moved / ".hermes" / "config.yaml").read_bytes())
+
+    def test_config_renamed_inside_final_open_before_fstat_does_not_launch(self) -> None:
+        # The final check fstats the fd it opened. Another file renamed onto
+        # config.yaml inside that open, before fstat, is the name the child opens.
+        evil = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(evil))
+        planted = self.root / "adopt-true.yaml"
+        planted.write_bytes(evil)
+        real_open = os.open
+        swapped = False
+
+        def called_from_reverify() -> bool:
+            frame = inspect.currentframe()
+            while frame is not None:
+                if frame.f_code.co_name == "_reverify_hermes_switch":
+                    return True
+                frame = frame.f_back
+            return False
+
+        def racing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            fd = real_open(path, flags, *args, **kwargs)
+            if not swapped and path == "config.yaml" and called_from_reverify():
+                os.rename(planted, self.config())
+                swapped = True
+            return fd
+
+        with mock.patch.object(policy.os, "open", side_effect=racing_open):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self.assertTrue(swapped)
+        self.launcher.assert_not_called()
+        self.assertEqual(evil, self.config().read_bytes())
 
     def test_config_that_appears_before_the_link_is_not_replaced(self) -> None:
         (self.home / ".hermes").mkdir(mode=0o700)

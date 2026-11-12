@@ -26,7 +26,10 @@ discovery is refused by checking, with ``lstat`` only, that the child's home is 
 not the operator's home and holds no Claude Code store and no Pi, Hermes or OpenCode state or
 login entry. No credential file is opened or read. The one file read is a Hermes
 ``.hermes/config.yaml`` that is already exactly the size of the adopt switch Recursion writes there
-(37 bytes), to confirm it is that switch; a config of any other size refuses unread.
+(37 bytes), to confirm it is that switch; a config of any other size refuses unread. Immediately
+before a Hermes launch, ``lstat`` (no follow) checks that the route home, ``.hermes`` and
+``config.yaml`` are still the inodes that read used. A same-inode rewrite after that read cannot
+be bound: the child opens the file by path, and this check does not try to close that window.
 
 ``guard_then_spawn`` takes the launcher and argv as trusted, core-owned inputs: it does not parse
 argv, so an engine flag that selects a provider or config is the caller's responsibility. On a
@@ -1237,12 +1240,14 @@ def _recheck_route_home(engine: str, route_home: str) -> None:
         raise SubscriptionRouteRefused(engine, "route_home_not_private")
 
 
-def _reverify_hermes_switch(engine: str, route_home: str) -> None:
-    """Last step before launch: the switch bytes, read from the inode this launch accepted.
+def _reverify_hermes_switch(engine: str, route_home: str) -> tuple[int, int]:
+    """Read the switch from the inode this launch accepted, under the held route home.
 
-    ``config.yaml`` is opened ``O_NOFOLLOW`` under the held route home. Its device and inode must be
+    ``config.yaml`` is opened ``O_NOFOLLOW`` under that directory. Its device and inode must be
     the ones recorded when the switch was written or reused, and the bytes must still be the false
-    switch. A true switch is restored or removed before the refusal.
+    switch. A true switch is restored or removed before the refusal. Returns the device and inode
+    of the ``.hermes`` directory that read used, so the caller can bind the child's paths to it.
+    The path ``lstat`` is not done here: it runs after this returns, immediately before launch.
     """
 
     hold = _route_home_for(engine, route_home)
@@ -1253,6 +1258,7 @@ def _reverify_hermes_switch(engine: str, route_home: str) -> None:
     except OSError:
         raise _refuse_hermes_config(engine, ".hermes") from None
     fd = -1
+    hermes_id: tuple[int, int] | None = None
     try:
         try:
             fd = os.open("config.yaml", _HERMES_OPEN_FLAGS, dir_fd=hermes_fd)
@@ -1260,20 +1266,69 @@ def _reverify_hermes_switch(engine: str, route_home: str) -> None:
             raise _refuse_hermes_config(engine, "config.yaml") from None
         opened = os.fstat(fd)
         data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+        try:
+            hermes_st = os.fstat(hermes_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
         if (stat.S_ISREG(opened.st_mode) and opened.st_uid == os.geteuid()
                 and (opened.st_dev, opened.st_ino) == (hold.config_dev, hold.config_ino)
                 and data == _HERMES_ADOPT_YAML):
-            return
-        if _is_true_variant(data):
-            seen = (opened.st_dev, opened.st_ino)
-            os.close(fd)
-            fd = -1
-            _neutralize_true_variant(hermes_fd, seen)
-        raise _refuse_hermes_config(engine, "config.yaml")
+            hermes_id = (hermes_st.st_dev, hermes_st.st_ino)
+        else:
+            if _is_true_variant(data):
+                seen = (opened.st_dev, opened.st_ino)
+                os.close(fd)
+                fd = -1
+                _neutralize_true_variant(hermes_fd, seen)
+            raise _refuse_hermes_config(engine, "config.yaml")
     finally:
         if fd >= 0:
             os.close(fd)
         os.close(hermes_fd)
+    if hermes_id is None:
+        raise _refuse_hermes_config(engine, ".hermes")
+    return hermes_id
+
+
+def _bind_hermes_launch_path(engine: str, route_home: str, hermes_dev: int, hermes_ino: int) -> None:
+    """After the descriptor read, the paths the child opens still name those inodes.
+
+    ``os.lstat`` does not follow links. ``route_home`` must be the held directory,
+    ``route_home/.hermes`` the directory opened under that hold, and
+    ``route_home/.hermes/config.yaml`` the switch inode recorded for this launch.
+
+    A same-inode rewrite after the read cannot be bound: the child opens ``config.yaml``
+    by path, and ``lstat`` cannot see new bytes in the inode just read. This check does
+    not try to close that window.
+    """
+
+    hold = _route_home_for(engine, route_home)
+    try:
+        home_st = os.lstat(route_home)
+        held = os.fstat(hold.fd)
+    except OSError:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+    if ((home_st.st_dev, home_st.st_ino) != (hold.dev, hold.ino)
+            or (held.st_dev, held.st_ino) != (hold.dev, hold.ino)
+            or not stat.S_ISDIR(home_st.st_mode) or not stat.S_ISDIR(held.st_mode)):
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
+    try:
+        hermes_st = os.lstat(os.path.join(route_home, ".hermes"))
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    if (not stat.S_ISDIR(hermes_st.st_mode)
+            or (hermes_st.st_dev, hermes_st.st_ino) != (hermes_dev, hermes_ino)):
+        raise _refuse_hermes_config(engine, ".hermes")
+    config_dev, config_ino = hold.config_dev, hold.config_ino
+    if config_dev is None or config_ino is None:
+        raise _refuse_hermes_config(engine, "config.yaml")
+    try:
+        config_st = os.lstat(os.path.join(route_home, ".hermes", "config.yaml"))
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    if (not stat.S_ISREG(config_st.st_mode)
+            or (config_st.st_dev, config_st.st_ino) != (config_dev, config_ino)):
+        raise _refuse_hermes_config(engine, "config.yaml")
 
 
 def _launch_checked(
@@ -1294,8 +1349,10 @@ def _launch_checked(
     _apply_hermes_adopt_override(decision, route_home)
     _recheck_route_home(decision.engine, route_home)
     if decision.engine == "hermes":
-        # Final step: nothing between this read and the launcher call.
-        _reverify_hermes_switch(decision.engine, route_home)
+        # Descriptor read first (the held dirfd). The path lstat is the last step before launch.
+        # A same-inode rewrite after that read cannot be bound: the child opens config.yaml by path.
+        hermes_dev, hermes_ino = _reverify_hermes_switch(decision.engine, route_home)
+        _bind_hermes_launch_path(decision.engine, route_home, hermes_dev, hermes_ino)
     # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
     # launch options _reject_launch_shape let through; none can replace env, shell or the model.
     return decision, launcher(

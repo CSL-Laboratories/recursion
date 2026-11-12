@@ -213,7 +213,7 @@ class ClaudeCodeAdapter(RouteAdapter):
             elif kind == "rate_limit_event":
                 info = msg.get("rate_limit_info")
                 events.append(c.event("usage", "claude.rate_limit_event", _info_fields(info)))
-                limit = _rejected(info, "claude.rate_limit_event", self.vendor_reset) or limit
+                limit = c.prefer_limit(limit, _rejected(info, "claude.rate_limit_event", self.vendor_reset))
             elif kind == "result":
                 return _classify_result(rid, msg, limit, events, model, self.vendor_reset)
             # assistant / user / other system envelopes: model payload or progress, never classified
@@ -248,9 +248,11 @@ def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, mode
     if msg.get("is_error") is not True and msg.get("subtype") == "success":
         text = msg.get("result")
         return c.result(rid, None, text=text if isinstance(text, str) else "", events=events)
-    limit = _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info", translate) or limit
-    if limit is None and msg.get("error") == "rate_limit":
-        limit = c.limit_signal("connection", "claude.result.error")
+    limit = c.prefer_limit(limit, _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info", translate))
+    if msg.get("error") == "rate_limit" and (limit is None or limit.get("scope") != "connection"):
+        # The envelope says the login is limited. A model window seen earlier does not narrow that.
+        reset = limit.get("reset_at") if isinstance(limit, dict) else None
+        limit = c.limit_signal("connection", "claude.result.error", reset_at=reset)
     if limit is not None:
         return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="typed limit")
     # Auth error names and api_error_status are unverified field names.

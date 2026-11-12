@@ -98,14 +98,18 @@ class CodexAdapter(RouteAdapter):
                 events.append(c.event("usage", "codex.account/rateLimits/read", {
                     "ignored": scalar(err.error.get("message"))}))
                 limits = None
-            limit = _exhausted(limits.get("rateLimits") if isinstance(limits, dict) else None,
-                               "codex.account/rateLimits/read", events, self.vendor_reset)
-            if limit is not None:
-                return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="limit before turn")
+            rpc._apply_snapshot(limits.get("rateLimits") if isinstance(limits, dict) else None,
+                                "codex.account/rateLimits/read")
+            if rpc.limit is not None:
+                return c.result(rid, c.PLAN_LIMIT, limit=rpc.limit, events=events, detail="limit before turn")
             thread = rpc.call("thread/start", {"model": model})
             thread_id = thread.get("thread", {}).get("id") if isinstance(thread, dict) else None
             if not isinstance(thread_id, str):
                 raise _Protocol("thread/start returned no thread id")
+            # A limit learned while the thread was starting is already a typed signal. Do not start
+            # the turn on a bucket the vendor has said is exhausted.
+            if rpc.limit is not None:
+                return c.result(rid, c.PLAN_LIMIT, limit=rpc.limit, events=events, detail="limit before turn")
             rpc.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": request["prompt"]}]})
             return rpc.until_turn_completed(rid)
         except _RpcError as err:
@@ -127,7 +131,7 @@ class _Rpc:
     def __init__(self, adapter: CodexAdapter, process, deadline_at: float, events: list, model: str) -> None:
         self.adapter, self.process, self.deadline_at = adapter, process, deadline_at
         self.events, self.model = events, model
-        self.next_id, self.limit, self.text = 1, None, []
+        self.next_id, self.limit, self._bucket, self.text = 1, None, None, []
 
     def notify(self, method: str, params: dict | None = None) -> None:
         self.process.send(json.dumps({"method": method, **({"params": params} if params else {})}))
@@ -166,12 +170,40 @@ class _Rpc:
             self.process.send(json.dumps({"id": msg["id"], "error": {"code": -32601, "message": "unsupported"}}))
             self.events.append(c.event("server_request_refused", "codex.jsonrpc", {"method": method}))
         elif method == "account/rateLimits/updated":
-            self.limit = _exhausted(params.get("rateLimits"), "codex.account/rateLimits/updated",
-                                    self.events, self.adapter.vendor_reset) or self.limit
+            self._apply_snapshot(params.get("rateLimits"), "codex.account/rateLimits/updated")
         elif method == "item/completed":
             item = params.get("item") or {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                 self.text.append(item["text"])  # model payload: kept as the answer, never classified
+
+    def _apply_snapshot(self, snapshot: object, source: str) -> None:
+        """Book one rate-limit snapshot. The newest reading of a bucket replaces that bucket.
+
+        A snapshot under 100% clears the limit kept for that same bucket. It does not clear a
+        different bucket. A model bucket does not replace a connection window already booked.
+        """
+
+        if not isinstance(snapshot, dict):
+            return
+        windows = any(isinstance(snapshot.get(name), dict) for name in ("primary", "secondary"))
+        signal = _exhausted(snapshot, source, self.events, self.adapter.vendor_reset)
+        if not windows:
+            return
+        bucket = _bucket(snapshot)
+        if signal is None:
+            if self._bucket == bucket:
+                self.limit, self._bucket = None, None
+            return
+        if self.limit is not None and self.limit.get("scope") == "connection" and signal.get("scope") != "connection":
+            return
+        self.limit, self._bucket = signal, bucket
+
+
+def _bucket(snapshot: dict) -> str:
+    limit_id = snapshot.get("limitId")
+    if isinstance(limit_id, str) and limit_id and limit_id != DEFAULT_LIMIT_ID:
+        return limit_id
+    return "connection"
 
 
 def _exhausted(snapshot: object, source: str, events: list, translate) -> dict | None:

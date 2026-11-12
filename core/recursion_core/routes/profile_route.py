@@ -64,6 +64,9 @@ class ProfileRouteAdapter(RouteAdapter):
             return c.result(rid, c.SUBSCRIPTION_ROUTE_REFUSED, detail=err.cause)
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
+        if self._clock() >= deadline_at:
+            process.fence("deadline")
+            return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
         events: list[dict] = []
         try:
             return self._driver(process, request, deadline_at, events)

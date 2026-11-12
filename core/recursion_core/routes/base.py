@@ -44,6 +44,10 @@ class RouteAdapter:
             process = self._launcher(argv, env=env, shell=False)
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
+        # Spawn can outlast the caller's deadline. Do not write stdin after it has passed.
+        if self._clock() >= deadline_at:
+            process.fence("deadline")
+            return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
         events: list[dict] = []
         try:
             return self.drive(process, request, deadline_at, events)

@@ -25,7 +25,10 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   or ``probe_lease_s`` when the caller gives no deadline: a probe that never reports cannot hold it
   forever, and a probe still inside its deadline is never joined by a second one.
   Probe success closes; a probe that hits a limit reopens with backoff (the key the limit names);
-  its lease is freed on whichever key held it; ``reset`` closes at once.
+  its lease is freed on whichever key held it. A limit from a different request does not drop a
+  lease that is still inside its deadline, and that probe's later success does not clear a limit
+  window opened under the lease. A refusal reports the open window that lasts longest, so a probe
+  on one slot cannot hide a longer limit on another. ``reset`` closes at once.
 
 The cooldown, lease and short-fault numbers are uncalibrated defaults (PRODUCT.md 11.2, B-10);
 this module does not claim to have measured anything. It is thread-safe: one lock guards all
@@ -101,15 +104,29 @@ class ConnectionBreaker:
             # Open and half-open keys first: a short fault never hides a real connection or model limit
             # from its tenant (grill Q23), so that tenant still gets the limit notice and its on_limit.
             probe_key = None
+            open_block = None  # (retry_at, display) the open window that ends latest
+            lease_block = None
             for key in self._slots_for(connection, model):
                 rec = self._keys.get(key)
                 if rec is None or rec["state"] == CLOSED:
                     continue
-                if rec["state"] == OPEN and now < rec["open_until"]:
-                    return _refused(c.BREAKER_OPEN, rec["open_until"], self._display(key))
-                if rec["state"] == HALF_OPEN and rec["lease_until"] is not None and now < rec["lease_until"]:
-                    return _refused(c.PROBE_IN_FLIGHT, rec["lease_until"], self._display(key))
+                display = self._display(key)
+                if rec["state"] == OPEN and _future(rec.get("open_until"), now):
+                    if open_block is None or rec["open_until"] > open_block[0]:
+                        open_block = (rec["open_until"], display)
+                if _live_lease(rec, now):
+                    if lease_block is None or rec["lease_until"] > lease_block[0]:
+                        lease_block = (rec["lease_until"], display)
+                    continue
+                if rec["state"] == OPEN and _future(rec.get("open_until"), now):
+                    continue
                 probe_key = probe_key or key  # cooldown over, or the last probe's lease expired
+            # An open window outranks a probe lease: the caller cannot run until that window ends,
+            # even when another slot still holds a probe.
+            if open_block is not None:
+                return _refused(c.BREAKER_OPEN, open_block[0], open_block[1])
+            if lease_block is not None:
+                return _refused(c.PROBE_IN_FLIGHT, lease_block[0], lease_block[1])
             until = self._short.get((connection, model, tenant))
             if until is not None:
                 if now < until:
@@ -141,7 +158,7 @@ class ConnectionBreaker:
                 self._short[(connection, model, tenant)] = now + self._short_s
                 return self._release(probe, now) or "short_fault"
             if code is None:
-                return self._close_probe(probe) or "none"
+                return self._close_probe(probe, now) or "none"
             # Deadlines, engine errors, auth, protocol, exit: request-local. A probe that ends this way
             # proved nothing, so its lease is released for the next request to probe.
             return self._release(probe, now) or "none"
@@ -159,7 +176,12 @@ class ConnectionBreaker:
         # reset_at is already on this clock. A raw vendor epoch that was not translated is far past
         # now + max_open_s and is capped here; adapters translate so a real reset is not the cap.
         until = min(reset_at, now + self._max_open_s) if reset_at is not None and reset_at > now else now + backoff
-        rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
+        # A probe that is still inside its deadline keeps its lease. Clearing it here would let the
+        # next admit start a second probe while the first run is still going.
+        if _live_lease(rec, now):
+            rec.update(state=OPEN, open_until=until, source=signal["source"])
+        else:
+            rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
         return until
 
     def _find_probe(self, probe: str | None) -> dict | None:
@@ -167,10 +189,15 @@ class ConnectionBreaker:
             return None
         return next((rec for rec in self._keys.values() if rec.get("probe") == probe), None)
 
-    def _close_probe(self, probe: str | None) -> str | None:
+    def _close_probe(self, probe: str | None, now: float) -> str | None:
         rec = self._find_probe(probe)
         if rec is None:
             return None
+        # A limit opened under this lease is newer than the probe's success. Drop the lease and
+        # leave the window; closing here would admit the next request while the limit still holds.
+        if rec["state"] == OPEN and _future(rec.get("open_until"), now):
+            rec.update(probe=None, lease_until=None)
+            return "probe_released"
         rec.update(state=CLOSED, failures=0, probe=None, lease_until=None)
         return "closed"
 
@@ -204,6 +231,14 @@ class ConnectionBreaker:
             if rec["state"] == OPEN and self._clock() < rec["open_until"]:
                 return OPEN
             return HALF_OPEN
+
+
+def _future(value: object, now: float) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and now < value
+
+
+def _live_lease(rec: dict, now: float) -> bool:
+    return isinstance(rec.get("probe"), str) and _future(rec.get("lease_until"), now)
 
 
 def _is_signal(value: object) -> bool:

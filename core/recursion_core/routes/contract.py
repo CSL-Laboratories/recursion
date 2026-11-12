@@ -174,6 +174,21 @@ def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], f
     return translated
 
 
+def prefer_limit(current: dict | None, new: dict | None) -> dict | None:
+    """The limit a run should book from the signals it has seen, newest last.
+
+    A later reading replaces an earlier one of the same or a broader scope. A model
+    window does not replace a connection window already seen: that would let one
+    family's bucket hide a limit that fences every model on the login.
+    """
+
+    if new is None:
+        return current
+    if current is not None and current.get("scope") == "connection" and new.get("scope") != "connection":
+        return current
+    return new
+
+
 def limit_signal(scope: str, source: str, *, model: str | None = None, reset_at: float | None = None) -> dict:
     """Build a limit signal. Adapters call this only from typed vendor fields, never from text."""
 

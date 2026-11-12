@@ -1024,7 +1024,11 @@ class RoundFourTest(unittest.TestCase):
             InMemoryRunRegistry([legacy])
 
     def test_stop_does_not_demote_a_stopped_run_that_has_no_cgroup(self) -> None:
-        # The loader rejects this shape. A row that still reaches Stop stays stopped.
+        # The loader rejects this shape. The row is stopped, but it is not a recorded stop:
+        # the cgroup was cleared, so the early return no longer answers stopped (fail-closed,
+        # owner decision on the planted-live-member early return; revert that predicate to
+        # restore the old stopped/repeat answer). Stop falls through to pending/cgroup_unknown.
+        # The registry still refuses to reopen the row, so the stored state stays stopped.
         reg = InMemoryRunRegistry()
         reg.put({"run_id": "r1", "tenant": "t", "engine": "codex", "state": "running",
                  "cgroup": "/cg/r1", "stop": None, "start_key": None})
@@ -1034,11 +1038,13 @@ class RoundFourTest(unittest.TestCase):
                                                "generation": reg._runs["r1"]["generation"]}
         api, _, _, _ = make_api(registry=reg)
         res = api.call("run.stop", {"run_id": "r1"})
-        self.assertEqual((res["code"], res.get("state"), res.get("repeat")), (a.STOPPED, "stopped", True))
-        self.assertNotEqual(res.get("reason"), "cgroup_unknown")
+        self.assertEqual((res["code"], res.get("state"), res.get("reason"), res.get("recorded")),
+                         (a.PENDING, "pending", "cgroup_unknown", False))
+        self.assertIsNot(res.get("repeat"), True)
         stored = reg.get("r1")
         assert stored is not None
         self.assertEqual(stored["state"], "stopped")
+        self.assertIsNone(stored.get("cgroup"))
 
 
 class RoundFiveTest(unittest.TestCase):

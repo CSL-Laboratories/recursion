@@ -17,7 +17,10 @@ Methods and typed result codes::
 
 A registry error never escapes ``call``: a read or a start that cannot reach the registry answers
 ``registry_unavailable`` and launches nothing. Once the cleanup layer has answered, Stop returns that
-answer even if writing it back fails, with ``"recorded": false``.
+answer even if writing it back fails, with ``"recorded": false``, when a re-read shows no live member.
+If that re-read fails, the stopped answer holds only when the pre-put row had no members. A live member,
+or a probe that cannot say, answers ``pending``. A put that returns no snapshot answers ``stopped``
+only when the re-read row is a recorded stop.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
@@ -299,7 +302,11 @@ class ControlAPI:
         the put: that is not proof the member is gone, and not a disk failure. On success ``rec``
         becomes the snapshot this put stored, not a later read. A registry that does not return that
         snapshot is refreshed in full, so a newer generation is never paired with an older payload.
+        This thread's ``put_snapshot`` is ``returned`` when ``put`` returned the row, ``reread`` when
+        a later read supplied it, and ``missing`` when that read failed. A missing or reread snapshot
+        is not by itself a recorded stop.
         """
+        self._local.put_snapshot = "returned"
         try:
             stored = self._registry.put(dict(rec))
         except StaleGeneration:
@@ -314,18 +321,22 @@ class ControlAPI:
             rec.clear()
             rec.update(stored)
             return "ok"
-        self._refresh(rec)
+        if self._refresh(rec):
+            self._local.put_snapshot = "reread"
+        else:
+            self._local.put_snapshot = "missing"
         return "ok"
 
-    def _refresh(self, rec: dict) -> None:
+    def _refresh(self, rec: dict) -> bool:
         try:
             fresh = self._registry.get(rec["run_id"])
         except Exception:
-            return
-        if fresh is None:
-            return
+            return False
+        if not isinstance(fresh, dict):
+            return False
         rec.clear()
         rec.update(fresh)
+        return True
 
     def _reread(self, rec: dict) -> dict | None:
         try:
@@ -503,12 +514,18 @@ class ControlAPI:
         A changed cgroup is cleaned up once more. That budget stays in this frame, so falling back to
         the retained launch cannot open another attempt.
         """
-        # A stopped row stays stopped. Adoption is for a launch that has not been recorded, and it
-        # must not turn a terminal stop into a pending cgroup-unknown answer.
+        # A recorded stop stays stopped. Adoption is for a launch that has not been recorded, and it
+        # must not turn that recorded stop into a pending cgroup-unknown answer.
+        # Fail-closed (owner decision, revertible): ``state == stopped`` is not enough for the early
+        # return. A planted stopped row that still lists a live member is not a recorded stop, so it
+        # falls through and answers pending. A stopped row with no cgroup fails the same predicate.
         if rec.get("state") == "stopped":
             res = {"code": STOPPED, "run_id": rec["run_id"], "state": "stopped", "repeat": True}
-            # A stopped launch this process still holds was never written: try again now.
-            return self._recorded(res, rec) if rec["run_id"] in self._launched else res
+            if rec["run_id"] in self._launched:
+                # A stopped launch this process still holds was never written: try again now.
+                return self._recorded(res, rec)
+            if _recorded_stop(rec):
+                return res
         reconfirms_left = 1
         while True:
             adopted = self._adopt_unrecorded_launch(rec)
@@ -613,19 +630,26 @@ class ControlAPI:
         return self._pending_instead(rec, blocked or "stop_unattested")
 
     def _lost_stop_is_pending(self, outcome: str, res: dict, rec: dict) -> tuple[str, dict]:
-        """The one retry lost. Pending, unless a later writer stored a recorded stop."""
-        if outcome != "stale" or res.get("code") != STOPPED:
+        """The one retry lost. Pending, unless a later writer stored a recorded stop.
+
+        The recorded-stop accept runs before the ``code == stopped`` guard. A blank stopped
+        re-read replaces that answer with pending, and the pending put can then lose to a real
+        attestation. That stored row is stopped even though ``res`` is already pending.
+        """
+        if outcome != "stale":
             return outcome, res
         latest = self._reread(rec)
+        if latest is not None and _recorded_stop(latest):
+            rec.clear()
+            rec.update(latest)
+            return "ok", {"code": STOPPED, "run_id": latest["run_id"], "state": "stopped", "repeat": True}
+        if res.get("code") != STOPPED:
+            return outcome, res
         if latest is None:
             # The lost write is not a stopped run. The row could not be read, so a live member
             # may still be on it.
             run_id = rec.get("run_id")
             return "down", {"code": PENDING, "run_id": run_id, "state": "pending", "reason": "unknown"}
-        if latest.get("state") == "stopped" and _recorded_stop(latest):
-            rec.clear()
-            rec.update(latest)
-            return "ok", {"code": STOPPED, "run_id": latest["run_id"], "state": "stopped", "repeat": True}
         if latest.get("state") == "stopped":
             # An empty proof, or a member still listed, is not a recorded stop.
             reason = "generation_conflict"
@@ -646,18 +670,89 @@ class ControlAPI:
         rec.update(latest)
         return outcome, res
 
+    def _row_liveness(self, row: dict) -> str | None:
+        """``member_alive``, ``liveness_unknown``, or None when no member is shown alive.
+
+        A probe that raises is not proof the member is gone. An empty member list is neither.
+        """
+        members = row.get("members") or []
+        if not members:
+            return None
+        try:
+            for member in members:
+                pid = member.get("pid") if isinstance(member, dict) else None
+                if self._process_alive(pid):
+                    return "member_alive"
+        except Exception:
+            return "liveness_unknown"
+        return None
+
+    def _blind_snapshot_stop(self, outcome: str, res: dict, rec: dict, snapshot: str) -> tuple[str, dict]:
+        """A put that returned no snapshot answers stopped only when the re-read is a recorded stop."""
+        if outcome != "ok" or res.get("code") != STOPPED or snapshot == "returned":
+            return outcome, res
+        if snapshot == "reread" and _recorded_stop(rec):
+            return outcome, res
+        if snapshot == "reread":
+            reason = self._row_liveness(rec)
+            if reason is None:
+                reason = "generation_conflict" if rec.get("state") == "stopped" else "unknown"
+            if rec.get("state") == "stopped":
+                return "down", {"code": PENDING, "run_id": rec.get("run_id"), "state": "pending", "reason": reason}
+            return self._pending_instead(rec, reason)
+        reason = "liveness_unknown" if rec.get("members") else "unknown"
+        return "down", {"code": PENDING, "run_id": rec.get("run_id"), "state": "pending", "reason": reason}
+
+    def _down_stop(self, outcome: str, res: dict, rec: dict, pre_members: list) -> tuple[str, dict]:
+        """A non-typed put failure is not a stopped run while a member may still be live.
+
+        The re-read is best-effort. A live member answers ``member_alive``. A probe that raises
+        answers ``liveness_unknown``. A re-read that is itself a recorded stop answers stopped.
+
+        If the re-read fails, the documented contract still answers stopped with ``recorded`` false,
+        and only then: the pre-put row had no members and the stop was already confirmed. The
+        snapshot we tried to store had been confirmed empty, and a member joined inside the failed
+        put is not visible, so this path does not invent one. A pre-put member we can no longer
+        read is not that contract: answer ``liveness_unknown``. A re-read that shows only members
+        already proved dead keeps the confirmed-stop answer. They are not a live member, and the
+        probe did not fail.
+        """
+        if outcome != "down" or res.get("code") != STOPPED:
+            return outcome, res
+        fresh = self._reread(rec)
+        run_id = rec.get("run_id")
+        if fresh is None:
+            if pre_members:
+                return "down", {"code": PENDING, "run_id": run_id, "state": "pending", "reason": "liveness_unknown"}
+            return outcome, res
+        if _recorded_stop(fresh):
+            rec.clear()
+            rec.update(fresh)
+            return "ok", {"code": STOPPED, "run_id": fresh["run_id"], "state": "stopped", "repeat": True}
+        reason = self._row_liveness(fresh)
+        if reason:
+            return "down", {"code": PENDING, "run_id": run_id, "state": "pending", "reason": reason}
+        return outcome, res
+
     def _recorded(self, res: dict, rec: dict, *, reconfirm: bool = False) -> dict:
-        # The cleanup layer's answer is the truth; a failed write-back is reported, not raised. The next
-        # stop then sees the old state and asks again, which is safe (cgroup.kill and pidfds repeat).
-        # A stale generation is not a failed disk: the record moved under us, so the stop is applied to
-        # the fresh record once. A member that joined in that window keeps the stop pending.
+        # The cleanup layer's answer is the truth only when the stored row agrees. A failed write-back
+        # is reported, not raised. The next stop then sees the old state and asks again, which is safe
+        # (cgroup.kill and pidfds repeat). A stale generation is not a failed disk: the record moved
+        # under us, so the stop is applied to the fresh record once. A member that joined in that
+        # window keeps the stop pending. A put that returns no snapshot, or raises a non-typed error,
+        # is checked against the row we can re-read before that prebuilt stopped answer is returned.
+        pre_members = list(rec.get("members") or [])
         try:
             outcome = self._commit(rec)
         except _RegistryError:
             outcome = "down"
-        # A refused proof is not a stopped run. A lost disk write still answers with the cleanup
-        # result below; this is only the attestation refusal.
+            snapshot = "returned"
+        else:
+            snapshot = getattr(self._local, "put_snapshot", "returned")
+        # A refused proof is not a stopped run. A lost disk write is re-read below; this is only
+        # the attestation refusal.
         outcome, res = self._unattested_to_pending(outcome, res, rec)
+        outcome, res = self._blind_snapshot_stop(outcome, res, rec, snapshot)
         if outcome == "stale":
             fresh = self._reread(rec)
             if fresh is None:
@@ -674,7 +769,8 @@ class ControlAPI:
                 outcome = "ok"
             elif fresh.get("state") == "stopped":
                 # ``state == stopped`` with an empty proof, or with a member still listed, is not
-                # a recorded stop. Answer pending instead of repeat-stopped.
+                # a recorded stop. Answer pending instead of repeat-stopped. ``_lost_stop_is_pending``
+                # still accepts a row that becomes a recorded stop while this pending put is in flight.
                 fresh["stop"] = self._carry_stop(rec.get("stop"), rec, fresh)
                 outcome, res = self._pending_instead(fresh, "generation_conflict")
                 rec.clear()
@@ -725,6 +821,7 @@ class ControlAPI:
         # writer, then owns the row: answer pending unless that row is already stopped.
         outcome, res = self._unattested_to_pending(outcome, res, rec)
         outcome, res = self._lost_stop_is_pending(outcome, res, rec)
+        outcome, res = self._down_stop(outcome, res, rec, pre_members)
         if outcome != "ok":
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands

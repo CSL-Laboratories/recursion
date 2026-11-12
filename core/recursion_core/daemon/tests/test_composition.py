@@ -914,28 +914,40 @@ class LauncherTest(unittest.TestCase):
 
     def test_kill_tree_answers_empty_only_on_an_attested_end(self):
         class FakeDaemon:
-            def __init__(self, states):
-                self.states, self.stopped, self.seen = list(states), [], []
+            def __init__(self, states, clear):
+                self.states, self.clear = list(states), clear
+                self.stopped, self.seen, self.walked = [], [], []
 
-            def stop(self, run_id):
-                self.stopped.append(run_id)
+            def stop(self, run_id, *, cgroup=None):
+                self.stopped.append((run_id, cgroup))
 
-            def reconcile(self, run_id):
-                self.seen.append(run_id)
+            def reconcile(self, run_id, *, cgroup=None):
+                self.seen.append((run_id, cgroup))
                 state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
                 return Run(run_id, f'recursion-run-{run_id}.service', True, state, BOOT, '')
 
-        def tree(*states):
+            def cgroup_clear(self, run_id, cgroup):
+                self.walked.append((run_id, cgroup))
+                return self.clear
+
+        def tree(*states, clear=True):
             clock = FakeClock(0.0)
-            daemon = FakeDaemon(states)
+            daemon = FakeDaemon(states, clear)
             return daemon, launcher.UnitKillTree(daemon, poll_s=0.5, clock=clock, sleep=clock.advance)
 
         group = '/user.slice/app.slice/recursion-run-run-7.service'
         daemon, kill = tree('terminated')
         kill.request_stop(group)
-        self.assertEqual(daemon.stopped, ['run-7'])
+        self.assertEqual(daemon.stopped, [('run-7', group)])  # the path goes to the daemon with the Stop
         self.assertEqual(kill.confirm(group, 5.0), EMPTY)
+        self.assertEqual((daemon.seen, daemon.walked), ([('run-7', group)], [('run-7', group)]))
         self.assertEqual(tree('stopping', 'stopping', 'terminated')[1].confirm(group, 5.0), EMPTY)
+        # A terminated row is not enough: the path itself has to read absent or empty in this call.
+        self.assertEqual(tree('terminated', clear=False)[1].confirm(group, 2.0), POPULATED)
+        self.assertEqual(tree('terminated', clear=None)[1].confirm(group, 2.0), UNKNOWN)
+        watched, watching = tree('stopping', clear=False)
+        self.assertEqual(watching.confirm(group, 2.0), POPULATED)
+        self.assertEqual(watched.walked, [], 'the path is walked only once the row reads terminated')
         self.assertEqual(tree('running')[1].confirm(group, 2.0), POPULATED)
         self.assertEqual(tree('stopping')[1].confirm(group, 2.0), POPULATED)
         self.assertEqual(tree('unknown')[1].confirm(group, 2.0), UNKNOWN)
@@ -946,7 +958,7 @@ class LauncherTest(unittest.TestCase):
                 kill.request_stop(bad)
             with self.assertRaises(ValueError):
                 kill.confirm(bad, 1.0)
-        self.assertEqual(daemon.stopped, ['run-7'])
+        self.assertEqual(daemon.stopped, [('run-7', group)])
 
     def test_engine_process_reads_lines_until_the_main_process_is_gone(self):
         out = self.tmp / 'stdout.jsonl'

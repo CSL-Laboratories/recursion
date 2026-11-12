@@ -779,19 +779,48 @@ class Daemon:
             self._reconcile(self.registry.get(run_id))
             return self.registry.get(run_id)
 
-    def stop(self, run_id):
+    def stop(self, run_id, *, cgroup=None):
+        """Record the Stop, send it and return the run's record.
+
+        ``cgroup`` is the path the caller will name in its receipt. It is walked beside the one on
+        the control record, which a launch whose record was never written does not have.
+        """
         with self.lock:
             self._open()
             self.registry.request_stop(run_id)
-            self._reconcile(self.registry.get(run_id), send_stop=True)
+            self._reconcile(self.registry.get(run_id), send_stop=True, cgroup=cgroup)
             return self.registry.get(run_id)
 
-    def reconcile(self, run_id):
-        """Observe one run now and return its record. Raises KeyError for an unknown id."""
+    def reconcile(self, run_id, *, cgroup=None):
+        """Observe one run now and return its record. Raises KeyError for an unknown id.
+
+        ``cgroup`` is walked as in ``stop``.
+        """
         with self.lock:
             self._open()
-            self._reconcile(self.registry.get(run_id))
+            self._reconcile(self.registry.get(run_id), cgroup=cgroup)
             return self.registry.get(run_id)
+
+    def cgroup_clear(self, run_id, cgroup):
+        """Walk ``cgroup`` now, for a run with a recorded Stop. Raises KeyError for an unknown id.
+
+        True: the path is absent or empty. False: a process is still alive in it. None: that
+        cannot be told (no Stop is recorded for the run, the path does not name the run's unit,
+        the manager cannot walk, or the walk could not be finished).
+
+        The run's row says what was seen of its unit and of the cgroup on its control record. It
+        can read ``terminated`` without this path ever having been looked at: a launch whose
+        control record never got its cgroup has none recorded, and a sweep or a fence that replays
+        its Stop on a unit systemd has forgotten finds no path to walk. A Stop receipt names a
+        cgroup, so the kill tree asks here about that very path before it answers ``stopped``.
+        What is alive there is killed, as in every walk under a recorded Stop.
+        """
+        with self.lock:
+            self._open()
+            run = self.registry.get(run_id)
+            if not run.stop_requested:
+                return None  # the walk kills what it finds: never without a recorded Stop
+            return self._walk_cgroups(run, [cgroup])
 
     def _stop_send_due(self, run_id):
         held = self._stop_resend.get(run_id)
@@ -802,7 +831,7 @@ class Daemon:
         wait = STOP_RESEND_BASE_S if held is None else min(held[1] * 2, STOP_RESEND_MAX_S)
         self._stop_resend[run_id] = (self.clock() + wait, wait)
 
-    def _reconcile(self, run, detail='', send_stop=False):
+    def _reconcile(self, run, detail='', send_stop=False, cgroup=None):
         if run.state in TERMINAL:
             self._stop_resend.pop(run.run_id, None)
             return
@@ -841,7 +870,7 @@ class Daemon:
             # restarted forgets its units; their processes stay). So the recorded cgroup is
             # walked, and what is still alive there is killed through the cgroup (ADV1-1).
             if observation == 'gone' and (stopped or not_loaded):
-                clear = self._recorded_cgroup_clear(run)
+                clear = self._recorded_cgroup_clear(run, cgroup)
                 if clear is True:
                     observation = 'empty'
                     if not_loaded and not detail:
@@ -865,29 +894,40 @@ class Daemon:
         if (state, detail[:500]) != (run.state, run.detail):
             self.registry.state(run.run_id, state, detail)
 
-    def _recorded_cgroup_clear(self, run):
-        """True when the cgroup recorded for ``run`` is absent or empty, False when a process
-        is still alive in it, None when that cannot be told.
+    def _recorded_cgroup_clear(self, run, cgroup=None):
+        """True when every cgroup known for ``run`` is absent or empty, False when a process is
+        still alive in one, None when that cannot be told.
 
-        The recorded path is the one on the run's control record. A run with none (it never
-        launched, or the launch was never recorded) has no path to walk: no receipt can say
-        ``stopped`` for it either, because the control API confirms only a recorded cgroup.
+        The paths are the one on the run's control record and ``cgroup``, the one a Stop brought
+        with it. A run with neither (it never launched, or its launch was never recorded and no
+        Stop named a path) has nothing to walk, and its row ends on systemd's word. That row is
+        not a Stop receipt: the kill tree answers only after ``cgroup_clear`` walked the path the
+        receipt names.
         """
         try:
             group = self.registry.control_cgroup(run.run_id)
         except ValueError:
             log.exception('control record of %s is unreadable; its cgroup was not walked', run.run_id)
             return None
-        if group is None:
+        paths = [path for path in dict.fromkeys((group, cgroup)) if path is not None]
+        if not paths:
             return True
+        return self._walk_cgroups(run, paths)
+
+    def _walk_cgroups(self, run, paths):
+        """The manager's walk over each of ``paths``: False if any holds a live process, else
+        None if any could not be told, else True."""
         check = getattr(self.manager, 'recorded_cgroup_clear', None)
         if not callable(check):
             return None
         try:
-            return check(run.unit, group)
+            outcomes = [check(run.unit, path) for path in paths]
         except Exception:
             log.exception('walk of the recorded cgroup of %s failed', run.run_id)
             return None
+        if False in outcomes:
+            return False
+        return None if None in outcomes else True
 
     def _termination_attested(self, unit):
         attest = getattr(self.manager, 'processes_gone', None)

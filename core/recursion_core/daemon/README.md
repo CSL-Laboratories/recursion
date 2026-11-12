@@ -102,7 +102,12 @@ are unaffected:
   alone: when the run's control record carries a cgroup path, that path is walked,
   what is still alive there is killed through the cgroup (`cgroup.kill`, else
   SIGKILL by pidfd to each listed pid /proc still places there), and only an
-  absent or empty cgroup is `terminated`; otherwise the run stays `stopping`. A scripted observation that the unit ended, or a listener that is
+  absent or empty cgroup is `terminated`; otherwise the run stays `stopping`. A Stop
+  brings the cgroup path its receipt will name, and that path is walked the same way
+  when the control record carries none (a launch whose record was never written).
+  `run.stop` answers `stopped` only after that very path read absent or empty in the
+  same call, whatever the row already says: a row a sweep or a fence ended with no
+  path to walk is not a receipt. A scripted observation that the unit ended, or a listener that is
   still alive, is not `terminated`. A read of `cgroup.procs` or `/proc/<pid>/stat`
   that fails with anything other than ENOENT or ESRCH is unknown, not an empty
   cgroup and not a dead process, and is not `terminated`. A run with a recorded

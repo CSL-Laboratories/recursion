@@ -5,6 +5,8 @@ observation and attestation code and only scripts what ``systemctl`` prints (and
 over a fake cgroup tree on disk; the composed tests use ``ProcessUnitManager`` from
 ``test_composition``. The defects found here (ADV1-1, -6, -7, -8) are fixed and their tests say "(fixed)".
 """
+import contextlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -19,7 +21,7 @@ import unittest
 from unittest import mock
 
 from recursion_core.control.api import ControlAPI
-from recursion_core.control.registry import StopUnattested
+from recursion_core.control.registry import EMPTY, POPULATED, UNKNOWN, StopUnattested
 from recursion_core.daemon import Daemon, Registry, RUN_ID
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import engine_exec, launcher
@@ -66,6 +68,19 @@ def show(**props):
             'Job': '', 'InvocationID': 'a' * 32, 'ExecMainStartTimestampMonotonic': '5', 'MainPID': '0'}
     base.update(props)
     return ''.join(f'{k}={v}\n' for k, v in base.items())
+
+
+class SteppedClock:
+    """Moves only when the kill tree sleeps, so a confirm window ends without any waiting."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
 
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')
@@ -256,6 +271,128 @@ class StopTruthTest(unittest.TestCase):
         self.assertEqual((answer['code'], answer.get('reason')), ('pending', 'confirm_unknown'), answer)
         self.assertFalse([c for c in manager.calls if c[:3] == ['systemctl', '--user', 'stop']],
                          'documents: a lost_reboot run is never sent a systemctl stop')
+
+    @contextlib.contextmanager
+    def failing_control_writes(self, only=None):
+        """Control-record writes fail as on a full disk: every one, or just the ``only``-th."""
+        real, count = Registry.control_put, [0]
+
+        def put(registry, run_id, text):
+            count[0] += 1
+            if only is None or count[0] == only:
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real(registry, run_id, text)
+
+        with mock.patch.object(Registry, 'control_put', put):
+            yield
+
+    def unrecorded_launch(self, proc):
+        """A launch whose control record never got its cgroup (``start_unconfirmed``; the API keeps the
+        path in memory), on a manager that has since forgotten the unit. ``proc`` sits in that cgroup."""
+        daemon = Daemon(Registry(self.tmp / 'state'), self.forgotten(), boot_id=lambda: BOOT)
+        self.addCleanup(daemon.close)
+        registry = adapter.DurableRunRegistry(daemon.registry, processes=adapter.pid_alive(daemon.manager))
+
+        def starter(params):
+            run_id = params['run_id']
+            group = f'/app.slice/recursion-run-{run_id}.service'
+            self.cgroup(group, [proc.pid])
+            daemon.registry.add(run_id, BOOT)
+            daemon.registry.state(run_id, 'running')
+            return {'cgroup': group}
+
+        clock = SteppedClock()
+        kill = launcher.UnitKillTree(daemon, poll_s=0.1, clock=clock, sleep=clock.sleep)
+        api = ControlAPI(registry, kill, starter, time.time, confirm_timeout_s=0.3)
+        with self.failing_control_writes(only=2):  # the launch intent lands, the running record does not
+            started = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi'})
+        self.assertEqual(started['code'], 'start_unconfirmed', started)
+        run_id = started['run_id']
+        self.assertIsNone(daemon.registry.control_cgroup(run_id), 'the control record carries no cgroup')
+        return api, daemon, run_id, f'/app.slice/recursion-run-{run_id}.service'
+
+    def assertPendingOnALiveCgroup(self, api, run_id, proc):
+        answer = api.call('run.stop', {'run_id': run_id})
+        self.assertIsNone(proc.poll(), 'the process in the supervised cgroup is still alive')
+        self.assertNotStopped(answer)
+        self.assertEqual(answer.get('reason'), 'cgroup_populated', answer)
+        stored = api.call('run.status', {'run_id': run_id})['run']
+        self.assertNotEqual(stored['state'], 'stopped', stored)
+        self.assertIsNone(stored.get('stop_attestation'), stored)
+
+    def test_start_unconfirmed_forgotten_unit_with_live_cgroup_is_not_stopped(self):
+        """R1-1: with no cgroup on the control record, the path Stop brings is the one walked."""
+        proc = self.victim()
+        api, daemon, run_id, _ = self.unrecorded_launch(proc)
+        self.assertPendingOnALiveCgroup(api, run_id, proc)
+        row = daemon.registry.get(run_id)
+        self.assertEqual((row.state, row.detail), ('stopping', 'unit gone; the recorded cgroup still holds a process'))
+
+    def test_a_sweep_that_ends_the_row_of_an_unrecorded_launch_does_not_make_its_stop_stopped(self):
+        """R1-1: Stop's write-back fails again, a sweep replays the Stop with no path to walk and ends the
+        row; the next Stop still walks the cgroup its receipt would name."""
+        proc = self.victim()
+        api, daemon, run_id, _ = self.unrecorded_launch(proc)
+        with self.failing_control_writes():
+            first = api.call('run.stop', {'run_id': run_id})
+        self.assertNotStopped(first)
+        self.assertIs(first.get('recorded'), False, first)
+        daemon.sweep()
+        self.assertEqual(daemon.registry.get(run_id).state, 'terminated',
+                         "precondition: the row ended on systemd's word, with no path to walk")
+        self.assertPendingOnALiveCgroup(api, run_id, proc)
+
+    def test_a_fence_that_ends_the_row_of_an_unrecorded_launch_does_not_make_its_stop_stopped(self):
+        """R1-1: a fence (``Daemon.stop`` with no path) ends the row first; Stop is still pending."""
+        proc = self.victim()
+        api, daemon, run_id, group = self.unrecorded_launch(proc)
+        self.assertEqual(daemon.stop(run_id).state, 'terminated',
+                         "precondition: the row ended on systemd's word, with no path to walk")
+        self.assertPendingOnALiveCgroup(api, run_id, proc)
+        # Once that cgroup reads empty, the same Stop is attested, for that path.
+        proc.kill()
+        proc.wait()
+        self.cgroup(group, [])
+        answer = api.call('run.stop', {'run_id': run_id})
+        self.assertEqual((answer['code'], answer['state']), ('stopped', 'stopped'), answer)
+        proof = api.call('run.status', {'run_id': run_id})['run']['stop_attestation']
+        self.assertEqual((proof['proof'], proof['cgroup']), ('empty', group))
+
+    def test_kill_tree_does_not_take_a_terminated_row_for_an_empty_cgroup(self):
+        """R1-1: ``confirm`` is ``EMPTY`` only when the path it was given was walked absent or empty."""
+        proc = self.victim()
+        directory = self.cgroup(GROUP, [proc.pid])
+        _, daemon = self.api(self.forgotten())
+        clock = SteppedClock()
+        kill = launcher.UnitKillTree(daemon, poll_s=0.1, clock=clock, sleep=clock.sleep)
+        daemon.registry.request_stop('run-x')
+        daemon.registry.state('run-x', 'terminated')  # however the row got there
+        self.assertEqual(kill.confirm(GROUP, 0.3), POPULATED)
+        self.assertIsNone(proc.poll())
+        self.cgroup(GROUP, [])
+        os.symlink(self.root, directory / 'loop')  # a walk that cannot be finished is not an empty cgroup
+        self.assertEqual(kill.confirm(GROUP, 0.3), UNKNOWN)
+        os.unlink(directory / 'loop')
+        self.assertEqual(kill.confirm(GROUP, 0.3), EMPTY)
+        shutil.rmtree(directory)
+        self.assertEqual(kill.confirm(GROUP, 0.3), EMPTY)
+
+    def test_cgroup_clear_walks_only_under_a_recorded_stop(self):
+        """The walk kills what it finds, so the daemon refuses it for a run nobody asked to stop."""
+        manager = self.forgotten()
+        manager.recorded_cgroup_clear = mock.Mock(return_value=False)
+        _, daemon = self.api(manager)
+        self.assertIsNone(daemon.cgroup_clear('run-x', GROUP))
+        manager.recorded_cgroup_clear.assert_not_called()
+        daemon.registry.request_stop('run-x')
+        for outcome in (False, None, True):
+            manager.recorded_cgroup_clear.return_value = outcome
+            self.assertIs(daemon.cgroup_clear('run-x', GROUP), outcome)
+        manager.recorded_cgroup_clear.assert_called_with(UNIT, GROUP)
+        manager.recorded_cgroup_clear.side_effect = OSError('walk failed')
+        self.assertIsNone(daemon.cgroup_clear('run-x', GROUP))
+        with self.assertRaises(KeyError):
+            daemon.cgroup_clear('run-none', GROUP)
 
     def test_kill_tree_refuses_a_cgroup_that_names_no_run_unit(self):
         kill = launcher.UnitKillTree(mock.Mock())

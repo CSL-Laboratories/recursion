@@ -115,6 +115,23 @@ def lock_child(path, ready):
         signal.pause()
 
 
+def _fds_targeting(path):
+    """Open fds whose /proc/self/fd target is this path."""
+    path = Path(path)
+    parent = str(path.parent)
+    name = path.name
+    hits = []
+    for fd in os.listdir('/proc/self/fd'):
+        try:
+            target = os.readlink(f'/proc/self/fd/{fd}')
+        except OSError:
+            continue
+        bare = target[:-len(' (deleted)')] if target.endswith(' (deleted)') else target
+        if os.path.basename(bare) == name and os.path.dirname(bare) == parent:
+            hits.append(target)
+    return hits
+
+
 class DaemonTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -656,6 +673,57 @@ class DaemonTests(unittest.TestCase):
             pass
         self.assertEqual(set(os.listdir('/proc/self/fd')), before)
 
+    def test_rename_between_lock_opens_is_refused(self):
+        # The directory fd is flocked first. Replacing the runtime directory
+        # before the lock file is opened must not publish that file into the
+        # replacement, and must not leave either fd open.
+        runtime = self.path / 'lock-runtime'
+        runtime.mkdir(mode=0o700)
+        aside = self.path / 'lock-runtime-aside'
+        real_open = os.open
+        swapped = False
+
+        def swap_after_directory_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            if (not swapped and dir_fd is None and flags & os.O_DIRECTORY
+                    and Path(path) == runtime):
+                os.rename(runtime, aside)
+                runtime.mkdir(mode=0o700)
+                swapped = True
+            return fd
+
+        before = set(os.listdir('/proc/self/fd'))
+        with patch('recursion_core.daemon.os.open', swap_after_directory_open):
+            with self.assertRaises(AlreadyRunning):
+                with UserLock(runtime):
+                    pass
+        self.assertTrue(swapped)
+        self.assertTrue((aside / 'recursion-daemon.lock').is_file())
+        self.assertFalse((runtime / 'recursion-daemon.lock').exists())
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+        with UserLock(runtime):
+            pass
+
+    def test_renamed_away_directory_is_not_the_path_lease(self):
+        # Once UserLock has returned, a later rename of its directory is
+        # outside the path. The lease stays on the original inode. The new
+        # directory at the same path is a different lease.
+        runtime = self.path / 'lock-runtime'
+        first = UserLock(runtime)
+        first.__enter__()
+        try:
+            aside = self.path / 'lock-runtime-aside'
+            os.rename(runtime, aside)
+            runtime.mkdir(mode=0o700)
+            with self.assertRaises(AlreadyRunning):
+                with UserLock(aside):
+                    pass
+            with UserLock(runtime):
+                pass
+        finally:
+            first.__exit__(None, None, None)
+
     def test_failed_registry_open_closes_the_connection(self):
         # A file under 100 bytes is refused before sqlite opens it. This one
         # passes that size gate and the header check, then fails inside sqlite.
@@ -717,6 +785,48 @@ class DaemonTests(unittest.TestCase):
         self.assertIsNotNone(caught)
         self.assertEqual(set(os.listdir('/proc/self/fd')), before)
         del caught
+
+    def test_seal_failure_closes_the_connection(self):
+        # _seal_files runs after the live connection is stored. A symlink
+        # sidecar or an EIO from chmod must not leave that connection's fd
+        # alive for as long as the traceback is.
+        def plant_symlink(name):
+            def plant(directory):
+                os.symlink('sidecar-target', directory / name)
+            return plant
+
+        def plant_chmod_eio(directory):
+            pass
+
+        cases = (
+            ('runs.sqlite3-shm', plant_symlink('runs.sqlite3-shm'), RegistryIntegrityError),
+            ('runs.sqlite3-note', plant_symlink('runs.sqlite3-note'), RegistryIntegrityError),
+            ('chmod-eio', plant_chmod_eio, OSError),
+        )
+        for label, plant, error in cases:
+            with self.subTest(label=label):
+                directory = self.path / label
+                registry = Registry(directory)
+                registry.close()
+                plant(directory)
+                target = directory / 'runs.sqlite3'
+                self.assertEqual(_fds_targeting(target), [])
+                caught = None
+                try:
+                    if label == 'chmod-eio':
+                        with patch('recursion_core.daemon.os.chmod',
+                                   side_effect=OSError(errno.EIO, 'Input/output error')):
+                            Registry(directory)
+                    else:
+                        Registry(directory)
+                except error as exc:
+                    caught = sys.exc_info()
+                    if label == 'chmod-eio':
+                        self.assertIs(type(exc), OSError)
+                        self.assertEqual(exc.errno, errno.EIO)
+                self.assertIsNotNone(caught)
+                self.assertEqual(_fds_targeting(target), [])
+                del caught
 
 
 class RuntimeTests(unittest.TestCase):

@@ -87,8 +87,14 @@ class UserLock:
     The exclusive lease is the runtime directory, not only the lock file. flock
     follows an open file description: after the lock file is removed, a new
     file at the same path is a different inode and the two flocks do not
-    conflict. Holding the directory keeps a second daemon out until this
-    process releases the lease or dies.
+    conflict. The lock file is opened relative to that directory fd. After both
+    flocks, the path's directory must still be the same inode; if it was
+    replaced, both fds are released and AlreadyRunning is raised.
+
+    A directory renamed away before this entry is a different inode from
+    whatever now sits at the path. The kernel does not connect that old flock
+    to the new directory, so a later locker of the replacement is not blocked
+    by it. Choosing which directory is the runtime is left to the caller.
     """
     def __init__(self, runtime: Path):
         self.path = runtime / 'recursion-daemon.lock'
@@ -100,11 +106,22 @@ class UserLock:
         dirfd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             fcntl.flock(dirfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            # A relative name: an absolute path would ignore dir_fd and follow
+            # a replacement directory created at the same path.
+            fd = os.open(
+                self.path.name,
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=dirfd,
+            )
             try:
                 if os.fstat(fd).st_uid != os.getuid():
                     raise PermissionError('Runtime lock must be owned by operator')
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = os.fstat(dirfd)
+                live = os.stat(self.path.parent)
+                if (live.st_dev, live.st_ino) != (held.st_dev, held.st_ino):
+                    raise AlreadyRunning('One daemon per user per machine')
             except BaseException:
                 os.close(fd)
                 raise
@@ -294,10 +311,25 @@ class Registry:
             _sync_directory(self.directory)
         self._dir_durable = True
         try:
-            self._reopen()
-        except sqlite3.Error as exc:
-            raise RegistryIntegrityError('registry is not open') from exc
-        self._seal_files()
+            try:
+                self._reopen()
+            except sqlite3.Error as exc:
+                raise RegistryIntegrityError('registry is not open') from exc
+            self._seal_files()
+        except BaseException:
+            # _seal_files runs only after _reopen has stored the connection.
+            # Close it before the traceback can keep this half-built Registry,
+            # and its fd, alive. _reopen already drops a connection it did not
+            # publish.
+            db = self.db
+            self.db = None
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            db = None
+            raise
 
     def _temp_path(self):
         return self.directory / f'.runs.sqlite3.tmp-{os.getpid()}-{threading.get_ident()}'

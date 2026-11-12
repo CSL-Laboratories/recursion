@@ -242,19 +242,36 @@ def _hash_regular(path: str, detail: str) -> str:
     """Hash a regular file. ``_manifest`` resolves a symlink before it calls this."""
 
     missing = "wrapper_launcher_missing" if detail == "launcher" else "wrapper_file_missing"
-    if not isinstance(path, str) or os.path.islink(path) or not os.path.isfile(path):
+    if not isinstance(path, str):
         raise WrapperPinRefused(missing, detail)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise WrapperPinRefused(missing, detail) from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise WrapperPinRefused(missing, detail)
+    # The cap is the file's size. Check it before reading so a sparse or
+    # unreadable file over the cap refuses without pulling the body in, and
+    # without a path-bearing OSError. The loop still stops a file that grows
+    # past the cap while it is being hashed.
+    if info.st_size > _MAX_FILE_BYTES:
+        raise WrapperPinRefused("wrapper_file_too_large", detail)
     digest = hashlib.sha256()
     total = 0
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > _MAX_FILE_BYTES:
-                raise WrapperPinRefused("wrapper_file_too_large", detail)
-            digest.update(chunk)
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_FILE_BYTES:
+                    raise WrapperPinRefused("wrapper_file_too_large", detail)
+                digest.update(chunk)
+    except FileNotFoundError:
+        raise WrapperPinRefused(missing, detail) from None
+    except OSError:
+        raise WrapperPinRefused("wrapper_tree_unreadable", detail) from None
     return digest.hexdigest()
 
 

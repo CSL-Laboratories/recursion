@@ -158,6 +158,78 @@ class WrapperPinTests(_Base):
             )
         self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_pin_mismatch", "binary"))
 
+    def test_unreadable_binary_refuses_without_its_path(self) -> None:
+        binary = self.install / "agy"
+        binary.write_text("agy-binary\n", encoding="ascii")
+        os.chmod(binary, 0)
+        with self.assertRaises(WrapperPinRefused) as caught:
+            measure_antigravity_pin("1.5.5", str(binary), self.small_launcher())
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_tree_unreadable", "binary"))
+        self.assertNotIn(str(binary), str(caught.exception))
+
+    def test_unreadable_binary_over_one_gib_refuses_too_large(self) -> None:
+        # The cap is the file's size. Read permission is not required to know it,
+        # and the absolute path must not ride out on an OSError.
+        binary = self.sparse("agy", _GIB + 1)
+        os.chmod(binary, 0)
+        with self.assertRaises(WrapperPinRefused) as caught:
+            measure_antigravity_pin("1.5.5", binary, self.small_launcher())
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_too_large", "binary"))
+        self.assertNotIn(binary, str(caught.exception))
+
+    def test_oversize_binary_is_refused_without_reading_it(self) -> None:
+        binary = self.sparse("agy", _GIB + 1)
+        launcher = self.small_launcher()
+        read_bytes: list[int] = []
+        real_open = open
+
+        def tracking(file, mode="r", *args, **kwargs):
+            handle = real_open(file, mode, *args, **kwargs)
+            if os.fspath(file) == binary:
+                original = handle.read
+
+                def read(n=-1, original=original):
+                    data = original(n)
+                    read_bytes.append(len(data))
+                    return data
+
+                handle.read = read
+            return handle
+
+        with mock.patch("builtins.open", tracking):
+            with self.assertRaises(WrapperPinRefused) as caught:
+                measure_antigravity_pin("1.5.5", binary, launcher)
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_too_large", "binary"))
+        self.assertEqual(read_bytes, [])
+
+    def test_bytes_past_the_old_cap_are_in_the_pin(self) -> None:
+        binary = self.install / "agy"
+        size = 40 * _MIB
+        tail = b"TAIL"
+        with open(binary, "wb") as handle:
+            handle.truncate(size)
+            handle.seek(size - len(tail))
+            handle.write(tail)
+        pin = measure_antigravity_pin("1.5.5", str(binary), self.small_launcher())
+        expected = hashlib.sha256()
+        zeros = bytes(_MIB)
+        remaining = size - len(tail)
+        while remaining >= _MIB:
+            expected.update(zeros)
+            remaining -= _MIB
+        if remaining:
+            expected.update(bytes(remaining))
+        expected.update(tail)
+        self.assertEqual(pin.binary_sha256, expected.hexdigest())
+
+    def test_unreadable_package_file_over_one_gib_refuses_too_large(self) -> None:
+        path = self.sparse("big.bin", _GIB + 1)
+        os.chmod(path, 0)
+        with self.assertRaises(WrapperPinRefused) as caught:
+            measure_package_pin(str(self.install / "launcher.js"), str(self.install))
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_too_large", "big.bin"))
+        self.assertNotIn(path, str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

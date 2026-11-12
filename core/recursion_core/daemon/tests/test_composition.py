@@ -295,6 +295,120 @@ class ComposedDaemonTest(unittest.TestCase):
         states = {r['state'] for r in api.call('run.list')['runs']}
         self.assertEqual(states, {'start_failed'})
 
+    #: Routes the daemon has no credential custody for, each with what its method needs set in the
+    #: daemon's environment. With those set the adapter itself accepts the route, so a refusal here is
+    #: the daemon's own and not the adapter's "needs ... set".
+    NO_CUSTODY_ROUTES = {
+        'api_key_helper': ({'kind': 'api_key', 'id': 'work-helper', 'key_source': 'api_key_helper'}, {}),
+        'bedrock': ({'kind': 'passthrough', 'id': 'aws-work', 'method': 'bedrock'},
+                    {'CLAUDE_CODE_USE_BEDROCK': '1', 'AWS_REGION': 'us-east-1', 'AWS_PROFILE': 'work'}),
+        'vertex': ({'kind': 'passthrough', 'id': 'gcp-work', 'method': 'vertex'},
+                   {'CLAUDE_CODE_USE_VERTEX': '1', 'CLOUD_ML_REGION': 'us-east5',
+                    'ANTHROPIC_VERTEX_PROJECT_ID': 'synthetic-project'}),
+        'foundry': ({'kind': 'passthrough', 'id': 'azure-work', 'method': 'foundry'},
+                    {'CLAUDE_CODE_USE_FOUNDRY': '1', 'ANTHROPIC_FOUNDRY_RESOURCE': 'synthetic-resource'}),
+        'gateway': ({'kind': 'passthrough', 'id': 'gateway-work', 'method': 'gateway'},
+                    {'ANTHROPIC_BASE_URL': 'https://gateway.invalid', 'ANTHROPIC_AUTH_TOKEN': 'synthetic-gateway-value'}),
+    }
+
+    def probe_engine(self):
+        """An engine that leaves a file behind if it is ever executed, and then answers like a result."""
+        ran = self.tmp / 'engine-ran'
+        self.engine.write_text(
+            '#!/usr/bin/python3 -I\nimport json, os, sys\n'
+            f'open({str(ran)!r}, "w").write(json.dumps(sorted(os.environ)))\n'
+            'sys.stdin.read()\n'
+            'print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ran"}), flush=True)\n')
+        os.chmod(self.engine, 0o700)
+        return ran
+
+    def test_api_key_helper_route_does_not_silently_fall_back_to_personal_oauth_token(self):
+        """R1-3: a helper-key or passthrough route is refused ``launch_refused`` and nothing is launched.
+        Before, it started under the user's sign-in and was recorded as the other connection."""
+        ran = self.probe_engine()
+        self.environ['CLAUDE_CONFIG_DIR'] = str(self.tmp / 'custom-claude-cfg')
+        self.environ['CLAUDE_CODE_OAUTH_TOKEN'] = 'synthetic-oauth-test-value'
+        base = dict(self.environ)
+        for name, (connection, needs) in self.NO_CUSTODY_ROUTES.items():
+            with self.subTest(route=name):
+                self.environ = {**base, **needs}
+                self.routes = {'claude_code': {
+                    'route': {'engine': 'claude_code', 'model': 'm', 'connection': dict(connection)},
+                    'deadline_s': 60.0, 'binary': str(self.engine)}}
+                try:
+                    with mock.patch.object(adapter.log, 'error') as logged:
+                        _, composed = self.boot()
+                    api = self.api(composed)
+                    composed.breaker.bind_run = binds = mock.Mock(return_value=None)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi'})
+                    self.assertEqual(answer['code'], 'start_failed', answer)
+                    self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+                    self.assertTrue(answer['start_error']['detail'].startswith('no credential custody: '), answer)
+                    self.assertEqual(self.units.started, [], 'a unit was started')
+                    self.assertFalse(ran.exists(), 'the engine was executed')
+                    binds.assert_not_called()  # refused before the run is bound to the connection it names
+                    run = api.call('run.status', {'run_id': answer['run_id']})['run']
+                    self.assertEqual((run['state'], run['cgroup'], run['observed']), ('start_failed', None, None))
+                    row = next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+                    self.assertEqual((row['configured'], row['sign_in']), (True, connection['kind']))
+                    self.assertTrue(row['blocker'].startswith('launch_refused: no credential custody: '), row)
+                    # Said once when the routes load, too: the operator need not start a run to find out.
+                    said = [call.args[0] % call.args[1:] for call in logged.call_args_list]
+                    self.assertTrue(any(line.startswith('route claude_code cannot start (launch_refused): '
+                                                        'no credential custody: ') for line in said), said)
+                finally:
+                    self.shutdown()
+                    self.kill_units()
+                    self.units.started.clear()
+                    self.units.procs.clear()
+                    ran.unlink(missing_ok=True)
+
+    def test_a_route_file_with_a_helper_key_route_refuses_that_route_and_starts_the_other(self):
+        """R1-3 through ``routes.json``: the refused route does not take the subscription route with it."""
+        ran = self.probe_engine()
+        config = self.tmp / 'config' / 'recursion'
+        config.mkdir(parents=True, mode=0o700)
+        standin = self.tmp / 'bin' / 'codex-standin' / 'claude'
+        standin.parent.mkdir(mode=0o700)
+        shutil.copyfile(STANDIN, standin)
+        os.chmod(standin, 0o700)
+        routes = config / adapter.ROUTES_FILE
+        routes.write_text(json.dumps({'routes': {'claude_code': {
+            'model': 'm', 'connection': {'kind': 'api_key', 'id': 'work-helper', 'key_source': 'api_key_helper'},
+            'deadline_s': 60, 'binary': str(self.engine)}}}))
+        os.chmod(routes, 0o600)
+        self.environ['CLAUDE_CODE_OAUTH_TOKEN'] = 'synthetic-oauth-test-value'
+        self.routes = None  # read the operator's file
+        with mock.patch.object(adapter.log, 'error'):
+            _, composed = self.boot()
+        api = self.api(composed)
+        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi'})
+        self.assertEqual(answer['code'], 'start_failed', answer)
+        self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+        self.assertEqual((self.units.started, ran.exists()), ([], False))
+        self.shutdown()
+        # The same file with the subscription route: it starts, as before.
+        routes.write_text(json.dumps({'routes': {'claude_code': {
+            'model': 'stand-in-model', 'api_key_helper': 'absent',
+            'connection': {'kind': 'subscription', 'id': 'stand-in-login'},
+            'deadline_s': 120, 'binary': str(standin)}}}))
+        _, composed = self.boot()
+        self.start(self.api(composed))
+        self.assertEqual(len(self.units.started), 1)
+
+    def test_route_unsupported_names_only_the_routes_without_custody(self):
+        def entry(connection):
+            return {'route': {'engine': 'claude_code', 'model': 'm', 'connection': connection}, 'deadline_s': 1.0}
+
+        for name, (connection, _) in self.NO_CUSTODY_ROUTES.items():
+            self.assertTrue(adapter.route_unsupported(entry(connection)).startswith('no credential custody: '), name)
+        for allowed in ({'kind': 'subscription', 'id': 'login'},
+                        {'kind': 'api_key', 'id': 'key-1', 'credential_env': 'ANTHROPIC_API_KEY'},
+                        {'kind': 'api_key', 'id': 'key-1', 'credential_env': 'ANTHROPIC_API_KEY', 'key_source': 'custody'}):
+            self.assertIsNone(adapter.route_unsupported(entry(allowed)), allowed)
+        for malformed in (None, {}, {'route': None}, {'route': {}}, entry(None), entry('passthrough')):
+            self.assertIsNone(adapter.route_unsupported(malformed), malformed)  # the route contract refuses these
+
     # -- CLI -------------------------------------------------------------------------------------
     def run_cli(self, argv, path):
         out = io.StringIO()

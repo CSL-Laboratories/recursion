@@ -240,7 +240,11 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
   "deadline_s": 3600, "binary": "/abs/path/claude"}}}`. Nothing is defaulted: an engine
   with no entry answers `start_failed` / `route_not_configured`.
 
-Not done: credential custody (an API-key route refuses, `no credential`), Pi, Hermes and
+Not done: credential custody (an API-key route refuses, `no credential`; a Claude Code route
+whose key comes from the user's `apiKeyHelper`, `"key_source": "api_key_helper"`, and a
+`passthrough` route (Bedrock, Vertex, Foundry or a gateway) are refused `start_failed` /
+`launch_refused`, `no credential custody`, before anything is launched, and `route.list` names
+that as the route's blocker; the subscription route is not affected), Pi, Hermes and
 OpenCode, the Control MCP transport, a browser pairing step for the device token, a second
 launch per run (a fallback route refuses `run_already_launched`), re-attaching the route
 driver to a run that outlived a daemon (its output file keeps growing and is readable; its

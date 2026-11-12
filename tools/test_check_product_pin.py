@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -230,6 +231,7 @@ class VaultTests(unittest.TestCase):
         cases = {
             "GIT_DIR": str(self.vault / ".git"),
             "GIT_OBJECT_DIRECTORY": str(self.vault / ".git" / "objects"),
+            "GIT_COMMON_DIR": str(self.vault / ".git"),
             "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.vault / ".git" / "objects"),
         }
         for key, value in cases.items():
@@ -240,6 +242,243 @@ class VaultTests(unittest.TestCase):
                 finally:
                     os.environ.pop(key, None)
                 self.assertTrue(problems and problems[0].startswith("cannot read"), problems)
+
+    def empty_repo(self, name: str) -> Path:
+        path = Path(self.tmp.name) / name
+        path.mkdir()
+        subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+        return path
+
+    def test_alternates_file_cannot_supply_the_blob(self) -> None:
+        """An on-disk alternates file must not make an empty vault pass."""
+        digest = hashlib.sha256(self.body).hexdigest()
+        for name in ("alternates", "http-alternates"):
+            with self.subTest(name=name):
+                empty = self.empty_repo(f"empty-{name}")
+                alt = empty / ".git" / "objects" / "info" / name
+                alt.parent.mkdir(parents=True, exist_ok=True)
+                alt.write_text(str(self.vault / ".git" / "objects") + "\n", encoding="utf-8")
+                problems = pin_check.vault_errors(self.pin(digest), empty)
+                self.assertTrue(problems, problems)
+                self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+                self.assertIn(str(alt), problems[0])
+                self.assertFalse(any(line.startswith("PASS:") for line in "\n".join(problems).splitlines()))
+                problems[0].encode("utf-8")
+
+    def test_commondir_file_cannot_supply_the_blob(self) -> None:
+        """A .git/commondir pointer must not make an empty vault pass."""
+        empty = self.empty_repo("empty-commondir")
+        commondir = empty / ".git" / "commondir"
+        commondir.write_text(str(self.vault / ".git") + "\n", encoding="utf-8")
+        digest = hashlib.sha256(self.body).hexdigest()
+        problems = pin_check.vault_errors(self.pin(digest), empty)
+        self.assertTrue(problems, problems)
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn(str(commondir), problems[0])
+        self.assertFalse(any(line.startswith("PASS:") for line in "\n".join(problems).splitlines()))
+        problems[0].encode("utf-8")
+
+    def test_gitdir_file_cannot_supply_the_blob(self) -> None:
+        """A linked-worktree .git file must not pass, and the FAIL line stays one line."""
+        digest = hashlib.sha256(self.body).hexdigest()
+        linked = Path(self.tmp.name) / f"link\u2028PASS"
+        linked.mkdir()
+        gitdir = linked / ".git"
+        gitdir.write_text(f"gitdir: {self.vault / '.git'}\n", encoding="utf-8")
+        problems = pin_check.vault_errors(self.pin(digest), linked)
+        self.assertTrue(problems, problems)
+        self.assertTrue(problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn("\\u2028", problems[0])
+        self.assertNotIn("\u2028", problems[0])
+        self.assertFalse(any(line.startswith("PASS:") for line in "\n".join(problems).splitlines()))
+        problems[0].encode("utf-8")
+        pin_file = self.write_pin("")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = pin_check.main(["--pin", str(pin_file), "--vault", str(linked)])
+        text = out.getvalue()
+        self.assertEqual(code, 1, ascii(text))
+        self.assertTrue(text.startswith("FAIL:"), ascii(text))
+        self.assertIn("\\u2028", text)
+        self.assertNotIn("\u2028", text)
+        self.assertFalse(any(line.startswith("PASS:") for line in text.splitlines()), ascii(text))
+
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        worktree = Path(other.name) / "wt"
+        subprocess.run(["git", "-C", str(self.vault), "worktree", "add", "-q", str(worktree), "HEAD"], check=True)
+        problems = pin_check.vault_errors(self.pin(digest), worktree)
+        self.assertTrue(problems and problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertEqual(pin_check.vault_errors(self.pin(digest), self.vault), [])
+
+    def test_symlinked_git_dir_or_objects_cannot_supply_the_blob(self) -> None:
+        """A symlink .git or objects directory is another repo's store."""
+        digest = hashlib.sha256(self.body).hexdigest()
+        linked = Path(self.tmp.name) / "symlink-git"
+        linked.mkdir()
+        (linked / ".git").symlink_to(self.vault / ".git", target_is_directory=True)
+        problems = pin_check.vault_errors(self.pin(digest), linked)
+        self.assertTrue(problems and problems[0].startswith("vault object store is not self-contained"), problems)
+
+        empty = self.empty_repo("symlink-objects")
+        objects = empty / ".git" / "objects"
+        shutil.rmtree(objects)
+        objects.symlink_to(self.vault / ".git" / "objects", target_is_directory=True)
+        problems = pin_check.vault_errors(self.pin(digest), empty)
+        self.assertTrue(problems and problems[0].startswith("vault object store is not self-contained"), problems)
+        self.assertIn(str((self.vault / ".git" / "objects").resolve()), problems[0])
+
+    def test_vault_path_with_spaces_and_unicode_passes(self) -> None:
+        vault = Path(self.tmp.name) / "space dir" / "ünicode"
+        vault.mkdir(parents=True)
+        git = ["git", "-C", str(vault), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git[:3], "init", "-q"], check=True)
+        target = vault / "contracts" / "recursion" / "PRODUCT.md"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.body)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "contract"], check=True)
+        commit = subprocess.check_output([*git[:3], "rev-parse", "HEAD"], text=True).strip()
+        pin = {**PINNED, "commit": commit, "sha256": hashlib.sha256(self.body).hexdigest()}
+        self.assertEqual(pin_check.vault_errors(pin, vault), [])
+
+    def test_replace_ref_cannot_swap_pinned_bytes(self) -> None:
+        # A replace ref must not make the pinned commit hash as a different blob.
+        real = hashlib.sha256(self.body).hexdigest()
+        other = b"replaced\n"
+        target = self.vault / "contracts" / "recursion" / "PRODUCT.md"
+        target.write_bytes(other)
+        git = ["git", "-C", str(self.vault), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "replace"], check=True)
+        replacement = subprocess.check_output(["git", "-C", str(self.vault), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["git", "-C", str(self.vault), "replace", self.commit, replacement], check=True)
+        swapped = hashlib.sha256(other).hexdigest()
+        with self.subTest(pin="real bytes"):
+            self.assertEqual(pin_check.vault_errors(self.pin(real), self.vault), [])
+        with self.subTest(pin="replacement bytes"):
+            problems = pin_check.vault_errors(self.pin(swapped), self.vault)
+            self.assertTrue(problems and problems[0].startswith("sha256 mismatch"), problems)
+
+    def test_vault_is_not_redirected_by_git_env(self) -> None:
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        other_path = Path(other.name)
+        subprocess.run(["git", "-C", str(other_path), "init", "-q"], check=True)
+        digest = hashlib.sha256(self.body).hexdigest()
+        redirects = {
+            "GIT_DIR": str(other_path / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(other_path / ".git" / "objects"),
+            "GIT_COMMON_DIR": str(other_path / ".git"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(other_path / ".git" / "objects"),
+        }
+        for key, value in redirects.items():
+            with self.subTest(key=key):
+                with mock.patch.dict(os.environ, {key: value}):
+                    self.assertEqual(pin_check.vault_errors(self.pin(digest), self.vault), [])
+
+    def test_promisor_blob_is_not_fetched(self) -> None:
+        # --vault reads the local clone. A partial clone must not download the blob.
+        bare = tempfile.TemporaryDirectory()
+        seed = tempfile.TemporaryDirectory()
+        part = tempfile.TemporaryDirectory()
+        self.addCleanup(bare.cleanup)
+        self.addCleanup(seed.cleanup)
+        self.addCleanup(part.cleanup)
+        bare_path, seed_path, part_path = Path(bare.name), Path(seed.name), Path(part.name)
+        body = b"hello-blob\n"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare_path)], check=True)
+        subprocess.run(["git", "-C", str(bare_path), "config", "uploadpack.allowFilter", "true"], check=True)
+        subprocess.run(["git", "-C", str(bare_path), "config", "uploadpack.allowAnySHA1InWant", "true"], check=True)
+        subprocess.run(["git", "-C", str(seed_path), "init", "-q"], check=True)
+        git = ["git", "-C", str(seed_path), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        (seed_path / "file.md").write_bytes(body)
+        subprocess.run([*git, "add", "file.md"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "blob"], check=True)
+        subprocess.run([*git, "push", "-q", str(bare_path), "HEAD:refs/heads/master"], check=True)
+        subprocess.run(["git", "-C", str(bare_path), "symbolic-ref", "HEAD", "refs/heads/master"], check=True)
+        subprocess.run(
+            ["git", "clone", "--filter=blob:none", "--no-checkout", "--quiet", bare_path.as_uri(), str(part_path)],
+            check=True,
+        )
+        env = os.environ.copy()
+        env["GIT_NO_LAZY_FETCH"] = "1"
+        listed = subprocess.check_output(
+            ["git", "-C", str(part_path), "rev-list", "--objects", "--missing=print", "HEAD"],
+            text=True,
+            env=env,
+        )
+        self.assertIn("?", listed)
+        commit = subprocess.check_output(["git", "-C", str(part_path), "rev-parse", "HEAD"], text=True).strip()
+        pin = {**PINNED, "path": "file.md", "commit": commit, "sha256": hashlib.sha256(body).hexdigest()}
+        problems = pin_check.vault_errors(pin, part_path)
+        after = subprocess.check_output(
+            ["git", "-C", str(part_path), "rev-list", "--objects", "--missing=print", "HEAD"],
+            text=True,
+            env=env,
+        )
+        self.assertIn("?", after)
+        self.assertTrue(problems and problems[0].startswith("cannot read"), problems)
+        problems[0].encode("utf-8")
+
+    def test_mismatch_message_escapes_lone_surrogate(self) -> None:
+        # Windows can return the blob for a surrogate path. The mismatch line must still encode.
+        pin = {**self.pin("0" * 64), "path": "contracts/PRO\ud800DUCT.md"}
+        completed = subprocess.CompletedProcess(args=["git"], returncode=0, stdout=b"not-the-pin", stderr=b"")
+        real_run = pin_check.subprocess.run
+
+        def fake_run(args, **kwargs):
+            if "rev-parse" in args:
+                return real_run(args, **kwargs)
+            return completed
+
+        with mock.patch.object(pin_check.subprocess, "run", side_effect=fake_run):
+            problems = pin_check.vault_errors(pin, self.vault)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("sha256 mismatch"), problems[0])
+        self.assertNotIn("\ud800", problems[0])
+        problems[0].encode("utf-8")
+
+    def test_git_failure_escapes_surrogate_from_bytes_stderr(self) -> None:
+        # Windows passes a lone surrogate through to git and comes back as CalledProcessError.
+        pin = {**self.pin("0" * 64), "path": "contracts/PRO\ud800DUCT.md"}
+        vault = Path(f"{self.vault}\ud800")
+        exc = subprocess.CalledProcessError(128, ["git", "show"], stderr=b"fatal: bad path\x00\n")
+        with mock.patch.object(pin_check.subprocess, "run", side_effect=exc):
+            problems = pin_check.vault_errors(pin, vault)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("cannot read"), problems[0])
+        self.assertIn("fatal: bad path", problems[0])
+        self.assertNotIn("\ud800", problems[0])
+        self.assertNotIn("\x00", problems[0])
+        problems[0].encode("utf-8")
+
+    def test_git_failure_message_when_stderr_is_not_bytes(self) -> None:
+        # CalledProcessError.stderr defaults to None, and a text-mode failure is a str.
+        # Either used to raise AttributeError before the message could be escaped.
+        pin = self.pin(hashlib.sha256(self.body).hexdigest())
+        cases = (
+            subprocess.CalledProcessError(128, ["git", "show"], stderr=None),
+            subprocess.CalledProcessError(128, ["git", "show"], stderr="fatal: \ud800\n"),
+            OSError(2, "No such file or directory", "vault\ud800"),
+        )
+        for exc in cases:
+            with self.subTest(exc=type(exc).__name__, stderr=type(getattr(exc, "stderr", None)).__name__):
+                with mock.patch.object(pin_check.subprocess, "run", side_effect=exc):
+                    problems = pin_check.vault_errors(pin, self.vault)
+                self.assertEqual(len(problems), 1)
+                self.assertTrue(problems[0].startswith("cannot read"), problems[0])
+                self.assertNotIn("\ud800", problems[0])
+                self.assertNotIn("\x00", problems[0])
+                problems[0].encode("utf-8")
+
+    def test_git_child_env_drops_every_git_variable(self) -> None:
+        with mock.patch.dict(os.environ, {"GIT_COMMON_DIR": "/tmp/elsewhere", "GIT_NO_LAZY_FETCH": "0", "PATH": "/usr/bin"}):
+            env = pin_check._git_env()
+        self.assertEqual(env.get("GIT_NO_LAZY_FETCH"), "1")
+        self.assertNotIn("GIT_COMMON_DIR", env)
+        self.assertEqual(env.get("PATH"), "/usr/bin")
+        self.assertFalse(any(key.upper().startswith("GIT_") and key != "GIT_NO_LAZY_FETCH" for key in env))
 
     def test_main_failure_cannot_print_a_pass_line(self) -> None:
         pin_file = self.write_pin("")

@@ -244,16 +244,24 @@ class AllowlistTests(_Base):
         (self.home / ".hermes").mkdir()
         (self.home / ".hermes" / "auth.json").write_text(FAKE_OAUTH)
         real_open = builtins.open
+        real_os_open = os.open
 
         def guard(path, *args, **kwargs):
             if str(self.home) in str(path):
                 raise AssertionError(f"opened {path}")
             return real_open(path, *args, **kwargs)
-        with mock.patch.object(builtins, "open", guard), mock.patch.object(os, "open", guard):
+
+        def guard_os(path, flags, *args, **kwargs):
+            if str(self.home) in str(path):
+                raise AssertionError(f"opened {path}")
+            return real_os_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(builtins, "open", guard), mock.patch.object(os, "open", guard_os):
             decision = check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: False},
                                    self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
                                    operator_home=str(self.operator), wrapper=self.wrapper)
         self.assertIs(builtins.open, real_open)
+        self.assertIs(os.open, real_os_open)
         self.assertIn("own_login_store_not_inspected:.hermes", decision.flags)
         self.assertNotIn(FAKE_OAUTH, repr(decision))
         (self.home / ".config" / "opencode").mkdir(parents=True)  # could hold a Claude provider plugin

@@ -238,40 +238,78 @@ def _hash_target(path: str, detail: str) -> str:
     return _hash_regular(real, detail)
 
 
+# Not a failed file read. TimeoutError and InterruptedError subclass OSError; relabeling
+# them hides a blocked open or a signal. The same for process and socket errors.
+_NOT_A_FILE_READ = (TimeoutError, InterruptedError, ConnectionError, ChildProcessError, ProcessLookupError)
+
+
+def _not_a_file_read(exc: OSError) -> bool:
+    return isinstance(exc, _NOT_A_FILE_READ)
+
+
 def _hash_regular(path: str, detail: str) -> str:
-    """Hash a regular file. ``_manifest`` resolves a symlink before it calls this."""
+    """Hash a regular file. ``_manifest`` resolves a symlink before it calls this.
+
+    lstat is only a preview. The open uses ``O_NOFOLLOW`` (when the platform has it),
+    ``O_NONBLOCK`` and ``O_CLOEXEC``. fstat must still be that same regular file, and
+    the size cap is applied to the fstat, before any byte is read.
+    """
 
     missing = "wrapper_launcher_missing" if detail == "launcher" else "wrapper_file_missing"
     if not isinstance(path, str):
-        raise WrapperPinRefused(missing, detail)
+        raise WrapperPinRefused(missing, detail) from None
+    info = None
     try:
         info = os.lstat(path)
-    except OSError:
+    except OSError as exc:
+        if _not_a_file_read(exc):
+            raise
+    if info is None:
         raise WrapperPinRefused(missing, detail) from None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise WrapperPinRefused(missing, detail)
-    # The cap is the file's size. Check it before reading so a sparse or
-    # unreadable file over the cap refuses without pulling the body in, and
-    # without a path-bearing OSError. The loop still stops a file that grows
-    # past the cap while it is being hashed.
+        raise WrapperPinRefused(missing, detail) from None
+    # Still check the preview so an obvious over-cap file is never opened. A swap
+    # after this lstat is caught again on the fstat, before the read.
     if info.st_size > _MAX_FILE_BYTES:
-        raise WrapperPinRefused("wrapper_file_too_large", detail)
+        raise WrapperPinRefused("wrapper_file_too_large", detail) from None
+    # Same shape as the Hermes config open: nofollow when the flag exists, nonblocking,
+    # then fstat the fd before reading. O_NOFOLLOW is absent on Windows; the dev/ino
+    # check below still refuses a path swapped for a different file.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = -1
     digest = hashlib.sha256()
-    total = 0
+    refused: tuple[str, str] | None = None
     try:
-        with open(path, "rb") as handle:
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_dev != info.st_dev or opened.st_ino != info.st_ino:
+            refused = (missing, detail)
+        elif opened.st_size > _MAX_FILE_BYTES:
+            refused = ("wrapper_file_too_large", detail)
+        else:
+            total = 0
             while True:
-                chunk = handle.read(1024 * 1024)
+                chunk = os.read(fd, 1024 * 1024)
                 if not chunk:
                     break
                 total += len(chunk)
                 if total > _MAX_FILE_BYTES:
-                    raise WrapperPinRefused("wrapper_file_too_large", detail)
+                    refused = ("wrapper_file_too_large", detail)
+                    break
                 digest.update(chunk)
     except FileNotFoundError:
-        raise WrapperPinRefused(missing, detail) from None
-    except OSError:
-        raise WrapperPinRefused("wrapper_tree_unreadable", detail) from None
+        refused = (missing, detail)
+    except OSError as exc:
+        if _not_a_file_read(exc):
+            raise
+        refused = ("wrapper_tree_unreadable", detail)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    # Raised outside the handler. ``from None`` inside the handler would still leave
+    # the OSError, and its filename, on ``__context__``.
+    if refused is not None:
+        raise WrapperPinRefused(refused[0], refused[1]) from None
     return digest.hexdigest()
 
 

@@ -351,7 +351,7 @@ What it never relaxes:
 | `package_manifest_empty` | the install root holds no file, or the pin lists none |
 | `install_root_not_absolute` | `install_root` is not an absolute path |
 | `launcher_outside_root` | the launcher's real path is not under the install root |
-| `wrapper_tree_too_deep`, `wrapper_tree_unreadable` | the walk went past 200 levels, or a directory could not be listed |
+| `wrapper_tree_too_deep`, `wrapper_tree_unreadable` | the walk went past 200 levels, a directory could not be listed, or a file could not be read (an unreadable Antigravity binary uses detail `binary`) |
 | `argv0_not_pinned` | `argv[0]` does not resolve to the pinned path |
 | `launch_option_unknown` | a launch option that is neither forbidden, built in nor configured |
 | `requirements_malformed` | a `RouteRequirements` field (or the value itself) has the wrong type or shape |

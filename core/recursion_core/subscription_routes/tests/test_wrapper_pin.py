@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import unittest
 from unittest import mock
 
@@ -20,6 +21,7 @@ from recursion_core.subscription_routes import (
     measure_antigravity_pin,
     measure_package_pin,
 )
+from recursion_core.subscription_routes import wrapper_pin
 from recursion_core.subscription_routes.tests.test_subscription_routes import _Base
 
 _MIB = 1024 * 1024
@@ -229,6 +231,246 @@ class WrapperPinTests(_Base):
             measure_package_pin(str(self.install / "launcher.js"), str(self.install))
         self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_too_large", "big.bin"))
         self.assertNotIn(path, str(caught.exception))
+
+    def test_hash_open_uses_nofollow_nonblock_and_cloexec(self) -> None:
+        # Platforms without O_NOFOLLOW (simulated Windows) must not crash: the bit is optional.
+        # Where the flag exists, the open has to carry it, plus O_NONBLOCK and O_CLOEXEC.
+        binary = self.install / "agy"
+        binary.write_bytes(b"ab")
+        flags_seen: list[int] = []
+        real_open = wrapper_pin.os.open
+
+        def spy(path, flags, *args, **kwargs):
+            if os.fspath(path) == str(binary):
+                flags_seen.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(wrapper_pin.os, "open", spy):
+            digest = wrapper_pin._hash_regular(str(binary), "binary")
+        self.assertEqual(hashlib.sha256(b"ab").hexdigest(), digest)
+        self.assertEqual([_read_flags()], flags_seen)
+
+    def test_swapped_oversize_file_is_refused_before_any_read(self) -> None:
+        # lstat sees a 2-byte regular file. Before open, the path becomes a symlink to,
+        # or a hard link of, a 1 GiB+1 sparse file. The old open() follows that and reads
+        # 1,073,741,825 bytes before wrapper_file_too_large.
+        cases = (
+            ("symlink", "wrapper_tree_unreadable"),  # O_NOFOLLOW: open fails, nothing is read
+            ("hardlink", "wrapper_file_missing"),  # fstat inode is not the lstat inode
+            ("grown", "wrapper_file_too_large"),  # same inode, fstat size is past the cap
+        )
+        for kind, cause in cases:
+            with self.subTest(kind=kind):
+                binary = str(self.install / f"agy-{kind}")
+                if kind == "grown":
+                    # The file really is 1 GiB+1. lstat is forged to report 2 bytes, same dev/ino.
+                    self.sparse(f"agy-{kind}", _GIB + 1)
+                    huge = binary
+                    swap = None
+                else:
+                    with open(binary, "wb") as handle:
+                        handle.write(b"ab")
+                    huge = self.sparse(f"huge-{kind}", _GIB + 1)
+                    swap = kind
+                with self._swap_on_open(binary, huge, swap) as counter:
+                    if kind == "grown":
+                        self._lie_about_lstat_size(binary)
+                    with self.assertRaises(WrapperPinRefused) as caught:
+                        wrapper_pin._hash_regular(binary, "binary")
+                self.assertEqual((caught.exception.cause, caught.exception.detail), (cause, "binary"))
+                self.assertEqual(
+                    0, counter["n"],
+                    f"{kind}: read {counter['n']} bytes; a 1 GiB+1 file must refuse before any read",
+                )
+                self.assertNotIn(binary, _exception_chain_text(caught.exception))
+                self.assertNotIn(huge, _exception_chain_text(caught.exception))
+
+    def test_missing_nofollow_refuses_a_swapped_symlink_before_any_read(self) -> None:
+        # getattr(os, "O_NOFOLLOW", 0) at the open, as on a platform that has no such flag.
+        # The symlink is followed, and the fstat dev/ino check refuses it before the read.
+        binary = str(self.install / "agy-nonofollow")
+        with open(binary, "wb") as handle:
+            handle.write(b"ab")
+        huge = self.sparse("huge-nonofollow", _GIB + 1)
+        saved = os.O_NOFOLLOW
+        try:
+            del os.O_NOFOLLOW
+            with self._swap_on_open(binary, huge, "symlink") as counter:
+                with self.assertRaises(WrapperPinRefused) as caught:
+                    wrapper_pin._hash_regular(binary, "binary")
+        finally:
+            os.O_NOFOLLOW = saved
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_missing", "binary"))
+        self.assertEqual(0, counter["n"], f"read {counter['n']} bytes with O_NOFOLLOW absent")
+        self.assertNotIn(huge, _exception_chain_text(caught.exception))
+
+    def test_fifo_swapped_in_before_open_does_not_block(self) -> None:
+        binary = str(self.install / "agy-fifo")
+        with open(binary, "wb") as handle:
+            handle.write(b"ab")
+        fired = {"yes": False}
+
+        def handler(signum, frame):
+            fired["yes"] = True
+            raise TimeoutError("fifo open blocked")
+
+        previous = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, handler)
+        try:
+            signal.alarm(2)
+            try:
+                with self._swap_on_open(binary, binary, "fifo") as counter:
+                    with self.assertRaises(WrapperPinRefused) as caught:
+                        wrapper_pin._hash_regular(binary, "binary")
+            finally:
+                signal.alarm(0)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+        self.assertFalse(fired["yes"], "open blocked on the FIFO until SIGALRM")
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_missing", "binary"))
+        self.assertEqual(0, counter["n"])
+        self.assertNotIn(binary, _exception_chain_text(caught.exception))
+
+    def test_timeout_and_interrupt_are_not_relabeled_as_unreadable(self) -> None:
+        binary = str(self.install / "agy-signal")
+        with open(binary, "wb") as handle:
+            handle.write(b"ab")
+        for error in (TimeoutError("open timed out"), InterruptedError("open interrupted")):
+            with self.subTest(error=type(error).__name__):
+                def boom(*_args, **_kwargs):
+                    raise error
+
+                with mock.patch("builtins.open", boom), mock.patch.object(wrapper_pin.os, "open", boom):
+                    with self.assertRaises(type(error)) as caught:
+                        wrapper_pin._hash_regular(binary, "binary")
+                self.assertIsInstance(caught.exception, type(error))
+                self.assertNotIsInstance(caught.exception, WrapperPinRefused)
+
+    def test_unreadable_binary_path_is_not_on_the_context_chain(self) -> None:
+        binary = self.install / "agy"
+        binary.write_text("agy-binary\n", encoding="ascii")
+        os.chmod(binary, 0)
+        with self.assertRaises(WrapperPinRefused) as caught:
+            measure_antigravity_pin("1.5.5", str(binary), self.small_launcher())
+        refused = caught.exception
+        self.assertEqual((refused.cause, refused.detail), ("wrapper_tree_unreadable", "binary"))
+        # from None inside the handler still leaves PermissionError on __context__, filename and all.
+        self.assertIsNone(refused.__cause__)
+        self.assertIsNone(refused.__context__)
+        self.assertNotIn(str(binary), _exception_chain_text(refused))
+
+    def _lie_about_lstat_size(self, binary: str) -> None:
+        """Make the lstat inside the hash report 2 bytes for ``binary``. The file itself is unchanged."""
+
+        real_lstat = wrapper_pin.os.lstat
+
+        def lstat(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if os.fspath(path) != binary:
+                return info
+            return os.stat_result((
+                info.st_mode, info.st_ino, info.st_dev, info.st_nlink, info.st_uid, info.st_gid,
+                2, info.st_atime, info.st_mtime, info.st_ctime,
+            ))
+
+        patcher = mock.patch.object(wrapper_pin.os, "lstat", lstat)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _swap_on_open(self, binary: str, huge: str, kind: str | None):
+        """After lstat, the first open of ``binary`` finds ``kind`` instead (symlink, hard link, or FIFO)."""
+
+        counter = {"n": 0}
+        state = {"done": False}
+        real_open = open
+        real_os_open = wrapper_pin.os.open
+        real_read = wrapper_pin.os.read
+
+        def maybe_swap(path) -> None:
+            if kind is None or state["done"] or os.fspath(path) != binary:
+                return
+            state["done"] = True
+            os.unlink(binary)
+            if kind == "symlink":
+                os.symlink(huge, binary)
+            elif kind == "hardlink":
+                os.link(huge, binary)
+            elif kind == "fifo":
+                os.mkfifo(binary)
+            else:
+                raise AssertionError(kind)
+
+        def tracking_open(file, mode="r", *args, **kwargs):
+            maybe_swap(file)
+            handle = real_open(file, mode, *args, **kwargs)
+            original = handle.read
+
+            def read(n=-1, original=original):
+                data = original(n)
+                counter["n"] += len(data)
+                return data
+
+            handle.read = read
+            return handle
+
+        def tracking_os_open(path, flags, *args, **kwargs):
+            maybe_swap(path)
+            return real_os_open(path, flags, *args, **kwargs)
+
+        def tracking_read(fd, n, *args, **kwargs):
+            data = real_read(fd, n, *args, **kwargs)
+            counter["n"] += len(data)
+            return data
+
+        return _Swap(counter, tracking_open, tracking_os_open, tracking_read)
+
+
+class _Swap:
+    """Patches open and os.read for one hash, then yields the byte counter."""
+
+    def __init__(self, counter, tracking_open, tracking_os_open, tracking_read) -> None:
+        self.counter = counter
+        self._patches = (
+            mock.patch("builtins.open", tracking_open),
+            mock.patch.object(wrapper_pin.os, "open", tracking_os_open),
+            mock.patch.object(wrapper_pin.os, "read", tracking_read),
+        )
+
+    def __enter__(self):
+        for patcher in self._patches:
+            patcher.start()
+        return self.counter
+
+    def __exit__(self, *exc):
+        for patcher in reversed(self._patches):
+            patcher.stop()
+        return False
+
+
+def _read_flags() -> int:
+    flags = os.O_RDONLY
+    for name in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC"):
+        flags |= getattr(os, name, 0)
+    return flags
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    parts: list[str] = []
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts.append(repr(current))
+        filename = getattr(current, "filename", None)
+        if filename is not None:
+            parts.append(repr(filename))
+        for link in (current.__cause__, current.__context__):
+            if isinstance(link, BaseException):
+                pending.append(link)
+    return "\n".join(parts)
 
 
 if __name__ == "__main__":

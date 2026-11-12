@@ -29,7 +29,10 @@ and the TUI.
 
 A registry error never escapes ``call``: a read or a start that cannot reach the registry answers
 ``registry_unavailable`` and launches nothing. Once the cleanup layer has answered, Stop returns that
-answer even if writing it back fails, with ``"recorded": false``.
+answer even if writing it back fails, with ``"recorded": false``. A write refused as stale is different:
+the record moved under the Stop, so the decision is applied to a fresh read, at most ``STALE_RETRIES``
+times, and from that stale write until a write of the run lands an empty result answers ``pending``,
+never ``stopped``.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
@@ -91,6 +94,9 @@ CODES = frozenset({STARTED, OK, STOPPED, PENDING, RUN_UNKNOWN, REQUEST_INVALID, 
 SUCCESS_CODES = frozenset({STARTED, OK, STOPPED})
 _PENDING_REASON = {POPULATED: "cgroup_populated", TIMEOUT: "confirm_timeout"}
 LIST_LIMIT_MAX = 1000  # the most runs one run.list page may ask for
+# How many times a Stop decision whose write came back stale is applied to a fresh read of the record.
+# An empty result that has not landed after the last one answers pending, never stopped.
+STALE_RETRIES = 3
 
 # starter(params) -> {"cgroup"}: the daemon's launch path (route service + cgroup leaf), injected. params
 # carries the API-chosen "run_id", which the starter must launch under.
@@ -124,6 +130,9 @@ class ControlAPI:
         self._start_locks: dict[tuple[str, str], list] = {}
         # In-memory only (a restart loses them; reconciling then is the CSL-738 startup sweep):
         self._launched: dict[str, dict] = {}  # run_id -> record (with cgroup) of a launch whose write failed
+        # Runs whose Stop write-back came back stale and has not landed since: this process's copy of
+        # the record (a kept launch included) may be behind, so it is not enough to answer stopped.
+        self._stale_stops: set[str] = set()
         self._stop_wanted: set[str] = set()  # Stops that arrived before the launch was recorded
         self._failed: set[str] = set()  # starts that raised but whose start_failed write failed
 
@@ -600,73 +609,93 @@ class ControlAPI:
         rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason=reason)
         return self._recorded({"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}, rec)
 
+    def _held(self, rec: dict, reason: str, *, checked: bool = True) -> dict:
+        """Put ``rec`` in the pending shape for ``reason`` and return that answer. Nothing is written.
+        ``checked`` counts the look that led here; pass False when this Stop already counted it."""
+        rec["state"] = "stop_pending"
+        if rec.get("stop") is None:
+            rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
+        rec["stop"].update(checks=rec["stop"].get("checks", 0) + (1 if checked else 0), reason=reason)
+        rec["stop_attestation"] = None
+        return {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}
+
     def _recorded(self, res: dict, rec: dict, *, reconfirm: bool = False) -> dict:
         # The cleanup layer's answer is the truth; a failed write-back is reported, not raised. The next
         # stop then sees the old state and asks again, which is safe (cgroup.kill and pidfds repeat).
-        # A stale generation is not a failed disk: the record moved under us, so the stop is applied to
-        # the fresh record once. A member that joined in that window keeps the stop pending.
+        #
+        # A stale generation is not a failed disk: the record moved under us. The decision is then applied
+        # to a fresh read, at most ``STALE_RETRIES`` times, and a member that joined in that window keeps
+        # the stop pending. From the first stale write until a write of this run lands, what this process
+        # holds of the record is not known to be current, so ``stopped`` is not answered from it: an
+        # empty result that did not land answers ``pending`` (``member_alive`` when a member is seen
+        # alive on the record now, else ``cgroup_changed``). That holds for a later Stop too, which may
+        # be working from the launch record this process kept while the registry cannot be read.
+        run_id = rec["run_id"]
+        moved = run_id in self._stale_stops
         try:
             outcome = self._commit(rec)
         except _RegistryError:
             outcome = "down"
         if outcome == "stale":
-            fresh = self._reread(rec)
-            if fresh is None:
-                outcome = "down"
-            elif fresh.get("state") == "stopped":
-                # An older pending or populated result must not demote a stop that already committed.
-                rec.clear()
-                rec.update(fresh)
-                res = {"code": STOPPED, "run_id": fresh["run_id"], "state": "stopped", "repeat": True}
-                outcome = "ok"
-            elif res.get("code") == STOPPED and self._cgroup_identity(fresh) != self._cgroup_identity(rec):
-                # The empty result belongs to the cgroup we confirmed, not to the one stored now.
-                fresh["stop"] = self._carry_stop(rec.get("stop"), rec, fresh)
-                if reconfirm:
+            moved = True
+            # What the cleanup layer said, and the record it said it of. Every retry starts from these.
+            decided, confirmed = dict(res), dict(rec)
+            empty = decided.get("code") == STOPPED
+            for _ in range(STALE_RETRIES):
+                fresh = self._reread(rec)
+                if fresh is None:
+                    outcome = "down"
+                    break
+                if fresh.get("state") == "stopped":
+                    # An older pending or populated result must not demote a stop that already committed.
                     rec.clear()
                     rec.update(fresh)
-                    return {"_reconfirm": True}
-                fresh["state"] = "stop_pending"
-                fresh["stop"].update(checks=fresh["stop"].get("checks", 0) + 1, reason="cgroup_changed")
-                fresh["stop_attestation"] = None
-                res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": "cgroup_changed"}
-                try:
-                    outcome = self._commit(fresh)
-                except _RegistryError:
-                    outcome = "down"
-                rec.clear()
-                rec.update(fresh)
-            else:
-                fresh["stop"] = self._carry_stop(rec.get("stop"), rec, fresh)
-                if res.get("code") == STOPPED:
-                    blocked = self._block_stop(fresh)
-                    if blocked or not fresh.get("cgroup"):
-                        reason = blocked or "cgroup_unknown"
-                        fresh["state"] = "stop_pending"
-                        if fresh.get("stop") is None:
-                            fresh["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None,
-                                             "requested": False}
-                        fresh["stop"].update(checks=fresh["stop"].get("checks", 0) + 1, reason=reason)
-                        fresh["stop_attestation"] = None
-                        res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}
+                    res = {"code": STOPPED, "run_id": fresh["run_id"], "state": "stopped", "repeat": True}
+                    outcome = "ok"
+                    break
+                res = dict(decided)
+                fresh["stop"] = self._carry_stop(confirmed.get("stop"), confirmed, fresh)
+                if not empty:
+                    fresh["state"] = confirmed.get("state", fresh.get("state"))
+                    fresh["stop_attestation"] = None
+                elif self._cgroup_identity(fresh) != self._cgroup_identity(confirmed):
+                    # The empty result belongs to the cgroup we confirmed, not to the one stored now.
+                    if reconfirm:
+                        rec.clear()
+                        rec.update(fresh)
+                        return {"_reconfirm": True}
+                    res = self._held(fresh, "cgroup_changed")
+                else:
+                    reason = self._block_stop(fresh) or (None if fresh.get("cgroup") else "cgroup_unknown")
+                    if reason:
+                        res = self._held(fresh, reason)
                     else:
                         fresh["state"] = "stopped"
                         fresh["stop_attestation"] = self._attestation(fresh)
-                else:
-                    fresh["state"] = rec.get("state", fresh.get("state"))
-                    fresh["stop_attestation"] = None
                 try:
                     outcome = self._commit(fresh)
                 except _RegistryError:
                     outcome = "down"
                 rec.clear()
                 rec.update(fresh)
+                if outcome != "stale":
+                    break
+        if outcome == "ok":
+            self._stale_stops.discard(run_id)
+        elif moved:
+            self._stale_stops.add(run_id)
+            if res.get("code") == STOPPED:
+                # One read, for the reason only: a member seen alive now is named; anything else, an
+                # unreadable record included, is a record that changed.
+                latest = self._reread(rec)
+                joined = latest is not None and self._block_stop(latest) == "member_alive"
+                res = self._held(rec, "member_alive" if joined else "cgroup_changed", checked=False)
         if outcome != "ok":
             res["recorded"] = False
-            if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
-                self._launched[rec["run_id"]] = dict(rec, stop=dict(rec["stop"]) if rec.get("stop") else None)
+            if run_id in self._launched:  # keep the decision with the launch until a write lands
+                self._launched[run_id] = dict(rec, stop=dict(rec["stop"]) if rec.get("stop") else None)
         else:
-            self._launched.pop(rec["run_id"], None)  # the cgroup is in the registry now
+            self._launched.pop(run_id, None)  # the cgroup is in the registry now
         return res
 
 

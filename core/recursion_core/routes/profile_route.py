@@ -62,6 +62,10 @@ class ProfileRouteAdapter(RouteAdapter):
             )
         except SubscriptionRouteRefused as err:
             return c.result(rid, c.SUBSCRIPTION_ROUTE_REFUSED, detail=err.cause)
+        except c.RouteError as err:
+            # The launcher's typed refusal (the same one RouteAdapter.run returns). Nothing was
+            # started, so this is not an engine fault and must not escape the route boundary.
+            return c.result(rid, err.code, detail=err.detail)
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []

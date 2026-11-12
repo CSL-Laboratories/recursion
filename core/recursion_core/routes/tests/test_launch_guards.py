@@ -170,6 +170,25 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
             self.assertEqual(service.handle(req)["code"], c.LAUNCH_REFUSED, name)
         self.assertEqual((asked, self.launcher.calls), ([], []))
 
+    @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
+    def test_a_launcher_route_error_stays_a_typed_refusal(self) -> None:
+        # RouteAdapter.run turns the launcher's RouteError into a result. Profile routes go through
+        # the same launcher and must not let that refusal escape as an engine fault.
+        class Refuse:
+            def __call__(self, argv, **kwargs):
+                raise c.RouteError(c.LAUNCH_REFUSED, "child_env:PATH:path_empty_entry")
+
+        drive = lambda process, req, deadline_at, events: c.result(req["request_id"], None, text="driven")
+        adapters = profile_adapters(Refuse(), self.clock, lambda cid, name: "sk-test",
+                                    {"PATH": "/usr/bin", "HOME": "/home/operator"},
+                                    argv=pinned_argv, driver=drive, operator_home="/home/operator")
+        service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
+        profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
+        res = service.handle(self.req("pi", profile, wrapper=self.pin()))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertEqual(res["detail"], "child_env:PATH:path_empty_entry")
+        self.assertEqual(res["status"], "error")
+
     def test_reuses_subscription_routes_not_a_copy(self) -> None:
         text = (PKG / "profile_route.py").read_text()
         self.assertIn("from recursion_core.subscription_routes import", text)

@@ -248,8 +248,16 @@ class RouteStarter:
                 raise self._refuse(run_id, 'start_in_flight', '')
             self._active[run_id] = ctx
             self.failures.pop(run_id, None)
-        threading.Thread(target=self._drive, args=(ctx, request), name=f'recursion-run-{run_id}',
-                         daemon=True).start()
+        thread = threading.Thread(target=self._drive, args=(ctx, request), name=f'recursion-run-{run_id}',
+                                  daemon=True)
+        try:
+            thread.start()
+        except BaseException:
+            # The thread never ran, so _drive will not drop the run. Leave it out or every later
+            # start of this run_id refuses start_in_flight.
+            with self._lock:
+                self._active.pop(run_id, None)
+            raise
         if ctx.wait_started(self._start_timeout_s):
             return {'cgroup': ctx.cgroup}
         result = ctx.result
@@ -323,6 +331,42 @@ class RouteStarter:
 
 
 # -- the object every surface calls -----------------------------------------------------------------
+def _read_regular(path, tail=None):
+    """Read a regular file without following a symlink.
+
+    ``tail`` is the maximum number of trailing bytes. A symlink, or anything that is not a
+    regular file, raises ``OSError`` (``O_NOFOLLOW``), the same refusal the launcher uses when
+    it creates the file.
+    """
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    if not nofollow:
+        # A platform without O_NOFOLLOW (the simulated-Windows suite strips it) still must not
+        # follow a symlink. The running daemon refuses to start unless O_NOFOLLOW exists.
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise OSError('not a regular file')
+    fd = os.open(path, os.O_RDONLY | nofollow | getattr(os, 'O_CLOEXEC', 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError('not a regular file')
+        size = info.st_size
+        start = 0 if tail is None else max(0, size - tail)
+        if start:
+            os.lseek(fd, start, os.SEEK_SET)
+        want = size - start
+        chunks = []
+        while want:
+            block = os.read(fd, min(want, 1 << 16))
+            if not block:
+                break
+            chunks.append(block)
+            want -= len(block)
+        return size, start, b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
 class DaemonControl:
     """``call(method, params) -> dict`` for the socket, the CLI and the GUI."""
 
@@ -486,7 +530,8 @@ class DaemonControl:
         if not RUN_ID.fullmatch(run_id):
             return None
         try:
-            data = json.loads((self._state / 'runs' / run_id / 'result.json').read_text(encoding='utf-8'))
+            _size, _start, raw = _read_regular(self._state / 'runs' / run_id / 'result.json')
+            data = json.loads(raw.decode('utf-8'))
         except (OSError, ValueError):
             return None
         return data if isinstance(data, dict) else None
@@ -496,11 +541,8 @@ class DaemonControl:
         if not RUN_ID.fullmatch(run_id):
             return None
         try:
-            with open(self._state / 'runs' / run_id / 'stdout.jsonl', 'rb') as handle:
-                size = os.fstat(handle.fileno()).st_size
-                start = max(0, size - OUTPUT_TAIL_BYTES)
-                handle.seek(start)
-                data = handle.read(OUTPUT_TAIL_BYTES)
+            size, start, data = _read_regular(self._state / 'runs' / run_id / 'stdout.jsonl',
+                                              tail=OUTPUT_TAIL_BYTES)
         except FileNotFoundError:
             return None  # the run never reached a launch
         except OSError as exc:

@@ -18,7 +18,7 @@ import os
 import subprocess
 from collections.abc import Mapping, Sequence
 
-from recursion_core.child_env import ChildRoute, ValidatedEnv, build_child_env, spawn
+from recursion_core.child_env import ChildRoute, EnvRefused, ValidatedEnv, build_child_env, spawn
 
 __all__ = ["launch_env", "spawn_route_process"]
 
@@ -74,7 +74,12 @@ def launch_env(
     validated = build_child_env("codex", home=route_home, auth_mode="subscription", parent=parent)
     launched = validated.to_dict()
     if credential:
-        launched[credential] = checked[credential]
+        # This name was held out of build_child_env, which is what refuses a NUL or an empty route key.
+        # Putting it back unchecked lets the value reach Popen, which raises ValueError instead of EnvRefused.
+        value = checked.get(credential)
+        if not isinstance(value, str) or not value or "\0" in value or "\0" in credential:
+            raise EnvRefused(None if "\0" in credential else credential, "route_key_malformed")
+        launched[credential] = value
     return validated, launched
 
 

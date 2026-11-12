@@ -151,8 +151,10 @@ class _Server(ThreadingMixIn, WSGIServer):
         """Move a connection from reading to answering. False: no thread may answer it now."""
         stop = (method, path.split("?", 1)[0]) == ("POST", "/stop")
         with self._gate:
+            if request in self._working:
+                return True  # a keep-alive follow-up on a connection already admitted
             if request not in self._reading:
-                return True  # evicted: its next read fails and the thread leaves
+                return False  # evicted, or never admitted: do not answer it outside the cap
             limit = MAX_REQUEST_THREADS + STOP_RESERVED_THREADS if stop else MAX_REQUEST_THREADS
             if len(self._working) >= limit:
                 return False

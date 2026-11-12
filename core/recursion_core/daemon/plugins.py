@@ -507,7 +507,15 @@ class PluginHost:
                                     '(it stays marked degraded)', plugin_id)
                     self._turn.notify_all()
 
-        threading.Thread(target=run, name='recursion-operator-read', daemon=True).start()
+        thread = threading.Thread(target=run, name='recursion-operator-read', daemon=True)
+        try:
+            thread.start()
+        except BaseException:
+            # run() is what clears _busy. A thread that never started must not leave every later read busy.
+            with self._turn:
+                self._busy = False
+                self._turn.notify_all()
+            raise
         if done.wait(self._operator_deadline_s):
             return outcome
         with self._turn:

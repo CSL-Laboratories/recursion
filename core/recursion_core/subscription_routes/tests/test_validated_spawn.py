@@ -241,6 +241,33 @@ class OwnLoopSpawnTests(unittest.TestCase):
         self.assertNotIn("poison-pass", popen.call_args.kwargs["env"].values())
         self.assertNotIn("HTTPS_PROXY", popen.call_args.kwargs["env"])
 
+    def test_a_non_anthropic_credential_with_a_nul_is_refused(self) -> None:
+        # ANTHROPIC_API_KEY is checked inside build_child_env. Any other credential is grafted
+        # afterwards and must get the same shape check, or a NUL reaches Popen and raises ValueError.
+        with self.assertRaises(EnvRefused) as caught:
+            launch_env(
+                {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "OPENAI_API_KEY": "sk-test\x00injected"},
+                route_home=str(self.home), credential_env="OPENAI_API_KEY",
+            )
+        self.assertEqual(caught.exception.cause, "route_key_malformed")
+        self.assertNotIn("\x00", str(caught.exception))
+        self.assertNotIn("sk-test", str(caught.exception))
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused):
+            spawn_route_process(
+                [self.argv[0], "run"],
+                {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "OPENAI_API_KEY": "sk-test\x00injected"},
+                route_home=str(self.home), credential_env="OPENAI_API_KEY", cwd=str(self.home),
+            )
+        popen.assert_not_called()
+
+    def test_a_missing_non_anthropic_credential_is_refused(self) -> None:
+        with self.assertRaises(EnvRefused) as caught:
+            launch_env(
+                {"PATH": "/usr/bin:/bin", "HOME": str(self.home)},
+                route_home=str(self.home), credential_env="OPENAI_API_KEY",
+            )
+        self.assertEqual(caught.exception.cause, "route_key_malformed")
+
     def test_an_unsafe_path_never_reaches_popen(self) -> None:
         parent = {**self.base, "PATH": "relative-bin"}
         with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused):

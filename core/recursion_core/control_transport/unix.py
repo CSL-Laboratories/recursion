@@ -22,6 +22,7 @@ import socket
 import stat
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -166,6 +167,44 @@ def _acquire_lock(path: str) -> int:
     return fd
 
 
+# Servers whose lock fd a forked child must drop. flock is on the open file
+# description, so the child's dup keeps the lock after the parent closes its own.
+_LIVE_SERVERS: weakref.WeakSet = weakref.WeakSet()
+
+
+def _drop_lock_after_fork() -> None:
+    """Close lock fds inherited across fork. ``O_CLOEXEC`` does not run on fork."""
+    for server in list(_LIVE_SERVERS):
+        fd = server._lock_fd
+        server._lock_fd = None
+        if not isinstance(fd, int):
+            continue
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+if hasattr(os, "register_at_fork"):  # pragma: no branch - POSIX
+    os.register_at_fork(after_in_child=_drop_lock_after_fork)
+
+
+def _unlink_inode(path: str, ident: tuple[int, int] | None) -> None:
+    """Unlink ``path`` only when it is still the inode ``ident`` and not a symlink."""
+    if ident is None:
+        return
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or (st.st_dev, st.st_ino) != ident:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def _clear_stale_socket(path: str) -> None:
     try:
         st = os.lstat(path)
@@ -178,7 +217,9 @@ def _clear_stale_socket(path: str) -> None:
         probe.settimeout(1.0)
         probe.connect(path)
     except OSError as exc:
-        if exc.errno not in (errno.ECONNREFUSED, errno.ENOENT):
+        # EACCES/EPERM: the socket is ours but mode 000 (or similar), so connect
+        # cannot tell a listener from a stale file. Nothing else can use it either.
+        if exc.errno not in (errno.ECONNREFUSED, errno.ENOENT, errno.EACCES, errno.EPERM):
             raise
         os.unlink(path)
         return
@@ -244,6 +285,7 @@ class UnixControlServer:
         self._next_conn_id = 0
         self.refused: list[str] = []
         self.accepted = 0
+        _LIVE_SERVERS.add(self)
 
     @property
     def path(self) -> str:
@@ -257,69 +299,88 @@ class UnixControlServer:
                 raise RuntimeError("server already closed")
             ensure_private_dir(self.directory)
             lock_fd = _acquire_lock(self._path + ".lock")
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            bound = False
+            # Published before bind so a fork during startup drops this fd in the child.
+            self._lock_fd = lock_fd
+            sock: socket.socket | None = None
+            bound_id: tuple[int, int] | None = None
             try:
+                # socket() is inside the cleanup: a failure here must not leave the flock held.
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 _clear_stale_socket(self._path)
-                # The 0700 directory already keeps other uids out of the bind-to-chmod window;
-                # chmod rather than umask because umask is process-wide and racy across threads.
+                # fstat(fd) is the sockfs inode, not the directory entry, so it cannot
+                # name the file we bound. Record that entry, then chmod it without
+                # following a symlink planted in between: a path swap must not change
+                # some other file's mode or become the inode we listen under.
                 sock.bind(self._path)
-                bound = True
-                os.chmod(self._path, 0o600)
-                st = os.lstat(self._path)
-                if not stat.S_ISSOCK(st.st_mode) or st.st_uid != self._uid:
+                try:
+                    before = os.lstat(self._path)
+                except FileNotFoundError as exc:
+                    raise InsecureSocketPath(f"{self._path} changed under us after bind") from exc
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISSOCK(before.st_mode) or before.st_uid != self._uid:
+                    raise InsecureSocketPath(f"{self._path} changed under us after bind")
+                bound_id = (before.st_dev, before.st_ino)
+                try:
+                    os.chmod(self._path, 0o600, follow_symlinks=False)
+                except (OSError, NotImplementedError) as exc:
+                    raise InsecureSocketPath(f"{self._path} changed under us after bind") from exc
+                listed = os.lstat(self._path)
+                if (
+                    stat.S_ISLNK(listed.st_mode)
+                    or not stat.S_ISSOCK(listed.st_mode)
+                    or listed.st_uid != self._uid
+                    or (listed.st_dev, listed.st_ino) != bound_id
+                    or stat.S_IMODE(listed.st_mode) & 0o077
+                ):
                     raise InsecureSocketPath(f"{self._path} changed under us after bind")
                 sock.listen(socket.SOMAXCONN)
                 sock.settimeout(_ACCEPT_POLL_S)
+                self._sock = sock
+                self._bound = bound_id
+                self._thread = threading.Thread(target=self._accept_loop, name="control-transport-accept", daemon=True)
+                self._thread.start()
             except BaseException:
-                sock.close()
-                if bound:
-                    try:
-                        os.unlink(self._path)
-                    except FileNotFoundError:
-                        pass
+                if sock is not None:
+                    sock.close()
+                self._sock = None
+                self._bound = None
+                self._thread = None
+                self._lock_fd = None
+                _unlink_inode(self._path, bound_id)
                 os.close(lock_fd)
                 raise
-            self._sock = sock
-            self._lock_fd = lock_fd
-            self._bound = (st.st_dev, st.st_ino)
-            self._thread = threading.Thread(target=self._accept_loop, name="control-transport-accept", daemon=True)
-            self._thread.start()
 
     def close(self) -> None:
         self._stop.set()
         thread = self._thread
-        if thread is not None:
+        # A handler that stops the server runs on a worker. Joining that thread here
+        # raises, and the lock fd would stay held.
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5.0)
-        with self._lock:
-            workers = list(self._workers)
-            conns = list(self._conns)
-        for conn in conns:
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        for worker in workers:
-            worker.join(timeout=self._idle_timeout_s + 1.0)
-        with self._lock:
-            sock, self._sock = self._sock, None
-            lock_fd, self._lock_fd = self._lock_fd, None
-            bound, self._bound = self._bound, None
-        if sock is not None:
-            sock.close()
-            # Unlink only the inode we bound: if an operator removed our socket and a
-            # successor bound the path, closing us must not take its socket away.
-            try:
-                st = os.lstat(self._path)
-            except FileNotFoundError:
-                st = None
-            if st is not None and bound == (st.st_dev, st.st_ino):
+        try:
+            with self._lock:
+                workers = list(self._workers)
+                conns = list(self._conns)
+            for conn in conns:
                 try:
-                    os.unlink(self._path)
-                except FileNotFoundError:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
                     pass
-        if lock_fd is not None:
-            os.close(lock_fd)
+            for worker in workers:
+                if worker is threading.current_thread() or worker.ident is None:
+                    continue
+                worker.join(timeout=self._idle_timeout_s + 1.0)
+        finally:
+            # Always drop the listen socket and the flock, even when a join fails.
+            with self._lock:
+                sock, self._sock = self._sock, None
+                lock_fd, self._lock_fd = self._lock_fd, None
+                bound, self._bound = self._bound, None
+            if sock is not None:
+                sock.close()
+                # Unlink only the inode we bound: a successor at this path stays.
+                _unlink_inode(self._path, bound)
+            if lock_fd is not None:
+                os.close(lock_fd)
 
     def __enter__(self) -> UnixControlServer:
         self.start()
@@ -405,6 +466,18 @@ class UnixControlServer:
                 except FrameError:
                     _send_quietly(conn, {"ok": False, "error": {"code": "response_too_large"}})
                     return
+                except (TypeError, ValueError):
+                    # json.dumps raises TypeError for bytes/sets and ValueError for NaN.
+                    # That used to kill the worker after the handler had already returned.
+                    # Nothing was written (encode runs before send), so the stream stays aligned.
+                    fallback = _copy_request_id(
+                        {"ok": False, "error": {"code": "internal_error"}}, request
+                    )
+                    try:
+                        write_frame(conn, fallback, max_bytes=self._max_frame_bytes)
+                    except (OSError, FrameError, TypeError, ValueError):
+                        return
+                    continue
                 except OSError:
                     return
         finally:
@@ -449,10 +522,22 @@ def _is_busy(response: Message) -> bool:
     return response == _BUSY_MESSAGE
 
 
+def _copy_request_id(message: Message, request: Message) -> Message:
+    """Echo ``request``'s id when that id can be written back out. Otherwise omit it."""
+    if "id" not in request or "id" in message:
+        return message
+    ident = request["id"]
+    try:
+        encode_frame({"id": ident})
+    except (FrameError, TypeError, ValueError):
+        return message
+    return {**message, "id": ident}
+
+
 def _send_quietly(conn: socket.socket, message: Message) -> None:
     try:
         write_frame(conn, message)
-    except (OSError, FrameError):
+    except (OSError, FrameError, TypeError, ValueError):
         pass
 
 
@@ -474,6 +559,7 @@ class UnixControlClient:
         self._timeout_s = timeout_s
         self._max_frame_bytes = max_frame_bytes
         self._lock = threading.Lock()
+        self._io = threading.Lock()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.settimeout(timeout_s)
@@ -485,23 +571,28 @@ class UnixControlClient:
         self._sock: socket.socket | None = sock
 
     def request(self, message: Message) -> Message:
-        """Send one frame and return its reply; any failure closes the client for good.
+        """Send one frame and return its reply. A socket failure closes the client.
 
-        A timeout or partial read leaves the stream mid-frame, so the next read would hand
-        back an earlier request's late reply (a Stop's answer as a ping's). The socket is
+        A local encode error writes nothing and leaves the connection open. A timeout
+        or partial read leaves the stream mid-frame, so the next read would hand back
+        an earlier request's late reply (a Stop's answer as a ping's). The socket is
         closed instead, and a reply whose ``id`` differs from the request's is refused.
-        ``timeout_s`` bounds the whole reply, not each ``recv``. A server at its connection
-        cap raises ``TransportBusy``: the request was not delivered.
+        ``timeout_s`` bounds the whole reply, not each ``recv``. ``close`` shuts the
+        socket down without waiting out that read. A server at its connection cap
+        raises ``TransportBusy``: the request was not delivered.
         """
-        with self._lock:
-            sock = self._sock
-            if sock is None:
-                raise ConnectionError("client closed")
+        # Encode before touching the socket. Anything after sendall can desync the stream.
+        payload = encode_frame(message, max_bytes=self._max_frame_bytes)
+        with self._io:
+            with self._lock:
+                sock = self._sock
+                if sock is None:
+                    raise ConnectionError("client closed")
             try:
                 deadline = time.monotonic() + self._timeout_s
                 sock.settimeout(self._timeout_s)
                 try:
-                    write_frame(sock, message, max_bytes=self._max_frame_bytes)
+                    sock.sendall(payload)
                 except OSError:
                     # A busy server may have answered and hung up before our write landed.
                     if _pending_busy(sock):
@@ -515,15 +606,27 @@ class UnixControlClient:
                 if "id" in message and response.get("id") != message["id"]:
                     raise FrameError("reply_id_mismatch")
             except BaseException:
-                self._sock = None
+                with self._lock:
+                    if self._sock is sock:
+                        self._sock = None
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 sock.close()
                 raise
         return response
 
     def close(self) -> None:
+        # Do not take ``_io``: an in-flight request holds it across the read, and
+        # shutdown is what unblocks that read.
         with self._lock:
             sock, self._sock = self._sock, None
         if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             sock.close()
 
     def __enter__(self) -> UnixControlClient:

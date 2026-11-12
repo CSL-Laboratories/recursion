@@ -956,14 +956,18 @@ def _urllib_environment_hit(entry: str, request_host: str) -> bool:
     """One entry, matched as CPython 3.12 ``proxy_bypass_environment`` matches it against ``request_host``.
 
     Leading dots are removed, then the name is equal to ``Request.host`` or to its host-only part, or a dotted
-    suffix of either (``name = '.' + name`` before ``endswith``). ``2.3]:443`` is a suffix of
-    ``[::ffff:10.1.2.3]:443``; ``2.3]`` is a suffix of the host-only ``[::ffff:10.1.2.3]``. The port in the
-    entry is part of that string: ``2.3]:80`` does not match port 443.
+    suffix of either (``name = '.' + name`` before ``endswith``). An entry that is only dots strips to empty
+    and still matches: CPython appends ``'.'`` anyway, so the suffix is ``'.'`` and a host that itself ends
+    with ``'.'`` (``example.com.``, ``example.com.:443``, ``localhost..``) bypasses. ``2.3]:443`` is a suffix
+    of ``[::ffff:10.1.2.3]:443``; ``2.3]`` is a suffix of the host-only ``[::ffff:10.1.2.3]``. The port in the
+    entry is part of that string: ``2.3]:80`` does not match port 443. ``request_host`` is the exact
+    ``Request.host`` the handler passes, trailing dots included.
     """
 
-    name = entry.strip().lstrip(".").lower()
-    if not name:
+    name = entry.strip().lower()
+    if not name:  # whitespace only: CPython's ``if name`` skips it, and it is not a dot
         return False
+    name = name.lstrip(".")
     hostonly = _urllib_hostonly(request_host)
     if hostonly == name or request_host == name:
         return True
@@ -985,12 +989,14 @@ def _client_hit(entry: str, host: str, port: int | None, *, urllib_host: bool = 
     requests deletes spaces before this is called and then uses ``hostname.endswith(entry)`` with no dot
     boundary, and the same on ``hostname:port`` when the URL spells a port. Leading dots are removed first so
     ``.2001:db8::1:8443`` is that host:port and ``.2001:db8::1:9`` is not. A ``*``, ``%`` or ``/`` entry is left
-    to the rules that already judge those. Nothing here resolves a name.
+    to the rules that already judge those. Nothing here resolves a name. ``host`` keeps a trailing dot:
+    ``Request.host`` and ``urlsplit.hostname`` both keep it, and ``hostname.endswith('.')`` is how requests
+    bypasses a dot-only entry.
     """
 
     if not entry or any(mark in entry for mark in "*/%"):
         return False
-    host = host.lower().strip("[]").rstrip(".")
+    host = host.lower().strip("[]")
     texts: list[str] = []
     for text in (entry.lower(), entry.lower().lstrip(".")):
         if text and text not in texts:
@@ -1307,7 +1313,9 @@ def _no_proxy_route_bypass(value: str, host: str, port: int | None = None) -> tu
     The same matcher as ``_no_proxy_bypass``, over the one host: the host itself, a parent domain with or
     without the leading dot, a ``*`` pattern, with scheme, brackets, ``:port`` and trailing dot stripped from
     the entry. The entry's port is not compared with the route's: curl and requests ignore it, so another port
-    is still a hit. The host is compared lowercased and without its own trailing dot. An IP-literal host is
+    is still a hit. Name and address comparison uses the host lowercased and without its trailing dots. The
+    client comparison (``_client_hit``) uses that same host with the trailing dots kept, because that is
+    ``Request.host`` and requests' hostname. An IP-literal host is
     also matched as an address: by an entry that is that address, and by a CIDR block that holds it (curl
     7.86+, requests, undici and Go honour CIDR). A CIDR entry never matches a name: no matcher resolves DNS.
     An entry that is an address or a block is decided as one and not also as a name, so the port strip cannot
@@ -1326,7 +1334,8 @@ def _no_proxy_route_bypass(value: str, host: str, port: int | None = None) -> tu
     ``no_proxy_unparseable`` for an entry still not ASCII after folding when the host has an ``xn--`` label.
     """
 
-    host = host.lower().strip("[]").rstrip(".")
+    shown = host.lower().strip("[]")  # Request.host / requests hostname, trailing dots kept
+    host = shown.rstrip(".")  # name and address matchers; a trailing-dot IP still parses
     addresses = _host_addresses(host)
     v4 = [int(address) for address in addresses if address.version == 4]
     for position, reading in enumerate(_no_proxy_readings(value), 1):
@@ -1339,7 +1348,7 @@ def _no_proxy_route_bypass(value: str, host: str, port: int | None = None) -> tu
                 named = _no_proxy_name(entry)
                 matcher = _no_proxy_hit if index == 0 else _name_hit  # only the entry itself is a "*" pattern
                 hit = bool(named) and named.strip("*.") != "" and matcher(named, (host,))
-            if not hit and _client_hit(raw, host, port):
+            if not hit and _client_hit(raw, shown, port):
                 hit = True
             # A name's :port is dropped and then matched with no dot boundary ("pic.com" in "epic.com").
             # Two or more colons is an IPv6 spelling: dropping the last field would turn "2001:db8::2" into
@@ -1348,7 +1357,7 @@ def _no_proxy_route_bypass(value: str, host: str, port: int | None = None) -> tu
             # Request.host on every port; ProxyHandler only matches the port still written in the entry.
             if not hit and raw.lstrip(".").count(":") < 2:
                 named = _no_proxy_name(raw)
-                hit = bool(named) and _client_hit(named, host, port, urllib_host=False)
+                hit = bool(named) and _client_hit(named, shown, port, urllib_host=False)
             if hit:
                 return position, "no_proxy_route_host", "matches the route's base URL host"
         if any(first <= address <= last for first, last in reading.ranges for address in v4):

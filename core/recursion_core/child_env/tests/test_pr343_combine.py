@@ -291,6 +291,96 @@ class NoProxyClientTests(unittest.TestCase):
                     env = _build(home, {**_PROXY, "NO_PROXY": entry}, ChildRoute(api_key=KEY, base_url=base_url))
                     self.assertEqual((entry, base_url), (env["NO_PROXY"], env["ANTHROPIC_BASE_URL"]))
 
+    def test_dot_only_entry_refuses_a_trailing_dot_route_host(self) -> None:
+        """A dot-only NO_PROXY entry bypasses a route host that still ends with ``.``.
+
+        CPython 3.12 ``proxy_bypass_environment`` drops leading dots, then suffix-matches
+        ``'.' + name``. An entry that is only dots (``'.'``, ``'..'``, ``'...'``, spaces or a
+        newline around one dot, or ``',.,.'``) strips to empty, so that suffix is ``'.'`` and
+        ``Request.host`` / the host-only part bypasses when it ends with ``'.'``. requests 2.31
+        ``should_bypass_proxies`` uses ``hostname.endswith`` (the hostname keeps the dot) and then
+        ``proxy_bypass`` on that hostname. ``http://localhost../v1`` is not loopback:
+        ``_loopback_host`` removes only one trailing dot. The route check used to ``rstrip('.')``
+        the host before building ``Request.host``, and to treat an empty stripped entry as a miss,
+        so these launched.
+        """
+
+        import urllib.parse
+        import urllib.request
+
+        routes = (
+            "https://example.com.:443/v1",
+            "https://example.com./v1",
+            "https://EXAMPLE.COM.",
+            "http://10.1.2.3.",
+            "https://api.example.com.",
+            "http://localhost../v1",
+        )
+        entries = (".", "..", "...", " . ", ".\n", ",.,.")
+        why = "matches the route's base URL host; the entry is not shown"
+        proxies = {"https": PROXY, "http": PROXY}
+        try:
+            from pip._vendor.requests.utils import should_bypass_proxies
+        except ImportError:  # the urllib checks above are the ones CI always has
+            should_bypass_proxies = None
+
+        def requests_endswith(url: str, entry: str) -> bool:
+            """requests 2.31's endswith, after ``replace(" ", "").split(",")``, hostname and host:port."""
+
+            parsed = urllib.parse.urlparse(url)
+            hostname = parsed.hostname or ""
+            host_with_port = f"{hostname}:{parsed.port}" if parsed.port else hostname
+            return any(hostname.endswith(item) or host_with_port.endswith(item)
+                       for item in entry.replace(" ", "").split(",") if item)
+
+        for base_url in routes:
+            request_host = urllib.request.Request(base_url).host
+            hostname = urllib.parse.urlparse(base_url).hostname
+            for entry in entries:
+                with self.subTest(base_url=base_url, entry=entry):
+                    self.assertTrue(
+                        urllib.request.proxy_bypass_environment(request_host, {**proxies, "no": entry}),
+                        request_host,
+                    )
+                    saved = {name: os.environ.get(name) for name in ("no_proxy", "NO_PROXY")}
+                    os.environ["no_proxy"] = entry
+                    os.environ.pop("NO_PROXY", None)
+                    try:
+                        self.assertTrue(urllib.request.proxy_bypass(request_host), request_host)
+                        self.assertTrue(urllib.request.proxy_bypass(hostname), hostname)
+                    finally:
+                        for name, value in saved.items():
+                            if value is None:
+                                os.environ.pop(name, None)
+                            else:
+                                os.environ[name] = value
+                    if should_bypass_proxies is not None:
+                        self.assertTrue(should_bypass_proxies(base_url, entry))
+                    # endswith is the requests check that is not urllib. '..' / '...' / a trailing
+                    # newline bypass through urllib's empty-name '.' suffix, not through endswith,
+                    # except 'localhost..', which really does end with '..'.
+                    if entry in {".", " . ", ",.,."} or base_url == "http://localhost../v1" and entry == "..":
+                        self.assertTrue(requests_endswith(base_url, entry), (base_url, entry))
+                    refused = self._refused(entry, base_url)
+                    position = 2 if entry == ",.,." else 1
+                    self.assertEqual(
+                        ("NO_PROXY", "no_proxy_route_host", position),
+                        (refused.name, refused.cause, refused.position),
+                    )
+                    self.assertEqual(f"entry {position} of NO_PROXY {why}", refused.detail)
+        # The same entries do not bypass a host with no trailing dot, so they still launch.
+        home = _home(self)
+        for entry in entries:
+            for base_url in ("https://example.com/v1", "https://[::ffff:10.1.2.3]:443/v1"):
+                with self.subTest(kept=entry, base_url=base_url):
+                    request_host = urllib.request.Request(base_url).host
+                    self.assertFalse(
+                        urllib.request.proxy_bypass_environment(request_host, {**proxies, "no": entry}),
+                        request_host,
+                    )
+                    env = _build(home, {**_PROXY, "NO_PROXY": entry}, ChildRoute(api_key=KEY, base_url=base_url))
+                    self.assertEqual((entry, base_url), (env["NO_PROXY"], env["ANTHROPIC_BASE_URL"]))
+
 
 class ProxyClearedTests(unittest.TestCase):
     def test_empty_lowercase_proxy_clears_uppercase(self) -> None:

@@ -110,10 +110,16 @@ def _take_key(buf: bytes, *, final: bool) -> tuple[str | None, bytes]:
             return None, buf
         return "esc", buf[1:]
     need = _utf8_len(buf[0])
-    if len(buf) < need and not final:
-        return None, buf
-    take = buf if final and len(buf) < need else buf[:need]
-    return take.decode("utf-8", "replace"), buf[len(take):]
+    if need > 1:
+        # A byte that is not 10xxxxxx ends the pending lead. That lead is one U+FFFD; the byte
+        # itself is the next key (so ESC still goes through the disambiguation window above).
+        for i in range(1, min(need, len(buf))):
+            if buf[i] & 0xC0 != 0x80:
+                return "\ufffd", buf[i:]
+        if len(buf) < need:
+            return (None, buf) if not final else ("\ufffd", b"")
+        return buf[:need].decode("utf-8", "replace"), buf[need:]
+    return buf[:1].decode("utf-8", "replace"), buf[1:]
 
 
 class Tty:

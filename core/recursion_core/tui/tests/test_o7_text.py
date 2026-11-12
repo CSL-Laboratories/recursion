@@ -304,6 +304,53 @@ class StaleWatchOnlyTest(unittest.TestCase):
         app.request("run.status", {"run_id": "r"})
         self.assertFalse(app.watch_only)
 
+    def test_a_dropped_status_run_does_not_clear_watch_only(self) -> None:
+        # call_api drops a cyclic run and leaves {code: ok}. That is not an applied read.
+        run = {"run_id": "r", "state": "running", "engine": "e", "tenant": "t"}
+        leaked = "SHOULD-NOT-LEAK"
+
+        class API:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.mode = "down"
+
+            def call(self, method: str, params: dict | None = None) -> dict:
+                self.calls.append(method)
+                if method == "run.list":
+                    return {"code": "ok", "runs": [dict(run)]}
+                if method == "run.status":
+                    if self.mode != "cyclic":
+                        return {"code": "ok", "run": dict(run)} if self.mode == "ok" else {"code": "control_api_unavailable"}
+                    cyclic = {"run_id": "r", "state": "stopped", "engine": "e", "tenant": "t", "note": leaked}
+                    cyclic["self"] = cyclic
+                    return {"code": "ok", "run": cyclic}
+                return {"code": "started", "run": {**run, "run_id": "new"}}
+
+        api = API()
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"}, width=80, height=24)
+        app.open()
+        app.attach("r")
+        api.mode = "down"
+        app.request("run.status", {"run_id": "r"})
+        self.assertTrue(app.watch_only)
+        self.assertIsNotNone(app.status_refresh_failed)
+        api.mode = "cyclic"
+        app.request("run.status", {"run_id": "r"})
+        self.assertEqual(app.last, {"code": "ok"})
+        self.assertIsNotNone(app.status_refresh_failed)
+        self.assertTrue(app.watch_only)
+        self.assertEqual(app.runs[0]["state"], "running")
+        self.assertTrue(any("without a run" in err for err in app.errors))
+        self.assertNotIn(leaked, "\n".join(app.errors))
+        self.assertNotIn(leaked, "\n".join(app.transcript))
+        app.command("start --tenant t1 --engine codex --prompt hi")
+        self.assertNotIn("run.start", api.calls)
+        self.assertIn("refused locally: start while watch_only", app.errors[-1])
+        api.mode = "ok"
+        app.request("run.status", {"run_id": "r"})
+        self.assertIsNone(app.status_refresh_failed)
+        self.assertFalse(app.watch_only)
+
 
 class ErrorStaysTest(unittest.TestCase):
     def test_error_is_never_redrawn_away(self) -> None:

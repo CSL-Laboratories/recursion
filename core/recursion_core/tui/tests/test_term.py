@@ -75,6 +75,25 @@ class TtyReadTest(unittest.TestCase):
         os.write(self.master, raw[1:])
         self.assertEqual(self.terminal.read_key(0.5), "你")
 
+    def test_esc_after_a_utf8_lead_is_escape_not_payload(self) -> None:
+        os.write(self.master, b"\xe4\x1b")
+        self.assertEqual(self.terminal.read_key(0.5), "\ufffd")
+        # The ESC still waits out the arrow-key window before it is delivered.
+        self.assertEqual(self.terminal.read_key(0.3), "esc")
+
+    def test_a_utf8_lead_does_not_swallow_the_following_bytes(self) -> None:
+        os.write(self.master, b"\xe4\x1bA")
+        self.assertEqual(self.terminal.read_key(0.5), "\ufffd")
+        self.assertEqual(self.terminal.read_key(0.5), "esc")
+        self.assertEqual(self.terminal.read_key(0.5), "A")
+        os.write(self.master, b"\xe4Z")
+        self.assertEqual(self.terminal.read_key(0.5), "\ufffd")
+        self.assertEqual(self.terminal.read_key(0.5), "Z")
+        os.write(self.master, b"\xe4\x1b[Aj")
+        self.assertEqual(self.terminal.read_key(0.5), "\ufffd")
+        self.assertEqual(self.terminal.read_key(0.5), "up")
+        self.assertEqual(self.terminal.read_key(0.5), "j")
+
     def test_eof_is_reported_instead_of_a_ready_empty_read(self) -> None:
         os.close(self.master)
         self.master = -1

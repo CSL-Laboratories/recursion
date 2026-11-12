@@ -218,10 +218,14 @@ class TuiApp:
         elif method == "run.status":
             # An unavailable status stays failed until a later status succeeds. A refusal is an answer,
             # not a failed read, and a successful list must not clear it (bot review 4503920903).
-            if code == "ok":
+            # ``code`` ok with no run was not applied: call_api drops a cyclic run and keeps ``code``.
+            # Clearing the failure here would turn watch_only off and allow Start on that answer.
+            if code == "ok" and isinstance(answer.get("run"), dict):
                 self.status_refresh_failed = None
-                if isinstance(answer.get("run"), dict):
-                    self._merge(answer["run"])
+                self._merge(answer["run"])
+            elif code == "ok":
+                self.status_refresh_failed = "run.status answered ok without a run"
+                self._error("run.status answered ok without a run")
             elif code == p.UNAVAILABLE:
                 self.status_refresh_failed = f"run.status answered {field(code)}"
         elif code == "ok" and isinstance(answer.get("run"), dict):
@@ -229,13 +233,22 @@ class TuiApp:
         elif code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
             rid = answer["run_id"]
             state = "stopped" if code == "stopped" else "stop_pending"
-            # Applied now, so any read that started earlier is older than this Stop.
-            self._read_at[rid] = time.monotonic()
-            self._stop_mark[rid] = (self._read_at[rid], state, answer.get("reason"))
+            reason = answer.get("reason")
+            # Build every replacement before writing. ``stop: 1`` is not a record; spreading it used to
+            # raise after state and the Stop mark were set, so the answer handler recorded only
+            # ``TypeError`` and never reached UNCERTAIN.
+            updates = []
             for run in self.runs:
                 if run.get("run_id") == rid:
-                    run["state"] = state
-                    run["stop"] = {**(run.get("stop") or {}), "reason": answer.get("reason")}
+                    prior = run.get("stop")
+                    base = prior if isinstance(prior, dict) else {}
+                    updates.append((run, {**base, "reason": reason}))
+            # Applied now, so any read that started earlier is older than this Stop.
+            self._read_at[rid] = time.monotonic()
+            self._stop_mark[rid] = (self._read_at[rid], state, reason)
+            for run, stop in updates:
+                run["state"] = state
+                run["stop"] = stop
         elif code == "started" and isinstance(answer.get("run"), dict):
             self._merge(answer["run"])
         self._answer_keyed = p.keyed_conditions(answer)
@@ -262,7 +275,12 @@ class TuiApp:
         self.sync_conditions()
 
     def _consider(self, run: dict) -> dict:
-        """The run record a read may store. A read that started before a newer Stop keeps the local row."""
+        """The run record a read may store.
+
+        A read that started before a newer Stop keeps the local row, so a stale ``running`` cannot hide
+        that Stop. An incoming ``stopped`` row is terminal and is kept even then (the same rule
+        ``_overlay_stop`` already applies when this client has no local row).
+        """
 
         started = self._answer_started
         rid = run.get("run_id")
@@ -270,7 +288,7 @@ class TuiApp:
             return run
         if started < self._read_at.get(rid, -1):
             old = next((known for known in self.runs if known.get("run_id") == rid), None)
-            if old is not None:
+            if old is not None and run.get("state") != "stopped":
                 return old
             return self._overlay_stop(run, started)
         self._read_at[rid] = started

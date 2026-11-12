@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 
-from recursion_core.control.registry import POPULATED
+from recursion_core.control.registry import EMPTY, POPULATED
 from recursion_core.tui import protocol as p
 from recursion_core.tui.app import Loop, TuiApp
 from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI
@@ -35,6 +35,26 @@ class _HoldReads(RecordingAPI):
         if method == self.method and self.arm:
             self.held.set()
             self.release.wait(5)
+        return result
+
+
+class _BlockBeforeRead(RecordingAPI):
+    """Holds one armed call before the inner API reads, so the payload is whatever landed while it waited."""
+
+    def __init__(self, inner, method: str) -> None:
+        super().__init__(inner)
+        self.method, self.arm = method, False
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.payload = None
+
+    def call(self, method, params=None):
+        if method == self.method and self.arm:
+            self.arm = False
+            self.entered.set()
+            self.release.wait(5)
+        result = super().call(method, params)
+        if method == self.method:
+            self.payload = result
         return result
 
 
@@ -79,6 +99,40 @@ class StaleReadTest(unittest.TestCase):
 
     def test_a_status_started_before_stop_does_not_restore_the_old_run(self) -> None:
         self._run("run.status")
+
+    def test_an_early_list_that_reads_stopped_replaces_the_pending_row(self) -> None:
+        # A list blocked before it reads still carries an early start time. Once a later Stop has
+        # confirmed, that list's stopped row is the registry's word and must replace stop_pending.
+        driver = FakeDriver(confirm_answers=[POPULATED, EMPTY])
+        run_id = driver.start_run()
+        api = _BlockBeforeRead(driver.api, "run.list")
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"}, width=80, height=24)
+        loop = Loop(app, api)
+        loop.start()
+        self.addCleanup(driver.halt)
+        self.addCleanup(api.release.set)
+        self.addCleanup(loop.shutdown)
+        self.assertTrue(wait_for(lambda: app.runs), "open did not list the run")
+        api.arm = True
+        loop.press("r")
+        self.assertTrue(api.entered.wait(2), "the list was not held before the read")
+        loop.press("s")
+        self.assertTrue(wait_for(lambda: app.mode == "confirm_stop"))
+        loop.press("y")
+        self.assertTrue(wait_for(lambda: app.runs[0]["state"] == "stop_pending"), app.runs)
+        self.assertIn(f"run={run_id}", app._uncertain)
+        self.assertIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
+        second = driver.api.call("run.stop", {"run_id": run_id})
+        self.assertEqual(second["code"], "stopped")
+        self.assertEqual(driver.registry.get(run_id)["state"], "stopped")
+        self.assertEqual(app.runs[0]["state"], "stop_pending", "the UI has not seen the second Stop yet")
+        api.payload = None
+        api.release.set()
+        self.assertTrue(wait_for(lambda: api.payload is not None and app.last_method == "run.list"))
+        self.assertEqual(api.payload["runs"][0]["state"], "stopped")
+        self.assertEqual(app.runs[0]["state"], "stopped", app.runs[0])
+        self.assertNotIn(f"run={run_id}", app._uncertain)
+        self.assertNotIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
 
 
 class LoopSurvivesBadInputTest(unittest.TestCase):
@@ -130,3 +184,51 @@ class LoopSurvivesBadInputTest(unittest.TestCase):
         loop.press("y")
         self.assertTrue(wait_for(lambda: api.stops == 2), api.stops)
         self.assertEqual(app.last.get("repeat"), True)
+
+    def test_a_non_dict_stop_does_not_leave_stop_pending_without_uncertain(self) -> None:
+        # stop: 1 is not a record. Spreading it raises after state and the Stop mark are written,
+        # and the answer handler then records only the exception class.
+        class API:
+            def call(self, method, params=None):
+                if method == "run.list":
+                    return {"code": "ok", "runs": [
+                        {"run_id": "r", "state": "running", "engine": "e", "tenant": "t", "stop": 1}]}
+                if method == "run.stop":
+                    return {"code": "pending", "run_id": "r", "reason": "cgroup_populated"}
+                return {"code": "ok", "runs": []}
+
+        api = API()
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"}, width=100, height=30)
+        loop = Loop(app, api)
+        loop.start()
+        self.addCleanup(loop.shutdown)
+        self.assertTrue(wait_for(lambda: app.runs))
+        loop.press("s")
+        self.assertTrue(wait_for(lambda: app.mode == "confirm_stop"))
+        loop.press("y")
+        self.assertTrue(wait_for(lambda: app.last_method == "run.stop"), app.errors)
+        row = app.runs[0]
+        self.assertEqual(row["state"], "stop_pending")
+        self.assertIsInstance(row["stop"], dict)
+        self.assertEqual(row["stop"].get("reason"), "cgroup_populated")
+        self.assertIn("r", app._read_at)
+        self.assertEqual(app._stop_mark["r"][1], "stop_pending")
+        self.assertIn("run=r", app._uncertain)
+        self.assertEqual({label for label, _ in app.conditions()}, {p.UNCERTAIN, p.UNRECONCILED})
+        self.assertNotIn("TypeError", " ".join(app.errors))
+        screen = "\n".join(text for text, _ in app.frame())
+        self.assertIn("UNCERTAIN:", screen)
+        self.assertIn("UNRECONCILED:", screen)
+
+    def test_keyboard_interrupt_is_not_turned_into_a_dropped_answer(self) -> None:
+        api = RecordingAPI(FakeDriver().api)
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"}, width=80, height=24)
+        loop = Loop(app, api)
+
+        def boom(method, params, answer):
+            raise KeyboardInterrupt
+
+        loop._answers.put((boom, "run.stop", {"run_id": "r"}, {"code": "pending", "run_id": "r"}, 0.0))
+        with self.assertRaises(KeyboardInterrupt):
+            loop.tick()
+        self.assertFalse(any("KeyboardInterrupt" in err for err in app.errors))

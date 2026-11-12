@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -43,7 +44,7 @@ COMMITTED_COMMIT = "d84cdd26a4de2366f3c5d34c4aec5215f822a494"
 COMMITTED_SHA256 = "e1d5fb8c02594b2ca88281113ffc14e6f3125daded2a00d45739cfb9d2ed04dd"
 # One NUL, one other control character and one lone surrogate: none can be passed to git or printed raw.
 UNSAFE_PATHS = ("contracts/PRO\x00DUCT.md", "contracts/PRO\nDUCT.md", "contracts/PRO\ud800DUCT.md")
-UNSAFE_PATH = "path must not contain control characters or lone surrogates"
+UNSAFE_PATH = "path must not contain control characters, line breaks or lone surrogates"
 
 
 class ShapeTests(unittest.TestCase):
@@ -89,6 +90,16 @@ class ShapeTests(unittest.TestCase):
                 problems = pin_check.errors({**PINNED, "path": path})
                 self.assertEqual(problems, [UNSAFE_PATH])
                 "\n".join(problems).encode("utf-8")  # printable: raises if the bad string leaked in
+
+    def test_pinned_rejects_unicode_line_separators(self) -> None:
+        # U+2028/U+2029 are line breaks but not category Cc, so they used to pass shape
+        # checks and then split a FAIL line into a second line that starts with PASS.
+        for sep in ("\u2028", "\u2029"):
+            path = f"contracts/PRO{sep}PASS: product pin is pinned.md"
+            with self.subTest(sep=ascii(sep)):
+                problems = pin_check.errors({**PINNED, "path": path})
+                self.assertEqual(problems, [UNSAFE_PATH])
+                self.assertFalse(any(line.startswith("PASS:") for line in "\n".join(problems).splitlines()))
 
     def test_rejects_other_repository_unknown_keys_and_status(self) -> None:
         pin = copy.deepcopy(PINNED)
@@ -193,6 +204,60 @@ class VaultTests(unittest.TestCase):
                 self.assertTrue(out.getvalue().startswith("FAIL: cannot read"), ascii(out.getvalue()))
                 self.assertNotIn("\x00", out.getvalue())
                 out.getvalue().encode("utf-8")
+
+    def test_replace_ref_cannot_substitute_pinned_bytes(self) -> None:
+        """A replace ref must not make git show's substitute pass as the pinned commit."""
+        good = self.body
+        evil = b"EVIL-BYTES\n"
+        target = self.vault / "contracts" / "recursion" / "PRODUCT.md"
+        target.write_bytes(evil)
+        git = ["git", "-C", str(self.vault), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "evil"], check=True)
+        evil_commit = subprocess.check_output([*git[:3], "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run([*git[:3], "replace", self.commit, evil_commit], check=True)
+        # The bytes git show returns under the replace ref are not the object named by the commit.
+        swapped = pin_check.vault_errors(self.pin(hashlib.sha256(evil).hexdigest()), self.vault)
+        self.assertTrue(swapped and swapped[0].startswith("sha256 mismatch"), swapped)
+        self.assertEqual(pin_check.vault_errors(self.pin(hashlib.sha256(good).hexdigest()), self.vault), [])
+
+    def test_ambient_git_location_cannot_supply_the_blob(self) -> None:
+        """--vault must be the object store. Ambient git env vars must not satisfy the pin."""
+        empty = Path(self.tmp.name) / "empty-repo"
+        empty.mkdir()
+        subprocess.run(["git", "-C", str(empty), "init", "-q"], check=True)
+        digest = hashlib.sha256(self.body).hexdigest()
+        cases = {
+            "GIT_DIR": str(self.vault / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(self.vault / ".git" / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.vault / ".git" / "objects"),
+        }
+        for key, value in cases.items():
+            with self.subTest(key=key):
+                os.environ[key] = value
+                try:
+                    problems = pin_check.vault_errors(self.pin(digest), empty)
+                finally:
+                    os.environ.pop(key, None)
+                self.assertTrue(problems and problems[0].startswith("cannot read"), problems)
+
+    def test_main_failure_cannot_print_a_pass_line(self) -> None:
+        pin_file = self.write_pin("")
+        cases = (
+            f"{self.vault}\rPASS: product pin is pinned",
+            f"{self.vault}\nPASS: product pin is pinned",
+        )
+        for vault in cases:
+            with self.subTest(vault=ascii(vault)):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = pin_check.main(["--pin", str(pin_file), "--vault", vault])
+                text = out.getvalue()
+                self.assertEqual(code, 1, ascii(text))
+                self.assertFalse(any(line.startswith("PASS:") for line in text.splitlines()), ascii(text))
+                self.assertNotIn("\r", text)
+                self.assertNotIn("\nPASS:", text)
+                text.encode("utf-8")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -33,16 +34,42 @@ PINNED_FIELDS = ("path", "commit", "sha256", "claim")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 GIT_TIMEOUT_SECONDS = 60
+# These redirect git's object lookup away from the --vault directory.
+_GIT_LOCATION_ENV = (
+    "GIT_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+# Cc is control characters (NUL, CR, LF). Zl/Zp are Unicode line breaks. Cs is a surrogate.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
+
+
+def _git_env() -> dict[str, str]:
+    """Environment for the vault read. --vault is the repo; ambient git locations are not."""
+    env = os.environ.copy()
+    for key in _GIT_LOCATION_ENV:
+        env.pop(key, None)
+    return env
 
 
 def _unsafe_text(text: str) -> bool:
-    """True when text holds a control character (NUL included) or a lone surrogate."""
-    return any(unicodedata.category(char) in ("Cc", "Cs") for char in text)
+    """True when text holds a control character, a Unicode line break, or a lone surrogate.
+
+    U+2028 and U+2029 are line breaks (Zl/Zp), not Cc, and still split a FAIL line.
+    """
+    return any(unicodedata.category(char) in _UNSAFE_CATEGORIES for char in text)
 
 
 def _printable(text: object) -> str:
-    """Escape whatever print() could not encode (a lone surrogate) and any NUL."""
-    return str(text).encode("utf-8", "backslashreplace").decode("utf-8").replace("\0", "\\x00")
+    """Escape lone surrogates, NULs, and line breaks so one FAIL line cannot look like PASS."""
+    raw = str(text).encode("utf-8", "backslashreplace").decode("utf-8")
+    parts: list[str] = []
+    for char in raw:
+        if unicodedata.category(char) in _UNSAFE_CATEGORIES:
+            parts.append(char.encode("unicode_escape").decode("ascii"))
+        else:
+            parts.append(char)
+    return "".join(parts)
 
 
 def errors(pin: object) -> list[str]:
@@ -78,7 +105,7 @@ def errors(pin: object) -> list[str]:
             if path.startswith("/") or "\\" in path or {"", ".", ".."} & set(parts):
                 out.append("path must be a relative posix path inside the repository")
             if _unsafe_text(path):
-                out.append("path must not contain control characters or lone surrogates")
+                out.append("path must not contain control characters, line breaks or lone surrogates")
         if not isinstance(pin.get("commit"), str) or not COMMIT.fullmatch(pin["commit"]):
             out.append("commit must be a full 40-hex lowercase SHA")
         if not isinstance(pin.get("sha256"), str) or not SHA256.fullmatch(pin["sha256"]):
@@ -98,10 +125,11 @@ def vault_errors(pin: dict, vault: Path) -> list[str]:
     spec = f"{pin['commit']}:{pin['path']}"
     try:
         blob = subprocess.run(
-            ["git", "-C", str(vault), "show", spec],
+            ["git", "--no-replace-objects", "-C", str(vault), "show", spec],
             check=True,
             capture_output=True,
             timeout=GIT_TIMEOUT_SECONDS,
+            env=_git_env(),
         ).stdout
     except subprocess.TimeoutExpired:
         return [f"cannot read {spec!a} from {str(vault)!a}: git timed out after {GIT_TIMEOUT_SECONDS} seconds"]

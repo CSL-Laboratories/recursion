@@ -234,7 +234,7 @@ class WrapperPinTests(_Base):
 
     def test_hash_open_uses_nofollow_nonblock_and_cloexec(self) -> None:
         # Platforms without O_NOFOLLOW (simulated Windows) must not crash: the bit is optional.
-        # Where the flag exists, the open has to carry it, plus O_NONBLOCK and O_CLOEXEC.
+        # Where the flag exists, the open has to carry it, plus O_NONBLOCK, O_CLOEXEC and O_NOCTTY.
         binary = self.install / "agy"
         binary.write_bytes(b"ab")
         flags_seen: list[int] = []
@@ -449,7 +449,7 @@ class _Swap:
 
 def _read_flags() -> int:
     flags = os.O_RDONLY
-    for name in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC"):
+    for name in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC", "O_NOCTTY"):
         flags |= getattr(os, name, 0)
     return flags
 

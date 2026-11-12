@@ -251,8 +251,8 @@ def _hash_regular(path: str, detail: str) -> str:
     """Hash a regular file. ``_manifest`` resolves a symlink before it calls this.
 
     lstat is only a preview. The open uses ``O_NOFOLLOW`` (when the platform has it),
-    ``O_NONBLOCK`` and ``O_CLOEXEC``. fstat must still be that same regular file, and
-    the size cap is applied to the fstat, before any byte is read.
+    ``O_NONBLOCK``, ``O_CLOEXEC`` and ``O_NOCTTY``. fstat must still be that same
+    regular file, and the size cap is applied to the fstat, before any byte is read.
     """
 
     missing = "wrapper_launcher_missing" if detail == "launcher" else "wrapper_file_missing"
@@ -273,9 +273,17 @@ def _hash_regular(path: str, detail: str) -> str:
     if info.st_size > _MAX_FILE_BYTES:
         raise WrapperPinRefused("wrapper_file_too_large", detail) from None
     # Same shape as the Hermes config open: nofollow when the flag exists, nonblocking,
-    # then fstat the fd before reading. O_NOFOLLOW is absent on Windows; the dev/ino
-    # check below still refuses a path swapped for a different file.
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    # cloexec, and noctty, then fstat the fd before reading. O_NOCTTY matters when
+    # O_NOFOLLOW is unavailable: a symlink swapped for a pty in a session with no
+    # controlling terminal would otherwise become the ctty. O_NOFOLLOW is absent on
+    # Windows; the dev/ino check below still refuses a path swapped for a different file.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOCTTY", 0)
+    )
     fd = -1
     digest = hashlib.sha256()
     refused: tuple[str, str] | None = None

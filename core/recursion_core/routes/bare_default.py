@@ -40,9 +40,11 @@ _FLAG_GAP = re.compile(r" {2,}|\t")
 # A component longer than this is not a build number. int() raises past 4300 digits,
 # and a shorter oversized token would be copied into the refusal.
 _BUILD_PART_MAX = 9
-# Present is the whole sentence, not a substring. Cores are the only present-tense
-# statements. A trailer is allowed only when the remainder of the sentence is that
-# exact string. Anything else that mentions default or bare is unknown.
+# Present is the whole sentence, proved from every --bare chunk, any --no-bare
+# block, and --print together. Cores are the only present-tense statements. A
+# trailer is allowed only when the remainder of the sentence is that exact string.
+# On --print a core counts only when the sentence names bare. Any other sentence
+# is unknown, except the neutral allowlist and the explicit absent forms below.
 _PRESENT_CORES = (
     "default: true",
     "defaults to --bare",
@@ -70,6 +72,16 @@ _PRESENT_TRAILERS = (
 )
 _PRESENT_SENTENCES = frozenset(
     core + trailer for core in _PRESENT_CORES for trailer in _PRESENT_TRAILERS)
+# Sentences that make no default claim and may sit beside a present sentence.
+# "minimal mode" is the recorded short label. "print response and exit" and the
+# measured print opener are the recorded neutral fragments. The rest of the
+# measured 2.1.311-2.1.321 --bare description is not listed, so that help stays
+# unknown.
+_NEUTRAL_SENTENCES = frozenset({
+    "minimal mode",
+    "print response and exit",
+    "print response and exit (useful for pipes)",
+})
 # Explicit future-default wording ("it'll be the default", "will soon be the default").
 # "not" or "never" between the auxiliary and be/become is not this form.
 _FUTURE_DEFAULT = re.compile(
@@ -83,15 +95,14 @@ _PRESENTISH = re.compile(
     r"|\bdefaults\s+to\s+--bare\b"
     r"|\bdefault:\s*true\b")
 _DEFAULT_OFF = re.compile(r"\bdefault\s*[:=]\s*(?:false|off|disabled)\b")
-_MENTIONS = re.compile(r"\bdefaults?\b|\bbare\b|--bare\b")
-# A sibling sentence with one of these keeps an exact present sentence from winning.
-_MARKERS = re.compile(
-    r"\b(?:will|won't|shall|shan't|going|slated|about|may|might|would|could|should|"
-    r"was|were|previously|if|then|later|subsequent|forthcoming|sooner|soon|"
-    r"planned|future|upcoming|must)\b"
-    r"|\bno\s+longer\b"
-    r"|'ll\b")
-# An option that turns bare mode off would only exist if bare can be on without the flag.
+_NAMES_BARE = re.compile(r"\bbare\b|--bare\b")
+# Printable ASCII after the whitespace collapse. A character outside this set
+# that survives NFKC and quote folding fails closed.
+_PRINTABLE_ASCII = frozenset(chr(code) for code in range(0x20, 0x7F))
+_ASCII_SPACE = frozenset(" \t\n\r\f\v")
+# Owner decision (pr336 deep6): a --no-bare header is not present by itself.
+# Text under --bare and --no-bare is classified with the same whole-text rule.
+# The flag is still reported as bare_opt_out.
 _OPT_OUT = ("--no-bare",)
 
 
@@ -178,57 +189,80 @@ def _sentences(text: str) -> list[str]:
     return [key for part in re.split(r"[.;!?]+", text) if (key := _sentence_key(part))]
 
 
-def _classify_sentence(sentence: str, *, option: str) -> str | None:
-    """``present`` only for an exact allowlisted sentence. ``None`` makes no claim."""
+def _printable_ascii_block(raw: str) -> bool:
+    """True when NFKC and quote folding leave only printable ASCII in one help block.
 
+    ASCII whitespace stays, because wrapped help lines are collapsed later. Any other
+    character that survives that fold, including ZWSP, ZWNJ, a soft hyphen, a
+    confusable letter, or a combining mark, means the block cannot prove a default.
+    """
+
+    text = unicodedata.normalize("NFKC", raw)
+    text = "".join(_fold_char(ch) for ch in text)
+    return all(ch in _PRINTABLE_ASCII or ch in _ASCII_SPACE for ch in text)
+
+
+def _unique_chunks(chunks: dict[str, list[str]], names: tuple[str, ...]) -> list[str]:
+    """Raw blocks for ``names``, in order, without repeating a shared alias block."""
+
+    seen: list[str] = []
+    for name in names:
+        for raw in chunks.get(name, ()):
+            if raw not in seen:
+                seen.append(raw)
+    return seen
+
+
+def _joined_description(raws: list[str]) -> str:
+    return " ".join(part for raw in raws if (part := _chunk_description(raw)))
+
+
+def _sentence_kind(sentence: str, *, scope: str) -> str:
+    """``present``, ``absent``, ``neutral``, or ``unknown`` for one sentence.
+
+    ``scope`` is ``bare`` (the ``--bare`` and ``--no-bare`` text together) or
+    ``print``. A present allowlist sentence on ``--print`` counts only when it
+    names bare. ``it'll be the default`` stays an absent signal.
+    """
+
+    if sentence in _NEUTRAL_SENTENCES:
+        return "neutral"
     if sentence in _PRESENT_SENTENCES:
-        return "present"
-    future = _FUTURE_DEFAULT.search(sentence) is not None
-    presentish = _PRESENTISH.search(sentence) is not None
-    off = option == "--bare" and _DEFAULT_OFF.search(sentence) is not None
-    if future and (presentish or off):
-        return "unknown"
-    if future:
-        return "absent"
-    if off and presentish:
-        return "unknown"
-    if off:
-        return "absent"
-    if _MENTIONS.search(sentence) or presentish:
-        return "unknown"
-    return None
-
-
-def _classify_description(text: str, *, option: str) -> str | None:
-    """How one option description speaks about the bare default. ``None`` is silent."""
-
-    if not text:
-        return None
-    sentences = _sentences(text)
-    kinds = [_classify_sentence(sentence, option=option) for sentence in sentences]
-    if "present" in kinds:
-        for sentence, kind in zip(sentences, kinds):
-            if kind != "present" and _MARKERS.search(sentence):
-                return "unknown"
-        if "unknown" in kinds:
+        if scope == "print" and _NAMES_BARE.search(sentence) is None:
             return "unknown"
         return "present"
-    if "unknown" in kinds:
+    future = _FUTURE_DEFAULT.search(sentence) is not None
+    off = scope == "bare" and _DEFAULT_OFF.search(sentence) is not None
+    presentish = _PRESENTISH.search(sentence) is not None
+    if (future and (presentish or off)) or (off and presentish):
         return "unknown"
-    if "absent" in kinds:
+    if future or off:
         return "absent"
-    return None
+    return "unknown"
 
 
 def classify_help(text: object) -> str:
     """Return ``"absent"``, ``"present"`` or ``"unknown"`` for one build's ``claude --help`` text.
 
     Help is normalized first (NFKC, apostrophes and quotes folded to ASCII, wrapped
-    lines collapsed, lower case). ``present`` is only an exact present-tense sentence
-    from the allowlist, plus an exact trailing clause when one is listed. Any other
-    sentence that mentions default or bare is ``unknown``. ``absent`` is the explicit
-    future-default wording (``it'll be the default`` and ``will be the default``,
-    including after a folded apostrophe) or ``default: false`` on ``--bare``.
+    lines collapsed, lower case). After that fold, a character outside printable
+    ASCII in a ``--bare``, ``--no-bare``, or ``--print`` block is ``unknown``.
+
+    ``present`` is proved from the whole of that text. Every ``--bare`` chunk and
+    any ``--no-bare`` block are one description. Every sentence there, and every
+    sentence of ``--print``, must be an allowlisted present sentence or a neutral
+    fragment (``minimal mode``, ``print response and exit``), and at least one
+    sentence must be present. ``--print`` contributes ``present`` only when the
+    sentence names bare (``defaults to --bare``). Any other sentence is ``unknown``.
+    An absent signal beside a present signal, in either option, is ``unknown``.
+
+    ``absent`` is the explicit future-default wording (``it'll be the default`` and
+    ``will be the default``, including after a folded apostrophe) or ``default:
+    false`` on ``--bare``, when nothing else contradicts it.
+
+    Owner decision (pr336 deep6): a ``--no-bare`` header is not ``present`` by
+    itself. The description under that header is read with the same rule. The
+    flag is still reported as ``bare_opt_out``.
     """
 
     if not isinstance(text, str) or not text.strip():
@@ -236,19 +270,24 @@ def classify_help(text: object) -> str:
     chunks = _option_raw_chunks(text)
     if "--bare" not in chunks or "--print" not in chunks:
         return "unknown"
-    if any(opt in chunks for opt in _OPT_OUT):
-        return "present"
+    relevant = _unique_chunks(chunks, ("--bare", "--no-bare", "--print"))
+    if any(not _printable_ascii_block(raw) for raw in relevant):
+        return "unknown"
+    bare_sentences = _sentences(_joined_description(_unique_chunks(chunks, ("--bare", "--no-bare"))))
+    print_sentences = _sentences(_joined_description(_unique_chunks(chunks, ("--print",))))
     saw_present = False
     saw_absent = False
-    for option in ("--bare", "--print"):
-        for raw in chunks[option]:
-            decision = _classify_description(_chunk_description(raw), option=option)
-            if decision == "unknown":
+    for scope, sentences in (("bare", bare_sentences), ("print", print_sentences)):
+        for sentence in sentences:
+            kind = _sentence_kind(sentence, scope=scope)
+            if kind == "unknown":
                 return "unknown"
-            if decision == "present":
+            if kind == "present":
                 saw_present = True
-            elif decision == "absent":
+            elif kind == "absent":
                 saw_absent = True
+    if saw_present and saw_absent:
+        return "unknown"
     if saw_present:
         return "present"
     return "absent" if saw_absent else "unknown"

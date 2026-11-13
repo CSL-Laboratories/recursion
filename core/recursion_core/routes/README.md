@@ -79,12 +79,19 @@ run's environment changes:
   route, or cancel). Not reported is the same question.
 - `--bare` as the `-p` default (B20, CSL-726; t1418u correction): the surface reports
   `route.bare_default` and `route.bare_opt_out` from `bare_default.probe_auth_mode()`
-  (one `claude --help`, small fixed env, 10 s timeout). Both the `--bare` and
-  `-p/--print` help blocks are checked: if either says `--bare` is the default now,
-  the state is `present`. Future-tense wording ("will become the default for -p")
-  is `absent`; negated wording never proves the default. Neutral or incomplete help
-  is `unknown`, not proof that the default is off. The recorded 2.1.312 excerpt omits
-  print help and therefore reads `unknown`. To check a build:
+  (one `claude --help`, small fixed env, 10 s timeout). `present` is proved from
+  the whole `--bare` text (every chunk, including a `--no-bare` block) and from
+  `--print`. Every sentence must be an allowlisted present sentence or a recorded
+  neutral fragment (`minimal mode`, `print response and exit`, and the measured
+  `print response and exit (useful for pipes)`), and at least one
+  sentence must be present. `--print` counts as present only when the sentence
+  names bare (`defaults to --bare`). Any other sentence is `unknown`. An absent
+  signal beside a present signal is `unknown`. A character outside printable ASCII
+  after NFKC and quote folding, in a `--bare`, `--no-bare`, or `--print` block, is
+  `unknown`. `it'll be the default` stays `absent`. A `--no-bare` header is not
+  itself `present` (owner decision, pr336 deep6): the description decides, and the
+  flag is still `bare_opt_out`. Recorded help for 2.1.311 through 2.1.321 reads `unknown`.
+  The recorded 2.1.312 excerpt omits print help and therefore reads `unknown`. To check a build:
   `PYTHONPATH=core python3 -B -m recursion_core.routes.bare_default --claude PATH`
   runs only `PATH --version` and `PATH --help` and prints the state, the route's answer and both help blocks.
   The classifier still reports those fields, and the CLI prints them. They are not

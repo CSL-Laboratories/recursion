@@ -150,9 +150,13 @@ class ClassifyHelpTest(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertEqual(bd.classify_help(help_with_bare(desc)), "unknown")
 
-    def test_opt_out_option_means_bare_can_be_on_without_the_flag(self) -> None:
+    def test_opt_out_header_is_not_present_by_itself(self) -> None:
+        # Owner decision (pr336 deep6): a --no-bare header does not prove present.
+        # "Turn bare off" is not an allowlisted sentence, so the text is unknown.
+        # The flag is still the advertised opt-out. Was present.
         text = help_with_bare("Minimal mode.", extra="  --no-bare                             Turn bare off\n")
-        self.assertEqual(bd.classify_help(text), "present")
+        self.assertEqual(bd.classify_help(text), "unknown")
+        self.assertEqual(bd.auth_mode(text)["bare_opt_out"], "--no-bare")
 
     def test_measured_builds_read_unknown(self) -> None:
         # Classifier unknown is not an allow. Without claude_build/help_text these measured
@@ -408,6 +412,109 @@ class ClassifyHelpTest(unittest.TestCase):
             with self.subTest(sentence=sentence):
                 self.assertNotEqual(bd.classify_help(help_with_bare(sentence + ".")), "present")
 
+    def test_present_is_proved_from_the_whole_text(self) -> None:
+        # Each row is present at 27916814. Parent 2f965a52 is named on the rows
+        # that were already present there. The others are regressions at 27916814:
+        # "Next release.", "In the next version.", a later --bare chunk, and an
+        # allowlist core that does not name bare when it is applied to --print.
+        present = "This is the default for -p. "
+        # Also present at 2f965a52.
+        siblings = (
+            "It is not enabled.",
+            "Never enable it.",
+            "Unless you opt out.",
+            "When print mode is on.",
+            "It used to be optional.",
+            "? Not yet.",
+            "E.g. not in interactive mode.",
+        )
+        for sibling in siblings:
+            with self.subTest(sibling=sibling):
+                self.assertEqual(bd.classify_help(help_with_bare(present + sibling)), "unknown")
+        # Unknown at 2f965a52. Present at 27916814.
+        for sibling in ("Next release.", "In the next version."):
+            with self.subTest(sibling=sibling):
+                self.assertEqual(bd.classify_help(help_with_bare(present + sibling)), "unknown")
+        hides = (
+            ("zwsp", "\u200b"),
+            ("zwnj", "\u200c"),
+            ("soft hyphen", "\u00ad"),
+            ("combining acute", "\u0301"),
+        )
+        hidden = []
+        for label, char in hides:
+            if label == "combining acute":
+                hidden.append((label + " will", f"It wi{char}ll happen."))
+                hidden.append((label + " not", f"It is n{char}ot enabled."))
+                hidden.append((label + " default", f"This is the de{char}fault."))
+            else:
+                hidden.append((label + " will", f"It w{char}ill happen."))
+                hidden.append((label + " not", f"It is n{char}ot enabled."))
+                hidden.append((label + " default", f"This is the d{char}efault."))
+        hidden.append(("cyrillic i will", "It w\u0456ll happen."))
+        hidden.append(("cyrillic e default", "This is the d\u0435fault."))
+        for label, sibling in hidden:
+            with self.subTest(hidden=label):
+                # These siblings are also present at 2f965a52.
+                self.assertEqual(bd.classify_help(help_with_bare(present + sibling)), "unknown")
+        # A later --bare chunk. Unknown at 2f965a52. Present at 27916814.
+        later = (
+            "  --bare                                It'll be the default for -p.\n",
+            "  --bare                                --bare will become the default for -p.\n",
+            "  --bare                                In the next version.\n",
+        )
+        for chunk in later:
+            with self.subTest(chunk=chunk.strip()):
+                text = (HEAD
+                        + "  --bare                                This is the default for -p.\n"
+                        + chunk
+                        + "  -p, --print                           Print response and exit\n")
+                self.assertEqual(bd.classify_help(text), "unknown")
+        # Allowlist cores that do not name bare, applied to --print.
+        # Unknown at 2f965a52. Present at 27916814.
+        print_cores = (
+            "default: true",
+            "This is the default.",
+            "This is the default for -p.",
+            "This is now the default.",
+            "This is now the default for -p.",
+            "This is the default for -p, not a future release.",
+        )
+        for core in print_cores:
+            with self.subTest(print_core=core):
+                text = help_with_bare("Minimal mode.").replace("Print response and exit", core)
+                self.assertEqual(bd.classify_help(text), "unknown")
+        # default: false on --bare plus a print sentence that names bare.
+        # Present at 27916814 and at 2f965a52.
+        with self.subTest(case="default false plus print present"):
+            contradicted = help_with_bare("Minimal mode. default: false").replace(
+                "Print response and exit", "Defaults to --bare.")
+            self.assertEqual(bd.classify_help(contradicted), "unknown")
+        # --no-bare header before the description is read. Present at both revisions.
+        # Empty header plus a neutral --bare line is unknown. default: false is absent.
+        # An allowlisted sentence is present from the text, not from the header.
+        with self.subTest(case="no-bare header turn bare off"):
+            text = help_with_bare(
+                "Minimal mode.", extra="  --no-bare                             Turn bare off\n")
+            self.assertEqual(bd.classify_help(text), "unknown")
+        with self.subTest(case="no-bare header empty"):
+            text = help_with_bare("Minimal mode.", extra="  --no-bare\n")
+            self.assertEqual(bd.classify_help(text), "unknown")
+        with self.subTest(case="no-bare header default false"):
+            text = help_with_bare("default: false", extra="  --no-bare\n")
+            self.assertEqual(bd.classify_help(text), "absent")
+            self.assertEqual(bd.auth_mode(text)["bare_opt_out"], "--no-bare")
+        with self.subTest(case="no-bare header with present text"):
+            text = help_with_bare(
+                "Minimal mode. This is the default for -p.", extra="  --no-bare\n")
+            self.assertEqual(bd.classify_help(text), "present")
+        # A confusable character outside --bare, --no-bare, and --print does not decide.
+        with self.subTest(case="confusable outside relevant blocks"):
+            text = help_with_bare(
+                "This is the default for -p.",
+                extra="  --add-dir <directories...>            Extra w\u0456ll\n")
+            self.assertEqual(bd.classify_help(text), "present")
+
 
 class ReadHelpTest(unittest.TestCase):
     def _run(self, returncode=0, stdout=b"", exc=None):
@@ -482,7 +589,9 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
     def test_documented_opt_out_does_not_launch_without_the_measured_hash(self):
         text = help_with_bare("Minimal mode.", extra="  --no-bare       Disable bare mode\n")
         metadata = bd.auth_mode(text)
-        self.assertEqual(metadata, {"bare_default": "present", "bare_opt_out": "--no-bare"})
+        # The header is not present. "Disable bare mode" is not an allowlisted sentence.
+        # Was present. The route still refuses this synthetic help.
+        self.assertEqual(metadata, {"bare_default": "unknown", "bare_opt_out": "--no-bare"})
         h = Harness([claude_ok()])
         res = h.handle(request(measured=False, **metadata))
         self.assertEqual(res["code"], c.LAUNCH_REFUSED)
@@ -594,7 +703,9 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
         for line in cases:
             with self.subTest(line=line):
                 text = HEAD + line + "  -p, --print                           Print response and exit\n"
-                self.assertEqual(bd.classify_help(text), "present")
+                # The alias is read. default: false is absent; the --no-bare header
+                # does not turn it into present. Was present.
+                self.assertEqual(bd.classify_help(text), "absent")
                 self.assertEqual(bd.auth_mode(text)["bare_opt_out"], "--no-bare")
         text = HEAD + "  -b|--bare                             This is the default for -p.\n" + (
             "  -p, --print                           Print response and exit\n")
@@ -605,7 +716,10 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
                 + "  --bare                                Minimal mode. default: false\n"
                 + "  --bare                                This is the default for -p.\n"
                 + "  -p, --print                           Print response and exit\n")
-        self.assertEqual(bd.classify_help(text), "present")
+        # Both chunks are read. default: false beside a present sentence is unknown.
+        # The first chunk alone would be absent, and the second alone would be present.
+        # Was present.
+        self.assertEqual(bd.classify_help(text), "unknown")
 
     def test_wrapped_argv_example_stays_in_the_block(self) -> None:
         # Description lines in the measured help are indented further than the header.

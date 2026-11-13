@@ -138,7 +138,9 @@ class _Rpc:
         while True:
             msg = self._next()
             if msg.get("id") == rid and "method" not in msg:
-                if isinstance(msg.get("error"), dict):
+                if "error" in msg:
+                    if not isinstance(msg["error"], dict):
+                        raise _Protocol("JSON-RPC error must be an object")
                     raise _RpcError(msg["error"])
                 return msg.get("result")
             self._notification(msg)

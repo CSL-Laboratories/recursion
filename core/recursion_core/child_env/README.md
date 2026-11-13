@@ -33,7 +33,9 @@ Spec: CSLR-D-012, PRODUCT.md `d84cdd26a4de2366f3c5d34c4aec5215f822a494` (SHA-256
   - absent in the parent means absent in the child;
   - an override naming it is refused (`override_denied`);
   - a Codex child never gets it;
-  - this package never sets, stores, checks or logs it, and `ChildRoute` has no field for it.
+  - The package checks only that the parent-provided value is a string without NUL, retains it in
+    the returned environment, and passes it unchanged. It does not obtain it from another source,
+    write it to disk, or log it. `ChildRoute` has no field for it.
 - A Claude Code child may update its own binary. This is intended (owner call):
   `DISABLE_AUTOUPDATER` is not on the Claude allowlist and the core does not set it, so the
   parent's value does not reach the child. An override naming `DISABLE_AUTOUPDATER` is still

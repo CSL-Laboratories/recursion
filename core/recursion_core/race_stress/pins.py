@@ -20,21 +20,27 @@ top-level importable name under ``core/`` is refused too: the drivers insert tha
 on ``sys.path``, so ``core/dataclasses.py`` would shadow the standard library.
 
 ``git ls-files`` does not list children of an untracked symlink or of a nested git directory,
-so those names are not trusted. ``os.walk(followlinks=False)`` and ``lstat`` refuse any
-symlink under ``core/`` unless that path is a symlink in ``HEAD`` and the link text matches,
-any nested ``.git`` file or directory under ``core/``, and any untracked directory directly
-in ``core/`` or in a measured package directory. Each tracked file's parent chain must be
+so those names are not trusted. ``os.walk(followlinks=False)`` and ``lstat`` refuse every
+symlink under ``core/``. A committed symlink whose link text matches ``HEAD`` is still
+refused: the target bytes are not that blob, and the pinned heads have no symlinks there.
+A dangling Emacs lock named ``.#*`` is the exception. Nested ``.git`` entries are refused.
+An untracked directory in ``core/`` or a measured package directory is refused when it
+contains a file, except a dot-directory other than ``.git`` and a ``*.egg-info`` directory,
+and those two only when they contain no ``.py``, ``.pyc``, ``.so``, or ``.pth``. An empty
+directory (no files at any depth) is allowed. Each tracked file's parent chain must be
 real directories, again by ``lstat`` rather than by following links.
+
+A file pin hashes more than its own blob. Importing the pinned module runs every ancestor
+package ``__init__.py``, and those files import sibling modules, so each of those tracked
+files is hashed against ``HEAD`` as well.
 
 ``git`` is ``/usr/bin/git`` when that binary exists, not whatever ``PATH`` names. The bytes of
 that binary are not pinned, and ``GIT_EXEC_PATH`` can still redirect its subcommands.
 Environment variables that point ``git`` at a different repository are ignored. A sourceless
 ``foo.pyc`` beside a file pin loses to ``foo.py`` in FileFinder, so it is not treated as a
 shadow while the pinned source is present. An extra ``helper.py`` next to a file pin is a
-different module name; a directory pin still refuses it. An empty untracked directory directly
-under ``core/`` or a measured package directory is refused: the name is importable even when
-``git`` does not list the directory. Elsewhere, an empty directory is invisible to ``git`` and,
-as a namespace, does not beat a tracked module or a later stdlib module.
+different module name; a directory pin still refuses it. An empty directory does not beat a
+tracked module or a later regular module on ``sys.path``.
 
 Anything else skips with a message naming both heads, instead of measuring code nobody pinned.
 Set ``RACE_STRESS_UNPINNED=1`` to run against an unpinned tree anyway (the run then reports
@@ -46,6 +52,7 @@ Re-pin by updating ``head`` and ``objects`` after re-running the suite on the ne
 
 from __future__ import annotations
 
+import ast
 import importlib.machinery
 import os
 import shutil
@@ -331,28 +338,56 @@ def _head_index(root: Path) -> tuple[dict[str, tuple[str, str]], set[str]] | Non
     return files, dirs
 
 
-def _symlink_blob_matches(root: Path, path: Path, oid: str) -> bool:
-    try:
-        out = subprocess.run(
-            [GIT, "-C", str(root), "cat-file", "blob", oid],
-            check=False, capture_output=True, timeout=15, env=git_env())
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if out.returncode != 0:
+def _dangling_emacs_lock(name: str, path: Path) -> bool:
+    """True for a dangling ``.#*`` symlink (an Emacs lock, ``user@host.pid``)."""
+    if not name.startswith(".#"):
         return False
     try:
-        link = os.fsencode(os.readlink(path))
+        os.readlink(path)
     except OSError:
         return False
-    return link == out.stdout
+    return not os.path.exists(path)
+
+
+def _benign_container(name: str) -> bool:
+    """A dot-directory other than ``.git``, or a setuptools ``*.egg-info`` directory."""
+    if name in (".", "..", ".git"):
+        return False
+    return name.startswith(".") or name.endswith(".egg-info")
+
+
+def _dangerous_import_name(name: str) -> bool:
+    return _has_import_suffix(name) or name.endswith(".pth") or name.endswith(".so")
+
+
+def _has_any_file(path: Path) -> bool:
+    """True when ``path`` contains a non-directory entry at any depth. Symlinks are not followed."""
+    for _dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        if filenames:
+            return True
+    return False
+
+
+def _dangerous_files(root_rel: str, path: Path) -> list[str]:
+    found: list[str] = []
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        rel_dir = Path(os.path.normpath(dirpath)).relative_to(path).as_posix()
+        for name in filenames:
+            if not _dangerous_import_name(name):
+                continue
+            child = name if rel_dir == "." else f"{rel_dir}/{name}"
+            found.append(f"importable {root_rel}/{child}")
+    return found
 
 
 def _layout_problems(root: Path, pin_paths: list[str]) -> list[str]:
     """Symlinks, nested git entries, and importable directories under ``core/``.
 
     The walk does not follow symlinks and does not trust ``git ls-files`` output.
-    A symlink is kept only when ``HEAD`` records that path as a symlink and the
-    worktree link text is that blob.
+    Every symlink is refused, including one ``HEAD`` records, except a dangling
+    Emacs ``.#*`` lock. An empty directory is allowed. A dot-directory other than
+    ``.git``, and a ``*.egg-info`` directory, are allowed when they hold no
+    importable file.
     """
     root_abs = Path(os.path.normpath(os.path.abspath(root)))
     core = root_abs / "core"
@@ -390,9 +425,7 @@ def _layout_problems(root: Path, pin_paths: list[str]) -> list[str]:
                 prune.add(name)
                 continue
             if stat.S_ISLNK(ent.st_mode):
-                mode_oid = tracked.get(rel)
-                if (mode_oid is not None and mode_oid[0] == "120000"
-                        and _symlink_blob_matches(root_abs, full, mode_oid[1])):
+                if _dangling_emacs_lock(name, full):
                     prune.add(name)
                     continue
                 problems.append(f"symlink {rel}")
@@ -400,7 +433,12 @@ def _layout_problems(root: Path, pin_paths: list[str]) -> list[str]:
                 continue
             if (parent_relevant and stat.S_ISDIR(ent.st_mode)
                     and rel not in tracked_dirs and rel not in tracked):
-                problems.append(f"untracked importable {rel}")
+                if not _has_any_file(full):
+                    pass
+                elif _benign_container(name):
+                    problems.extend(_dangerous_files(rel, full))
+                else:
+                    problems.append(f"untracked importable {rel}")
             elif (rel_dir == "core" and _has_import_suffix(name) and rel not in tracked):
                 problems.append(f"untracked importable {rel}")
         dirnames[:] = [d for d in dirnames if d not in prune]
@@ -443,6 +481,161 @@ def _core_path_shadows(root: Path) -> list[str]:
     return found
 
 
+def _ancestor_inits(path: str) -> list[str]:
+    """Package ``__init__.py`` files above a pinned file, under ``core/`` and not ``core`` itself."""
+    parts = Path(path).parts
+    if len(parts) < 2 or parts[0] != "core" or not parts[-1].endswith(".py"):
+        return []
+    acc = ["core"]
+    inits: list[str] = []
+    for part in parts[1:-1]:
+        acc.append(part)
+        inits.append("/".join(acc + ["__init__.py"]))
+    return inits
+
+
+def _package_of(rel: str) -> str:
+    """Import package of a ``core/`` module path. ``__init__.py`` is its own package."""
+    parts = Path(rel).parts
+    if len(parts) < 2 or parts[0] != "core":
+        return ""
+    body = list(parts[1:])
+    if body[-1] == "__init__.py":
+        return ".".join(body[:-1])
+    if body[-1].endswith(".py"):
+        body[-1] = body[-1][:-3]
+        return ".".join(body[:-1])
+    return ""
+
+
+def _imported_modules(rel: str, text: str) -> list[str]:
+    """``recursion_core`` modules named by import statements in ``text``."""
+    package = _package_of(rel)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend(alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            parts = package.split(".") if package else []
+            drop = node.level - 1
+            if drop > len(parts):
+                continue
+            base = parts[:len(parts) - drop] if drop else list(parts)
+            if node.module:
+                parent = ".".join([*base, *node.module.split(".")])
+                found.append(parent)
+            else:
+                parent = ".".join(base)
+            # ``from pkg import name`` loads ``pkg.name`` when that submodule exists.
+            found.extend(f"{parent}.{alias.name}" for alias in node.names if parent)
+        elif node.module:
+            found.append(node.module)
+            found.extend(f"{node.module}.{alias.name}" for alias in node.names)
+    return [mod for mod in found if mod.startswith("recursion_core")]
+
+
+def _module_candidates(mod: str) -> tuple[str, str]:
+    base = "core/" + mod.replace(".", "/")
+    return f"{base}/__init__.py", f"{base}.py"
+
+
+def _exists_regular_or_link(path: Path) -> bool:
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)
+
+
+def _read_module_text(path: Path) -> str | None:
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _file_pin_dependency_problems(root: Path, path: str) -> list[str]:
+    """Ancestor package inits, and the tracked modules they or the pin import, must match HEAD.
+
+    Importing a pinned file runs those ``__init__.py`` files first. Their import lines name
+    the other modules that execute. Only ``recursion_core`` names are followed.
+    """
+    indexed = _head_index(root)
+    if indexed is None:
+        return ["could not list tracked files under core/"]
+    files, _dirs = indexed
+    problems: list[str] = []
+    queue = [path, *_ancestor_inits(path)]
+    seen: set[str] = set()
+    extra: list[tuple[str, str]] = []
+    while queue:
+        rel = queue.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        meta = files.get(rel)
+        if meta is None or meta[0] not in ("100644", "100755"):
+            if rel != path and _exists_regular_or_link(root / rel):
+                problems.append(f"untracked import {rel}")
+            continue
+        if rel != path:
+            extra.append((rel, meta[1]))
+        text = _read_module_text(root / rel)
+        if text is None:
+            continue
+        for mod in _imported_modules(rel, text):
+            init, py = _module_candidates(mod)
+            chosen = None
+            for cand in (init, py):
+                info = files.get(cand)
+                if info is not None and info[0] in ("100644", "100755"):
+                    chosen = cand
+                    break
+            if chosen is None:
+                for cand in (init, py):
+                    if cand not in seen and _exists_regular_or_link(root / cand):
+                        chosen = cand
+                        break
+            if chosen is not None and chosen not in seen:
+                queue.append(chosen)
+    names: list[str] = []
+    oids: list[str] = []
+    for rel, oid in extra:
+        chain = _parent_chain_problem(root, rel)
+        if chain:
+            problems.append(chain)
+            continue
+        file = root / rel
+        if not file.is_file() or file.is_symlink():
+            problems.append(f"{rel} missing or is a symlink")
+            continue
+        names.append(rel)
+        oids.append(oid)
+    if not names:
+        return problems
+    out = _git(root, "hash-object", "--no-filters", "--", *names)
+    if out is None or out.returncode != 0 or len(out.stdout.splitlines()) != len(names):
+        problems.append("could not hash imported worktree bytes")
+        return problems
+    for rel, oid, got in zip(names, oids, out.stdout.splitlines()):
+        if got != oid:
+            problems.append(f"{rel} worktree bytes differ")
+    return problems
+
+
 def _path_problems(root: Path, path: str, oid: str) -> list[str]:
     """Reasons ``path`` is not the pinned object. Empty when the worktree bytes and imports match."""
     if _git_text(root, "rev-parse", f"HEAD:{path}") != oid:
@@ -469,6 +662,7 @@ def _path_problems(root: Path, path: str, oid: str) -> list[str]:
                 problems.append("worktree bytes differ")
     if len(blobs) == 1 and blobs[0][0] == path:
         problems.extend(_file_pin_shadows(root, path))
+        problems.extend(_file_pin_dependency_problems(root, path))
     else:
         problems.extend(_directory_pin_shadows(root, path, blobs))
     return problems

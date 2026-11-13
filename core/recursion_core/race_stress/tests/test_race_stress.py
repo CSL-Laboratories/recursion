@@ -45,12 +45,14 @@ _PYTHON_IMPORT_ENV = (
     "PYTHONPLATLIBDIR",
 )
 
-# -I does not put the script directory on sys.path. Insert the driver directory, then
+# -I does not put the script directory on sys.path. Append the driver directory
+# after the standard library so drivers/json.py cannot shadow stdlib json, then
 # run the script so prepare_tree_import can put the measured core/ first.
 _DRIVER_BOOTSTRAP = (
     "import sys, runpy\n"
     "drivers, script = sys.argv[1], sys.argv[2]\n"
-    "sys.path.insert(0, drivers)\n"
+    "sys.path[:] = [entry for entry in sys.path if entry != drivers]\n"
+    "sys.path.append(drivers)\n"
     "sys.argv = [script, *sys.argv[3:]]\n"
     "runpy.run_path(script, run_name='__main__')\n"
 )

@@ -558,7 +558,8 @@ class PinTests(unittest.TestCase):
             self.assertIn("symlink", message)
             self.assertIn("not a real directory", message)
 
-    def test_tracked_symlink_matching_head_is_allowed_until_retargeted(self) -> None:
+    def test_tracked_symlink_matching_head_is_refused(self) -> None:
+        # The link text matching HEAD is not enough: the target bytes are not that blob.
         rel = "core/recursion_core/daemon"
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -575,12 +576,128 @@ class PinTests(unittest.TestCase):
                 ["git", "rev-parse", "HEAD"], cwd=repo, env=_git_env(), text=True).strip()
             self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
             ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
-            self.assertTrue(ok, message)
+            self.assertFalse(ok, message)
+            self.assertIn("symlink", message)
+            self.assertIn("note-link", message)
             link.unlink()
             link.symlink_to("missing-target")
             ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
             self.assertFalse(ok, message)
             self.assertIn("note-link", message)
+
+    def test_committed_symlink_target_rewrite_is_refused(self) -> None:
+        # HEAD records the link text. Rewriting the target must not stay pinned.
+        rel = "core/recursion_core/routes/breaker.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            head = _repo(repo, {rel: "v1\n"})
+            outside = Path(tmp) / "evil_dataclasses.py"
+            outside.write_text("SHADOW = False\n")
+            link = repo / "core" / "dataclasses.py"
+            link.symlink_to(outside)
+            subprocess.check_call(["git", "add", "--", "core/dataclasses.py"], cwd=repo, env=_git_env())
+            subprocess.check_call(["git", "commit", "-q", "-m", "link"], cwd=repo, env=_git_env())
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, env=_git_env(), text=True).strip()
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            listed = subprocess.check_output(
+                ["git", "ls-tree", "HEAD", "core/dataclasses.py"], cwd=repo, env=_git_env(), text=True)
+            self.assertIn("120000", listed)
+            outside.write_text(
+                "import sys\n"
+                "real = sys.base_prefix + '/lib/python{}.{}'.format(*sys.version_info[:2])"
+                " + '/dataclasses.py'\n"
+                "__file__ = real\n"
+                "if __spec__ is not None:\n"
+                "    __spec__.origin = real\n"
+                "SHADOW = True\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("symlink", message)
+            self.assertIn("core/dataclasses.py", message)
+
+    def test_file_pin_hashes_ancestor_inits_and_imported_modules(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        files = {
+            "core/recursion_core/__init__.py": '"""pkg"""\n',
+            "core/recursion_core/routes/__init__.py":
+                "from recursion_core.routes.breaker import VALUE\n"
+                "from recursion_core.routes.service import SERVICE\n",
+            rel: "from recursion_core.routes import contract as c\nVALUE = 1\n",
+            "core/recursion_core/routes/contract.py": "CODES = ()\n",
+            "core/recursion_core/routes/service.py": "SERVICE = 1\n",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            for dirty in (
+                    "core/recursion_core/routes/__init__.py",
+                    "core/recursion_core/__init__.py",
+                    "core/recursion_core/routes/service.py",
+                    "core/recursion_core/routes/contract.py"):
+                with self.subTest(dirty=dirty):
+                    dest = repo / dirty
+                    original = dest.read_text()
+                    dest.write_text(original + "MUT = 1\n")
+                    ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+                    self.assertFalse(ok, message)
+                    self.assertIn(dirty, message)
+                    dest.write_text(original)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+
+    def test_benign_untracked_entries_under_core_are_allowed(self) -> None:
+        # Empty dirs, dot-dirs other than .git, egg-info, dangling Emacs locks,
+        # and editor junk cannot become the imported module.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, rel = self._pinned_file(tmp)
+            (repo / "core/json").mkdir()
+            (repo / "core/dataclasses").mkdir()
+            (repo / "core/json/nested/empty").mkdir(parents=True)
+            (repo / "core/recursion_core/routes/breaker").mkdir()
+            (repo / "core/__pycache__").mkdir()
+            egg = repo / "core/recursion_core.egg-info"
+            egg.mkdir()
+            (egg / "PKG-INFO").write_text("Name: recursion\n")
+            (egg / "SOURCES.txt").write_text("breaker.py\n")
+            cache = repo / "core/.pytest_cache/v/cache"
+            cache.mkdir(parents=True)
+            (cache / "nodeids").write_text("\n")
+            (repo / "core/.pytest_cache/README.md").write_text("cache\n")
+            (repo / "core/.pytest_cache/.gitignore").write_text("*\n")
+            vscode = repo / "core/.vscode"
+            vscode.mkdir()
+            (vscode / "settings.json").write_text("{}\n")
+            routes = repo / "core/recursion_core/routes"
+            (routes / ".#breaker.py").symlink_to("user@host.99999")
+            (repo / "core/.#json").symlink_to("user@host.1")
+            (routes / ".breaker.py.swp").write_text("swap\n")
+            (routes / "breaker.py~").write_text("backup\n")
+            (routes / "scratch.txt").write_text("not a module\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (egg / "evil.py").write_text("VALUE = 'egg'\n")
+            (repo / "core/.pytest_cache/evil.pth").write_text("x\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("evil.py", message)
+            self.assertIn("evil.pth", message)
+            (egg / "evil.py").unlink()
+            (repo / "core/.pytest_cache/evil.pth").unlink()
+            (repo / "core/notemacs").symlink_to("missing-target")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("symlink", message)
+            self.assertIn("notemacs", message)
+            (repo / "core/notemacs").unlink()
+            (routes / "__pycache__").mkdir()
+            (routes / "__pycache__/breaker.pyc").write_bytes(b"pyc")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("__pycache__", message)
 
     def test_path_git_cannot_make_a_dirty_tree_look_pinned(self) -> None:
         rel = "core/recursion_core/routes/breaker.py"
@@ -1215,6 +1332,91 @@ class DriverExitTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("shadows the import", proc.stderr)
         self.assertNotIn("violation_count", proc.stdout)
+
+    def test_verify_loaded_rejects_origin_rewritten_to_stdlib(self) -> None:
+        # A file symlink has no __path__. Rewriting __file__ and spec.origin to the
+        # stdlib file hides it from the path check; the loader still names core/.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tree"
+            outside = Path(tmp) / "evil_dataclasses.py"
+            outside.write_text(
+                "import sys\n"
+                "real = sys.base_prefix + '/lib/python{}.{}'.format(*sys.version_info[:2])"
+                " + '/dataclasses.py'\n"
+                "__file__ = real\n"
+                "if __spec__ is not None:\n"
+                "    __spec__.origin = real\n"
+                "SHADOW = True\n")
+            core = root / "core"
+            core.mkdir(parents=True)
+            (core / "dataclasses.py").symlink_to(outside)
+            script = (
+                "import sys\n"
+                "sys.path.append(sys.argv[1])\n"
+                "import _harness as h\n"
+                "h.prepare_tree_import(sys.argv[2])\n"
+                "import dataclasses\n"
+                "print('FILE', dataclasses.__file__)\n"
+                "print('ORIGIN', dataclasses.__spec__.origin)\n"
+                "print('SHADOW', getattr(dataclasses, 'SHADOW', None))\n"
+                "loader = dataclasses.__spec__.loader\n"
+                "print('LOADER', loader.get_filename())\n"
+                "h.verify_loaded(sys.argv[2], [])\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", script, str(DRIVERS), str(root)],
+                capture_output=True, text=True, timeout=60)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("SHADOW True", proc.stdout, combined)
+        self.assertIn("/dataclasses.py", proc.stdout, combined)
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("dataclasses", proc.stderr)
+        self.assertNotIn("violation_count", proc.stdout)
+
+    def test_isolated_bootstrap_does_not_import_drivers_json(self) -> None:
+        from recursion_core.race_stress.tests.test_race_stress import _DRIVER_BOOTSTRAP
+        import sysconfig
+        with tempfile.TemporaryDirectory() as tmp:
+            drivers = Path(tmp) / "drivers"
+            shutil.copytree(DRIVERS, drivers, ignore=shutil.ignore_patterns("__pycache__"))
+            (drivers / "json.py").write_text(
+                "PLANTED = True\n"
+                "def dumps(*args, **kwargs):\n"
+                "    raise RuntimeError('planted-json')\n")
+            script = Path(tmp) / "probe.py"
+            script.write_text("import json\nimport _harness\nprint(json.__file__)\n")
+            proc = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", _DRIVER_BOOTSTRAP, str(drivers), str(script)],
+                capture_output=True, text=True, timeout=60)
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertIn(sysconfig.get_path("stdlib"), proc.stdout)
+        self.assertNotIn(str(drivers), proc.stdout)
+        self.assertNotIn("planted-json", combined)
+
+    def test_verify_loaded_rejects_stdlib_loaded_outside_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tree"
+            root.mkdir()
+            planted = str(DRIVERS / "json.py")
+            script = (
+                "import importlib.machinery, importlib.util, sys, types\n"
+                "sys.path.append(sys.argv[1])\n"
+                "import _harness as h\n"
+                "planted = sys.argv[2]\n"
+                "mod = types.ModuleType('json')\n"
+                "mod.__file__ = planted\n"
+                "loader = importlib.machinery.SourceFileLoader('json', planted)\n"
+                "mod.__spec__ = importlib.util.spec_from_loader('json', loader)\n"
+                "sys.modules['json'] = mod\n"
+                "h.verify_loaded(sys.argv[3], [])\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", script, str(DRIVERS), planted, str(root)],
+                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("json", proc.stderr)
+        self.assertIn("drivers", proc.stderr)
 
     def test_driver_rejects_a_symlinked_stdlib_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

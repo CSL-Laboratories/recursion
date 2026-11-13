@@ -18,12 +18,16 @@ was restored is not. Untracked and ignored files are refused when Python could i
 place of that source: a bytecode cache (a timestamp or unchecked-hash `.pyc` runs even under
 `-B`), an extension module, a package directory sitting on a module, any other importable file
 under a directory pin, and an untracked top-level name on the `core/` path the driver inserts.
-A symlink anywhere under `core/` is refused unless that path is a symlink in the checkout's
-`HEAD` and the link text matches. A nested `.git` file or directory under `core/` is refused.
-An untracked directory in `core/` or in a measured package directory is refused too, including
-one `git ls-files` prints as a single name. Each tracked file's parents must be real
-directories (`lstat`, not a followed link). A file such as `scratch.txt` that cannot be a
-module and does not create a directory is left alone. `git` is `/usr/bin/git` when that binary
+A symlink anywhere under `core/` is refused, including one whose link text matches `HEAD`
+(the pinned heads have none). A dangling Emacs lock named `.#*` is left alone. A nested
+`.git` file or directory under `core/` is refused. An untracked directory in `core/` or in
+a measured package directory is refused when it contains a file, except an empty directory,
+a dot-directory other than `.git`, and a `*.egg-info` directory that holds no `.py`, `.pyc`,
+`.so`, or `.pth`. Each tracked file's parents must be real directories (`lstat`, not a
+followed link). A file pin also hashes every ancestor package `__init__.py` and the tracked
+modules those files import. A file such as `scratch.txt` that cannot be a module and does
+not create a directory is left alone. The driver directory is appended after the standard
+library, and a stdlib module loaded from `drivers/` is refused. `git` is `/usr/bin/git` when that binary
 exists, not whatever `PATH` names, and `git`
 variables that select another repository (`GIT_DIR` and the rest) are ignored. Any other tree
 skips with a message naming both heads; `RACE_STRESS_UNPINNED=1` measures it anyway. Earlier

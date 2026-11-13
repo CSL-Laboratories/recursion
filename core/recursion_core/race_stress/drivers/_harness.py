@@ -6,6 +6,31 @@ Each driver runs as its own script so it can put a measured tree's ``core/`` fir
 
 from __future__ import annotations
 
+import sys
+
+
+def _prefer_stdlib_over_drivers() -> None:
+    """Keep this file's directory on ``sys.path`` after the standard library.
+
+    A script launch puts ``drivers/`` first. An ``-I`` bootstrap that inserts it
+    there makes ``import json`` load ``drivers/json.py``. ``sys`` is a built-in,
+    so this runs before any other import can see that entry.
+    """
+    file = __file__
+    drivers = ""
+    for sep in ("/", "\\"):
+        cut = file.rfind(sep)
+        if cut > 0:
+            drivers = file[:cut]
+            break
+    if not drivers:
+        return
+    sys.path[:] = [entry for entry in sys.path if entry != drivers]
+    sys.path.append(drivers)
+
+
+_prefer_stdlib_over_drivers()
+
 import argparse
 import hashlib
 import importlib
@@ -16,7 +41,6 @@ import random
 import shutil
 import stat
 import subprocess
-import sys
 import sysconfig
 import threading
 import time
@@ -189,6 +213,15 @@ def _fs_locations(module) -> list[str]:
     sub = getattr(spec, "submodule_search_locations", None) if spec is not None else None
     if sub:
         locs.extend(str(item) for item in sub)
+    loader = getattr(spec, "loader", None) if spec is not None else None
+    get = getattr(loader, "get_filename", None)
+    if callable(get):
+        try:
+            filename = get()
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            filename = None
+        if isinstance(filename, str):
+            locs.append(filename)
     out: list[str] = []
     for loc in locs:
         if not loc or loc in ("built-in", "frozen") or loc.startswith("<"):
@@ -294,6 +327,27 @@ def _refuse_loaded_shadow(name, module, tree_lex: str, core: Path, core_lex: str
         if (rel_core is not None and Path(rel_core).parts[:1] == ("recursion_core",)
                 and Path(cached).is_file()):
             raise SystemExit(f"{name} loaded with bytecode cache {cached}")
+    if top not in stdlib:
+        return
+    drivers = _lexical(str(Path(__file__).resolve().parent))
+    for loc in _fs_locations(module):
+        if any(_relative_to(_lexical(loc), root) is not None for root in _stdlib_roots()):
+            continue
+        if _relative_to(_lexical(loc), drivers) is not None:
+            raise SystemExit(f"{name} loaded from {loc}; stdlib module loaded from drivers/")
+        raise SystemExit(f"{name} loaded from {loc}, not the stdlib prefix")
+
+
+def _stdlib_roots() -> tuple[str, ...]:
+    """Directories from ``sysconfig`` that hold the standard library (under ``sys.base_prefix``)."""
+    roots: list[str] = []
+    for key in ("stdlib", "platstdlib"):
+        raw = sysconfig.get_path(key)
+        if isinstance(raw, str) and raw:
+            lex = _lexical(raw)
+            if lex not in roots:
+                roots.append(lex)
+    return tuple(roots)
 
 
 def verify_loaded(tree: str, expected: list[tuple[object, str]]) -> None:
@@ -301,10 +355,11 @@ def verify_loaded(tree: str, expected: list[tuple[object, str]]) -> None:
 
     ``expected`` is ``(module, path relative to tree)``. Origins are compared as written
     and by ``lstat`` from the tree root; symlinks are not resolved to decide whether a
-    file sits under ``core/``. A package directory or extension that took the place of
-    the pinned source, a bytecode cache beside a loaded file, a module whose path leaves
-    the tree through a symlink, or a standard-library name loaded from ``core/`` (or from
-    the directory a ``core/`` symlink names) is refused.
+    file sits under ``core/``. The loader's filename is checked even when ``__file__``
+    and ``spec.origin`` have been rewritten. A package directory or extension that took
+    the place of the pinned source, a bytecode cache beside a loaded file, a module whose
+    path leaves the tree through a symlink, or a standard-library name loaded from
+    ``core/`` or from ``drivers/`` (anywhere outside the stdlib prefix) is refused.
     """
     tree_lex = _lexical(tree)
     core = Path(tree_lex) / "core"

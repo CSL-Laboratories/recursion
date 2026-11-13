@@ -42,14 +42,21 @@ recorded module's class back through ``object.__setattr__`` before it
 writes any attribute. ``sys.modules``, ``sys.path``, ``sys.meta_path``,
 ``sys.path_hooks`` and ``sys.path_importer_cache`` are written through the
 module's real dict, not ``setattr``, so a class whose ``__setattr__``
-raises cannot abort the pass. Each of those steps runs on its own. One
-failure does not skip the rest. If any step fails, the load is refused
-with ``plugin_import_state_unrestored`` and further loads are refused the
-same way until the process restarts. The proof reads the real dict again
-and compares the heap class dict. It does not call ``getattr``, so a
-descriptor cannot plant a module or a class attribute while returning the
-expected value. An added or replaced descriptor on a heap module class is
-put back, or the load is refused with ``plugin_import_state_unrestored``.
+raises cannot abort the pass. ``sys.__class__`` is put back with
+``object.__setattr__`` before those writes. Each of those steps runs on
+its own. One failure does not skip the rest. Ending the import record,
+restoring, and proving each catch ``BaseException``, so a finder ``__eq__``
+or a ``sys`` class ``__getattribute__`` cannot skip the restore. Any
+exception or failed proof latches the process: the load is refused with
+``plugin_import_state_unrestored`` and further loads are refused the same
+way until restart. ``importlib.reload`` of this module does not clear that
+latch. The proof reads the real module dict and the real class dict
+(``type.__dict__['__dict__']``), not ``getattr`` and not ``cls.__dict__``,
+so a metaclass ``__getattribute__`` cannot hide a class attribute. It
+requires ``type(sys) is ModuleType``, the original ``sys.modules`` object,
+and the original ``meta_path`` and ``path_hooks`` lists. An added or
+replaced descriptor on a heap module class is put back, or the load is
+refused with ``plugin_import_state_unrestored`` and the process latches.
 
 A finalizer on a dropped module can insert another name or binding before
 the load returns. That includes a finalizer a cycle holds until garbage
@@ -61,9 +68,11 @@ frame still held can be collected. Names or bindings that are still
 different after the restore bound are refused with
 ``plugin_import_state_unrestored``. They are not reported as
 ``plugin_import_failed``: that code means the import tables were proved
-equal to the snapshot. A finalizer that keeps re-arming past the bound can
+equal to the snapshot. A failed proof latches the process, including a
+finalizer that keeps re-arming and a class ``__delattr__`` that does not
+remove the attribute. A finalizer that keeps re-arming past the bound can
 still leave a name or a binding. A chain of deferred finalizers longer than
-the collection bound can still plant one after the load returns.
+the collection bound can still plant one after the proof has passed.
 
 A second ``load`` on the same loader is refused, including a nested call on
 this thread and a call from another thread. The loader lock is not waited on.
@@ -195,14 +204,23 @@ class _ImportRecord:
 _import_isolation = threading.Lock()
 _import_depth = threading.local()
 _import_finding = threading.local()
-# A restore step that cannot finish sets this. Later loads are refused until
+# A restore that cannot be proved sets this. Later loads are refused until
 # the process restarts: this interpreter can no longer prove its import tables.
-_import_restore_latched = False
+# ``importlib.reload`` re-executes this module in the same globals. The name is
+# bound only when it is absent, and nothing here assigns it false again.
+if "_import_restore_latched" not in globals():
+    _import_restore_latched = False
 
 
 def _latch_import_restore() -> None:
     global _import_restore_latched
     _import_restore_latched = True
+
+
+def _refuse_unrestored() -> None:
+    """Latch, then refuse. A failed proof must not clear on the next load."""
+    _latch_import_restore()
+    raise Refused("plugin_import_state_unrestored")
 
 
 def _require_import_restorable() -> None:
@@ -296,14 +314,47 @@ def _begin_import_record(record: _ImportRecord) -> None:
     sys.meta_path.insert(0, record.finder)
 
 
+def _finder_present(finder: object) -> bool:
+    """True when ``finder`` is still on ``sys.meta_path``, compared by identity.
+
+    ``list.remove`` uses ``__eq__``. A finder can raise ``ValueError`` from
+    ``__eq__`` and still be on the list; that is not the absent-item case.
+    """
+    try:
+        meta = types.ModuleType.__dict__["__dict__"].__get__(sys).get("meta_path")
+    except BaseException:  # noqa: BLE001 - a lying sys class must fail closed
+        return True
+    if not isinstance(meta, list):
+        return True
+    for item in list(meta):
+        if item is finder:
+            return True
+    return False
+
+
 def _end_import_record(record: _ImportRecord) -> dict:
+    """Drop the recording finder, then stop the record.
+
+    ``ValueError`` from ``list.remove`` means the finder is already gone.
+    Any other exception, including a ``sys`` class that raises on
+    ``meta_path`` and a finder ``__eq__`` that plants a module and raises,
+    is re-raised after the record stops so the caller can still restore
+    and latch. The exception must not escape past that caller.
+    """
+    caught: BaseException | None = None
     finder = getattr(record, "finder", None)
     if finder is not None:
         try:
             sys.meta_path.remove(finder)
-        except ValueError:
-            pass
-    return record.stop()
+        except ValueError as exc:
+            if _finder_present(finder):
+                caught = exc
+        except BaseException as exc:  # noqa: BLE001 - caller latches and restores
+            caught = exc
+    found = record.stop()
+    if caught is not None:
+        raise caught
+    return found
 
 
 class _ModuleView:
@@ -488,16 +539,27 @@ def _is_heap_module_class(cls: object, cache: dict[int, bool]) -> bool:
     return heap
 
 
+def _class_namespace(cls: object):
+    """The class's real dict, past a metaclass ``__getattribute__``.
+
+    ``cls.__dict__`` is an ordinary attribute lookup. A metaclass can return
+    a mapping that hides a descriptor added after the snapshot. The
+    ``type`` descriptor reads the real dict.
+    """
+    return type.__dict__["__dict__"].__get__(cls)
+
+
 def _snapshot_class_attrs(cls: object, cache: dict[int, bool]) -> object:
     """Copy a heap class's descriptors, or ``None`` when the class is not one.
 
-    Iteration of ``cls.__dict__`` does not invoke those descriptors. ``_UNREADABLE``
+    The copy uses :func:`_class_namespace`, the same accessor the proof uses.
+    Iteration of that dict does not invoke the descriptors. ``_UNREADABLE``
     means the copy failed and the proof must fail closed.
     """
     if not _is_heap_module_class(cls, cache):
         return None
     try:
-        return dict(getattr(cls, "__dict__", {}))
+        return dict(_class_namespace(cls))
     except Exception:
         return _UNREADABLE
 
@@ -512,10 +574,26 @@ def _call_restore_step(snap: _ImportSnapshot, fn) -> None:
     """Run one restore step. A failure does not escape, so later steps still run."""
     try:
         failed = fn() is False
-    except Exception:
+    except BaseException:  # noqa: BLE001 - one step must not skip the rest
         failed = True
     if failed:
         _mark_restore_failure(snap)
+
+
+def _restore_sys_class() -> bool:
+    """Put ``sys`` back to ``ModuleType`` through ``object.__setattr__``.
+
+    A class installed on ``sys`` can raise from ``__getattribute__`` and
+    ``__setattr__``. The write does not go through that class. The proof
+    requires ``type(sys) is ModuleType``.
+    """
+    if type(sys) is types.ModuleType:
+        return True
+    try:
+        object.__setattr__(sys, "__class__", types.ModuleType)
+    except BaseException:  # noqa: BLE001 - the caller records the failed step
+        return False
+    return type(sys) is types.ModuleType
 
 
 def _write_module_attr(module: object, name: str, value: object) -> bool:
@@ -558,7 +636,7 @@ def _class_attrs_match(view: _ModuleView) -> bool:
     if saved is _UNREADABLE or not isinstance(saved, dict):
         return False
     try:
-        current = view.cls.__dict__
+        current = _class_namespace(view.cls)
     except Exception:
         return False
     if len(current) != len(saved):
@@ -579,7 +657,8 @@ def _restore_class_attrs(view: _ModuleView) -> bool:
     cls = view.cls
     ok = True
     try:
-        current_keys = list(cls.__dict__)
+        current = _class_namespace(cls)
+        current_keys = list(current)
     except Exception:
         return False
     for key in current_keys:
@@ -589,9 +668,16 @@ def _restore_class_attrs(view: _ModuleView) -> bool:
             delattr(cls, key)
         except Exception:
             ok = False
+            continue
+        try:
+            if key in _class_namespace(cls):
+                # ``__delattr__`` returned without removing the attribute.
+                ok = False
+        except Exception:
+            ok = False
     for key, value in saved.items():
         try:
-            live = cls.__dict__.get(key, _MISSING)
+            live = _class_namespace(cls).get(key, _MISSING)
         except Exception:
             ok = False
             continue
@@ -599,6 +685,12 @@ def _restore_class_attrs(view: _ModuleView) -> bool:
             continue
         try:
             setattr(cls, key, value)
+        except Exception:
+            ok = False
+            continue
+        try:
+            if _class_namespace(cls).get(key, _MISSING) is not value:
+                ok = False
         except Exception:
             ok = False
     return ok
@@ -853,12 +945,14 @@ def _apply_import_restore(snap: _ImportSnapshot) -> None:
     """
     modules = snap.modules_dict
     snap.restore_blocked = False
-    # Classes first. ``sys.modules = ...`` must not run while a plugin-swapped
-    # ``sys.__class__`` still raises on assignment.
+    # ``sys``'s class first. A swapped class can raise on ``meta_path`` and
+    # on assignment, so the reset goes through ``object.__setattr__`` before
+    # any table is written.
+    _call_restore_step(snap, _restore_sys_class)
     for view in snap.module_views:
         try:
             restored = _restore_module_class(view.module, view.cls)
-        except Exception:
+        except BaseException:  # noqa: BLE001 - one class must not skip the rest
             restored = False
         if restored is False:
             _mark_restore_failure(snap)
@@ -880,7 +974,7 @@ def _apply_import_restore(snap: _ImportSnapshot) -> None:
     for view in snap.module_views:
         try:
             restored = _restore_module_view(view)
-        except Exception:
+        except BaseException:  # noqa: BLE001 - one module must not skip the rest
             restored = False
         if restored is False:
             _mark_restore_failure(snap)
@@ -925,8 +1019,52 @@ def _apply_import_restore(snap: _ImportSnapshot) -> None:
                     live_inner[:] = list(items)
             except Exception:
                 continue
-    except Exception:
+    except BaseException:  # noqa: BLE001 - package paths must not skip the proof
         _mark_restore_failure(snap)
+
+
+def _lists_same(live: object, items: list) -> bool:
+    """True when ``live`` is a list of the same objects as ``items``, in order."""
+    if not isinstance(live, list) or len(live) != len(items):
+        return False
+    for left, right in zip(live, items):
+        if left is not right:
+            return False
+    return True
+
+
+def _prove_import_restored(snap: _ImportSnapshot) -> bool:
+    """True when raw accessors still show the snapshotted import tables.
+
+    ``type(sys)`` is ``ModuleType``. ``sys``'s real dict holds the original
+    modules object and the original ``meta_path`` and ``path_hooks`` lists,
+    with the same entries by identity. Heap class dicts match the snapshot
+    taken through the same class-dict descriptor. A mismatch is a failed proof.
+    """
+    try:
+        if type(sys) is not types.ModuleType:
+            return False
+        namespace = types.ModuleType.__dict__["__dict__"].__get__(sys)
+        modules = namespace.get("modules", _MISSING)
+        meta = namespace.get("meta_path", _MISSING)
+        hooks = namespace.get("path_hooks", _MISSING)
+        if modules is not snap.modules_dict:
+            return False
+        if meta is not snap.meta or not _lists_same(meta, snap.meta_items):
+            return False
+        if hooks is not snap.hooks or not _lists_same(hooks, snap.hooks_items):
+            return False
+        if namespace.get("path", _MISSING) is not snap.path:
+            return False
+        if namespace.get("path_importer_cache", _MISSING) is not snap.cache:
+            return False
+        if _import_modules_dirty(snap, modules):
+            return False
+        if _import_bindings_dirty(snap, modules):
+            return False
+    except BaseException:  # noqa: BLE001 - an unreadable table is a failed proof
+        return False
+    return True
 
 
 def _restore_import_state(snap: _ImportSnapshot) -> None:
@@ -939,18 +1077,22 @@ def _restore_import_state(snap: _ImportSnapshot) -> None:
     wrong after the restore bound refuse the load with
     ``plugin_import_state_unrestored``, even when ``sys.modules`` itself
     matches. A chain of deferred finalizers longer than the collection bound
-    can still plant a name after this returns.
+    can still plant a name after this returns. A failed proof latches the
+    process before the refusal is raised.
     """
-    modules = snap.modules_dict
 
     def settle(bound: int) -> bool:
         for _ in range(bound):
-            _apply_import_restore(snap)
+            try:
+                _apply_import_restore(snap)
+            except BaseException:  # noqa: BLE001 - a restore error must latch, not escape
+                _mark_restore_failure(snap)
+                return False
             # A failed step is not an ordinary import failure, and a later
             # pass must not clear that. Finalizer dirtiness still retries.
             if _import_restore_latched or snap.restore_blocked:
                 return False
-            if not _import_bindings_dirty(snap, modules) and not _import_modules_dirty(snap, modules):
+            if _prove_import_restored(snap):
                 return True
         return False
 
@@ -959,24 +1101,24 @@ def _restore_import_state(snap: _ImportSnapshot) -> None:
         if settle(_RESTORE_BOUND):
             return collected == 0
         if collected == 0:
-            raise Refused("plugin_import_state_unrestored")
+            _refuse_unrestored()
         return False
 
     if not settle(_RESTORE_BOUND):
         # A step that could not write the tables is not repaired by another
         # collection. Finalizer dirtiness still collects below.
         if _import_restore_latched:
-            raise Refused("plugin_import_state_unrestored")
+            _refuse_unrestored()
         # A cycle may be holding the finalizer that keeps a name or binding
         # in place. Collect before treating the bound as exhausted.
         if gc.collect() == 0 or not settle(_RESTORE_BOUND):
             if not settle(1):
-                raise Refused("plugin_import_state_unrestored")
+                _refuse_unrestored()
     for _ in range(_GC_COLLECT_BOUND):
         if proved_after_collect():
             return
     if not settle(_RESTORE_BOUND):
-        raise Refused("plugin_import_state_unrestored")
+        _refuse_unrestored()
 
 
 class PluginLoader:
@@ -1198,6 +1340,7 @@ class PluginLoader:
         if not _import_isolation.acquire(blocking=False):
             raise Refused("plugin_load_busy")
         _import_depth.depth = 1
+        unrestored = False
         try:
             snap = _ImportSnapshot()
             record = _ImportRecord()
@@ -1211,29 +1354,54 @@ class PluginLoader:
                 except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
                     failure = exc
                 finally:
-                    for name in sorted(set(sys.modules) - set(snap.modules)):
-                        origin = getattr(sys.modules.get(name), "__file__", None) or ""
-                        if origin.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
-                            findings.append(_finding("active", "extension_module_loaded", "warn", name))
-                    gil_on = self._gil_gate(manifest.plugin_id, findings)
-                    self.last_findings = tuple(findings)
+                    try:
+                        for name in sorted(set(sys.modules) - set(snap.modules)):
+                            origin = getattr(sys.modules.get(name), "__file__", None) or ""
+                            if origin.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
+                                findings.append(_finding("active", "extension_module_loaded", "warn", name))
+                        gil_on = self._gil_gate(manifest.plugin_id, findings)
+                        self.last_findings = tuple(findings)
+                    except BaseException:  # noqa: BLE001 - the scan must not skip restore
+                        unrestored = True
             finally:
-                _end_import_record(record)
-                if gil_on or failure is not None:
+                # Record end, restore, and proof each run. An exception in one
+                # must not skip the others. The latch is set only after the
+                # restore attempt, so a raise while dropping the finder cannot
+                # abort the tables being put back.
+                try:
+                    _end_import_record(record)
+                except BaseException:  # noqa: BLE001 - record end must not skip restore
+                    unrestored = True
+                if gil_on or failure is not None or unrestored:
                     # The traceback and this frame hold the plugin module. Drop
                     # them before collection so a cycle the activation still
                     # referenced can be collected inside the restore, while the
                     # module dict is still intact for finalizers that close
                     # over it.
                     if failure is not None:
-                        failure.__traceback__ = None
-                        failure.__context__ = None
-                        failure.__cause__ = None
+                        try:
+                            failure.__traceback__ = None
+                            failure.__context__ = None
+                            failure.__cause__ = None
+                        except BaseException:  # noqa: BLE001 - dropping it must not skip restore
+                            unrestored = True
                     module = None
-                    _restore_import_state(snap)
+                    try:
+                        _restore_import_state(snap)
+                    except BaseException:  # noqa: BLE001 - restore must not skip the proof
+                        unrestored = True
+                    try:
+                        if not _prove_import_restored(snap):
+                            unrestored = True
+                    except BaseException:  # noqa: BLE001 - an unreadable proof latches
+                        unrestored = True
+                if unrestored:
+                    _latch_import_restore()
         finally:
             _import_depth.depth = 0
             _import_isolation.release()
+        if unrestored or _import_restore_latched:
+            raise Refused("plugin_import_state_unrestored")
         if gil_on:
             raise Refused("core_poisoned_gil_enabled", manifest.plugin_id) from failure
         if failure is not None:

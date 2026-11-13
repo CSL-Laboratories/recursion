@@ -1618,6 +1618,7 @@ class SharedImportRollbackTests(unittest.TestCase):
             self.assertEqual(code, "plugin_import_state_unrestored")
         finally:
             self._clear_hunt_modules()
+            self._clear_import_latch()
 
     def _repair_module(self, module: types.ModuleType, *names: str) -> None:
         """Put a test-mutated module back without going through its class."""
@@ -1675,6 +1676,7 @@ class SharedImportRollbackTests(unittest.TestCase):
             self.assertFalse(pwned and code == "plugin_import_failed")
         finally:
             self._repair_module(encoder, "pwn")
+            self._clear_import_latch()
 
     def test_a_rearming_weakref_on_a_binding_is_not_an_ordinary_import_failure(self) -> None:
         """A weakref callback puts ``json.encoder.pwn`` back when it is deleted.
@@ -1715,6 +1717,7 @@ class SharedImportRollbackTests(unittest.TestCase):
             except Exception:
                 pass
             self._repair_module(encoder, "pwn", "_arm", "_stop")
+            self._clear_import_latch()
 
     def test_a_failed_load_writes_a_binding_when_setattr_raises(self) -> None:
         """A swapped module class whose ``__setattr__`` raises cannot keep ``pwn``.
@@ -2159,6 +2162,396 @@ class SharedImportRollbackTests(unittest.TestCase):
             sys.modules.pop("crypto_heap_flag", None)
             sys.modules.pop("crypto_heap.planted", None)
             self._clear_import_latch()
+
+    def _load_outcome(self, source: bytes, *, plugin_id: str) -> str:
+        """Refusal code, ``ok`` when the load returns, or the exception type name."""
+        try:
+            code = self._run_failing(source, plugin_id=plugin_id)
+        except Exception as exc:
+            return type(exc).__name__
+        return "ok" if code is None else code
+
+    def _drop_plugin_modules(self) -> None:
+        for name in list(sys.modules):
+            if name.startswith("csl_plugin_"):
+                sys.modules.pop(name, None)
+
+    def test_a_one_shot_meta_path_guard_cannot_skip_restore(self) -> None:
+        """A ``sys`` class that raises once on ``meta_path`` must not skip restore.
+
+        ``_end_import_record`` only caught ``ValueError``. The raise left the
+        swapped class and the planted module dict in place, the latch clear,
+        and a later load free to run. Fails on 8c3b543d.
+        """
+        import recursion_core.plugin_security.loader as loader_mod
+        source = (
+            "import sys, types\n"
+            "class Guard(types.ModuleType):\n"
+            "    fired = False\n"
+            "    def __getattribute__(self, name):\n"
+            "        if name == 'meta_path' and not Guard.fired:\n"
+            "            Guard.fired = True\n"
+            "            raise RuntimeError('meta-once')\n"
+            "        return types.ModuleType.__getattribute__(self, name)\n"
+            "mapping = types.ModuleType.__dict__['__dict__'].__get__(sys)\n"
+            "planted = types.ModuleType('pwn_guard')\n"
+            "planted.marker = 'pwned'\n"
+            "evil = dict(mapping['modules'])\n"
+            "evil['pwn_guard'] = planted\n"
+            "mapping['modules'] = evil\n"
+            "object.__setattr__(sys, '__class__', Guard)\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        saved_modules = sys.modules
+        saved_meta = sys.meta_path
+        saved_meta_items = list(saved_meta)
+        saved_hooks = sys.path_hooks
+        saved_cache = sys.path_importer_cache
+        saved_path = sys.path
+        try:
+            code = self._load_outcome(source, plugin_id="bad.guard.once")
+            self.assertEqual(code, "plugin_import_state_unrestored")
+            self.assertIs(type(sys), types.ModuleType)
+            self.assertIs(sys.modules, saved_modules)
+            self.assertNotIn("pwn_guard", sys.modules)
+            self.assertIs(sys.meta_path, saved_meta)
+            self.assertTrue(loader_mod._import_restore_latched)
+            later = self._load_outcome(b"VALUE = 1\n", plugin_id="later.guard.once")
+            self.assertEqual(later, "plugin_import_state_unrestored")
+        finally:
+            saved_meta[:] = saved_meta_items
+            self._repair_sys(saved_modules, saved_meta, saved_hooks, saved_cache, saved_path)
+            sys.modules.pop("pwn_guard", None)
+            self._drop_plugin_modules()
+
+    def test_an_eq_finder_cannot_plant_and_skip_restore(self) -> None:
+        """A finder ``__eq__`` that plants ``pwn_eq`` and raises must not skip restore.
+
+        ``list.remove`` calls ``__eq__``. The ``RuntimeError`` used to escape
+        before the tables were put back, so the plant survived and a later
+        load ran. Fails on 8c3b543d.
+        """
+        import recursion_core.plugin_security.loader as loader_mod
+        source = (
+            "import sys, types\n"
+            "class EqFinder:\n"
+            "    fired = False\n"
+            "    def __eq__(self, other):\n"
+            "        if EqFinder.fired:\n"
+            "            return NotImplemented\n"
+            "        EqFinder.fired = True\n"
+            "        planted = types.ModuleType('pwn_eq')\n"
+            "        planted.marker = 'pwned'\n"
+            "        sys.modules['pwn_eq'] = planted\n"
+            "        raise RuntimeError('eq')\n"
+            "    def find_spec(self, fullname, path, target=None):\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, EqFinder())\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        saved_modules = sys.modules
+        saved_meta = sys.meta_path
+        saved_meta_items = list(saved_meta)
+        saved_hooks = sys.path_hooks
+        saved_cache = sys.path_importer_cache
+        saved_path = sys.path
+        try:
+            code = self._load_outcome(source, plugin_id="bad.eq.finder")
+            self.assertEqual(code, "plugin_import_state_unrestored")
+            self.assertNotIn("pwn_eq", sys.modules)
+            self.assertIs(sys.modules, saved_modules)
+            self.assertIs(sys.meta_path, saved_meta)
+            self.assertFalse(any(type(item).__name__ == "EqFinder" for item in sys.meta_path))
+            self.assertTrue(loader_mod._import_restore_latched)
+            later = self._load_outcome(b"VALUE = 1\n", plugin_id="later.eq.finder")
+            self.assertEqual(later, "plugin_import_state_unrestored")
+        finally:
+            saved_meta[:] = saved_meta_items
+            self._repair_sys(saved_modules, saved_meta, saved_hooks, saved_cache, saved_path)
+            sys.modules.pop("pwn_eq", None)
+            self._drop_plugin_modules()
+
+    def test_a_metaclass_cannot_hide_a_class_attribute_behind_dict(self) -> None:
+        """A metaclass ``__getattribute__`` must not hide a new class attribute.
+
+        ``cls.__dict__`` can return a mapping that omits ``evil`` while the
+        real class dict still holds it. The snapshot and the proof have to
+        use the class-dict descriptor. Fails on 8c3b543d, which reports
+        ``plugin_import_failed`` and leaves ``evil`` in place.
+        """
+        import recursion_core.plugin_security.loader as loader_mod
+
+        class _Hidden(dict):
+            def __init__(self, real, hidden):
+                super().__init__()
+                self._real = real
+                self._hidden = hidden
+
+            def __iter__(self):
+                return (key for key in self._real if key not in self._hidden)
+
+            def __len__(self):
+                return sum(1 for _ in self)
+
+            def __contains__(self, key):
+                return key not in self._hidden and key in self._real
+
+            def get(self, key, default=None):
+                if key in self._hidden:
+                    return default
+                return self._real.get(key, default)
+
+            def keys(self):
+                return [key for key in self._real if key not in self._hidden]
+
+            def items(self):
+                return [(key, self._real[key]) for key in self.keys()]
+
+            def __getitem__(self, key):
+                if key in self._hidden:
+                    raise KeyError(key)
+                return self._real[key]
+
+        class Meta(type):
+            def __getattribute__(cls, name):
+                if name == "__dict__":
+                    real = type.__dict__["__dict__"].__get__(cls)
+                    return _Hidden(real, frozenset(("evil",)))
+                return type.__getattribute__(cls, name)
+
+        class Heap(types.ModuleType, metaclass=Meta):
+            pass
+
+        host = Heap("dict_fake_host")
+        sys.modules["dict_fake_host"] = host
+        source = (
+            b"import dict_fake_host\n"
+            b"type(dict_fake_host).evil = 'pwned'\n"
+            b"raise RuntimeError('boom')\n"
+        )
+        try:
+            code = self._load_outcome(source, plugin_id="bad.dict.fake")
+            raw = type.__dict__["__dict__"].__get__(Heap)
+            evil_live = raw.get("evil") == "pwned"
+            self.assertFalse(evil_live and code == "plugin_import_failed")
+            if evil_live:
+                self.assertEqual(code, "plugin_import_state_unrestored")
+                later = self._load_outcome(b"VALUE = 1\n", plugin_id="later.dict.fake")
+                self.assertEqual(later, "plugin_import_state_unrestored")
+            else:
+                self.assertEqual(code, "plugin_import_failed")
+                self.assertNotIn("evil", raw)
+                self.assertFalse(loader_mod._import_restore_latched)
+                dev_loader, raws, sigs = self._loader_for({"good.after.dict": b"VALUE = 1\n"})
+                loaded = dev_loader.load(raws["good.after.dict"], sigs["good.after.dict"], b"VALUE = 1\n")
+                self.assertEqual(loaded.module.VALUE, 1)
+                self.assertFalse(loader_mod._import_restore_latched)
+        finally:
+            try:
+                type.__delattr__(Heap, "evil")
+            except Exception:
+                pass
+            sys.modules.pop("dict_fake_host", None)
+            self._drop_plugin_modules()
+            self._clear_import_latch()
+
+    def test_a_replanting_finalizer_latches_later_loads(self) -> None:
+        """A ``__del__`` that puts the module back is a failed proof, so it latches.
+
+        The current load is ``plugin_import_state_unrestored`` and a later
+        load is refused the same way. Fails on 8c3b543d, which refuses only
+        the current load.
+        """
+        import recursion_core.plugin_security.loader as loader_mod
+        source = (
+            "import sys, types\n"
+            "def plant():\n"
+            "    class Rearm(types.ModuleType):\n"
+            "        def __del__(self):\n"
+            "            n = getattr(Rearm, '_n', 0) + 1\n"
+            "            Rearm._n = n\n"
+            "            if n > 1000:\n"
+            "                return\n"
+            "            again = Rearm('hunt_del_plant')\n"
+            "            again.marker = 'pwned'\n"
+            "            sys.modules['hunt_del_plant'] = again\n"
+            "    sys.modules['hunt_del_plant'] = Rearm('hunt_del_plant')\n"
+            "plant()\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            code = self._load_outcome(source, plugin_id="bad.del.plant")
+            self.assertEqual(code, "plugin_import_state_unrestored")
+            self.assertTrue(loader_mod._import_restore_latched)
+            later = self._load_outcome(b"VALUE = 1\n", plugin_id="later.del.plant")
+            self.assertEqual(later, "plugin_import_state_unrestored")
+        finally:
+            self._clear_hunt_modules()
+            sys.modules.pop("hunt_del_plant", None)
+            self._clear_import_latch()
+            self._drop_plugin_modules()
+
+    def test_a_noop_class_delattr_latches_later_loads(self) -> None:
+        """A metaclass ``__delattr__`` that leaves the attribute must latch.
+
+        The proof sees ``stuck`` and refuses the load. The next load must be
+        refused too. Fails on 8c3b543d, which leaves the latch clear.
+        """
+        import recursion_core.plugin_security.loader as loader_mod
+
+        class Meta(type):
+            def __delattr__(cls, name):
+                if name == "stuck":
+                    return None
+                return type.__delattr__(cls, name)
+
+        class Heap(types.ModuleType, metaclass=Meta):
+            pass
+
+        host = Heap("noop_del_host")
+        sys.modules["noop_del_host"] = host
+        source = (
+            b"import noop_del_host\n"
+            b"type(noop_del_host).stuck = 'pwned'\n"
+            b"raise RuntimeError('boom')\n"
+        )
+        try:
+            code = self._load_outcome(source, plugin_id="bad.noop.delattr")
+            self.assertEqual(code, "plugin_import_state_unrestored")
+            self.assertTrue(loader_mod._import_restore_latched)
+            later = self._load_outcome(b"VALUE = 1\n", plugin_id="later.noop.delattr")
+            self.assertEqual(later, "plugin_import_state_unrestored")
+        finally:
+            try:
+                type.__delattr__(Heap, "stuck")
+            except Exception:
+                pass
+            sys.modules.pop("noop_del_host", None)
+            self._clear_import_latch()
+            self._drop_plugin_modules()
+
+    def test_reload_cannot_clear_the_import_latch(self) -> None:
+        """``importlib.reload`` must not set the latch back to false.
+
+        A class attribute that cannot be removed latches the process. Reloading
+        this module used to run ``_import_restore_latched = False`` again, and
+        the next load ran. Fails on 8c3b543d.
+        """
+        import importlib
+        import recursion_core.plugin_security.loader as loader_mod
+
+        class Meta(type):
+            def __delattr__(cls, name):
+                if name == "stuck":
+                    raise RuntimeError("no-del-class")
+                return type.__delattr__(cls, name)
+
+        class Heap(types.ModuleType, metaclass=Meta):
+            pass
+
+        host = Heap("reload_latch_host")
+        sys.modules["reload_latch_host"] = host
+        source = (
+            b"import reload_latch_host\n"
+            b"type(reload_latch_host).stuck = 'pwned'\n"
+            b"raise RuntimeError('boom')\n"
+        )
+        try:
+            code = self._load_outcome(source, plugin_id="bad.reload.latch")
+            self.assertEqual(code, "plugin_import_state_unrestored")
+            self.assertTrue(loader_mod._import_restore_latched)
+            importlib.reload(loader_mod)
+            self.assertTrue(loader_mod._import_restore_latched)
+            later = self._load_outcome(b"VALUE = 1\n", plugin_id="later.reload.latch")
+            self.assertEqual(later, "plugin_import_state_unrestored")
+        finally:
+            try:
+                type.__delattr__(Heap, "stuck")
+            except Exception:
+                pass
+            sys.modules.pop("reload_latch_host", None)
+            self._clear_import_latch()
+            self._drop_plugin_modules()
+
+    def test_benign_loads_do_not_latch(self) -> None:
+        """Ordinary success and ordinary import failure must not latch.
+
+        ``VALUE = 1``, a failing ``import json``, ``PUBLIC_KEY_TYPES``, and
+        ``LazyLoader`` leave the latch clear. A later ``VALUE = 1`` still runs.
+        """
+        import importlib.util
+        import recursion_core.plugin_security.loader as loader_mod
+        self._clear_import_latch()
+        good = b"VALUE = 1\n"
+        dev_loader, raws, sigs = self._loader_for({"good.benign.value": good})
+        loaded = dev_loader.load(raws["good.benign.value"], sigs["good.benign.value"], good)
+        self.assertEqual(loaded.module.VALUE, 1)
+        self.assertFalse(loader_mod._import_restore_latched)
+
+        json_code = self._load_outcome(
+            b"import json\nraise RuntimeError('boom')\n", plugin_id="bad.benign.json")
+        self.assertEqual(json_code, "plugin_import_failed")
+        self.assertFalse(loader_mod._import_restore_latched)
+        import json
+        self.assertIs(sys.modules.get("json"), json)
+
+        pub = (
+            b"from cryptography.hazmat.primitives.asymmetric.types import PUBLIC_KEY_TYPES\n"
+            b"raise RuntimeError('boom')\n"
+        )
+        pub_code = self._load_outcome(pub, plugin_id="bad.benign.pub")
+        self.assertEqual(pub_code, "plugin_import_failed")
+        self.assertFalse(loader_mod._import_restore_latched)
+
+        saved_colorsys = sys.modules.get("colorsys")
+        lazy_ok = (
+            "import importlib.util, sys\n"
+            "name = 'colorsys'\n"
+            "spec = importlib.util.find_spec(name)\n"
+            "loader = importlib.util.LazyLoader(spec.loader)\n"
+            "spec.loader = loader\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "sys.modules[name] = module\n"
+            "loader.exec_module(module)\n"
+            "VALUE = module.rgb_to_yiq(1, 0, 0)[0]\n"
+        ).encode()
+        saved_uu = sys.modules.pop("uu", None)
+        lazy_fail = (
+            "import importlib.util, sys\n"
+            "name = 'uu'\n"
+            "spec = importlib.util.find_spec(name)\n"
+            "loader = importlib.util.LazyLoader(spec.loader)\n"
+            "spec.loader = loader\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "sys.modules[name] = module\n"
+            "loader.exec_module(module)\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            dev_loader, raws, sigs = self._loader_for({"good.benign.lazy": lazy_ok})
+            loaded = dev_loader.load(raws["good.benign.lazy"], sigs["good.benign.lazy"], lazy_ok)
+            self.assertEqual(loaded.module.VALUE, 0.3)
+            self.assertFalse(loader_mod._import_restore_latched)
+            self.assertIsInstance(importlib.util.LazyLoader, type)
+            lazy_code = self._load_outcome(lazy_fail, plugin_id="bad.benign.lazy")
+            self.assertEqual(lazy_code, "plugin_import_failed")
+            self.assertNotIn("uu", sys.modules)
+            self.assertFalse(loader_mod._import_restore_latched)
+        finally:
+            if saved_colorsys is None:
+                sys.modules.pop("colorsys", None)
+            else:
+                sys.modules["colorsys"] = saved_colorsys
+            if saved_uu is not None:
+                sys.modules["uu"] = saved_uu
+            else:
+                sys.modules.pop("uu", None)
+            self._drop_plugin_modules()
+        self.assertFalse(loader_mod._import_restore_latched)
+        again, raws, sigs = self._loader_for({"good.benign.again": good})
+        loaded = again.load(raws["good.benign.again"], sigs["good.benign.again"], good)
+        self.assertEqual(loaded.module.VALUE, 1)
+        self.assertFalse(loader_mod._import_restore_latched)
 
 
 class RevocationPublishTests(unittest.TestCase):

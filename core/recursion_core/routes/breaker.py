@@ -18,7 +18,8 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   short fault never hides a real limit on the same connection from that tenant.
 * It always recovers. An open key has a finite ``open_until`` (the signal's ``reset_at`` when that
   instant is still in the future, capped at ``max_open_s``; otherwise a cooldown with backoff up to
-  ``max_cooldown_s``).
+  ``max_cooldown_s``). A signal marked ``reset_unknown`` is not a vendor reset: the window is the
+  later of that capped known instant and this breaker's escalating cooldown.
   Repeated typed limits while that window still holds are one incident: they do not stack the
   failure count or extend a cooldown that has no later vendor reset. A probe admitted after the
   window, whose own result is a limit, is the next incident and doubles the cooldown.
@@ -198,7 +199,10 @@ class ConnectionBreaker:
         # reset_at is already on this clock. A future instant is the window, capped at max_open_s.
         # The default sits above a 30-day translated reset. A later instant, including one that
         # looks like a millisecond epoch, clamps to the ceiling so a probe is eventually admitted.
+        # reset_unknown keeps that known instant but does not treat it as the whole window: the
+        # cooldown still escalates, and the later of the two is the hold.
         bounded = self._cap_reset(reset_at, now)
+        unknown = signal.get("reset_unknown") is True
         open_until = rec.get("open_until")
         if rec["state"] == OPEN and isinstance(open_until, (int, float)) and now < open_until:
             # One incident per open window. A later vendor reset can extend it; a cooldown is not stacked.
@@ -208,7 +212,11 @@ class ConnectionBreaker:
             return rec["open_until"]
         rec["failures"] += 1
         backoff = self._backoff(rec["failures"])
-        until = bounded if bounded is not None else now + backoff
+        cooled = now + backoff
+        if unknown:
+            until = bounded if bounded is not None and bounded > cooled else cooled
+        else:
+            until = bounded if bounded is not None else cooled
         # A probe that is still inside its deadline keeps its lease. Clearing it here would let the
         # next admit start a second probe while the first run is still going.
         if _live_lease(rec, now):

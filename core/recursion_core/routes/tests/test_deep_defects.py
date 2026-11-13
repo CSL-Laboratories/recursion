@@ -424,9 +424,9 @@ class LimitSignalAccountingTest(unittest.TestCase):
 
     def test_an_exhausted_window_with_no_reset_is_not_cleared_when_its_sibling_resets(self) -> None:
         # Secondary is exhausted and names no resetsAt. That must not drop primary's known
-        # instant, and the fence is at least the cooldown and at least that instant.
-        # Primary is only +100s, so the fence is the 300s cooldown. It still holds after
-        # +100s, and one probe runs when the cooldown elapses.
+        # instant. The hold is the later of that instant and the breaker cooldown. Primary
+        # is only +100s, so the hold is the 300s cooldown. It still holds after +100s, and
+        # one probe runs when the cooldown elapses.
         notes = [
             {"method": "account/rateLimits/updated", "params": {"rateLimits": {
                 "limitId": "codex",
@@ -438,10 +438,10 @@ class LimitSignalAccountingTest(unittest.TestCase):
         res = h.handle(request(engine="codex", model="gpt-5"))
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         now = 1_000_000.0
-        for fence in (res["limit"]["reset_at"], res["retry_at"]):
-            self.assertIsInstance(fence, (int, float))
-            self.assertGreaterEqual(fence, now + 300)  # at least the cooldown
-            self.assertGreaterEqual(fence, 1_000_100.0)  # at least the known reset
+        # The known instant stays on the signal. The hold is the breaker's cooldown, which
+        # is later than that instant. A synthesized vendor reset would hide the known one.
+        self.assertEqual(res["limit"]["reset_at"], 1_000_100.0)
+        self.assertEqual(res["retry_at"], now + 300)
         h.clock.advance(101)  # past primary's reset, inside the cooldown fence
         blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
         self.assertEqual(blocked["code"], c.BREAKER_OPEN)
@@ -645,6 +645,73 @@ class LimitSignalAccountingTest(unittest.TestCase):
         probe = h.handle(request(rid="probe", engine="codex", model="gpt-5"))
         self.assertEqual(probe["text"], "probed")
         self.assertEqual(len(h.launcher.calls), 2)
+
+    def _healthy_generation_leaves_the_other_exhausted_kind(self, second: dict) -> None:
+        # Clock 1_000_000, primary only. generation=10 is exhausted at +10s. An incomparable
+        # exhausted snapshot then holds until 3_592_000 (30 days, under the 40-day cap).
+        # generation=11 is healthy and newer than generation=10 only. It must not clear the
+        # other kind, or the turn starts and the breaker stays closed.
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_010}}}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": second}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "generation": 11, "primary": {"usedPercent": 10}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 3_592_000.0)
+        self.assertEqual(res["retry_at"], 3_592_000.0)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertNotIn("thread/start", methods)
+        self.assertEqual(h.breaker.state("codex:subscription:login-A"), "open")
+        h.clock.advance(11)  # past generation 10's reset; the other kind still holds
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(blocked["retry_at"], 3_592_000.0)
+        self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_a_newer_healthy_generation_does_not_clear_an_incomparable_timestamp(self) -> None:
+        self._healthy_generation_leaves_the_other_exhausted_kind({
+            "limitId": "codex", "timestamp": 1,
+            "primary": {"usedPercent": 100, "resetsAt": 3_592_000}})
+
+    def test_a_newer_healthy_generation_does_not_clear_an_unstamped_exhaustion(self) -> None:
+        self._healthy_generation_leaves_the_other_exhausted_kind({
+            "limitId": "codex", "primary": {"usedPercent": 100, "resetsAt": 3_592_000}})
+
+    def test_an_unknown_reset_escalates_on_the_breaker_cooldown(self) -> None:
+        # Neither window names resetsAt. Synthesizing now+300 as a vendor reset launches
+        # a probe every 300s, including when this breaker cooldown is 120s (fences at
+        # 300, then 600). The holds are the cooldown and then double: 120s, then 240s.
+        limits = {"limitId": "codex", "primary": {"usedPercent": 100}, "secondary": {"usedPercent": 100}}
+        h = Harness([codex_script(limits=limits), codex_script(limits=limits), codex_script("later")])
+        h.breaker = ConnectionBreaker(h.clock, cooldown_s=120, max_cooldown_s=3600)
+        h.service._breaker = h.breaker
+        first = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(first["code"], c.PLAN_LIMIT)
+        self.assertIsNone(first["limit"]["reset_at"])
+        self.assertEqual(first["retry_at"], 1_000_120.0)
+        h.clock.advance(120)
+        second = h.handle(request(rid="probe", engine="codex", model="gpt-5"))
+        self.assertEqual(second["code"], c.PLAN_LIMIT)
+        self.assertIsNone(second["limit"]["reset_at"])
+        self.assertEqual(second["retry_at"], 1_000_360.0)
+        h.clock.advance(120)  # a flat 120s or 300s fence would launch here
+        blocked = h.handle(request(rid="early", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(h.launcher.calls), 2)
+        h.clock.advance(120)
+        opened = h.handle(request(rid="next", engine="codex", model="gpt-5"))
+        self.assertEqual(opened["text"], "later")
+        self.assertEqual(len(h.launcher.calls), 3)
 
 
 class DeadlineLaunchTest(unittest.TestCase):

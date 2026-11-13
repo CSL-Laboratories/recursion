@@ -37,10 +37,19 @@ recorded on F60, CSL-762).
   a record against the host after a restart (the startup sweep) belongs to the durable-registry item,
   CSL-738.
 - Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
-  fails answers `registry_unavailable`. A record missing a required field or carrying a wrong type is
-  that same answer and is not written back. Once the cleanup layer has answered, Stop returns `stopped` or
-  `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
-  record and asks the cleanup layer again, which is safe to repeat. For a launch whose own write failed,
+  fails answers `registry_unavailable`. A record missing a required field, carrying a wrong type, or
+  carrying a subclass of `str`, `int` or `bool` is that same answer and is not written back. Values are
+  copied out as exact builtins before they are compared or stored. `started_at` and `stop.requested_at`
+  may be an exact `int` or an exact `float` (the clock returns a float); `checks` is an exact `int`.
+  A `get` whose `run_id` is not the id that was fetched is the same failed read. Stop never drops the
+  in-memory launch of a different id. Only an exact string `empty` from confirm is `stopped`. Any other
+  confirm answer, including a `str` subclass, is `pending` / `confirm_unknown`. An unexpected exception
+  inside `call` answers `registry_unavailable` / `internal:<type>` and does not clear a kill already
+  requested. `run.list` parses each row the same way: a bad row is omitted, the readable rows are
+  returned, and `malformed` is how many were omitted (zero when every row parsed). Once the cleanup
+  layer has answered, Stop returns `stopped` or `pending` even if writing that back fails, with
+  `"recorded": false`; the next stop then sees the old record and asks the cleanup layer again, which
+  is safe to repeat. For a launch whose own write failed,
   the API keeps the Stop decision with that launch, so a later Stop or a same-key retry continues it
   (re-sends a request that raised, writes back a confirmed `stopped`) and never records a bare `running`
   over it. A failed start whose record cannot be re-read writes nothing, so it never erases a Stop

@@ -866,5 +866,367 @@ class UnhashableValueTest(unittest.TestCase):
                 self.assertEqual(len(kill.confirms), 2)
 
 
+class _EqStr(str):
+    """str subclass whose ``__eq__`` also claims to be ``equals``."""
+
+    def __new__(cls, text: str, equals: str):
+        obj = str.__new__(cls, text)
+        obj.equals = equals
+        return obj
+
+    def __eq__(self, other: object) -> bool:
+        if other == self.equals:
+            return True
+        return str.__eq__(self, other)
+
+    def __hash__(self) -> int:
+        return str.__hash__(self)
+
+
+class _HashBoom(str):
+    def __hash__(self) -> int:
+        raise TypeError("hostile-hash")
+
+
+class _AnyEq(str):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return 0
+
+
+class _EqBoom(str):
+    def __eq__(self, other: object) -> bool:
+        raise TypeError("hostile-eq")
+
+    def __hash__(self) -> int:
+        return 0
+
+
+class _AddBoom(int):
+    def __add__(self, other: object) -> int:
+        raise TypeError("hostile-add")
+
+    def __radd__(self, other: object) -> int:
+        raise TypeError("hostile-add")
+
+
+class _EmptyTruthy(str):
+    """Empty string whose ``__bool__`` is true, so ``isinstance`` plus ``bool`` accepts it."""
+
+    def __new__(cls) -> _EmptyTruthy:
+        return str.__new__(cls, "")
+
+    def __bool__(self) -> bool:
+        return True
+
+
+class _UnhashKey(str):
+    def __hash__(self) -> int:
+        raise TypeError("unhashable-key")
+
+
+class _EqualsEmpty:
+    """Not a str. ``__eq__('empty')`` is true, so ``answer != EMPTY`` is false."""
+
+    def __eq__(self, other: object) -> bool:
+        return other == "empty"
+
+    def __ne__(self, other: object) -> bool:
+        return not (other == "empty")
+
+    def __hash__(self) -> int:
+        return 0
+
+
+class _InjectingRegistry(InMemoryRunRegistry):
+    """Stores plain records. Reads hand back a hostile value, which is what a registry can do."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.on_get: dict[str, object] = {}
+        self.on_find: dict[str, object] = {}
+        self.on_list: dict[str, object] = {}
+
+    def _apply(self, rec: dict | None, hooks: dict[str, object]) -> dict | None:
+        if rec is None:
+            return None
+        hook = hooks.get(rec["run_id"])
+        if hook is not None:
+            hook(rec)
+        return rec
+
+    def get(self, run_id: str):
+        return self._apply(super().get(run_id), self.on_get)
+
+    def find_start(self, tenant: str, client_key: str):
+        return self._apply(super().find_start(tenant, client_key), self.on_find)
+
+    def list(self):
+        return [self._apply(rec, self.on_list) for rec in super().list()]
+
+
+def _plain_record(**extra: object) -> dict:
+    rec = {"run_id": "run-9", "tenant": "t1", "engine": "codex", "state": "running",
+           "cgroup": "/cg/run-9", "started_at": 1.0, "stop": None,
+           "start_key": {"client_key": "k", "engine": "codex",
+                         "prompt_sha256": hashlib.sha256(b"p").hexdigest()}}
+    rec.update(extra)
+    return rec
+
+
+class ExactBuiltinBoundaryTest(unittest.TestCase):
+    """Subclasses of str and int must not pass a record, a confirm answer, or a caller key.
+
+    On 05249709, ``isinstance`` admits them. A hostile ``__eq__`` / ``__hash__`` / ``__bool__`` /
+    ``__add__`` then reports a false stop, launches twice, escapes ``call``, or pops another run.
+    """
+
+    P = {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k"}
+
+    def _no_escape(self, api, method: str, params: dict) -> dict:
+        try:
+            return api.call(method, params)
+        except Exception as err:
+            self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+
+    def test_1_state_subclass_is_not_a_false_stopped(self) -> None:
+        # ~369: state == "stopped" via __eq__, content is still "running". No kill, but "stopped".
+        registry = _InjectingRegistry()
+        kill = FakeKillTree([EMPTY])
+        api, _, _, _ = make_api(kill, registry=registry)
+        registry.put(_plain_record())
+        registry.on_get["run-9"] = lambda rec: rec.__setitem__("state", _EqStr("running", "stopped"))
+        res = self._no_escape(api, "run.stop", {"run_id": "run-9"})
+        self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "get:malformed"})
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(registry._runs["run-9"]["state"], "running")
+
+    def test_1_state_subclass_does_not_relaunch_one_start_key(self) -> None:
+        # ~290: state == "start_failed" via __eq__ relaunches a run that is already running.
+        registry = _InjectingRegistry()
+        api, _, _, starter = make_api(registry=registry)
+        registry.put(_plain_record())
+        hostile = lambda rec: rec.__setitem__("state", _EqStr("running", "start_failed"))
+        registry.on_find["run-9"] = hostile
+        registry.on_get["run-9"] = hostile
+        res = self._no_escape(api, "run.start", self.P)
+        self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "find_start:malformed"})
+        self.assertEqual(starter.calls, [])
+        self.assertEqual(registry._runs["run-9"]["cgroup"], "/cg/run-9")
+
+    def test_1_state_subclass_hash_does_not_escape_call(self) -> None:
+        # ~144: state in _STATES hashes the subclass and the TypeError leaves call().
+        registry = _InjectingRegistry()
+        api, _, _, starter = make_api(registry=registry)
+        registry.put(_plain_record())
+        registry.on_get["run-9"] = lambda rec: rec.__setitem__("state", _HashBoom("running"))
+        stop = self._no_escape(api, "run.stop", {"run_id": "run-9"})
+        self.assertEqual(stop, {"code": a.REGISTRY_UNAVAILABLE, "detail": "get:malformed"})
+        registry.on_find["run-9"] = lambda rec: rec.__setitem__("state", _HashBoom("running"))
+        start = self._no_escape(api, "run.start", self.P)
+        self.assertEqual(start, {"code": a.REGISTRY_UNAVAILABLE, "detail": "find_start:malformed"})
+        self.assertEqual(starter.calls, [])
+
+    def test_2_confirm_non_str_equal_to_empty_is_not_stopped(self) -> None:
+        # ~404: answer != EMPTY is false because __eq__('empty') is true. The tree was signalled
+        # and must stay pending, not stopped.
+        registry = InMemoryRunRegistry()
+        kill = FakeKillTree([_EqualsEmpty()])
+        api, _, _, _ = make_api(kill, registry=registry)
+        run = started(api)
+        res = self._no_escape(api, "run.stop", {"run_id": run})
+        self.assertEqual(res.get("code"), a.PENDING)
+        self.assertEqual(res.get("reason"), "confirm_unknown")
+        self.assertEqual(registry.get(run)["state"], "stop_pending")
+        self.assertEqual(len(kill.requests), 1)
+
+    def test_2_confirm_str_subclass_does_not_escape_after_request_stop(self) -> None:
+        # ~81-82: isinstance(answer, str) then _PENDING_REASON.get hashes it, after request_stop.
+        registry = InMemoryRunRegistry()
+        kill = FakeKillTree([_HashBoom("populated"), EMPTY])
+        api, _, _, _ = make_api(kill, registry=registry)
+        run = started(api)
+        res = self._no_escape(api, "run.stop", {"run_id": run})
+        self.assertEqual((res["code"], res["reason"]), (a.PENDING, "confirm_unknown"))
+        self.assertIs(registry.get(run)["stop"]["requested"], True)
+        self.assertEqual(len(kill.requests), 1)
+        again = self._no_escape(api, "run.stop", {"run_id": run})
+        self.assertEqual(again["code"], a.STOPPED)
+        self.assertEqual(len(kill.requests), 1)
+        self.assertEqual(len(kill.confirms), 2)
+
+    def test_3_prompt_sha256_subclass_is_not_a_duplicate(self) -> None:
+        # ~232: digest __eq__ is true for every string, so a different prompt is accepted as the same start.
+        registry = _InjectingRegistry()
+        api, _, _, starter = make_api(registry=registry)
+        registry.put(_plain_record())
+        registry.on_find["run-9"] = lambda rec: rec["start_key"].__setitem__("prompt_sha256", _AnyEq("nope"))
+        res = self._no_escape(api, "run.start", {**self.P, "prompt": "other-prompt"})
+        self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "find_start:malformed"})
+        self.assertNotEqual(res.get("duplicate"), True)
+        self.assertEqual(starter.calls, [])
+
+    def test_3_prompt_sha256_raising_eq_does_not_escape(self) -> None:
+        registry = _InjectingRegistry()
+        api, _, _, starter = make_api(registry=registry)
+        registry.put(_plain_record())
+        registry.on_find["run-9"] = lambda rec: rec["start_key"].__setitem__("prompt_sha256", _EqBoom("nope"))
+        res = self._no_escape(api, "run.start", {**self.P, "prompt": "other-prompt"})
+        self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "find_start:malformed"})
+        self.assertEqual(starter.calls, [])
+
+    def test_4_reread_does_not_write_cgroup_onto_another_run(self) -> None:
+        # ~271-281: get(run-1) returns run-2, and the new cgroup is put onto run-2.
+        registry = InMemoryRunRegistry()
+        registry.put({"run_id": "run-2", "tenant": "victim", "engine": "codex", "state": "running",
+                      "cgroup": "/cg/victim", "started_at": 1.0, "stop": None, "start_key": None})
+        swapped = {"done": False}
+
+        def get(run_id: str, _get=registry.get):
+            if not swapped["done"] and run_id == "run-1":
+                swapped["done"] = True
+                return _get("run-2")
+            return _get(run_id)
+
+        registry.get = get
+
+        def starter(params: dict) -> dict:
+            return {"cgroup": f"/cg/{params['run_id']}"}
+
+        api, _, _, _ = make_api(registry=registry, starter=starter)
+        res = self._no_escape(api, "run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"})
+        self.assertEqual(res["code"], a.STARTED)
+        self.assertEqual(res["run"]["run_id"], "run-1")
+        self.assertEqual(res["run"]["cgroup"], "/cg/run-1")
+        victim = registry._runs["run-2"]
+        self.assertEqual((victim["state"], victim["cgroup"], victim["tenant"]), ("running", "/cg/victim", "victim"))
+        stored = registry._runs["run-1"]
+        self.assertEqual((stored["state"], stored["cgroup"]), ("running", "/cg/run-1"))
+
+    def test_4_stop_of_another_id_does_not_pop_the_live_launch(self) -> None:
+        # ~368-380 and ~428-436: stop("run-2") is handed run-1's id with state stopped, pops
+        # _launched["run-1"], and the live cgroup is never killed.
+        registry = InMemoryRunRegistry()
+        fail_running = {"on": False}
+
+        def put(record: dict, _put=registry.put):
+            if fail_running["on"] and record.get("state") == "running":
+                raise OSError("disk")
+            return _put(record)
+
+        def get(run_id: str, _get=registry.get):
+            if run_id == "run-2":
+                rec = _get("run-1")
+                if rec is None:
+                    return None
+                rec["run_id"] = "run-1"
+                rec["state"] = "stopped"
+                rec["cgroup"] = "/cg/forged"
+                rec["stop"] = {"requested_at": 1.0, "checks": 1, "reason": None, "requested": True}
+                return rec
+            return _get(run_id)
+
+        registry.put = put
+        registry.get = get
+        kill = FakeKillTree([EMPTY])
+        api, _, _, _ = make_api(kill, registry=registry)
+        fail_running["on"] = True
+        started_run = self._no_escape(api, "run.start", self.P)
+        self.assertEqual(started_run["code"], a.START_UNCONFIRMED)
+        self.assertIn("run-1", api._launched)
+        cgroup = api._launched["run-1"]["cgroup"]
+        fail_running["on"] = False
+        steal = self._no_escape(api, "run.stop", {"run_id": "run-2"})
+        self.assertEqual(steal["code"], a.REGISTRY_UNAVAILABLE)
+        self.assertIn("run-1", api._launched)
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(registry._runs["run-1"]["state"], "starting")
+        live = self._no_escape(api, "run.stop", {"run_id": "run-1"})
+        self.assertEqual(live["code"], a.STOPPED)
+        self.assertEqual(kill.requests, [cgroup])
+
+    def test_5_checks_subclass_does_not_wedge_stop(self) -> None:
+        # ~116 admits an int subclass; ~407 ``checks + 1`` raises on every later stop.
+        registry = _InjectingRegistry()
+        kill = FakeKillTree([EMPTY])
+        api, _, _, _ = make_api(kill, registry=registry)
+        registry.put(_plain_record(stop={"requested_at": 1.0, "checks": 2, "reason": None, "requested": False}))
+        registry.on_get["run-9"] = lambda rec: rec["stop"].__setitem__("checks", _AddBoom(2))
+        for _ in range(2):
+            res = self._no_escape(api, "run.stop", {"run_id": "run-9"})
+            self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "get:malformed"})
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(registry._runs["run-9"]["state"], "running")
+
+    def test_6_empty_cgroup_subclass_does_not_request_stop(self) -> None:
+        # ~99-100: isinstance(str) and a truthy __bool__ pass _nonempty_str, then request_stop("").
+        registry = _InjectingRegistry()
+        kill = FakeKillTree([EMPTY])
+        api, _, _, _ = make_api(kill, registry=registry)
+        registry.put(_plain_record())
+        registry.on_get["run-9"] = lambda rec: rec.__setitem__("cgroup", _EmptyTruthy())
+        res = self._no_escape(api, "run.stop", {"run_id": "run-9"})
+        self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "get:malformed"})
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(registry._runs["run-9"]["state"], "running")
+
+    def test_7_unhashable_client_key_subclass_is_request_invalid(self) -> None:
+        # ~218: isinstance(client_key, str) then the lock dict hashes it and TypeError leaves call().
+        api, _, _, starter = make_api()
+        res = self._no_escape(api, "run.start", {**self.P, "client_key": _UnhashKey("k")})
+        self.assertEqual(res, {"code": a.REQUEST_INVALID, "detail": "client_key"})
+        self.assertEqual(starter.calls, [])
+        tenant = self._no_escape(api, "run.start", {**self.P, "tenant": _UnhashKey("t1")})
+        self.assertEqual(tenant, {"code": a.REQUEST_INVALID, "detail": "tenant"})
+        self.assertEqual(starter.calls, [])
+        run_id = self._no_escape(api, "run.stop", {"run_id": _UnhashKey("run-1")})
+        self.assertEqual(run_id, {"code": a.REQUEST_INVALID, "detail": "run_id"})
+
+    def test_list_omits_malformed_rows_and_counts_them(self) -> None:
+        # Choice: a bad row is omitted and counted. The readable rows are still returned.
+        # The whole list stays ``ok``. ``malformed`` is 0 when every row parsed.
+        api, _, _, _ = make_api()
+        api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"})
+        clean = self._no_escape(api, "run.list", {})
+        self.assertEqual(clean["code"], a.OK)
+        self.assertEqual(clean["malformed"], 0)
+        self.assertEqual(len(clean["runs"]), 1)
+
+        registry = _InjectingRegistry()
+        listing, _, _, _ = make_api(registry=registry)
+        registry.put(_plain_record(run_id="run-8"))
+        registry.put(_plain_record())
+        registry.on_list["run-9"] = lambda rec: rec.__setitem__("state", _EqStr("running", "stopped"))
+        res = self._no_escape(listing, "run.list", {})
+        self.assertEqual(res["code"], a.OK)
+        self.assertEqual([row["run_id"] for row in res["runs"]], ["run-8"])
+        self.assertEqual(res["malformed"], 1)
+        self.assertTrue(all(type(row["state"]) is str for row in res["runs"]))
+
+    def test_unexpected_exception_keeps_kill_bookkeeping(self) -> None:
+        # call() turns a later bug into a code and does not drop a kill already requested.
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        cgroup = registry.get(run)["cgroup"]
+
+        def boom(*args, **kwargs):
+            rec = args[0]
+            api._kill.request_stop(rec["cgroup"])
+            api._launched[run] = {"run_id": run, "cgroup": rec["cgroup"]}
+            rec["stop"] = {"requested_at": 1, "checks": 0, "reason": None, "requested": True}
+            api._try_put(rec)
+            raise RuntimeError("after-request")
+
+        api._stop = boom
+        res = self._no_escape(api, "run.stop", {"run_id": run})
+        self.assertEqual(res["code"], a.REGISTRY_UNAVAILABLE)
+        self.assertTrue(str(res["detail"]).startswith("internal:"))
+        self.assertEqual(kill.requests, [cgroup])
+        self.assertIs(registry.get(run)["stop"]["requested"], True)
+        self.assertIn(run, api._launched)
+
+
 if __name__ == "__main__":
     unittest.main()

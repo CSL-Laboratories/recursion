@@ -5,6 +5,8 @@
   "idempotency": "none",
   "precondition": "none",
   "requires": [],
+  "falls_back": [],
+  "service": null,
   "page_allowed": true,
   "mcp": {
     "tool": "recursion_run_status",

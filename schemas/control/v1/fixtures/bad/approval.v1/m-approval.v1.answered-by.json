@@ -9,15 +9,12 @@
     "engine": "claude_code",
     "session_id": "ses-7f3a9c2e51d04b6a",
     "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-    "call_form": "csl-call/v1",
-    "call": {
-      "cwd": null,
-      "input": {},
-      "tool": "TodoRead"
-    }
+    "tool": "TodoRead",
+    "cwd": null,
+    "input": {}
   },
   "digest_form": "rfc8785/v1",
-  "digest": "9b4e43a64f948e7bb5fcf2b277be5176537d612e70c85350fcd117a5471bca1f",
+  "digest": "30aa49feccede6693850352254603a85767fba5bf573473c5aeb67569d7afb66",
   "display": [],
   "rendered_form": "csl-approval-lines/v0",
   "rendered": [

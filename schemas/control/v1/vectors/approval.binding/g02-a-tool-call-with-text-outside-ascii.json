@@ -10,19 +10,16 @@
       "engine": "claude_code",
       "session_id": "ses-7f3a9c2e51d04b6a",
       "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-      "call_form": "csl-call/v1",
-      "call": {
-        "cwd": "/home/dev/projets/caf\u00e9",
-        "input": {
-          "file_path": "notes/men\u00fa.txt",
-          "content": "caf\u00e9 \u2014 1.5 kg",
-          "weight_kg": 1.5
-        },
-        "tool": "Write"
+      "tool": "Write",
+      "cwd": "/home/dev/projets/caf\u00e9",
+      "input": {
+        "file_path": "notes/men\u00fa.txt",
+        "content": "caf\u00e9 \u2014 1.5 kg",
+        "weight_kg": 1.5
       }
     },
     "digest_form": "rfc8785/v1",
-    "digest": "0b449eb950c280bf8a02b4113265201fcf6f913855412f9e29b60beb6a15afd5",
+    "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
     "display": [],
     "rendered_form": "csl-approval-lines/v0",
     "rendered": [
@@ -73,5 +70,5 @@
     "revision": 1
   },
   "expect": [],
-  "effect_text": "{\"call\":{\"cwd\":\"/home/dev/projets/caf\u00e9\",\"input\":{\"content\":\"caf\u00e9 \u2014 1.5 kg\",\"file_path\":\"notes/men\u00fa.txt\",\"weight_kg\":1.5},\"tool\":\"Write\"},\"call_form\":\"csl-call/v1\",\"engine\":\"claude_code\",\"kind\":\"engine_tool\",\"run_id\":\"run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7\",\"session_id\":\"ses-7f3a9c2e51d04b6a\"}"
+  "effect_text": "{\"cwd\":\"/home/dev/projets/caf\u00e9\",\"engine\":\"claude_code\",\"input\":{\"content\":\"caf\u00e9 \u2014 1.5 kg\",\"file_path\":\"notes/men\u00fa.txt\",\"weight_kg\":1.5},\"kind\":\"engine_tool\",\"run_id\":\"run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7\",\"session_id\":\"ses-7f3a9c2e51d04b6a\",\"tool\":\"Write\"}"
 }

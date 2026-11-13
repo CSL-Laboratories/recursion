@@ -5,6 +5,8 @@
   "idempotency": "x-nobody-defined-this",
   "precondition": "none",
   "requires": [],
+  "falls_back": [],
+  "service": null,
   "page_allowed": true,
   "mcp": {
     "exposed": true,

@@ -5,6 +5,8 @@
   "idempotency": "command_id",
   "precondition": "expected_revision",
   "requires": [],
+  "falls_back": [],
+  "service": null,
   "page_allowed": true,
   "mcp": {
     "exposed": true,

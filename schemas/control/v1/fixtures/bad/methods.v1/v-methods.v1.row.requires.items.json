@@ -7,6 +7,8 @@
   "requires": [
     "x-nobody-defined-this"
   ],
+  "falls_back": [],
+  "service": null,
   "page_allowed": true,
   "mcp": {
     "exposed": true,

@@ -4,6 +4,8 @@
   "mutating": false,
   "idempotency": "none",
   "requires": [],
+  "falls_back": [],
+  "service": null,
   "page_allowed": true,
   "mcp": {
     "exposed": true,

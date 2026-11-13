@@ -4,12 +4,12 @@
     {
       "file": "good/approval.v1/h01-tool-call-pending-shown-on-the-terminal.json",
       "schema": "approval.v1.json",
-      "shows": "An engine asked to run a command. One surface has shown it; nobody has answered. Showing it did not raise its revision."
+      "shows": "An engine asked to run a command. One surface has shown it; nobody has answered."
     },
     {
       "file": "good/approval.v1/h02-tool-call-approved.json",
       "schema": "approval.v1.json",
-      "shows": "The owner approved it on the surface that showed it. The answer raised the revision to 2."
+      "shows": "The owner approved it on the surface that showed it. Its revision is still 1: an answer changes the state, not the content."
     },
     {
       "file": "good/approval.v1/h03-tool-call-with-text-outside-ascii.json",
@@ -57,11 +57,6 @@
       "shows": "A call with an empty input, from an engine that does not say where it would run: the lines say so, they do not leave it out."
     },
     {
-      "file": "good/approval.v1/h12-a-call-on-its-own.json",
-      "schema": "approval.v1.json#/$defs/call",
-      "shows": "The call of h03 on its own: a tool's name, its input and its directory, in any alphabet."
-    },
-    {
       "file": "bad/approval.v1/b01-pending-with-an-answer.json",
       "schema": "approval.v1.json",
       "rule": "A 'pending' request has no answer yet.",
@@ -107,9 +102,9 @@
       }
     },
     {
-      "file": "bad/approval.v1/b06-the-call-as-a-string-someone-serialised.json",
+      "file": "bad/approval.v1/b06-the-input-as-a-string-someone-serialised.json",
       "schema": "approval.v1.json",
-      "rule": "An engine's call is bound as a value under RFC 8785, not as a string that some serialiser wrote: two serialisers disagree, one canonical form does not.",
+      "rule": "A tool's input is bound as an object under RFC 8785, not as a string that some serialiser wrote: two serialisers disagree, one canonical form does not.",
       "expect": {
         "keyword": "additionalProperties",
         "at": "/effect"
@@ -260,15 +255,6 @@
       }
     },
     {
-      "file": "bad/approval.v1/f-approval.v1.engine-tool-effect.call-form.json",
-      "schema": "approval.v1.json",
-      "rule": "The value at /effect/call_form is fixed by approval.v1.json#/$defs/engine_tool_effect/properties/call_form.",
-      "expect": {
-        "keyword": "const",
-        "at": "/effect/call_form"
-      }
-    },
-    {
       "file": "bad/approval.v1/f-approval.v1.engine-tool-effect.kind.json",
       "schema": "approval.v1.json",
       "rule": "The value at /effect/kind is fixed by approval.v1.json#/$defs/engine_tool_effect/properties/kind.",
@@ -386,33 +372,6 @@
       }
     },
     {
-      "file": "bad/approval.v1/m-approval.v1.call.cwd.json",
-      "schema": "approval.v1.json#/$defs/call",
-      "rule": "The object described at approval.v1.json#/$defs/call always carries 'cwd'.",
-      "expect": {
-        "keyword": "required",
-        "at": ""
-      }
-    },
-    {
-      "file": "bad/approval.v1/m-approval.v1.call.input.json",
-      "schema": "approval.v1.json#/$defs/call",
-      "rule": "The object described at approval.v1.json#/$defs/call always carries 'input'.",
-      "expect": {
-        "keyword": "required",
-        "at": ""
-      }
-    },
-    {
-      "file": "bad/approval.v1/m-approval.v1.call.tool.json",
-      "schema": "approval.v1.json#/$defs/call",
-      "rule": "The object described at approval.v1.json#/$defs/call always carries 'tool'.",
-      "expect": {
-        "keyword": "required",
-        "at": ""
-      }
-    },
-    {
       "file": "bad/approval.v1/m-approval.v1.digest-form.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/ always carries 'digest_form'.",
@@ -467,18 +426,9 @@
       }
     },
     {
-      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.call-form.json",
+      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.cwd.json",
       "schema": "approval.v1.json",
-      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'call_form'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/effect"
-      }
-    },
-    {
-      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.call.json",
-      "schema": "approval.v1.json",
-      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'call'.",
+      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'cwd'.",
       "expect": {
         "keyword": "required",
         "at": "/effect"
@@ -488,6 +438,15 @@
       "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.engine.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'engine'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/effect"
+      }
+    },
+    {
+      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.input.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'input'.",
       "expect": {
         "keyword": "required",
         "at": "/effect"
@@ -515,6 +474,15 @@
       "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.session-id.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'session_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/effect"
+      }
+    },
+    {
+      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.tool.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'tool'.",
       "expect": {
         "keyword": "required",
         "at": "/effect"
@@ -869,15 +837,6 @@
       "expect": {
         "keyword": "additionalProperties",
         "at": "/opened_by/0/principal"
-      }
-    },
-    {
-      "file": "bad/approval.v1/u-approval.v1.call.json",
-      "schema": "approval.v1.json",
-      "rule": "The object described at approval.v1.json#/$defs/call is closed: a field nobody defined is refused.",
-      "expect": {
-        "keyword": "additionalProperties",
-        "at": "/effect/call"
       }
     },
     {
@@ -4881,7 +4840,7 @@
     {
       "file": "good/methods.v1/h55-interrupt-on-a-driver-that-cannot-interrupt.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "shows": "An interrupt for an engine whose driver has no interrupt flag is 'unsupported', naming the flag. Stop still works."
+      "shows": "An interrupt for an engine whose driver has no interrupt flag falls back to Stop: the answer says which path was taken (the interrupt's outcome) and carries the Stop's own answer."
     },
     {
       "file": "good/methods.v1/h56-session-stop-of-no-session.json",
@@ -4902,6 +4861,11 @@
       "file": "good/methods.v1/h59-a-start-error-whose-detail-carries-colons.json",
       "schema": "methods.v1.json#/$defs/start_error",
       "shows": "The detail of a start error is the launch path's own text: it may carry colons, as when one refusal wraps the code of another."
+    },
+    {
+      "file": "good/methods.v1/h60-row-of-session-interrupt.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "shows": "The row of session.interrupt: it requires no driver flag, and says what it does without one: it falls back to Stop, then resumes."
     },
     {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",
@@ -8093,6 +8057,33 @@
       }
     },
     {
+      "file": "bad/methods.v1/m-methods.v1.row.falls-back.items.flag.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row/properties/falls_back/items always carries 'flag'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/falls_back/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.row.falls-back.items.then.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row/properties/falls_back/items always carries 'then'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/falls_back/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.row.falls-back.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row always carries 'falls_back'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
       "file": "bad/methods.v1/m-methods.v1.row.idempotency.json",
       "schema": "methods.v1.json#/$defs/row",
       "rule": "The object described at methods.v1.json#/$defs/row always carries 'idempotency'.",
@@ -8249,6 +8240,15 @@
       "file": "bad/methods.v1/m-methods.v1.row.scope.json",
       "schema": "methods.v1.json#/$defs/row",
       "rule": "The object described at methods.v1.json#/$defs/row always carries 'scope'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.row.service.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row always carries 'service'.",
       "expect": {
         "keyword": "required",
         "at": ""
@@ -9173,6 +9173,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/u-methods.v1.row.falls-back.items.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row/properties/falls_back/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/falls_back/0"
+      }
+    },
+    {
       "file": "bad/methods.v1/u-methods.v1.row.json",
       "schema": "methods.v1.json#/$defs/row",
       "rule": "The object described at methods.v1.json#/$defs/row is closed: a field nobody defined is refused.",
@@ -10088,6 +10097,24 @@
       "expect": {
         "keyword": "enum",
         "at": "/answer/routes/0/maturity"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.row.falls-back.items.flag.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The value at /falls_back/0/flag must be one of the values listed at methods.v1.json#/$defs/row/properties/falls_back/items/properties/flag.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/falls_back/0/flag"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.row.falls-back.items.then.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The value at /falls_back/0/then must be one of the values listed at methods.v1.json#/$defs/row/properties/falls_back/items/properties/then.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/falls_back/0/then"
       }
     },
     {

@@ -19,13 +19,61 @@ Nothing is frozen yet.
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.3 |
-| `event.v1.json` | 1.0-draft.3 |
-| `approval.v1.json` | 1.0-draft.3 |
+| `event.v1.json` | 1.0-draft.4 |
+| `approval.v1.json` | 1.0-draft.4 |
 | `driver.v2.json` | 1.0-draft.2 |
 | `mcp.task.v1.json` | 1.0-draft.2 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.4 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.5 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## Brought in line with the build plan's third revision (Nov 13, 2026)
+
+The build plan was revised again while the drafts below were being written, and it now carries the
+owner's two decisions. Where it differs from these drafts it wins. Three things changed for it here;
+the rest of its list is under "Not aligned yet" at the end of this section.
+
+### `approval.v1.json` is `1.0-draft.4`
+
+| Change from draft 3 | What it breaks |
+|---|---|
+| An engine-tool effect is flat: `kind`, `engine`, `session_id`, `run_id`, `tool`, `cwd`, `input` (an object). Draft 3's `call` and `call_form` are gone; the digest form in the record (`rfc8785/v1`) names and versions the form, strict profile included | Every producer and reader of draft 3's engine effect, and every digest of one |
+| `revision` counts changes to the request's CONTENT (its effect, its rendered lines, its deadline). An opening does not change it, and neither does an answer: an answer changes the state. Draft 3 raised it at an answer | A producer that raises the revision when a request is answered, carried out, vetoed or expires. `approval.answered` carries the same revision as the request |
+| The size rule is worded as a refusal with a typed code (`too_large`, `too_many_lines`), never a truncation. Still PROVISIONAL | Nothing |
+
+### `event.v1.json` is `1.0-draft.4`
+
+An interrupt's `outcome` is `delivered`, `fell_back_to_stop` or `no_live_turn`. Draft 3 had
+`unsupported` where `fell_back_to_stop` now stands: a driver that cannot interrupt does not leave the
+turn running, the run is asked to stop and the session resumes. What it breaks: a producer or reader of
+`unsupported` there.
+
+### `methods.v1.json` is `1.0-draft.5`
+
+| Change from draft 4 | What it breaks |
+|---|---|
+| A row gains `falls_back`: the driver flags whose absence changes how the method works instead of refusing it, each with what it does then (`session.interrupt` without `interrupt`: `stop_then_resume`; `session.steer` without `mid_turn_input`: `next_turn`). The answer says which path was taken | A reader of rows that lists a fixed set of columns |
+| `session.interrupt` requires no flag again. Draft 4 made it require `interrupt`; the plan says it falls back to Stop | A caller that expected `unsupported` from it on a driver that cannot interrupt |
+| A row gains `service`: the service the method needs, or null. Until a named service is ready, that method alone answers `unavailable` with detail `service_starting`. No row names one yet | The same readers of rows |
+
+**Reserved method names.** These names have no row yet and are answered `method_unknown`; they are
+listed here so that nobody uses one for something else: `device.pair_begin`, `device.list`,
+`device.revoke` (the lane that builds pairing), and `config.scan`, `config.offers`, `config.apply`,
+`prefs.export`, `prefs.import` (the lane that builds import). `methods.list` does not list them.
+
+### Not aligned yet with that revision
+
+These are in the plan's list and not in the drafts. Each is a breaking change to a draft, so each will
+be its own entry here when it lands.
+
+| In the plan | In the drafts today |
+|---|---|
+| The run record's `route`, `route_decision`, `workspace`, `owner`, `budget`, `session_id` and `turn_id` are ONE `launch` object, with `containment_level` and the route entry as it was loaded; `start_error` is reserved on the record | Separate optional fields; no `start_error` |
+| `steer.sent` replaces `steer.delivered`; `input.accepted` is the engine's typed acceptance of an input; `turn.started` and `steer.queued` carry fewer fields; a queue item is `delivered` only on `input.accepted` | `steer.delivered`; no `input.accepted`; the driver's parse cannot draft one |
+| `events.read` and `events.follow` take the cursor they return | They take a log id and a number |
+| The Task names its source (`turn` or `run`) and the run source is given field by field (a start that never launched is `failed` with code `start_failed`; no retained result is `failed` with `result_unavailable`; times come from the run's log) | `mcp.task.v1` draft 2, unchanged |
+| `state.changed.coalesced` may be null; `stop.requested` names a scope; the driver's `user_message` names its turn | As in draft 2 |
+| A plugin holding `run` may stop only a run whose `launch.owner` is that plugin (provisional) | Not stated |
 
 ## After the second cross-family read of these drafts (Nov 13, 2026)
 

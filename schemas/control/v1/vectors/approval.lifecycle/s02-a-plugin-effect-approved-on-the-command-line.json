@@ -346,7 +346,7 @@
       }
     },
     {
-      "what": "The owner approves it there. The revision becomes 2.",
+      "what": "The owner approves it there.",
       "principal": {
         "kind": "owner",
         "id": "local"
@@ -478,7 +478,7 @@
           },
           "answer": "approve",
           "answered_at": "2026-11-13T07:35:02.000Z",
-          "revision": 2
+          "revision": 1
         }
       },
       "record": {
@@ -594,7 +594,7 @@
         },
         "answer": "approve",
         "answered_at": "2026-11-13T07:35:02.000Z",
-        "revision": 2
+        "revision": 1
       }
     },
     {
@@ -729,7 +729,7 @@
         },
         "answer": "approve",
         "answered_at": "2026-11-13T07:35:02.000Z",
-        "revision": 2
+        "revision": 1
       }
     }
   ]

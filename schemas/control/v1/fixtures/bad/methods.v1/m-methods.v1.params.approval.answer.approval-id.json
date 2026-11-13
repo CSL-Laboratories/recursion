@@ -2,7 +2,7 @@
   "method": "approval.answer",
   "params": {
     "command_id": "tui-7c1e.0042",
-    "digest": "b2f03e58c884b88b4a04c063dfc3991bfd8896cb54cc0bbf9d8b5174e42cdd3d",
+    "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
     "answer": "deny",
     "expected_revision": 1,
     "surface": "tui"

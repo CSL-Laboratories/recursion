@@ -10,18 +10,15 @@
       "engine": "claude_code",
       "session_id": "ses-7f3a9c2e51d04b6a",
       "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-      "call_form": "csl-call/v1",
-      "call": {
-        "cwd": "/srv",
-        "input": {
-          "file_path": "notes/\u202egnp.exe",
-          "note": "a\u200bb\u007f"
-        },
-        "tool": "Write"
+      "tool": "Write",
+      "cwd": "/srv",
+      "input": {
+        "file_path": "notes/\u202egnp.exe",
+        "note": "a\u200bb\u007f"
       }
     },
     "digest_form": "rfc8785/v1",
-    "digest": "c77bbdbb10377ea41ab688dd303489a1c4aa559e43783742924d4a05a4d9ec4e",
+    "digest": "7608258824f0a15d66259fa8a78fb71db0f7a8cdca20ea4fccb1eff9e5dfedaa",
     "display": [],
     "rendered_form": "csl-approval-lines/v0",
     "rendered": [

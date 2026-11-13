@@ -1,8 +1,0 @@
-{
-  "cwd": "/home/dev/projets/café",
-  "input": {
-    "file_path": "notes/menú.txt",
-    "content": "café — 1.5 kg",
-    "weight_kg": 1.5
-  }
-}

@@ -141,8 +141,9 @@ today, keeps `csl-cj/v0`; nothing signed is migrated. The owner decided this and
 marked as possibly revisited: the form's name carries its version, so a later change is a new value in
 `digest_form`, not a new record.
 
-**The call of an engine tool** (profile `csl-call/v1`). Everything an engine supplied is in `call`:
-the tool's name, its input and the directory. It is read strictly and bound as a value:
+**The call of an engine tool.** An engine-tool effect carries the core's own fields (`kind`,
+`engine`, `session_id`, `run_id`) and what the engine supplied: `tool`, `cwd` and `input`, the
+tool's input as an object. The three are read strictly and bound as they are:
 
 | Question | Rule |
 |---|---|
@@ -155,7 +156,7 @@ the tool's name, its input and the directory. It is read strictly and bound as a
 | Unicode normalisation | None. A string is kept as it was written |
 | Depth | 64 at most |
 | What is hashed | The UTF-8 bytes of the WHOLE effect as RFC 8785 writes it: the core's own fields and the engine's call under one form. Keys in the order of their UTF-16 code units (U+10000 sorts before U+E000); numbers as ECMAScript writes them (`1.0` is `1`, `1e-7` is `1e-7`, minus zero is `0`, `1e21` is `1e+21`); strings as themselves |
-| Size | The call's text is at most 262,144 bytes and the approval's lines at most 200. A call that does not fit is never cut and never drawn: the core denies it without asking |
+| Size (PROVISIONAL) | `tool`, `cwd` and `input` together are at most 262,144 bytes as RFC 8785 writes them, and the approval's lines at most 200. A call that does not fit is refused with a typed code and is never truncated: no request is drawn |
 | What the lines show | The same text, except that a character a surface must never be handed raw is written as a `\u` escape: controls, the marks that reorder or hide text, private use, tags (the list is in `rules.py`, `NOT_SHOWN_RAW`, and is explicit so that it does not move with a Unicode version). Text an engine supplied is always drawn as JSON text, quotes included, so two different values never draw the same line |
 | What is carried out | The call that was bound. Where an engine's permission protocol lets the answer carry the input, the driver sends back the bound input; otherwise the private binding to the engine's own pending request is the link |
 
@@ -172,14 +173,14 @@ of characters shown as escapes, and the size rule. The alternative to "deny with
 prompt that shows part of the call and makes the owner read the rest before an answer is taken, which
 is a protocol of its own.
 
-**Revision.** `revision` is the revision of the request and of what it shows. It starts at 1 and rises
-by one at every change of the request: an answer, the effect being carried out, a veto, the deadline
-passing. Recording that a surface showed the request (`approval.open`) is a note about the request, not
-a change of it: it does not raise the revision, and the note carries the revision that was shown. What
-a pending request shows never changes, so a pending request is at revision 1 and an answer names
-`expected_revision` 1. `vectors/approval.lifecycle/` walks one request through an answer before any
-showing, two surfaces, a wrong digest, a stale revision, the answer, a retry of the same command, the
-same command id with another answer, a second answer, and an engine trying to answer.
+**Revision.** `revision` counts changes to the request's CONTENT: its effect, its rendered lines,
+its deadline. It starts at 1. A showing (`approval.open`) does not change it, and neither does an
+answer: an answer changes the request's state, not its content. An opening carries the revision that
+was shown, and an answer names the revision it read, so if the content ever changes everyone must
+look again before an answer is taken. `vectors/approval.lifecycle/` walks one request through an
+answer before any showing, two surfaces, a wrong digest, a stale revision, the answer, a retry of the
+same command, the same command id with another answer, a second answer, and an engine trying to
+answer.
 
 ## The method table
 

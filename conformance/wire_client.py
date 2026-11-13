@@ -418,8 +418,9 @@ def check_vector(schemas: SchemaSet, entry: dict) -> str | None:
             return f"taken as {text[:80]}, expected the refusal '{expect['refused']}'"
         if text != expect["call_text"]:
             return f"the call's text is {text[:200]!r}, expected {expect['call_text'][:200]!r}"
-        misfit = _misfit(schemas, "approval.v1.json#/$defs/call", call)
-        return f"the call does not fit its schema: {misfit}" if misfit else None
+        effect = {"kind": "engine_tool", "engine": "claude_code", "session_id": None, "run_id": "run-vector", **call}
+        misfit = _misfit(schemas, "approval.v1.json#/$defs/engine_tool_effect", effect)
+        return f"the call does not fit an engine-tool effect: {misfit}" if misfit else None
     if rule == "approval.binding":
         # One approval record of the right shape, and exactly what does not agree inside it.
         record = vector["record"]

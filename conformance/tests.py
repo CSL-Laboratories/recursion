@@ -77,7 +77,7 @@ class PublishedFilesTest(unittest.TestCase):
             ("api.v1.json", "/$defs/tool/properties/input_schema"),       # a JSON Schema, the plugin's own
             ("approval.v1.json", "/properties/effect"),                   # typed per source by the rules below it
             ("approval.v1.json", "/$defs/plugin_effect/properties/payload"),  # the plugin's own data, never read
-            ("approval.v1.json", "/$defs/call/properties/input"),         # the tool's own input, never interpreted
+            ("approval.v1.json", "/$defs/engine_tool_effect/properties/input"),  # the tool's own input, never interpreted
             ("driver.v2.json", "/$defs/event_draft/properties/payload"),  # typed per type by the rules below it
         }
         rules = ("allOf", "if", "then", "else", "not")

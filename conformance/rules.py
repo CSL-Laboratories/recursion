@@ -13,8 +13,8 @@ What is here:
 * ``read_strict``: the strict reading of JSON text that came from an engine (the input of a tool call).
 * ``text_of``: the text of a value as RFC 8785 writes it; its UTF-8 bytes are what is hashed. With
   ``display`` on, the same text with the characters no terminal should be handed raw written as escapes.
-* ``call_of`` and ``check_call``: the call of an engine tool (its tool, its input, its directory), profile
-  ``csl-call/v1``.
+* ``call_of``, ``call_in`` and ``check_call``: what an engine supplied for one tool call (its tool, its
+  input, its directory) and the strict profile it is held to.
 * ``canonical_v0``: the restricted canonical JSON ``csl-cj/v0`` that plugin effects and today's
   signatures use.
 * ``effect_bytes`` and ``digest_of``: the bytes an approval's digest is taken over, by ``digest_form``.
@@ -37,7 +37,6 @@ CJ_MAX_DEPTH = 32            # of csl-cj/v0, as plugin_security/canonical.py has
 CALL_MAX = 262144            # UTF-8 bytes of a call's text; a larger call is never drawn and never approved
 LINE_PIECE = 4000            # characters of a value on one rendered line; the rest continues on the next
 LINES_MAX = 200              # rendered lines of one approval; an effect that needs more is never drawn
-CALL_FORM = "csl-call/v1"
 LINES_FORM = "csl-approval-lines/v0"
 DIGEST_FORMS = {"engine_tool": "rfc8785/v1", "plugin_effect": "csl-cj/v0"}
 
@@ -230,7 +229,7 @@ def text_of(value, display: bool = False) -> str:
 # ------------------------------------------------------------------------------ the call of a tool
 
 def check_call(call) -> None:
-    """Refuse a call that is not in profile ``csl-call/v1``.
+    """Refuse a call that is not in the strict profile of digest form ``rfc8785/v1``.
 
     A call is ``{"cwd": ..., "input": {...}, "tool": ...}`` and nothing else: the tool's name (1 to 256
     characters), the tool's input (an object) and the directory the call would run in (a string, or
@@ -262,6 +261,11 @@ def call_of(tool, input_text: str, cwd) -> dict:
     call = {"cwd": cwd, "input": value, "tool": tool}
     check_call(call)
     return call
+
+
+def call_in(effect: dict) -> dict:
+    """The engine's own part of an engine-tool effect: its ``tool``, its ``cwd`` and its ``input``."""
+    return {"cwd": effect["cwd"], "input": effect["input"], "tool": effect["tool"]}
 
 
 # --------------------------------------------------------------------------- csl-cj/v0 and the digest
@@ -350,7 +354,7 @@ def approval_lines(source: str, effect: dict) -> list:
         return {"text": label + text_of(value, display=True), "trust": "untrusted"}
 
     if source == "engine_tool":
-        call = effect["call"]
+        call = call_in(effect)
         check_call(call)
         lines = [core("Tool call waiting for an answer"),
                  core("engine: " + effect["engine"]),
@@ -394,7 +398,7 @@ def approval_problems(record: dict) -> list:
     source, effect = record.get("source"), record.get("effect")
     if source == "engine_tool":
         try:
-            check_call(effect["call"])
+            check_call(call_in(effect))
         except (Refused, KeyError, TypeError):
             problems.append("call")
     if not isinstance(source, str) or record.get("digest_form") != DIGEST_FORMS.get(source):
@@ -511,12 +515,11 @@ def transcript_problems(events: list, lines: list) -> list:
 class ApprovalModel:
     """approval.open and approval.answer on one request, one call at a time.
 
-    ``revision`` is the revision of the request and of what it shows. It starts at 1 and rises by one at
-    every change of the request: an answer, the effect being carried out, a veto, the deadline passing.
-    Recording that a surface showed the request is a note about the request, not a change of it, and
-    does not raise the revision; the note carries the revision that was shown. So while a request is
-    pending and what it shows cannot change, its revision stays 1; if a later version ever lets the
-    shown content change, that raises the revision and everyone must look again.
+    ``revision`` counts changes to the request's CONTENT: its effect, its rendered lines, its deadline.
+    It starts at 1. A showing does not change it and neither does an answer: the state of the request
+    changes, its content does not. An opening carries the revision that was shown, so if the content
+    ever changes (a deadline moved, say), the revision rises and everyone must look again before an
+    answer is taken.
 
     The order of checks for approval.answer: the caller is an owner or a device (else scope_refused);
     the same command id with the same params returns the first answer, and with other params is
@@ -570,5 +573,5 @@ class ApprovalModel:
         if params["digest"] != record["digest"]:
             return {"code": "conflict", "detail": "digest_mismatch", **refusal}
         record.update(state="approved" if params["answer"] == "approve" else "denied", answered_by=principal,
-                      answer=params["answer"], answered_at=at, revision=record["revision"] + 1)
+                      answer=params["answer"], answered_at=at)
         return {"code": "ok", "approval": copy.deepcopy(record)}

@@ -93,8 +93,11 @@ def require_launcher_platform():
 class RunContext:
     """One control-API run while its route request is in flight. Set by the starter, read by the launcher."""
 
-    def __init__(self, run_id):
+    def __init__(self, run_id, *, breaker=None):
         self.run_id = run_id
+        self.breaker = breaker
+        self.admitted = None
+        self.bound = False
         self.cgroup = None
         self.process = None
         self.result = None
@@ -428,6 +431,20 @@ class ProductionLauncher:
             # One unit per run id. A second launch for the same run (a fallback route) needs its own
             # run record, which the control API does not have yet.
             raise refused('run_already_launched')
+        if ctx.breaker is not None and ctx.admitted is None:
+            # The run is bound to what the breaker admitted, and the route service asks the breaker
+            # before every launch, so an admission is always on record here. If a path ever arrives
+            # without one, the launch is refused: an engine is never started unbound beside a breaker.
+            raise refused('breaker_admission_missing')
+        if ctx.breaker is not None and ctx.admitted is not None and not ctx.bound:
+            error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1])
+            if error is not None:
+                raise refused('breaker_bind_failed:' + error)
+            ctx.bound = True
+            if ctx.cancelled:
+                # The bind can wait on the store for longer than the start waits. The start has then
+                # given up and been answered: launch nothing for it.
+                raise refused('start_abandoned')
         validated = self.child_environment(env)
         try:
             executable = _resolve_executable(argv[0], validated)
@@ -443,7 +460,7 @@ class ProductionLauncher:
         unit = f'recursion-run-{ctx.run_id}.service'
         if not UNIT.fullmatch(unit):
             raise refused('run_id')
-        stdin_fd = env_fd = None
+        stdin_fd = env_fd = pidfd = None
         process = None
         try:
             for name in ('stdin.fifo', 'env.fifo'):
@@ -479,6 +496,8 @@ class ProductionLauncher:
                 process.close()
             else:
                 self._fence_quietly(ctx.run_id)
+                if pidfd is not None:
+                    os.close(pidfd)
             if stdin_fd is not None:
                 os.close(stdin_fd)
             raise

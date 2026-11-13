@@ -332,6 +332,32 @@ class LeafTests(unittest.TestCase):
             with self.assertRaises((TypeError, ValueError), msg=repr(bad)):
                 self.root.sweep(keep=bad)
 
+    def test_adopted_leaf_works_as_context_manager_and_bad_leaf_is_not_walked(self):
+        orphan = self.orphan_leaf('run-adopted')
+        with self.root.adopt('run-adopted') as adopted:
+            pass
+        orphan.wait(5)
+        self.assertEqual(adopted.outcome.state, 'empty')
+        self.assertEqual(self.leaves(), [])
+
+        outside = self.mount.parent / 'outside-victim'
+        outside.mkdir()
+        (outside / 'cgroup.procs').touch()
+        touched = []
+
+        class SymlinkSwapFs(FakeCgroup):
+            def make_leaf(self, leaf):
+                os.symlink(outside, leaf)
+
+            def populated(self, leaf):
+                touched.append(os.path.realpath(leaf))
+                return super().populated(leaf)
+
+        swap_root = DelegatedRoot(self.root_path, SymlinkSwapFs(self.mount))
+        with self.assertRaises(PermissionError):
+            swap_root.launch('run-swapped', ['true'])
+        self.assertEqual(touched, [])
+
     def test_adopt_refuses_missing_or_bad_leaf(self):
         with self.assertRaises(PermissionError):
             self.root.adopt('run-missing')

@@ -507,7 +507,13 @@ class PluginHost:
                                     '(it stays marked degraded)', plugin_id)
                     self._turn.notify_all()
 
-        threading.Thread(target=run, name='recursion-operator-read', daemon=True).start()
+        try:
+            threading.Thread(target=run, name='recursion-operator-read', daemon=True).start()
+        except BaseException:
+            with self._turn:
+                self._busy = False
+                self._turn.notify_all()
+            raise
         if done.wait(self._operator_deadline_s):
             return outcome
         with self._turn:

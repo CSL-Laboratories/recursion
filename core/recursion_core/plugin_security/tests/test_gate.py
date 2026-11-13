@@ -281,11 +281,22 @@ class AuthorityFieldTests(unittest.TestCase):
         # Bot review 4511542761 at 7e5c3502: run.bind accepted "vendor/model" and "@", but profile validation
         # refused both, so no profile could authorise an order from such a run.
         from recursion_core.plugin_security import authority, breaker
-        self.assertEqual(authority._MODEL_VALUE.pattern, breaker._ID.pattern)
+        self.assertEqual(authority._PROVIDER_VALUE.pattern, breaker._ID.pattern)
         self.w.bind("run-3", "conn-a", provider="acme", model_version="acme/model-v1@2026-11")
         env = profile(self.w.installer, profile_id="prof-3", provider="acme", model_version="acme/model-v1@2026-11")
         self.assertTrue(self._authorize(effect(run_id="run-3"), env)["ok"])
         env = profile(self.w.installer, profile_id="prof-4", model_version="bad model")
+        self.assertEqual(_code(self._authorize(effect(), env)), "profile_model")
+        # A model the store records outside the id grammar: bound, named and authorised like the one above.
+        self.w.bind("run-5", "conn-a", provider="acme", model_version="opus[1m]")
+        env = profile(self.w.installer, profile_id="prof-5", provider="acme", model_version="opus[1m]")
+        self.assertTrue(self._authorize(effect(run_id="run-5"), env)["ok"])
+        # Naming it does not loosen the match: a run bound to another spelling is still refused.
+        self.w.bind("run-6", "conn-a", provider="acme", model_version="opus")
+        env = profile(self.w.installer, profile_id="prof-6", provider="acme", model_version="opus[1m]")
+        self.assertEqual(_code(self._authorize(effect(run_id="run-6"), env)), "profile_model_mismatch")
+        # The provider keeps the id grammar, in a profile as in the store.
+        env = profile(self.w.installer, profile_id="prof-7", provider="acme[1]")
         self.assertEqual(_code(self._authorize(effect(), env)), "profile_model")
 
 @needs_crypto

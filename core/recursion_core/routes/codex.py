@@ -21,7 +21,8 @@ Typed limit signals:
   kind. A tie on that kind keeps the exhausted reading. Two exhausted readings on that tie keep the
   later known reset. When one of them names no numeric ``resetsAt``, the known instant stays and the
   signal says the reset is unknown, so the breaker waits until the later of that instant and its
-  escalating cooldown. A strictly newer snapshot of the same kind replaces the stored reading.
+  escalating cooldown. That unknown mark stays on the window when a different stamp kind names the
+  later or an equal instant. A strictly newer snapshot of the same kind replaces the stored reading.
   An exhausted snapshot of a different kind keeps its own reset: a later healthy reading of one
   kind does not clear the others, and each stands until its reset. When neither snapshot carries
   a stamp, an
@@ -345,8 +346,9 @@ def _reported(open_windows: dict[tuple[str, str], dict]) -> dict | None:
 def _window_from_kinds(kinds: dict[str, tuple]) -> dict | None:
     """The exhausted readings of one window. Incomparable kinds both stand.
 
-    A missing reset does not drop a known one. The signal is marked unknown so one kind's missing
-    instant is not stored as that known reset.
+    A missing reset does not drop a known one. Unknown is the OR of every exhausted kind: its
+    ``reset_unknown`` flag, or a reset that is missing. The mark is copied onto the returned
+    window whichever kind's instant is later.
     """
 
     chosen = None
@@ -354,11 +356,12 @@ def _window_from_kinds(kinds: dict[str, tuple]) -> dict | None:
     for _stamp, _local, signal in kinds.values():
         if signal is None:
             continue
-        if _reset_value(signal) is None:
+        if signal.get("reset_unknown") is True or _reset_value(signal) is None:
             unknown = True
         chosen = signal if chosen is None else _later_reset(chosen, signal)
     if chosen is None:
         return None
+    chosen = _without_nonfinite_reset(chosen)
     if not unknown:
         return chosen
     marked = dict(chosen)
@@ -370,16 +373,32 @@ def _reset_value(signal: dict) -> float | None:
     value = signal.get("reset_at")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _without_nonfinite_reset(signal: dict) -> dict:
+    """Drop a NaN or infinite reset. A finite or absent reset is the same signal."""
+
+    value = signal.get("reset_at")
+    if isinstance(value, float) and not math.isfinite(value):
+        cleaned = dict(signal)
+        cleaned["reset_at"] = None
+        return cleaned
+    return signal
 
 
 def _later_reset(kept: dict, incoming: dict) -> dict:
-    """The exhausted signal whose reset is later. A missing reset does not shorten a known one."""
+    """The exhausted signal whose reset is later. A missing or non-finite reset does not shorten a known one."""
 
     new_at, old_at = _reset_value(incoming), _reset_value(kept)
     if new_at is not None and (old_at is None or new_at > old_at):
-        return incoming
-    return kept
+        chosen = incoming
+    else:
+        chosen = kept
+    return _without_nonfinite_reset(chosen)
 
 
 def _merge_tied_exhaustion(kept: dict, incoming: dict) -> dict:

@@ -8,6 +8,7 @@ that has already passed the deadline still writes to the child.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import tempfile
@@ -642,6 +643,101 @@ class LimitSignalAccountingTest(unittest.TestCase):
         self.assertEqual(blocked["code"], c.BREAKER_OPEN)
         self.assertEqual(blocked["retry_at"], 1_000_000.0 + month)
         self.assertEqual(len(h.launcher.calls), 1)
+
+    def _primary_note(self, stamp: dict, primary: dict) -> dict:
+        return {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "limitId": "codex", **stamp, "primary": {"usedPercent": 100, **primary}}}}
+
+    def _unknown_across_kinds_holds_until_the_cooldown(self, notes: list[dict]) -> None:
+        # Clock 1_000_000, cooldown 300, primary only. The notes arrive during the read.
+        # One kind's tie stored reset_unknown beside a known instant. The window must keep
+        # that mark whichever kind's instant wins, so the hold is the later of +100s and
+        # the cooldown. Dropping the mark plans retry_at +100s and the next launch runs.
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            *notes,
+            {"id": 2, "result": {"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 10}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_100.0)
+        self.assertIs(res["limit"].get("reset_unknown"), True)
+        self.assertEqual(res["retry_at"], 1_000_300.0)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertNotIn("thread/start", methods)
+        h.clock.advance(100)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(blocked["retry_at"], 1_000_300.0)
+        self.assertEqual(len(h.launcher.calls), 1)
+        h.clock.advance(200)
+        probe = h.handle(request(rid="probe", engine="codex", model="gpt-5"))
+        self.assertEqual(probe["text"], "should-not-run")
+        self.assertEqual(probe["breaker_effect"], "closed")
+        self.assertEqual(len(h.launcher.calls), 2)
+
+    def test_a_tied_unknown_reset_is_kept_when_a_later_kind_follows(self) -> None:
+        # generation 10 at +10s, the same generation with no resetsAt, then timestamp 1 at +100s.
+        self._unknown_across_kinds_holds_until_the_cooldown([
+            self._primary_note({"generation": 10}, {"resetsAt": 1_000_010}),
+            self._primary_note({"generation": 10}, {}),
+            self._primary_note({"timestamp": 1}, {"resetsAt": 1_000_100}),
+        ])
+
+    def test_a_tied_unknown_reset_is_kept_when_a_later_kind_comes_first(self) -> None:
+        # The same three readings, reversed. The timestamp is stored first and is the later instant.
+        self._unknown_across_kinds_holds_until_the_cooldown([
+            self._primary_note({"timestamp": 1}, {"resetsAt": 1_000_100}),
+            self._primary_note({"generation": 10}, {}),
+            self._primary_note({"generation": 10}, {"resetsAt": 1_000_010}),
+        ])
+
+    def test_a_shared_instant_keeps_unknown_when_the_plain_kind_is_stored_first(self) -> None:
+        # Both kinds name +100s. The plain timestamp is stored first. On that tie the first
+        # signal is kept, so the generation's unknown mark is dropped and a probe runs at +100s.
+        self._unknown_across_kinds_holds_until_the_cooldown([
+            self._primary_note({"timestamp": 1}, {"resetsAt": 1_000_100}),
+            self._primary_note({"generation": 10}, {"resetsAt": 1_000_100}),
+            self._primary_note({"generation": 10}, {}),
+        ])
+
+    def test_a_shared_instant_keeps_unknown_when_the_marked_kind_is_stored_first(self) -> None:
+        # The same shared instant, with the generation tie stored first.
+        self._unknown_across_kinds_holds_until_the_cooldown([
+            self._primary_note({"generation": 10}, {"resetsAt": 1_000_100}),
+            self._primary_note({"generation": 10}, {}),
+            self._primary_note({"timestamp": 1}, {"resetsAt": 1_000_100}),
+        ])
+
+    def test_later_reset_treats_a_nonfinite_instant_as_absent(self) -> None:
+        # vendor_reset already drops a non-finite resetsAt. The fold helper must not
+        # return one either: a NaN compares false in both directions and would win by
+        # being the stored signal.
+        from recursion_core.routes.codex import _later_reset
+
+        finite = c.limit_signal("connection", "test", reset_at=1_000_100.0)
+        missing = c.limit_signal("connection", "test", reset_at=None)
+        for bad_at in (float("nan"), float("inf"), float("-inf")):
+            bad = dict(finite, reset_at=bad_at)
+            for result in (
+                _later_reset(bad, finite),
+                _later_reset(finite, bad),
+                _later_reset(bad, missing),
+                _later_reset(missing, bad),
+                _later_reset(bad, dict(bad)),
+            ):
+                reset = result.get("reset_at")
+                self.assertFalse(isinstance(reset, float) and not math.isfinite(reset))
+            self.assertEqual(_later_reset(bad, finite)["reset_at"], 1_000_100.0)
+            self.assertEqual(_later_reset(finite, bad)["reset_at"], 1_000_100.0)
+            self.assertIsNone(_later_reset(bad, missing)["reset_at"])
+            self.assertIsNone(_later_reset(missing, bad)["reset_at"])
+            self.assertIsNone(_later_reset(bad, dict(bad))["reset_at"])
 
     def test_an_incomparable_exhausted_snapshot_does_not_shorten_a_known_reset(self) -> None:
         # generation=10 is 30 days out. A timestamped exhausted read at +10s is a different

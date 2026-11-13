@@ -1091,15 +1091,17 @@ def _stopped_row_without_cgroup(reg: InMemoryRunRegistry, cgroup: str | None) ->
 class ReviewDeepSixTest(unittest.TestCase):
     def test_an_empty_written_cgroup_does_not_accept_a_foreign_recorded_stop(self) -> None:
         # The row is stopped, the proof names no cgroup, and the id is in _launched
-        # with no cgroup. Confirm runs on that empty cgroup. put returns a recorded
-        # stop of /cg/other while the stored row is running with late/9 alive.
-        # That returned stop is not the write. CLI must not exit 0, and MCP must
-        # set isError. Each surface is the first stop on its own registry.
+        # with no cgroup. Stop must not call request_stop and must not put: that
+        # put only bumps generation, and a registry that answered it with another
+        # cgroup's stop must not be consulted. The row stays stopped, with no
+        # member planted. CLI must not exit 0, and MCP must set isError. Each
+        # surface is the first stop on its own registry.
         for written in (None, ""):
             with self.subTest(written=written):
                 reg = _ForeignStopOnEmptyCgroup()
-                api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
                 fresh = _stopped_row_without_cgroup(reg, written)
+                before = fresh["generation"]
                 api._launched["r1"] = dict(fresh)
                 api._launched["r1"]["cgroup"] = written
                 out, err = io.StringIO(), io.StringIO()
@@ -1107,31 +1109,37 @@ class ReviewDeepSixTest(unittest.TestCase):
                 res = json.loads(out.getvalue())
                 self.assertEqual(res["code"], a.PENDING)
                 self.assertEqual(res["state"], "pending")
-                self.assertEqual(res["reason"], "member_alive")
+                self.assertEqual(res["reason"], "cgroup_unknown")
                 self.assertNotEqual(res["code"], a.STOPPED)
                 self.assertIsNot(res.get("repeat"), True)
                 self.assertNotEqual(code, 0)
                 self.assertEqual(code, cli.EXIT_PENDING)
                 self.assertNotIn(res["code"], a.SUCCESS_CODES)
+                self.assertEqual(kill.requests, [])
                 stored = reg.get("r1")
                 assert stored is not None
-                self.assertNotEqual(stored["state"], "stopped")
-                self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
-                self.assertIs(reg.process_alive(9), True)
+                self.assertEqual(stored["generation"], before)
+                self.assertEqual(stored["state"], "stopped")
+                self.assertEqual(stored["members"], [])
+                self.assertFalse(a._recorded_stop(stored))
 
                 reg = _ForeignStopOnEmptyCgroup()
-                api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
                 fresh = _stopped_row_without_cgroup(reg, written)
+                before = fresh["generation"]
                 api._launched["r1"] = dict(fresh)
                 api._launched["r1"]["cgroup"] = written
                 tool = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r1"})
                 self.assertTrue(tool["isError"])
                 self.assertEqual(tool["structuredContent"]["code"], a.PENDING)
+                self.assertEqual(tool["structuredContent"]["reason"], "cgroup_unknown")
                 self.assertNotEqual(tool["structuredContent"]["code"], a.STOPPED)
+                self.assertEqual(kill.requests, [])
                 stored = reg.get("r1")
                 assert stored is not None
-                self.assertNotEqual(stored["state"], "stopped")
-                self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+                self.assertEqual(stored["generation"], before)
+                self.assertEqual(stored["state"], "stopped")
+                self.assertEqual(stored["members"], [])
 
     def test_a_same_cgroup_snapshot_is_checked_against_the_stored_members(self) -> None:
         # put returns a recorded stop of the cgroup that was written, with no
@@ -1220,6 +1228,379 @@ class ReviewDeepSixTest(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue())["code"], a.PENDING)
         self.assertTrue(mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r1"})["isError"])
+
+
+def _attested_stop_snapshot(record: dict, current: dict, *, cgroup_field: str) -> dict:
+    """A stopped dict whose proof names the cgroup ``record`` was writing.
+
+    ``cgroup_field`` is ``keep`` (the row cgroup equals that path), ``empty``,
+    ``none``, or ``absent`` (the key is left off).
+    """
+    generation = record.get("generation")
+    if not isinstance(generation, int):
+        generation = current.get("generation") if isinstance(current.get("generation"), int) else 1
+    written = record.get("cgroup")
+    marker = record.get("cgroup_marker")
+    snap = {
+        "run_id": record["run_id"],
+        "tenant": current.get("tenant"),
+        "engine": current.get("engine"),
+        "state": "stopped",
+        "cgroup_marker": marker,
+        "generation": generation,
+        "members": [],
+        "stop_attestation": {
+            "proof": "empty",
+            "cgroup": written,
+            "cgroup_marker": marker,
+            "member_ids": [],
+            "generation": generation,
+        },
+    }
+    if cgroup_field == "empty":
+        snap["cgroup"] = ""
+    elif cgroup_field == "none":
+        snap["cgroup"] = None
+    elif cgroup_field == "keep":
+        snap["cgroup"] = written
+    return snap
+
+
+class _UnreadableAfterStoppedPut(InMemoryRunRegistry):
+    """A stopped put stores running late/9 and returns a recorded-stop snapshot.
+
+    Later reads either raise ``OSError`` or return None. The snapshot is not the row.
+    """
+
+    def __init__(self, mode: str) -> None:
+        super().__init__(processes=lambda _pid: True)
+        self.mode = mode
+        self.blind = False
+        self.hidden: dict | None = None
+        self.stopped_puts = 0
+
+    def put(self, record: dict):
+        if record.get("state") == "stopped":
+            self.stopped_puts += 1
+            current = self._runs.get(record["run_id"])
+            assert current is not None
+            planted = dict(current)
+            planted["state"] = "running"
+            planted["members"] = [{"member_id": "late", "pid": 9}]
+            planted["stop"] = None
+            planted["stop_attestation"] = None
+            self._runs[record["run_id"]] = planted
+            self.hidden = planted
+            self.blind = True
+            return _attested_stop_snapshot(record, current, cgroup_field="keep")
+        return super().put(record)
+
+    def get(self, run_id: str):
+        row = super().get(run_id)
+        if self.blind:
+            self.hidden = row
+            if self.mode == "oserror":
+                raise OSError("disk")
+            return None
+        return row
+
+
+class _BlankCgroupSnapshot(InMemoryRunRegistry):
+    """A stopped put stores running late/9 and returns a stop whose row cgroup is blank.
+
+    The attestation still names the cgroup that was written. Later reads return that
+    same snapshot, so a check that only trusts the proof does not see late/9.
+    """
+
+    def __init__(self, cgroup_field: str) -> None:
+        super().__init__(processes=lambda _pid: True)
+        self._cgroup_field = cgroup_field
+        self._lie: dict | None = None
+        self.hidden: dict | None = None
+        self.stopped_puts = 0
+
+    def put(self, record: dict):
+        if record.get("state") == "stopped":
+            self.stopped_puts += 1
+            current = self._runs.get(record["run_id"])
+            assert current is not None
+            planted = dict(current)
+            planted["state"] = "running"
+            planted["members"] = [{"member_id": "late", "pid": 9}]
+            planted["stop"] = None
+            planted["stop_attestation"] = None
+            self._runs[record["run_id"]] = planted
+            self.hidden = planted
+            self._lie = _attested_stop_snapshot(record, current, cgroup_field=self._cgroup_field)
+            return _attested_stop_snapshot(record, current, cgroup_field=self._cgroup_field)
+        return super().put(record)
+
+    def get(self, run_id: str):
+        if self._lie is not None:
+            self.hidden = super().get(run_id)
+            return _attested_stop_snapshot(
+                {"run_id": run_id, "cgroup": self._lie["stop_attestation"]["cgroup"],
+                 "cgroup_marker": self._lie.get("cgroup_marker"),
+                 "generation": self._lie.get("generation")},
+                self._lie, cgroup_field=self._cgroup_field)
+        return super().get(run_id)
+
+
+class ReviewDeepSevenTest(unittest.TestCase):
+    def test_an_unreadable_reread_after_a_stopped_put_is_not_stopped(self) -> None:
+        # put returns a recorded stop of the cgroup that was written. The following
+        # get raises, or returns None, and the stored row is still running with
+        # late/9 alive. Copying the put snapshot answers stopped (CLI exit 0, MCP
+        # isError false). The re-read has to succeed. Each surface is the first
+        # stop on its own registry. A second stop does not kill again.
+        for mode in ("oserror", "none"):
+            with self.subTest(mode=mode):
+                reg = _UnreadableAfterStoppedPut(mode)
+                api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+                res = api.call("run.stop", {"run_id": run})
+                self.assertEqual(res["code"], a.PENDING)
+                self.assertEqual(res["state"], "pending")
+                self.assertEqual(res["reason"], "stop_unverified")
+                self.assertIs(res["recorded"], False)
+                self.assertNotEqual(res["code"], a.STOPPED)
+                self.assertIsNot(res.get("repeat"), True)
+                self.assertNotIn(res["code"], a.SUCCESS_CODES)
+                self.assertEqual(len(kill.requests), 1)
+                self.assertEqual(reg.stopped_puts, 1)
+                assert reg.hidden is not None
+                self.assertEqual(reg.hidden["state"], "running")
+                self.assertEqual(reg.hidden["members"], [{"member_id": "late", "pid": 9}])
+                self.assertIs(reg.process_alive(9), True)
+                again = api.call("run.stop", {"run_id": run})
+                self.assertNotEqual(again["code"], a.STOPPED)
+                self.assertNotIn(again["code"], a.SUCCESS_CODES)
+                self.assertEqual(len(kill.requests), 1)
+                self.assertEqual(reg.stopped_puts, 1)
+
+                reg = _UnreadableAfterStoppedPut(mode)
+                api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+                out, err = io.StringIO(), io.StringIO()
+                code = cli.main(["stop", run], api, out, err)
+                body = json.loads(out.getvalue())
+                self.assertEqual(body["code"], a.PENDING)
+                self.assertEqual(body["reason"], "stop_unverified")
+                self.assertNotEqual(code, 0)
+                self.assertEqual(code, cli.EXIT_PENDING)
+                self.assertEqual(len(kill.requests), 1)
+                assert reg.hidden is not None
+                self.assertEqual(reg.hidden["members"], [{"member_id": "late", "pid": 9}])
+
+                reg = _UnreadableAfterStoppedPut(mode)
+                api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+                tool = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": run})
+                self.assertTrue(tool["isError"])
+                self.assertEqual(tool["structuredContent"]["code"], a.PENDING)
+                self.assertEqual(tool["structuredContent"]["reason"], "stop_unverified")
+                self.assertNotEqual(tool["structuredContent"]["code"], a.STOPPED)
+                self.assertEqual(len(kill.requests), 1)
+
+    def test_a_returned_snapshot_with_a_blank_cgroup_is_not_the_written_stop(self) -> None:
+        # The attestation names the cgroup that was written. The returned row's
+        # cgroup is "", None, or missing. That is not the written cgroup. The
+        # stored row is running with late/9. CLI must not exit 0, and MCP must
+        # set isError. One kill, and the stopped put is not repeated.
+        for field in ("empty", "none", "absent"):
+            with self.subTest(field=field):
+                written = {"run_id": "r", "state": "stopped", "cgroup": "/cg/written",
+                           "cgroup_marker": "cg-1", "generation": 2}
+                current = {"tenant": "t", "engine": "e", "generation": 2}
+                stored = _attested_stop_snapshot(written, current, cgroup_field=field)
+                self.assertFalse(a._stop_snapshot_ok(written, stored))
+
+                reg = _BlankCgroupSnapshot(field)
+                api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+                res = api.call("run.stop", {"run_id": run})
+                self.assertEqual(res["code"], a.PENDING)
+                self.assertEqual(res["state"], "pending")
+                self.assertEqual(res["reason"], "stop_unverified")
+                self.assertIs(res.get("recorded"), False)
+                self.assertNotEqual(res["code"], a.STOPPED)
+                self.assertIsNot(res.get("repeat"), True)
+                self.assertNotIn(res["code"], a.SUCCESS_CODES)
+                self.assertEqual(len(kill.requests), 1)
+                self.assertEqual(reg.stopped_puts, 1)
+                assert reg.hidden is not None
+                self.assertEqual(reg.hidden["state"], "running")
+                self.assertEqual(reg.hidden["members"], [{"member_id": "late", "pid": 9}])
+                self.assertIs(reg.process_alive(9), True)
+                again = api.call("run.stop", {"run_id": run})
+                self.assertEqual(len(kill.requests), 1)
+                self.assertEqual(reg.stopped_puts, 1)
+
+                reg = _BlankCgroupSnapshot(field)
+                api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+                out, err = io.StringIO(), io.StringIO()
+                code = cli.main(["stop", run], api, out, err)
+                body = json.loads(out.getvalue())
+                self.assertEqual(body["code"], a.PENDING)
+                self.assertEqual(body["reason"], "stop_unverified")
+                self.assertNotEqual(code, 0)
+                self.assertEqual(code, cli.EXIT_PENDING)
+                self.assertNotIn(body["code"], a.SUCCESS_CODES)
+
+                reg = _BlankCgroupSnapshot(field)
+                api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+                tool = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": run})
+                self.assertTrue(tool["isError"])
+                self.assertEqual(tool["structuredContent"]["code"], a.PENDING)
+                self.assertEqual(tool["structuredContent"]["reason"], "stop_unverified")
+                self.assertNotEqual(tool["structuredContent"]["code"], a.STOPPED)
+
+    def test_a_missing_cgroup_key_is_pending_and_does_not_raise(self) -> None:
+        # request_stop(rec["cgroup"]) raises KeyError when the key is absent, and
+        # each pending put bumps generation. Absent is cgroup_unknown. The first
+        # call records that intent. Later calls do not put.
+        reg = InMemoryRunRegistry(processes=lambda _pid: False)
+        reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                 "cgroup": "/cg/r", "stop": None, "start_key": None})
+        reg._runs["r"].pop("cgroup", None)
+        api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+        api._launched["r"] = {"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                              "stop": None}
+        before = reg.get("r")["generation"]
+        for _ in range(4):
+            res = api.call("run.stop", {"run_id": "r"})
+            self.assertEqual(res["code"], a.PENDING)
+            self.assertEqual(res["state"], "pending")
+            self.assertEqual(res["reason"], "cgroup_unknown")
+            self.assertNotIn("KeyError", res["reason"])
+            self.assertNotEqual(res["code"], a.STOPPED)
+            self.assertNotIn(res["code"], a.SUCCESS_CODES)
+        stored = reg.get("r")
+        assert stored is not None
+        self.assertEqual(stored["generation"], before + 1)
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(stored["stop"]["reason"], "cgroup_unknown")
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(["stop", "r"], api, out, err)
+        self.assertEqual(json.loads(out.getvalue())["reason"], "cgroup_unknown")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cli.EXIT_PENDING)
+        self.assertEqual(reg.get("r")["generation"], before + 1)
+        self.assertTrue(mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r"})["isError"])
+
+    def test_a_launched_stopped_row_with_no_cgroup_does_not_bump_generation(self) -> None:
+        # The handle and the row have no cgroup. Each pending call used to put the
+        # already-stopped row and bump generation, or call request_stop on the
+        # empty path. Nothing material changes, so there is no put and no kill.
+        for kind in ("none", "empty", "absent"):
+            with self.subTest(kind=kind):
+                reg = InMemoryRunRegistry(processes=lambda _pid: False)
+                reg.put({"run_id": "r1", "tenant": "t", "engine": "e", "state": "running",
+                         "cgroup": "/cg/r1", "stop": None, "start_key": None})
+                row = reg._runs["r1"]
+                row["state"] = "stopped"
+                row["members"] = []
+                row["cgroup_marker"] = None
+                row["stop_attestation"] = {
+                    "proof": "empty", "cgroup": None, "cgroup_marker": None,
+                    "member_ids": [], "generation": row["generation"],
+                }
+                if kind == "absent":
+                    row.pop("cgroup", None)
+                elif kind == "empty":
+                    row["cgroup"] = ""
+                else:
+                    row["cgroup"] = None
+                api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                held = {"run_id": "r1", "tenant": "t", "engine": "e", "state": "stopped",
+                        "stop": None, "members": []}
+                if kind != "absent":
+                    held["cgroup"] = row.get("cgroup")
+                api._launched["r1"] = held
+                before = reg.get("r1")["generation"]
+                for _ in range(4):
+                    res = api.call("run.stop", {"run_id": "r1"})
+                    self.assertEqual(res["code"], a.PENDING)
+                    self.assertEqual(res["state"], "pending")
+                    self.assertEqual(res["reason"], "cgroup_unknown")
+                    self.assertNotEqual(res["code"], a.STOPPED)
+                    self.assertIsNot(res.get("repeat"), True)
+                    self.assertNotIn(res["code"], a.SUCCESS_CODES)
+                stored = reg.get("r1")
+                assert stored is not None
+                self.assertEqual(stored["generation"], before)
+                self.assertEqual(stored["state"], "stopped")
+                self.assertEqual(stored["members"], [])
+                self.assertEqual(kill.requests, [])
+                self.assertFalse(a._recorded_stop(stored))
+
+    def test_an_older_proof_repeats_stopped_without_a_kill(self) -> None:
+        # Confirmed. The proof generation is older than the row, it names the
+        # cgroup, and no member is listed. Repeat stopped, and do not kill.
+        reg = InMemoryRunRegistry(processes=lambda _pid: False)
+        reg.put({"run_id": "r1", "tenant": "t", "engine": "e", "state": "running",
+                 "cgroup": "/cg/r1", "stop": None, "start_key": None})
+        row = reg._runs["r1"]
+        row["state"] = "stopped"
+        row["members"] = []
+        row["generation"] = row["generation"] + 2
+        row["stop_attestation"] = {
+            "proof": "empty",
+            "cgroup": row["cgroup"],
+            "cgroup_marker": row.get("cgroup_marker"),
+            "member_ids": [],
+            "generation": row["generation"] - 2,
+        }
+        api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+        before = reg.get("r1")["generation"]
+        self.assertTrue(a._recorded_stop(reg.get("r1")))
+        for _ in range(3):
+            res = api.call("run.stop", {"run_id": "r1"})
+            self.assertEqual(res["code"], a.STOPPED)
+            self.assertEqual(res["state"], "stopped")
+            self.assertIs(res["repeat"], True)
+            self.assertIsNot(res.get("recorded"), False)
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(kill.confirms, [])
+        self.assertEqual(reg.get("r1")["generation"], before)
+
+    def test_two_apis_do_not_bump_an_ahead_proof_with_a_live_member(self) -> None:
+        # Confirmed. Two ControlAPIs share the registry. The proof is ahead of the
+        # row and late/9 is alive. Pending, member_alive, and the generation stays.
+        reg = InMemoryRunRegistry(processes=lambda _pid: True)
+        reg.put({"run_id": "r1", "tenant": "t", "engine": "e", "state": "running",
+                 "cgroup": "/cg/r1", "stop": None, "start_key": None})
+        row = reg._runs["r1"]
+        row["state"] = "stopped"
+        row["members"] = [{"member_id": "late", "pid": 9}]
+        row["stop_attestation"] = {
+            "proof": "empty",
+            "cgroup": row["cgroup"],
+            "cgroup_marker": row.get("cgroup_marker"),
+            "member_ids": ["late"],
+            "generation": row["generation"] + 4,
+        }
+        before = reg.get("r1")["generation"]
+        self.assertFalse(a._recorded_stop(reg.get("r1")))
+        for _ in range(2):
+            api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+            for _call in range(3):
+                res = api.call("run.stop", {"run_id": "r1"})
+                self.assertEqual(res["code"], a.PENDING)
+                self.assertEqual(res["state"], "pending")
+                self.assertEqual(res["reason"], "member_alive")
+                self.assertIs(res["recorded"], False)
+                self.assertNotEqual(res["code"], a.STOPPED)
+                self.assertNotIn(res["code"], a.SUCCESS_CODES)
+            self.assertEqual(kill.requests, [])
+        stored = reg.get("r1")
+        assert stored is not None
+        self.assertEqual(stored["generation"], before)
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+        self.assertEqual(stored["state"], "stopped")
 
 
 if __name__ == "__main__":

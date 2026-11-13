@@ -21,10 +21,15 @@ answer even if writing it back fails, with ``"recorded": false``, when a re-read
 If that re-read fails, the stopped answer holds only when the pre-put row had no members. A live member,
 or a probe that cannot say, answers ``pending``. A put that returns no snapshot answers ``stopped``
 only when the re-read row is a recorded stop. A put that returns a dict answers ``stopped`` only when
-that dict is a recorded stop of the cgroup that was written and the stored row lists no members.
-An empty written cgroup does not match a proof that names one. Otherwise Stop re-reads and answers
-``pending`` when a member is alive or the probe cannot say. A pending answer that changes nothing
-material is not written again, so it does not bump the row generation.
+that dict is a recorded stop of the cgroup that was written, the stored cgroup equals that written
+cgroup, and a re-read of the row lists no members. The re-read has to succeed: a get that raises or
+returns nothing is ``pending`` / ``stop_unverified``, and Stop does not kill again for that answer.
+An empty written cgroup does not match a proof that names one. A stored cgroup that is missing or
+empty does not match a written cgroup. Otherwise Stop re-reads and answers ``pending`` when a member
+is alive or the probe cannot say. A pending answer that changes nothing material is not written
+again, so it does not bump the row generation. A launch handle with no cgroup does not
+call ``request_stop``: Stop answers ``pending`` / ``cgroup_unknown``. An already-stopped
+row is not written. A launch that is still starting records that intent once.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
@@ -312,10 +317,13 @@ class ControlAPI:
 
         A stopped write whose returned dict is not itself a recorded stop of the cgroup that was
         written is ``snapshot``, not success. An empty written cgroup is not a stop of a proof that
-        names a cgroup. A same-cgroup snapshot is checked against the stored row's members. ``rec``
+        names a cgroup. The stored cgroup has to equal the written one. A same-cgroup snapshot is
+        checked against the stored row, and a re-read that cannot be done is not success. ``rec``
         is then the re-read when that read worked.
         """
         self._local.put_snapshot = "returned"
+        self._local.stop_unverified = False
+        self._local.written_cgroup = rec.get("cgroup") if rec.get("state") == "stopped" else None
         try:
             stored = self._registry.put(dict(rec))
         except StaleGeneration:
@@ -361,16 +369,18 @@ class ControlAPI:
         return True
 
     def _returned_stop_matches(self, written: dict, stored: dict) -> bool:
-        """The returned stop names the written cgroup, and the stored row agrees.
+        """The returned stop names the written cgroup, and a re-read of the stored row agrees.
 
-        A re-read that fails leaves the returned snapshot: its cgroup already matched.
-        A re-read with members, a live member, or a different cgroup does not.
+        The re-read has to return the row. A get that raises or returns nothing is not
+        proof the stop was stored, so the put snapshot is not copied as ``stopped``.
+        A re-read with members, a live member, or a different cgroup does not match.
         """
         if not _stop_snapshot_ok(written, stored):
             return False
         fresh = self._reread(written)
-        if fresh is None:
-            return True
+        if not isinstance(fresh, dict):
+            self._local.stop_unverified = True
+            return False
         if fresh.get("members") or self._row_liveness(fresh):
             return False
         return _stop_snapshot_ok(written, fresh)
@@ -534,8 +544,12 @@ class ControlAPI:
         # after the launch). Keep that row and take only the cgroup the handle saw, plus a cleanup
         # decision that never landed. A handle that already says stopped is confirmed again so the
         # proof is rebuilt for this generation instead of replayed.
-        if launched.get("cgroup"):
-            rec["cgroup"] = launched["cgroup"]
+        if not launched.get("cgroup"):
+            # Nothing to aim cleanup at. request_stop(rec["cgroup"]) raises KeyError
+            # when the key is missing; None and "" are not a tree. Pending, and do
+            # not put a row that is already stopped: that write only bumps generation.
+            return self._stop_intent(rec)
+        rec["cgroup"] = launched["cgroup"]
         if launched.get("cgroup_marker"):
             rec["cgroup_marker"] = launched["cgroup_marker"]
         if isinstance(launched.get("stop"), dict):
@@ -604,15 +618,19 @@ class ControlAPI:
         if not rec["stop"].get("requested", True):
             # First stop, a stop intent left during launch, or an earlier request raised before it was known
             # to be sent: (re)send it. A request is not reused for a different cgroup identity.
+            # A missing cgroup key is absent, not a cleanup error, and it is not sent.
+            cgroup = rec.get("cgroup")
+            if not isinstance(cgroup, str) or not cgroup:
+                return self._stop_intent(rec)
             try:
-                self._kill.request_stop(rec["cgroup"])
+                self._kill.request_stop(cgroup)
             except Exception as err:
                 return self._pending(rec, f"cleanup_error:{type(err).__name__}")
             rec["stop"]["requested"] = True
-            rec["stop"]["cgroup"] = rec.get("cgroup")
+            rec["stop"]["cgroup"] = cgroup
             rec["stop"]["cgroup_marker"] = rec.get("cgroup_marker")
         try:
-            answer = self._kill.confirm(rec["cgroup"], self._confirm_timeout_s)
+            answer = self._kill.confirm(rec.get("cgroup"), self._confirm_timeout_s)
         except Exception as err:
             return self._pending(rec, f"cleanup_error:{type(err).__name__}")
         if answer != EMPTY:
@@ -643,12 +661,17 @@ class ControlAPI:
         res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": "cgroup_unknown"}
         # The row is already stopped and still has no cgroup. Putting again only
         # bumps generation and rewrites the stop dict. A launch that is not
-        # stopped yet does write: that is the intent the starter acts on.
+        # stopped yet does write once: that is the intent the starter acts on.
+        # A later call sees that reason already stored and does not put again.
         if rec.get("state") == "stopped":
             return res
-        if rec.get("stop") is None:
+        stop = rec.get("stop")
+        if isinstance(stop, dict) and stop.get("reason") == "cgroup_unknown":
+            return res
+        if not isinstance(stop, dict):
             rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
-        rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason="cgroup_unknown")
+            stop = rec["stop"]
+        stop.update(checks=stop.get("checks", 0) + 1, reason="cgroup_unknown")
         if not self._try_put(rec):
             res["recorded"] = False
         return res
@@ -747,7 +770,15 @@ class ControlAPI:
         if outcome != "ok" or res.get("code") != STOPPED or snapshot == "returned":
             return outcome, res
         if snapshot == "reread" and _recorded_stop(rec):
-            return outcome, res
+            # A cleared cgroup can still be a recorded stop of an older proof. It is
+            # not the stop this put just wrote unless the row cgroup is the written one.
+            written_cgroup = getattr(self._local, "written_cgroup", None)
+            if (isinstance(written_cgroup, str) and written_cgroup
+                    and rec.get("cgroup") == written_cgroup):
+                return outcome, res
+            reason = self._row_liveness(rec) or "stop_unverified"
+            return "down", {"code": PENDING, "run_id": rec.get("run_id"), "state": "pending",
+                            "reason": reason}
         if snapshot == "reread":
             reason = self._row_liveness(rec)
             if reason is None:
@@ -878,10 +909,16 @@ class ControlAPI:
         outcome, res = self._lost_stop_is_pending(outcome, res, rec)
         outcome, res = self._down_stop(outcome, res, rec, pre_members)
         if outcome == "snapshot":
-            # The put returned a dict that was not the stop we wrote. The re-read, or its
-            # failure, decides. A recorded stop stays stopped; a live member stays pending.
-            snap = getattr(self._local, "put_snapshot", "missing")
-            outcome, res = self._blind_snapshot_stop("ok", res, rec, snap)
+            # The put returned a dict that was not the stop we wrote, or the re-read
+            # could not be done. An unreadable re-read is not ``stopped``. A recorded
+            # stop of the written cgroup stays stopped; a live member stays pending.
+            if getattr(self._local, "stop_unverified", False):
+                outcome = "down"
+                res = {"code": PENDING, "run_id": rec.get("run_id"), "state": "pending",
+                       "reason": "stop_unverified"}
+            else:
+                snap = getattr(self._local, "put_snapshot", "missing")
+                outcome, res = self._blind_snapshot_stop("ok", res, rec, snap)
         if outcome != "ok":
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
@@ -960,8 +997,10 @@ def _recorded_stop(row: dict) -> bool:
 def _stop_snapshot_ok(written: dict, stored: dict) -> bool:
     """True when ``stored`` is a recorded stop of the cgroup ``written`` asked to store.
 
-    An empty written cgroup is not a stop of a proof that names a cgroup. The caller
-    re-reads a same-cgroup snapshot before trusting its members.
+    The stored cgroup has to equal that written cgroup. Missing, empty, and a
+    different path are not a match. An empty written cgroup is not a stop of a
+    proof that names a cgroup. The caller re-reads a same-cgroup snapshot before
+    trusting its members.
     """
     if not _recorded_stop(stored) or stored.get("run_id") != written.get("run_id"):
         return False
@@ -973,8 +1012,7 @@ def _stop_snapshot_ok(written: dict, stored: dict) -> bool:
         return False
     if proof.get("cgroup") != written_cgroup:
         return False
-    stored_cgroup = stored.get("cgroup")
-    if isinstance(stored_cgroup, str) and stored_cgroup and stored_cgroup != written_cgroup:
+    if stored.get("cgroup") != written_cgroup:
         return False
     if stored.get("members"):
         return False

@@ -14,19 +14,29 @@ Linux is the tested path. macOS uses the same AF_UNIX family and is designed in 
 A connect that fails with ``EACCES`` or ``EPERM`` does not reclaim the socket.
 Owner decision: that errno is not proof the file is stale, so a dead mode-000
 socket stays until the operator removes it. ``ECONNREFUSED`` reclaims only
-while an ``O_PATH`` fd holds that inode. Removal renames the directory entry
-to a hidden name in the same directory and unlinks that name only when it is
-still the pinned inode and a second connect still reports ``ECONNREFUSED``.
-``rename`` is atomic, so a listener that binds the original path after the
-rename keeps that name. A socket that ``listen``s after that second connect
-and before the unlink can still lose the hidden name; that is the remaining
-window.
+while an ``O_PATH`` fd holds that inode and ``renameat2(RENAME_NOREPLACE)``
+can move the directory entry aside. The hidden name is no longer than the
+socket's own name, so the recheck path still fits in ``sun_path``. It is
+unlinked only when it is still the pinned inode and a second connect, checked
+through that directory fd, still reports ``ECONNREFUSED``. Anything else
+moves the hidden name back with ``RENAME_NOREPLACE``. If that move back
+fails, the error names the hidden entry. Without ``renameat2`` the socket
+stays in place, the same as a platform with no ``O_PATH``.
+
+``start`` also removes our own earlier hidden sockets that are still
+``ECONNREFUSED``. It does not touch non-sockets or live listeners.
+
+A socket that ``listen``s on the hidden name after that second connect
+returns and before the hidden name is unlinked can still lose that name.
+That is the remaining window. ``RENAME_NOREPLACE`` closes the earlier window
+where a quarantine name was chosen and then replaced.
 """
 
 from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import ipaddress
 import os
 import re
@@ -384,27 +394,34 @@ def _load_renameat2():
     return fn
 
 
-def _rename_noreplace(dfd: int, src: str, dst: str) -> bool | None:
+def _rename_noreplace(dfd: int, src: str, dst: str) -> str:
     """Move ``src`` onto ``dst`` inside ``dfd`` without replacing ``dst``.
 
-    ``True`` when the name moved or ``src`` was already gone. ``False`` when
-    ``dst`` exists. ``None`` when ``renameat2`` is not available; the caller
-    then uses ``os.rename`` only after ``lstat`` reports ``ENOENT``.
+    ``"moved"`` when the name moved. ``"exists"`` when ``dst`` is already
+    there (``EEXIST``), including when it is a directory. ``"gone"`` when
+    ``src`` was already absent. ``"unsupported"`` when ``renameat2`` cannot
+    be used. Any other errno is raised and the name is not moved. There is
+    no ``os.rename`` fallback: that call replaces an entry created after the
+    check.
     """
     fn = _load_renameat2()
     if fn is None:
-        return None
+        return "unsupported"
     ctypes.set_errno(0)
     rc = fn(dfd, os.fsencode(src), dfd, os.fsencode(dst), _RENAME_NOREPLACE)
     if rc == 0:
-        return True
+        return "moved"
     err = ctypes.get_errno()
     if err in (errno.EEXIST, errno.ENOTEMPTY):
-        return False
+        return "exists"
     if err == errno.ENOENT:
-        return True
-    if err in (errno.ENOSYS, errno.EINVAL):
-        return None
+        return "gone"
+    if err in (errno.ENOSYS, errno.EINVAL, getattr(errno, "ENOTSUP", 0), getattr(errno, "EOPNOTSUPP", 0)):
+        return "unsupported"
+    if err == 0:
+        raise OSError(errno.EIO, "renameat2 failed", src)
+    if err in (errno.EACCES, errno.EPERM):
+        raise PermissionError(err, os.strerror(err), src)
     raise OSError(err, os.strerror(err), src)
 
 
@@ -427,122 +444,206 @@ def _open_parent_dir(directory: str) -> int:
     return _remember_pin(os.open(directory, flags))
 
 
-def _fresh_quarantine(dfd: int, socket_name: str) -> str:
-    """A hidden name in ``dfd`` that is not already there. Fail rather than replace.
+# ".q" plus 4 hex chars of the socket name, and at least 2 hex chars that vary.
+# A shorter socket name cannot be quarantined without growing the path.
+_QUARANTINE_PREFIX_LEN = 6
+_QUARANTINE_SUFFIX_MIN = 2
 
-    The name is no longer than ``socket_name``, so a recheck ``connect`` still
-    fits in ``sun_path`` when the original socket path did.
+
+def _quarantine_prefix(socket_name: str) -> str | None:
+    """``.q`` plus a short tag of ``socket_name``, or ``None`` if it cannot fit.
+
+    The whole quarantine name stays within ``socket_name``'s byte length, so a
+    recheck ``connect`` cannot exceed the path length that was already accepted.
     """
-    limit = max(len(os.fsencode(socket_name)), 2)
-    for _ in range(8):
-        name = ("." + secrets.token_hex(16)).encode("ascii")[:limit].decode("ascii")
-        if name in (".", ".."):
-            continue
-        try:
-            os.lstat(name, dir_fd=dfd)
-        except FileNotFoundError:
-            return name
-    raise InsecureSocketPath("quarantine name already exists")
+    raw = os.fsencode(socket_name)
+    prefix = ".q" + hashlib.sha256(raw).hexdigest()[:4]
+    if len(prefix) != _QUARANTINE_PREFIX_LEN:
+        return None
+    if len(raw) < len(prefix) + _QUARANTINE_SUFFIX_MIN:
+        return None
+    return prefix
 
 
-def _restore_quarantine(dfd: int, qname: str, name: str) -> bool:
-    """Put ``qname`` back on ``name``. False leaves ``qname`` where it is.
+def _quarantine_name(socket_name: str) -> str | None:
+    """One hidden name, the same byte length as ``socket_name``."""
+    prefix = _quarantine_prefix(socket_name)
+    if prefix is None:
+        return None
+    limit = len(os.fsencode(socket_name))
+    suffix_len = limit - len(prefix)
+    suffix = secrets.token_hex((suffix_len + 1) // 2)[:suffix_len]
+    name = prefix + suffix
+    if len(os.fsencode(name)) != limit or name in (".", ".."):
+        return None
+    return name
 
-    ``link`` cannot name a socket, so the fallback is ``os.rename`` and only
-    when ``lstat`` of ``name`` raises ``ENOENT``. That check is not atomic.
-    Linux uses ``renameat2(RENAME_NOREPLACE)``, which will not replace a name
-    bound after the quarantine rename.
-    """
-    moved = _rename_noreplace(dfd, qname, name)
-    if moved is not None:
-        return moved
+
+def _can_quarantine(directory: str, socket_name: str) -> bool:
+    """True when a hidden name can be moved aside without growing the path."""
+    if _load_renameat2() is None:
+        return False
+    prefix = _quarantine_prefix(socket_name)
+    if prefix is None:
+        return False
+    limit = len(os.fsencode(socket_name))
+    sample = prefix + ("0" * (limit - len(prefix)))
+    return len(os.fsencode(os.path.join(directory, sample))) <= _MAX_SUN_PATH
+
+
+def _same_dir(directory: str, ident: tuple[int, int]) -> bool:
+    """True when ``directory`` still resolves to the inode ``ident``."""
     try:
-        os.lstat(name, dir_fd=dfd)
-    except FileNotFoundError:
-        try:
-            os.rename(qname, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-        except OSError:
-            return False
-        return True
+        st = os.stat(directory)
     except OSError:
         return False
-    return False
+    return stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == ident
 
 
-def _refuse_foreign(path: str, qpath: str, restored: bool) -> None:
-    if restored:
-        raise InsecureSocketPath(f"{path} exists and is not our socket")
-    raise InsecureSocketPath(f"{path} exists and is not our socket. Left at {qpath}.")
+def _restore_noreplace(dfd: int, qname: str, name: str) -> bool:
+    """Move ``qname`` back onto ``name`` without replacing ``name``.
+
+    False means ``qname`` is still there. ``os.rename`` is not used.
+    """
+    result = _rename_noreplace(dfd, qname, name)
+    return result in ("moved", "gone")
+
+
+def _recheck_hidden(dfd: int, directory: str, qname: str) -> int | None:
+    """Probe the hidden socket through the directory fd ``dfd`` holds.
+
+    ``/proc/self/fd/<dfd>/<qname>`` resolves in that directory. It is used
+    only when the string fits in ``sun_path``; a longer string connects to
+    the quarantine path instead. Either way the parent directory's
+    ``(dev, ino)`` is checked immediately before and after the connect.
+    ``ENOENT`` or a parent mismatch raises: the caller restores the hidden
+    name and does not treat the reclaim as finished. ``/proc/net/unix`` is
+    not consulted.
+    """
+    ident = os.fstat(dfd)
+    held = (ident.st_dev, ident.st_ino)
+    if not _same_dir(directory, held):
+        raise InsecureSocketPath(f"{directory} changed during reclaim")
+    proc = f"/proc/self/fd/{dfd}/{qname}"
+    if len(os.fsencode(proc)) <= _MAX_SUN_PATH:
+        err = _probe_listener(proc)
+    else:
+        err = _probe_listener(os.path.join(directory, qname))
+    if not _same_dir(directory, held) or err == errno.ENOENT:
+        raise InsecureSocketPath(f"{directory} changed during reclaim")
+    return err
+
+
+def _quarantine_move(dfd: int, src: str, socket_name: str) -> str | None:
+    """Rename ``src`` to a fresh hidden name. ``None`` if ``src`` is already gone.
+
+    ``EEXIST`` picks another name. Any other failure leaves ``src`` where it
+    is and raises. ``renameat2`` is the only move.
+    """
+    if _load_renameat2() is None or _quarantine_prefix(socket_name) is None:
+        raise InsecureSocketPath(
+            f"{src} is not connectable (ECONNREFUSED). Left in place. Remove this socket if it is stale."
+        )
+    for _ in range(16):
+        dst = _quarantine_name(socket_name)
+        if dst is None or dst == src:
+            break
+        result = _rename_noreplace(dfd, src, dst)
+        if result == "moved":
+            return dst
+        if result == "gone":
+            return None
+        if result == "exists":
+            continue
+        if result == "unsupported":
+            raise InsecureSocketPath(
+                f"{src} is not connectable (ECONNREFUSED). Left in place. Remove this socket if it is stale."
+            )
+    raise InsecureSocketPath(f"{src} could not be quarantined. Left in place.")
+
+
+def _unlink_pinned_in(
+    dfd: int,
+    directory: str,
+    name: str,
+    path: str,
+    pin: int,
+    *,
+    socket_name: str,
+    recheck: bool,
+) -> None:
+    """Quarantine ``name`` inside ``dfd`` and unlink it only when it is still ``pin``.
+
+    ``socket_name`` sizes the hidden name. After a successful move, this
+    always tries to move the hidden name back unless the unlink of that
+    verified name succeeded. A failed move-back raises ``InsecureSocketPath``
+    and names the hidden entry.
+
+    A socket that ``listen``s after the recheck connect and before the unlink
+    can still lose the hidden name. That is the remaining window.
+    """
+    if not _can_quarantine(directory, socket_name):
+        _refuse_unreclaimed(path, errno.ECONNREFUSED)
+        return
+    held = os.fstat(pin)
+    qname: str | None = None
+    try:
+        qname = _quarantine_move(dfd, name, socket_name)
+        if qname is None:
+            return
+        try:
+            listed = os.lstat(qname, dir_fd=dfd)
+        except FileNotFoundError:
+            qname = None
+            return
+        if not _pinned_match(listed, held):
+            raise InsecureSocketPath(f"{path} exists and is not our socket")
+        if recheck:
+            still = _recheck_hidden(dfd, directory, qname)
+            if still != errno.ECONNREFUSED:
+                if still is None:
+                    raise InsecureSocketPath(f"{path} is live: another server is listening")
+                # ENOENT is a parent mismatch, not a finished reclaim. Restore, then refuse.
+                _refuse_unreclaimed(path, still)
+                raise InsecureSocketPath(f"{directory} changed during reclaim")
+        try:
+            os.unlink(qname, dir_fd=dfd)
+        except FileNotFoundError:
+            qname = None
+            return
+        qname = None
+    finally:
+        if qname is not None:
+            qpath = os.path.join(directory, qname)
+            if not _restore_noreplace(dfd, qname, name):
+                raise InsecureSocketPath(f"{path} could not be restored. Left at {qpath}.")
 
 
 def _unlink_pinned(path: str, pin: int, *, recheck: bool = False) -> None:
-    """Remove ``path`` only when the quarantined entry is the inode ``pin`` holds.
+    """Remove ``path`` only when its quarantined entry is the inode ``pin`` holds.
 
-    ``os.rename`` onto a fresh hidden name in the same directory is atomic, so
-    a listener that binds ``path`` after that rename gets a new directory entry
-    and is not unlinked. The hidden name is unlinked only when its ``lstat``
-    matches ``fstat(pin)``. Any other inode is moved back with
-    ``renameat2(RENAME_NOREPLACE)``. When the original name is already taken,
-    the hidden name is left in place and ``InsecureSocketPath`` names it.
+    The move is ``renameat2(RENAME_NOREPLACE)`` inside an ``O_PATH`` directory
+    fd. A listener that binds ``path`` after that move gets a new directory
+    entry and is not unlinked. The hidden name is unlinked only when its
+    ``lstat`` matches ``fstat(pin)``. Any other inode, a live recheck, or a
+    parent that no longer matches the directory fd is moved back. When the
+    original name is already taken, the hidden name is left in place and
+    ``InsecureSocketPath`` names it.
 
-    ``recheck`` connects to the hidden name before that unlink. A socket that
-    had only ``bind``ed when the first probe ran, and has since ``listen``ed,
-    is moved back and refused. Close does not recheck: the listen fd is
-    already shut, and an inherited dup must not keep the name.
+    ``recheck`` connects through the directory fd before that unlink. Close
+    does not recheck: the listen fd is already shut, and an inherited dup
+    must not keep the name.
 
-    The ``O_PATH|O_DIRECTORY`` fd stays open for every dir-relative operation.
-    ``rename`` does not touch a name bound after it returns. A socket that
-    ``listen``s after the recheck connect and before the hidden name is
-    unlinked can still lose that hidden name.
+    A socket that ``listen``s after the recheck connect and before the hidden
+    name is unlinked can still lose that hidden name. That is the remaining
+    window.
     """
     directory, name = os.path.split(path)
     if not name or name in (".", "..") or not directory:
         raise InsecureSocketPath(f"{path} exists and is not our socket")
     dfd = _open_parent_dir(directory)
     try:
-        held = os.fstat(pin)
-        qname: str | None = None
-        for _ in range(8):
-            candidate = _fresh_quarantine(dfd, name)
-            try:
-                os.rename(name, candidate, src_dir_fd=dfd, dst_dir_fd=dfd)
-            except FileNotFoundError:
-                return
-            except FileExistsError:
-                continue
-            qname = candidate
-            break
-        if qname is None:
-            raise InsecureSocketPath(f"{path} exists and is not our socket")
-        qpath = os.path.join(directory, qname)
-        try:
-            listed = os.lstat(qname, dir_fd=dfd)
-        except FileNotFoundError:
-            return
-        if _pinned_match(listed, held):
-            if recheck:
-                still = _probe_listener(qpath)
-                if still != errno.ECONNREFUSED:
-                    restored = _restore_quarantine(dfd, qname, name)
-                    if still is None:
-                        if restored:
-                            raise InsecureSocketPath(f"{path} is live: another server is listening")
-                        raise InsecureSocketPath(
-                            f"{path} is live: another server is listening. Left at {qpath}."
-                        )
-                    if still == errno.ENOENT:
-                        return
-                    if not restored:
-                        raise InsecureSocketPath(f"{path} exists and is not our socket. Left at {qpath}.")
-                    _refuse_unreclaimed(path, still)
-                    return
-            try:
-                os.unlink(qname, dir_fd=dfd)
-            except FileNotFoundError:
-                pass
-            return
-        restored = _restore_quarantine(dfd, qname, name)
-        _refuse_foreign(path, qpath, restored)
+        _unlink_pinned_in(dfd, directory, name, path, pin, socket_name=name, recheck=recheck)
     finally:
         _close_pin(dfd)
 
@@ -552,10 +653,11 @@ def _clear_stale_socket(path: str) -> None:
 
     The inode is pinned before the probe and held until the quarantine check
     returns. ``ECONNREFUSED`` means this namespace has no listener on that
-    inode, so the rename may reclaim it. A replacement bound while the pin is
-    open has a different inode: the quarantine entry does not match and is
-    moved back. Without ``O_PATH`` the inode cannot be held, so
-    ``ECONNREFUSED`` is left in place rather than reclaimed.
+    inode, so ``renameat2(RENAME_NOREPLACE)`` may move it aside. A replacement
+    bound while the pin is open has a different inode: the quarantine entry
+    does not match and is moved back. Without ``O_PATH``, or without
+    ``renameat2``, or when the socket name cannot hold a hidden name no longer
+    than itself, ``ECONNREFUSED`` is left in place rather than reclaimed.
 
     ``EACCES`` and ``EPERM`` do not reclaim: a live mode-000 or mode-070
     listener fails connect the same way a dead socket does. ``/proc/net/unix``
@@ -589,11 +691,89 @@ def _clear_stale_socket(path: str) -> None:
             raise InsecureSocketPath(f"{path} exists and is not our socket")
         err = _probe_listener(path)
         if err == errno.ECONNREFUSED:
+            directory, name = os.path.split(path)
+            # No safe hidden name: same refusal as a platform with no O_PATH.
+            if not directory or not _can_quarantine(directory, name):
+                _refuse_unreclaimed(path, err)
+                return
             _unlink_pinned(path, pin, recheck=True)
             return
         _refuse_unreclaimed(path, err)
     finally:
         _close_pin(pin)
+
+
+def _reap_quarantine(directory: str, socket_name: str) -> None:
+    """Remove our abandoned quarantine sockets. Leave everything else alone.
+
+    Called from ``start`` while the directory flock is held. An entry is
+    removed only when it carries this socket's quarantine prefix, is a socket
+    we own, and a connect through the held directory fd returns
+    ``ECONNREFUSED``. Non-sockets, symlinks, other users' sockets, and live
+    listeners stay. Removal goes through the same pin, recheck and
+    ``RENAME_NOREPLACE`` restore as a stale public socket.
+    """
+    if not _can_pin() or not _can_quarantine(directory, socket_name):
+        return
+    prefix = _quarantine_prefix(socket_name)
+    if prefix is None:
+        return
+    try:
+        dfd = _open_parent_dir(directory)
+    except OSError:
+        return
+    try:
+        ident = os.fstat(dfd)
+        held_dir = (ident.st_dev, ident.st_ino)
+        if not _same_dir(directory, held_dir):
+            return
+        try:
+            names = [entry.name for entry in os.scandir(f"/proc/self/fd/{dfd}")]
+        except OSError:
+            return
+        if not _same_dir(directory, held_dir):
+            return
+        limit = len(os.fsencode(socket_name))
+        for entry in names:
+            if entry in (socket_name, ".", "..") or not entry.startswith(prefix):
+                continue
+            if len(os.fsencode(entry)) > limit:
+                continue
+            try:
+                listed = os.lstat(entry, dir_fd=dfd)
+            except OSError:
+                continue
+            if stat.S_ISLNK(listed.st_mode) or not stat.S_ISSOCK(listed.st_mode) or listed.st_uid != os.geteuid():
+                continue
+            try:
+                still = _recheck_hidden(dfd, directory, entry)
+            except (InsecureSocketPath, OSError):
+                continue
+            if still != errno.ECONNREFUSED:
+                continue
+            try:
+                pin = os.open(entry, os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dfd)
+            except OSError:
+                continue
+            pin = _remember_pin(pin)
+            try:
+                try:
+                    held = os.fstat(pin)
+                except OSError:
+                    continue
+                if not _pinned_match(listed, held):
+                    continue
+                full = os.path.join(directory, entry)
+                try:
+                    _unlink_pinned_in(
+                        dfd, directory, entry, full, pin, socket_name=socket_name, recheck=True
+                    )
+                except (InsecureSocketPath, OSError):
+                    pass
+            finally:
+                _close_pin(pin)
+    finally:
+        _close_pin(dfd)
 
 
 def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -> PeerCred:
@@ -683,6 +863,9 @@ class UnixControlServer:
             try:
                 # socket() is inside the cleanup: a failure here must not leave the flock held.
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                # Under the flock: drop hidden sockets a failed restore left behind,
+                # then reclaim the public name if it is still ECONNREFUSED.
+                _reap_quarantine(self.directory, os.path.basename(self._path))
                 _clear_stale_socket(self._path)
                 # fstat(fd) is the sockfs inode, not the directory entry, so it cannot
                 # name the file we bound. Record that entry, then chmod it without

@@ -1028,6 +1028,7 @@ class InodeQuarantineTests(_TmpCase):
         """
         orig_unlink = unix.os.unlink
         orig_rename = unix.os.rename
+        orig_rn = unix._rename_noreplace
 
         def plant() -> None:
             if "sock" in planted:
@@ -1046,17 +1047,27 @@ class InodeQuarantineTests(_TmpCase):
                 return orig_unlink(target, *args, **kwargs)
             return orig_unlink(target, *args, **kwargs)
 
+        def moved_public(src: object, dfd: int | None, moved: bool) -> None:
+            if moved and _at_path(src, dfd) == path and "sock" not in planted:
+                plant()
+
         def fake_rename(src: object, dst: object, *args: object, **kwargs: object):
             full = _at_path(src, kwargs.get("src_dir_fd"))  # type: ignore[arg-type]
             result = orig_rename(src, dst, *args, **kwargs)
-            if full == path and "sock" not in planted:
-                plant()
+            moved_public(src, kwargs.get("src_dir_fd"), full == path)  # type: ignore[arg-type]
+            return result
+
+        def fake_rn(dfd: int, src: str, dst: str):
+            result = orig_rn(dfd, src, dst)
+            moved_public(src, dfd, result == "moved" or result is True)
             return result
 
         unix.os.unlink = fake_unlink  # type: ignore[assignment]
         unix.os.rename = fake_rename  # type: ignore[assignment]
+        unix._rename_noreplace = fake_rn  # type: ignore[assignment]
         self.addCleanup(setattr, unix.os, "unlink", orig_unlink)
         self.addCleanup(setattr, unix.os, "rename", orig_rename)
+        self.addCleanup(setattr, unix, "_rename_noreplace", orig_rn)
         self.addCleanup(lambda: planted["sock"].close() if "sock" in planted else None)
 
     def _assert_plant_keeps_its_name(self, path: str, planted: dict) -> None:
@@ -1296,6 +1307,559 @@ class InodeQuarantineTests(_TmpCase):
         self.assertEqual(errors, [])
         self.assertGreater(stats["armed"], 100, stats)
         self.assertEqual(stats["lost"], 0, stats)
+
+
+def _q_prefix(socket_name: str) -> str:
+    """The quarantine prefix ``unix`` reaps. Duplicated so the test runs before the helper exists."""
+    import hashlib
+
+    return ".q" + hashlib.sha256(os.fsencode(socket_name)).hexdigest()[:4]
+
+
+def _socket_entries(directory: str) -> list[str]:
+    found = []
+    for name in os.listdir(directory):
+        try:
+            st = os.lstat(os.path.join(directory, name))
+        except OSError:
+            continue
+        if stat.S_ISSOCK(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+            found.append(name)
+    return found
+
+
+def _refused_sockets(directory: str) -> list[str]:
+    """Sockets in ``directory`` whose connect fails with ``ECONNREFUSED``."""
+    refused = []
+    for name in _socket_entries(directory):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            try:
+                probe.connect(os.path.join(directory, name))
+            except OSError as exc:
+                if exc.errno == errno.ECONNREFUSED:
+                    refused.append(name)
+        finally:
+            probe.close()
+    return refused
+
+
+@unittest.skipUnless(LINUX, "Linux is the tested path")
+class QuarantineRestoreTests(_TmpCase):
+    """Failures after the quarantine rename must not abandon the inode.
+
+    Each case failed on 56af0d69: ``os.rename`` replaced a name that appeared
+    after ``lstat``, a failing ``unlink`` or a too-long recheck path left the
+    hidden socket in place, and ``ENOENT`` from a path connect was treated as
+    a finished reclaim.
+    """
+
+    def _stale(self, directory: str, name: str = "control.sock") -> tuple[str, int]:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        path = os.path.join(directory, name)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()
+        return path, os.lstat(path).st_ino
+
+    def _exact_dir(self, name: str, total: int = 107) -> str:
+        parent = tempfile.mkdtemp(prefix="q", dir="/tmp")
+        self.addCleanup(self._rm_tree, parent)
+        need = total - len(name) - 1
+        self.assertGreaterEqual(need, len(parent))
+        if need == len(parent):
+            directory = parent
+        else:
+            directory = os.path.join(parent, "d" * (need - len(parent) - 1))
+            os.makedirs(directory, mode=0o700)
+        path = os.path.join(directory, name)
+        self.assertEqual(len(os.fsencode(path)), total)
+        os.chmod(directory, 0o700)
+        return directory
+
+    def _rm_tree(self, root: str) -> None:
+        for current, dirs, files in os.walk(root, topdown=False):
+            for name in files:
+                try:
+                    os.unlink(os.path.join(current, name))
+                except OSError:
+                    pass
+            for name in dirs:
+                path = os.path.join(current, name)
+                try:
+                    if os.path.islink(path):
+                        os.unlink(path)
+                    else:
+                        os.chmod(path, 0o700)
+                        os.rmdir(path)
+                except OSError:
+                    pass
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+
+    def test_restore_failure_is_reaped_on_the_next_start(self) -> None:
+        """A hidden socket left when restore cannot move back is removed by the next start().
+
+        Non-sockets and live listeners that share the quarantine prefix stay.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        prefix = _q_prefix("control.sock")
+        kept_file = os.path.join(self.sock_dir, prefix + "file!!")
+        with open(kept_file, "wb") as fh:
+            fh.write(b"keep")
+        live_name = prefix + "live!!"
+        live_path = os.path.join(self.sock_dir, live_name)
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(live.close)
+        live.bind(live_path)
+        live.listen(1)
+        live_ino = os.lstat(live_path).st_ino
+        dead_name = prefix + "dead!!"
+        dead_path = os.path.join(self.sock_dir, dead_name)
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(dead_path)
+        dead.close()
+        os.chmod(dead_path, 0)
+        dead_ino = os.lstat(dead_path).st_ino
+
+        def abandon_one() -> str | None:
+            if os.path.lexists(path):
+                os.unlink(path)
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(path)
+            stale.close()
+            occupied = {"n": 0}
+            orig_rename = unix.os.rename
+            orig_rn = unix._rename_noreplace
+            orig_connect = socket.socket.connect
+
+            def occupy(src: object, dfd: int | None) -> None:
+                if occupied["n"] or _at_path(src, dfd) != path:
+                    return
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.write(fd, b"block")
+                os.close(fd)
+                occupied["n"] = 1
+
+            def fake_rename(src: object, dst: object, *args: object, **kwargs: object):
+                result = orig_rename(src, dst, *args, **kwargs)
+                occupy(src, kwargs.get("src_dir_fd"))  # type: ignore[arg-type]
+                return result
+
+            def fake_rn(dfd: int, src: str, dst: str):
+                result = orig_rn(dfd, src, dst)
+                if result is True or result == "moved":
+                    occupy(src, dfd)
+                return result
+
+            def fake_connect(sock: socket.socket, addr: object) -> None:
+                if occupied["n"] and addr != path:
+                    raise OSError(errno.EACCES, "Permission denied")
+                orig_connect(sock, addr)
+
+            unix.os.rename = fake_rename  # type: ignore[assignment]
+            unix._rename_noreplace = fake_rn  # type: ignore[assignment]
+            socket.socket.connect = fake_connect  # type: ignore[method-assign]
+            try:
+                srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+                try:
+                    srv.start()
+                except (OSError, ct.InsecureSocketPath):
+                    pass
+                finally:
+                    srv.close()
+            finally:
+                unix.os.rename = orig_rename  # type: ignore[assignment]
+                unix._rename_noreplace = orig_rn  # type: ignore[assignment]
+                socket.socket.connect = orig_connect  # type: ignore[method-assign]
+            if os.path.lexists(path) and not stat.S_ISSOCK(os.lstat(path).st_mode):
+                os.unlink(path)
+            hidden = [name for name in _refused_sockets(self.sock_dir) if name not in (live_name, dead_name, "control.sock")]
+            return hidden[0] if hidden else None
+
+        left = [name for _ in range(4) if (name := abandon_one())]
+        self.assertGreaterEqual(len(left), 1, os.listdir(self.sock_dir))
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        srv.start()
+        self.addCleanup(srv.close)
+        with UnixControlClient(srv.path) as client:
+            self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+        self.assertEqual(
+            [name for name in _refused_sockets(self.sock_dir) if name != "control.sock"],
+            [],
+            os.listdir(self.sock_dir),
+        )
+        with open(kept_file, "rb") as fh:
+            self.assertEqual(fh.read(), b"keep")
+        self.assertEqual(os.lstat(live_path).st_ino, live_ino)
+        self.assertEqual(os.lstat(dead_path).st_ino, dead_ino)
+        self.assertEqual(stat.S_IMODE(os.lstat(dead_path).st_mode), 0)
+
+    def test_listener_planted_on_a_quarantine_name_is_not_replaced(self) -> None:
+        """A listener bound on the quarantine name before the move keeps that name."""
+        os.mkdir(self.sock_dir, 0o700)
+        path, _inode = self._stale(self.sock_dir)
+        planted: dict = {}
+        orig_rename = unix.os.rename
+        orig_rn = unix._rename_noreplace
+
+        def plant(dst: object, dfd: int | None) -> None:
+            if planted or not isinstance(dst, str) or not dst.startswith("."):
+                return
+            full = _at_path(dst, dfd)
+            if os.path.lexists(full):
+                return
+            live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            live.bind(full)
+            live.listen(1)
+            planted["sock"] = live
+            planted["path"] = full
+            planted["ino"] = os.lstat(full).st_ino
+
+        def fake_rename(src: object, dst: object, *args: object, **kwargs: object):
+            plant(dst, kwargs.get("dst_dir_fd"))  # type: ignore[arg-type]
+            return orig_rename(src, dst, *args, **kwargs)
+
+        def fake_rn(dfd: int, src: str, dst: str):
+            plant(dst, dfd)
+            return orig_rn(dfd, src, dst)
+
+        unix.os.rename = fake_rename  # type: ignore[assignment]
+        unix._rename_noreplace = fake_rn  # type: ignore[assignment]
+        self.addCleanup(setattr, unix.os, "rename", orig_rename)
+        self.addCleanup(setattr, unix, "_rename_noreplace", orig_rn)
+        self.addCleanup(lambda: planted["sock"].close() if "sock" in planted else None)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        srv.start()
+        self.assertIn("sock", planted, os.listdir(self.sock_dir))
+        listed = os.lstat(planted["path"])
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual(listed.st_ino, planted["ino"])
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        planted["sock"].settimeout(2)
+        client.connect(planted["path"])
+        conn, _ = planted["sock"].accept()
+        conn.close()
+        with UnixControlClient(srv.path) as control:
+            self.assertEqual(control.request({"op": "ping"})["op"], "pong")
+
+    def test_directory_at_a_quarantine_name_is_not_a_hard_error(self) -> None:
+        """A directory created on the quarantine name is left alone and another name is used."""
+        os.mkdir(self.sock_dir, 0o700)
+        self._stale(self.sock_dir)
+        planted: dict = {}
+        orig_rename = unix.os.rename
+        orig_rn = unix._rename_noreplace
+
+        def plant(dst: object, dfd: int | None) -> None:
+            if planted or not isinstance(dst, str) or not dst.startswith("."):
+                return
+            full = _at_path(dst, dfd)
+            if os.path.lexists(full):
+                return
+            os.mkdir(full, 0o700)
+            planted["path"] = full
+            planted["ino"] = os.lstat(full).st_ino
+
+        def fake_rename(src: object, dst: object, *args: object, **kwargs: object):
+            plant(dst, kwargs.get("dst_dir_fd"))  # type: ignore[arg-type]
+            return orig_rename(src, dst, *args, **kwargs)
+
+        def fake_rn(dfd: int, src: str, dst: str):
+            plant(dst, dfd)
+            return orig_rn(dfd, src, dst)
+
+        unix.os.rename = fake_rename  # type: ignore[assignment]
+        unix._rename_noreplace = fake_rn  # type: ignore[assignment]
+        self.addCleanup(setattr, unix.os, "rename", orig_rename)
+        self.addCleanup(setattr, unix, "_rename_noreplace", orig_rn)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        srv.start()
+        self.assertIn("path", planted)
+        listed = os.lstat(planted["path"])
+        self.assertTrue(stat.S_ISDIR(listed.st_mode))
+        self.assertEqual(listed.st_ino, planted["ino"])
+        with UnixControlClient(srv.path) as client:
+            self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+
+    def test_unlink_permission_error_restores_the_public_name(self) -> None:
+        """``PermissionError`` from unlink after the rename puts the public name back."""
+        os.mkdir(self.sock_dir, 0o700)
+        path, inode = self._stale(self.sock_dir)
+        orig_unlink = unix.os.unlink
+
+        def fake_unlink(target: object, *args: object, **kwargs: object):
+            full = _at_path(target, kwargs.get("dir_fd"))  # type: ignore[arg-type]
+            if full.startswith(self.sock_dir + os.sep) and os.path.basename(full) not in ("control.sock", "control.sock.lock"):
+                raise PermissionError(errno.EACCES, "Permission denied", full)
+            return orig_unlink(target, *args, **kwargs)
+
+        unix.os.unlink = fake_unlink  # type: ignore[assignment]
+        self.addCleanup(setattr, unix.os, "unlink", orig_unlink)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        with self.assertRaises(PermissionError) as caught:
+            srv.start()
+        self.assertEqual(caught.exception.errno, errno.EACCES)
+        listed = os.lstat(path)
+        self.assertEqual(listed.st_ino, inode)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual(_refused_sockets(self.sock_dir), ["control.sock"])
+
+    def test_close_unlink_permission_error_restores_the_public_name(self) -> None:
+        os.mkdir(self.sock_dir, 0o700)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        srv.start()
+        self.addCleanup(srv.close)
+        inode = os.lstat(srv.path).st_ino
+        orig_unlink = unix.os.unlink
+
+        def fake_unlink(target: object, *args: object, **kwargs: object):
+            full = _at_path(target, kwargs.get("dir_fd"))  # type: ignore[arg-type]
+            if os.path.basename(str(full)).startswith("."):
+                raise PermissionError(errno.EACCES, "Permission denied", full)
+            return orig_unlink(target, *args, **kwargs)
+
+        unix.os.unlink = fake_unlink  # type: ignore[assignment]
+        self.addCleanup(setattr, unix.os, "unlink", orig_unlink)
+        with self.assertRaises(PermissionError) as caught:
+            srv.close()
+        self.assertEqual(caught.exception.errno, errno.EACCES)
+        listed = os.lstat(srv.path)
+        self.assertEqual(listed.st_ino, inode)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual([name for name in _socket_entries(self.sock_dir) if name.startswith(".")], [])
+
+    def test_long_path_does_not_abandon_the_socket(self) -> None:
+        """A 107-byte socket path is not moved aside when the quarantine name cannot fit."""
+        name = "s"
+        directory = self._exact_dir(name, 107)
+        path, inode = self._stale(directory, name)
+        self.assertEqual(len(os.fsencode(path)), 107)
+        srv = UnixControlServer(directory, ct.with_ping_health(), name=name)
+        self.addCleanup(srv.close)
+        exc: BaseException | None = None
+        try:
+            srv.start()
+        except BaseException as err:  # noqa: BLE001 - the assertion reports the type and the directory
+            exc = err
+        entries = os.listdir(directory)
+        self.assertIsInstance(exc, ct.InsecureSocketPath, (type(exc).__name__, exc, entries))
+        self.assertIn("Left in place", str(exc))
+        listed = os.lstat(path)
+        self.assertEqual(listed.st_ino, inode)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual([entry for entry in entries if entry.startswith(".")], [])
+
+    def test_long_path_that_fits_a_quarantine_name_is_reclaimed(self) -> None:
+        name = "control.sock"
+        directory = self._exact_dir(name, 107)
+        path, _inode = self._stale(directory, name)
+        self.assertEqual(len(os.fsencode(path)), 107)
+        self.assertLessEqual(len(os.fsencode(path)), 107)
+        srv = UnixControlServer(directory, ct.with_ping_health(), name=name)
+        self.addCleanup(srv.close)
+        srv.start()
+        with UnixControlClient(srv.path) as client:
+            self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+        srv.close()
+        self.assertFalse(os.path.lexists(path))
+        self.assertEqual([entry for entry in os.listdir(directory) if entry.startswith(".")], [])
+
+    def _flip_during_recheck(self, flip) -> tuple[BaseException | None, bool]:
+        orig_connect = socket.socket.connect
+        flipped = {"n": 0}
+
+        def fake_connect(sock: socket.socket, addr: object) -> None:
+            if flipped["n"] == 0 and addr != flip["path"]:
+                flipped["n"] = 1
+                flip["do"]()
+            orig_connect(sock, addr)
+
+        socket.socket.connect = fake_connect  # type: ignore[method-assign]
+        srv = UnixControlServer(flip["directory"], ct.with_ping_health(), name=flip["name"])
+        started = False
+        exc: BaseException | None = None
+        try:
+            try:
+                srv.start()
+                started = True
+            except BaseException as err:  # noqa: BLE001
+                exc = err
+        finally:
+            socket.socket.connect = orig_connect  # type: ignore[method-assign]
+            if started:
+                srv.close()
+            else:
+                srv.close()
+        return exc, started
+
+    def test_parent_symlink_flip_during_recheck_does_not_report_success(self) -> None:
+        """Flipping a parent symlink during the recheck must not look like a finished reclaim.
+
+        The socket directory itself is real. ``link`` is a parent of that directory, so
+        ``O_NOFOLLOW`` still opens it, and the connect path changes after the dir fd is held.
+        """
+        real_holder = os.path.join(self.base, "real_holder")
+        empty_holder = os.path.join(self.base, "empty_holder")
+        os.mkdir(real_holder, 0o700)
+        os.mkdir(empty_holder, 0o700)
+        real = os.path.join(real_holder, "run")
+        empty = os.path.join(empty_holder, "run")
+        os.mkdir(real, 0o700)
+        os.mkdir(empty, 0o700)
+        link = os.path.join(self.base, "link")
+        os.symlink(real_holder, link)
+        directory = os.path.join(link, "run")
+        path, inode = self._stale(directory, "control.sock")
+        real_path = os.path.join(real, "control.sock")
+        self.assertEqual(os.lstat(real_path).st_ino, inode)
+
+        def do_flip() -> None:
+            os.unlink(link)
+            os.symlink(empty_holder, link)
+
+        exc, started = self._flip_during_recheck(
+            {"path": path, "directory": directory, "name": "control.sock", "do": do_flip}
+        )
+        self.assertFalse(started, (exc, os.listdir(real), os.listdir(empty)))
+        self.assertIsInstance(exc, ct.InsecureSocketPath, exc)
+        restored = os.lstat(real_path)
+        self.assertEqual(restored.st_ino, inode)
+        self.assertTrue(stat.S_ISSOCK(restored.st_mode))
+        self.assertFalse(os.path.lexists(os.path.join(empty, "control.sock")))
+        self.assertEqual([name for name in os.listdir(real) if name.startswith(".")], [])
+
+    def test_directory_replacement_during_recheck_does_not_report_success(self) -> None:
+        """A replaced parent makes a path connect return ENOENT while the dir fd still holds the socket.
+
+        The socket name is long enough that ``/proc/self/fd/<dirfd>/<name>`` does not fit in
+        ``sun_path``, so the recheck has to notice the parent inode changed.
+        """
+        parent = tempfile.mkdtemp(prefix="p", dir="/tmp")
+        self.addCleanup(self._rm_tree, parent)
+        name = "n" * (107 - len(parent) - 1)
+        directory = parent
+        path, inode = self._stale(directory, name)
+        self.assertEqual(len(os.fsencode(path)), 107)
+        self.assertGreater(len(os.fsencode(f"/proc/self/fd/0/{name}")), 107)
+        old = directory + "_old"
+
+        def do_replace() -> None:
+            os.rename(directory, old)
+            os.mkdir(directory, 0o700)
+
+        exc, started = self._flip_during_recheck(
+            {"path": path, "directory": directory, "name": name, "do": do_replace}
+        )
+        self.assertFalse(started, (exc, os.listdir(old) if os.path.isdir(old) else None))
+        self.assertIsInstance(exc, ct.InsecureSocketPath, exc)
+        restored_path = os.path.join(old, name)
+        restored = os.lstat(restored_path)
+        self.assertEqual(restored.st_ino, inode)
+        self.assertTrue(stat.S_ISSOCK(restored.st_mode))
+        self.assertFalse(any(stat.S_ISSOCK(os.lstat(os.path.join(directory, entry)).st_mode) for entry in os.listdir(directory)))
+        self.assertEqual([entry for entry in os.listdir(old) if entry.startswith(".")], [])
+
+    def test_quarantine_name_race_replaces_no_listener(self) -> None:
+        """Listeners planted on the quarantine name across the move are not replaced."""
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        stats = {"lost": 0, "armed": 0}
+        orig_rename = unix.os.rename
+        orig_rn = unix._rename_noreplace
+        for _ in range(40):
+            if os.path.lexists(path):
+                os.unlink(path)
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(path)
+            stale.close()
+            planted: dict = {}
+
+            def plant(dst: object, dfd: int | None, planted: dict = planted) -> None:
+                if planted or not isinstance(dst, str) or not dst.startswith("."):
+                    return
+                full = _at_path(dst, dfd)
+                if os.path.lexists(full):
+                    return
+                live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    live.bind(full)
+                    live.listen(1)
+                except OSError:
+                    live.close()
+                    return
+                planted["sock"] = live
+                planted["path"] = full
+                planted["ino"] = os.lstat(full).st_ino
+
+            def fake_rename(src: object, dst: object, *args: object, **kwargs: object):
+                plant(dst, kwargs.get("dst_dir_fd"))  # type: ignore[arg-type]
+                return orig_rename(src, dst, *args, **kwargs)
+
+            def fake_rn(dfd: int, src: str, dst: str):
+                plant(dst, dfd)
+                return orig_rn(dfd, src, dst)
+
+            unix.os.rename = fake_rename  # type: ignore[assignment]
+            unix._rename_noreplace = fake_rn  # type: ignore[assignment]
+            try:
+                try:
+                    unix._clear_stale_socket(path)
+                except (OSError, ct.InsecureSocketPath):
+                    pass
+            finally:
+                unix.os.rename = orig_rename  # type: ignore[assignment]
+                unix._rename_noreplace = orig_rn  # type: ignore[assignment]
+            if "sock" not in planted:
+                continue
+            stats["armed"] += 1
+            try:
+                listed = os.lstat(planted["path"])
+                kept = stat.S_ISSOCK(listed.st_mode) and listed.st_ino == planted["ino"]
+            except OSError:
+                kept = False
+            if kept:
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    client.settimeout(0.2)
+                    planted["sock"].settimeout(0.2)
+                    client.connect(planted["path"])
+                    conn, _ = planted["sock"].accept()
+                    conn.close()
+                except OSError:
+                    kept = False
+                finally:
+                    client.close()
+            planted["sock"].close()
+            if not kept:
+                stats["lost"] += 1
+        self.assertGreaterEqual(stats["armed"], 30, stats)
+        self.assertEqual(stats["lost"], 0, stats)
+
+    def test_without_renameat2_a_refused_socket_stays_in_place(self) -> None:
+        os.mkdir(self.sock_dir, 0o700)
+        path, inode = self._stale(self.sock_dir)
+        orig = unix._load_renameat2
+        unix._load_renameat2 = lambda: None  # type: ignore[method-assign]
+        self.addCleanup(setattr, unix, "_load_renameat2", orig)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        with self.assertRaises(ct.InsecureSocketPath) as caught:
+            srv.start()
+        self.assertIn("Left in place", str(caught.exception))
+        listed = os.lstat(path)
+        self.assertEqual(listed.st_ino, inode)
+        self.assertEqual([name for name in os.listdir(self.sock_dir) if name.startswith(".")], [])
 
 
 if __name__ == "__main__":

@@ -250,10 +250,11 @@ class TrustStore:
             return generation
 
     def close(self) -> None:
-        db = self._db
-        self._db = None
-        if db is not None:
-            db.close()
+        with self._lock:
+            db = self._db
+            self._db = None
+            if db is not None:
+                db.close()
 
     def classify(self, manifest: Manifest, signature: object) -> tuple[str, str | None, str]:
         """Return ``(trust, signer_key_id, reason)``; trust is ``signed`` or ``unsigned``."""

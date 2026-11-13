@@ -181,4 +181,5 @@ class ConnectionBreaker:
             return {"provider": bound[2], "model_version": bound[3]}
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._db.close()

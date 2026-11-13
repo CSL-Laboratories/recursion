@@ -272,4 +272,5 @@ class Authority:
                 "remaining_minor": profile["budgets"]["total_minor"] - spent - amount_minor}
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._db.close()

@@ -246,10 +246,11 @@ def route_unbindable(entry, breaker):
     and a binding the store refuses stops the launch. Two things about a route make every binding
     fail. One is a connection id the store cannot key (``breaker_connection_unrepresentable``); a
     limit on such a connection could not be kept across a restart either. The other is a model the
-    store cannot record (``breaker_model_unrepresentable``): an empty name, one longer than 128
-    characters, or one with a space, a control character or a non-ASCII character in it. The start is
-    refused for either before the route service is asked, and ``route.list`` names the same refusal
-    as the route's blocker. Both read this one function, so they cannot differ.
+    store cannot record (``breaker_model_unrepresentable``): one longer than 128 characters, or one
+    with a space, a control character or a non-ASCII character in it. The start is refused for either
+    before the route service is asked, and ``route.list`` names the same refusal as the route's
+    blocker. Both read this one function, so they cannot differ. A model that is missing, empty or
+    not text is not refused here: the route validator answers ``request_invalid`` for it, as before.
 
     As in ``route_unsupported``, the routes of a ``limits.fallback`` list count only when the daemon
     would launch from the list (``on_limit: fallback``). A list that is only shown to the user
@@ -267,10 +268,12 @@ def route_unbindable(entry, breaker):
             if conn is not None and not breaker.representable(conn):
                 # A limit on this connection could never be kept across a restart: refuse, do not run unfenced.
                 return 'breaker_connection_unrepresentable', 'connection id'
-    if not breaker.model_representable(route.get('model')):
+    model = route.get('model')
+    if isinstance(model, str) and model and not breaker.model_representable(model):
         return 'breaker_model_unrepresentable', 'model'
     for place, other in enumerate(fallbacks, 1):
-        if isinstance(other, dict) and not breaker.model_representable(other.get('model')):
+        model = other.get('model') if isinstance(other, dict) else None
+        if isinstance(model, str) and model and not breaker.model_representable(model):
             return 'breaker_model_unrepresentable', f'fallback {place}: model'
     return None
 

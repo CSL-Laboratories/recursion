@@ -474,17 +474,19 @@ class Adv2ContentLengthTests(GuiCase):
     """A request says once how long its body is. With two Content-Length headers the server read the
     first, so a shorter first header made a prefix of the body the whole form: "...run_id=run-12" out
     of "...run_id=run-1234567890", with the page's own length check satisfied. A request that names
-    its length more than once is refused before the page sees it."""
+    its length more than once is refused before the page sees it. So is one with a Transfer-Encoding
+    header: the server decodes no transfer coding and would read such a body by its Content-Length."""
 
     WHOLE = b'confirm=explicit&run_id=run-1234567890'
 
-    def post_raw(self, gui, lengths, body):
-        """POST /stop with one Content-Length header per entry of ``lengths``; the status line that came back."""
+    def post_raw(self, gui, lengths, body, more=''):
+        """POST /stop with one Content-Length header per entry of ``lengths`` (and the header lines in
+        ``more``); the status line that came back."""
         import socket
         port = gui.address[1]
         head = (f'POST /stop HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n'
                 'Content-Type: application/x-www-form-urlencoded\r\n'
-                + ''.join(f'Content-Length: {length}\r\n' for length in lengths) + '\r\n').encode()
+                + ''.join(f'Content-Length: {length}\r\n' for length in lengths) + more + '\r\n').encode()
         with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
             client.sendall(head + body)
             client.shutdown(socket.SHUT_WR)
@@ -506,7 +508,31 @@ class Adv2ContentLengthTests(GuiCase):
             # One length, for contrast: the same bytes are a Stop of the run they name.
             self.assertEqual(self.post_raw(gui, (whole,), self.WHOLE).split()[1], '200')
             self.assertEqual(fake.call.stops, [{'run_id': 'run-1234567890'}])
+            # A plain read is answered as before.
+            self.assertEqual(self.get(gui, '/')[0], 200)
             # A refused request holds no place among the readers or the answering threads afterwards.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and (gui.server._reading or gui.server._working):
+                time.sleep(0.02)
+            self.assertEqual((len(gui.server._reading), len(gui.server._working)), (0, 0))
+
+    def test_a_request_with_a_transfer_encoding_is_refused(self):
+        whole = len(self.WHOLE)
+        chunked = 'Transfer-Encoding: chunked\r\n'
+        fake, transport = control_over(FakeOperatorHost({}))
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            # With one length (the shorter one named run-12), with two, and with none; and another coding.
+            for lengths, more in (((whole - 8,), chunked), ((whole,), chunked), ((whole - 8, whole), chunked),
+                                  ((), chunked), ((whole,), 'Transfer-Encoding: identity\r\n'),
+                                  ((whole,), 'transfer-encoding: gzip, chunked\r\n')):
+                with self.subTest(content_lengths=lengths, header=more.strip()):
+                    status = self.post_raw(gui, lengths, self.WHOLE, more)
+                    self.assertEqual(status.split(None, 2)[1:], ['400', 'ambiguous request length'], status)
+                    self.assertEqual(fake.call.stops, [], 'a request with a transfer coding was acted on')
+            # One length and no transfer coding, for contrast: a Stop of the run the body names. And a plain read.
+            self.assertEqual(self.post_raw(gui, (whole,), self.WHOLE).split()[1], '200')
+            self.assertEqual(fake.call.stops, [{'run_id': 'run-1234567890'}])
+            self.assertEqual(self.get(gui, '/')[0], 200)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and (gui.server._reading or gui.server._working):
                 time.sleep(0.02)

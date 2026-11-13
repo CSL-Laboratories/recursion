@@ -294,10 +294,15 @@ class RouteStarter:
                    'deadline_s': entry['deadline_s'], 'route': json.loads(json.dumps(entry['route']))}
         ctx = RunContext(run_id)
         with self._lock:
-            if run_id in self._active:
-                raise self._refuse(run_id, 'start_in_flight', '')
-            self._active[run_id] = ctx
-            self.failures.pop(run_id, None)
+            in_flight = run_id in self._active
+            if not in_flight:
+                self._active[run_id] = ctx
+                self.failures.pop(run_id, None)
+        if in_flight:
+            # Refused once the lock is released: ``_refuse`` takes it to record the refusal, and it is
+            # not reentrant. Refusing inside the block left this thread waiting on itself, and every
+            # later start, every worker's cleanup and ``active()`` waiting behind it.
+            raise self._refuse(run_id, 'start_in_flight', '')
         threading.Thread(target=self._drive, args=(ctx, request), name=f'recursion-run-{run_id}',
                          daemon=True).start()
         if ctx.wait_started(self._start_timeout_s):

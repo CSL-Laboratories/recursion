@@ -25,8 +25,11 @@ import unittest
 from unittest import mock
 
 from recursion_core.control import cli
+from recursion_core.control.api import ControlAPI
 from recursion_core.control.client import SocketAPI
-from recursion_core.control.registry import EMPTY, POPULATED, TIMEOUT, UNKNOWN, StaleGeneration, StopUnattested
+from recursion_core.control.registry import (
+    EMPTY, POPULATED, TIMEOUT, UNKNOWN, InMemoryRunRegistry, StaleGeneration, StopUnattested,
+)
 from recursion_core.control_transport import TransportBusy
 from recursion_core.daemon import Daemon, Registry, Run, UnitNotLoaded
 from recursion_core.daemon import control_adapter as adapter
@@ -1206,6 +1209,139 @@ class LauncherTest(unittest.TestCase):
         refused = subprocess.run([sys.executable, '-I', '-S', str(launcher.ENGINE_EXEC), str(fifo), '--', 'env'],
                                  capture_output=True, text=True, timeout=30, check=False)
         self.assertEqual((refused.returncode, refused.stdout), (127, ''))
+
+
+class HeldRoute:
+    """A route service that launches nothing: each request waits here until the test lets it go."""
+
+    def __init__(self):
+        self.changed = threading.Condition()
+        self.calls = []  # (run id, release event), in the order the route workers got here
+
+    def handle(self, request):
+        release = threading.Event()
+        with self.changed:
+            self.calls.append((request['request_id'], release))
+            self.changed.notify_all()
+        release.wait()
+        return {'request_id': request['request_id'], 'code': 'engine_exited', 'detail': 'held route let go'}
+
+    def reached(self, count, bound_s):
+        """True once ``count`` requests got here. ``bound_s`` only ends a wait that would never end."""
+        with self.changed:
+            return self.changed.wait_for(lambda: len(self.calls) >= count, bound_s)
+
+    def let_go(self, index=None):
+        with self.changed:
+            held = self.calls if index is None else [self.calls[index]]
+            for _, release in held:
+                release.set()
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class StartInFlightTest(unittest.TestCase):
+    """A start whose launch outlived the start timeout leaves its route worker running. A second start
+    of that run id while the worker is still there is refused ``start_in_flight``. The refusal used to
+    be raised while the starter held its own lock, and recording it takes that lock: the thread never
+    came back, and every later start, every worker's cleanup and ``active()`` waited behind it.
+
+    Each call that could wait for ever is made on its own thread. ``BOUND_S`` only ends a wait that
+    would otherwise never end, so it decides how long a failure takes and never whether a test passes.
+    """
+
+    BOUND_S = 30.0
+    ENTRY = {'route': {'engine': 'claude_code', 'model': 'held'}, 'deadline_s': 5}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='rc-inflight-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.route = HeldRoute()
+        self.addCleanup(self.route.let_go)
+        # start_timeout_s=0: a start gives up at once, with no waiting, while its route worker is held.
+        self.starter = adapter.RouteStarter(self.route, {'claude_code': self.ENTRY}, mock.Mock(closed=False),
+                                            self.tmp, start_timeout_s=0)
+
+    def answered(self, call, *args):
+        """What ``call`` answered, or None if it has not answered at all."""
+        box = []
+
+        def run():
+            try:
+                box.append(('returned', call(*args)))
+            except adapter.StartRefused as refused:
+                box.append(('refused', refused.code))
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(self.BOUND_S)
+        return box[0] if box else None
+
+    def worker_ended(self, run_id):
+        for thread in threading.enumerate():
+            if thread.name == f'recursion-run-{run_id}':
+                thread.join(self.BOUND_S)
+                if thread.is_alive():
+                    return False
+        return True
+
+    @staticmethod
+    def params(run_id):
+        return {'run_id': run_id, 'engine': 'claude_code', 'tenant': 't1', 'prompt': 'hi'}
+
+    def test_a_second_start_of_a_run_still_in_flight_is_refused_and_the_starter_goes_on(self):
+        starter, route = self.starter, self.route
+        run, other = 'run-' + 'a' * 32, 'run-' + 'b' * 32
+        self.assertEqual(self.answered(starter, self.params(run)), ('refused', 'launch_timeout'))
+        self.assertTrue(route.reached(1, self.BOUND_S), 'the first route worker is held in the route')
+        # The same run id again, while that worker is still there.
+        self.assertEqual(self.answered(starter, self.params(run)), ('refused', 'start_in_flight'))
+        self.assertEqual(starter.failures[run], {'code': 'start_in_flight', 'detail': ''})
+        self.assertEqual([run_id for run_id, _ in route.calls], [run], 'the refused start launched nothing')
+        # The starter is not wedged: it says the run is in flight, and another run id gets its own worker.
+        self.assertEqual(self.answered(starter.active, run), ('returned', True))
+        self.assertEqual(self.answered(starter, self.params(other)), ('refused', 'launch_timeout'))
+        self.assertTrue(route.reached(2, self.BOUND_S), 'the other run reached the route')
+        self.assertEqual(route.calls[1][0], other)
+        # Once the first worker has ended, the run id is free and can be started again.
+        route.let_go(0)
+        self.assertTrue(self.worker_ended(run), 'the first route worker ended')
+        self.assertEqual(self.answered(starter.active, run), ('returned', False))
+        self.assertEqual(self.answered(starter, self.params(run)), ('refused', 'launch_timeout'))
+        self.assertTrue(route.reached(3, self.BOUND_S), 'the run was launched again')
+        self.assertEqual(route.calls[2][0], run)
+        self.assertEqual(starter.failures[run], {'code': 'launch_timeout', 'detail': ''})
+
+    def test_a_same_key_retry_while_the_first_launch_is_still_in_flight_is_answered(self):
+        """The way a client gets there: the first ``run.start`` outlives the start timeout and answers
+        ``start_failed``; the client retries with the same ``client_key`` while the route worker is
+        still running; the control API relaunches under the same run id, and the starter refuses."""
+        route = self.route
+        api = ControlAPI(InMemoryRunRegistry(), mock.Mock(), self.starter, time.time)
+        control = adapter.DaemonControl(api, api._registry, mock.Mock(), self.starter, self.tmp)
+        start = {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi', 'client_key': 'k1'}
+
+        def outcome(params):
+            answer = self.answered(control.call, 'run.start', params)
+            self.assertIsNotNone(answer, 'run.start was answered')
+            answer = answer[1]
+            return answer['code'], answer.get('run_id'), (answer.get('start_error') or {}).get('code')
+
+        code, run, error = outcome(start)
+        self.assertEqual((code, error), ('start_failed', 'launch_timeout'))
+        self.assertTrue(route.reached(1, self.BOUND_S), 'the first route worker is held in the route')
+        self.assertEqual(outcome(start), ('start_failed', run, 'start_in_flight'))
+        self.assertEqual([run_id for run_id, _ in route.calls], [run], 'the retry launched nothing')
+        # Later starts are answered: another key gets a run of its own, and its worker reaches the route.
+        code, later, error = outcome(dict(start, client_key='k2'))
+        self.assertEqual((code, error), ('start_failed', 'launch_timeout'))
+        self.assertNotEqual(later, run)
+        self.assertTrue(route.reached(2, self.BOUND_S), 'the later start reached the route')
+        # Once the first worker has ended, the same key launches the same run again.
+        route.let_go(0)
+        self.assertTrue(self.worker_ended(run), 'the first route worker ended')
+        self.assertEqual(outcome(start), ('start_failed', run, 'launch_timeout'))
+        self.assertTrue(route.reached(3, self.BOUND_S), 'the run was launched again')
+        self.assertEqual(route.calls[2][0], run)
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)

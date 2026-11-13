@@ -13,7 +13,8 @@ Linux is the tested path. macOS uses the same AF_UNIX family and is designed in 
 
 A connect that fails with ``EACCES`` or ``EPERM`` does not reclaim the socket.
 Owner decision: that errno is not proof the file is stale, so a dead mode-000
-socket stays until the operator removes it.
+socket stays until the operator removes it. ``ECONNREFUSED`` reclaims only
+while an ``O_PATH`` fd holds that inode, and only when the path still names it.
 """
 
 from __future__ import annotations
@@ -233,16 +234,22 @@ def _stat_our_socket(path: str) -> os.stat_result | None:
 
 
 def _probe_listener(path: str) -> int | None:
-    """``None`` when a listener accepts. Otherwise ``connect``'s errno.
+    """``None`` when a listener is present. Otherwise ``connect``'s errno.
 
-    Errnos other than refused, missing, and permission-denied propagate.
+    A full accept queue fails this non-blocking connect with ``BlockingIOError``
+    (``EAGAIN``). That listener is live: return ``None`` so the caller does not
+    unlink. Errnos other than refused, missing, and permission-denied propagate.
     """
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         probe.settimeout(1.0)
         try:
             probe.connect(path)
+        except BlockingIOError:
+            return None
         except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return None
             if exc.errno in (errno.ECONNREFUSED, errno.ENOENT, errno.EACCES, errno.EPERM):
                 return exc.errno
             raise
@@ -251,38 +258,76 @@ def _probe_listener(path: str) -> int | None:
     return None
 
 
-def _unlink_our_socket(path: str, ident: tuple[int, int]) -> None:
-    """Unlink ``path`` only when a fresh lstat still shows socket inode ``ident``.
+def _open_inode_pin(path: str) -> int | None:
+    """Fd that holds ``path``'s inode until closed, or ``None`` if the name is gone.
 
-    A symlink or a different inode is refused and left in place. ``_unlink_inode``
-    checks again at the unlink, so a swap between the lstat and the unlink misses.
+    ``O_PATH|O_NOFOLLOW`` does not connect. With both flags a symlink yields an
+    fd for the link itself; the caller rejects that from ``fstat``. The fd is
+    what stops the inode being reused after the name is removed.
+    """
+    try:
+        return os.open(path, os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InsecureSocketPath(f"{path} exists and is not our socket") from exc
+
+
+def _refuse_unreclaimed(path: str, err: int | None) -> None:
+    """Raise for a live or unconnectable socket. A missing name returns. No unlink."""
+    if err is None:
+        raise InsecureSocketPath(f"{path} is live: another server is listening")
+    if err == errno.ENOENT:
+        return
+    code = errno.errorcode.get(err, str(err))
+    raise InsecureSocketPath(
+        f"{path} is not connectable ({code}). Left in place. Remove this socket if it is stale."
+    )
+
+
+def _unlink_our_socket(path: str, pin: int) -> None:
+    """Unlink ``path`` only when a fresh lstat still names the inode ``pin`` holds.
+
+    ``pin`` is the ``O_PATH`` fd opened before the probe. That inode cannot be
+    reused, so a listener bound at ``path`` after the old name was removed does
+    not match ``fstat(pin)`` and is left in place. ``_unlink_inode`` checks again.
     """
     try:
         st = os.lstat(path)
     except FileNotFoundError:
         return
+    held = os.fstat(pin)
     if (
         stat.S_ISLNK(st.st_mode)
         or not stat.S_ISSOCK(st.st_mode)
+        or not stat.S_ISSOCK(held.st_mode)
         or st.st_uid != os.geteuid()
-        or (st.st_dev, st.st_ino) != ident
+        or (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino)
     ):
         raise InsecureSocketPath(f"{path} exists and is not our socket")
-    _unlink_inode(path, ident)
+    _unlink_inode(path, (held.st_dev, held.st_ino))
 
 
 def _clear_stale_socket(path: str) -> None:
     """Drop a socket we own only when connect proves nothing is listening.
 
-    ``ECONNREFUSED`` means this namespace has no listener on that inode, so
-    the inode-checked unlink may reclaim it. ``EACCES`` and ``EPERM`` do not:
-    a live mode-000 or mode-070 listener fails connect the same way a dead
-    socket does. ``/proc/net/unix`` cannot separate those. Another net
-    namespace, a bind mount in another mount namespace, a symlink or ``..``
-    alias, and a path ``str.splitlines`` would split (newline, vertical tab)
-    all omit the listener while it is still live. Do not chmod on this path
-    either: chmod would leave a listener at 0600, and ``follow_symlinks=False``
-    still walks a parent symlink.
+    The inode is pinned before the probe and held until the unlink check
+    returns. ``ECONNREFUSED`` means this namespace has no listener on that
+    inode, so the inode-checked unlink may reclaim it. A replacement bound
+    in between has a different inode while the pin is open, and is refused.
+    Without ``O_PATH`` the inode cannot be held, so ``ECONNREFUSED`` is left
+    in place rather than reclaimed.
+
+    ``EACCES`` and ``EPERM`` do not reclaim: a live mode-000 or mode-070
+    listener fails connect the same way a dead socket does. ``/proc/net/unix``
+    cannot separate those. Another net namespace, a bind mount in another
+    mount namespace, a symlink or ``..`` alias, and a path ``str.splitlines``
+    would split (newline, vertical tab) all omit the listener while it is
+    still live. Do not chmod on this path either: chmod would leave a listener
+    at 0600, and ``follow_symlinks=False`` still walks a parent symlink.
+
+    A full accept queue surfaces as ``EAGAIN`` / ``BlockingIOError``. That is
+    a live listener: the same refusal as a successful connect, and no unlink.
 
     Owner decision: never unlink on ``EACCES`` or ``EPERM``. A dead mode-000
     socket stays until the operator removes it.
@@ -290,19 +335,29 @@ def _clear_stale_socket(path: str) -> None:
     st = _stat_our_socket(path)
     if st is None:
         return
-    ident = (st.st_dev, st.st_ino)
-    err = _probe_listener(path)
-    if err is None:
-        raise InsecureSocketPath(f"{path} is live: another server is listening")
-    if err == errno.ENOENT:
+    if getattr(os, "O_PATH", None) is None or getattr(os, "O_NOFOLLOW", None) is None:
+        # No fd can hold the inode, so a reused number could match a new listener.
+        _refuse_unreclaimed(path, _probe_listener(path))
         return
-    if err == errno.ECONNREFUSED:
-        _unlink_our_socket(path, ident)
+    pin = _open_inode_pin(path)
+    if pin is None:
         return
-    code = errno.errorcode.get(err, str(err))
-    raise InsecureSocketPath(
-        f"{path} is not connectable ({code}). Left in place. Remove this socket if it is stale."
-    )
+    try:
+        held = os.fstat(pin)
+        if (
+            stat.S_ISLNK(held.st_mode)
+            or not stat.S_ISSOCK(held.st_mode)
+            or held.st_uid != os.geteuid()
+            or (held.st_dev, held.st_ino) != (st.st_dev, st.st_ino)
+        ):
+            raise InsecureSocketPath(f"{path} exists and is not our socket")
+        err = _probe_listener(path)
+        if err == errno.ECONNREFUSED:
+            _unlink_our_socket(path, pin)
+            return
+        _refuse_unreclaimed(path, err)
+    finally:
+        os.close(pin)
 
 
 def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -> PeerCred:

@@ -5,6 +5,8 @@ permission swaps around bind, lock-fd leaks (failed socket() and fork), a
 handler reply that cannot be encoded, a local encode error closing a healthy
 client, and close() that cannot cancel. Unconnectable-socket cases and a
 close() that skips shutdown after a failed unlink failed on 1d0649c7.
+An ECONNREFUSED probe that unlinks a listener bound on the reused inode, and
+a full-backlog EAGAIN left as BlockingIOError, failed on e212728e.
 """
 
 from __future__ import annotations
@@ -810,6 +812,96 @@ class LockAndPermissionTests(_TmpCase):
         self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o644)
         with open(victim, "rb") as fh:
             self.assertEqual(fh.read(), b"secret")
+
+    def test_refused_unlink_does_not_drop_a_listener_on_a_reused_inode(self) -> None:
+        """A live socket bound in the ECONNREFUSED window must keep its name.
+
+        ext4 reuses the inode of a closed unix socket as soon as the name is
+        unlinked. A saved ``(st_dev, st_ino)`` then matches the replacement,
+        and ``S_ISSOCK`` does not reject it. A swapped regular file does not
+        catch this.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()
+        planted: dict = {}
+        orig_connect = socket.socket.connect
+
+        def fake_connect(sock: socket.socket, addr: object) -> None:
+            try:
+                orig_connect(sock, addr)
+            except OSError as exc:
+                if exc.errno == errno.ECONNREFUSED and addr == path and "sock" not in planted:
+                    os.unlink(path)
+                    live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    live.bind(path)
+                    live.listen(1)
+                    planted["sock"] = live
+                    planted["ino"] = os.lstat(path).st_ino
+                raise
+
+        socket.socket.connect = fake_connect  # type: ignore[method-assign]
+        self.addCleanup(setattr, socket.socket, "connect", orig_connect)
+        self.addCleanup(lambda: planted["sock"].close() if "sock" in planted else None)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        with self.assertRaises((OSError, ct.InsecureSocketPath)):
+            srv.start()
+        self.assertIn("sock", planted)
+        listed = os.lstat(path)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual(listed.st_ino, planted["ino"])
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        planted["sock"].settimeout(2)
+        client.connect(path)
+        conn, _ = planted["sock"].accept()
+        conn.close()
+
+    def test_full_backlog_eagain_is_live_and_not_unlinked(self) -> None:
+        """A full accept queue is a live listener. ``EAGAIN`` must not unlink it."""
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(1)
+        listed = os.lstat(path)
+        inode = listed.st_ino
+        mode = stat.S_IMODE(listed.st_mode)
+        fillers: list[socket.socket] = []
+        self.addCleanup(lambda: [client.close() for client in fillers])
+        while len(fillers) < 64:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.setblocking(False)
+            try:
+                client.connect(path)
+            except BlockingIOError as exc:
+                self.assertEqual(exc.errno, errno.EAGAIN)
+                client.close()
+                break
+            fillers.append(client)
+        else:
+            self.fail("accept queue never returned EAGAIN")
+        self.assertGreaterEqual(len(fillers), 1)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        with self.assertRaises(ct.InsecureSocketPath) as caught:
+            srv.start()
+        self.assertIn("is live", str(caught.exception))
+        kept = os.lstat(path)
+        self.assertTrue(stat.S_ISSOCK(kept.st_mode))
+        self.assertEqual(kept.st_ino, inode)
+        self.assertEqual(stat.S_IMODE(kept.st_mode), mode)
+        again = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(again.close)
+        again.setblocking(False)
+        with self.assertRaises(BlockingIOError) as blocked:
+            again.connect(path)
+        self.assertEqual(blocked.exception.errno, errno.EAGAIN)
 
     def _swap_before_mode_change(self, plant) -> None:
         """Run ``plant(path)`` once, inside the chmod that follows bind."""

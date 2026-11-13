@@ -23,7 +23,7 @@ replacement. It builds the child environment from nothing:
   private key or the passphrase; the parent's own values are still carried;
 * the user's own ``CLAUDE_CODE_OAUTH_TOKEN`` passes through to a Claude child unchanged
   (PRODUCT.md d84cdd26 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
-  method from every run). It is never checked, logged or settable by an override; absent in the
+  method from every run). Only string/NUL serialization validity is checked; it is never logged or settable by an override. Absent in the
   parent means absent in the child;
 * every call names its auth mode (``subscription``, ``api_key`` or ``cloud_provider``; PRODUCT.md
   d84cdd26 section 3.3, "Every route starts with an explicit auth mode"; CSLR-D-012). An omitted or
@@ -242,7 +242,7 @@ class EngineProfile:
     allowed: tuple[str, ...]
     hosts: tuple[str, ...]  # its own endpoints: a NO_PROXY entry matching one refuses while a proxy is set
     scrub: tuple[str, ...]  # credential and route selectors, asserted absent (they are not allowlisted)
-    # The user's own sign-in names: copied from the parent unchanged when present, never checked, never set by
+    # The user's own sign-in names: copied unchanged after string/NUL serialization checks, never set by
     # an override, absent when the parent lacks them (PRODUCT.md d84cdd26 section 3.3, Nov 8 fleet correction).
     passthrough: tuple[str, ...] = ()
     # Route-owned names. Each is on ``scrub``, so the parent's value and an override never set it; the child
@@ -393,6 +393,11 @@ def build_child_env(
             raise EnvRefused(name, "override_denied")
         env[name] = value
 
+    # Serialization validity applies to passthrough and NO_PROXY too.
+    # Temp values are replaced below, so they never reach the child unchanged.
+    for name, value in (*env.items(), *passed.items()):
+        if name not in TEMP_NAMES and (not isinstance(value, str) or (name not in NO_PROXY_NAMES and "\0" in value)):
+            raise EnvRefused(name, "value_malformed")
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:
         cause = _unsafe_value(name, env[name]) if env[name] else None  # empty: no path or URL to check
         if cause is not None:
@@ -416,12 +421,20 @@ def build_child_env(
             for name in [name for name in NO_PROXY_NAMES if name in env]:
                 if (found := _no_proxy_route_bypass(env[name], host)) is not None:
                     raise _no_proxy_refused(name, *found)
+    # Keep existing NO_PROXY refusal precedence, positions and safe messages.
+    # An otherwise accepted NUL entry still cannot be serialized into exec's env,
+    # even when no proxy is configured.
+    for name in NO_PROXY_NAMES:
+        if name in env:
+            for position, entry in enumerate(_no_proxy_entries(env[name]), 1):
+                if "\0" in entry:
+                    raise _no_proxy_refused(name, position, "no_proxy_unparseable", "contains a NUL byte")
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
     if present:
         env.update(dict.fromkeys(present, _route_tmp()))
     env["HOME"] = home
-    env.update(passed)  # after every check: the user's own sign-in value is passed as it is, never read here
+    env.update(passed)  # serialization-checked only; the sign-in value is not interpreted
 
     leaked = sorted(name for name in env if name in profile.scrub
                     or (name not in profile.allowed and name not in profile.passthrough and _DENIED.search(name)))
@@ -1252,7 +1265,7 @@ def _lexical_dir(path: str) -> str:
 
 
 def _private_dir(path: str | None) -> bool:
-    if not isinstance(path, str) or not os.path.isabs(path):
+    if not isinstance(path, str) or "\0" in path or not os.path.isabs(path):
         return False
     entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling
     if os.path.basename(entry) == "..":  # link/sub/.. names the link's target without naming an entry: refused

@@ -560,7 +560,7 @@ def _check_home(
 
     if os.name == "nt" or not hasattr(os, "geteuid"):
         raise SubscriptionRouteRefused(engine, "platform_unsupported")
-    if not isinstance(route_home, str) or not os.path.isabs(route_home):
+    if not isinstance(route_home, str) or "\0" in route_home or not os.path.isabs(route_home):
         raise SubscriptionRouteRefused(engine, "route_home_missing")
     if env.get("HOME") != route_home:
         raise SubscriptionRouteRefused(engine, "child_home_not_route_home")

@@ -1010,6 +1010,45 @@ class ComposedDaemonTest(unittest.TestCase):
                     finally:
                         self.shutdown()
 
+    def test_every_route_in_a_fallback_list_the_daemon_would_launch_from_is_checked(self):
+        """Not the first entry alone: the route service tries the list in order, so any entry can be the
+        one that is launched. An id the store cannot represent refuses the start wherever it stands."""
+        pristine = json.loads(json.dumps(self.routes))
+
+        def listed(connection_id):
+            return {'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                    'connection': {'kind': 'subscription', 'id': connection_id}}
+
+        for place in (2, 3):
+            with self.subTest(place_of_the_entry_in_the_list=place):
+                entries = [listed(f'fallback-login-{number}') for number in range(1, place)] + [listed('bad space id')]
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['limits'] = {'on_limit': 'fallback', 'fallback': entries}
+                _, composed = self.boot()
+                try:
+                    answer = self.api(composed).call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                                   'prompt': 'helper=0 fast=1'})
+                    self.assertEqual((answer['code'], (answer.get('start_error') or {}).get('code')),
+                                     ('start_failed', 'breaker_connection_unrepresentable'), answer)
+                    self.assertEqual(self.units.started, [], 'a refused start launched nothing')
+                finally:
+                    self.shutdown()
+
+    def test_a_launch_beside_a_breaker_with_no_admission_on_record_is_refused(self):
+        """The launcher binds a run to what the breaker admitted for it. The route service asks the
+        breaker before every launch, so no path in the daemon launches without that record. Here the
+        record is made to go missing: the launch is refused, and no engine is started unbound."""
+        _, composed = self.boot()
+        admit_without_a_record = composed.breaker._inner.admit  # admits, and notes nothing on the run
+        with mock.patch.object(composed.breaker, 'admit', side_effect=admit_without_a_record):
+            answer = self.api(composed).call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                           'prompt': 'helper=0 fast=1'})
+        self.assertEqual(answer['code'], 'start_failed', answer)
+        self.assertEqual(answer['start_error'], {'code': 'launch_refused', 'detail': 'breaker_admission_missing'})
+        self.assertEqual(self.units.started, [])
+        rid = self.start(self.api(composed), 'helper=0 fast=1')  # with the record, the same start launches
+        self.assertEqual(self.api(composed).call('run.stop', {'run_id': rid})['code'], 'stopped')
+
     def test_a_breaker_store_that_cannot_be_read_refuses_starts_and_keeps_reads(self):
         path = daemon_breaker.store_path(self.state)
         Registry(self.state).close()

@@ -431,6 +431,11 @@ class ProductionLauncher:
             # One unit per run id. A second launch for the same run (a fallback route) needs its own
             # run record, which the control API does not have yet.
             raise refused('run_already_launched')
+        if ctx.breaker is not None and ctx.admitted is None:
+            # The run is bound to what the breaker admitted, and the route service asks the breaker
+            # before every launch, so an admission is always on record here. If a path ever arrives
+            # without one, the launch is refused: an engine is never started unbound beside a breaker.
+            raise refused('breaker_admission_missing')
         if ctx.breaker is not None and ctx.admitted is not None and not ctx.bound:
             error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1])
             if error is not None:

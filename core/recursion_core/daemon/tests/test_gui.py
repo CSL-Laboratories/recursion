@@ -148,13 +148,14 @@ class LoopbackTests(TestCase):
         self.assertIn("Withheld: data not labelled <code>kalshi</code>", page)
 
     def test_cli_passes_plugin_directories_to_the_loader_and_imports_nothing(self):
+        plugin_dirs = tuple(str(Path(p).absolute()) for p in ("one", "two"))
         before = set(sys.modules)
         with mock.patch.object(entry, "require_free_threaded") as check, \
              mock.patch.object(entry, "main") as main, \
-             mock.patch("sys.argv", ["daemon", "--plugin", "/opt/plugins/one", "--plugin", "/opt/plugins/two",
+             mock.patch("sys.argv", ["daemon", "--plugin", plugin_dirs[0], "--plugin", plugin_dirs[1],
                                      "--gui-port", "0"]):
             entry.cli()
-        main.assert_called_once_with(plugin_dirs=("/opt/plugins/one", "/opt/plugins/two"), port=0)
+        main.assert_called_once_with(plugin_dirs=plugin_dirs, port=0)
         self.assertGreaterEqual(check.call_count, 1)
         self.assertEqual(set(sys.modules) - before, set())
         self.assertFalse(hasattr(entry, "importlib"), "the entry point has no import-by-name path for plugins")

@@ -63,8 +63,8 @@ every call refuses (``platform_unsupported``) instead of passing values unchecke
 The same holds for any build without ``os.geteuid``, and the owner helpers refuse
 (``owner_check_unsupported``, or a false owned-chain / private-dir result) there.
 
-Candidate code: no engine, provider or network is used, and nothing here claims the
-new core's runtime calls it yet.
+Candidate policy code used by the daemon and subscription-route launch helpers.
+Policy validation itself starts no engine and makes no provider or network call.
 """
 
 from __future__ import annotations

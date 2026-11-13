@@ -156,9 +156,8 @@ class SubscriptionProviderTests(_Base):
                     self.assertRefusedBeforeSpawn(engine, self.profile(auth=auth), self.env(), "claude_subscription_auth")
             for provider in ("anthropic-oauth", "claude-max", "claude-pro"):
                 with self.subTest(engine=engine, provider=provider):
-                    if provider in ENGINES[engine].subscription_providers or provider.startswith("claude"):
-                        self.assertRefusedBeforeSpawn(engine, self.profile(provider=provider, model=None), self.env(),
-                                                      "claude_subscription_provider")
+                    self.assertRefusedBeforeSpawn(engine, self.profile(provider=provider, model=None), self.env(),
+                                                  "claude_subscription_provider")
 
     def test_missing_or_unknown_fields_fail_closed(self) -> None:
         cases = (

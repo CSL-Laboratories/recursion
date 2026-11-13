@@ -1176,8 +1176,9 @@ class HermesHomeReuseTests(_Calls):
     def test_hermes_dir_swapped_after_recheck_open_refuses(self) -> None:
         # os.open of .hermes returns an fd. fstat and listdir on that fd still see
         # the pinned directory after the name is renamed aside and a new .hermes
-        # with .env is put in its place. The name has to be stat'd on the home fd
-        # after the listing, and the new directory is left where it is.
+        # with .env is put in its place. The hardlink that keeps the config inode
+        # raises its link count, so the descriptor check refuses config.yaml. The
+        # new directory is left where it is.
         swapped = False
         real_open = os.open
 
@@ -1204,7 +1205,7 @@ class HermesHomeReuseTests(_Calls):
 
         with mock.patch.object(policy.os, "open", side_effect=racing_open):
             exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
-        self.assertEqual(".hermes", exc.detail)
+        self.assertEqual("config.yaml", exc.detail)
         self.assertTrue(swapped)
         self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
         aside = self.home / ".hermes.aside"
@@ -1751,6 +1752,216 @@ class HermesHomeReuseTests(_Calls):
                              requirements=RouteRequirements(owned_hermes_home=str(home)))
                 self.assertFalse((home / ".hermes").exists())
         self.launcher.assert_not_called()
+
+    # os.* calls counted while _recheck_pinned_hermes_config is on the stack.
+    # On 0f1fa676 that trace is 37 long: pass 2 listdir is 22, its ENOENT stats are
+    # 23 (.env) and 24 (.op.env), the final .hermes name stat is 30, and the final
+    # config.yaml name stat is 32.
+    _RECHECK_HOOKS = ("open", "stat", "fstat", "listdir", "pread", "close")
+
+    def _reset_hermes_tree(self) -> None:
+        for name in (".hermes", ".hermes.aside"):
+            path = self.home / name
+            if path.is_symlink():
+                path.unlink()
+            elif path.exists():
+                shutil.rmtree(path) if path.is_dir() else path.unlink()
+        swapped = self.root / "swapped-config.yaml"
+        if swapped.exists():
+            swapped.unlink()
+        self.launcher.reset_mock()
+
+    @contextmanager
+    def _hook_recheck_syscalls(self, index: int | None, mutate):
+        """Count recheck os calls. After call ``index`` returns, run ``mutate`` once.
+
+        ``mutate`` receives a dict it may fill with ``id`` and ``st`` so later hooked
+        ``fstat`` results for that inode keep the pre-mutation stamp. The final name
+        seal calls the functions captured at import, so it still sees the real inode.
+        """
+
+        counter = {"n": 0}
+        events: list[str] = []
+        guard = {"on": False}
+        freeze: dict[str, object] = {"id": None, "st": None}
+
+        def make(name: str):
+            real = getattr(os, name)
+
+            def wrapped(*args: object, **kwargs: object):
+                if guard["on"]:
+                    return real(*args, **kwargs)
+                try:
+                    result = real(*args, **kwargs)
+                    err: BaseException | None = None
+                except BaseException as exc:
+                    result, err = None, exc
+                frozen = freeze["st"]
+                frozen_id = freeze["id"]
+                if (err is None and name == "fstat" and frozen is not None
+                        and frozen_id == (result.st_dev, result.st_ino)):
+                    result = frozen
+                if _stack_has("_recheck_pinned_hermes_config"):
+                    seen = counter["n"]
+                    counter["n"] += 1
+                    events.append(name)
+                    if index is not None and seen == index:
+                        guard["on"] = True
+                        try:
+                            mutate(freeze)
+                        finally:
+                            guard["on"] = False
+                if err is not None:
+                    raise err
+                return result
+
+            return wrapped
+
+        patches = [mock.patch.object(policy.os, name, side_effect=make(name)) for name in self._RECHECK_HOOKS]
+        for patcher in patches:
+            patcher.start()
+        try:
+            yield counter, events
+        finally:
+            for patcher in patches:
+                patcher.stop()
+
+    def _trace_recheck(self) -> list[str]:
+        with self._hook_recheck_syscalls(None, lambda _freeze: None) as (_counter, events):
+            self.launch("hermes")
+        self._reset_hermes_tree()
+        return events
+
+    def _plant_new_config_inode(self, freeze: dict[str, object]) -> None:
+        live = os.lstat(self.config())
+        freeze["id"] = (live.st_dev, live.st_ino)
+        freeze["st"] = _clone_stat(live)
+        fd = os.open(self.root / "swapped-config.yaml", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, b"# owner config, left in place\nmodel: theirs\n")
+        finally:
+            os.close(fd)
+        os.rename(self.root / "swapped-config.yaml", self.config())
+        self.assertNotEqual(live.st_ino, os.lstat(self.config()).st_ino)
+
+    def _replace_hermes_dir(self, _freeze: dict[str, object]) -> None:
+        aside = self.home / ".hermes.aside"
+        os.rename(self.home / ".hermes", aside)
+        self._private(self.home / ".hermes")
+        fd = os.open(self.config(), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, b"auth:\n  adopt_external_logins: true \n")
+        finally:
+            os.close(fd)
+        env = os.open(self.home / ".hermes" / ".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(env, b"HERMES_HOME=/not-the-route\n")
+        finally:
+            os.close(env)
+
+    def _plant_named(self, name: str, payload: bytes):
+        def plant(_freeze: dict[str, object]) -> None:
+            fd = os.open(
+                self.home / ".hermes" / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            )
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+        return plant
+
+    def _assert_mutation_left_in_place(self, kind: str) -> None:
+        if kind == "inode":
+            self.assertEqual(b"# owner config, left in place\nmodel: theirs\n", self.config().read_bytes())
+        elif kind == "hermes":
+            self.assertEqual(ADOPT_YAML, (self.home / ".hermes.aside" / "config.yaml").read_bytes())
+            self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / ".env").read_bytes())
+        elif kind in (".env", ".op.env"):
+            self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / kind).read_bytes())
+        elif kind == "state.db":
+            self.assertEqual(b"x", (self.home / ".hermes" / "state.db").read_bytes())
+
+    def test_new_config_inode_after_final_name_stat_refuses(self) -> None:
+        # Index 32 on 0f1fa676 is the last stat of config.yaml. The fstat after it
+        # compared device and inode only, so a same-tick replacement (nlink 0, ctime
+        # unchanged) still launched. Hooked fstats keep that pre-unlink stamp.
+        with self._hook_recheck_syscalls(32, self._plant_new_config_inode):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self._assert_mutation_left_in_place("inode")
+        self.launcher.assert_not_called()
+
+    def test_hermes_replaced_after_final_name_stat_refuses(self) -> None:
+        # Index 30 on 0f1fa676 is the last stat of .hermes. Later config checks used
+        # the directory fd opened before that stat, so the new directory still launched.
+        with self._hook_recheck_syscalls(30, self._replace_hermes_dir):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual(".hermes", exc.detail)
+        self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
+        self._assert_mutation_left_in_place("hermes")
+        self.launcher.assert_not_called()
+
+    def test_dotenv_after_pass_two_enoent_refuses(self) -> None:
+        # Pass 2's absence stats are indices 23 (.env) and 24 (.op.env). The old final
+        # phase never stat'd them again.
+        for index, name in ((23, ".env"), (24, ".op.env"), (24, ".env")):
+            with self.subTest(index=index, name=name):
+                self._reset_hermes_tree()
+                with self._hook_recheck_syscalls(index, self._plant_named(name, b"HERMES_HOME=/not-the-route\n")):
+                    exc = self.refused("hermes_dotenv_in_home", self.launch, "hermes")
+                self.assertEqual(name, exc.detail)
+                self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
+                self._assert_mutation_left_in_place(name)
+                self.launcher.assert_not_called()
+
+    def test_api_key_state_db_after_pass_two_listdir_refuses(self) -> None:
+        # Index 22 is pass 2's listdir. The old final phase did not list again.
+        with self._hook_recheck_syscalls(22, self._plant_named("state.db", b"x")):
+            exc = self.refused("engine_store_in_route_home", self.launch, "hermes")
+        self.assertEqual("state.db", exc.detail)
+        self._assert_mutation_left_in_place("state.db")
+        self.launcher.assert_not_called()
+
+    def test_subscription_state_db_after_pass_two_listdir_still_launches(self) -> None:
+        # Subscription extra names other than .env / .op.env stay allowed.
+        with self._hook_recheck_syscalls(22, self._plant_named("state.db", b"x")):
+            self.launch_sub()
+        self.assertEqual(b"x", (self.home / ".hermes" / "state.db").read_bytes())
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(1, self.launcher.call_count)
+
+    def test_mutation_after_every_recheck_syscall_except_the_final_pread_refuses(self) -> None:
+        events = self._trace_recheck()
+        self.assertEqual(("listdir", "stat", "stat"), (events[22], events[23], events[24]))
+        self.assertGreater(len(events), 32)
+        self.assertEqual("pread", events[-1])
+        mutations = (
+            ("inode", self._plant_new_config_inode, "hermes"),
+            ("hermes", self._replace_hermes_dir, "hermes"),
+            (".env", self._plant_named(".env", b"HERMES_HOME=/not-the-route\n"), "hermes"),
+            (".op.env", self._plant_named(".op.env", b"HERMES_HOME=/not-the-route\n"), "hermes"),
+            ("state.db", self._plant_named("state.db", b"x"), "hermes"),
+        )
+        for kind, mutate, _engine in mutations:
+            for index in range(len(events) - 1):
+                with self.subTest(kind=kind, index=index):
+                    self._reset_hermes_tree()
+                    with self._hook_recheck_syscalls(index, mutate):
+                        with self.assertRaises(SubscriptionRouteRefused) as caught:
+                            self.launch("hermes")
+                    self.assertNotIn("HERMES_HOME=/not-the-route", str(caught.exception))
+                    self._assert_mutation_left_in_place(kind)
+                    self.launcher.assert_not_called()
+
+    def test_thirty_honest_api_key_and_subscription_launches(self) -> None:
+        for kind, launch in (("api_key", lambda: self.launch("hermes")), ("subscription", self.launch_sub)):
+            with self.subTest(kind=kind):
+                self._reset_hermes_tree()
+                for _ in range(30):
+                    launch()
+                self.assertEqual(30, self.launcher.call_count)
+                self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+                self.assertEqual(["config.yaml"], sorted(os.listdir(self.home / ".hermes")))
 
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")

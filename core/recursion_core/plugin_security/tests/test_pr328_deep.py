@@ -1619,6 +1619,278 @@ class SharedImportRollbackTests(unittest.TestCase):
         finally:
             self._clear_hunt_modules()
 
+    def _repair_module(self, module: types.ModuleType, *names: str) -> None:
+        """Put a test-mutated module back without going through its class."""
+        try:
+            object.__setattr__(module, "__class__", types.ModuleType)
+        except Exception:
+            pass
+        try:
+            mapping = types.ModuleType.__dict__["__dict__"].__get__(module)
+        except Exception:
+            return
+        for name in names:
+            live = mapping.get(name)
+            cls = type(live)
+            if isinstance(live, types.ModuleType) and cls is not types.ModuleType:
+                try:
+                    cls._stop = True
+                except Exception:
+                    pass
+        for name in names:
+            mapping.pop(name, None)
+
+    def test_a_rearming_binding_finalizer_is_not_an_ordinary_import_failure(self) -> None:
+        """``__del__`` puts ``json.encoder.pwn`` back after each delete.
+
+        ``sys.modules`` can be clean while that attribute is still the
+        attacker's module. The load must be ``plugin_import_state_unrestored``,
+        not ``plugin_import_failed``. Fails on 255fedcf, where settle accepts
+        a clean module table with a dirty binding.
+        """
+        import json.encoder as encoder
+        source = (
+            "import json.encoder as enc, types\n"
+            "def plant():\n"
+            "    class Rearm(types.ModuleType):\n"
+            "        def __del__(self):\n"
+            "            if getattr(Rearm, '_stop', False):\n"
+            "                return\n"
+            "            again = Rearm('json.encoder.pwn')\n"
+            "            again.marker = 'pwned'\n"
+            "            enc.pwn = again\n"
+            "    mod = Rearm('json.encoder.pwn')\n"
+            "    mod.marker = 'pwned'\n"
+            "    enc.pwn = mod\n"
+            "plant()\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            code = self._run_failing(source, plugin_id="bad.encoder.rearm.del")
+            pwned = getattr(getattr(encoder, "pwn", None), "marker", None) == "pwned"
+            if pwned:
+                self.assertEqual(code, "plugin_import_state_unrestored")
+            else:
+                self.assertEqual(code, "plugin_import_failed")
+            self.assertFalse(pwned and code == "plugin_import_failed")
+        finally:
+            self._repair_module(encoder, "pwn")
+
+    def test_a_rearming_weakref_on_a_binding_is_not_an_ordinary_import_failure(self) -> None:
+        """A weakref callback puts ``json.encoder.pwn`` back when it is deleted.
+
+        Same rule as a re-arming ``__del__``: a dirty binding is not an
+        ordinary ``plugin_import_failed``. Fails on 255fedcf.
+        """
+        import json.encoder as encoder
+        source = (
+            "import json.encoder as enc, types, weakref\n"
+            "def arm(ref):\n"
+            "    if getattr(enc, '_stop', False):\n"
+            "        return\n"
+            "    again = types.ModuleType('json.encoder.pwn')\n"
+            "    again.marker = 'pwned'\n"
+            "    enc.pwn = again\n"
+            "    enc._arm = weakref.ref(again, arm)\n"
+            "def plant():\n"
+            "    mod = types.ModuleType('json.encoder.pwn')\n"
+            "    mod.marker = 'pwned'\n"
+            "    enc._arm = weakref.ref(mod, arm)\n"
+            "    enc.pwn = mod\n"
+            "plant()\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            code = self._run_failing(source, plugin_id="bad.encoder.rearm.weak")
+            pwned = getattr(getattr(encoder, "pwn", None), "marker", None) == "pwned"
+            if pwned:
+                self.assertEqual(code, "plugin_import_state_unrestored")
+            else:
+                self.assertEqual(code, "plugin_import_failed")
+            self.assertFalse(pwned and code == "plugin_import_failed")
+        finally:
+            try:
+                mapping = types.ModuleType.__dict__["__dict__"].__get__(encoder)
+                mapping["_stop"] = True
+            except Exception:
+                pass
+            self._repair_module(encoder, "pwn", "_arm", "_stop")
+
+    def test_a_failed_load_writes_a_binding_when_setattr_raises(self) -> None:
+        """A swapped module class whose ``__setattr__`` raises cannot keep ``pwn``.
+
+        The write goes through the module's real dict, and the class is put
+        back first. Fails on 255fedcf, which swallows the ``setattr`` error
+        and reports ``plugin_import_failed`` while ``json.encoder.pwn`` stays.
+        """
+        import json.encoder as encoder
+        source = (
+            "import json.encoder as enc, types\n"
+            "class Guard(types.ModuleType):\n"
+            "    def __setattr__(self, name, value):\n"
+            "        raise RuntimeError('no-set')\n"
+            "    def __delattr__(self, name):\n"
+            "        raise RuntimeError('no-del')\n"
+            "mod = types.ModuleType('pwn')\n"
+            "mod.marker = 'pwned'\n"
+            "enc.pwn = mod\n"
+            "enc.__class__ = Guard\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.encoder.guard")
+            self.assertIs(type(encoder), types.ModuleType)
+            self.assertFalse(hasattr(encoder, "pwn"))
+            self.assertNotEqual(getattr(getattr(encoder, "pwn", None), "marker", None), "pwned")
+        finally:
+            self._repair_module(encoder, "pwn")
+
+    def test_a_failed_load_restores_a_module_class_hiding_a_binding(self) -> None:
+        """A module-class descriptor must not outlive the failed load.
+
+        ``vars`` still shows the snapshotted module while ``getattr`` returns
+        the attacker's. The class is restored, then the binding is checked
+        with ``getattr``. Fails on 255fedcf.
+        """
+        host = types.ModuleType("desc_host")
+        real = types.ModuleType("desc_host.real")
+        real.marker = "kept"
+        host.real = real
+        sys.modules["desc_host"] = host
+        source = (
+            "import desc_host, types\n"
+            "evil = types.ModuleType('evil')\n"
+            "evil.marker = 'pwned'\n"
+            "class Shadow(types.ModuleType):\n"
+            "    @property\n"
+            "    def real(self):\n"
+            "        return evil\n"
+            "    @property\n"
+            "    def pwn(self):\n"
+            "        return evil\n"
+            "desc_host.__class__ = Shadow\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.desc.host")
+            self.assertIs(type(host), types.ModuleType)
+            self.assertIs(getattr(host, "real", None), real)
+            self.assertEqual(getattr(real, "marker", None), "kept")
+            self.assertNotEqual(getattr(getattr(host, "pwn", None), "marker", None), "pwned")
+            self.assertFalse(hasattr(host, "pwn"))
+        finally:
+            self._repair_module(host, "pwn")
+            host.real = real
+            sys.modules.pop("desc_host", None)
+            sys.modules.pop("desc_host.real", None)
+            sys.modules.pop("desc_host.pwn", None)
+
+    def test_a_failed_load_drops_a_module_a_deferred_cycle_plants(self) -> None:
+        """A finalizer that arms another cycle must not plant after the load returns.
+
+        One ``gc.collect()`` runs the first finalizer and leaves the new cycle
+        for a later collection. Fails on 255fedcf: the later collection inserts
+        ``hunt_deferred`` after an ordinary ``plugin_import_failed``.
+        """
+        import gc
+        source = (
+            "import sys, types\n"
+            "def plant():\n"
+            "    class First:\n"
+            "        def __del__(self):\n"
+            "            class Second:\n"
+            "                def __del__(self):\n"
+            "                    planted = types.ModuleType('hunt_deferred')\n"
+            "                    planted.marker = 'pwned'\n"
+            "                    sys.modules['hunt_deferred'] = planted\n"
+            "            a = Second()\n"
+            "            b = Second()\n"
+            "            a.other = b\n"
+            "            b.other = a\n"
+            "    carrier = types.ModuleType('hunt_carrier')\n"
+            "    obj = First()\n"
+            "    carrier.obj = obj\n"
+            "    obj.carrier = carrier\n"
+            "    sys.modules['hunt_carrier'] = carrier\n"
+            "plant()\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.deferred.cycle")
+            self.assertNotIn("hunt_carrier", sys.modules)
+            for _ in range(4):
+                gc.collect()
+            self.assertNotIn("hunt_deferred", sys.modules)
+            self.assertNotEqual(getattr(sys.modules.get("hunt_deferred"), "marker", None), "pwned")
+        finally:
+            self._clear_hunt_modules()
+            sys.modules.pop("hunt_deferred", None)
+
+    def test_a_failed_load_drops_a_module_reachable_only_as_an_attribute(self) -> None:
+        """A module that is not in ``sys.modules`` is still snapshotted.
+
+        ``nest_only.child`` and ``nest_only.child.grand`` are only attributes.
+        Bindings added on them are removed. Fails on 255fedcf, which leaves
+        ``nest_only.child.pwn`` reachable after ``plugin_import_failed``.
+        """
+        nest = types.ModuleType("nest_only")
+        child = types.ModuleType("nest_only.child")
+        grand = types.ModuleType("nest_only.child.grand")
+        child.marker = "kept"
+        grand.marker = "kept"
+        nest.child = child
+        child.grand = grand
+        sys.modules["nest_only"] = nest
+        source = (
+            "import nest_only, types\n"
+            "pwn = types.ModuleType('pwn')\n"
+            "pwn.marker = 'pwned'\n"
+            "nest_only.child.pwn = pwn\n"
+            "deeper = types.ModuleType('deeper')\n"
+            "deeper.marker = 'pwned'\n"
+            "nest_only.child.grand.pwn = deeper\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.nest.only")
+            self.assertIs(nest.child, child)
+            self.assertIs(child.grand, grand)
+            self.assertFalse(hasattr(child, "pwn"))
+            self.assertFalse(hasattr(grand, "pwn"))
+            self.assertEqual(child.marker, "kept")
+            self.assertEqual(grand.marker, "kept")
+            self.assertNotEqual(getattr(getattr(child, "pwn", None), "marker", None), "pwned")
+            self.assertNotEqual(getattr(getattr(grand, "pwn", None), "marker", None), "pwned")
+        finally:
+            self._repair_module(child, "pwn")
+            self._repair_module(grand, "pwn")
+            sys.modules.pop("nest_only", None)
+            sys.modules.pop("nest_only.child", None)
+            sys.modules.pop("nest_only.child.grand", None)
+            sys.modules.pop("nest_only.child.pwn", None)
+
+    def test_a_successful_load_keeps_a_preexisting_nested_module(self) -> None:
+        """Walking nested modules for the snapshot does not disturb a good load."""
+        nest = types.ModuleType("nest_keep")
+        child = types.ModuleType("nest_keep.child")
+        child.marker = "kept"
+        nest.child = child
+        sys.modules["nest_keep"] = nest
+        source = (
+            "import nest_keep\n"
+            "VALUE = nest_keep.child.marker\n"
+        ).encode()
+        try:
+            dev_loader, raws, sigs = self._loader_for({"good.nest.keep": source})
+            loaded = dev_loader.load(raws["good.nest.keep"], sigs["good.nest.keep"], source)
+            self.assertEqual(loaded.module.VALUE, "kept")
+            self.assertIs(nest.child, child)
+            self.assertFalse(hasattr(child, "pwn"))
+            self.assertEqual(dev_loader.permissions("good.nest.keep"), ("read",))
+        finally:
+            sys.modules.pop("nest_keep", None)
+            sys.modules.pop("nest_keep.child", None)
+
 
 class RevocationPublishTests(unittest.TestCase):
     def test_a_failed_revoke_does_not_publish_a_generation_below_the_row(self) -> None:

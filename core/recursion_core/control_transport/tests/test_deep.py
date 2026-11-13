@@ -9,6 +9,9 @@ An ECONNREFUSED probe that unlinks a listener bound on the reused inode, and
 a full-backlog EAGAIN left as BlockingIOError, failed on e212728e.
 Unlink-by-path after a matching lstat, close() with no inode pin, and a
 forked child that inherits that pin, failed on ef816f7c.
+A connect that follows a final-component symlink or a directory round-trip
+undone inside connect, and a reap of dead sockets the quarantine generator
+cannot name, failed on a4c6d121.
 """
 
 from __future__ import annotations
@@ -1316,6 +1319,53 @@ def _q_prefix(socket_name: str) -> str:
     return ".q" + hashlib.sha256(os.fsencode(socket_name)).hexdigest()[:4]
 
 
+def _resolved_connect_path(addr: object) -> str | None:
+    """Directory entry a pathname connect looks up.
+
+    ``/proc/self/fd/<dirfd>/<name>`` is that directory entry.
+    ``/proc/self/fd/<fd>`` with no further component is an inode the fd
+    already holds; ``readlink`` is only where that inode is linked, and
+    connect does not follow a swap of the link.
+    """
+    if not isinstance(addr, str) or not addr.startswith("/"):
+        return None
+    marker = "/proc/self/fd/"
+    if not addr.startswith(marker):
+        return addr
+    rest = addr[len(marker):]
+    if rest.isdigit():
+        try:
+            link = os.readlink(addr)
+        except OSError:
+            return None
+        return link if link.startswith("/") else None
+    if "/" not in rest:
+        return None
+    fd, name = rest.split("/", 1)
+    if not fd.isdigit() or not name or "/" in name:
+        return None
+    try:
+        directory = os.readlink(marker + fd)
+    except OSError:
+        return None
+    if not directory.startswith("/"):
+        return None
+    return os.path.join(directory, name)
+
+
+def _linked_socket(directory: str, inode: int) -> str | None:
+    """Path in ``directory`` that is the socket inode ``inode``, if it is still linked."""
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        try:
+            listed = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISSOCK(listed.st_mode) and not stat.S_ISLNK(listed.st_mode) and listed.st_ino == inode:
+            return path
+    return None
+
+
 def _socket_entries(directory: str) -> list[str]:
     found = []
     for name in os.listdir(directory):
@@ -1860,6 +1910,282 @@ class QuarantineRestoreTests(_TmpCase):
         listed = os.lstat(path)
         self.assertEqual(listed.st_ino, inode)
         self.assertEqual([name for name in os.listdir(self.sock_dir) if name.startswith(".")], [])
+
+    def _assert_refused(self, path: str) -> None:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(probe.close)
+        probe.settimeout(0.2)
+        with self.assertRaises(OSError) as caught:
+            probe.connect(path)
+        self.assertEqual(caught.exception.errno, errno.ECONNREFUSED)
+
+    def test_symlink_swap_during_connect_does_not_unlink_a_live_listener(self) -> None:
+        """A final-component symlink undone inside connect must not look like ECONNREFUSED.
+
+        Failed on a4c6d121: the recheck connected to ``/proc/self/fd/<dirfd>/<qname>``,
+        followed the symlink to a dead socket, and ``start`` unlinked the live inode
+        after the symlink was removed.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        pub = "control.sock"
+        prefix = _q_prefix(pub)
+        self.assertEqual(prefix, ".q0f9a")
+        qname = prefix + "abcdef"
+        self.assertEqual(len(qname), len(pub))
+        live, live_path, live_ino = self._listen(self.sock_dir, qname)
+        public = os.path.join(self.sock_dir, pub)
+        dead_path = os.path.join(self.base, "dead.sock")
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(dead.close)
+        dead.bind(dead_path)
+        dead.close()
+        swaps = {"n": 0}
+        orig = socket.socket.connect
+
+        def fake_connect(sock: socket.socket, addr: object) -> None:
+            path = _resolved_connect_path(addr)
+            aside = None
+            if (
+                path
+                and path != public
+                and path != dead_path
+                and os.path.lexists(path)
+                and not os.path.islink(path)
+                and stat.S_ISSOCK(os.lstat(path).st_mode)
+            ):
+                aside = path + ".aside"
+                os.rename(path, aside)
+                os.symlink(dead_path, path)
+                swaps["n"] += 1
+            try:
+                orig(sock, addr)
+            finally:
+                if aside is not None:
+                    if os.path.islink(path):
+                        os.unlink(path)
+                    if os.path.lexists(aside) and not os.path.lexists(path):
+                        os.rename(aside, path)
+
+        socket.socket.connect = fake_connect  # type: ignore[method-assign]
+        self.addCleanup(setattr, socket.socket, "connect", orig)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health(), name=pub)
+        self.addCleanup(srv.close)
+        try:
+            srv.start()
+        finally:
+            socket.socket.connect = orig  # type: ignore[method-assign]
+        self.assertGreaterEqual(swaps["n"], 1)
+        listed = os.lstat(live_path)
+        self.assertEqual(listed.st_ino, live_ino)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertFalse(stat.S_ISLNK(listed.st_mode))
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        live.settimeout(2)
+        client.connect(live_path)
+        conn, _ = live.accept()
+        conn.close()
+        self.assertFalse(any(os.path.islink(os.path.join(self.sock_dir, name)) for name in os.listdir(self.sock_dir)))
+
+    def test_directory_round_trip_during_connect_does_not_unlink_a_live_listener(self) -> None:
+        """A directory rename undone inside connect must not look like ECONNREFUSED.
+
+        The socket name is long enough that ``/proc/self/fd/<dirfd>/<name>`` does not
+        fit in ``sun_path``. Failed on a4c6d121: the recheck connected to the
+        directory path, which a round-trip pointed at a dead socket, then ``start``
+        unlinked the live inode after the directory was put back.
+        """
+        directory = tempfile.mkdtemp(prefix="d", dir="/tmp")
+        away = directory + "_away"
+        self.addCleanup(self._rm_tree, directory)
+        self.addCleanup(lambda: self._rm_tree(away) if os.path.isdir(away) else None)
+        os.chmod(directory, 0o700)
+        name_len = 107 - len(directory) - 1
+        self.assertGreaterEqual(name_len, 92, directory)
+        pub = "p" * name_len
+        prefix = _q_prefix(pub)
+        qname = (prefix + ("ab" * name_len))[:name_len]
+        self.assertEqual(len(qname), name_len)
+        self.assertTrue(qname.startswith(prefix))
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in qname[len(prefix):]))
+        self.assertGreater(len(f"/proc/self/fd/0/{qname}"), 107)
+        self.assertEqual(len(os.path.join(directory, pub)), 107)
+        live, live_path, live_ino = self._listen(directory, qname)
+        public = os.path.join(directory, pub)
+        moves = {"n": 0}
+        orig = socket.socket.connect
+
+        def fake_connect(sock: socket.socket, addr: object) -> None:
+            path = _resolved_connect_path(addr)
+            moved = False
+            base = None
+            if (
+                path
+                and path != public
+                and os.path.dirname(path) == directory
+                and os.path.basename(path) not in (pub, os.path.basename(pub) + ".lock")
+            ):
+                base = os.path.basename(path)
+                os.rename(directory, away)
+                moved = True
+                os.mkdir(directory, 0o700)
+                planted = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    planted.bind(os.path.join(directory, base))
+                finally:
+                    planted.close()
+                moves["n"] += 1
+            try:
+                orig(sock, addr)
+            finally:
+                if moved and base is not None:
+                    planted_path = os.path.join(directory, base)
+                    if os.path.lexists(planted_path):
+                        os.unlink(planted_path)
+                    if os.path.isdir(directory):
+                        os.rmdir(directory)
+                    if not os.path.exists(directory) and os.path.isdir(away):
+                        os.rename(away, directory)
+
+        socket.socket.connect = fake_connect  # type: ignore[method-assign]
+        self.addCleanup(setattr, socket.socket, "connect", orig)
+        srv = UnixControlServer(directory, ct.with_ping_health(), name=pub)
+        self.addCleanup(srv.close)
+        try:
+            srv.start()
+        finally:
+            socket.socket.connect = orig  # type: ignore[method-assign]
+        self.assertGreaterEqual(moves["n"], 1)
+        listed = os.lstat(live_path)
+        self.assertEqual(listed.st_ino, live_ino)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        live.settimeout(2)
+        client.connect(live_path)
+        conn, _ = live.accept()
+        conn.close()
+
+    def test_refused_recheck_does_not_unlink_a_different_inode(self) -> None:
+        """ECONNREFUSED on the verified inode must not unlink a socket planted at the name.
+
+        The hook points the name at a dead socket for the real connect, then leaves a
+        live listener there. Failed on a4c6d121: ``start`` unlinked that listener.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        public, _inode = self._stale(self.sock_dir)
+        dead_path = os.path.join(self.base, "dead.sock")
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(dead.close)
+        dead.bind(dead_path)
+        dead.close()
+        planted: dict = {}
+        orig = socket.socket.connect
+
+        def fake_connect(sock: socket.socket, addr: object) -> None:
+            path = _resolved_connect_path(addr)
+            aside = None
+            if path and path != public and path != dead_path and os.path.lexists(path) and not os.path.islink(path):
+                if stat.S_ISSOCK(os.lstat(path).st_mode):
+                    aside = path + ".aside"
+                    os.rename(path, aside)
+                    os.symlink(dead_path, path)
+            try:
+                orig(sock, addr)
+            finally:
+                if aside is not None:
+                    if os.path.islink(path):
+                        os.unlink(path)
+                    if path is not None and os.path.lexists(aside):
+                        os.unlink(aside)
+                    live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    self.addCleanup(live.close)
+                    live.bind(path)
+                    live.listen(1)
+                    planted["sock"] = live
+                    planted["ino"] = os.lstat(path).st_ino
+
+        socket.socket.connect = fake_connect  # type: ignore[method-assign]
+        self.addCleanup(setattr, socket.socket, "connect", orig)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        started = False
+        exc: BaseException | None = None
+        try:
+            try:
+                srv.start()
+                started = True
+            except BaseException as err:  # noqa: BLE001 - the assertion names the type
+                exc = err
+        finally:
+            socket.socket.connect = orig  # type: ignore[method-assign]
+        self.assertIn("ino", planted)
+        linked = _linked_socket(self.sock_dir, planted["ino"])
+        self.assertIsNotNone(linked, (started, exc, os.listdir(self.sock_dir)))
+        self.assertFalse(started)
+        self.assertIsInstance(exc, ct.InsecureSocketPath)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        planted["sock"].settimeout(2)
+        client.connect(linked)
+        conn, _ = planted["sock"].accept()
+        conn.close()
+
+    def test_reap_keeps_dead_sockets_the_generator_cannot_name(self) -> None:
+        """Reap only names ``_quarantine_name`` can produce.
+
+        Failed on a4c6d121: a dead ``.q0f9a`` (6 bytes) and ``.q0f9az`` (7 bytes)
+        were unlinked, as was any owned refused socket whose name started with
+        the prefix and was no longer than the public name.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        pub = "control.sock"
+        prefix = _q_prefix(pub)
+        self.assertEqual(prefix, ".q0f9a")
+        self.assertEqual(len(prefix), 6)
+        kept = {
+            prefix: None,  # .q0f9a
+            prefix + "z": None,  # .q0f9az
+            prefix + "abcdez": None,
+            prefix + "ABCDEF": None,
+            prefix + "abcdefx": None,
+        }
+        self.assertEqual(len(prefix + "abcdez"), len(pub))
+        self.assertEqual(len(prefix + "ABCDEF"), len(pub))
+        self.assertGreater(len(prefix + "abcdefx"), len(pub))
+        removed = prefix + "abcdef"
+        self.assertEqual(len(removed), len(pub))
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in removed[len(prefix):]))
+        inodes = {}
+        for name in list(kept) + [removed]:
+            path, inode = self._stale(self.sock_dir, name)
+            inodes[name] = inode
+            self._assert_refused(path)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health(), name=pub)
+        self.addCleanup(srv.close)
+        srv.start()
+        with UnixControlClient(srv.path) as client:
+            self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+        self.assertNotIn(removed, os.listdir(self.sock_dir))
+        for name, inode in inodes.items():
+            if name == removed:
+                continue
+            path = os.path.join(self.sock_dir, name)
+            listed = os.lstat(path)
+            self.assertEqual(listed.st_ino, inode, name)
+            self.assertTrue(stat.S_ISSOCK(listed.st_mode), name)
+            self._assert_refused(path)
+
+    def _listen(self, directory: str, name: str) -> tuple[socket.socket, str, int]:
+        path = os.path.join(directory, name)
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(live.close)
+        live.bind(path)
+        live.listen(1)
+        return live, path, os.lstat(path).st_ino
 
 
 if __name__ == "__main__":

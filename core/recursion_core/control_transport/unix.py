@@ -16,20 +16,29 @@ Owner decision: that errno is not proof the file is stale, so a dead mode-000
 socket stays until the operator removes it. ``ECONNREFUSED`` reclaims only
 while an ``O_PATH`` fd holds that inode and ``renameat2(RENAME_NOREPLACE)``
 can move the directory entry aside. The hidden name is no longer than the
-socket's own name, so the recheck path still fits in ``sun_path``. It is
-unlinked only when it is still the pinned inode and a second connect, checked
-through that directory fd, still reports ``ECONNREFUSED``. Anything else
-moves the hidden name back with ``RENAME_NOREPLACE``. If that move back
-fails, the error names the hidden entry. Without ``renameat2`` the socket
-stays in place, the same as a platform with no ``O_PATH``.
+socket's own name. The recheck opens that name with ``O_PATH|O_NOFOLLOW``,
+checks the fd is the inode just verified, and connects to
+``/proc/self/fd/<that fd>``. A symlink or a directory round-trip undone
+inside connect cannot redirect that fd. After ``ECONNREFUSED`` the name is
+lstat'd again (``AT_SYMLINK_NOFOLLOW``) and unlinked only when it is still
+that inode. Anything else moves the hidden name back with
+``RENAME_NOREPLACE``. If that move back fails, the error names the hidden
+entry. Without ``renameat2``, without ``O_PATH``, or when that proc path
+cannot be used, the socket stays in place.
 
 ``start`` also removes our own earlier hidden sockets that are still
-``ECONNREFUSED``. It does not touch non-sockets or live listeners.
+``ECONNREFUSED``, and only when the name is one the quarantine generator
+can produce: the public name's byte length, its prefix, and a suffix from
+``token_hex`` (``0-9a-f``). A dead ``.q`` prefix of 6 bytes, or that prefix
+plus one extra character, is left alone. Non-sockets and live listeners
+stay.
 
 A socket that ``listen``s on the hidden name after that second connect
 returns and before the hidden name is unlinked can still lose that name.
-That is the remaining window. ``RENAME_NOREPLACE`` closes the earlier window
-where a quarantine name was chosen and then replaced.
+That window remains. Names shorter than 8 bytes cannot be quarantined and
+are not reaped. Platforms without ``renameat2`` or ``O_PATH`` keep the
+socket. ``RENAME_NOREPLACE`` closes the earlier window where a quarantine
+name was chosen and then replaced.
 """
 
 from __future__ import annotations
@@ -466,7 +475,10 @@ def _quarantine_prefix(socket_name: str) -> str | None:
 
 
 def _quarantine_name(socket_name: str) -> str | None:
-    """One hidden name, the same byte length as ``socket_name``."""
+    """One hidden name, the same byte length as ``socket_name``.
+
+    The suffix is ``secrets.token_hex``: lowercase ``0-9a-f`` only.
+    """
     prefix = _quarantine_prefix(socket_name)
     if prefix is None:
         return None
@@ -477,6 +489,30 @@ def _quarantine_name(socket_name: str) -> str | None:
     if len(os.fsencode(name)) != limit or name in (".", ".."):
         return None
     return name
+
+
+# ``secrets.token_hex`` alphabet. Reap must not accept a wider set.
+_QUARANTINE_ALPHABET = frozenset("0123456789abcdef")
+
+
+def _is_quarantine_name(entry: str, socket_name: str) -> bool:
+    """True when ``entry`` is a name ``_quarantine_name`` can return.
+
+    Same byte length as ``socket_name``, that name's prefix, and a suffix of
+    at least two ``token_hex`` characters. The 6-byte prefix alone, or the
+    prefix plus one other character, is not such a name.
+    """
+    prefix = _quarantine_prefix(socket_name)
+    if prefix is None or entry in (socket_name, ".", ".."):
+        return False
+    if len(os.fsencode(entry)) != len(os.fsencode(socket_name)):
+        return False
+    if not entry.startswith(prefix):
+        return False
+    suffix = entry[len(prefix):]
+    if len(suffix) < _QUARANTINE_SUFFIX_MIN:
+        return False
+    return all(ch in _QUARANTINE_ALPHABET for ch in suffix)
 
 
 def _can_quarantine(directory: str, socket_name: str) -> bool:
@@ -509,27 +545,94 @@ def _restore_noreplace(dfd: int, qname: str, name: str) -> bool:
     return result in ("moved", "gone")
 
 
-def _recheck_hidden(dfd: int, directory: str, qname: str) -> int | None:
-    """Probe the hidden socket through the directory fd ``dfd`` holds.
+def _left_in_place(path: str) -> str:
+    """Refusal that tells the operator the socket was not removed."""
+    code = errno.errorcode.get(errno.ECONNREFUSED, str(errno.ECONNREFUSED))
+    return f"{path} is not connectable ({code}). Left in place. Remove this socket if it is stale."
 
-    ``/proc/self/fd/<dfd>/<qname>`` resolves in that directory. It is used
-    only when the string fits in ``sun_path``; a longer string connects to
-    the quarantine path instead. Either way the parent directory's
-    ``(dev, ino)`` is checked immediately before and after the connect.
-    ``ENOENT`` or a parent mismatch raises: the caller restores the hidden
-    name and does not treat the reclaim as finished. ``/proc/net/unix`` is
-    not consulted.
+
+def _name_is_inode(dfd: int, name: str, verified: os.stat_result) -> bool:
+    """True when ``name`` in ``dfd`` still lstats as ``verified``.
+
+    ``os.lstat`` with ``dir_fd`` is ``fstatat(..., AT_SYMLINK_NOFOLLOW)``.
+    A symlink at ``name`` does not match.
+    """
+    try:
+        listed = os.lstat(name, dir_fd=dfd)
+    except OSError:
+        return False
+    return _pinned_match(listed, verified)
+
+
+def _open_matching_socket(dfd: int, name: str, verified: os.stat_result) -> int:
+    """``O_PATH|O_NOFOLLOW`` fd for ``name`` when it is the inode ``verified``.
+
+    The caller closes the fd. A symlink, a different inode, or an open that
+    cannot be made raises and the caller does not unlink.
+    """
+    if getattr(os, "O_PATH", None) is None or getattr(os, "O_NOFOLLOW", None) is None:
+        raise InsecureSocketPath(_left_in_place(name))
+    flags = os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dfd)
+    except OSError as exc:
+        raise InsecureSocketPath(_left_in_place(name)) from exc
+    fd = _remember_pin(fd)
+    try:
+        held = os.fstat(fd)
+    except OSError as exc:
+        _close_pin(fd)
+        raise InsecureSocketPath(_left_in_place(name)) from exc
+    if not _pinned_match(held, verified):
+        _close_pin(fd)
+        raise InsecureSocketPath(f"{name} exists and is not our socket")
+    return fd
+
+
+def _proc_inode_path(fd: int) -> str | None:
+    """``/proc/self/fd/<fd>`` when that string can be passed to ``connect``."""
+    proc = f"/proc/self/fd/{fd}"
+    if len(os.fsencode(proc)) > _MAX_SUN_PATH:
+        return None
+    try:
+        st = os.stat("/proc/self/fd")
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    return proc
+
+
+def _recheck_hidden(dfd: int, directory: str, qname: str, verified: os.stat_result) -> int | None:
+    """Probe the inode ``verified``, not the directory entry ``qname``.
+
+    Opens ``qname`` with ``O_PATH|O_NOFOLLOW`` on ``dfd`` and connects to
+    ``/proc/self/fd/<that fd>``. Connect through that fd sees the inode: a
+    live listener succeeds and a dead socket returns ``ECONNREFUSED``. A
+    final-component symlink or a directory rename undone inside connect
+    cannot change which inode is probed. After ``ECONNREFUSED``, ``qname``
+    is lstat'd again and must still be ``verified``; a different inode is
+    not a finished reclaim. If ``O_PATH`` or the proc path cannot be used,
+    this raises and the caller leaves the socket in place. The parent
+    directory's ``(dev, ino)`` is checked immediately before and after the
+    connect. ``/proc/net/unix`` is not consulted.
     """
     ident = os.fstat(dfd)
-    held = (ident.st_dev, ident.st_ino)
-    if not _same_dir(directory, held):
+    held_dir = (ident.st_dev, ident.st_ino)
+    if not _same_dir(directory, held_dir):
         raise InsecureSocketPath(f"{directory} changed during reclaim")
-    proc = f"/proc/self/fd/{dfd}/{qname}"
-    if len(os.fsencode(proc)) <= _MAX_SUN_PATH:
+    full = os.path.join(directory, qname)
+    fd = _open_matching_socket(dfd, qname, verified)
+    try:
+        proc = _proc_inode_path(fd)
+        if proc is None:
+            raise InsecureSocketPath(_left_in_place(full))
         err = _probe_listener(proc)
-    else:
-        err = _probe_listener(os.path.join(directory, qname))
-    if not _same_dir(directory, held) or err == errno.ENOENT:
+    finally:
+        _close_pin(fd)
+    if not _same_dir(directory, held_dir) or err == errno.ENOENT:
+        raise InsecureSocketPath(f"{directory} changed during reclaim")
+    if err == errno.ECONNREFUSED and not _name_is_inode(dfd, qname, verified):
         raise InsecureSocketPath(f"{directory} changed during reclaim")
     return err
 
@@ -599,12 +702,15 @@ def _unlink_pinned_in(
         if not _pinned_match(listed, held):
             raise InsecureSocketPath(f"{path} exists and is not our socket")
         if recheck:
-            still = _recheck_hidden(dfd, directory, qname)
+            still = _recheck_hidden(dfd, directory, qname, held)
             if still != errno.ECONNREFUSED:
                 if still is None:
                     raise InsecureSocketPath(f"{path} is live: another server is listening")
                 # ENOENT is a parent mismatch, not a finished reclaim. Restore, then refuse.
                 _refuse_unreclaimed(path, still)
+                raise InsecureSocketPath(f"{directory} changed during reclaim")
+            # The connect was bound to ``held``. Unlink only if the name still is.
+            if not _name_is_inode(dfd, qname, held):
                 raise InsecureSocketPath(f"{directory} changed during reclaim")
         try:
             os.unlink(qname, dir_fd=dfd)
@@ -630,9 +736,9 @@ def _unlink_pinned(path: str, pin: int, *, recheck: bool = False) -> None:
     original name is already taken, the hidden name is left in place and
     ``InsecureSocketPath`` names it.
 
-    ``recheck`` connects through the directory fd before that unlink. Close
-    does not recheck: the listen fd is already shut, and an inherited dup
-    must not keep the name.
+    ``recheck`` connects through an ``O_PATH`` fd of the hidden inode before
+    that unlink, then lstats the name again. Close does not recheck: the
+    listen fd is already shut, and an inherited dup must not keep the name.
 
     A socket that ``listen``s after the recheck connect and before the hidden
     name is unlinked can still lose that hidden name. That is the remaining
@@ -653,11 +759,13 @@ def _clear_stale_socket(path: str) -> None:
 
     The inode is pinned before the probe and held until the quarantine check
     returns. ``ECONNREFUSED`` means this namespace has no listener on that
-    inode, so ``renameat2(RENAME_NOREPLACE)`` may move it aside. A replacement
-    bound while the pin is open has a different inode: the quarantine entry
-    does not match and is moved back. Without ``O_PATH``, or without
-    ``renameat2``, or when the socket name cannot hold a hidden name no longer
-    than itself, ``ECONNREFUSED`` is left in place rather than reclaimed.
+    inode, so ``renameat2(RENAME_NOREPLACE)`` may move it aside. The hidden
+    name is probed through an ``O_PATH`` fd of that same inode, not by the
+    path. A replacement bound while the pin is open has a different inode:
+    the quarantine entry does not match and is moved back. Without ``O_PATH``,
+    without ``renameat2``, when the proc path cannot be used, or when the
+    socket name cannot hold a hidden name no longer than itself,
+    ``ECONNREFUSED`` is left in place rather than reclaimed.
 
     ``EACCES`` and ``EPERM`` do not reclaim: a live mode-000 or mode-070
     listener fails connect the same way a dead socket does. ``/proc/net/unix``
@@ -707,11 +815,13 @@ def _reap_quarantine(directory: str, socket_name: str) -> None:
     """Remove our abandoned quarantine sockets. Leave everything else alone.
 
     Called from ``start`` while the directory flock is held. An entry is
-    removed only when it carries this socket's quarantine prefix, is a socket
-    we own, and a connect through the held directory fd returns
-    ``ECONNREFUSED``. Non-sockets, symlinks, other users' sockets, and live
-    listeners stay. Removal goes through the same pin, recheck and
-    ``RENAME_NOREPLACE`` restore as a stale public socket.
+    removed only when its name is one ``_quarantine_name`` can produce, it
+    is a socket we own, and a connect to that inode returns ``ECONNREFUSED``.
+    A shorter name that only starts with the prefix is left alone, as is a
+    name of the right length whose suffix is not ``token_hex``. Non-sockets,
+    symlinks, other users' sockets, and live listeners stay. Removal goes
+    through the same pin, inode recheck and ``RENAME_NOREPLACE`` restore as
+    a stale public socket.
     """
     if not _can_pin() or not _can_quarantine(directory, socket_name):
         return
@@ -733,11 +843,8 @@ def _reap_quarantine(directory: str, socket_name: str) -> None:
             return
         if not _same_dir(directory, held_dir):
             return
-        limit = len(os.fsencode(socket_name))
         for entry in names:
-            if entry in (socket_name, ".", "..") or not entry.startswith(prefix):
-                continue
-            if len(os.fsencode(entry)) > limit:
+            if not _is_quarantine_name(entry, socket_name):
                 continue
             try:
                 listed = os.lstat(entry, dir_fd=dfd)
@@ -746,7 +853,7 @@ def _reap_quarantine(directory: str, socket_name: str) -> None:
             if stat.S_ISLNK(listed.st_mode) or not stat.S_ISSOCK(listed.st_mode) or listed.st_uid != os.geteuid():
                 continue
             try:
-                still = _recheck_hidden(dfd, directory, entry)
+                still = _recheck_hidden(dfd, directory, entry, listed)
             except (InsecureSocketPath, OSError):
                 continue
             if still != errno.ECONNREFUSED:

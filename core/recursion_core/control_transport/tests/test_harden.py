@@ -302,8 +302,13 @@ class PathSwapTests(_TmpCase):
         successor = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(successor.close)
         successor.bind(self.sock_path)
-        srv.close()
-        self.assertTrue(stat.S_ISSOCK(os.lstat(self.sock_path).st_mode))
+        ino = os.lstat(self.sock_path).st_ino
+        # The name is not the inode we bound. close refuses it and leaves it.
+        with self.assertRaises(ct.InsecureSocketPath):
+            srv.close()
+        listed = os.lstat(self.sock_path)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual(listed.st_ino, ino)
 
     def test_close_then_start_again_is_refused(self) -> None:
         srv = UnixControlServer(self.sock_dir, ct.with_ping_health())

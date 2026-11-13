@@ -7,6 +7,8 @@ client, and close() that cannot cancel. Unconnectable-socket cases and a
 close() that skips shutdown after a failed unlink failed on 1d0649c7.
 An ECONNREFUSED probe that unlinks a listener bound on the reused inode, and
 a full-backlog EAGAIN left as BlockingIOError, failed on e212728e.
+Unlink-by-path after a matching lstat, close() with no inode pin, and a
+forked child that inherits that pin, failed on ef816f7c.
 """
 
 from __future__ import annotations
@@ -958,6 +960,342 @@ class LockAndPermissionTests(_TmpCase):
         self.assertEqual(os.lstat(path).st_ino, planted["ino"])
         srv.close()
         self.assertEqual(os.lstat(path).st_ino, planted["ino"])
+
+
+def _at_path(target: object, dir_fd: int | None) -> str:
+    """Path ``target`` names, relative to ``dir_fd`` when that fd is set."""
+    if isinstance(target, bytes):
+        target = os.fsdecode(target)
+    if not isinstance(target, str):
+        return ""
+    if dir_fd is None:
+        return target
+    try:
+        directory = os.readlink(f"/proc/self/fd/{dir_fd}")
+    except OSError:
+        return target
+    return os.path.join(directory, target)
+
+
+def _opath_pin_count(path: str) -> int:
+    """Open ``O_PATH`` fds in this process whose path is ``path``."""
+    count = 0
+    opath = getattr(os, "O_PATH", 0)
+    for name in os.listdir("/proc/self/fd"):
+        if not name.isdigit():
+            continue
+        try:
+            if os.readlink(f"/proc/self/fd/{name}") != path:
+                continue
+            with open(f"/proc/self/fdinfo/{name}", encoding="ascii") as info:
+                for line in info:
+                    if line.startswith("flags:"):
+                        if int(line.split()[1], 8) & opath:
+                            count += 1
+                        break
+        except OSError:
+            continue
+    return count
+
+
+def _name_held(path: str, inode: int, wait_s: float) -> bool:
+    """True when ``path`` names ``inode`` within ``wait_s``.
+
+    A quarantine rename moves the name aside and puts it back. The wait covers
+    that gap. A path unlink does not put the name back.
+    """
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            listed = os.lstat(path)
+        except FileNotFoundError:
+            listed = None
+        if listed is not None and stat.S_ISSOCK(listed.st_mode) and listed.st_ino == inode:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.0002)
+
+
+@unittest.skipUnless(LINUX, "Linux is the tested path")
+class InodeQuarantineTests(_TmpCase):
+    def _plant_hooks(self, path: str, planted: dict) -> None:
+        """Hook ``os.unlink`` and ``os.rename`` so a listener appears at removal.
+
+        On a path unlink the hook binds the listener and then performs the
+        caller's unlink, which drops that name. On a rename of the socket the
+        hook binds after the name has moved and leaves the listener in place.
+        """
+        orig_unlink = unix.os.unlink
+        orig_rename = unix.os.rename
+
+        def plant() -> None:
+            if "sock" in planted:
+                return
+            live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            live.bind(path)
+            live.listen(1)
+            planted["sock"] = live
+            planted["ino"] = os.lstat(path).st_ino
+
+        def fake_unlink(target: object, *args: object, **kwargs: object):
+            full = _at_path(target, kwargs.get("dir_fd"))  # type: ignore[arg-type]
+            if full == path and "sock" not in planted:
+                orig_unlink(target, *args, **kwargs)
+                plant()
+                return orig_unlink(target, *args, **kwargs)
+            return orig_unlink(target, *args, **kwargs)
+
+        def fake_rename(src: object, dst: object, *args: object, **kwargs: object):
+            full = _at_path(src, kwargs.get("src_dir_fd"))  # type: ignore[arg-type]
+            result = orig_rename(src, dst, *args, **kwargs)
+            if full == path and "sock" not in planted:
+                plant()
+            return result
+
+        unix.os.unlink = fake_unlink  # type: ignore[assignment]
+        unix.os.rename = fake_rename  # type: ignore[assignment]
+        self.addCleanup(setattr, unix.os, "unlink", orig_unlink)
+        self.addCleanup(setattr, unix.os, "rename", orig_rename)
+        self.addCleanup(lambda: planted["sock"].close() if "sock" in planted else None)
+
+    def _assert_plant_keeps_its_name(self, path: str, planted: dict) -> None:
+        self.assertIn("sock", planted)
+        listed = os.lstat(path)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual(listed.st_ino, planted["ino"])
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        planted["sock"].settimeout(2)
+        client.connect(path)
+        conn, _ = planted["sock"].accept()
+        conn.close()
+
+    def test_removal_hook_keeps_the_listener_it_plants(self) -> None:
+        """A listener planted inside unlink/rename at the moment of removal keeps its name.
+
+        ``lstat`` matching the pin used to be followed by ``unlink(path)``. The
+        hook binds in that call, and the path unlink removes the new listener.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()
+        planted: dict = {}
+        self._plant_hooks(path, planted)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        try:
+            srv.start()
+        except (OSError, ct.InsecureSocketPath):
+            pass
+        self._assert_plant_keeps_its_name(path, planted)
+
+    def test_close_hook_replacement_keeps_its_name(self) -> None:
+        """close() must not drop a socket planted in its unlink, even if the inode is reused.
+
+        The listen fd is already closed, so without an ``O_PATH`` pin the
+        replacement can reuse ``(st_dev, st_ino)`` and a path unlink removes it.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        srv.start()
+        self.addCleanup(srv.close)
+        planted: dict = {}
+        self._plant_hooks(srv.path, planted)
+        try:
+            srv.close()
+        except ct.InsecureSocketPath:
+            pass
+        self._assert_plant_keeps_its_name(srv.path, planted)
+
+    def test_unlistening_socket_reusing_an_inode_before_the_pin_is_not_reclaimed(self) -> None:
+        """A bound socket that has not listen()ed must keep its name.
+
+        The old order lstat'd, then opened the pin. A socket bound in that gap
+        reused the inode, connect returned ECONNREFUSED, and the name was removed.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()
+        planted: dict = {}
+        orig_lstat = unix.os.lstat
+        orig_open = unix.os.open
+
+        def plant_unlistening() -> None:
+            if "sock" in planted:
+                return
+            os.unlink(path)
+            live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            live.bind(path)
+            planted["sock"] = live
+            planted["ino"] = orig_lstat(path).st_ino
+
+        def fake_lstat(target: object, *args: object, **kwargs: object):
+            if target == path and "sock" not in planted:
+                current = orig_lstat(target, *args, **kwargs)
+                if stat.S_ISSOCK(current.st_mode):
+                    plant_unlistening()
+                    return orig_lstat(target, *args, **kwargs)
+            return orig_lstat(target, *args, **kwargs)
+
+        def fake_open(target: object, flags: int, *args: object, **kwargs: object):
+            fd = orig_open(target, flags, *args, **kwargs)
+            if (
+                target == path
+                and flags & os.O_PATH
+                and not flags & getattr(os, "O_DIRECTORY", 0)
+                and "sock" not in planted
+            ):
+                plant_unlistening()
+            return fd
+
+        unix.os.lstat = fake_lstat  # type: ignore[assignment]
+        unix.os.open = fake_open  # type: ignore[assignment]
+        self.addCleanup(setattr, unix.os, "lstat", orig_lstat)
+        self.addCleanup(setattr, unix.os, "open", orig_open)
+        self.addCleanup(lambda: planted["sock"].close() if "sock" in planted else None)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        try:
+            srv.start()
+        except (OSError, ct.InsecureSocketPath):
+            pass
+        self.assertIn("sock", planted)
+        listed = os.lstat(path)
+        self.assertEqual(listed.st_ino, planted["ino"])
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        planted["sock"].listen(1)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        planted["sock"].settimeout(2)
+        client.connect(path)
+        conn, _ = planted["sock"].accept()
+        conn.close()
+
+    def test_forked_child_has_no_inode_pin(self) -> None:
+        """The server holds an O_PATH pin, and a forked child does not inherit it."""
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        srv.start()
+        self.addCleanup(srv.close)
+        self.assertEqual(_opath_pin_count(srv.path), 1)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(lambda: os.close(read_fd) if read_fd >= 0 else None)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r".*multi-threaded.*", category=DeprecationWarning)
+            pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(read_fd)
+                os.write(write_fd, f"{_opath_pin_count(srv.path)}\n".encode())
+                os.close(write_fd)
+            finally:
+                os._exit(0)
+        os.close(write_fd)
+        os.set_blocking(read_fd, False)
+        got = b""
+        deadline = time.monotonic() + 2.0
+        while b"\n" not in got and time.monotonic() < deadline:
+            try:
+                chunk = os.read(read_fd, 64)
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            if not chunk:
+                break
+            got += chunk
+        self.addCleanup(_reap, pid)
+        self.assertEqual(got, b"0\n")
+        # The child's close of its dup must leave the parent's pin in place.
+        self.assertEqual(_opath_pin_count(srv.path), 1)
+        srv.close()
+        self.assertEqual(_opath_pin_count(srv.path), 0)
+        self.assertEqual(_opath_pin_count(self.sock_dir), 0)
+
+    def test_racing_reclaim_loses_no_listener(self) -> None:
+        """A listener bound while a stale socket is reclaimed keeps its name.
+
+        About two seconds, one reclaimer and one listener. A socket counts
+        only after a client has connected, so a name removed before listen
+        is not a lost listener. On ef816f7c the path unlink after lstat
+        removed listeners that had replaced the stale inode.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, "control.sock")
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()
+        deadline = time.monotonic() + 2.0
+        stats = {"lost": 0, "armed": 0}
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def reclaimer() -> None:
+            while time.monotonic() < deadline:
+                try:
+                    unix._clear_stale_socket(path)
+                except (ct.InsecureSocketPath, OSError):
+                    pass
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    return
+
+        def listener() -> None:
+            while time.monotonic() < deadline:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client: socket.socket | None = None
+                try:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        sock.bind(path)
+                    except OSError:
+                        continue
+                    sock.listen(1)
+                    try:
+                        inode = os.lstat(path).st_ino
+                    except FileNotFoundError:
+                        continue
+                    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    client.settimeout(0.05)
+                    try:
+                        client.connect(path)
+                    except OSError:
+                        continue
+                    time.sleep(0)
+                    kept = _name_held(path, inode, 0.02)
+                    with lock:
+                        stats["armed"] += 1
+                        if not kept:
+                            stats["lost"] += 1
+                except OSError:
+                    continue
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    return
+                finally:
+                    if client is not None:
+                        client.close()
+                    sock.close()
+
+        threads = [
+            threading.Thread(target=reclaimer, name="reclaim-race"),
+            threading.Thread(target=listener, name="listener-race"),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertGreater(stats["armed"], 100, stats)
+        self.assertEqual(stats["lost"], 0, stats)
 
 
 if __name__ == "__main__":

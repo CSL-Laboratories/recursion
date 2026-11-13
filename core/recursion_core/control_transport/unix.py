@@ -14,15 +14,23 @@ Linux is the tested path. macOS uses the same AF_UNIX family and is designed in 
 A connect that fails with ``EACCES`` or ``EPERM`` does not reclaim the socket.
 Owner decision: that errno is not proof the file is stale, so a dead mode-000
 socket stays until the operator removes it. ``ECONNREFUSED`` reclaims only
-while an ``O_PATH`` fd holds that inode, and only when the path still names it.
+while an ``O_PATH`` fd holds that inode. Removal renames the directory entry
+to a hidden name in the same directory and unlinks that name only when it is
+still the pinned inode and a second connect still reports ``ECONNREFUSED``.
+``rename`` is atomic, so a listener that binds the original path after the
+rename keeps that name. A socket that ``listen``s after that second connect
+and before the unlink can still lose the hidden name; that is the remaining
+window.
 """
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import ipaddress
 import os
 import re
+import secrets
 import socket
 import stat
 import threading
@@ -189,21 +197,77 @@ def _acquire_lock(path: str) -> int:
 _LIVE_SERVERS: weakref.WeakSet = weakref.WeakSet()
 
 
-def _drop_lock_after_fork() -> None:
-    """Close lock fds inherited across fork. ``O_CLOEXEC`` does not run on fork."""
-    for server in list(_LIVE_SERVERS):
-        fd = server._lock_fd
-        server._lock_fd = None
-        if not isinstance(fd, int):
-            continue
+# O_PATH pins and the directory fds used to rename them. Fork copies the fd
+# table; O_CLOEXEC does not run then. ``_PIN_FDS_LOCK`` is held across fork so
+# the child closes exactly the fds that were open, then drops the lock.
+_PIN_FDS: set[int] = set()
+_PIN_FDS_LOCK = threading.Lock()
+
+
+def _remember_pin(fd: int) -> int:
+    with _PIN_FDS_LOCK:
+        _PIN_FDS.add(fd)
+    return fd
+
+
+def _close_pin(fd: int | None) -> None:
+    if not isinstance(fd, int):
+        return
+    with _PIN_FDS_LOCK:
+        _PIN_FDS.discard(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _pins_before_fork() -> None:
+    _PIN_FDS_LOCK.acquire()
+
+
+def _pins_after_fork_parent() -> None:
+    _PIN_FDS_LOCK.release()
+
+
+def _drop_inherited_fds() -> None:
+    """Close lock fds and inode pins inherited across fork.
+
+    ``O_CLOEXEC`` does not run on fork. The child must not keep the parent's
+    flock or an ``O_PATH`` pin of the bound socket.
+    """
+    try:
+        pins = list(_PIN_FDS)
+        _PIN_FDS.clear()
+        for server in list(_LIVE_SERVERS):
+            lock_fd = server._lock_fd
+            server._lock_fd = None
+            pin_fd = server._pin_fd
+            server._pin_fd = None
+            for fd in (lock_fd, pin_fd):
+                if isinstance(fd, int):
+                    pins.append(fd)
+        seen: set[int] = set()
+        for fd in pins:
+            if fd in seen:
+                continue
+            seen.add(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    finally:
         try:
-            os.close(fd)
-        except OSError:
+            _PIN_FDS_LOCK.release()
+        except RuntimeError:
             pass
 
 
 if hasattr(os, "register_at_fork"):  # pragma: no branch - POSIX
-    os.register_at_fork(after_in_child=_drop_lock_after_fork)
+    os.register_at_fork(
+        before=_pins_before_fork,
+        after_in_parent=_pins_after_fork_parent,
+        after_in_child=_drop_inherited_fds,
+    )
 
 
 def _unlink_inode(path: str, ident: tuple[int, int] | None) -> None:
@@ -258,19 +322,30 @@ def _probe_listener(path: str) -> int | None:
     return None
 
 
+def _can_pin() -> bool:
+    """True when an ``O_PATH`` fd can hold an inode and a directory for rename."""
+    return (
+        getattr(os, "O_PATH", None) is not None
+        and getattr(os, "O_NOFOLLOW", None) is not None
+        and getattr(os, "O_DIRECTORY", None) is not None
+    )
+
+
 def _open_inode_pin(path: str) -> int | None:
     """Fd that holds ``path``'s inode until closed, or ``None`` if the name is gone.
 
     ``O_PATH|O_NOFOLLOW`` does not connect. With both flags a symlink yields an
     fd for the link itself; the caller rejects that from ``fstat``. The fd is
-    what stops the inode being reused after the name is removed.
+    what stops the inode being reused after the name is removed. It is recorded
+    so a forked child closes its dup.
     """
     try:
-        return os.open(path, os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise InsecureSocketPath(f"{path} exists and is not our socket") from exc
+    return _remember_pin(fd)
 
 
 def _refuse_unreclaimed(path: str, err: int | None) -> None:
@@ -285,38 +360,202 @@ def _refuse_unreclaimed(path: str, err: int | None) -> None:
     )
 
 
-def _unlink_our_socket(path: str, pin: int) -> None:
-    """Unlink ``path`` only when a fresh lstat still names the inode ``pin`` holds.
+# renameat2(RENAME_NOREPLACE). Linux rejects a replace; sockets cannot be link()ed.
+_RENAME_NOREPLACE = 1
+_renameat2 = None
+_renameat2_ready = False
 
-    ``pin`` is the ``O_PATH`` fd opened before the probe. That inode cannot be
-    reused, so a listener bound at ``path`` after the old name was removed does
-    not match ``fstat(pin)`` and is left in place. ``_unlink_inode`` checks again.
-    """
+
+def _load_renameat2():
+    """``renameat2`` from libc, or ``None`` when this platform has no such symbol."""
+    global _renameat2, _renameat2_ready
+    if _renameat2_ready:
+        return _renameat2
+    _renameat2_ready = True
     try:
-        st = os.lstat(path)
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.renameat2
+    except (AttributeError, OSError):
+        _renameat2 = None
+        return None
+    fn.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    fn.restype = ctypes.c_int
+    _renameat2 = fn
+    return fn
+
+
+def _rename_noreplace(dfd: int, src: str, dst: str) -> bool | None:
+    """Move ``src`` onto ``dst`` inside ``dfd`` without replacing ``dst``.
+
+    ``True`` when the name moved or ``src`` was already gone. ``False`` when
+    ``dst`` exists. ``None`` when ``renameat2`` is not available; the caller
+    then uses ``os.rename`` only after ``lstat`` reports ``ENOENT``.
+    """
+    fn = _load_renameat2()
+    if fn is None:
+        return None
+    ctypes.set_errno(0)
+    rc = fn(dfd, os.fsencode(src), dfd, os.fsencode(dst), _RENAME_NOREPLACE)
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in (errno.EEXIST, errno.ENOTEMPTY):
+        return False
+    if err == errno.ENOENT:
+        return True
+    if err in (errno.ENOSYS, errno.EINVAL):
+        return None
+    raise OSError(err, os.strerror(err), src)
+
+
+def _pinned_match(listed: os.stat_result, held: os.stat_result) -> bool:
+    """True when ``listed`` is the socket inode ``held`` (the pin's fstat)."""
+    return (
+        not stat.S_ISLNK(listed.st_mode)
+        and not stat.S_ISLNK(held.st_mode)
+        and stat.S_ISSOCK(listed.st_mode)
+        and stat.S_ISSOCK(held.st_mode)
+        and listed.st_uid == os.geteuid()
+        and held.st_uid == os.geteuid()
+        and (listed.st_dev, listed.st_ino) == (held.st_dev, held.st_ino)
+    )
+
+
+def _open_parent_dir(directory: str) -> int:
+    """``O_PATH|O_DIRECTORY`` fd for dir-relative rename, lstat and unlink."""
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    return _remember_pin(os.open(directory, flags))
+
+
+def _fresh_quarantine(dfd: int, socket_name: str) -> str:
+    """A hidden name in ``dfd`` that is not already there. Fail rather than replace.
+
+    The name is no longer than ``socket_name``, so a recheck ``connect`` still
+    fits in ``sun_path`` when the original socket path did.
+    """
+    limit = max(len(os.fsencode(socket_name)), 2)
+    for _ in range(8):
+        name = ("." + secrets.token_hex(16)).encode("ascii")[:limit].decode("ascii")
+        if name in (".", ".."):
+            continue
+        try:
+            os.lstat(name, dir_fd=dfd)
+        except FileNotFoundError:
+            return name
+    raise InsecureSocketPath("quarantine name already exists")
+
+
+def _restore_quarantine(dfd: int, qname: str, name: str) -> bool:
+    """Put ``qname`` back on ``name``. False leaves ``qname`` where it is.
+
+    ``link`` cannot name a socket, so the fallback is ``os.rename`` and only
+    when ``lstat`` of ``name`` raises ``ENOENT``. That check is not atomic.
+    Linux uses ``renameat2(RENAME_NOREPLACE)``, which will not replace a name
+    bound after the quarantine rename.
+    """
+    moved = _rename_noreplace(dfd, qname, name)
+    if moved is not None:
+        return moved
+    try:
+        os.lstat(name, dir_fd=dfd)
     except FileNotFoundError:
-        return
-    held = os.fstat(pin)
-    if (
-        stat.S_ISLNK(st.st_mode)
-        or not stat.S_ISSOCK(st.st_mode)
-        or not stat.S_ISSOCK(held.st_mode)
-        or st.st_uid != os.geteuid()
-        or (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino)
-    ):
+        try:
+            os.rename(qname, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except OSError:
+            return False
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _refuse_foreign(path: str, qpath: str, restored: bool) -> None:
+    if restored:
         raise InsecureSocketPath(f"{path} exists and is not our socket")
-    _unlink_inode(path, (held.st_dev, held.st_ino))
+    raise InsecureSocketPath(f"{path} exists and is not our socket. Left at {qpath}.")
+
+
+def _unlink_pinned(path: str, pin: int, *, recheck: bool = False) -> None:
+    """Remove ``path`` only when the quarantined entry is the inode ``pin`` holds.
+
+    ``os.rename`` onto a fresh hidden name in the same directory is atomic, so
+    a listener that binds ``path`` after that rename gets a new directory entry
+    and is not unlinked. The hidden name is unlinked only when its ``lstat``
+    matches ``fstat(pin)``. Any other inode is moved back with
+    ``renameat2(RENAME_NOREPLACE)``. When the original name is already taken,
+    the hidden name is left in place and ``InsecureSocketPath`` names it.
+
+    ``recheck`` connects to the hidden name before that unlink. A socket that
+    had only ``bind``ed when the first probe ran, and has since ``listen``ed,
+    is moved back and refused. Close does not recheck: the listen fd is
+    already shut, and an inherited dup must not keep the name.
+
+    The ``O_PATH|O_DIRECTORY`` fd stays open for every dir-relative operation.
+    ``rename`` does not touch a name bound after it returns. A socket that
+    ``listen``s after the recheck connect and before the hidden name is
+    unlinked can still lose that hidden name.
+    """
+    directory, name = os.path.split(path)
+    if not name or name in (".", "..") or not directory:
+        raise InsecureSocketPath(f"{path} exists and is not our socket")
+    dfd = _open_parent_dir(directory)
+    try:
+        held = os.fstat(pin)
+        qname: str | None = None
+        for _ in range(8):
+            candidate = _fresh_quarantine(dfd, name)
+            try:
+                os.rename(name, candidate, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except FileNotFoundError:
+                return
+            except FileExistsError:
+                continue
+            qname = candidate
+            break
+        if qname is None:
+            raise InsecureSocketPath(f"{path} exists and is not our socket")
+        qpath = os.path.join(directory, qname)
+        try:
+            listed = os.lstat(qname, dir_fd=dfd)
+        except FileNotFoundError:
+            return
+        if _pinned_match(listed, held):
+            if recheck:
+                still = _probe_listener(qpath)
+                if still != errno.ECONNREFUSED:
+                    restored = _restore_quarantine(dfd, qname, name)
+                    if still is None:
+                        if restored:
+                            raise InsecureSocketPath(f"{path} is live: another server is listening")
+                        raise InsecureSocketPath(
+                            f"{path} is live: another server is listening. Left at {qpath}."
+                        )
+                    if still == errno.ENOENT:
+                        return
+                    if not restored:
+                        raise InsecureSocketPath(f"{path} exists and is not our socket. Left at {qpath}.")
+                    _refuse_unreclaimed(path, still)
+                    return
+            try:
+                os.unlink(qname, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+            return
+        restored = _restore_quarantine(dfd, qname, name)
+        _refuse_foreign(path, qpath, restored)
+    finally:
+        _close_pin(dfd)
 
 
 def _clear_stale_socket(path: str) -> None:
     """Drop a socket we own only when connect proves nothing is listening.
 
-    The inode is pinned before the probe and held until the unlink check
+    The inode is pinned before the probe and held until the quarantine check
     returns. ``ECONNREFUSED`` means this namespace has no listener on that
-    inode, so the inode-checked unlink may reclaim it. A replacement bound
-    in between has a different inode while the pin is open, and is refused.
-    Without ``O_PATH`` the inode cannot be held, so ``ECONNREFUSED`` is left
-    in place rather than reclaimed.
+    inode, so the rename may reclaim it. A replacement bound while the pin is
+    open has a different inode: the quarantine entry does not match and is
+    moved back. Without ``O_PATH`` the inode cannot be held, so
+    ``ECONNREFUSED`` is left in place rather than reclaimed.
 
     ``EACCES`` and ``EPERM`` do not reclaim: a live mode-000 or mode-070
     listener fails connect the same way a dead socket does. ``/proc/net/unix``
@@ -332,32 +571,29 @@ def _clear_stale_socket(path: str) -> None:
     Owner decision: never unlink on ``EACCES`` or ``EPERM``. A dead mode-000
     socket stays until the operator removes it.
     """
-    st = _stat_our_socket(path)
-    if st is None:
-        return
-    if getattr(os, "O_PATH", None) is None or getattr(os, "O_NOFOLLOW", None) is None:
+    if not _can_pin():
         # No fd can hold the inode, so a reused number could match a new listener.
+        st = _stat_our_socket(path)
+        if st is None:
+            return
         _refuse_unreclaimed(path, _probe_listener(path))
         return
+    # Pin before any lstat. A socket bound after this open cannot reuse the
+    # inode, including one that has bind()ed and not yet listen()ed.
     pin = _open_inode_pin(path)
     if pin is None:
         return
     try:
         held = os.fstat(pin)
-        if (
-            stat.S_ISLNK(held.st_mode)
-            or not stat.S_ISSOCK(held.st_mode)
-            or held.st_uid != os.geteuid()
-            or (held.st_dev, held.st_ino) != (st.st_dev, st.st_ino)
-        ):
+        if stat.S_ISLNK(held.st_mode) or not stat.S_ISSOCK(held.st_mode) or held.st_uid != os.geteuid():
             raise InsecureSocketPath(f"{path} exists and is not our socket")
         err = _probe_listener(path)
         if err == errno.ECONNREFUSED:
-            _unlink_our_socket(path, pin)
+            _unlink_pinned(path, pin, recheck=True)
             return
         _refuse_unreclaimed(path, err)
     finally:
-        os.close(pin)
+        _close_pin(pin)
 
 
 def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -> PeerCred:
@@ -413,6 +649,7 @@ class UnixControlServer:
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
         self._lock_fd: int | None = None
+        self._pin_fd: int | None = None
         self._bound: tuple[int, int] | None = None
         self._thread: threading.Thread | None = None
         self._workers: set[threading.Thread] = set()
@@ -452,13 +689,29 @@ class UnixControlServer:
                 # following a symlink planted in between: a path swap must not change
                 # some other file's mode or become the inode we listen under.
                 sock.bind(self._path)
+                # Pin immediately. A socket that bind()s in this gap and reuses
+                # the inode is the one fstat names; anything bound after the pin
+                # cannot reuse it. The pin stays open for the server's life so
+                # close() can quarantine this inode.
+                pin = _open_inode_pin(self._path) if _can_pin() else None
+                if _can_pin() and pin is None:
+                    raise InsecureSocketPath(f"{self._path} changed under us after bind")
+                self._pin_fd = pin
+                if pin is not None:
+                    held = os.fstat(pin)
+                    if stat.S_ISLNK(held.st_mode) or not stat.S_ISSOCK(held.st_mode) or held.st_uid != self._uid:
+                        raise InsecureSocketPath(f"{self._path} changed under us after bind")
+                    bound_id = (held.st_dev, held.st_ino)
                 try:
                     before = os.lstat(self._path)
                 except FileNotFoundError as exc:
                     raise InsecureSocketPath(f"{self._path} changed under us after bind") from exc
                 if stat.S_ISLNK(before.st_mode) or not stat.S_ISSOCK(before.st_mode) or before.st_uid != self._uid:
                     raise InsecureSocketPath(f"{self._path} changed under us after bind")
-                bound_id = (before.st_dev, before.st_ino)
+                if bound_id is None:
+                    bound_id = (before.st_dev, before.st_ino)
+                elif (before.st_dev, before.st_ino) != bound_id:
+                    raise InsecureSocketPath(f"{self._path} changed under us after bind")
                 try:
                     os.chmod(self._path, 0o600, follow_symlinks=False)
                 except (OSError, NotImplementedError) as exc:
@@ -485,8 +738,16 @@ class UnixControlServer:
                 self._bound = None
                 self._thread = None
                 self._lock_fd = None
-                _unlink_inode(self._path, bound_id)
-                os.close(lock_fd)
+                pin = self._pin_fd
+                self._pin_fd = None
+                try:
+                    if pin is not None:
+                        _unlink_pinned(self._path, pin)
+                    elif bound_id is not None and not _can_pin():
+                        _unlink_inode(self._path, bound_id)
+                finally:
+                    _close_pin(pin)
+                    os.close(lock_fd)
                 raise
 
     def close(self) -> None:
@@ -543,20 +804,28 @@ class UnixControlServer:
             self._release_bound_socket()
 
     def _release_bound_socket(self) -> None:
-        """Close the listen socket, unlink that inode, then drop the flock.
+        """Close the listen socket, quarantine that inode, then drop the flock.
 
-        Unlink is inode-checked, so a successor that already bound this path
-        stays. The flock is last: once it is gone, a peer may be woken.
+        The ``O_PATH`` pin taken at bind is held across the rename, so a
+        successor that reused the inode does not match and is moved back.
+        ``InsecureSocketPath`` is raised when the name was not our inode. The
+        flock is released before that exception leaves: once it is gone, a
+        peer may be woken.
         """
         with self._lock:
             sock, self._sock = self._sock, None
             lock_fd, self._lock_fd = self._lock_fd, None
             bound, self._bound = self._bound, None
+            pin, self._pin_fd = self._pin_fd, None
         try:
             if sock is not None:
                 sock.close()
-                _unlink_inode(self._path, bound)
+                if pin is not None:
+                    _unlink_pinned(self._path, pin)
+                elif bound is not None and not _can_pin():
+                    _unlink_inode(self._path, bound)
         finally:
+            _close_pin(pin)
             if lock_fd is not None:
                 os.close(lock_fd)
 

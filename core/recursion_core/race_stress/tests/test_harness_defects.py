@@ -649,6 +649,118 @@ class PinTests(unittest.TestCase):
             ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
             self.assertTrue(ok, message)
 
+    def test_directory_pin_hashes_ancestor_init(self) -> None:
+        # Importing the pinned package runs core/recursion_core/__init__.py first.
+        # A directory pin used to hash only the tree, so an edit there stayed pinned.
+        rel = "core/recursion_core/daemon"
+        init = "core/recursion_core/__init__.py"
+        extra = "core/recursion_core/extra.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                init: "from recursion_core.extra import EXTRA\n",
+                extra: "EXTRA = 1\n",
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            for dirty in (init, extra):
+                dest = repo / dirty
+                original = dest.read_text()
+                dest.write_text(original + "MUT = 1\n")
+                ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+                self.assertFalse(ok, message)
+                self.assertIn(dirty, message)
+                dest.write_text(original)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+
+    def test_file_pin_refuses_package_shadow_of_imported_module_outside_search_set(self) -> None:
+        # policy.py is hashed because an ancestor imports it, but its parent directory
+        # is not an import-search directory. FileFinder still prefers policy/__init__.py.
+        rel = "core/recursion_core/routes/breaker.py"
+        parent = "core/recursion_core/subscription_routes"
+        policy = f"{parent}/policy.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                "core/recursion_core/routes/__init__.py":
+                    "from recursion_core.subscription_routes.policy import POLICY\n",
+                rel: "VALUE = 1\n",
+                policy: "POLICY = 1\n",
+                f"{parent}/__init__.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            search = pins._import_search_dirs([rel])
+            self.assertNotIn(parent, search)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (repo / parent / "helper.py").write_text("HELPER = 1\n")
+            (repo / parent / "scratch.txt").write_text("not a module\n")
+            (repo / parent / ".#policy.py").symlink_to("user@host.99999")
+            empty = repo / parent / "policy"
+            empty.mkdir()
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            init = empty / "__init__.py"
+            init.write_text("POLICY = 'pkg'\n")
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.subscription_routes.policy import POLICY; print(POLICY)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "pkg")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("policy/__init__.py", message)
+
+    def test_file_pin_refuses_pycache_of_imported_package_init(self) -> None:
+        # An unchecked-hash .pyc beside an imported package __init__.py runs under -B.
+        # That package directory is outside the import-search set, so the old file pin
+        # hashed the .py and still returned true.
+        rel = "core/recursion_core/routes/breaker.py"
+        parent = "core/recursion_core/subscription_routes"
+        init = f"{parent}/__init__.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                "core/recursion_core/routes/__init__.py":
+                    "from recursion_core.subscription_routes import VALUE\n",
+                rel: "VALUE = 1\n",
+                init: "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            self.assertNotIn(parent, pins._import_search_dirs([rel]))
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            src = repo / init
+            src.write_text("VALUE = 'cache'\n")
+            py_compile.compile(
+                str(src), doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+            src.write_text("VALUE = 1\n")
+            cache = Path(importlib.util.cache_from_source(str(src)))
+            self.assertTrue(cache.is_file(), cache)
+            self.assertEqual(src.read_text(), "VALUE = 1\n")
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.subscription_routes import VALUE; print(VALUE)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "cache")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("__pycache__", message)
+
     def test_benign_untracked_entries_under_core_are_allowed(self) -> None:
         # Empty dirs, dot-dirs other than .git, egg-info, dangling Emacs locks,
         # and editor junk cannot become the imported module.

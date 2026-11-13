@@ -14,10 +14,12 @@ suffix before source. A timestamp-matched or unchecked-hash ``.pyc`` is executed
 ``-B``, while ``module.__file__`` still names the ``.py``. Under a directory pin every
 untracked path is refused except a file that is provably not importable: its name has no
 source, bytecode, or extension suffix, and every parent directory is already tracked (a new
-directory is a namespace package). A file pin also refuses a sibling ``__pycache__``, an
-extension module with the pinned stem, and a package directory with that stem. An untracked
-top-level importable name under ``core/`` is refused too: the drivers insert that directory
-on ``sys.path``, so ``core/dataclasses.py`` would shadow the standard library.
+directory is a namespace package). Every hashed module, including one imported from outside
+the import-search directories, refuses a same-stem package directory (``__init__`` with any
+source, bytecode, or extension suffix), a same-stem extension module, and every entry in
+that directory's ``__pycache__``. Any untracked ``.pyc`` under ``core/`` is refused. An
+untracked top-level importable name under ``core/`` is refused too: the drivers insert that
+directory on ``sys.path``, so ``core/dataclasses.py`` would shadow the standard library.
 
 ``git ls-files`` does not list children of an untracked symlink or of a nested git directory,
 so those names are not trusted. ``os.walk(followlinks=False)`` and ``lstat`` refuse every
@@ -32,15 +34,16 @@ real directories, again by ``lstat`` rather than by following links.
 
 A file pin hashes more than its own blob. Importing the pinned module runs every ancestor
 package ``__init__.py``, and those files import sibling modules, so each of those tracked
-files is hashed against ``HEAD`` as well.
+files is hashed against ``HEAD`` as well. A directory pin hashes those same ancestor
+``__init__.py`` files and the modules they import. The directory's own ``__init__.py`` is
+already inside the pinned tree.
 
 ``git`` is ``/usr/bin/git`` when that binary exists, not whatever ``PATH`` names. The bytes of
 that binary are not pinned, and ``GIT_EXEC_PATH`` can still redirect its subcommands.
-Environment variables that point ``git`` at a different repository are ignored. A sourceless
-``foo.pyc`` beside a file pin loses to ``foo.py`` in FileFinder, so it is not treated as a
-shadow while the pinned source is present. An extra ``helper.py`` next to a file pin is a
-different module name; a directory pin still refuses it. An empty directory does not beat a
-tracked module or a later regular module on ``sys.path``.
+Environment variables that point ``git`` at a different repository are ignored. An extra
+``helper.py`` next to a hashed module is a different module name; a directory pin still
+refuses it. An empty directory does not beat a tracked module or a later regular module on
+``sys.path``.
 
 Anything else skips with a message naming both heads, instead of measuring code nobody pinned.
 Set ``RACE_STRESS_UNPINNED=1`` to run against an unpinned tree anyway (the run then reports
@@ -148,6 +151,10 @@ def _has_import_suffix(name: str) -> bool:
     return any(name.endswith(suffix) for suffix in _IMPORT_SUFFIXES)
 
 
+def _is_bytecode(name: str) -> bool:
+    return any(name.endswith(suffix) for suffix in importlib.machinery.BYTECODE_SUFFIXES)
+
+
 def _tracked_blobs(root: Path, path: str) -> list[tuple[str, str]] | None:
     """``(path, blob)`` for every file at ``HEAD`` under ``path``. None if that list is unusable."""
     out = _git(root, "ls-tree", "-r", "-z", "HEAD", "--", path)
@@ -218,36 +225,75 @@ def _module_stem(filename: str) -> str:
     return Path(filename).stem
 
 
-def _file_pin_shadows(root: Path, path: str) -> list[str]:
-    parent = Path(path).parent.as_posix()
-    stem = _module_stem(Path(path).name)
+def _pycache_home(rel: str) -> str | None:
+    """Directory that owns the ``__pycache__`` component of ``rel``, if it has one."""
+    parts = Path(rel).parts
+    if "__pycache__" not in parts:
+        return None
+    index = parts.index("__pycache__")
+    if index == 0:
+        return None
+    return "/".join(parts[:index])
+
+
+def _file_pin_shadows(root: Path, paths: list[str]) -> list[str]:
+    """Shadows of every hashed module, including imports outside the search set.
+
+    FileFinder loads ``stem/__init__.*`` before ``stem.py``, and an extension suffix
+    before source. Every entry in a hashed module's ``__pycache__`` can run under
+    ``-B`` while ``module.__file__`` still names the ``.py``. A sibling ``helper.py``
+    is a different module and is left alone. An empty ``stem/`` directory is not a
+    package, so it is left alone too.
+    """
+    stems: dict[str, set[str]] = {}
+    for path in paths:
+        parent = Path(path).parent.as_posix()
+        if parent in ("", "."):
+            continue
+        stems.setdefault(parent, set()).add(_module_stem(Path(path).name))
+    if not stems:
+        return []
+    indexed = _head_index(root)
+    if indexed is None:
+        return ["could not list tracked files under core/"]
+    files, _dirs = indexed
+    untracked = _untracked(root, "core")
+    if untracked is None:
+        return ["could not list untracked files under core/"]
+    parents = set(stems)
     found: list[str] = []
-    cache = f"{parent}/__pycache__"
-    cached = _untracked(root, cache)
-    if cached is None:
-        found.append(f"could not list {cache}")
-    else:
-        found.extend(f"bytecode cache {name}" for name in cached)
-    tracked = _git_z(root, "ls-files", "-z", "--", cache)
-    if tracked is None:
-        found.append(f"could not list {cache}")
-    else:
-        found.extend(f"bytecode cache {name}" for name in tracked)
-    others = _untracked(root, parent)
-    if others is None:
-        return found + [f"could not list untracked files beside {path}"]
-    prefix = f"{parent}/{stem}/"
-    for rel in others:
-        name = Path(rel).name
-        if Path(rel).parent.as_posix() == parent:
-            if any(name == stem + suffix for suffix in importlib.machinery.EXTENSION_SUFFIXES):
-                found.append(f"extension shadow {rel}")
-        elif rel.startswith(prefix) and name.startswith("__init__") and _has_import_suffix(name):
-            found.append(f"package shadow {rel}")
-    for suffix in _IMPORT_SUFFIXES:
-        init = f"{prefix}__init__{suffix}"
-        if _git_text(root, "cat-file", "-t", f"HEAD:{init}") == "blob":
-            found.append(f"package shadow {init}")
+    seen: set[str] = set()
+
+    def add(kind: str, rel: str) -> None:
+        item = f"{kind} {rel}"
+        if item not in seen:
+            seen.add(item)
+            found.append(item)
+
+    def consider(rel: str) -> None:
+        path = Path(rel)
+        name = path.name
+        parent = path.parent.as_posix()
+        home = _pycache_home(rel)
+        if home in parents:
+            add("bytecode cache", rel)
+            return
+        if parent in parents and any(
+                name == stem + suffix
+                for stem in stems[parent]
+                for suffix in importlib.machinery.EXTENSION_SUFFIXES):
+            add("extension shadow", rel)
+            return
+        grand = path.parent.parent.as_posix()
+        stem = path.parent.name
+        if (grand in parents and stem in stems[grand] and name.startswith("__init__")
+                and _has_import_suffix(name)):
+            add("package shadow", rel)
+
+    for rel in untracked:
+        consider(rel)
+    for rel in files:
+        consider(rel)
     return found
 
 
@@ -431,6 +477,11 @@ def _layout_problems(root: Path, pin_paths: list[str]) -> list[str]:
                 problems.append(f"symlink {rel}")
                 prune.add(name)
                 continue
+            # An unchecked-hash or timestamp-matched .pyc runs under -B from any
+            # directory, including one outside the import-search set.
+            if (name in filenames and stat.S_ISREG(ent.st_mode) and rel not in tracked
+                    and _is_bytecode(name)):
+                problems.append(f"bytecode cache {rel}")
             if (parent_relevant and stat.S_ISDIR(ent.st_mode)
                     and rel not in tracked_dirs and rel not in tracked):
                 if not _has_any_file(full):
@@ -482,9 +533,13 @@ def _core_path_shadows(root: Path) -> list[str]:
 
 
 def _ancestor_inits(path: str) -> list[str]:
-    """Package ``__init__.py`` files above a pinned file, under ``core/`` and not ``core`` itself."""
+    """Package ``__init__.py`` files above ``path``, under ``core/`` and not ``core`` itself.
+
+    ``path`` is a pinned file or a pinned directory. A directory's own ``__init__.py``
+    is not listed: that file is already inside the pinned tree.
+    """
     parts = Path(path).parts
-    if len(parts) < 2 or parts[0] != "core" or not parts[-1].endswith(".py"):
+    if len(parts) < 2 or parts[0] != "core":
         return []
     acc = ["core"]
     inits: list[str] = []
@@ -567,15 +622,17 @@ def _read_module_text(path: Path) -> str | None:
         return None
 
 
-def _file_pin_dependency_problems(root: Path, path: str) -> list[str]:
+def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], list[str]]:
     """Ancestor package inits, and the tracked modules they or the pin import, must match HEAD.
 
-    Importing a pinned file runs those ``__init__.py`` files first. Their import lines name
-    the other modules that execute. Only ``recursion_core`` names are followed.
+    Importing a pinned file or a pinned directory runs those ``__init__.py`` files first.
+    Their import lines name the other modules that execute. Only ``recursion_core`` names
+    are followed. The second list is every tracked module path in that closure, so a
+    shadow check can cover parents that are not import-search directories.
     """
     indexed = _head_index(root)
     if indexed is None:
-        return ["could not list tracked files under core/"]
+        return ["could not list tracked files under core/"], []
     files, _dirs = indexed
     problems: list[str] = []
     queue = [path, *_ancestor_inits(path)]
@@ -611,6 +668,12 @@ def _file_pin_dependency_problems(root: Path, path: str) -> list[str]:
                         break
             if chosen is not None and chosen not in seen:
                 queue.append(chosen)
+    closure: list[str] = []
+    if path in files and files[path][0] in ("100644", "100755"):
+        closure.append(path)
+    for rel, _oid in extra:
+        if rel not in closure:
+            closure.append(rel)
     names: list[str] = []
     oids: list[str] = []
     for rel, oid in extra:
@@ -625,15 +688,15 @@ def _file_pin_dependency_problems(root: Path, path: str) -> list[str]:
         names.append(rel)
         oids.append(oid)
     if not names:
-        return problems
+        return problems, closure
     out = _git(root, "hash-object", "--no-filters", "--", *names)
     if out is None or out.returncode != 0 or len(out.stdout.splitlines()) != len(names):
         problems.append("could not hash imported worktree bytes")
-        return problems
+        return problems, closure
     for rel, oid, got in zip(names, oids, out.stdout.splitlines()):
         if got != oid:
             problems.append(f"{rel} worktree bytes differ")
-    return problems
+    return problems, closure
 
 
 def _path_problems(root: Path, path: str, oid: str) -> list[str]:
@@ -660,10 +723,10 @@ def _path_problems(root: Path, path: str, oid: str) -> list[str]:
             if len(hashed) != len(blobs) or any(
                     got != blob for (_name, blob), got in zip(blobs, hashed)):
                 problems.append("worktree bytes differ")
-    if len(blobs) == 1 and blobs[0][0] == path:
-        problems.extend(_file_pin_shadows(root, path))
-        problems.extend(_file_pin_dependency_problems(root, path))
-    else:
+    dep, closure = _file_pin_dependency_problems(root, path)
+    problems.extend(dep)
+    problems.extend(_file_pin_shadows(root, closure))
+    if not (len(blobs) == 1 and blobs[0][0] == path):
         problems.extend(_directory_pin_shadows(root, path, blobs))
     return problems
 

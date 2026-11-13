@@ -97,7 +97,6 @@ class StopTest(unittest.TestCase):
     def test_malformed_stop_object_requests_the_kill(self) -> None:
         cases = (
             {"requested_at": 1.0},
-            {"requested": "yes", "checks": 0, "reason": None},
             "sent",
             ["requested"],
             1,
@@ -233,6 +232,75 @@ class StopTest(unittest.TestCase):
         again = api.call("run.start", p)
         self.assertEqual((again["code"], again["detail"]), (a.START_FAILED, "stop_requested"))
         self.assertEqual(kill.requests, [])
+
+    def test_non_bool_requested_or_bad_checks_is_pending_not_stopped(self) -> None:
+        # requested must be exactly True. 1, "yes", a negative checks count and
+        # a non-int checks count are not a prior kill: request_stop, then pending.
+        cases = (
+            {"requested": 1, "checks": 0, "reason": None},
+            {"requested": "yes", "checks": 0, "reason": None},
+            {"requested": True, "checks": -1, "reason": None},
+            {"requested": True, "checks": "0", "reason": None},
+            {"requested": True, "checks": True, "reason": None},
+        )
+        for raw in cases:
+            with self.subTest(stop=raw):
+                api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+                run = started(api)
+                rec = registry.get(run)
+                cgroup = rec["cgroup"]
+                recorded = dict(raw)
+                recorded["cgroup"] = cgroup
+                rec["stop"] = recorded
+                registry.put(rec)
+                res = api.call("run.stop", {"run_id": run})
+                self.assertEqual(kill.requests, [cgroup])
+                self.assertEqual((res["code"], res["state"]), (a.PENDING, "pending"))
+                self.assertNotEqual(registry.get(run)["state"], "stopped")
+                self.assertEqual(kill.confirms, [])
+                self.assertIs(registry.get(run)["stop"]["requested"], True)
+                self.assertEqual(registry.get(run)["stop"]["cgroup"], cgroup)
+                again = api.call("run.stop", {"run_id": run})
+                self.assertEqual(again["code"], a.STOPPED)
+                self.assertEqual(len(kill.requests), 1)
+                self.assertEqual(kill.confirms, [cgroup])
+
+    def test_request_for_another_cgroup_is_pending_until_this_cgroup_is_requested(self) -> None:
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        rec = registry.get(run)
+        cgroup = rec["cgroup"]
+        rec["stop"] = {
+            "requested": True,
+            "checks": 2,
+            "reason": None,
+            "requested_at": 1.0,
+            "cgroup": cgroup + "-other",
+        }
+        registry.put(rec)
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(kill.requests, [cgroup])
+        self.assertEqual((res["code"], res["state"], res["reason"]), (a.PENDING, "pending", "stop_not_requested"))
+        self.assertEqual(registry.get(run)["state"], "stop_pending")
+        self.assertEqual(registry.get(run)["stop"]["cgroup"], cgroup)
+        self.assertIs(registry.get(run)["stop"]["requested"], True)
+        again = api.call("run.stop", {"run_id": run})
+        self.assertEqual(again["code"], a.STOPPED)
+        self.assertEqual(len(kill.requests), 1)
+        self.assertEqual(kill.confirms, [cgroup])
+
+    def test_requested_true_without_a_cgroup_does_not_answer_stopped(self) -> None:
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        rec = registry.get(run)
+        cgroup = rec["cgroup"]
+        rec["stop"] = {"requested": True, "checks": 1, "reason": None}
+        registry.put(rec)
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(kill.requests, [cgroup])
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertNotEqual(registry.get(run)["state"], "stopped")
+        self.assertEqual(registry.get(run)["stop"]["cgroup"], cgroup)
 
 
 class ReadsAndStartTest(unittest.TestCase):

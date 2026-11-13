@@ -6,7 +6,7 @@ control API only sees these two interfaces, and tests fake them. A run record is
     {"run_id", "tenant", "engine",
      "state": "starting" | "start_failed" | "running" | "stop_pending" | "stopped",
      "cgroup": None | "<cgroup path or handle id>", "started_at",
-     "stop": None | {"requested_at", "checks", "reason", "requested"},
+     "stop": None | {"requested_at", "checks", "reason", "requested", "cgroup"},
      "start_key": None | {"client_key", "engine", "prompt_sha256"}}
 
 ``start_key`` is stored with the record so start dedupe survives a daemon restart: a durable registry

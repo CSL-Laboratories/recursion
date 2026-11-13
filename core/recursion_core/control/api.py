@@ -34,12 +34,16 @@ record against the host after a restart is the CSL-738 startup sweep.
 
 Stop: the first call asks the cleanup layer to stop the run's tree, then asks it to confirm. Only a
 confirmed empty cgroup yields ``stopped``, and only after the cleanup request for that cgroup has been
-sent. A populated cgroup, a confirm timeout, an unknown answer or a
+sent. The stop record stores that cgroup with ``requested`` set to exactly ``True``. A later stop
+answers ``stopped`` only when that recorded cgroup is still the run's cgroup. A request recorded for a
+different cgroup, a non-bool ``requested`` (for example ``1``), or a negative or non-int ``checks``
+is not a prior request: Stop sends ``request_stop`` for the current cgroup and answers ``pending``.
+A populated cgroup, a confirm timeout, an unknown answer or a
 cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
-pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested`` is
-not exactly true: the key is missing, the stop object is malformed, it raised, or it is a stop intent
-from before the launch was recorded), in which case it sends it
-(``cgroup.kill`` and pidfd signals are safe to repeat).
+pending run it only re-checks, unless the earlier cleanup request was never sent for this cgroup
+(``stop.requested`` is not exactly true, or it names another cgroup: the key is missing, the stop
+object is malformed, it raised, or it is a stop intent from before the launch was recorded), in which
+case it sends it (``cgroup.kill`` and pidfd signals are safe to repeat).
 Reads never change state and never call the cleanup layer.
 
 ``client_key`` dedupes a retried start per tenant and is bound to that start's engine and prompt (the
@@ -293,21 +297,35 @@ class ControlAPI:
                 return self._recorded({"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}, rec)
         self._stop_wanted.discard(run_id)
         first = rec["state"] != "stop_pending"
+        cgroup = rec["cgroup"]
+        raw = rec.get("stop")
+        # A non-bool requested, a bad checks count, or a request for a different
+        # cgroup is not a prior kill of this cgroup. Send one and answer pending.
+        untrusted = self._stop_request_untrusted(raw, cgroup)
         stop = self._coerce_stop(rec)
-        if stop.get("requested") is not True:
+        bound = (
+            not untrusted
+            and stop.get("requested") is True
+            and isinstance(raw, dict)
+            and raw.get("cgroup") == cgroup
+        )
+        if not bound:
             # First stop, a partial or malformed stop object, a stop intent left during launch, or an
             # earlier request that raised before it was known to be sent: (re)send it. A missing
-            # ``requested`` key is not "already sent".
+            # ``requested`` key is not "already sent", and a request for another cgroup is not this one.
             try:
-                self._kill.request_stop(rec["cgroup"])
+                self._kill.request_stop(cgroup)
             except Exception as err:
                 return self._pending(rec, f"cleanup_error:{type(err).__name__}")
             stop["requested"] = True
+            stop["cgroup"] = cgroup
+            if untrusted:
+                return self._pending(rec, "stop_not_requested")
         try:
-            answer = self._kill.confirm(rec["cgroup"], self._confirm_timeout_s)
+            answer = self._kill.confirm(cgroup, self._confirm_timeout_s)
         except Exception as err:
             return self._pending(rec, f"cleanup_error:{type(err).__name__}")
-        if answer != EMPTY or stop.get("requested") is not True:
+        if answer != EMPTY or stop.get("requested") is not True or stop.get("cgroup") != cgroup:
             # Never answer stopped without a cleanup request for this cgroup.
             if answer != EMPTY:
                 reason = _PENDING_REASON.get(answer, "confirm_unknown")
@@ -319,17 +337,38 @@ class ControlAPI:
         res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first}
         return self._recorded(res, rec)
 
+    def _stop_request_untrusted(self, raw: object, cgroup: str) -> bool:
+        """True when this stop record must not be treated as a kill of ``cgroup``.
+
+        ``requested`` counts only when it is exactly ``True`` and the recorded
+        cgroup is ``cgroup``. A non-bool ``requested`` (``1``, ``"yes"``) and a
+        negative or non-int ``checks`` are invalid: the caller sends
+        ``request_stop`` and answers pending, never stopped, on this call.
+        """
+
+        if not isinstance(raw, dict):
+            return False
+        if "requested" in raw and not isinstance(raw.get("requested"), bool):
+            return True
+        if "checks" in raw:
+            checks = raw.get("checks")
+            if isinstance(checks, bool) or not isinstance(checks, int) or checks < 0:
+                return True
+        return raw.get("requested") is True and raw.get("cgroup") != cgroup
+
     def _coerce_stop(self, rec: dict) -> dict:
         """A stop object records a sent kill only when ``requested`` is exactly true.
 
         Anything else (missing key, a non-dict, a non-bool) has not requested
-        the kill and must send it.
+        the kill and must send it. A negative or non-int ``checks`` is not a
+        count; it is replaced with ``0`` so a later increment cannot raise.
         """
 
         stop = rec.get("stop")
         if not isinstance(stop, dict):
             stop = {}
-        if not isinstance(stop.get("checks"), int) or isinstance(stop.get("checks"), bool):
+        checks = stop.get("checks")
+        if isinstance(checks, bool) or not isinstance(checks, int) or checks < 0:
             stop["checks"] = 0
         stop.setdefault("requested_at", self._clock())
         if "reason" not in stop:

@@ -1604,6 +1604,45 @@ class SpawnBoundaryTests(unittest.TestCase):
         self.assertFalse(systemd.available, systemd.reason)
         self.assertIsNone(systemd.target_uid)
 
+    def test_getgroups_oserror_rejects_engine_gid_selection(self) -> None:
+        # A failed getgroups() is not an empty supplementary list. Selecting an
+        # engine gid from the primary gid alone would accept a shared group.
+        with mock.patch.object(privileged_spawn.os, "getgid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getegid", return_value=1000), \
+             mock.patch.object(
+                 privileged_spawn.os, "getgroups", side_effect=OSError("getgroups failed")
+             ):
+            backends = detect_backends(
+                facts=self._facts(),
+                run_fn=self._engine_gid_run("65531\n", systemd=False),
+                helper_paths=("/tmp/csl734-no-such-helper",),
+                env={},
+                engine_user="engine",
+            )
+        sudo = next(b for b in backends if b.name == "sudo")
+        self.assertFalse(sudo.available, sudo.reason)
+        self.assertIsNone(sudo.target_uid)
+        self.assertIn("caller group list unavailable", sudo.reason)
+
+    def test_short_getgroups_cannot_hide_a_proc_status_group(self) -> None:
+        # getgroups() omits gid 4. /proc/self/status Groups still lists it, so
+        # an engine whose gid is 4 overlaps the caller and is not selectable.
+        with mock.patch.object(privileged_spawn.os, "getgid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getegid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getgroups", return_value=[1000]), \
+             mock.patch.object(privileged_spawn, "host_groups_of", return_value=(4, 1000)):
+            backends = detect_backends(
+                facts=self._facts(),
+                run_fn=self._engine_gid_run("4\n", systemd=False),
+                helper_paths=("/tmp/csl734-no-such-helper",),
+                env={},
+                engine_user="engine",
+            )
+        sudo = next(b for b in backends if b.name == "sudo")
+        self.assertFalse(sudo.available, sudo.reason)
+        self.assertIsNone(sudo.target_uid)
+        self.assertNotEqual(select_path(backends, f21_open=()).name, "sudo")
+
 
 @unittest.skipUnless(LIVE, f"live host probes run only with {LIVE_ENV}=1")
 class LiveHostTests(unittest.TestCase):
@@ -1739,7 +1778,8 @@ class ProbeCleanupTests(unittest.TestCase):
                     fh.write(
                         "import os, subprocess, sys, tempfile, time\n"
                         "from recursion_core.control.privileged_spawn import _popen_checked\n"
-                        "directory = tempfile.mkdtemp(prefix='csl734-store-')\n"
+                        "stamp = int(time.time()) - 24 * 3600\n"
+                        "directory = tempfile.mkdtemp(prefix='csl734-store-%d-' % stamp)\n"
                         "os.chmod(directory, 0o1777)\n"
                         "proc = _popen_checked(('sleep', '60'), "
                         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
@@ -1842,6 +1882,218 @@ class ProbeCleanupTests(unittest.TestCase):
                 elif os.path.isdir(path):
                     os.chmod(path, 0o700)
                     os.rmdir(path)
+
+
+class ParentDeathSignalTests(unittest.TestCase):
+    """Parent-death signal must fire even when SIGTERM is ignored or blocked.
+
+    The race check compares getppid() to the spawner recorded before fork.
+    getppid()==1 kills a child whose spawner is pid 1, and misses a child
+    adopted by a subreaper.
+    """
+
+    def _call_arm(self, spawner: int, ppid: int) -> list[tuple[int, int]]:
+        import ctypes
+
+        privileged_spawn._SPAWNER_PID = spawner
+        killed: list[tuple[int, int]] = []
+        handler = signal.getsignal(signal.SIGTERM)
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+        def record(pid: int, sig: int) -> None:
+            killed.append((pid, sig))
+
+        try:
+            with mock.patch.object(privileged_spawn.os, "getppid", return_value=ppid), \
+                 mock.patch.object(privileged_spawn.os, "kill", side_effect=record):
+                privileged_spawn._arm_parent_death_signal()
+        finally:
+            signal.signal(signal.SIGTERM, handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            ctypes.CDLL(None, use_errno=True).prctl(1, 0, 0, 0, 0)
+            privileged_spawn._SPAWNER_PID = 0
+        return killed
+
+    def test_spawner_pid_1_does_not_kill_the_child(self) -> None:
+        self.assertEqual(self._call_arm(1, 1), [])
+
+    def test_subreaper_adoption_kills_the_child(self) -> None:
+        spawner = os.getpid()
+        killed = self._call_arm(spawner, spawner + 10)
+        self.assertEqual(killed, [(os.getpid(), signal.SIGTERM)])
+
+    def test_ignored_and_blocked_sigterm_still_dies_with_the_parent(self) -> None:
+        core_dir = os.path.dirname(os.path.dirname(os.path.dirname(privileged_spawn.__file__)))
+        code = (
+            "import os, signal, subprocess, sys\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGTERM])\n"
+            "from recursion_core.control.privileged_spawn import _popen_checked\n"
+            "proc = _popen_checked(('sleep', '60'), "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "sys.stdout.write(str(proc.pid) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "os._exit(0)\n"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = core_dir + os.pathsep + env.get("PYTHONPATH", "")
+        env.pop("RECURSION_LIVE_HOST_PROBES", None)
+        env.pop("RECURSION_CGROUP_ROOT", None)
+        child_pid = None
+        helper = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=core_dir,
+        )
+        try:
+            assert helper.stdout is not None and helper.stderr is not None
+            line = helper.stdout.readline()
+            helper.wait(timeout=10)
+            if helper.returncode != 0 or not line.strip():
+                err = helper.stderr.read().decode("utf-8", "replace")
+                self.fail(f"helper rc={helper.returncode} out={line!r} err={err}")
+            child_pid = int(line.strip())
+            deadline = time.time() + 2
+            while time.time() < deadline and _pid_alive(child_pid):
+                time.sleep(0.05)
+            self.assertFalse(
+                _pid_alive(child_pid),
+                "sleep child survived a parent whose SIGTERM was ignored and blocked",
+            )
+        finally:
+            if helper.poll() is None:
+                helper.kill()
+                helper.wait(timeout=2)
+            if child_pid is not None and _pid_alive(child_pid):
+                os.kill(child_pid, signal.SIGKILL)
+
+
+class StoreSweepTests(unittest.TestCase):
+    """Stale store reaping must not follow an attacker-controlled mtime.
+
+    ``csl734-store-same-*`` is the control probe and is never removed.
+    Age comes from the timestamp in the directory name. A directory with no
+    timestamp is removed only when it is mode 0700. Another euid, a young
+    directory, a non-prefix name, a symlink and the symlink target stay.
+    """
+
+    def _token(self) -> str:
+        return f"{os.getpid()}-{time.time_ns()}"
+
+    def _drop(self, path: str) -> None:
+        if os.path.islink(path) or os.path.isfile(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            os.chmod(path, 0o700)
+            os.rmdir(path)
+
+    def test_same_uid_control_prefix_is_not_reaped(self) -> None:
+        path = os.path.join(tempfile.gettempdir(), f"csl734-store-same-{self._token()}")
+        old = time.time() - 24 * 3600
+        os.mkdir(path)
+        try:
+            os.chmod(path, 0o700)
+            os.utime(path, (old, old))
+            privileged_spawn._reap_stale_store_dirs()
+            self.assertTrue(os.path.isdir(path))
+        finally:
+            self._drop(path)
+
+    def test_refreshed_mtime_does_not_save_an_old_named_store(self) -> None:
+        old_s = int(time.time()) - 24 * 3600
+        path = os.path.join(tempfile.gettempdir(), f"csl734-store-{old_s}-{self._token()}")
+        os.mkdir(path)
+        try:
+            os.chmod(path, 0o1777)
+            os.utime(path, None)  # attacker created a file; mtime is now
+            privileged_spawn._reap_stale_store_dirs()
+            self.assertFalse(os.path.exists(path))
+        finally:
+            self._drop(path)
+
+    def test_young_name_is_kept_when_mtime_was_set_old(self) -> None:
+        path = os.path.join(
+            tempfile.gettempdir(), f"csl734-store-{int(time.time())}-{self._token()}"
+        )
+        old = time.time() - 24 * 3600
+        os.mkdir(path)
+        try:
+            os.chmod(path, 0o1777)
+            os.utime(path, (old, old))
+            privileged_spawn._reap_stale_store_dirs()
+            self.assertTrue(os.path.isdir(path))
+        finally:
+            self._drop(path)
+
+    def test_non_0700_without_a_timestamp_is_not_reaped(self) -> None:
+        path = os.path.join(tempfile.gettempdir(), f"csl734-store-plain-{self._token()}")
+        old = time.time() - 24 * 3600
+        os.mkdir(path)
+        try:
+            os.chmod(path, 0o755)
+            os.utime(path, (old, old))
+            privileged_spawn._reap_stale_store_dirs()
+            self.assertTrue(os.path.isdir(path))
+        finally:
+            self._drop(path)
+
+    def test_owner_only_0700_old_mtime_is_reaped(self) -> None:
+        path = os.path.join(tempfile.gettempdir(), f"csl734-store-owned-{self._token()}")
+        old = time.time() - 24 * 3600
+        os.mkdir(path)
+        try:
+            os.chmod(path, 0o700)
+            os.utime(path, (old, old))
+            privileged_spawn._reap_stale_store_dirs()
+            self.assertFalse(os.path.exists(path))
+        finally:
+            self._drop(path)
+
+    def test_other_euid_young_non_prefix_symlink_and_target_stay(self) -> None:
+        tmp = tempfile.gettempdir()
+        token = self._token()
+        old = time.time() - 24 * 3600
+        other = os.path.join(tmp, f"csl734-store-{int(old)}-other-{token}")
+        young = os.path.join(tmp, f"csl734-store-young-{token}")
+        other_prefix = os.path.join(tmp, f"csl734-sudo-probe-{token}")
+        link_target = os.path.join(tmp, f"csl734-link-target-{token}")
+        link = os.path.join(tmp, f"csl734-store-{int(old)}-link-{token}")
+        paths = (other, young, other_prefix, link_target, link)
+        os.mkdir(other)
+        os.mkdir(young)
+        os.mkdir(other_prefix)
+        os.mkdir(link_target)
+        try:
+            os.chmod(other, 0o1777)
+            os.utime(other, (old, old))
+            os.utime(other_prefix, (old, old))
+            os.symlink(link_target, link)
+            os.utime(link, (old, old), follow_symlinks=False)
+            real_lstat = privileged_spawn.os.lstat
+
+            def lstat(path: str):
+                st = real_lstat(path)
+                if path == other:
+                    seq = list(st)
+                    seq[4] = st.st_uid + 1
+                    return os.stat_result(seq)
+                return st
+
+            with mock.patch.object(privileged_spawn.os, "lstat", side_effect=lstat):
+                privileged_spawn._reap_stale_store_dirs()
+            self.assertTrue(os.path.isdir(other))
+            self.assertTrue(os.path.isdir(young))
+            self.assertTrue(os.path.isdir(other_prefix))
+            self.assertTrue(os.path.islink(link))
+            self.assertTrue(os.path.isdir(link_target))
+        finally:
+            for path in paths:
+                try:
+                    self._drop(path)
+                except OSError:
+                    pass
 
 
 def _pid_alive(pid: int) -> bool:

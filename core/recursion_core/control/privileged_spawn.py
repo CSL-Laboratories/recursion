@@ -112,6 +112,13 @@ DEFAULT_N = 20
 # per-command, per-target and per-argument, so detection checks those
 # launches rather than shorter aliases.
 SLEEP_PROBE_ARGV: tuple[str, ...] = ("sleep", "8")
+# Same-uid probe stores. The control probe uses a distinct prefix so the
+# stale-directory sweep cannot delete a directory it is still using.
+_STORE_DIR_PREFIX = "csl734-store-"
+_STORE_SAME_PREFIX = "csl734-store-same-"
+# Set in the parent before fork. The child compares getppid() to this value.
+_SPAWNER_PID = 0
+_LIBC: ctypes.CDLL | None = None
 OVERHEAD_ARGV: tuple[str, ...] = ("true",)
 SUDO_REQUIRED_COMMANDS: tuple[tuple[str, ...], ...] = (
     OVERHEAD_ARGV,
@@ -511,32 +518,83 @@ def _scrubbed_env() -> dict[str, str]:
     return {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
 
 
+def _linux_libc() -> ctypes.CDLL:
+    """libc handles used from the child between fork and exec.
+
+    Initialised in the parent so the child does not construct a ``CDLL``.
+    ``signal`` and ``sigprocmask`` are the async-signal-safe calls; the
+    preexec hook is already Python.
+    """
+
+    global _LIBC
+    if _LIBC is not None:
+        return _LIBC
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl.argtypes = (
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    )
+    libc.prctl.restype = ctypes.c_int
+    libc.signal.argtypes = (ctypes.c_int, ctypes.c_void_p)
+    libc.signal.restype = ctypes.c_void_p
+    libc.sigemptyset.argtypes = (ctypes.c_void_p,)
+    libc.sigemptyset.restype = ctypes.c_int
+    libc.sigaddset.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    libc.sigaddset.restype = ctypes.c_int
+    libc.sigprocmask.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    libc.sigprocmask.restype = ctypes.c_int
+    _LIBC = libc
+    return libc
+
+
+def _reset_and_unblock_sigterm(libc: ctypes.CDLL) -> bool:
+    """Make SIGTERM the default, unblocked disposition. False if either call fails.
+
+    Both a ``SIG_IGN`` disposition and a blocked SIGTERM are preserved across
+    exec, so a parent-death SIGTERM would otherwise never arrive.
+    """
+
+    previous = libc.signal(signal.SIGTERM, ctypes.c_void_p(0))  # SIG_DFL
+    if previous == ctypes.c_void_p(-1).value:  # SIG_ERR
+        return False
+    pending = ctypes.create_string_buffer(128)  # glibc sigset_t
+    if libc.sigemptyset(pending) != 0:
+        return False
+    if libc.sigaddset(pending, signal.SIGTERM) != 0:
+        return False
+    if libc.sigprocmask(1, pending, None) != 0:  # SIG_UNBLOCK
+        return False
+    return True
+
+
 def _arm_parent_death_signal() -> None:
-    """Linux child ``preexec_fn``: SIGTERM this process if its parent dies.
+    """Linux child ``preexec_fn``: die if the spawning process is already gone.
 
     ``PR_SET_PDEATHSIG`` is the kernel's parent-death signal. It covers
     SIGTERM and SIGKILL of the parent. Nothing is installed in the parent:
     SIGTERM stays the default action, and there is no process-global handler.
-    A failure leaves the child unchanged. The probe store directory is
-    separate: a SIGKILL of the parent can leave a ``csl734-store-*`` directory
-    until the next probe start reaps one that is older than the probe timeout.
+    The child resets SIGTERM to ``SIG_DFL`` and unblocks it before arming
+    SIGTERM; if that fails, the death signal is SIGKILL, which cannot be
+    ignored or blocked. The spawner pid is the one recorded before fork.
+    ``getppid() == 1`` is the wrong race check: it kills the child when the
+    spawner is pid 1, and it leaves the child alive when a subreaper has
+    adopted it. A failure of ``prctl`` leaves the child unchanged. The probe
+    store directory is separate: a SIGKILL of the parent can leave a
+    ``csl734-store-<timestamp>-*`` directory until the next probe start reaps
+    one whose recorded creation time is older than the probe timeout.
     """
 
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        prctl = libc.prctl
-        prctl.argtypes = (
-            ctypes.c_int,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-        )
-        prctl.restype = ctypes.c_int
-        if prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        libc = _LIBC if _LIBC is not None else _linux_libc()
+        death = signal.SIGTERM if _reset_and_unblock_sigterm(libc) else signal.SIGKILL
+        if libc.prctl(1, death, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
             return
-        if os.getppid() == 1:
-            os.kill(os.getpid(), signal.SIGTERM)
+        spawner = _SPAWNER_PID
+        if spawner > 0 and os.getppid() != spawner:
+            os.kill(os.getpid(), death)
     except Exception:
         return
 
@@ -557,6 +615,10 @@ def _popen_checked(
 
     if not argv:
         raise FileNotFoundError("empty command")
+    global _SPAWNER_PID
+    _SPAWNER_PID = os.getpid()
+    if os.uname().sysname == "Linux":
+        _linux_libc()
     bin_fd = _open_trusted_executable(argv[0])
     try:
         return subprocess.Popen(
@@ -688,10 +750,14 @@ def _rejected_target_uid(uid: int | None, our_uid: int) -> bool:
     return uid is None or uid == our_uid or _unusable_host_id(uid)
 
 
-def _caller_group_set(caller_groups: Collection[int] | None = None) -> frozenset[int]:
+def _caller_group_set(caller_groups: Collection[int] | None = None) -> frozenset[int] | None:
     """The caller's primary, effective and supplementary gids.
 
     ``caller_groups`` replaces that set in tests. ``None`` reads this process.
+    ``None`` as a result means the process group list could not be read:
+    ``os.getgroups`` failed, so the set is not usable. When ``/proc/self/status``
+    ``Groups`` is readable, those gids are included too, so a short
+    ``getgroups`` list cannot hide an overlapping gid.
     """
 
     if caller_groups is not None:
@@ -700,7 +766,10 @@ def _caller_group_set(caller_groups: Collection[int] | None = None) -> frozenset
     try:
         found.update(os.getgroups())
     except OSError:
-        pass
+        return None
+    proc_groups = host_groups_of(os.getpid())
+    if proc_groups is not None:
+        found.update(proc_groups)
     return frozenset(found)
 
 
@@ -722,6 +791,8 @@ def _gid_set_rejected(
     if _unusable_host_id(primary):
         return f"rejected: primary gid {primary} is root or not a host gid"
     caller = _caller_group_set(caller_groups)
+    if caller is None:
+        return "rejected: caller group list unavailable"
     if primary in caller:
         return f"rejected: primary gid {primary} is in the caller's groups"
     if groups is None:
@@ -1355,7 +1426,7 @@ def _probe_pid(tally: _Tally, pid: int | None, missing: str) -> None:
 
 
 def _probe_store_reap_age_s() -> float:
-    """Age past which a ``csl734-store-*`` directory is stale.
+    """Age past which a ``csl734-store-<timestamp>-*`` directory is stale.
 
     This is the runner timeout of the sleep probe command. A directory
     younger than that may belong to a probe that has just started.
@@ -1364,18 +1435,41 @@ def _probe_store_reap_age_s() -> float:
     return _launch_timeout(SLEEP_PROBE_ARGV)
 
 
+def _store_name_created_at(name: str) -> float | None:
+    """Creation time recorded in ``csl734-store-<seconds-or-ns>-*``, or ``None``.
+
+    The temp directory is often mode ``01777``, so another user can create a
+    file inside it and refresh ``st_mtime``. The timestamp in the name is not
+    writable that way: sticky ``/tmp`` refuses a rename by anyone but the owner.
+    """
+
+    if not name.startswith(_STORE_DIR_PREFIX) or name.startswith(_STORE_SAME_PREFIX):
+        return None
+    token = name[len(_STORE_DIR_PREFIX):].split("-", 1)[0]
+    if not token.isdigit() or len(token) < 9:
+        return None
+    value = int(token)
+    if len(token) >= 16:
+        return value / 1_000_000_000
+    return float(value)
+
+
 def _reap_stale_store_dirs() -> None:
     """Remove stale same-uid probe store directories left by a killed parent.
 
-    Only directories in the temp dir whose names start with the exact prefix
-    ``csl734-store-``, are not symlinks, are owned by this euid, and are older
-    than the probe timeout. SIGTERM installs no process-global handler, so a
-    SIGTERM of the parent does not remove the directory either. A SIGKILL of
-    the parent leaving the directory until this next probe start is a residual.
+    Only real directories in the temp dir whose names start with
+    ``csl734-store-`` and not ``csl734-store-same-`` (the control probe),
+    are not symlinks, and are owned by this euid. Age comes from the
+    creation time in the directory name. A name with no timestamp is reaped
+    only when the mode is exactly ``0700`` (another user cannot write inside
+    it and refresh ``st_mtime``); any other mode is left alone. A directory
+    owned by another euid is left alone. SIGTERM installs no process-global
+    handler, so a SIGTERM of the parent does not remove the directory either.
+    A SIGKILL of the parent leaving the directory until this next probe start
+    is a residual.
     """
 
     tmp = tempfile.gettempdir()
-    prefix = "csl734-store-"
     min_age = _probe_store_reap_age_s()
     now = time.time()
     euid = os.geteuid()
@@ -1384,7 +1478,7 @@ def _reap_stale_store_dirs() -> None:
     except OSError:
         return
     for name in names:
-        if not name.startswith(prefix):
+        if not name.startswith(_STORE_DIR_PREFIX) or name.startswith(_STORE_SAME_PREFIX):
             continue
         path = os.path.join(tmp, name)
         try:
@@ -1395,7 +1489,12 @@ def _reap_stale_store_dirs() -> None:
             continue
         if st.st_uid != euid:
             continue
-        if now - st.st_mtime <= min_age:
+        created = _store_name_created_at(name)
+        if created is None:
+            if stat.S_IMODE(st.st_mode) != 0o700:
+                continue
+            created = st.st_mtime
+        if now - created <= min_age:
             continue
         shutil.rmtree(path, ignore_errors=True)
 
@@ -1414,10 +1513,11 @@ def run_same_uid_probes(
 
     The sleep child is in its own session and arms ``PR_SET_PDEATHSIG``, so it
     dies when this process dies. No SIGTERM handler is installed. SIGKILL of
-    this process can leave the ``csl734-store-*`` directory (mode 01777) until
-    the next call reaps a directory with that exact prefix, owned by this
-    euid, and older than the probe timeout. That leftover directory is a
-    residual.
+    this process can leave the ``csl734-store-<timestamp>-*`` directory (mode
+    01777) until the next call reaps a directory with that prefix, owned by
+    this euid, whose name timestamp is older than the probe timeout. The
+    ``csl734-store-same-`` control directories are not reaped. That leftover
+    directory is a residual.
     """
 
     if n < 10:
@@ -1428,7 +1528,7 @@ def run_same_uid_probes(
     _reap_stale_store_dirs()
     tally = _Tally()
     write_prefix = spawn_command(backend, ())
-    with tempfile.TemporaryDirectory(prefix="csl734-store-") as tmp:
+    with tempfile.TemporaryDirectory(prefix=f"{_STORE_DIR_PREFIX}{time.time_ns()}-") as tmp:
         os.chmod(tmp, 0o1777)
         for _ in range(n):
             tally.add(
@@ -1465,7 +1565,7 @@ def run_same_uid_control_probes(n: int = DEFAULT_N) -> tuple[ProbeSummary, ...]:
         raise ValueError(f"probe n must be >= 10, got {n}")
     our_uid = os.getuid()
     tally = _Tally()
-    with tempfile.TemporaryDirectory(prefix="csl734-store-same-") as tmp:
+    with tempfile.TemporaryDirectory(prefix=_STORE_SAME_PREFIX) as tmp:
         os.chmod(tmp, 0o1777)
         for _ in range(n):
             tally.add(

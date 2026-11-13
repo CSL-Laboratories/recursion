@@ -18,7 +18,10 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
 
 - every schema is valid Draft 2020-12, carries a version tag, and has its file name as its `$id`;
 - every `$ref` written in a schema resolves;
-- every object that lists properties is closed;
+- every object is closed, except the few that are open on purpose, which are listed by name;
+- the method table validates against its schema, and for every method the row, the params schema and
+  the answer schema agree (the same codes, a `command_id` exactly where the row says, no `principal` or
+  `owner` among the params), and only `run.stop` mutates without a key;
 - `fixtures/index.json` and the fixture folders list exactly the same files;
 - every file under `fixtures/good/` validates;
 - every file under `fixtures/bad/` is refused **for its own rule**: the index names the schema keyword

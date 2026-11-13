@@ -1,0 +1,7 @@
+{
+  "method": "session.kill",
+  "params": {},
+  "answer": {
+    "code": "ok"
+  }
+}

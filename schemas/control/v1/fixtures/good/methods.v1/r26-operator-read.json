@@ -1,0 +1,8 @@
+{
+  "method": "operator.read",
+  "params": {
+    "command": {
+      "command": "operator.conditions.inspect"
+    }
+  }
+}

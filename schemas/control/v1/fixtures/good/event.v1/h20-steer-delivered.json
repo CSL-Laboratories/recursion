@@ -9,6 +9,7 @@
   "trust": "trusted",
   "payload": {
     "item_id": "qi-0002",
+    "delivery_id": "dlv-0008",
     "how": "mid_turn"
   }
 }

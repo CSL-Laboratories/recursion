@@ -1,0 +1,12 @@
+{
+  "item_id": "qi-0001",
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "order": 1,
+  "text": "When the tests pass, also update the changelog.",
+  "revision": 1,
+  "delivery": "next_turn",
+  "state": "outcome_unknown",
+  "delivery_id": "dlv-0007",
+  "turn_id": "turn-000c",
+  "created_at": "2026-11-13T07:34:20.000Z"
+}

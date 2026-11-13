@@ -1,0 +1,33 @@
+{
+  "name": "approval.answer",
+  "scope": "approve",
+  "mutating": true,
+  "idempotency": "command_id",
+  "precondition": "expected_revision",
+  "requires": [],
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_approval_answer",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  "beta": true,
+  "codes": [
+    "ok",
+    "request_invalid",
+    "scope_refused",
+    "unavailable",
+    "unsupported",
+    "conflict",
+    "prompt_not_shown",
+    "approval_unknown"
+  ],
+  "lane": "APPROVALS",
+  "params": "#/$defs/params.approval.answer",
+  "result": "#/$defs/answer.approval.answer"
+}

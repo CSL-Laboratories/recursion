@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "common.v1.json",
   "title": "common.v1: definitions shared by the control records",
-  "x-version": "1.0-draft.1",
+  "x-version": "1.0-draft.2",
   "description": "Shared definitions. Nothing here is a record on its own; the record schemas beside this file refer to these by '$ref': 'common.v1.json#/$defs/<name>'. Every string pattern is written for ECMA 262 and is paired with a 'not' that refuses a line break, because some regular expression engines let '$' match before a final newline.",
   "$defs": {
     "run_id": {
@@ -35,6 +35,12 @@
       "pattern": "^qi-[A-Za-z0-9_-]{1,61}$",
       "not": {"pattern": "[\\r\\n]"}
     },
+    "delivery_id": {
+      "description": "Names one attempt to hand a message to an engine. Minted by the core when delivery begins, written toward the engine with the message, and named again by the event that shows the engine took it. Always starts with 'dlv-'.",
+      "type": "string",
+      "pattern": "^dlv-[A-Za-z0-9_-]{1,60}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
     "approval_id": {
       "description": "Names one approval request. Minted by the core, never by an engine or a plugin. Always starts with 'apr-'.",
       "type": "string",
@@ -42,7 +48,7 @@
       "not": {"pattern": "[\\r\\n]"}
     },
     "command_id": {
-      "description": "A client's own id for one mutating request, so a retry is recognised. Minted by the client. 8 to 128 characters from A-Z a-z 0-9 . _ : and -.",
+      "description": "A client's own id for one mutating request, so a retry is recognised. Minted by the client: at least 96 bits of randomness, or a random part made once per client process followed by a counter. 8 to 128 characters from A-Z a-z 0-9 . _ : and -.",
       "type": "string",
       "pattern": "^[A-Za-z0-9._:-]{8,128}$",
       "not": {"pattern": "[\\r\\n]"}
@@ -71,7 +77,7 @@
       "minimum": 0
     },
     "seq": {
-      "description": "A position in one event log. The first event of a log is 1 and each later event is one more: there are no holes.",
+      "description": "A position in one event log. The first event of a log is 1 and each later event is one more: there are no holes, and a number is never used twice.",
       "type": "integer",
       "minimum": 1
     },
@@ -81,7 +87,7 @@
       "minimum": 1
     },
     "epoch": {
-      "description": "The daemon's epoch: a whole number that rises each time a daemon opens the event store. A cursor carries it so a client can tell that the daemon restarted between two reads.",
+      "description": "The daemon's epoch: a whole number that only rises, by one each time a daemon opens the event store. A cursor carries it so a client can tell that the daemon restarted between two reads.",
       "type": "integer",
       "minimum": 1
     },
@@ -96,15 +102,31 @@
       "pattern": "^[a-z][a-z0-9_]{0,31}$",
       "not": {"pattern": "[\\r\\n]"}
     },
+    "code_word": {
+      "description": "A typed code: lower-case letters, digits and underscores, starting with a letter.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "connection": {
+      "description": "The login or key a route is billed through: its kind, and a label for it. The label is never a credential and never contains one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["subscription", "api_key", "passthrough"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 200, "not": {"pattern": "[\\r\\n]"}}
+      }
+    },
     "connection_id": {
-      "description": "The meter a route is billed through: the connection's kind, a colon, and the login or key label (routes/contract.py connection_key). It is a label. It is never a credential and never contains one.",
+      "description": "A connection written as one string, '<kind>:<id>': the key the breaker and the meters use (routes/contract.py, connection_key). A label, never a credential.",
       "type": "string",
       "pattern": "^(subscription|api_key|passthrough):.+$",
       "maxLength": 256,
       "not": {"pattern": "[\\r\\n]"}
     },
     "principal": {
-      "description": "Who asked. 'owner' is the user on the owner-only socket; 'device' is a paired device on the page's door; 'session' is an engine acting with a token scoped to its own session; 'plugin' is a loaded plugin; 'internal' is the daemon's own code. The id is a label for that principal. A token, a cookie or a key never appears here.",
+      "description": "Who asked. 'owner' is the user on the owner-only socket; 'device' is a paired device on the page's door; 'session' is an engine acting with a token scoped to its own session; 'plugin' is a loaded plugin; 'internal' is the daemon's own code. The server derives the principal from the way the request came in; it is never read from the request. The id is a label for that principal. A token, a cookie or a key never appears here.",
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "id"],
@@ -112,6 +134,12 @@
         "kind": {"enum": ["owner", "device", "session", "plugin", "internal"]},
         "id": {"$ref": "#/$defs/token"}
       }
+    },
+    "owner": {
+      "description": "Who owns a run: 'host' (the core, for a run a user or a session started) or the id of the plugin that started it. Derived by the server from the principal, never taken from a request.",
+      "type": "string",
+      "pattern": "^(host|[a-z][a-z0-9_.-]{1,63})$",
+      "not": {"pattern": "[\\r\\n]"}
     },
     "workspace": {
       "description": "Where a session or run works. 'path' is the launch folder the user chose. In 'direct' mode the engine works in that folder and worktree_path is null. In 'worktree' mode the engine works in worktree_path, a git worktree cut from base_ref, and both are strings.",
@@ -136,24 +164,59 @@
       ]
     },
     "route": {
-      "description": "The route a session or run uses once routing has decided: the engine, the model (null when the engine's own default is used) and the connection it is billed through.",
+      "description": "A route in short: the engine, the model (null when the engine's own default is used) and the connection it is billed through. The stored run record keeps more (run.record.v1, launch_route): everything the launch used.",
       "type": "object",
       "additionalProperties": false,
       "required": ["engine", "model", "connection"],
       "properties": {
         "engine": {"$ref": "#/$defs/engine_name"},
         "model": {"type": ["string", "null"], "minLength": 1},
-        "connection": {"$ref": "#/$defs/connection_id"}
+        "connection": {"$ref": "#/$defs/connection"}
       }
     },
-    "budget": {
-      "description": "The dollar reservation of a run or session. reservation_id names the reservation in the quota ledger; cap_usd is the most this run or session may spend, null when no cap is set. It is never a key and never names one.",
+    "hand_pick": {
+      "description": "The route the user named. A hand pick always wins over the routing config and the default.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["reservation_id", "cap_usd"],
+      "required": ["engine", "model"],
       "properties": {
-        "reservation_id": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/token"}]},
-        "cap_usd": {"type": ["number", "null"], "minimum": 0}
+        "engine": {"$ref": "#/$defs/engine_name"},
+        "model": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "route_decision": {
+      "description": "What routing decided, and why. chosen is the route. reason is 'hand_pick' (the user named it), 'config' (the routing config chose it) or 'default' (the default engine). candidates lists every route that was considered, in order; 'skipped' is null for the one chosen and otherwise a typed code for why it was passed over. hand_pick is what the user named, or null.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chosen", "reason", "candidates", "hand_pick"],
+      "properties": {
+        "chosen": {"$ref": "#/$defs/route"},
+        "reason": {"enum": ["hand_pick", "config", "default"]},
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["engine", "model", "skipped"],
+            "properties": {
+              "engine": {"$ref": "#/$defs/engine_name"},
+              "model": {"type": ["string", "null"], "minLength": 1},
+              "skipped": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/code_word"}]}
+            }
+          }
+        },
+        "hand_pick": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hand_pick"}]}
+      },
+      "if": {"required": ["reason"], "properties": {"reason": {"const": "hand_pick"}}},
+      "then": {"properties": {"hand_pick": {"type": "object"}}}
+    },
+    "budget": {
+      "description": "The most a run or a session may spend, in US dollars. 0 means nothing may be spent, and that is the default: a record with no budget is read as cap_usd 0. The reservation itself, with its id and its state, is kept in the quota ledger under the run's id and is not written into any record here. A budget never carries or names a key.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cap_usd"],
+      "properties": {
+        "cap_usd": {"type": "number", "minimum": 0}
       }
     },
     "lease": {
@@ -165,6 +228,16 @@
         "owner": {"$ref": "#/$defs/token"},
         "epoch": {"$ref": "#/$defs/epoch"},
         "expires_at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "cgroup_identity": {
+      "description": "The identity of a unit's cgroup directory as the kernel gives it: the device and inode numbers read at launch. A path can be reused; this pair is how a later check tells the same directory from a new one at the same path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["st_dev", "st_ino"],
+      "properties": {
+        "st_dev": {"type": "integer", "minimum": 0},
+        "st_ino": {"type": "integer", "minimum": 0}
       }
     },
     "cursor": {

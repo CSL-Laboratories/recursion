@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "revoked-keys.v1.json",
+  "title": "revoked-keys.v1: the signed list of revoked developer keys ('csl-revoked-keys/1')",
+  "x-version": "1.0-draft.1",
+  "description": "DRAFT: revocation's details are an open question, and the lane that owns signing supplies the fields and the fixtures. The minimum is here. A list names the developer keys that are revoked. An install applies a list only when it is signed by a list key that install trusts. list_version is a whole number that only rises: a list lower than the last one an install accepted is refused, so an old list cannot be replayed to bring a key back. The signature is over the list's canonical bytes without the 'signature' field. NOT DECIDED: what an install does with a list that has expired or cannot be fetched. Until that is answered, the last accepted list stays in force, and the absence of a list never means that nothing is revoked.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "list_version", "issued_at", "expires_at", "keys", "signature"],
+  "properties": {
+    "schema": {"const": "csl-revoked-keys/1"},
+    "list_version": {"type": "integer", "minimum": 1},
+    "issued_at": {"$ref": "#/$defs/timestamp"},
+    "expires_at": {"$ref": "#/$defs/timestamp"},
+    "keys": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key_id", "revoked_at", "reason"],
+        "properties": {
+          "key_id": {"$ref": "#/$defs/key_id"},
+          "revoked_at": {"$ref": "#/$defs/timestamp"},
+          "reason": {"enum": ["compromised", "retired", "superseded", "unspecified"]}
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key_id", "alg", "value"],
+      "properties": {
+        "key_id": {"description": "The id of the LIST key that signed, not of a developer key.", "$ref": "#/$defs/key_id"},
+        "alg": {"const": "ed25519"},
+        "value": {"type": "string", "pattern": "^[0-9a-f]{128}$", "not": {"pattern": "[\\r\\n]"}}
+      }
+    }
+  },
+  "$defs": {
+    "key_id": {
+      "description": "A public key's stable id: 'ed25519:' and the first 32 hex digits of the key's SHA-256.",
+      "type": "string",
+      "pattern": "^ed25519:[0-9a-f]{32}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "timestamp": {
+      "description": "A moment in UTC as RFC 3339 with exactly three decimal places and a 'Z'.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)\\.[0-9]{3}Z$",
+      "not": {"pattern": "[\\r\\n]"}
+    }
+  }
+}

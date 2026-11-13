@@ -5,7 +5,7 @@
   "source": "core",
   "trust": "trusted",
   "state": null,
-  "text": "Approval needed: claude_code wants to run Bash",
+  "text": "APPROVAL NEEDED\nEngine claude_code asks to run the tool Bash in /home/dev/projects/atlas\ncommand: rm -rf build && make\nAnswer by its number: 1 approve, 2 deny. Nothing is approved by default.",
   "speech": "Approval needed",
   "focus": "approval"
 }

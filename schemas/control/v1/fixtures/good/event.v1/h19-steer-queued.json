@@ -9,6 +9,7 @@
   "trust": "trusted",
   "payload": {
     "item_id": "qi-0002",
+    "order": 2,
     "delivery": "steer",
     "revision": 1,
     "state": "queued"

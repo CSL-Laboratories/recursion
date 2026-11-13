@@ -1,6 +1,6 @@
 {
-  "cgroup": "/test.slice/recursion-run-run-26b009676bce471fa86d592c09df1adc.service",
-  "cgroup_marker": "cg-9a28a77cc36d4c5a89fe7284e4bf823a",
+  "cgroup": "/test.slice/recursion-run-run-17d4a69723244aa087c0942d2be267d4.service",
+  "cgroup_marker": "cg-438ad55eb8c74a349d9239e40ebb5b30",
   "engine": "claude_code",
   "generation": 2,
   "members": [],
@@ -8,24 +8,25 @@
     "detail": "",
     "state": "running",
     "stop_requested": false,
-    "unit": "recursion-run-run-26b009676bce471fa86d592c09df1adc.service"
+    "unit": "recursion-run-run-17d4a69723244aa087c0942d2be267d4.service"
   },
   "output": {
-    "bytes": 664,
+    "bytes": 783,
     "complete": false,
     "lines": [
-      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 85804, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 196841, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
       "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_stdin_eof\", \"note\": \"stdin closed; not treated as cancellation\"}",
-      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 1\"}]}}"
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 1\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 2\"}]}}"
     ]
   },
-  "run_id": "run-26b009676bce471fa86d592c09df1adc",
+  "run_id": "run-17d4a69723244aa087c0942d2be267d4",
   "start_key": {
     "client_key": "capture-1",
     "engine": "claude_code",
     "prompt_sha256": "3d7bb8776dad8b047d66746d9cd47c1b0c937eaba3ad596075a229b4a3137a98"
   },
-  "started_at": 1794555971.7227964,
+  "started_at": 1794559509.998849,
   "state": "running",
   "stop": null,
   "stop_attestation": null,

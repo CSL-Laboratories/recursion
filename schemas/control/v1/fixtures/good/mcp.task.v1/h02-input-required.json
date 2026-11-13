@@ -7,6 +7,7 @@
     "turn_id": "turn-000c"
   },
   "status": "input_required",
+  "outcome": null,
   "cancel_requested": false,
   "status_message": "waiting for an approval",
   "pending_approval_ids": [

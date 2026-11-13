@@ -1,0 +1,1178 @@
+{
+  "table_version": "1.0-draft.1",
+  "methods": [
+    {
+      "name": "run.start",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "client_key",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_run_start",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      },
+      "beta": false,
+      "codes": [
+        "started",
+        "start_failed",
+        "start_unconfirmed",
+        "request_invalid",
+        "registry_unavailable",
+        "scope_refused",
+        "workspace_invalid",
+        "workspace_busy",
+        "reservation_refused",
+        "breaker_store_missing"
+      ],
+      "lane": "CONTROL",
+      "params": "#/$defs/params.run.start",
+      "result": "#/$defs/answer.run.start"
+    },
+    {
+      "name": "run.status",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_run_status",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": false,
+      "codes": [
+        "ok",
+        "run_unknown",
+        "request_invalid",
+        "registry_unavailable",
+        "scope_refused"
+      ],
+      "lane": "CONTROL",
+      "params": "#/$defs/params.run.status",
+      "result": "#/$defs/answer.run.status"
+    },
+    {
+      "name": "run.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_run_list",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": false,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "registry_unavailable",
+        "scope_refused"
+      ],
+      "lane": "CONTROL",
+      "params": "#/$defs/params.run.list",
+      "result": "#/$defs/answer.run.list"
+    },
+    {
+      "name": "run.stop",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_run_stop",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": false,
+      "codes": [
+        "stopped",
+        "pending",
+        "ended",
+        "run_unknown",
+        "request_invalid",
+        "registry_unavailable",
+        "scope_refused"
+      ],
+      "lane": "STOP",
+      "params": "#/$defs/params.run.stop",
+      "result": "#/$defs/answer.run.stop"
+    },
+    {
+      "name": "route.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_route_list",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": false,
+      "codes": [
+        "ok",
+        "scope_refused"
+      ],
+      "lane": "CONTROL",
+      "params": "#/$defs/params.route.list",
+      "result": "#/$defs/answer.route.list"
+    },
+    {
+      "name": "plugin.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_plugin_list",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": false,
+      "codes": [
+        "ok",
+        "unavailable",
+        "scope_refused"
+      ],
+      "lane": "PLUGIN-HOST",
+      "params": "#/$defs/params.plugin.list",
+      "result": "#/$defs/answer.plugin.list"
+    },
+    {
+      "name": "session.start",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_start",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown",
+        "delegation_limit",
+        "start_failed",
+        "registry_unavailable",
+        "workspace_invalid",
+        "workspace_busy",
+        "reservation_refused",
+        "breaker_store_missing"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.start",
+      "result": "#/$defs/answer.session.start"
+    },
+    {
+      "name": "session.turn",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_revision",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_turn",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "busy",
+        "session_unknown",
+        "start_failed",
+        "registry_unavailable",
+        "workspace_invalid",
+        "workspace_busy",
+        "reservation_refused",
+        "breaker_store_missing"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.turn",
+      "result": "#/$defs/answer.session.turn"
+    },
+    {
+      "name": "session.steer",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_turn_id",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_steer",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.steer",
+      "result": "#/$defs/answer.session.steer"
+    },
+    {
+      "name": "session.queue",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_queue",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.queue",
+      "result": "#/$defs/answer.session.queue"
+    },
+    {
+      "name": "session.interrupt",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_turn_id",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_interrupt",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "pending",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.interrupt",
+      "result": "#/$defs/answer.session.interrupt"
+    },
+    {
+      "name": "session.resume",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_revision",
+      "requires": [
+        "resume"
+      ],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_resume",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "busy",
+        "session_unknown",
+        "start_failed",
+        "registry_unavailable",
+        "workspace_invalid",
+        "workspace_busy",
+        "reservation_refused",
+        "breaker_store_missing"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.resume",
+      "result": "#/$defs/answer.session.resume"
+    },
+    {
+      "name": "session.fork",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [
+        "fork"
+      ],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_fork",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown",
+        "workspace_invalid",
+        "workspace_busy",
+        "delegation_limit"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.fork",
+      "result": "#/$defs/answer.session.fork"
+    },
+    {
+      "name": "session.export",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_export",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "session_unknown"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.export",
+      "result": "#/$defs/answer.session.export"
+    },
+    {
+      "name": "session.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_list",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.list",
+      "result": "#/$defs/answer.session.list"
+    },
+    {
+      "name": "session.status",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_status",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "session_unknown"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.session.status",
+      "result": "#/$defs/answer.session.status"
+    },
+    {
+      "name": "session.stop",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_session_stop",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "stopped",
+        "pending",
+        "ended",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown"
+      ],
+      "lane": "DELEGATION",
+      "params": "#/$defs/params.session.stop",
+      "result": "#/$defs/answer.session.stop"
+    },
+    {
+      "name": "queue.update",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_revision",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_queue_update",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "item_unknown"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.queue.update",
+      "result": "#/$defs/answer.queue.update"
+    },
+    {
+      "name": "queue.cancel",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_revision",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_queue_cancel",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "item_unknown"
+      ],
+      "lane": "SESSIONS",
+      "params": "#/$defs/params.queue.cancel",
+      "result": "#/$defs/answer.queue.cancel"
+    },
+    {
+      "name": "approval.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_approval_list",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "APPROVALS",
+      "params": "#/$defs/params.approval.list",
+      "result": "#/$defs/answer.approval.list"
+    },
+    {
+      "name": "approval.open",
+      "scope": "approve",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "approval_unknown"
+      ],
+      "lane": "APPROVALS",
+      "params": "#/$defs/params.approval.open",
+      "result": "#/$defs/answer.approval.open"
+    },
+    {
+      "name": "approval.answer",
+      "scope": "approve",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_revision",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "prompt_not_shown",
+        "approval_unknown"
+      ],
+      "lane": "APPROVALS",
+      "params": "#/$defs/params.approval.answer",
+      "result": "#/$defs/answer.approval.answer"
+    },
+    {
+      "name": "events.read",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_events_read",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "session_unknown"
+      ],
+      "lane": "EVENTS",
+      "params": "#/$defs/params.events.read",
+      "result": "#/$defs/answer.events.read"
+    },
+    {
+      "name": "events.follow",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "session_unknown",
+        "busy"
+      ],
+      "lane": "EVENTS",
+      "params": "#/$defs/params.events.follow",
+      "result": "#/$defs/answer.events.follow"
+    },
+    {
+      "name": "route.explain",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_route_explain",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "QUOTA",
+      "params": "#/$defs/params.route.explain",
+      "result": "#/$defs/answer.route.explain"
+    },
+    {
+      "name": "operator.read",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "PLUGIN-HOST",
+      "params": "#/$defs/params.operator.read",
+      "result": "#/$defs/answer.operator.read"
+    },
+    {
+      "name": "budget.show",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_budget_show",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "QUOTA",
+      "params": "#/$defs/params.budget.show",
+      "result": "#/$defs/answer.budget.show"
+    },
+    {
+      "name": "workspace.diff",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_workspace_diff",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "session_unknown",
+        "workspace_invalid"
+      ],
+      "lane": "WORKSPACE",
+      "params": "#/$defs/params.workspace.diff",
+      "result": "#/$defs/answer.workspace.diff"
+    },
+    {
+      "name": "workspace.checkpoint",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_workspace_checkpoint",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown",
+        "workspace_invalid",
+        "workspace_busy"
+      ],
+      "lane": "WORKSPACE",
+      "params": "#/$defs/params.workspace.checkpoint",
+      "result": "#/$defs/answer.workspace.checkpoint"
+    },
+    {
+      "name": "workspace.restore",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_revision",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_workspace_restore",
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "busy",
+        "session_unknown",
+        "workspace_invalid",
+        "workspace_busy"
+      ],
+      "lane": "WORKSPACE",
+      "params": "#/$defs/params.workspace.restore",
+      "result": "#/$defs/answer.workspace.restore"
+    },
+    {
+      "name": "workspace.publish",
+      "scope": "manage",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": false,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "session_unknown",
+        "workspace_invalid",
+        "workspace_busy"
+      ],
+      "lane": "WORKSPACE",
+      "params": "#/$defs/params.workspace.publish",
+      "result": "#/$defs/answer.workspace.publish"
+    },
+    {
+      "name": "plugin.status",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_plugin_status",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "plugin_unknown"
+      ],
+      "lane": "PLUGIN-HOST",
+      "params": "#/$defs/params.plugin.status",
+      "result": "#/$defs/answer.plugin.status"
+    },
+    {
+      "name": "plugin.call",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict",
+        "plugin_unknown"
+      ],
+      "lane": "PLUGIN-HOST",
+      "params": "#/$defs/params.plugin.call",
+      "result": "#/$defs/answer.plugin.call"
+    },
+    {
+      "name": "key.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_key_list",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "KEYS",
+      "params": "#/$defs/params.key.list",
+      "result": "#/$defs/answer.key.list"
+    },
+    {
+      "name": "surface.prefs.get",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "PAGE",
+      "params": "#/$defs/params.surface.prefs.get",
+      "result": "#/$defs/answer.surface.prefs.get"
+    },
+    {
+      "name": "surface.prefs.set",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "command_id",
+      "precondition": "expected_revision",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported",
+        "conflict"
+      ],
+      "lane": "PAGE",
+      "params": "#/$defs/params.surface.prefs.set",
+      "result": "#/$defs/answer.surface.prefs.set"
+    },
+    {
+      "name": "doctor",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": true,
+        "tool": "recursion_doctor",
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        }
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "scope_refused",
+        "unavailable",
+        "unsupported"
+      ],
+      "lane": "INSTALL",
+      "params": "#/$defs/params.doctor",
+      "result": "#/$defs/answer.doctor"
+    },
+    {
+      "name": "methods.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "scope_refused"
+      ],
+      "lane": "CONTROL",
+      "params": "#/$defs/params.methods.list",
+      "result": "#/$defs/answer.methods.list"
+    }
+  ]
+}

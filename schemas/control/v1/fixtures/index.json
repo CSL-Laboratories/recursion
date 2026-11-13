@@ -4,7 +4,7 @@
     {
       "file": "good/approval.v1/h01-tool-call-pending-shown-on-the-terminal.json",
       "schema": "approval.v1.json",
-      "shows": "An engine asked to run a command. One surface has shown it; nobody has answered."
+      "shows": "An engine asked to run a command. One surface has shown it, at revision 1; nobody has answered."
     },
     {
       "file": "good/approval.v1/h02-tool-call-approved.json",
@@ -17,9 +17,9 @@
       "shows": "A tool input that holds accented text and a fraction. input_json carries it as an escaped JSON string, so the effect still fits the restricted canonical form."
     },
     {
-      "file": "good/approval.v1/h04-plugin-effect-pending.json",
+      "file": "good/approval.v1/h04-plugin-effect-pending-shown-nowhere.json",
       "schema": "approval.v1.json",
-      "shows": "A plugin asked to carry out an effect. The effect is the gate's own canonical object; it belongs to no turn."
+      "shows": "A plugin asked to carry out an effect. The effect is the gate's own canonical object; it belongs to no turn; no surface has shown it yet."
     },
     {
       "file": "good/approval.v1/h05-expired-unanswered.json",
@@ -45,6 +45,11 @@
       "file": "good/approval.v1/h09-private-binding.json",
       "schema": "approval.v1.json#/$defs/binding",
       "shows": "What the daemon keeps to route the answer to the engine's own pending request. Never sent."
+    },
+    {
+      "file": "good/approval.v1/h10-summary-as-approval-list-returns-it.json",
+      "schema": "approval.v1.json#/$defs/summary",
+      "shows": "A summary: enough to list the request and count down its deadline. Reading it is not showing the request."
     },
     {
       "file": "bad/approval.v1/b01-pending-with-an-answer.json",
@@ -191,6 +196,42 @@
       }
     },
     {
+      "file": "bad/approval.v1/b17-no-rendered-lines.json",
+      "schema": "approval.v1.json",
+      "rule": "Every request carries the lines the core rendered: a surface prints those and composes none of its own.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/approval.v1/b18-shown-by-a-plugin.json",
+      "schema": "approval.v1.json",
+      "rule": "Only the owner or a paired device can be recorded as having been shown a request.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/opened_by/0/principal/kind"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b19-an-open-record-with-no-revision.json",
+      "schema": "approval.v1.json",
+      "rule": "An open record names the revision that was shown, so an answer to an older showing can be refused.",
+      "expect": {
+        "keyword": "required",
+        "at": "/opened_by/0"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b20-a-summary-carrying-the-effect.json",
+      "schema": "approval.v1.json#/$defs/summary",
+      "rule": "A summary cannot be taken for the prompt: it carries no effect, no digest and no rendered lines.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
       "file": "good/common.v1/h01-cursor-before-the-first-event.json",
       "schema": "common.v1.json#/$defs/cursor",
       "shows": "A cursor that has read nothing yet: seq 0."
@@ -213,12 +254,27 @@
     {
       "file": "good/common.v1/h05-route.json",
       "schema": "common.v1.json#/$defs/route",
-      "shows": "A decided route: engine, model, and the connection it is billed through."
+      "shows": "A route in short: engine, model, and the connection it is billed through."
     },
     {
       "file": "good/common.v1/h06-principal-device.json",
       "schema": "common.v1.json#/$defs/principal",
       "shows": "A paired device. The id is a label, never the device token."
+    },
+    {
+      "file": "good/common.v1/h07-route-decision-by-config.json",
+      "schema": "common.v1.json#/$defs/route_decision",
+      "shows": "The routing config chose the second candidate; the first was skipped, with a typed reason."
+    },
+    {
+      "file": "good/common.v1/h08-budget-default-zero.json",
+      "schema": "common.v1.json#/$defs/budget",
+      "shows": "The default: nothing may be spent."
+    },
+    {
+      "file": "good/common.v1/h09-cgroup-identity.json",
+      "schema": "common.v1.json#/$defs/cgroup_identity",
+      "shows": "A cgroup directory's device and inode numbers, read at launch."
     },
     {
       "file": "bad/common.v1/b01-cursor-negative-seq.json",
@@ -302,12 +358,48 @@
       }
     },
     {
-      "file": "bad/common.v1/b10-route-with-a-credential-in-the-connection.json",
+      "file": "bad/common.v1/b10-route-with-a-secret-in-the-connection.json",
       "schema": "common.v1.json#/$defs/route",
-      "rule": "connection is '<kind>:<label>'. An object with a key in it is not a connection id.",
+      "rule": "A connection is a kind and a label. Nothing else may ride in it.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/connection"
+      }
+    },
+    {
+      "file": "bad/common.v1/b11-budget-naming-a-reservation.json",
+      "schema": "common.v1.json#/$defs/budget",
+      "rule": "A budget is the cap alone. The reservation, with its id and state, lives in the quota ledger, not in a record.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/b12-budget-with-no-cap.json",
+      "schema": "common.v1.json#/$defs/budget",
+      "rule": "A budget states its cap; an absent budget is read as 0, an empty one is not a budget.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/b13-hand-pick-reason-with-no-hand-pick.json",
+      "schema": "common.v1.json#/$defs/route_decision",
+      "rule": "When the reason is 'hand_pick', the hand pick is there.",
       "expect": {
         "keyword": "type",
-        "at": "/connection"
+        "at": "/hand_pick"
+      }
+    },
+    {
+      "file": "bad/common.v1/b14-an-owner-that-is-not-host-or-a-plugin-id.json",
+      "schema": "common.v1.json#/$defs/owner",
+      "rule": "An owner is 'host' or a plugin's id.",
+      "expect": {
+        "keyword": "pattern",
+        "at": ""
       }
     },
     {
@@ -328,7 +420,7 @@
     {
       "file": "good/driver.v2/h04-input-user-message.json",
       "schema": "driver.v2.json#/$defs/input",
-      "shows": "One input of a turn."
+      "shows": "One input of a turn, with the delivery id it is written toward the engine under."
     },
     {
       "file": "good/driver.v2/h05-input-approval-answer.json",
@@ -368,7 +460,7 @@
     {
       "file": "good/driver.v2/h12-fork-at-a-turn.json",
       "schema": "driver.v2.json#/$defs/fork",
-      "shows": "What fork takes."
+      "shows": "What fork takes: the state after that turn ended."
     },
     {
       "file": "bad/driver.v2/b01-a-flag-left-out.json",
@@ -425,9 +517,9 @@
       }
     },
     {
-      "file": "bad/driver.v2/b07-a-user-message-of-no-turn.json",
+      "file": "bad/driver.v2/b07-a-user-message-with-no-delivery-id.json",
       "schema": "driver.v2.json#/$defs/input",
-      "rule": "Every user message belongs to a turn.",
+      "rule": "Every user message is written toward the engine under a delivery id.",
       "expect": {
         "keyword": "required",
         "at": ""
@@ -457,7 +549,7 @@
       "rule": "A draft payload obeys event.v1: unknown is null, never 0.",
       "expect": {
         "keyword": "type",
-        "at": "/payload/output_tokens"
+        "at": "/payload/output_tokens/value"
       }
     },
     {
@@ -479,14 +571,23 @@
       }
     },
     {
-      "file": "good/event.v1/h01-state-changed-run-from-the-registry.json",
+      "file": "bad/driver.v2/b13-fork-at-no-turn.json",
+      "schema": "driver.v2.json#/$defs/fork",
+      "rule": "'at' is a turn of the session: the state after that turn ended.",
+      "expect": {
+        "keyword": "type",
+        "at": "/at"
+      }
+    },
+    {
+      "file": "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
       "schema": "event.v1.json",
-      "shows": "A run changed state in the registry. registry_seq is the outbox row of that change, so replay matches the registry exactly."
+      "shows": "A run changed and the change was seen as it was made. The payload is the run as it is after the change: the daemon's row and the stored control record."
     },
     {
       "file": "good/event.v1/h02-state-changed-session-created.json",
       "schema": "event.v1.json",
-      "shows": "A session was created: from is null, and the event belongs to no run and no turn."
+      "shows": "A session was created: the post-image is the session record, and the event belongs to no run and no turn."
     },
     {
       "file": "good/event.v1/h03-engine-output.json",
@@ -509,29 +610,29 @@
       "shows": "A large tool result: the text is not in the log; output_ref names where it was put."
     },
     {
-      "file": "good/event.v1/h07-approval-requested.json",
+      "file": "good/event.v1/h07-approval-requested-with-the-request-as-it-was.json",
       "schema": "event.v1.json",
-      "shows": "Only the core writes this event. A surface opens its approval state on it and on nothing an engine printed."
+      "shows": "Only the core writes this event. Its payload is the request exactly as it was, with the rendered lines, so a replay shows what was asked without a lookup."
     },
     {
-      "file": "good/event.v1/h08-approval-answered.json",
+      "file": "good/event.v1/h08-approval-answered-by-a-person.json",
       "schema": "event.v1.json",
-      "shows": "An approval left 'pending'."
+      "shows": "The owner denied it."
     },
     {
-      "file": "good/event.v1/h09-usage-known.json",
+      "file": "good/event.v1/h09-usage-with-each-measurement-marked.json",
       "schema": "event.v1.json",
-      "shows": "Token counts read from the engine's typed stream. The cost is not reported, so it is null, not 0."
+      "shows": "Token counts read from the engine's typed stream. Each measurement has its own quality: input and output are known, reasoning tokens and the cost are not reported and are null, not 0."
     },
     {
       "file": "good/event.v1/h10-usage-unknown.json",
       "schema": "event.v1.json",
-      "shows": "Nothing is known about this turn's usage: every number is null and the quality says so."
+      "shows": "Nothing is known about this turn's usage: every value is null and every quality says so."
     },
     {
-      "file": "good/event.v1/h11-usage-lower-bound-session-total.json",
+      "file": "good/event.v1/h11-usage-running-total-with-a-modelled-cost.json",
       "schema": "event.v1.json",
-      "shows": "A running total for the engine's session, known only as a lower bound, with a modelled cost. A ledger must not add it to earlier events."
+      "shows": "A running total for the engine's session: tokens observed as a lower bound, the cost modelled from a price table. It is never added to earlier events."
     },
     {
       "file": "good/event.v1/h12-limit-on-a-connection.json",
@@ -539,14 +640,14 @@
       "shows": "A typed plan limit on the whole connection, with the time it may clear."
     },
     {
-      "file": "good/event.v1/h13-limit-on-one-model.json",
+      "file": "good/event.v1/h13-limit-on-one-model-in-a-named-bucket.json",
       "schema": "event.v1.json",
-      "shows": "A short fence on one model; when it clears is not known."
+      "shows": "A limit that is not connection-wide: one model, in the bucket the vendor named; when it clears is not known."
     },
     {
       "file": "good/event.v1/h14-result-ok.json",
       "schema": "event.v1.json",
-      "shows": "A turn produced its result."
+      "shows": "A run produced its result."
     },
     {
       "file": "good/event.v1/h15-result-error-carrying-engine-text.json",
@@ -561,12 +662,12 @@
     {
       "file": "good/event.v1/h17-turn-started.json",
       "schema": "event.v1.json",
-      "shows": "A turn began, with the input as it was sent."
+      "shows": "The engine took a message: a turn began. The delivery id closes the delivery that was open."
     },
     {
-      "file": "good/event.v1/h18-turn-ended.json",
+      "file": "good/event.v1/h18-turn-ended-waiting-for-the-user.json",
       "schema": "event.v1.json",
-      "shows": "A turn reached a final state."
+      "shows": "A turn ended because the engine yielded and waits for the user. The turn's own result travels with it."
     },
     {
       "file": "good/event.v1/h19-steer-queued.json",
@@ -576,20 +677,20 @@
     {
       "file": "good/event.v1/h20-steer-delivered.json",
       "schema": "event.v1.json",
-      "shows": "The queued message reached the engine inside the turn in progress."
+      "shows": "The daemon wrote the queued message toward the engine, inside the turn in progress."
     },
     {
-      "file": "good/event.v1/h21-interrupt-requested.json",
+      "file": "good/event.v1/h21-interrupt-delivered.json",
       "schema": "event.v1.json",
-      "shows": "An interrupt of a turn was asked."
+      "shows": "An interrupt was asked by the owner and the turn was interrupted."
     },
     {
-      "file": "good/event.v1/h22-interrupt-delivered-by-stopping-the-run.json",
+      "file": "good/event.v1/h22-interrupt-with-no-live-turn.json",
       "schema": "event.v1.json",
-      "shows": "The driver has no cancel, so the interrupt was delivered by stopping the run."
+      "shows": "An interrupt was asked while no turn was in progress: nothing was done, and the log says so."
     },
     {
-      "file": "good/event.v1/h23-stop-requested.json",
+      "file": "good/event.v1/h23-stop-requested-by-the-owner.json",
       "schema": "event.v1.json",
       "shows": "A Stop of one run, and who asked."
     },
@@ -614,14 +715,54 @@
       "shows": "A new session was forked from this one at a turn."
     },
     {
-      "file": "good/event.v1/h28-route-decision.json",
+      "file": "good/event.v1/h28-route-decision-by-hand-pick.json",
       "schema": "event.v1.json",
       "shows": "Routing chose a route because the user named it."
     },
     {
       "file": "good/event.v1/h29-first-event-of-a-run-without-a-session.json",
       "schema": "event.v1.json",
-      "shows": "The log of a run started with run.start and no session is named 'run:<run_id>'."
+      "shows": "The log of a run started with run.start and no session is named 'run:<run_id>'. The run existed before logging began, so its first record is a snapshot."
+    },
+    {
+      "file": "good/event.v1/h30-state-changed-found-by-a-later-scan.json",
+      "schema": "event.v1.json",
+      "shows": "A change found by a scan, not seen as it was made: the reason says so, and 'coalesced' says it may stand for two earlier changes."
+    },
+    {
+      "file": "good/event.v1/h31-state-changed-turn.json",
+      "schema": "event.v1.json",
+      "shows": "A turn changed: the post-image is the turn as the session record keeps it."
+    },
+    {
+      "file": "good/event.v1/h32-approval-expired-nobody-answered.json",
+      "schema": "event.v1.json",
+      "shows": "A deadline is not a person's answer: the request expired, and answer and answered_by are null."
+    },
+    {
+      "file": "good/event.v1/h33-stop-requested-by-the-daemons-own-recovery.json",
+      "schema": "event.v1.json",
+      "shows": "The daemon's own recovery asked for the Stop; that is not a client's call."
+    },
+    {
+      "file": "good/event.v1/h34-workspace-grant.json",
+      "schema": "event.v1.json",
+      "shows": "A run was given access to a folder."
+    },
+    {
+      "file": "good/event.v1/h35-workspace-revoke.json",
+      "schema": "event.v1.json",
+      "shows": "A run's access to a folder was taken away."
+    },
+    {
+      "file": "good/event.v1/h36-effect-outcome-unknown.json",
+      "schema": "event.v1.json",
+      "shows": "A delivery was in flight when the daemon restarted: nobody can say whether it happened. It is shown, and never retried by itself."
+    },
+    {
+      "file": "good/event.v1/h37-turn-ended-by-a-stop-with-no-result.json",
+      "schema": "event.v1.json",
+      "shows": "A turn ended by a Stop before it had a result."
     },
     {
       "file": "bad/event.v1/b01-seq-zero.json",
@@ -665,16 +806,16 @@
       "rule": "A number that is not known is null, never 0.",
       "expect": {
         "keyword": "type",
-        "at": "/payload/input_tokens"
+        "at": "/payload/input_tokens/value"
       }
     },
     {
-      "file": "bad/event.v1/b06-known-usage-with-no-source.json",
+      "file": "bad/event.v1/b06-a-known-number-from-nowhere.json",
       "schema": "event.v1.json",
-      "rule": "Numbers that are 'known' came from somewhere: provenance is not 'unavailable'.",
+      "rule": "A number that is 'known' came from somewhere: its provenance is not 'unavailable'.",
       "expect": {
         "keyword": "enum",
-        "at": "/payload/provenance"
+        "at": "/payload/input_tokens/provenance"
       }
     },
     {
@@ -800,7 +941,7 @@
       "rule": "A token count is 0 or more.",
       "expect": {
         "keyword": "minimum",
-        "at": "/payload/output_tokens"
+        "at": "/payload/output_tokens/value"
       }
     },
     {
@@ -809,16 +950,16 @@
       "rule": "A principal is a kind and a label, here too.",
       "expect": {
         "keyword": "additionalProperties",
-        "at": "/payload/principal"
+        "at": "/payload/requested_by"
       }
     },
     {
-      "file": "bad/event.v1/b22-a-state-that-is-not-a-word.json",
+      "file": "bad/event.v1/b22-a-post-image-of-the-wrong-entity.json",
       "schema": "event.v1.json",
-      "rule": "A state is a lower-case word.",
+      "rule": "The post-image is typed by the entity: a session's is a session record, not a run's.",
       "expect": {
-        "keyword": "pattern",
-        "at": "/payload/to"
+        "keyword": "required",
+        "at": "/payload/post_image"
       }
     },
     {
@@ -828,6 +969,87 @@
       "expect": {
         "keyword": "enum",
         "at": "/source"
+      }
+    },
+    {
+      "file": "bad/event.v1/b24-an-approval-request-that-is-only-an-id.json",
+      "schema": "event.v1.json",
+      "rule": "approval.requested carries the request as it was, not a pointer to it.",
+      "expect": {
+        "keyword": "required",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/b25-an-approval-request-already-answered.json",
+      "schema": "event.v1.json",
+      "rule": "The snapshot in approval.requested is the request at the moment it was made: pending.",
+      "expect": {
+        "keyword": "const",
+        "at": "/payload/state"
+      }
+    },
+    {
+      "file": "bad/event.v1/b26-usage-as-bare-numbers.json",
+      "schema": "event.v1.json",
+      "rule": "Every measurement carries its own quality and provenance; a bare number says neither.",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/input_tokens"
+      }
+    },
+    {
+      "file": "bad/event.v1/b27-a-known-number-that-is-null.json",
+      "schema": "event.v1.json",
+      "rule": "A measurement marked 'known' has a value.",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/output_tokens/value"
+      }
+    },
+    {
+      "file": "bad/event.v1/b28-no-live-turn-that-names-a-turn.json",
+      "schema": "event.v1.json",
+      "rule": "'no_live_turn' means there was no turn to name.",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/turn_id"
+      }
+    },
+    {
+      "file": "bad/event.v1/b29-an-expiry-recorded-as-a-persons-answer.json",
+      "schema": "event.v1.json",
+      "rule": "A deadline is not a person's answer: an expired request has no answer.",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/answer"
+      }
+    },
+    {
+      "file": "bad/event.v1/b30-a-done-turn-with-no-result.json",
+      "schema": "event.v1.json",
+      "rule": "A turn that ended by yielding carries its result.",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/result"
+      }
+    },
+    {
+      "file": "bad/event.v1/b31-a-change-reason-nobody-defined.json",
+      "schema": "event.v1.json",
+      "rule": "A change is logged as 'commit', 'reconcile' or 'snapshot'.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/payload/reason"
+      }
+    },
+    {
+      "file": "bad/event.v1/b32-a-stop-of-a-run-that-names-no-run.json",
+      "schema": "event.v1.json",
+      "rule": "A Stop with scope 'run' names the run.",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/run_id"
       }
     },
     {
@@ -841,9 +1063,9 @@
       "shows": "An approval is pending: a person must answer it on a surface that draws approvals."
     },
     {
-      "file": "good/mcp.task.v1/h03-completed.json",
+      "file": "good/mcp.task.v1/h03-completed-done.json",
       "schema": "mcp.task.v1.json",
-      "shows": "The turn ended with a result."
+      "shows": "The turn ended and its work is done. The result is the turn's own, and it expires when the turn's does."
     },
     {
       "file": "good/mcp.task.v1/h04-failed.json",
@@ -863,12 +1085,17 @@
     {
       "file": "good/mcp.task.v1/h07-run-started-with-run-start.json",
       "schema": "mcp.task.v1.json",
-      "shows": "Work started with run.start: the Task id is the run id and there is no turn."
+      "shows": "Work started with run.start: the Task id is the run id, there is no session and no turn."
     },
     {
       "file": "good/mcp.task.v1/h08-run-that-failed-to-start.json",
       "schema": "mcp.task.v1.json",
       "shows": "A run whose start failed."
+    },
+    {
+      "file": "good/mcp.task.v1/h09-completed-but-waiting-for-the-user.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The turn is over, so the Task is completed; its outcome says the engine waits for the user, which is not 'done'."
     },
     {
       "file": "bad/mcp.task.v1/b01-completed-without-a-result.json",
@@ -952,6 +1179,601 @@
       }
     },
     {
+      "file": "bad/mcp.task.v1/b10-completed-with-a-stopped-outcome.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A turn that was stopped is 'cancelled', not 'completed'.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/outcome"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b11-a-run-task-that-claims-a-turns-outcome.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task of a run has no turn, so no turn outcome.",
+      "expect": {
+        "keyword": "type",
+        "at": "/outcome"
+      }
+    },
+    {
+      "file": "good/methods.v1/c01-run-start-started.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: run.start with a client_key."
+    },
+    {
+      "file": "good/methods.v1/c02-run-start-same-key-again.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: the same start again: the same run, 'duplicate' true, nothing launched."
+    },
+    {
+      "file": "good/methods.v1/c03-run-start-key-reused-for-another-prompt.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: the same key with another prompt is refused, and nothing is launched."
+    },
+    {
+      "file": "good/methods.v1/c04-run-start-no-route-for-the-engine.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: a start for an engine with no route: start_failed, with the launch path's own code."
+    },
+    {
+      "file": "good/methods.v1/c05-run-start-without-a-prompt.json",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "shows": "Captured: a start with no prompt is refused request_invalid, naming the field."
+    },
+    {
+      "file": "good/methods.v1/c06-run-status.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: run.status."
+    },
+    {
+      "file": "good/methods.v1/c07-run-status-of-no-run.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: run.status of a run id that names no run."
+    },
+    {
+      "file": "good/methods.v1/c08-run-status-without-a-run-id.json",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "shows": "Captured: run.status with no run_id."
+    },
+    {
+      "file": "good/methods.v1/c09-run-list-one-page.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: a page of run.list, with next_after for the next page."
+    },
+    {
+      "file": "good/methods.v1/c10-run-list-after-an-unknown-run.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: a cursor that names no run is refused, never answered with an empty page."
+    },
+    {
+      "file": "good/methods.v1/c11-run-list-limit-out-of-range.json",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "shows": "Captured: a limit out of range is refused."
+    },
+    {
+      "file": "good/methods.v1/c12-run-stop-pending.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: a Stop that is not confirmed."
+    },
+    {
+      "file": "good/methods.v1/c13-run-stop-stopped.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: the Stop that confirmed it."
+    },
+    {
+      "file": "good/methods.v1/c14-run-stop-of-no-run.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: a Stop of a run id that names no run."
+    },
+    {
+      "file": "good/methods.v1/c15-route-list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: the route inventory."
+    },
+    {
+      "file": "good/methods.v1/c16-plugin-list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: the plugin inventory with no plugin installed."
+    },
+    {
+      "file": "good/methods.v1/c17-a-method-the-daemon-does-not-know.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: a method that is not in the table is answered method_unknown."
+    },
+    {
+      "file": "good/methods.v1/h01-session-turn-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A turn is accepted: the session after it, and the new turn."
+    },
+    {
+      "file": "good/methods.v1/h02-session-turn-while-a-turn-is-live.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A turn sent while another is in progress is refused 'busy'."
+    },
+    {
+      "file": "good/methods.v1/h03-a-stale-revision.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A request that read an older revision is 'conflict', with the current revision so the client can read again."
+    },
+    {
+      "file": "good/methods.v1/h04-a-command-id-used-for-another-payload.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The same command id with another payload is 'conflict'; nothing is done."
+    },
+    {
+      "file": "good/methods.v1/h05-a-method-the-daemon-has-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A method of the table with no handler in the running daemon is 'unsupported', not 'method_unknown'."
+    },
+    {
+      "file": "good/methods.v1/h06-fork-on-a-driver-that-cannot-fork.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A missing driver flag is 'unsupported', naming the flag, before any side effect."
+    },
+    {
+      "file": "good/methods.v1/h07-approval-open.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A surface displays the prompt: the open is recorded and the request is returned."
+    },
+    {
+      "file": "good/methods.v1/h08-an-answer-from-a-surface-that-never-showed-it.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "An answer with no open record for the current revision is refused 'prompt_not_shown'."
+    },
+    {
+      "file": "good/methods.v1/h09-a-second-answer.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Someone answered first: the later answer is 'conflict', already_resolved."
+    },
+    {
+      "file": "good/methods.v1/h10-approval-list-returns-summaries.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "approval.list returns summaries; reading them shows nothing."
+    },
+    {
+      "file": "good/methods.v1/h11-events-read-as-a-transcript.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.read with projection 'transcript' returns lines and the cursor to read on from."
+    },
+    {
+      "file": "good/methods.v1/h12-events-follow-that-timed-out.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.follow waited and nothing new arrived: an empty page, the same cursor, timed_out true."
+    },
+    {
+      "file": "good/methods.v1/h13-session-stop-of-a-subtree-still-pending.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A subtree Stop is 'stopped' only when every run in it is; one pending run makes it pending, and the answer names which."
+    },
+    {
+      "file": "good/methods.v1/h14-methods-list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "What this daemon implements now."
+    },
+    {
+      "file": "good/methods.v1/h15-doctor.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A doctor report: a list of checks. What could not be checked is 'unknown', never 'ok'."
+    },
+    {
+      "file": "good/methods.v1/h16-a-refusal-by-the-authorizer.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A caller without the scope is refused before anything else is looked at."
+    },
+    {
+      "file": "good/methods.v1/h17-run-start-with-a-hand-pick-and-a-workspace.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A start as version 1 allows it: no engine named, a hand pick, a workspace."
+    },
+    {
+      "file": "good/methods.v1/h18-row-of-run-stop.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "shows": "The row of run.stop: mutating, with no key and no revision, because an emergency Stop never needs fresh state."
+    },
+    {
+      "file": "good/methods.v1/h19-row-of-session-fork.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "shows": "The row of session.fork: it needs the driver's fork flag."
+    },
+    {
+      "file": "good/methods.v1/r01-run-start.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of run.start."
+    },
+    {
+      "file": "good/methods.v1/r02-run-status.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of run.status."
+    },
+    {
+      "file": "good/methods.v1/r03-run-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of run.list."
+    },
+    {
+      "file": "good/methods.v1/r04-run-stop.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of run.stop."
+    },
+    {
+      "file": "good/methods.v1/r05-route-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of route.list."
+    },
+    {
+      "file": "good/methods.v1/r06-plugin-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of plugin.list."
+    },
+    {
+      "file": "good/methods.v1/r07-session-start.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.start."
+    },
+    {
+      "file": "good/methods.v1/r08-session-turn.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.turn."
+    },
+    {
+      "file": "good/methods.v1/r09-session-steer.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.steer."
+    },
+    {
+      "file": "good/methods.v1/r10-session-queue.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.queue."
+    },
+    {
+      "file": "good/methods.v1/r11-session-interrupt.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.interrupt."
+    },
+    {
+      "file": "good/methods.v1/r12-session-resume.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.resume."
+    },
+    {
+      "file": "good/methods.v1/r13-session-fork.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.fork."
+    },
+    {
+      "file": "good/methods.v1/r14-session-export.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.export."
+    },
+    {
+      "file": "good/methods.v1/r15-session-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.list."
+    },
+    {
+      "file": "good/methods.v1/r16-session-status.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.status."
+    },
+    {
+      "file": "good/methods.v1/r17-session-stop.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of session.stop."
+    },
+    {
+      "file": "good/methods.v1/r18-queue-update.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of queue.update."
+    },
+    {
+      "file": "good/methods.v1/r19-queue-cancel.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of queue.cancel."
+    },
+    {
+      "file": "good/methods.v1/r20-approval-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of approval.list."
+    },
+    {
+      "file": "good/methods.v1/r21-approval-open.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of approval.open."
+    },
+    {
+      "file": "good/methods.v1/r22-approval-answer.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of approval.answer."
+    },
+    {
+      "file": "good/methods.v1/r23-events-read.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of events.read."
+    },
+    {
+      "file": "good/methods.v1/r24-events-follow.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of events.follow."
+    },
+    {
+      "file": "good/methods.v1/r25-route-explain.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of route.explain."
+    },
+    {
+      "file": "good/methods.v1/r26-operator-read.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of operator.read."
+    },
+    {
+      "file": "good/methods.v1/r27-budget-show.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of budget.show."
+    },
+    {
+      "file": "good/methods.v1/r28-workspace-diff.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of workspace.diff."
+    },
+    {
+      "file": "good/methods.v1/r29-workspace-checkpoint.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of workspace.checkpoint."
+    },
+    {
+      "file": "good/methods.v1/r30-workspace-restore.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of workspace.restore."
+    },
+    {
+      "file": "good/methods.v1/r31-workspace-publish.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of workspace.publish."
+    },
+    {
+      "file": "good/methods.v1/r32-plugin-status.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of plugin.status."
+    },
+    {
+      "file": "good/methods.v1/r33-plugin-call.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of plugin.call."
+    },
+    {
+      "file": "good/methods.v1/r34-key-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of key.list."
+    },
+    {
+      "file": "good/methods.v1/r35-surface-prefs-get.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of surface.prefs.get."
+    },
+    {
+      "file": "good/methods.v1/r36-surface-prefs-set.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of surface.prefs.set."
+    },
+    {
+      "file": "good/methods.v1/r37-doctor.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of doctor."
+    },
+    {
+      "file": "good/methods.v1/r38-methods-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request of methods.list."
+    },
+    {
+      "file": "bad/methods.v1/b01-a-method-that-is-not-in-the-table.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "A request names a method of the table.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/method"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b02-run-stop-with-a-command-id.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "run.stop takes a run id and nothing else: a Stop never needs a key or a revision.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b03-a-mutating-request-with-no-command-id.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "Every mutating method except run.start and run.stop takes a command_id.",
+      "expect": {
+        "keyword": "required",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b04-a-turn-with-no-expected-revision.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "A turn names the revision it read, so a stale client cannot act on old state.",
+      "expect": {
+        "keyword": "required",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b05-an-answer-without-the-digest.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "An answer names the digest that was drawn.",
+      "expect": {
+        "keyword": "required",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b06-an-answer-that-is-not-approve-or-deny.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "An answer is 'approve' or 'deny'.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/params/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b07-a-projection-nobody-defined.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "A projection is 'raw' or 'transcript'.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/params/projection"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b08-a-principal-in-the-params.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "The principal comes from the way the request came in, never from its params.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b09-an-owner-in-the-params.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "A run's owner is derived by the server, never taken from params.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b10-a-queue-update-that-changes-nothing.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "An update names the text or the delivery to change.",
+      "expect": {
+        "keyword": "anyOf",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b11-a-conflict-with-no-detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "A 'conflict' says which: a reused id, a stale revision or turn, or an answer that came first.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b12-a-code-the-method-cannot-answer.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "A method answers only the codes its row lists: run.status is never 'busy'.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b13-an-unknown-method-answered-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "A method that is not in the table is answered method_unknown, never something else.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b14-unsupported-with-no-reason.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "'unsupported' says why: not_implemented, or the driver flag that is missing.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b15-a-transcript-answer-that-carries-events.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "With projection 'transcript' the answer carries lines, not events.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b16-started-without-the-run.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "A 'started' answer carries the run and whether it was a retry.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b17-a-wait-longer-than-allowed.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "events.follow waits at most 30 seconds.",
+      "expect": {
+        "keyword": "maximum",
+        "at": "/params/wait_ms"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b18-a-stop-that-needs-a-revision.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The row of run.stop can never require a key or a revision.",
+      "expect": {
+        "keyword": "const",
+        "at": "/precondition"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b19-a-mutating-method-without-a-command-id.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "A mutating method other than run.start and run.stop is keyed by command_id.",
+      "expect": {
+        "keyword": "const",
+        "at": "/idempotency"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b20-an-approval-method-offered-as-an-mcp-tool.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "A method that needs 'approve' is never offered as an MCP tool.",
+      "expect": {
+        "keyword": "const",
+        "at": "/mcp/exposed"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b21-a-read-with-a-precondition.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "A method that changes nothing takes no key and no revision.",
+      "expect": {
+        "keyword": "const",
+        "at": "/precondition"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b22-a-row-with-a-code-nobody-defined.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "A row lists codes from the table's own list.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/codes/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b23-a-refusal-that-is-a-success.json",
+      "schema": "methods.v1.json#/$defs/refusal",
+      "rule": "A refusal's code is a refusal.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/code"
+      }
+    },
+    {
       "file": "good/queue.item.v1/h01-queued-for-the-next-turn.json",
       "schema": "queue.item.v1.json",
       "shows": "A message waiting for the current turn to end."
@@ -959,17 +1781,17 @@
     {
       "file": "good/queue.item.v1/h02-steer-edited-twice.json",
       "schema": "queue.item.v1.json",
-      "shows": "A steer message the user edited twice before it was delivered: revision 3."
+      "shows": "A steer message the user edited twice before it was delivered: revision 3. Its place in the order did not change."
     },
     {
       "file": "good/queue.item.v1/h03-delivering.json",
       "schema": "queue.item.v1.json",
-      "shows": "Delivery has begun: from here on the item cannot be edited or withdrawn."
+      "shows": "The daemon has written the item toward the engine and has not yet seen the engine take it. It can no longer be edited."
     },
     {
       "file": "good/queue.item.v1/h04-delivered-into-a-turn.json",
       "schema": "queue.item.v1.json",
-      "shows": "Delivered, with the turn it went into."
+      "shows": "An event from the engine named the delivery: delivered, with the turn it became."
     },
     {
       "file": "good/queue.item.v1/h05-cancelled.json",
@@ -977,9 +1799,14 @@
       "shows": "Withdrawn before delivery."
     },
     {
+      "file": "good/queue.item.v1/h06-outcome-unknown-after-a-restart.json",
+      "schema": "queue.item.v1.json",
+      "shows": "The daemon restarted while the item was being delivered and no engine event names the delivery: nobody can say whether the engine took it. It is shown to the user and never sent again by itself."
+    },
+    {
       "file": "bad/queue.item.v1/b01-delivered-into-no-turn.json",
       "schema": "queue.item.v1.json",
-      "rule": "A delivered item names the turn it went into.",
+      "rule": "A delivered item names the turn it became.",
       "expect": {
         "keyword": "type",
         "at": "/turn_id"
@@ -1015,7 +1842,7 @@
     {
       "file": "bad/queue.item.v1/b05-a-state-nobody-defined.json",
       "schema": "queue.item.v1.json",
-      "rule": "An item is queued, delivering, delivered or cancelled.",
+      "rule": "An item is queued, delivering, delivered, cancelled or outcome_unknown.",
       "expect": {
         "keyword": "enum",
         "at": "/state"
@@ -1040,9 +1867,36 @@
       }
     },
     {
+      "file": "bad/queue.item.v1/b08-delivering-with-no-delivery-id.json",
+      "schema": "queue.item.v1.json",
+      "rule": "Delivery happens under an id, so the engine's own event can close it.",
+      "expect": {
+        "keyword": "type",
+        "at": "/delivery_id"
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/b09-outcome-unknown-claiming-a-turn.json",
+      "schema": "queue.item.v1.json",
+      "rule": "An item whose outcome is unknown did not provably become a turn.",
+      "expect": {
+        "keyword": "type",
+        "at": "/turn_id"
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/b10-no-place-in-the-order.json",
+      "schema": "queue.item.v1.json",
+      "rule": "Every item has its place in the order from the moment it is made.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
       "file": "good/run.record.v1/c01-running-keyed.json",
       "schema": "run.record.v1.json",
-      "shows": "Captured: the stored record of a run started with a client_key, while it runs."
+      "shows": "Captured: the stored record of a run started with a client_key, while it runs. Its start key is a legacy one: no intent."
     },
     {
       "file": "good/run.record.v1/c02-stop-pending.json",
@@ -1067,7 +1921,7 @@
     {
       "file": "good/run.record.v1/h01-every-version-1-addition.json",
       "schema": "run.record.v1.json",
-      "shows": "A stored record that carries every optional addition of version 1, and a start key with a request identity."
+      "shows": "A stored record that carries every optional addition of version 1, and a start key with a version 1 intent."
     },
     {
       "file": "good/run.record.v1/h02-starting-launch-intent.json",
@@ -1080,9 +1934,9 @@
       "shows": "A Stop that arrived before the launch was recorded: kept as an intent, not sent, with no cgroup of its own."
     },
     {
-      "file": "good/run.record.v1/h04-stopped-with-the-removal-proof.json",
+      "file": "good/run.record.v1/h04-launch-snapshot-of-a-key-route-with-a-fallback.json",
       "schema": "run.record.v1.json",
-      "shows": "A stopped run whose attestation is lane STOP's removal proof."
+      "shows": "The effective launch snapshot of an API-key route: the NAME of the variable the key is handed over in, never the key; and the fallback it lists."
     },
     {
       "file": "bad/run.record.v1/b01-stopped-without-an-attestation.json",
@@ -1105,9 +1959,9 @@
     {
       "file": "bad/run.record.v1/b03-a-proof-nobody-knows.json",
       "schema": "run.record.v1.json",
-      "rule": "proof is 'empty' or 'removed'. Any other proof is not evidence of a stop.",
+      "rule": "The stored proof is 'empty'. Any other proof is not evidence of a stop.",
       "expect": {
-        "keyword": "enum",
+        "keyword": "const",
         "at": "/stop_attestation/proof"
       }
     },
@@ -1168,7 +2022,7 @@
     {
       "file": "bad/run.record.v1/b10-a-key-in-the-budget.json",
       "schema": "run.record.v1.json",
-      "rule": "The budget names a reservation and a cap. It never carries or names a key.",
+      "rule": "The budget is the cap. It never carries or names a key.",
       "expect": {
         "keyword": "additionalProperties",
         "at": "/budget"
@@ -1181,6 +2035,51 @@
       "expect": {
         "keyword": "pattern",
         "at": "/run_id"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b12-the-removed-proof-in-the-store-before-it-is-defined.json",
+      "schema": "run.record.v1.json",
+      "rule": "A stored proof of 'removed' is reserved for the lane that owns Stop; until it defines it, the store holds only 'empty'.",
+      "expect": {
+        "keyword": "const",
+        "at": "/stop_attestation/proof"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b13-a-launch-manifest-before-it-is-defined.json",
+      "schema": "run.record.v1.json",
+      "rule": "'launch_manifest' is reserved, not free-form: nobody writes one until the lane that owns Stop has given it fields.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b14-an-intent-digest-with-no-version.json",
+      "schema": "run.record.v1.json",
+      "rule": "intent_version and intent_sha256 always come together.",
+      "expect": {
+        "keyword": "dependentRequired",
+        "at": "/start_key"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b15-a-second-home-for-the-requests-identity.json",
+      "schema": "run.record.v1.json",
+      "rule": "The identity of a request lives in start_key as intent_version and intent_sha256, and nowhere else.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b16-a-key-value-in-the-launch-snapshot.json",
+      "schema": "run.record.v1.json",
+      "rule": "The launch snapshot names the variable a key travels in. It never holds the key.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/route/connection"
       }
     },
     {
@@ -1307,7 +2206,7 @@
       "schema": "run.view.v1.json",
       "rule": "A view that says 'stopped' rests on a proof the schema knows.",
       "expect": {
-        "keyword": "enum",
+        "keyword": "const",
         "at": "/stop_attestation/proof"
       }
     },
@@ -1321,14 +2220,88 @@
       }
     },
     {
+      "file": "good/session.token.v1/h01-grant.json",
+      "schema": "session.token.v1.json",
+      "shows": "The grant the daemon keeps for one token: the token's digest, its session and what it may call. Never sent."
+    },
+    {
+      "file": "good/session.token.v1/h02-grant-revoked.json",
+      "schema": "session.token.v1.json",
+      "shows": "A revoked grant: the token is refused at once."
+    },
+    {
+      "file": "good/session.token.v1/h03-grant-that-may-only-watch.json",
+      "schema": "session.token.v1.json",
+      "shows": "A token that may only read its own session."
+    },
+    {
+      "file": "good/session.token.v1/h04-token-as-it-travels.json",
+      "schema": "session.token.v1.json#/$defs/token",
+      "shows": "The form of a token. This one is made up for the fixture and opens nothing."
+    },
+    {
+      "file": "bad/session.token.v1/b01-a-grant-holding-the-token.json",
+      "schema": "session.token.v1.json",
+      "rule": "The daemon keeps the token's digest, never the token.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/session.token.v1/b02-a-token-that-may-answer-approvals.json",
+      "schema": "session.token.v1.json",
+      "rule": "An approval can never be delegated: an engine cannot approve its own request.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/verbs/1"
+      }
+    },
+    {
+      "file": "bad/session.token.v1/b03-a-grant-for-nothing.json",
+      "schema": "session.token.v1.json",
+      "rule": "A grant names at least one method.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/verbs"
+      }
+    },
+    {
+      "file": "bad/session.token.v1/b04-a-grant-for-no-session.json",
+      "schema": "session.token.v1.json",
+      "rule": "A token is scoped to one session.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/session.token.v1/b05-a-token-that-may-publish.json",
+      "schema": "session.token.v1.json",
+      "rule": "A method that needs 'manage' can never be delegated.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/verbs/0"
+      }
+    },
+    {
+      "file": "bad/session.token.v1/b06-a-token-of-another-form.json",
+      "schema": "session.token.v1.json#/$defs/token",
+      "rule": "A token is 'rst1_' and 43 URL-safe characters.",
+      "expect": {
+        "keyword": "pattern",
+        "at": ""
+      }
+    },
+    {
       "file": "good/session.v1/h01-new-root-session-idle.json",
       "schema": "session.v1.json",
-      "shows": "A session that was just started: idle, no turn yet, no worker."
+      "shows": "A session that was just started: idle, no turn yet, no worker, and the default budget of zero."
     },
     {
       "file": "good/session.v1/h02-live-three-turns-on-one-worker.json",
       "schema": "session.v1.json",
-      "shows": "A multi-turn driver: three turns share one run_id, because one worker stays alive between turns. The third is in progress."
+      "shows": "A multi-turn driver: three turns share one run_id, because one worker stays alive between turns. Each ended turn keeps its own outcome and result; the third is in progress."
     },
     {
       "file": "good/session.v1/h03-idle-with-a-worker-waiting.json",
@@ -1353,7 +2326,12 @@
     {
       "file": "good/session.v1/h07-ended-after-a-failed-and-a-queued-turn.json",
       "schema": "session.v1.json",
-      "shows": "An ended session. One turn failed before it was bound to a run; one was still queued when the session ended."
+      "shows": "An ended session. One turn failed before it was bound to a run, with a typed code; one was still queued when the session ended."
+    },
+    {
+      "file": "good/session.v1/h08-a-turn-that-was-stopped-with-a-result-that-expires.json",
+      "schema": "session.v1.json",
+      "shows": "A turn ended by a Stop, and an earlier turn whose result will stop being readable at a stated time."
     },
     {
       "file": "bad/session.v1/b01-a-root-with-a-parent.json",
@@ -1464,12 +2442,57 @@
       }
     },
     {
-      "file": "bad/session.v1/b13-a-run-without-a-unit-on-a-live-session.json",
+      "file": "bad/session.v1/b13-a-live-session-with-no-unit.json",
       "schema": "session.v1.json",
       "rule": "A 'live' session has a worker: a turn in progress runs in a unit.",
       "expect": {
         "keyword": "type",
         "at": "/worker"
+      }
+    },
+    {
+      "file": "bad/session.v1/b14-an-ended-turn-with-no-outcome.json",
+      "schema": "session.v1.json",
+      "rule": "A turn that ended says how: its outcome is one of the four ways an engine yields.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/turns/0/outcome"
+      }
+    },
+    {
+      "file": "bad/session.v1/b15-an-ended-turn-with-no-result.json",
+      "schema": "session.v1.json",
+      "rule": "A turn's result is stored with the turn: an ended turn has one.",
+      "expect": {
+        "keyword": "type",
+        "at": "/turns/0/result"
+      }
+    },
+    {
+      "file": "bad/session.v1/b16-a-failed-turn-with-no-code.json",
+      "schema": "session.v1.json",
+      "rule": "A failed turn says why, with a typed code.",
+      "expect": {
+        "keyword": "type",
+        "at": "/turns/0/result/code"
+      }
+    },
+    {
+      "file": "bad/session.v1/b17-no-budget.json",
+      "schema": "session.v1.json",
+      "rule": "A session always states its budget; the default is a cap of 0.",
+      "expect": {
+        "keyword": "type",
+        "at": "/budget"
+      }
+    },
+    {
+      "file": "bad/session.v1/b18-a-running-turn-with-an-outcome.json",
+      "schema": "session.v1.json",
+      "rule": "A turn has an outcome only once it has ended.",
+      "expect": {
+        "keyword": "type",
+        "at": "/turns/2/outcome"
       }
     },
     {
@@ -1493,9 +2516,9 @@
       "shows": "Captured: a first Stop that was confirmed at once."
     },
     {
-      "file": "good/stop.result.v1/h01-stopped-with-removal-proof-level-and-claim.json",
+      "file": "good/stop.result.v1/h01-stopped-with-removal-proof-level-claim-and-fence.json",
       "schema": "stop.result.v1.json",
-      "shows": "A Stop as lane STOP will answer it: the removal proof, the containment level, and the key of the sentence to show."
+      "shows": "A Stop as the lane that owns Stop will answer it: the removal proof, the containment level, the key of the sentence to show, and the fence."
     },
     {
       "file": "good/stop.result.v1/h02-pending-not-recorded-after-a-cleanup-error.json",
@@ -1506,6 +2529,16 @@
       "file": "good/stop.result.v1/h03-stopped-with-todays-proof.json",
       "schema": "stop.result.v1.json",
       "shows": "A Stop that carries today's proof, 'empty', in the answer itself."
+    },
+    {
+      "file": "good/stop.result.v1/h04-ended-before-the-stop.json",
+      "schema": "stop.result.v1.json",
+      "shows": "The run had already ended on its own. The answer says it ended, never that it was stopped, and attests nothing."
+    },
+    {
+      "file": "good/stop.result.v1/h05-pending-with-a-launch-already-dispatched.json",
+      "schema": "stop.result.v1.json",
+      "shows": "A pending Stop that also says a launch had been handed to the unit manager before the fence was set."
     },
     {
       "file": "bad/stop.result.v1/b01-stopped-with-a-reason.json",
@@ -1544,12 +2577,12 @@
       }
     },
     {
-      "file": "bad/stop.result.v1/b05-removal-proof-without-the-inode.json",
+      "file": "bad/stop.result.v1/b05-removal-proof-without-the-identity.json",
       "schema": "stop.result.v1.json",
-      "rule": "The 'removed' proof names the cgroup directory by device and inode and says when it was gone.",
+      "rule": "The 'removed' proof names the cgroup directory by its device and inode numbers.",
       "expect": {
-        "keyword": "required",
-        "at": "/attestation"
+        "keyword": "type",
+        "at": "/attestation/cgroup_identity"
       }
     },
     {
@@ -1580,12 +2613,12 @@
       }
     },
     {
-      "file": "bad/stop.result.v1/b09-the-empty-proof-with-removal-fields.json",
+      "file": "bad/stop.result.v1/b09-recorded-true.json",
       "schema": "stop.result.v1.json",
-      "rule": "The 'empty' proof carries no device, inode or removal time.",
+      "rule": "'recorded' is present only when it is false, as today.",
       "expect": {
-        "keyword": "not",
-        "at": "/attestation"
+        "keyword": "const",
+        "at": "/recorded"
       }
     },
     {
@@ -1598,44 +2631,85 @@
       }
     },
     {
+      "file": "bad/stop.result.v1/b11-ended-with-an-attestation.json",
+      "schema": "stop.result.v1.json",
+      "rule": "'ended' never implies a verified removal: it attests nothing.",
+      "expect": {
+        "keyword": "not",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b12-ended-shown-with-a-stopped-sentence.json",
+      "schema": "stop.result.v1.json",
+      "rule": "An 'ended' answer may only carry the sentence for a run that ended before the Stop.",
+      "expect": {
+        "keyword": "const",
+        "at": "/claim"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b13-a-code-nobody-defined.json",
+      "schema": "stop.result.v1.json",
+      "rule": "A client that meets a code it does not know treats the run as not stopped; the schema refuses it.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/code"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b14-a-fence-with-no-incarnation.json",
+      "schema": "stop.result.v1.json",
+      "rule": "A fence fact names the incarnation it is about.",
+      "expect": {
+        "keyword": "required",
+        "at": "/fence"
+      }
+    },
+    {
       "file": "good/transcript.line.v1/h01-engine-output.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for an engine.output event: the payload's text, sanitised, still untrusted, nothing announced."
+      "shows": "The line for an engine.output event (event fixture h03): the payload's text, sanitised, still untrusted, nothing announced."
     },
     {
       "file": "good/transcript.line.v1/h02-state-changed.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a state.changed event: state is the event's 'to'."
+      "shows": "The line for a state.changed event (event fixture h01): state is the run's state in the post-image."
     },
     {
       "file": "good/transcript.line.v1/h03-turn-started.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a turn.started event: the input as sent."
+      "shows": "The line for a turn.started event (event fixture h17): the input as sent."
     },
     {
       "file": "good/transcript.line.v1/h04-approval-requested-moves-focus.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for an approval.requested event. Only this line, from the core, moves focus to the approval."
+      "shows": "The line for an approval.requested event (event fixture h07): the rendered lines, joined. Only this line, from the core, moves focus to the approval."
     },
     {
       "file": "good/transcript.line.v1/h05-tool-call.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a tool.call event: a sentence the core's renderer wrote from typed fields; still untrusted because the name came from the engine."
+      "shows": "The line for a tool.call event (event fixture h04): a sentence the core's renderer wrote from typed fields; still untrusted because the name came from the engine."
     },
     {
       "file": "good/transcript.line.v1/h06-stop-result-pending.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a stop.result event: state is its code, and the condition is announced."
+      "shows": "The line for a stop.result event (event fixture h24): state is its code, and the condition is announced."
     },
     {
       "file": "good/transcript.line.v1/h07-replay-gap.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a replay.gap event."
+      "shows": "The line for a replay.gap event (event fixture h16)."
     },
     {
       "file": "good/transcript.line.v1/h08-usage-with-no-text.json",
       "schema": "transcript.line.v1.json",
       "shows": "A line may have no text: the event is in the transcript, and a plain reader prints nothing for it."
+    },
+    {
+      "file": "good/transcript.line.v1/h09-turn-ended-waiting.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for a turn.ended event (event fixture h18): state is the turn's outcome."
     },
     {
       "file": "bad/transcript.line.v1/b01-engine-text-marked-trusted.json",
@@ -1676,7 +2750,7 @@
     {
       "file": "bad/transcript.line.v1/b05-state-changed-without-its-state.json",
       "schema": "transcript.line.v1.json",
-      "rule": "A state.changed line carries the new state.",
+      "rule": "A state.changed line carries the entity's state.",
       "expect": {
         "keyword": "type",
         "at": "/state"
@@ -1685,7 +2759,7 @@
     {
       "file": "bad/transcript.line.v1/b06-a-negative-time.json",
       "schema": "transcript.line.v1.json",
-      "rule": "time_rel_ms counts up from the first event of the log.",
+      "rule": "time_rel_ms counts up from the first event of the session's log.",
       "expect": {
         "keyword": "minimum",
         "at": "/time_rel_ms"

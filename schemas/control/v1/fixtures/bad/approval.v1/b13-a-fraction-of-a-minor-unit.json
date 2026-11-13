@@ -39,6 +39,24 @@
       "trust": "untrusted"
     }
   ],
+  "rendered": [
+    {
+      "text": "APPROVAL NEEDED",
+      "trust": "trusted"
+    },
+    {
+      "text": "Engine claude_code asks to run the tool Bash in /home/dev/projects/atlas",
+      "trust": "trusted"
+    },
+    {
+      "text": "command: rm -rf build && make",
+      "trust": "untrusted"
+    },
+    {
+      "text": "Answer by its number: 1 approve, 2 deny. Nothing is approved by default.",
+      "trust": "trusted"
+    }
+  ],
   "requested_at": "2026-11-13T07:34:30.000Z",
   "expires_at": "2026-11-13T07:49:30.000Z",
   "state": "pending",
@@ -49,6 +67,7 @@
         "id": "local"
       },
       "surface": "tui",
+      "revision": 1,
       "at": "2026-11-13T07:34:31.000Z"
     }
   ],

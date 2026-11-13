@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "approval.v1.json",
   "title": "approval.v1: one approval request, as a client reads it",
-  "x-version": "1.0-draft.1",
-  "description": "PUBLIC record. The core draws every approval, on every surface, from this record and from nothing else. approval_id is minted by the core, never by an engine or a plugin. source says where the request came from: 'engine_tool' (an engine asked permission for a tool call) or 'plugin_effect' (a plugin asked to carry out an effect). effect is exactly what is being approved, and digest is the SHA-256 of effect's canonical bytes in the form digest_form names: what is drawn is what is approved. display is extra text for the reader (labels and values, in order); it is OUTSIDE the digest, each entry says whether it is trusted, and no surface may show it as if it were the effect. Nothing defaults to approve: a request nobody answers is 'expired' at expires_at, and expired means denied. opened_by lists every principal and surface that showed the request; an answer from a principal and surface that never showed it is refused 'prompt_not_shown'. An answer names the digest that was drawn and the revision it read; the first valid answer wins and a later one is refused. Only an 'owner' or a 'device' principal may answer: an engine, a plugin and a session token never can. 'approved' becomes 'consumed' when the effect is carried out, once. 'vetoed' is a refusal that is final for that digest. No credential appears in this record. The daemon also keeps a private binding from the approval to the engine's own pending request ($defs/binding); it never leaves the daemon.",
+  "x-version": "1.0-draft.2",
+  "description": "PUBLIC record. The core draws every approval, on every surface, from this record and from nothing else. approval_id is minted by the core, never by an engine or a plugin. source says where the request came from: 'engine_tool' (an engine asked permission for a tool call) or 'plugin_effect' (a plugin asked to carry out an effect). effect is exactly what is being approved, and digest is the SHA-256 of effect's canonical bytes in the form digest_form names: what is drawn is what is approved. display is extra text for the reader (labels and values, in order); it is OUTSIDE the digest, each entry says whether it is trusted, and no surface may show it as if it were the effect. rendered is the lines the core's own renderer produced for this request: a surface prints these lines and composes no approval text of its own. Nothing defaults to approve: a request nobody answers is 'expired' at expires_at, and expired means denied. THE PROTOCOL: approval.list returns summaries ($defs/summary) and does not count as showing anything. A surface calls approval.open when it actually displays the prompt; that records the principal, the surface and the request's revision in opened_by and returns this record. approval.answer names the digest that was drawn and the revision it read; from a principal and surface with no open record for the current revision it is refused 'prompt_not_shown'. The first valid answer wins and a later one is refused. Only an 'owner' or a 'device' principal may open or answer: an engine, a plugin and a session token never can. 'approved' becomes 'consumed' when the effect is carried out, once. 'vetoed' is a refusal that is final for that digest. No credential appears in this record. The daemon also keeps a private binding from the approval to the engine's own pending request ($defs/binding); it never leaves the daemon.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["approval_id", "session_id", "run_id", "turn_id", "source", "effect", "digest_form", "digest", "display", "requested_at", "expires_at", "state", "opened_by", "answered_by", "answer", "answered_at", "revision"],
+  "required": ["approval_id", "session_id", "run_id", "turn_id", "source", "effect", "digest_form", "digest", "display", "rendered", "requested_at", "expires_at", "state", "opened_by", "answered_by", "answer", "answered_at", "revision"],
   "properties": {
     "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
     "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/log_id"}]},
@@ -33,18 +33,35 @@
         }
       }
     },
+    "rendered": {
+      "description": "The request as the core's renderer wrote it, line by line: a fixed header, then the effect, then any text that came from an engine or a plugin, passed through the sanitizer and marked untrusted. Every surface prints exactly these lines.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "trust"],
+        "properties": {
+          "text": {"type": "string", "maxLength": 4096, "not": {"pattern": "[\\r\\n]"}},
+          "trust": {"enum": ["trusted", "untrusted"]}
+        }
+      }
+    },
     "requested_at": {"$ref": "common.v1.json#/$defs/timestamp"},
     "expires_at": {"$ref": "common.v1.json#/$defs/timestamp"},
-    "state": {"enum": ["pending", "approved", "denied", "expired", "consumed", "vetoed"]},
+    "state": {"$ref": "#/$defs/state"},
     "opened_by": {
+      "description": "Every showing of the request that was recorded by approval.open: who, on which surface, at which revision of the request, and when.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["principal", "surface", "at"],
+        "required": ["principal", "surface", "revision", "at"],
         "properties": {
-          "principal": {"$ref": "common.v1.json#/$defs/principal"},
+          "principal": {"$ref": "#/$defs/approver"},
           "surface": {"$ref": "#/$defs/surface"},
+          "revision": {"$ref": "common.v1.json#/$defs/revision"},
           "at": {"$ref": "common.v1.json#/$defs/timestamp"}
         }
       }
@@ -77,6 +94,27 @@
     }
   ],
   "$defs": {
+    "state": {
+      "description": "pending: nobody has answered. approved: answered 'approve'; the effect may be carried out once. consumed: it was carried out. denied: answered 'deny'. vetoed: refused, and final for that digest. expired: the deadline passed with no answer, which means denied.",
+      "enum": ["pending", "approved", "denied", "expired", "consumed", "vetoed"]
+    },
+    "summary": {
+      "description": "What approval.list returns for each request: enough to list it and to count down its deadline, and nothing that could be taken for the prompt itself. Reading a summary is not showing the request.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approval_id", "session_id", "run_id", "turn_id", "source", "state", "requested_at", "expires_at", "revision"],
+      "properties": {
+        "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
+        "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/log_id"}]},
+        "run_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]},
+        "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
+        "source": {"enum": ["engine_tool", "plugin_effect"]},
+        "state": {"$ref": "#/$defs/state"},
+        "requested_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+        "expires_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+        "revision": {"$ref": "common.v1.json#/$defs/revision"}
+      }
+    },
     "surface": {
       "description": "The kind of surface that drew the request.",
       "enum": ["cli", "tui", "page", "phone"]

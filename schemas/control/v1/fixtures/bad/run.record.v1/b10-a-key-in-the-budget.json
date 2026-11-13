@@ -10,7 +10,8 @@
     "client_key": "k-1",
     "engine": "claude_code",
     "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "request_identity": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    "intent_version": 1,
+    "intent_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
   },
   "generation": 2,
   "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
@@ -27,7 +28,34 @@
   "route": {
     "engine": "claude_code",
     "model": "claude-sonnet-5-5",
-    "connection": "subscription:personal-max"
+    "connection": {
+      "kind": "subscription",
+      "id": "personal-max"
+    }
+  },
+  "route_decision": {
+    "chosen": {
+      "engine": "claude_code",
+      "model": "claude-sonnet-5-5",
+      "connection": {
+        "kind": "subscription",
+        "id": "personal-max"
+      }
+    },
+    "reason": "config",
+    "candidates": [
+      {
+        "engine": "codex",
+        "model": null,
+        "skipped": "breaker_open"
+      },
+      {
+        "engine": "claude_code",
+        "model": "claude-sonnet-5-5",
+        "skipped": null
+      }
+    ],
+    "hand_pick": null
   },
   "engine_session_id": "0d7c5a52-9a0e-4a43-9d57-5b9a1c6f2e11",
   "continues": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
@@ -35,8 +63,8 @@
     "kind": "owner",
     "id": "local"
   },
+  "owner": "host",
   "budget": {
-    "reservation_id": "res-00a1",
     "cap_usd": 5.0,
     "credential": "redacted"
   },
@@ -44,5 +72,9 @@
     "owner": "daemon",
     "epoch": 3,
     "expires_at": "2026-11-13T08:10:00.000Z"
+  },
+  "cgroup_identity": {
+    "st_dev": 27,
+    "st_ino": 18446
   }
 }

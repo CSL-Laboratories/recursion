@@ -2,30 +2,31 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "stop.result.v1.json",
   "title": "stop.result.v1: what a Stop answers",
-  "x-version": "1.0-draft.1",
-  "description": "The answer of run.stop when the run exists: 'stopped' or 'pending'. 'stopped' is answered only on evidence that the run's supervised cgroup holds no process; without that evidence the answer is 'pending' with a reason, never 'stopped'. The first three fields and 'repeat', 'reason' and 'recorded' are what the daemon answers today. 'attestation', 'containment_level' and 'claim' are new in version 1 and optional until lane STOP writes them. A client that meets a 'proof' it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
+  "x-version": "1.0-draft.2",
+  "description": "The answer of run.stop when the run exists. THE LEGACY ANSWER is exactly what the daemon answers today and stays valid: code 'stopped' or 'pending', 'state' with the same word, 'repeat' on a stopped answer, 'reason' on a pending one, and 'recorded' only when it is false. THE ADDITIONS are optional, and each is added to the daemon's answers by the lane that owns Stop, in a versioned step of its own, never by the lane that wrote this schema: the code 'ended', and the fields 'attestation', 'containment_level', 'claim' and 'fence'. Until then no answer carries them, and the answer for a run id that was never registered stays today's. MEANINGS, frozen: 'stopped' means the run's removal was attested (today by proof 'empty'; by 'removed' once that is added). 'ended' means the run had already ended before this Stop, and this call stopped nothing; it never implies a verified removal. 'pending' means neither is established. A client that meets a code or a proof it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
   "type": "object",
   "additionalProperties": false,
   "required": ["code", "run_id", "state"],
   "properties": {
-    "code": {"enum": ["stopped", "pending"]},
+    "code": {"enum": ["stopped", "pending", "ended"]},
     "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
     "state": {
       "description": "The same word as 'code'. It is kept because today's answer carries both.",
-      "enum": ["stopped", "pending"]
+      "enum": ["stopped", "pending", "ended"]
     },
     "reason": {"$ref": "#/$defs/pending_reason"},
     "repeat": {
-      "description": "False for the first Stop asked of a run. True when a Stop had already been asked: the run was already stopped, or an earlier Stop was pending and this one confirmed it.",
+      "description": "False for the first Stop asked of a run. True when a Stop had already been asked: the run was already stopped, or an earlier Stop was pending and this one confirmed it. It does not mean 'the run had already stopped'.",
       "type": "boolean"
     },
     "recorded": {
-      "description": "False when the answer could not be written to the registry. Today the field is present only when it is false; an absent field means the write landed. 'Not recorded' is its own fact: the cleanup answer above is still true.",
-      "type": "boolean"
+      "description": "Present only when it is false: the answer could not be written to the registry. An absent field means the write landed. 'Not recorded' is its own fact: the cleanup answer above is still true.",
+      "const": false
     },
     "attestation": {"$ref": "#/$defs/attestation"},
     "containment_level": {"$ref": "#/$defs/containment_level"},
-    "claim": {"$ref": "#/$defs/claim"}
+    "claim": {"$ref": "#/$defs/claim"},
+    "fence": {"$ref": "#/$defs/fence"}
   },
   "allOf": [
     {
@@ -43,6 +44,14 @@
         "properties": {"state": {"const": "pending"}},
         "not": {"anyOf": [{"required": ["repeat"]}, {"required": ["attestation"]}, {"required": ["claim"]}]}
       }
+    },
+    {
+      "if": {"required": ["code"], "properties": {"code": {"const": "ended"}}},
+      "then": {
+        "properties": {"state": {"const": "ended"}, "claim": {"const": "ended_before_stop_removal_unverified"}},
+        "not": {"anyOf": [{"required": ["reason"]}, {"required": ["repeat"]}, {"required": ["attestation"]}]}
+      },
+      "else": {"properties": {"claim": {"enum": ["cgroup_empty_whole_run_unverified", "cgroup_removed_whole_run_unverified"]}}}
     }
   ],
   "$defs": {
@@ -56,38 +65,36 @@
       "not": {"pattern": "[\\r\\n]"}
     },
     "attestation": {
-      "description": "The evidence a 'stopped' rests on. proof 'empty' (today): the cgroup named here was read empty and every member listed was gone, at this generation of the record. proof 'removed' (lane STOP): the cgroup directory recorded at launch, identified by its device and inode numbers, no longer exists or is a different directory, as observed at removed_at. A client that meets any other proof treats the run as NOT stopped.",
+      "description": "PROVISIONAL, the Stop lane's. The evidence a 'stopped' answer rests on, carried in the answer itself. proof 'empty': the cgroup at this path was read empty. proof 'removed': the cgroup directory recorded at launch, identified by cgroup_identity, no longer exists or is a different directory. time is when that was observed. cgroup_identity is null only when none was recorded at launch, which is possible only with proof 'empty'. A client that meets any other proof treats the run as NOT stopped.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["proof", "cgroup", "cgroup_marker", "member_ids", "generation"],
+      "required": ["proof", "cgroup", "cgroup_identity", "time"],
       "properties": {
         "proof": {"enum": ["empty", "removed"]},
         "cgroup": {"type": "string", "minLength": 1},
-        "cgroup_marker": {"type": "string", "minLength": 1},
-        "member_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "generation": {"type": "integer", "minimum": 1},
-        "cgroup_dev": {"description": "st_dev of the unit's cgroup directory, read at launch.", "type": "integer", "minimum": 0},
-        "cgroup_ino": {"description": "st_ino of the unit's cgroup directory, read at launch.", "type": "integer", "minimum": 0},
-        "removed_at": {"$ref": "common.v1.json#/$defs/timestamp"}
+        "cgroup_identity": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/cgroup_identity"}]},
+        "time": {"$ref": "common.v1.json#/$defs/timestamp"}
       },
-      "allOf": [
-        {
-          "if": {"required": ["proof"], "properties": {"proof": {"const": "removed"}}},
-          "then": {"required": ["cgroup_dev", "cgroup_ino", "removed_at"]}
-        },
-        {
-          "if": {"required": ["proof"], "properties": {"proof": {"const": "empty"}}},
-          "then": {"not": {"anyOf": [{"required": ["cgroup_dev"]}, {"required": ["cgroup_ino"]}, {"required": ["removed_at"]}]}}
-        }
-      ]
+      "if": {"required": ["proof"], "properties": {"proof": {"const": "removed"}}},
+      "then": {"properties": {"cgroup_identity": {"type": "object"}}}
     },
     "containment_level": {
-      "description": "How the run was contained when it launched. host_integrated: the engine ran as the daemon's own user in a delegated unit (the only level that exists today). engine_user: the engine ran as a separate operating-system user. contained: the unit also ran with the verified restrictions lane STOP defines. PROVISIONAL: the level names are lane STOP's and wait on a decision.",
+      "description": "PROVISIONAL, the Stop lane's, and it waits on a decision. How the run was contained when it launched. host_integrated: the engine ran as the daemon's own user in a delegated unit (the only level that exists today). engine_user: the engine ran as a separate operating-system user. contained: the unit also ran with the verified restrictions that lane defines.",
       "enum": ["host_integrated", "engine_user", "contained"]
     },
     "claim": {
-      "description": "The key of the sentence a surface shows for this Stop. No surface writes its own wording. cgroup_empty_whole_run_unverified: the supervised cgroup was read empty; nothing is claimed about a process that left it. cgroup_removed_whole_run_unverified: the supervised cgroup is gone; nothing is claimed about a process that left it. PROVISIONAL: lane STOP owns the list of keys.",
-      "enum": ["cgroup_empty_whole_run_unverified", "cgroup_removed_whole_run_unverified"]
+      "description": "PROVISIONAL, the Stop lane's. The key of the sentence a surface shows for this Stop. No surface writes its own wording. cgroup_empty_whole_run_unverified: the supervised cgroup was read empty; nothing is claimed about a process that left it. cgroup_removed_whole_run_unverified: the supervised cgroup is gone; nothing is claimed about a process that left it. ended_before_stop_removal_unverified: the run had ended before the Stop; this call stopped nothing and no removal was verified.",
+      "enum": ["cgroup_empty_whole_run_unverified", "cgroup_removed_whole_run_unverified", "ended_before_stop_removal_unverified"]
+    },
+    "fence": {
+      "description": "PROVISIONAL, the Stop lane's. Whether a launch of this run can still be dispatched. 'fenced': no later launch under this run id and incarnation will start. 'dispatched': a launch had already been handed to the unit manager when the fence was set. incarnation counts the launches under one run id.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "incarnation"],
+      "properties": {
+        "state": {"enum": ["fenced", "dispatched"]},
+        "incarnation": {"type": "integer", "minimum": 0}
+      }
     }
   }
 }

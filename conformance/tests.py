@@ -52,15 +52,28 @@ class PublishedFilesTest(unittest.TestCase):
         It does so itself (``additionalProperties``), or in every one of its forms: each branch of its
         ``oneOf``, or each ``then`` of the ``if`` rules in its ``allOf``. A sub-schema inside a rule
         (``allOf``, ``if``, ``then``, ``else``, ``not``) refines an object that is closed where it is
-        defined, so it is not asked again. Seven objects are open on purpose and are listed here, each with its reason
+        defined, so it is not asked again. A few objects are open on purpose and are listed here, each with its reason
         in the schema: they hold an engine's, a vendor's or a plugin's own data, and no consumer reads
         typed fields out of them.
         """
         open_on_purpose = {
             ("event.v1.json", "/properties/payload"),                     # typed per type by the rules below it
+            ("event.v1.json", "/$defs/state.changed/properties/post_image"),  # typed per entity by the rules below it
             ("event.v1.json", "/$defs/tool.call/properties/input"),       # the tool's own input, untrusted
+            ("run.record.v1.json", "/$defs/launch_route/properties/profile"),  # the engine adapter's own object
             ("run.view.v1.json", "/$defs/result/oneOf/1/properties/events/items/properties/data"),  # the adapter's
             ("run.view.v1.json", "/$defs/result/oneOf/1/properties/limit_notice"),                  # the adapter's
+            ("methods.v1.json", "/$defs/request/properties/params"),      # typed per method by the rules below it
+            ("methods.v1.json", "/$defs/exchange/properties/params"),     # typed per method by the rules below it
+            ("methods.v1.json", "/$defs/exchange/properties/answer"),     # typed per method by the rules below it
+            ("methods.v1.json", "/$defs/refused_exchange/properties/params"),  # a malformed request, on purpose
+            ("methods.v1.json", "/$defs/params.operator.read/properties/command"),          # the operator plugin's
+            ("methods.v1.json", "/$defs/answer.operator.read/anyOf/0/properties/body"),     # the operator plugin's
+            ("methods.v1.json", "/$defs/params.plugin.call/properties/arguments"),          # the plugin's own
+            ("methods.v1.json", "/$defs/answer.plugin.call/anyOf/0/properties/result"),     # the plugin's own
+            ("api.v1.json", "/$defs/registry/properties/panels/items"),   # a panel's shape is the page's
+            ("api.v1.json", "/$defs/registry/properties/required"),       # the page's
+            ("api.v1.json", "/$defs/tool/properties/input_schema"),       # a JSON Schema, the plugin's own
             ("approval.v1.json", "/properties/effect"),                   # typed per source by the rules below it
             ("approval.v1.json", "/$defs/plugin_effect/properties/payload"),  # the plugin's own data, never read
             ("driver.v2.json", "/$defs/event_draft/properties/payload"),  # typed per type by the rules below it
@@ -145,6 +158,49 @@ class PublishedFilesTest(unittest.TestCase):
                      for entry in client.load_index(folder)
                      if entry["schema"] == "event.v1.json" and entry["file"].startswith("good/")}
             self.assertEqual(sorted(set(types) - shown), [], "event types with no good fixture")
+
+    def test_the_method_table_agrees_with_its_schema(self):
+        """methods.table.v1.json is the table; methods.v1.json describes it and every method's params and answers."""
+        for folder, schemas in self.sets.items():
+            schema = schemas.schemas.get("methods.v1.json")
+            if schema is None:
+                continue
+            table = client.read_json(folder / "methods.table.v1.json")
+            errors = client.leaf_errors(schemas.validator("methods.v1.json"), table)
+            self.assertEqual(errors, [], "the table does not validate against the schema's root")
+            defs = schema["$defs"]
+            names = [row["name"] for row in table["methods"]]
+            self.assertEqual(len(names), len(set(names)), "a method has two rows")
+            self.assertEqual(sorted(names), sorted(defs["method_name"]["enum"]), "rows and method names differ")
+            self.assertEqual(table["table_version"], schema["x-version"])
+            mutating_without_key = []
+            for row in table["methods"]:
+                name = row["name"]
+                with self.subTest(method=name):
+                    self.assertEqual(row["params"], f"#/$defs/params.{name}")
+                    self.assertEqual(row["result"], f"#/$defs/answer.{name}")
+                    params, answer = defs[f"params.{name}"], defs[f"answer.{name}"]
+                    # Every code the row lists is one the answer schema allows, and the other way round.
+                    refusals = answer["anyOf"][1]["allOf"][1]["properties"]["code"]["enum"]
+                    listed_refusals = [code for code in row["codes"] if code in defs["refusal"]["properties"]["code"]["enum"]]
+                    self.assertEqual(sorted(listed_refusals), sorted(refusals))
+                    self.assertTrue(set(row["codes"]) - set(refusals), "a row lists no success code")
+                    # What the row says about keys and revisions is what the params schema requires.
+                    required = set(params.get("required", ()))
+                    self.assertEqual("command_id" in required, row["idempotency"] == "command_id")
+                    self.assertEqual(row["precondition"] in required, row["precondition"] != "none")
+                    self.assertNotIn("principal", params.get("properties", {}))
+                    self.assertNotIn("owner", params.get("properties", {}))
+                    if row["mutating"] and row["idempotency"] == "none":
+                        mutating_without_key.append(name)
+                    if row["mcp"]["exposed"]:
+                        self.assertEqual(row["mcp"]["tool"], "recursion_" + name.replace(".", "_"))
+            self.assertEqual(mutating_without_key, ["run.stop"], "only an emergency Stop may mutate without a key")
+            requests = {client.read_json(folder / "fixtures" / entry["file"])["method"]
+                        for entry in client.load_index(folder)
+                        if entry["schema"].startswith("methods.v1.json#/$defs/") and entry["file"].startswith("good/")
+                        and entry["schema"].split("/")[-1] in ("request", "exchange")}
+            self.assertEqual(sorted(set(names) - requests), [], "methods with no good request or exchange fixture")
 
     def test_the_public_run_view_carries_every_field_of_the_stored_record(self):
         for schemas in self.sets.values():

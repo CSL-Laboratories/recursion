@@ -12,6 +12,8 @@ First drafts. Nothing is frozen.
 |---|---|---|
 | `manifest.v1.json` | 1.0-draft.1 | The ten present fields, plus `runtime`, `interface`, `files`; five provisional permission names appended |
 | `install.v1.json` | 1.0-draft.1 | Today's `install.json`, with nothing added |
+| `api.v1.json` | 1.0-draft.1 | A skeleton of the entry points as data, and five rules that hold whatever the shapes become |
+| `revoked-keys.v1.json` | 1.0-draft.1 | The minimum: a rising list version, issue and expiry times, the revoked keys, the list key's signature |
 
 ### Provisional choices in this draft
 

@@ -5,13 +5,35 @@
     "model": null,
     "bucket": null,
     "span": "turn",
-    "input_tokens": null,
-    "output_tokens": 0,
-    "reasoning_tokens": null,
-    "cache_read_tokens": null,
-    "cache_write_tokens": null,
-    "cost_usd": null,
-    "quality": "unknown",
-    "provenance": "unavailable"
+    "input_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "output_tokens": {
+      "value": 0,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "reasoning_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cache_write_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cost_usd": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    }
   }
 }

@@ -2,6 +2,113 @@
   "about": "Every fixture of this folder. A file under good/ must validate against 'schema'. A file under bad/ must be refused, and 'rule' says which rule it breaks; 'expect' names the schema keyword that refuses it and the place in the fixture where it does (a JSON Pointer, '' for the whole value). The keys and digests are made up for the fixtures.",
   "fixtures": [
     {
+      "file": "good/api.v1/h01-a-command.json",
+      "schema": "api.v1.json#/$defs/command",
+      "shows": "One command a plugin offers. A user reaches it only through plugin.call."
+    },
+    {
+      "file": "good/api.v1/h02-a-tool.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "shows": "One tool a plugin declares, as data. A call of it waits for approval like any other effect."
+    },
+    {
+      "file": "good/api.v1/h03-a-subscription.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "shows": "The event types a plugin asks to be given."
+    },
+    {
+      "file": "good/api.v1/h04-a-theme.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "shows": "A theme a plugin offers. It never reaches the approval area."
+    },
+    {
+      "file": "good/api.v1/h05-a-run-a-plugin-owns.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "shows": "What a plugin passes to start a run it owns. The host adds who is asking and who owns the run."
+    },
+    {
+      "file": "good/api.v1/h06-what-the-host-attaches-to-a-call.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "shows": "The principal the host sets on every call a plugin makes into the core."
+    },
+    {
+      "file": "good/api.v1/h07-registry-as-today.json",
+      "schema": "api.v1.json#/$defs/registry",
+      "shows": "What registry() returns today: panels and what they require. A panel's shape is the page's."
+    },
+    {
+      "file": "bad/api.v1/b01-a-command-behind-another-permission.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "A command is offered with the 'command' permission and no other.",
+      "expect": {
+        "keyword": "const",
+        "at": "/permission"
+      }
+    },
+    {
+      "file": "bad/api.v1/b02-a-run-request-naming-its-owner.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The host sets a run's owner. A plugin that names one, its own or another's, is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/b03-a-run-request-naming-a-principal.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The host sets the principal. A plugin cannot say who it is.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/b04-a-call-as-the-owner.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "A plugin's calls carry a plugin principal, whatever the plugin would like.",
+      "expect": {
+        "keyword": "const",
+        "at": "/principal/kind"
+      }
+    },
+    {
+      "file": "bad/api.v1/b05-a-call-as-the-core.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "No plugin can carry the core's own name.",
+      "expect": {
+        "keyword": "not",
+        "at": "/principal/id"
+      }
+    },
+    {
+      "file": "bad/api.v1/b06-a-subscription-to-nothing.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "rule": "A subscription names at least one event type.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/types"
+      }
+    },
+    {
+      "file": "bad/api.v1/b07-a-tool-with-no-input-schema.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "A tool is declared as data: its input's schema is part of the declaration.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/b08-a-surface-that-is-not-a-theme-or-a-layout.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "A plugin offers themes and layouts; it cannot offer an approval surface.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/kind"
+      }
+    },
+    {
       "file": "good/install.v1/h01-one-trusted-key-one-grant.json",
       "schema": "install.v1.json",
       "shows": "One trusted developer key and one grant bound to a digest and that key."
@@ -195,6 +302,75 @@
       "rule": "The manifest is a closed set of fields: the signed bytes mean one thing.",
       "expect": {
         "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "good/revoked-keys.v1/h01-one-revoked-key.json",
+      "schema": "revoked-keys.v1.json",
+      "shows": "A list that revokes one developer key, signed by a list key. The signature here is made up for the fixture."
+    },
+    {
+      "file": "good/revoked-keys.v1/h02-an-empty-list.json",
+      "schema": "revoked-keys.v1.json",
+      "shows": "A list that revokes nothing is still a list: it has a version, so an older one cannot replace it."
+    },
+    {
+      "file": "good/revoked-keys.v1/h03-two-keys-for-different-reasons.json",
+      "schema": "revoked-keys.v1.json",
+      "shows": "Two keys, one retired and one with no reason given."
+    },
+    {
+      "file": "bad/revoked-keys.v1/b01-a-list-with-no-version.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A list carries its version, so a lower one than the last accepted can be refused.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b02-version-zero.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "list_version starts at 1 and only rises.",
+      "expect": {
+        "keyword": "minimum",
+        "at": "/list_version"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b03-an-unsigned-list.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A list is applied only when it is signed by a list key the install trusts.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b04-a-signature-of-another-kind.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The signature is Ed25519.",
+      "expect": {
+        "keyword": "const",
+        "at": "/signature/alg"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b05-a-key-named-by-its-label.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A revoked key is named by its key id, not by a label an install gave it.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/keys/0/key_id"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b06-a-list-that-never-expires.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A list says when it expires; what an install does then is not decided, and the last accepted list stays in force.",
+      "expect": {
+        "keyword": "required",
         "at": ""
       }
     }

@@ -1,5 +1,8 @@
 {
   "engine": "claude_code",
   "model": "claude-sonnet-5-5",
-  "connection": "subscription:personal-max"
+  "connection": {
+    "kind": "subscription",
+    "id": "personal-max"
+  }
 }

@@ -1,6 +1,6 @@
 {
-  "cgroup": "/test.slice/recursion-run-run-26b009676bce471fa86d592c09df1adc.service",
-  "cgroup_marker": "cg-9a28a77cc36d4c5a89fe7284e4bf823a",
+  "cgroup": "/test.slice/recursion-run-run-17d4a69723244aa087c0942d2be267d4.service",
+  "cgroup_marker": "cg-438ad55eb8c74a349d9239e40ebb5b30",
   "engine": "claude_code",
   "generation": 4,
   "members": [],
@@ -8,13 +8,13 @@
     "detail": "",
     "state": "terminated",
     "stop_requested": true,
-    "unit": "recursion-run-run-26b009676bce471fa86d592c09df1adc.service"
+    "unit": "recursion-run-run-17d4a69723244aa087c0942d2be267d4.service"
   },
   "output": {
-    "bytes": 2179,
+    "bytes": 2173,
     "complete": true,
     "lines": [
-      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 85804, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 196841, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
       "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_stdin_eof\", \"note\": \"stdin closed; not treated as cancellation\"}",
       "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 1\"}]}}",
       "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 2\"}]}}",
@@ -31,25 +31,38 @@
       "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_sigint\", \"note\": \"SIGINT received: the daemon told the engine to stop\"}"
     ]
   },
-  "run_id": "run-26b009676bce471fa86d592c09df1adc",
+  "result": {
+    "breaker_effect": "none",
+    "code": "engine_exited",
+    "contract": "recursion.route/v0",
+    "detail": "stdout closed before result",
+    "events": [],
+    "limit": null,
+    "limit_notice": null,
+    "request_id": "run-17d4a69723244aa087c0942d2be267d4",
+    "retry_at": null,
+    "status": "error",
+    "text": ""
+  },
+  "run_id": "run-17d4a69723244aa087c0942d2be267d4",
   "start_key": {
     "client_key": "capture-1",
     "engine": "claude_code",
     "prompt_sha256": "3d7bb8776dad8b047d66746d9cd47c1b0c937eaba3ad596075a229b4a3137a98"
   },
-  "started_at": 1794555971.7227964,
+  "started_at": 1794559509.998849,
   "state": "stopped",
   "stop": {
-    "cgroup": "/test.slice/recursion-run-run-26b009676bce471fa86d592c09df1adc.service",
-    "cgroup_marker": "cg-9a28a77cc36d4c5a89fe7284e4bf823a",
+    "cgroup": "/test.slice/recursion-run-run-17d4a69723244aa087c0942d2be267d4.service",
+    "cgroup_marker": "cg-438ad55eb8c74a349d9239e40ebb5b30",
     "checks": 2,
     "reason": null,
     "requested": true,
-    "requested_at": 1794555971.8236315
+    "requested_at": 1794559510.1080728
   },
   "stop_attestation": {
-    "cgroup": "/test.slice/recursion-run-run-26b009676bce471fa86d592c09df1adc.service",
-    "cgroup_marker": "cg-9a28a77cc36d4c5a89fe7284e4bf823a",
+    "cgroup": "/test.slice/recursion-run-run-17d4a69723244aa087c0942d2be267d4.service",
+    "cgroup_marker": "cg-438ad55eb8c74a349d9239e40ebb5b30",
     "generation": 3,
     "member_ids": [],
     "proof": "empty"

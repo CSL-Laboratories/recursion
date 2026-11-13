@@ -7,6 +7,7 @@
     "turn_id": "turn-000c"
   },
   "status": "working",
+  "outcome": null,
   "cancel_requested": true,
   "status_message": "stop pending: cgroup_populated",
   "pending_approval_ids": [],

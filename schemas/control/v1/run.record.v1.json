@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "run.record.v1.json",
   "title": "run.record.v1: the run record as the registry stores it",
-  "x-version": "1.0-draft.1",
-  "description": "STORAGE record. This is the JSON document the daemon's registry keeps for one run (core/recursion_core/control/registry.py). The twelve required fields are exactly what is stored today and none of them changes in version 1. The other fields are optional additions: each is either absent or carries a value, and null is not used for them. What a client reads from run.status and run.list is a different record, run.view.v1.",
+  "x-version": "1.0-draft.2",
+  "description": "STORAGE record. This is the JSON document the daemon's registry keeps for one run (core/recursion_core/control/registry.py). The twelve required fields are exactly what is stored today and none of them changes in version 1, including 'start_key' and 'stop_attestation' in today's shapes. The other fields are optional additions: each is either absent or carries a value, and null is not used for them. NONE of the additions is ever copied from a request's params: principal comes from the way the request came in, owner from that principal, budget from the quota part of start normalisation, route, route_decision and workspace from the validated output of start normalisation, and session_id and turn_id only from the daemon's own session service. RESERVED, and refused by this schema until the lane that owns Stop defines them: a 'launch_manifest' field, and a stored attestation whose proof is 'removed'. What a client reads from run.status and run.list is a different record, run.view.v1.",
   "type": "object",
   "additionalProperties": false,
   "required": ["run_id", "tenant", "engine", "state", "cgroup", "started_at", "stop", "start_key", "generation", "cgroup_marker", "members", "stop_attestation"],
@@ -23,12 +23,15 @@
     "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
     "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
     "workspace": {"$ref": "common.v1.json#/$defs/workspace"},
-    "route": {"$ref": "common.v1.json#/$defs/route"},
+    "route": {"$ref": "#/$defs/launch_route"},
+    "route_decision": {"$ref": "common.v1.json#/$defs/route_decision"},
     "engine_session_id": {"$ref": "#/$defs/engine_session_id"},
     "continues": {"$ref": "#/$defs/continues"},
     "principal": {"$ref": "common.v1.json#/$defs/principal"},
+    "owner": {"$ref": "common.v1.json#/$defs/owner"},
     "budget": {"$ref": "common.v1.json#/$defs/budget"},
-    "lease": {"$ref": "common.v1.json#/$defs/lease"}
+    "lease": {"$ref": "common.v1.json#/$defs/lease"},
+    "cgroup_identity": {"$ref": "common.v1.json#/$defs/cgroup_identity"}
   },
   "allOf": [{"$ref": "#/$defs/stopped_rules"}],
   "$defs": {
@@ -83,7 +86,7 @@
       }
     },
     "start_key": {
-      "description": "null for a start with no client_key. Otherwise what a retried start is compared with: the key, the engine, and the SHA-256 of the prompt's UTF-8 bytes (the prompt itself is not stored). request_identity is new in version 1 and optional: when the start was normalised (workspace, route, model, profile), it is the digest of that normalised request, and a retry with the same key and another identity is refused client_key_reused. A stored key without one is compared as today.",
+      "description": "null for a start with no client_key. Otherwise what a retried start is compared with. The three required fields are today's: the key, the engine, and the SHA-256 of the prompt's UTF-8 bytes (the prompt itself is not stored). intent_version and intent_sha256 are new in version 1, optional, and always come together: they are the only place the identity of a request is kept. The daemon computes the INTENT from what the client sent, never from a digest the client supplies. Version 1 is the JSON, with sorted keys, UTF-8 and no insignificant space, of {engine as given or null, prompt_sha256, workspace as given or null, hand_pick or null, containment_level or null, session_id or null}, where missing and null are the same; intent_sha256 is its SHA-256. A retry is looked up by (tenant, client_key) before anything is normalised: with a stored intent, an equal intent_sha256 is a retry and anything else is refused client_key_reused; with a key that has no intent (a legacy key), a request whose intent has only engine and prompt is compared as today, and a request with any other field set is refused client_key_reused.",
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["client_key", "engine", "prompt_sha256"],
@@ -91,11 +94,59 @@
         "client_key": {"type": "string"},
         "engine": {"$ref": "#/$defs/engine_as_given"},
         "prompt_sha256": {"$ref": "common.v1.json#/$defs/sha256"},
-        "request_identity": {"$ref": "common.v1.json#/$defs/sha256"}
-      }
+        "intent_version": {"const": 1},
+        "intent_sha256": {"$ref": "common.v1.json#/$defs/sha256"}
+      },
+      "dependentRequired": {"intent_version": ["intent_sha256"], "intent_sha256": ["intent_version"]}
     },
     "stop_attestation": {
-      "anyOf": [{"type": "null"}, {"$ref": "stop.result.v1.json#/$defs/attestation"}]
+      "description": "null unless the run is stopped. The stored proof is today's and only today's: 'empty', which says that the cgroup named here was read empty and every member listed was gone, at this generation of the record. A stored proof of 'removed' is RESERVED: the lane that owns Stop adds it together with the registry's own proof checks, and until then this schema refuses it. A reader that meets a proof it does not know treats the run as NOT stopped.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["proof", "cgroup", "cgroup_marker", "member_ids", "generation"],
+      "properties": {
+        "proof": {"const": "empty"},
+        "cgroup": {"type": "string", "minLength": 1},
+        "cgroup_marker": {"type": "string", "minLength": 1},
+        "member_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "generation": {"type": "integer", "minimum": 1}
+      }
+    },
+    "launch_route": {
+      "description": "The route the launch really used: the effective launch snapshot, shaped like one entry of the operator's routes file (the route part of a 'recursion.route/v0' request, core/recursion_core/routes/contract.py). A retry reuses this snapshot; nothing is routed again. engine, model and connection are always there. The other fields are the route contract's own and are present only when the entry had them. credential_env is the NAME of an environment variable, never a value. 'profile' is the engine adapter's own object.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "model", "connection"],
+      "properties": {
+        "engine": {"$ref": "common.v1.json#/$defs/engine_name"},
+        "model": {"type": "string", "minLength": 1},
+        "connection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": {"enum": ["subscription", "api_key", "passthrough"]},
+            "id": {"type": "string", "minLength": 1, "maxLength": 200, "not": {"pattern": "[\\r\\n]"}},
+            "credential_env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$", "not": {"pattern": "[\\r\\n]"}},
+            "key_source": {"enum": ["custody", "api_key_helper"]},
+            "method": {"type": "string", "minLength": 1},
+            "metered_per_model": {"type": "boolean"}
+          }
+        },
+        "bare": {"type": "boolean"},
+        "api_key_helper": {"enum": ["absent", "present"]},
+        "billing_ack": {"const": "api_key_helper"},
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["on_limit"],
+          "properties": {
+            "on_limit": {"enum": ["ask", "wait", "fallback"]},
+            "fallback": {"type": "array", "items": {"$ref": "#/$defs/launch_route"}}
+          }
+        },
+        "profile": {"type": "object"}
+      }
     },
     "engine_session_id": {
       "description": "The engine's own id for its conversation, used to resume or fork it. It is the engine's value and is treated as untrusted text.",

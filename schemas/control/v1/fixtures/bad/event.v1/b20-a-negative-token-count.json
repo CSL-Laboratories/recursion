@@ -1,9 +1,9 @@
 {
-  "seq": 44,
+  "seq": 52,
   "session_id": "ses-7f3a9c2e51d04b6a",
   "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
   "turn_id": "turn-000c",
-  "time": "2026-11-13T07:34:44.628Z",
+  "time": "2026-11-13T07:34:52.924Z",
   "type": "usage",
   "source": "engine",
   "trust": "untrusted",
@@ -12,13 +12,35 @@
     "model": "claude-sonnet-5-5",
     "bucket": null,
     "span": "call",
-    "input_tokens": 1824,
-    "output_tokens": -1,
-    "reasoning_tokens": null,
-    "cache_read_tokens": 15200,
-    "cache_write_tokens": 0,
-    "cost_usd": null,
-    "quality": "known",
-    "provenance": "observed"
+    "input_tokens": {
+      "value": 1824,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "output_tokens": {
+      "value": -1,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "reasoning_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+      "value": 15200,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cache_write_tokens": {
+      "value": 0,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cost_usd": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    }
   }
 }

@@ -1,0 +1,32 @@
+{
+  "method": "events.read",
+  "params": {
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "after": 41,
+    "limit": 200,
+    "projection": "transcript"
+  },
+  "answer": {
+    "code": "ok",
+    "projection": "transcript",
+    "lines": [
+      {
+        "seq": 3,
+        "time_rel_ms": 1840,
+        "event_type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "state": null,
+        "text": "Reading the tests.",
+        "speech": null,
+        "focus": null
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 42
+    },
+    "more": false
+  }
+}

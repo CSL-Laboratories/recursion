@@ -10,8 +10,9 @@
   "payload": {
     "connection_id": "subscription:personal-max",
     "scope": "connection",
-    "model": null,
     "kind": "plan_limit",
+    "model": null,
+    "bucket": null,
     "reset_at": "2026-11-13T12:00:00.000Z"
   }
 }

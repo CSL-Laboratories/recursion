@@ -8,6 +8,7 @@
   "source": "client",
   "trust": "trusted",
   "payload": {
+    "delivery_id": "dlv-0007",
     "index": 2,
     "text": "Fix the failing test in tests/test_io.py."
   },

@@ -18,9 +18,13 @@ Typed limit signals:
   when they carry the same stamp kind (``generation``, or else ``seq``, ``sequence``, ``timestamp``,
   ``capturedAt``, ``updatedAt``, ``asOf``; names unverified). A generation is not compared with a
   timestamp. A healthy reading clears one stamp kind only when it is strictly newer by that same
-  kind. A tie on that kind keeps the exhausted reading. An exhausted snapshot of a different kind
-  keeps its own reset: a later healthy reading of one kind does not clear the others, and each
-  stands until its reset. When neither snapshot carries a stamp, an
+  kind. A tie on that kind keeps the exhausted reading. Two exhausted readings on that tie keep the
+  later known reset. When one of them names no numeric ``resetsAt``, the known instant stays and the
+  signal says the reset is unknown, so the breaker waits until the later of that instant and its
+  escalating cooldown. A strictly newer snapshot of the same kind replaces the stored reading.
+  An exhausted snapshot of a different kind keeps its own reset: a later healthy reading of one
+  kind does not clear the others, and each stands until its reset. When neither snapshot carries
+  a stamp, an
   ``account/rateLimits/updated`` received after ``account/rateLimits/read`` was sent wins over
   that read's result. Codex's default bucket (``limitId``
   ``codex``) is credential-wide. Any other ``limitId`` is the breaker model key itself: the requested
@@ -214,9 +218,10 @@ class _Rpc:
         Each of primary and secondary is its own window, and each stamp kind is its own reading of
         that window. A reading replaces one kind only when it is strictly newer by that kind, or by
         local sequence when neither side of that kind is stamped. A tie keeps an exhausted reading.
-        A healthy reading clears only that kind. An incomparable exhausted reading stays until its
-        own reset. Healthy means a numeric usedPercent under 100. An omitted window, or a percent
-        that is not a number, changes nothing.
+        Two exhausted readings on that tie keep the later known reset, and a missing reset does not
+        drop a known one. A healthy reading clears only that kind. An incomparable exhausted reading
+        stays until its own reset. Healthy means a numeric usedPercent under 100. An omitted window,
+        or a percent that is not a number, changes nothing.
         """
 
         if not isinstance(snapshot, dict):
@@ -236,14 +241,18 @@ class _Rpc:
             key = (bucket, name)
             kinds = self._kinds.setdefault(key, {})
             prev = kinds.get(kind)
+            rank = None
             if prev is not None:
                 rank = _stamp_rank(stamp, local, prev[0], prev[1])
                 # Strictly older changes nothing. A same-kind tie keeps an exhausted reading, so a
-                # healthy snapshot does not clear it.
+                # healthy snapshot does not clear it. Two exhausted readings on that tie merge.
+                # A strictly newer same-kind snapshot still replaces the stored one.
                 if rank < 0 or (rank == 0 and percent < 100):
                     continue
             if percent >= 100:
                 signal = _window_signal(snapshot, source, self.adapter.vendor_reset(raw.get("resetsAt")))
+                if rank == 0 and prev is not None and prev[2] is not None:
+                    signal = _merge_tied_exhaustion(prev[2], signal)
                 kinds[kind] = (stamp, local, signal)
             else:
                 kinds[kind] = (stamp, local, None)
@@ -371,6 +380,28 @@ def _later_reset(kept: dict, incoming: dict) -> dict:
     if new_at is not None and (old_at is None or new_at > old_at):
         return incoming
     return kept
+
+
+def _merge_tied_exhaustion(kept: dict, incoming: dict) -> dict:
+    """Equal stamp, both exhausted. Keep the later known reset.
+
+    When either reading has no numeric reset, or is already marked unknown, that known
+    instant stays and the result says the reset is unknown. The breaker then holds the
+    later of that instant and its escalating cooldown.
+    """
+
+    merged = _later_reset(kept, incoming)
+    unknown = (
+        _reset_value(kept) is None
+        or _reset_value(incoming) is None
+        or kept.get("reset_unknown") is True
+        or incoming.get("reset_unknown") is True
+    )
+    if not unknown:
+        return merged
+    marked = dict(merged)
+    marked["reset_unknown"] = True
+    return marked
 
 
 # Unverified stamp names. The first one present is the snapshot's order; a higher value is newer.

@@ -543,6 +543,106 @@ class LimitSignalAccountingTest(unittest.TestCase):
         self.assertNotIn("turn/start", methods)
         self.assertIn("thread/start", methods)
 
+    def test_an_equal_generation_read_does_not_shorten_an_in_flight_reset(self) -> None:
+        # Clock 1_000_000. During account/rateLimits/read an update arrives at generation 10,
+        # primary exhausted, resetsAt 30 days out. The read result is the same generation with
+        # resetsAt 1_000_010 and is applied after that update, on the earlier send sequence.
+        # Equal stamps must keep the later reset. Replacing it plans the limit only until
+        # 1_000_010, and a turn runs at +11s while the update's month is still ahead.
+        month = 30 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_000.0 + month}}}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_010}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_000.0 + month)
+        self.assertNotIn("reset_unknown", res["limit"])
+        self.assertEqual(res["retry_at"], 1_000_000.0 + month)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertNotIn("thread/start", methods)
+        h.clock.advance(11)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(blocked["retry_at"], 1_000_000.0 + month)
+        self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_an_equal_generation_shorter_update_does_not_shorten_the_open_reset(self) -> None:
+        # A healthy generation 1 read lets thread/start run. Two updates during that call share
+        # generation 10: primary exhausted at +30d, then the same generation at +10s. The second
+        # must not replace the first. Replacing it leaves reset_at 1_000_010 and a turn runs at +11s.
+        month = 30 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "generation": 1, "primary": {"usedPercent": 10}}}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_000.0 + month}}}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_010}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_000.0 + month)
+        self.assertNotIn("reset_unknown", res["limit"])
+        self.assertEqual(res["retry_at"], 1_000_000.0 + month)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertIn("thread/start", methods)
+        h.clock.advance(11)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(blocked["retry_at"], 1_000_000.0 + month)
+        self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_an_equal_generation_read_without_a_reset_keeps_the_known_one(self) -> None:
+        # Same in-flight pair as the equal-generation read, except the read omits resetsAt.
+        # Dropping the known month leaves an unknown reset, so the cooldown is the whole hold
+        # and a turn runs at +300s. The known instant stays, and the signal says the reset is
+        # unknown, so the hold is the later of that instant and the escalating cooldown.
+        month = 30 * 24 * 3600
+        script = [
+            {"id": 1, "result": {"userAgent": "fake"}},
+            {"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex", "generation": 10,
+                "primary": {"usedPercent": 100, "resetsAt": 1_000_000.0 + month}}}},
+            {"id": 2, "result": {"rateLimits": {
+                "limitId": "codex", "generation": 10, "primary": {"usedPercent": 100}}}},
+            {"id": 3, "result": {"thread": {"id": "th-1"}}},
+            {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+            {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}},
+        ]
+        h = Harness([script, codex_script("should-not-run")])
+        res = h.handle(request(engine="codex", model="gpt-5"))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_000_000.0 + month)
+        self.assertIs(res["limit"].get("reset_unknown"), True)
+        self.assertEqual(res["retry_at"], 1_000_000.0 + month)
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertNotIn("turn/start", methods)
+        self.assertNotIn("thread/start", methods)
+        h.clock.advance(300)
+        blocked = h.handle(request(rid="later", engine="codex", model="gpt-5"))
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(blocked["retry_at"], 1_000_000.0 + month)
+        self.assertEqual(len(h.launcher.calls), 1)
+
     def test_an_incomparable_exhausted_snapshot_does_not_shorten_a_known_reset(self) -> None:
         # generation=10 is 30 days out. A timestamped exhausted read at +10s is a different
         # stamp kind. Replacing the window lets the next turn run at +11s.

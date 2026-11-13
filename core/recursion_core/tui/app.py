@@ -39,7 +39,10 @@ _TRUNCATED = "⟦truncated⟧"
 
 
 def _listed_run(row: object) -> bool:
-    """A run.list row may be committed only with a non-empty string id and a string state."""
+    """A run row may be committed only with a non-empty string id and a string state.
+
+    A whitespace id is a real id. An empty ``run.list`` is a separate, valid snapshot.
+    """
 
     if not isinstance(row, dict):
         return False
@@ -203,8 +206,9 @@ class TuiApp:
         if method == "run.list":
             runs = answer.get("runs")
             # A row that is not a dict, or a dict without a non-empty string run_id and a string
-            # state, is not an empty snapshot. Committing it cleared the latch and dropped a live
-            # run, so Start ran. One bad row fails the whole list.
+            # state, is not an empty snapshot. An empty list is a valid snapshot, and a whitespace
+            # id is a real id. Committing a bad row cleared the latch and dropped a live run, so
+            # Start ran. One bad row fails the whole list.
             if code == "ok" and isinstance(runs, list) and all(_listed_run(r) for r in runs):
                 incoming = runs
                 merged, seen = [], set()
@@ -236,17 +240,24 @@ class TuiApp:
             # ``code`` ok with no run was not applied: call_api drops a cyclic run and keeps ``code``.
             # Clearing the failure before the merge would turn watch_only off when the merge raises
             # (a non-dict ``stop``) and Loop drops the answer, which lets Start run.
-            if code == "ok" and isinstance(answer.get("run"), dict):
-                self._merge(answer["run"])
+            # The same row rule as run.list. A dict with no string state used to merge over a
+            # stop_pending row, clear this latch, and let Start run.
+            run = answer.get("run")
+            if code == "ok" and _listed_run(run):
+                self._merge(run)
                 self.status_refresh_failed = None
+            elif code == "ok" and isinstance(run, dict):
+                self.status_refresh_failed = "run.status answered ok with a malformed run"
+                self._error("run.status answered ok with a malformed run")
             elif code == "ok":
                 self.status_refresh_failed = "run.status answered ok without a run"
                 self._error("run.status answered ok without a run")
             elif code == p.UNAVAILABLE:
                 self.status_refresh_failed = f"run.status answered {field(code)}"
-        elif code == "ok" and isinstance(answer.get("run"), dict):
+        elif code == "ok" and isinstance(answer.get("run"), dict) and (
+                method != "run.start" or _listed_run(answer.get("run"))):
             self._merge(answer["run"])
-        elif code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
+        elif method == "run.stop" and code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
             rid = answer["run_id"]
             state = "stopped" if code == "stopped" else "stop_pending"
             reason = answer.get("reason")
@@ -265,7 +276,11 @@ class TuiApp:
             for run, stop in updates:
                 run["state"] = state
                 run["stop"] = stop
-        elif code == "started" and isinstance(answer.get("run"), dict):
+        elif method != "run.stop" and code in ("stopped", "pending"):
+            # stopped and pending confirm a Stop. On any other method they are an unexpected
+            # code: leave the row, the Stop mark, and the refresh latch as they are.
+            self._error(f"unexpected {method} status={field(code)}")
+        elif code == "started" and _listed_run(answer.get("run")):
             self._merge(answer["run"])
         self._answer_keyed = p.keyed_conditions(answer)
         self.answer_conditions = [(label, text) for label, _, text in self._answer_keyed]

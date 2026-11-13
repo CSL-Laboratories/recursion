@@ -5,7 +5,7 @@
   "source": "engine",
   "trust": "untrusted",
   "state": null,
-  "text": "Reading the tests.",
+  "text": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reading the tests.\"}]}}\n",
   "speech": null,
   "focus": null
 }

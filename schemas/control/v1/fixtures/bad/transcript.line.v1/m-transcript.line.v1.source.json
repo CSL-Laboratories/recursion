@@ -1,8 +1,8 @@
 {
   "seq": 10,
-  "time_rel_ms": 12400,
+  "time_rel_ms": 9333,
   "event_type": "usage",
-  "trust": "untrusted",
+  "trust": "trusted",
   "state": null,
   "text": null,
   "speech": null,

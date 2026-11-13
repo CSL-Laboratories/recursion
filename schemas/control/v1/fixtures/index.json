@@ -1,5 +1,5 @@
 {
-  "about": "Every fixture of this folder. A file under good/ must validate against 'schema'. A file under bad/ must be refused, and 'rule' says which rule it breaks; 'expect' names the schema keyword that refuses it and the place in the fixture where it does (a JSON Pointer, '' for the whole value). Files named c* were captured from the daemon by capture_today.py; files named h*, r* and b* were written by hand. Files named u-*, m-*, v-* and f-* were generated: each is a good fixture with one change (u: a field nobody defined added; m: a required field removed; v: a value replaced by one outside the list of allowed values; f: a fixed value replaced), and each proves the one rule its 'rule' names.",
+  "about": "Every fixture of this folder. A file under good/ must validate against 'schema'. A file under bad/ must be refused, and 'rule' says which rule it breaks; 'expect' names the schema keyword that refuses it and the place in the fixture where it does (a JSON Pointer, '' for the whole value). Files named c* were captured from the daemon by capture_today.py; files named h*, r* and b* were written by hand. Files named u-*, m-*, v-* and f-* were generated: each is a good fixture with one change (u: a field nobody defined added; m: a required field removed; v: a value replaced by one outside the list of allowed values; f: a fixed value replaced), and each proves the one rule its 'rule' names. 'of', on a good transcript line, names the event fixtures the line is the projection of: the first event of the log, then the line's own event.",
   "fixtures": [
     {
       "file": "good/approval.v1/h01-tool-call-pending-shown-on-the-terminal.json",
@@ -12509,47 +12509,82 @@
     {
       "file": "good/transcript.line.v1/h01-engine-output.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for an engine.output event (event fixture h03): the payload's text, sanitised, still untrusted, nothing announced."
+      "shows": "The line of event fixture h03, an engine.output: the payload's text as it is (a whole line of the engine's stream), still untrusted, nothing announced. 2,074 ms after the first event of the log.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h03-engine-output.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h02-state-changed.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a state.changed event (event fixture h01): state is the run's state in the post-image."
+      "shows": "The line of event fixture h01, the first event of the log, so its time is 0: state is the run's state in the post-image.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h03-turn-started.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a turn.started event (event fixture h17): the input as sent."
+      "shows": "The line of event fixture h17, a turn.started: the input as sent.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h17-turn-started.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h04-approval-requested-moves-focus.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for an approval.requested event (event fixture h07): the rendered lines, joined. Only this line, from the core, moves focus to the approval."
+      "shows": "The line of event fixture h07, an approval.requested: the rendered lines, joined. Only this line, from the core, moves focus to the approval.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h07-approval-requested-with-the-request-as-it-was.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h05-tool-call.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a tool.call event (event fixture h04): a sentence the core's renderer wrote from typed fields; still untrusted because the name came from the engine."
+      "shows": "The line of event fixture h04, a tool.call: a sentence the core's renderer wrote from typed fields; still untrusted because the name came from the engine.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h04-tool-call.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h06-stop-result-pending.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a stop.result event (event fixture h24): state is its code, and the condition is announced."
+      "shows": "The line of event fixture h24, a stop.result: state is its code, and the condition is announced.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h24-stop-result.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h07-replay-gap.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a replay.gap event (event fixture h16)."
+      "shows": "The line of event fixture h16, a replay.gap.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h16-replay-gap.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h08-usage-with-no-text.json",
       "schema": "transcript.line.v1.json",
-      "shows": "A line may have no text: the event is in the transcript, and a plain reader prints nothing for it."
+      "shows": "The line of event fixture h10, a usage event: a line may have no text; the event is in the transcript, and a plain reader prints nothing for it.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h10-usage-unknown.json"
+      ]
     },
     {
       "file": "good/transcript.line.v1/h09-turn-ended-waiting.json",
       "schema": "transcript.line.v1.json",
-      "shows": "The line for a turn.ended event (event fixture h18): state is the turn's outcome."
+      "shows": "The line of event fixture h18, a turn.ended: state is the turn's outcome.",
+      "of": [
+        "good/event.v1/h01-state-changed-run-as-it-was-committed.json",
+        "good/event.v1/h18-turn-ended-waiting-for-the-user.json"
+      ]
     },
     {
       "file": "bad/transcript.line.v1/b01-engine-text-marked-trusted.json",

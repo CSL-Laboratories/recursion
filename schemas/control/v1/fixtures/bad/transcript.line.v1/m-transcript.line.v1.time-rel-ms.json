@@ -1,8 +1,8 @@
 {
   "seq": 10,
   "event_type": "usage",
-  "source": "engine",
-  "trust": "untrusted",
+  "source": "core",
+  "trust": "trusted",
   "state": null,
   "text": null,
   "speech": null,

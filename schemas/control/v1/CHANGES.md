@@ -23,7 +23,7 @@ Nothing is frozen yet.
 | `approval.v1.json` | 1.0-draft.3 |
 | `driver.v2.json` | 1.0-draft.2 |
 | `mcp.task.v1.json` | 1.0-draft.2 |
-| `transcript.line.v1.json` | 1.0-draft.2 |
+| `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.4 |
 | `session.token.v1.json` | 1.0-draft.1 |
 
@@ -83,18 +83,38 @@ this record's `delivered` keeps its draft-2 wording until they are.
 | The payload digest of a command has a named form: SHA-256 of the UTF-8 bytes of the params without the command id, as RFC 8785 writes them | Nothing published |
 | Said in the rules, not new: a name with no row is `method_unknown`, a reserved name included, and `methods.list` never lists it; a row without a handler answers `unsupported`, `not_implemented` (31 exchanges now show it, one for each method not built yet). `run.start`'s key reused with another engine or prompt stays `request_invalid` with detail `client_key_reused`, as today (`control/api.py`), and is not turned into a new code | Nothing |
 
+### `transcript.line.v1.json` is `1.0-draft.3`
+
+The read found that the transcript fixtures were not projections of the events the index paired them
+with: four of five relative times were wrong, a line showed a sentence where its event carried a whole
+line of the engine's stream, and one line gave a usage event a source its event did not have. Each side
+validated on its own, so nothing noticed. Now `conformance/rules.py` (`transcript_fields`) states what a
+line must carry because its event says so (its seq, time, type, source, trust, state, and its text
+where the text is the event's own), the good transcript fixtures are made from their event fixtures by
+that rule, and nine vectors pair logs with their lines: two that agree and seven that do not, each
+caught for its own field.
+
+| Change | What it breaks |
+|---|---|
+| `time_rel_ms` never runs backwards: when the clock steps back, a line keeps the time of the line before it | A producer that subtracts and takes what it gets (it could go below the line before, or below 0) |
+| A timestamp that names a day that does not exist (the 31st of February) is refused by the rule; the pattern cannot refuse it | A log that holds one is not projected |
+| The text of an `engine.output` line is the payload's text, not a sentence read out of it | The first draft's own fixture |
+
+The sanitizer that engine text goes through is not part of these records; the rule gives an engine's
+text only when it is plain, which a sanitizer leaves alone. The sentences for the other event types,
+what is announced and where input goes are the renderer's and are not checked.
+
 ### Not changed yet, on purpose
 
 `mcp.task.v1.json` stays at draft 2. The Task of a run that has no session needs facts the run record
 does not keep (why a start failed, after a restart; when the state last changed) and a rule from a
 run's result to the Task's. Those cross lanes; the options are with the build's coordinator, and no
-lane should treat that half of the Task as agreed. The transcript fixtures are not yet checked as
-projections of the events they are paired with; that is next.
+lane should treat that half of the Task as agreed.
 
 ### The checks themselves
 
-`conformance/rules.py` and `vectors/` are new (42 vectors: 24 of the call profile, 16 of what an
-approval binds, 2 sequences of calls). `wire_client.py` run as a command checks the fixtures and the
+`conformance/rules.py` and `vectors/` are new (51 vectors: 24 of the call profile, 16 of what an
+approval binds, 2 sequences of calls, 9 of the transcript). `wire_client.py` run as a command checks the fixtures and the
 vectors and says in its last line that the consistency checks are only run by the unittest command.
 No fixture may be checked against a schema that refuses nothing.
 

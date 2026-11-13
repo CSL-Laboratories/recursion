@@ -1,6 +1,6 @@
 {
   "seq": 9,
-  "time_rel_ms": 12000,
+  "time_rel_ms": 15555,
   "event_type": "replay.gap",
   "source": "core",
   "trust": "trusted",

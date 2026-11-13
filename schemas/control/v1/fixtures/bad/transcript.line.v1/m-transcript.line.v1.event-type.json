@@ -1,8 +1,8 @@
 {
   "seq": 10,
-  "time_rel_ms": 12400,
-  "source": "engine",
-  "trust": "untrusted",
+  "time_rel_ms": 9333,
+  "source": "core",
+  "trust": "trusted",
   "state": null,
   "text": null,
   "speech": null,

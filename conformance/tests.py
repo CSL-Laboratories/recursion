@@ -177,6 +177,23 @@ class PublishedFilesTest(unittest.TestCase):
                     # A fixture lives in the folder named after the schema file it is checked against.
                     self.assertEqual(entry["file"].split("/")[1] + ".json", entry["schema"].split("#")[0])
 
+    def test_every_transcript_fixture_is_the_projection_of_its_events(self):
+        """A good transcript line names, in the index, the event fixtures it is the projection of (the
+        first event of the log, then its own event), and carries what those events say."""
+        seen = 0
+        for folder in self.sets:
+            for entry in client.load_index(folder):
+                if entry["schema"] != "transcript.line.v1.json" or not entry["file"].startswith("good/"):
+                    continue
+                with self.subTest(fixture=entry["file"]):
+                    self.assertIn("of", entry, "a good transcript line names the events it is the projection of")
+                    events = [client.read_json(folder / "fixtures" / name) for name in entry["of"]]
+                    line = client.read_json(folder / "fixtures" / entry["file"])
+                    wanted = client.rules.transcript_fields(events)[-1]
+                    self.assertEqual({key: line.get(key) for key in wanted}, wanted)
+                    seen += 1
+        self.assertGreater(seen, 5, "too few transcript fixtures to mean anything")
+
     def test_no_fixture_is_checked_against_a_schema_that_refuses_nothing(self):
         """A good fixture proves nothing against a schema that takes every value (the root of a file that
         only holds definitions, say): no fixture may name such a target."""
@@ -314,7 +331,7 @@ class PublishedFilesTest(unittest.TestCase):
                 expect = vector.get("expect")
                 if entry["rule"] == "call.profile":
                     kinds = {"caught" if "refused" in expect else "agrees"}
-                elif entry["rule"] == "approval.binding":
+                elif entry["rule"] in ("approval.binding", "transcript.projection"):
                     kinds = {"caught" if expect else "agrees"}
                 else:
                     codes = {step["answer"]["code"] for step in vector["steps"]}

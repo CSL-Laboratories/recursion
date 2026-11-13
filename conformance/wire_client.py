@@ -350,7 +350,7 @@ def check_instance(schemas: SchemaSet, entry: dict, instance: Any) -> str | None
     return None
 
 
-VECTOR_RULES = ("call.profile", "approval.binding", "approval.lifecycle")
+VECTOR_RULES = ("call.profile", "approval.binding", "approval.lifecycle", "transcript.projection")
 
 
 def load_vectors(folder: Path) -> list[dict]:
@@ -460,6 +460,18 @@ def check_vector(schemas: SchemaSet, entry: dict) -> str | None:
             if found:
                 return f"{where}: the record does not agree with itself: {found}"
         return None
+    if rule == "transcript.projection":
+        # A log from its first event, and the lines of its transcript: where a line is not what its event says.
+        for number, event in enumerate(vector["events"], 1):
+            misfit = _misfit(schemas, "event.v1.json", event)
+            if misfit:
+                return f"event {number} does not fit event.v1: {misfit}"
+        for number, line in enumerate(vector["lines"], 1):
+            misfit = _misfit(schemas, "transcript.line.v1.json", line)
+            if misfit:
+                return f"line {number} does not fit transcript.line.v1: {misfit}"
+        found = rules.transcript_problems(vector["events"], vector["lines"])
+        return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
     return f"no rule named {rule!r}"
 
 

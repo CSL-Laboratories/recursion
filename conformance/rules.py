@@ -20,11 +20,14 @@ What is here:
 * ``effect_bytes`` and ``digest_of``: the bytes an approval's digest is taken over, by ``digest_form``.
 * ``approval_lines``: the lines every surface prints for an approval (``csl-approval-lines/v0``).
 * ``approval_problems``: what does not agree inside one approval record.
+* ``transcript_fields`` and ``transcript_problems``: what a transcript line must carry because its
+  event says so.
 * ``ApprovalModel``: approval.open and approval.answer, step by step, with replay.
 """
 from __future__ import annotations
 
 import copy
+import datetime
 import hashlib
 import json
 
@@ -413,6 +416,93 @@ def approval_problems(record: dict) -> list:
             problems.append("opened_by")
             break
         seen.append(who)
+    return problems
+
+
+# ------------------------------------------------------------------------------------ the transcript
+
+def milliseconds(timestamp: str) -> int:
+    """A timestamp of these records as milliseconds since the start of 1970, or refuse.
+
+    The pattern in the schemas takes any day from 01 to 31 in any month. A date that does not exist
+    (2026-02-31) is refused here, with ``timestamp``. A second of 60 is read as the minute's last
+    second plus one.
+    """
+    try:
+        day, clock = timestamp[:-1].split("T")
+        year, month, date = (int(part) for part in day.split("-"))
+        hour, minute, rest = clock.split(":")
+        second, milli = rest.split(".")
+        days = datetime.date(year, month, date).toordinal() - datetime.date(1970, 1, 1).toordinal()
+        return ((days * 24 + int(hour)) * 60 + int(minute)) * 60000 + int(second) * 1000 + int(milli)
+    except (ValueError, AttributeError, TypeError):
+        raise Refused("timestamp") from None
+
+
+_STATE_FROM = {"turn.ended": "outcome", "approval.answered": "state", "stop.result": "code", "steer.queued": "state",
+               "interrupt": "outcome"}
+_TEXT_FROM = {"engine.output": "text", "turn.started": "text", "tool.result": "text", "result": "detail"}
+
+
+def _plain(text) -> bool:
+    return text is None or all(ch in "\t\n" or " " <= ch <= "~" for ch in text)
+
+
+def transcript_fields(events: list) -> list:
+    """What each line of a transcript must carry because its event says so: one dict for each event of a
+    log, in order, the log's first event first.
+
+    ``seq``, ``event_type``, ``source`` and ``trust`` are the event's. ``time_rel_ms`` is the event's
+    time minus the time of the log's first event, in milliseconds, and never less than the line before
+    it: when the clock steps back, a line keeps the value of the line before, so the time of a
+    transcript never runs backwards and is never negative. ``state`` is the state word the event
+    reports: for state.changed the entity's state in the post-image (for a run the stored record's, or
+    the daemon row's when there is no stored record); for turn.ended its outcome; for approval.answered
+    its state; for stop.result its code; for steer.queued its state; for interrupt its outcome; null
+    for every other type.
+
+    ``text`` is given only where the text is the event's own: the payload's text for engine.output,
+    turn.started and tool.result, the detail of a result, and the rendered lines of an
+    approval.requested joined by line feeds. Text that came from an engine goes through the core's
+    sanitizer, whose rule is not part of these records, so this function gives the text of such an
+    event only when it is plain (printable ASCII, tabs and line feeds), which a sanitizer leaves as it
+    is. For every other type the text is a sentence of the core's renderer and is not given here; nor
+    are ``speech`` and ``focus``.
+    """
+    lines, first, last = [], None, 0
+    for event in events:
+        at = milliseconds(event["time"])
+        first = at if first is None else first
+        last = max(last, at - first)
+        kind, payload = event["type"], event["payload"]
+        if kind == "state.changed":
+            image = payload["post_image"]
+            if payload["entity"] == "run":
+                image = image["control_record"] or image["daemon_row"]
+            state = image["state"]
+        else:
+            state = payload[_STATE_FROM[kind]] if kind in _STATE_FROM else None
+        line = {"seq": event["seq"], "time_rel_ms": last, "event_type": kind, "source": event["source"],
+                "trust": event["trust"], "state": state}
+        if kind == "approval.requested":
+            line["text"] = "\n".join(item["text"] for item in payload["rendered"])
+        elif kind in _TEXT_FROM and _plain(payload[_TEXT_FROM[kind]]):
+            line["text"] = payload[_TEXT_FROM[kind]]
+        lines.append(line)
+    return lines
+
+
+def transcript_problems(events: list, lines: list) -> list:
+    """Where the lines are not the projection of the events: ``"<line number>:<field>"`` for each field a
+    line carries that is not what its event says, ``"count"`` when there is not one line for each event,
+    ``"refused:<code>"`` when an event's time is not a moment that exists."""
+    try:
+        fields = transcript_fields(events)
+    except Refused as refusal:
+        return ["refused:" + refusal.code]
+    problems = [] if len(lines) == len(fields) else ["count"]
+    for number, (line, wanted) in enumerate(zip(lines, fields), 1):
+        problems += [f"{number}:{key}" for key, value in wanted.items() if line.get(key) != value]
     return problems
 
 

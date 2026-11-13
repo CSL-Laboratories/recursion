@@ -1,6 +1,6 @@
 {
   "seq": 18,
-  "time_rel_ms": 64000,
+  "time_rel_ms": 17629,
   "event_type": "turn.ended",
   "source": "core",
   "trust": "trusted",

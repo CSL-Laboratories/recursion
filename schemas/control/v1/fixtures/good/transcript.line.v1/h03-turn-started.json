@@ -1,6 +1,6 @@
 {
   "seq": 17,
-  "time_rel_ms": 61250,
+  "time_rel_ms": 16592,
   "event_type": "turn.started",
   "source": "client",
   "trust": "trusted",

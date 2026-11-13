@@ -22,8 +22,8 @@ Three files:
 - `wire_client.py`: reads the schemas, the fixtures and the vectors, and checks one of each.
 - `rules.py`: the rules a JSON Schema cannot state, as plain functions over plain values, importing the
   standard library alone: the strict reading of a tool's input, the text of a value as RFC 8785 writes
-  it, the digest of an effect, the lines of an approval, and `approval.open` and `approval.answer` one
-  call at a time. A client in another language implements these and checks the same vectors.
+  it, the digest of an effect, the lines of an approval, `approval.open` and `approval.answer` one
+  call at a time, and what a transcript line must carry because its event says so. A client in another language implements these and checks the same vectors.
 - `tests.py`: all of it as tests.
 
 ## What it checks
@@ -51,8 +51,9 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   bound for it, or is refused with exactly its code; an approval record of the right shape has exactly
   the problems its vector lists (none, or a digest that is not its effect's, lines that are not its
   effect's, a call outside its profile); a sequence of `approval.open` and `approval.answer` calls is
-  answered step by step as the protocol says. Every rule has vectors that agree and vectors it must
-  catch;
+  answered step by step as the protocol says; the lines of a transcript carry what their events say
+  (seq, time, type, source, trust, state, and the text where it is the event's own). Every rule has
+  vectors that agree and vectors it must catch;
 - every approval inside a good fixture, wherever it sits, has the digest of its effect and the lines
   of its effect;
 - no fixture is checked against a schema that refuses nothing (the root of a file that only holds
@@ -75,6 +76,9 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
 {"file": "bad/event.v1/b03-engine-content-marked-trusted.json", "schema": "event.v1.json",
  "rule": "Content from an engine is always 'untrusted'.", "expect": {"keyword": "const", "at": "/trust"}}
 ```
+
+A good transcript line also carries `of`: the event fixtures it is the projection of (the first event
+of the log, then its own event), and the suite checks that the line carries what those events say.
 
 `schema` may carry a fragment (`common.v1.json#/$defs/cursor`). `at` is a JSON Pointer into the fixture;
 the empty string is the whole value. `expect` is what this client checks with one validator; a client

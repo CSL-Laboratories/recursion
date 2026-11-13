@@ -1,0 +1,268 @@
+{
+  "events": [
+    {
+      "seq": 1,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-11-13T07:34:00.000Z",
+      "type": "turn.started",
+      "source": "client",
+      "trust": "trusted",
+      "payload": {
+        "delivery_id": "dlv-0007",
+        "index": 2,
+        "text": "Fix the failing test in tests/test_io.py."
+      }
+    },
+    {
+      "seq": 2,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-11-13T07:34:02.074Z",
+      "type": "engine.output",
+      "source": "engine",
+      "trust": "untrusted",
+      "payload": {
+        "stream": "stdout",
+        "text": "Reading the tests.\n",
+        "offset_start": 0,
+        "offset_end": 19
+      }
+    },
+    {
+      "seq": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-11-13T07:34:05.185Z",
+      "type": "tool.result",
+      "source": "engine",
+      "trust": "untrusted",
+      "payload": {
+        "call_id": "toolu_01H8",
+        "status": "ok",
+        "text": "41 passed in 3.20s\n",
+        "output_ref": null,
+        "truncated": false
+      }
+    },
+    {
+      "seq": 4,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-11-13T07:34:07.259Z",
+      "type": "approval.requested",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "call_form": "csl-call/v1",
+          "call": {
+            "cwd": "/home/dev/projects/atlas",
+            "input": {
+              "command": "rm -rf build && make",
+              "description": "clean build"
+            },
+            "tool": "Bash"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "b2f03e58c884b88b4a04c063dfc3991bfd8896cb54cc0bbf9d8b5174e42cdd3d",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "seq": 5,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-11-13T07:34:08.296Z",
+      "type": "approval.answered",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "approval_id": "apr-00c4",
+        "answer": "deny",
+        "answered_by": {
+          "kind": "owner",
+          "id": "local"
+        },
+        "revision": 2,
+        "state": "denied"
+      }
+    },
+    {
+      "seq": 6,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-11-13T07:35:01.000Z",
+      "type": "interrupt",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "turn_id": "turn-000c",
+        "requested_by": {
+          "kind": "owner",
+          "id": "local"
+        },
+        "outcome": "delivered"
+      }
+    },
+    {
+      "seq": 7,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-11-13T07:35:02.500Z",
+      "type": "turn.ended",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "outcome": "waiting",
+        "result": {
+          "code": null,
+          "detail": "",
+          "result_ref": "result:turn-000c"
+        }
+      }
+    }
+  ],
+  "lines": [
+    {
+      "seq": 1,
+      "time_rel_ms": 0,
+      "event_type": "turn.started",
+      "source": "client",
+      "trust": "trusted",
+      "state": null,
+      "text": "Fix the failing test in tests/test_io.py.",
+      "speech": null,
+      "focus": null
+    },
+    {
+      "seq": 2,
+      "time_rel_ms": 2074,
+      "event_type": "engine.output",
+      "source": "engine",
+      "trust": "untrusted",
+      "state": null,
+      "text": "Reading the tests.\n",
+      "speech": null,
+      "focus": null
+    },
+    {
+      "seq": 3,
+      "time_rel_ms": 5185,
+      "event_type": "tool.result",
+      "source": "engine",
+      "trust": "untrusted",
+      "state": null,
+      "text": "41 passed in 3.20s\n",
+      "speech": null,
+      "focus": null
+    },
+    {
+      "seq": 4,
+      "time_rel_ms": 7259,
+      "event_type": "approval.requested",
+      "source": "core",
+      "trust": "trusted",
+      "state": null,
+      "text": "Tool call waiting for an answer\nengine: claude_code\nrun: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7\ntool: \"Bash\"\ndirectory: \"/home/dev/projects/atlas\"\ninput fields: 2\n\"command\": \"rm -rf build && make\"\n\"description\": \"clean build\"",
+      "speech": "Approval needed",
+      "focus": "approval"
+    },
+    {
+      "seq": 5,
+      "time_rel_ms": 8296,
+      "event_type": "approval.answered",
+      "source": "core",
+      "trust": "trusted",
+      "state": "denied",
+      "text": "approval denied",
+      "speech": "denied",
+      "focus": null
+    },
+    {
+      "seq": 6,
+      "time_rel_ms": 61000,
+      "event_type": "interrupt",
+      "source": "core",
+      "trust": "trusted",
+      "state": "delivered",
+      "text": "interrupt delivered",
+      "speech": null,
+      "focus": null
+    },
+    {
+      "seq": 7,
+      "time_rel_ms": 62500,
+      "event_type": "turn.ended",
+      "source": "core",
+      "trust": "trusted",
+      "state": "done",
+      "text": "turn ended: waiting for you",
+      "speech": "waiting for you",
+      "focus": "composer"
+    }
+  ],
+  "expect": [
+    "7:state"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "events": [
+    {
+      "seq": 1,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "time": "2026-02-31T07:34:00.000Z",
+      "type": "turn.started",
+      "source": "client",
+      "trust": "trusted",
+      "payload": {
+        "delivery_id": "dlv-0007",
+        "index": 2,
+        "text": "Fix the failing test in tests/test_io.py."
+      }
+    }
+  ],
+  "lines": [
+    {
+      "seq": 1,
+      "time_rel_ms": 0,
+      "event_type": "turn.started",
+      "source": "client",
+      "trust": "trusted",
+      "state": null,
+      "text": "Fix the failing test in tests/test_io.py.",
+      "speech": null,
+      "focus": null
+    }
+  ],
+  "expect": [
+    "refused:timestamp"
+  ]
+}

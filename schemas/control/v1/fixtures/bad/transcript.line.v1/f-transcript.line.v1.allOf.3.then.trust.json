@@ -1,6 +1,6 @@
 {
   "seq": 7,
-  "time_rel_ms": 9120,
+  "time_rel_ms": 6222,
   "event_type": "approval.requested",
   "source": "core",
   "trust": "x-nobody-defined-this",

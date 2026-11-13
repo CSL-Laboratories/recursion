@@ -45,8 +45,9 @@ so that none of them can be taken away unnoticed.
 
 `vectors/` holds what a schema cannot check: each vector is checked against a rule that
 `conformance/rules.py` states as code (that a digest is the digest of its effect, that an approval's
-lines are the lines of that effect, how a tool call becomes the one string that is bound, how
-`approval.open` and `approval.answer` are answered one after another). `vectors/index.json` lists
+lines are the lines of that effect, how a tool call becomes the text that is bound, how
+`approval.open` and `approval.answer` are answered one after another, what a transcript line must
+carry because its event says so). `vectors/index.json` lists
 them. A client in another language implements the same rules and checks the same vectors.
 
 ## Storage records and public records are different records

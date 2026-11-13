@@ -14,9 +14,9 @@ from recursion_core.control import api as a
 from recursion_core.control import cli
 from recursion_core.control import mcp_tools
 from recursion_core.control.registry import (
-    InMemoryRunRegistry, LivenessUnknown, StaleGeneration, StopUnattested,
+    EMPTY, InMemoryRunRegistry, LivenessUnknown, StaleGeneration, StopUnattested,
 )
-from recursion_core.control.tests.fakes import make_api
+from recursion_core.control.tests.fakes import FakeKillTree, make_api
 from recursion_core.control.tests.test_registry_cas import _running
 
 
@@ -987,6 +987,239 @@ class AlreadyStoppedMemberTest(unittest.TestCase):
         self.assertEqual(stored["state"], "stopped")
         self.assertEqual(stored["engine"], "other")
         self.assertEqual(reg.get("r")["members"], [])
+
+
+class _ForeignStopOnEmptyCgroup(InMemoryRunRegistry):
+    """A stopped put with no cgroup stores a live member and returns another cgroup's stop.
+
+    ``get`` is the stored row. The dict ``put`` returns is not that row.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(processes=lambda _pid: True)
+
+    def put(self, record: dict):
+        cgroup = record.get("cgroup")
+        if record.get("state") == "stopped" and not (isinstance(cgroup, str) and cgroup):
+            current = self._runs.get(record["run_id"])
+            assert current is not None
+            planted = dict(current)
+            planted["state"] = "running"
+            planted["cgroup"] = "/cg/real"
+            planted["members"] = [{"member_id": "late", "pid": 9}]
+            planted["stop"] = None
+            planted["stop_attestation"] = None
+            self._runs[record["run_id"]] = planted
+            return {
+                "run_id": record["run_id"],
+                "tenant": current.get("tenant"),
+                "engine": current.get("engine"),
+                "state": "stopped",
+                "cgroup": "/cg/other",
+                "cgroup_marker": "cg-other",
+                "generation": 4,
+                "members": [],
+                "stop_attestation": {
+                    "proof": "empty",
+                    "cgroup": "/cg/other",
+                    "cgroup_marker": "cg-other",
+                    "member_ids": [],
+                    "generation": 4,
+                },
+            }
+        return super().put(record)
+
+
+class _SameCgroupStopHidesMember(InMemoryRunRegistry):
+    """A stopped put returns a recorded stop of the written cgroup and stores late/9 alive."""
+
+    def __init__(self) -> None:
+        super().__init__(processes=lambda _pid: True)
+
+    def put(self, record: dict):
+        if record.get("state") == "stopped":
+            current = self._runs.get(record["run_id"])
+            assert current is not None
+            planted = dict(current)
+            planted["state"] = "running"
+            planted["members"] = [{"member_id": "late", "pid": 9}]
+            planted["stop_attestation"] = None
+            self._runs[record["run_id"]] = planted
+            cgroup = record.get("cgroup")
+            marker = record.get("cgroup_marker")
+            generation = record.get("generation")
+            if not isinstance(generation, int):
+                generation = 1
+            return {
+                "run_id": record["run_id"],
+                "tenant": current.get("tenant"),
+                "engine": current.get("engine"),
+                "state": "stopped",
+                "cgroup": cgroup,
+                "cgroup_marker": marker,
+                "generation": generation,
+                "members": [],
+                "stop_attestation": {
+                    "proof": "empty",
+                    "cgroup": cgroup,
+                    "cgroup_marker": marker,
+                    "member_ids": [],
+                    "generation": generation,
+                },
+            }
+        return super().put(record)
+
+
+def _stopped_row_without_cgroup(reg: InMemoryRunRegistry, cgroup: str | None) -> dict:
+    """A stopped row whose proof names no cgroup. Members are empty, so liveness is clear."""
+    reg.put({"run_id": "r1", "tenant": "t", "engine": "e", "state": "running",
+             "cgroup": "/cg/r1", "stop": None, "start_key": None})
+    row = reg._runs["r1"]
+    row["state"] = "stopped"
+    row["cgroup"] = cgroup
+    row["cgroup_marker"] = None
+    row["members"] = []
+    row["stop_attestation"] = {
+        "proof": "empty", "cgroup": None, "cgroup_marker": None,
+        "member_ids": [], "generation": row["generation"],
+    }
+    fresh = reg.get("r1")
+    assert fresh is not None
+    return fresh
+
+
+class ReviewDeepSixTest(unittest.TestCase):
+    def test_an_empty_written_cgroup_does_not_accept_a_foreign_recorded_stop(self) -> None:
+        # The row is stopped, the proof names no cgroup, and the id is in _launched
+        # with no cgroup. Confirm runs on that empty cgroup. put returns a recorded
+        # stop of /cg/other while the stored row is running with late/9 alive.
+        # That returned stop is not the write. CLI must not exit 0, and MCP must
+        # set isError. Each surface is the first stop on its own registry.
+        for written in (None, ""):
+            with self.subTest(written=written):
+                reg = _ForeignStopOnEmptyCgroup()
+                api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                fresh = _stopped_row_without_cgroup(reg, written)
+                api._launched["r1"] = dict(fresh)
+                api._launched["r1"]["cgroup"] = written
+                out, err = io.StringIO(), io.StringIO()
+                code = cli.main(["stop", "r1"], api, out, err)
+                res = json.loads(out.getvalue())
+                self.assertEqual(res["code"], a.PENDING)
+                self.assertEqual(res["state"], "pending")
+                self.assertEqual(res["reason"], "member_alive")
+                self.assertNotEqual(res["code"], a.STOPPED)
+                self.assertIsNot(res.get("repeat"), True)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(code, cli.EXIT_PENDING)
+                self.assertNotIn(res["code"], a.SUCCESS_CODES)
+                stored = reg.get("r1")
+                assert stored is not None
+                self.assertNotEqual(stored["state"], "stopped")
+                self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+                self.assertIs(reg.process_alive(9), True)
+
+                reg = _ForeignStopOnEmptyCgroup()
+                api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+                fresh = _stopped_row_without_cgroup(reg, written)
+                api._launched["r1"] = dict(fresh)
+                api._launched["r1"]["cgroup"] = written
+                tool = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r1"})
+                self.assertTrue(tool["isError"])
+                self.assertEqual(tool["structuredContent"]["code"], a.PENDING)
+                self.assertNotEqual(tool["structuredContent"]["code"], a.STOPPED)
+                stored = reg.get("r1")
+                assert stored is not None
+                self.assertNotEqual(stored["state"], "stopped")
+                self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+
+    def test_a_same_cgroup_snapshot_is_checked_against_the_stored_members(self) -> None:
+        # put returns a recorded stop of the cgroup that was written, with no
+        # members. The stored row still lists late/9 alive. The returned members
+        # are not that row.
+        reg = _SameCgroupStopHidesMember()
+        api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+        run = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})["run"]["run_id"]
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(["stop", run], api, out, err)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["code"], a.PENDING)
+        self.assertEqual(res["state"], "pending")
+        self.assertEqual(res["reason"], "member_alive")
+        self.assertNotEqual(res["code"], a.STOPPED)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cli.EXIT_PENDING)
+        self.assertTrue(mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": run})["isError"])
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertNotEqual(stored["state"], "stopped")
+        self.assertEqual(stored["members"], [{"member_id": "late", "pid": 9}])
+        self.assertIs(reg.process_alive(9), True)
+
+    def test_repeated_pending_calls_do_not_bump_generation(self) -> None:
+        # A stopped row whose proof names no cgroup, with no members. Each
+        # pending answer is cgroup_unknown. A put here only bumps generation
+        # and rewrites the stop dict.
+        reg = InMemoryRunRegistry(processes=lambda _pid: False)
+        _stopped_row_without_cgroup(reg, None)
+        api, _, _, _ = make_api(registry=reg)
+        before = reg.get("r1")["generation"]
+        for _ in range(4):
+            res = api.call("run.stop", {"run_id": "r1"})
+            self.assertEqual(res["code"], a.PENDING)
+            self.assertEqual(res["state"], "pending")
+            self.assertEqual(res["reason"], "cgroup_unknown")
+            self.assertNotEqual(res["code"], a.STOPPED)
+            self.assertNotIn(res["code"], a.SUCCESS_CODES)
+        stored = reg.get("r1")
+        assert stored is not None
+        self.assertEqual(stored["generation"], before)
+        self.assertEqual(stored["state"], "stopped")
+        self.assertIsNone(stored.get("cgroup"))
+        self.assertEqual(stored["members"], [])
+        self.assertFalse(a._recorded_stop(stored))
+
+    def test_an_ahead_proof_cannot_become_stopped_by_catching_up(self) -> None:
+        # The proof generation is ahead of the row. A stopped put keeps that
+        # proof and bumps the row. Once the row generation catches the proof,
+        # the old proof must not answer stopped.
+        reg = InMemoryRunRegistry(processes=lambda _pid: False)
+        reg.put({"run_id": "r1", "tenant": "t", "engine": "e", "state": "running",
+                 "cgroup": "/cg/r1", "stop": None, "start_key": None})
+        row = reg._runs["r1"]
+        row["state"] = "stopped"
+        row["members"] = []
+        ahead = row["generation"] + 4
+        row["stop_attestation"] = {
+            "proof": "empty",
+            "cgroup": row["cgroup"],
+            "cgroup_marker": row.get("cgroup_marker"),
+            "member_ids": [],
+            "generation": ahead,
+        }
+        api, _, _, _ = make_api(FakeKillTree([EMPTY]), registry=reg)
+        start = reg.get("r1")["generation"]
+        self.assertGreater(ahead, start)
+        self.assertFalse(a._recorded_stop(reg.get("r1")))
+        for _ in range(6):
+            res = api.call("run.stop", {"run_id": "r1"})
+            self.assertEqual(res["code"], a.PENDING)
+            self.assertEqual(res["state"], "pending")
+            self.assertNotEqual(res["code"], a.STOPPED)
+            self.assertIsNot(res.get("repeat"), True)
+            self.assertNotIn(res["code"], a.SUCCESS_CODES)
+        stored = reg.get("r1")
+        assert stored is not None
+        self.assertEqual(stored["generation"], start)
+        self.assertGreater(stored["stop_attestation"]["generation"], stored["generation"])
+        self.assertFalse(a._recorded_stop(stored))
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["members"], [])
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(["stop", "r1"], api, out, err)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["code"], a.PENDING)
+        self.assertTrue(mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r1"})["isError"])
 
 
 if __name__ == "__main__":

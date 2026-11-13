@@ -131,7 +131,7 @@ class DurableRouteBreakerTests(unittest.TestCase):
         self.assertTrue(breaker.representable(CONN))
         self.assertFalse(breaker.representable('subscription:login with spaces'))
         with self.assertLogs('recursion_core.daemon.breaker', 'ERROR'):
-            self.assertEqual(breaker.bind_run('run-2', CONN, 'claude_code', 'model[1m]'), 'invalid_model_version')
+            self.assertEqual(breaker.bind_run('run-2', CONN, 'claude_code', 'model[1m]\n'), 'invalid_model_version')
         self.assertFalse(stored.tripped(CONN), 'asking whether an id is representable writes nothing')
         stored.close()  # a store that stopped answering: the route result still stands, and the gap is logged
         with self.assertLogs('recursion_core.daemon.breaker', 'ERROR') as logs:

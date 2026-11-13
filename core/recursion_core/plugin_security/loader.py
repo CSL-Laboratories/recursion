@@ -194,7 +194,7 @@ class PluginLoader:
                     raise Refused("plugin_already_active", manifest.plugin_id)
                 code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
                 findings.append(_finding("stage", "compiled", "info"))
-            except (Refused, SyntaxError, ValueError) as exc:
+            except (Refused, SyntaxError, ValueError, RecursionError, MemoryError) as exc:
                 # No plugin code ran, but the rule is a GIL read after every load attempt.
                 if self._gil_gate("refused_load", findings):
                     raise Refused("core_poisoned_gil_enabled", "refused_load") from exc

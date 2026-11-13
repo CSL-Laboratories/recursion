@@ -98,8 +98,10 @@ class _Handler(WSGIRequestHandler):
 
     def parse_request(self):
         parsed = super().parse_request()
-        if parsed and len(self.headers.get_all("Content-Length", ())) > 1:
-            self.send_error(400, "duplicate Content-Length")
+        if parsed and (len(self.headers.get_all("Content-Length", ())) > 1
+                       or self.headers.get("Transfer-Encoding") is not None):
+            # One Content-Length and no transfer coding: this server reads a body by its length only.
+            self.send_error(400, "ambiguous request length")
             return False
         self._reader.deadline = time.monotonic() + BODY_DEADLINE_S
         if parsed and not self.server.headers_read(self.connection, self.command, self.path):

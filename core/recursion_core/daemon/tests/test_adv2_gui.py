@@ -18,6 +18,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 from urllib.parse import urlencode
 
 from recursion_core.daemon import control_adapter as adapter
@@ -115,15 +116,43 @@ class Adv2HungPluginTests(GuiCase):
         return predicate()
 
     def test_a_second_read_is_not_held_forever_behind_a_hung_plugin(self):
-        first = threading.Thread(target=self.host.operator, args=({'command': READ, 'request_id': 'r1'},), daemon=True)
+        # The original 3 s join also bounded the shipped turn wait. That bound is kept as a check of the
+        # wait this host was built with and would really use (setUp passes none), before it is overridden:
+        # the constant alone says nothing about a constructor that ignores it.
+        self.assertEqual(self.host._operator_turn_wait_s, plugins.OPERATOR_TURN_WAIT_S,
+                         'a host built with no turn wait does not use the shipped default')
+        self.assertLessEqual(self.host._operator_turn_wait_s, 3.0, 'the default turn wait holds an O7 read too long')
+        self.host._operator_turn_wait_s = 0.05
+        first_answers, answers, errors = [], [], []
+
+        def read(command, target):
+            try:
+                target.append(self.host.operator(command))
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=read, args=({'command': READ, 'request_id': 'r1'}, first_answers),
+                                 daemon=True)
+        second = threading.Thread(target=read, args=({'command': 'operator.health.inspect'}, answers), daemon=True)
         first.start()
-        self.assertTrue(self.wait_for(lambda: self.module.CALLS))
-        answers = []
-        second = threading.Thread(target=lambda: answers.append(self.host.operator({'command': 'operator.health.inspect'})),
-                                  daemon=True)
-        second.start()
-        second.join(3)
-        self.assertFalse(second.is_alive(), 'the second O7 read is still waiting on the hung plugin after 3 s')
+        try:
+            self.assertTrue(self.wait_for(lambda: self.module.CALLS))
+            second.start()
+            second.join(10)  # watchdog, not a speed assertion; the first read is still held by GATE
+            self.assertFalse(second.is_alive(), 'the second O7 read is still blocked')
+            self.assertEqual(errors, [], 'an operator read raised instead of returning a typed answer')
+            self.assertEqual(answers, [(503, {'error': 'unavailable: operator plugin busy with an earlier read; '
+                                                      'nothing was read'})])
+            self.assertEqual(self.module.CALLS, [READ], 'the busy refusal must not invoke the plugin')
+        finally:
+            self.module.GATE.set()
+            first.join(10)
+            if second.ident is not None:
+                second.join(10)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([answer[0] for answer in first_answers], [200])
 
     def test_a_timed_out_call_answers_504_marks_the_plugin_degraded_and_no_second_call_is_made(self):
         host = plugins.PluginHost(self.tmp / 'config' / 'recursion', self.tmp / 'state', gil_probe=FakeGilProbe(),
@@ -134,11 +163,26 @@ class Adv2HungPluginTests(GuiCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             status, body = host.operator({'command': READ})
         self.assertEqual((status, body), (504, {'error': plugins.OPERATOR_TIMED_OUT}))
-        started = time.monotonic()
-        status, body = host.operator({'command': READ})
-        self.assertLess(time.monotonic() - started, 0.2, 'a read into a stuck plugin is answered at once')
-        self.assertEqual(status, 504)
-        self.assertIn('no new call was made', body['error'])
+        # Check the first six stuck reads directly, including the very first one.
+        # Keep the broad first-read watchdog and the fastest-of-five latency check.
+        # A one-off sleep below ten seconds is intentionally not rejected.
+        host._operator_turn_wait_s = 30.0
+        fastest = None
+        with mock.patch.object(host._turn, 'wait_for',
+                               side_effect=AssertionError('a stuck read waited for the turn')), \
+                mock.patch.object(threading.Thread, 'start',
+                                  side_effect=AssertionError('a stuck read launched a new thread')):
+            for attempt in range(6):
+                started = time.monotonic()
+                status, body = host.operator({'command': READ})
+                took = time.monotonic() - started
+                self.assertEqual(status, 504)
+                self.assertIn('no new call was made', body['error'])
+                if attempt == 0:
+                    self.assertLess(took, 10.0, 'a read into a stuck plugin waited for the turn')
+                else:
+                    fastest = took if fastest is None else min(fastest, took)
+        self.assertLess(fastest, 0.2, 'the fastest of five reads into a stuck plugin was not answered at once')
         self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')
         self.assertIn('a call has still not returned', host.inventory()['plugins'][0]['degraded'])
         self.assertIn('degraded', host.route_records()[0]['blocker'])
@@ -430,17 +474,19 @@ class Adv2ContentLengthTests(GuiCase):
     """A request says once how long its body is. With two Content-Length headers the server read the
     first, so a shorter first header made a prefix of the body the whole form: "...run_id=run-12" out
     of "...run_id=run-1234567890", with the page's own length check satisfied. A request that names
-    its length more than once is refused before the page sees it."""
+    its length more than once is refused before the page sees it. So is one with a Transfer-Encoding
+    header: the server decodes no transfer coding and would read such a body by its Content-Length."""
 
     WHOLE = b'confirm=explicit&run_id=run-1234567890'
 
-    def post_raw(self, gui, lengths, body):
-        """POST /stop with one Content-Length header per entry of ``lengths``; the status line that came back."""
+    def post_raw(self, gui, lengths, body, more=''):
+        """POST /stop with one Content-Length header per entry of ``lengths`` (and the header lines in
+        ``more``); the status line that came back."""
         import socket
         port = gui.address[1]
         head = (f'POST /stop HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n'
                 'Content-Type: application/x-www-form-urlencoded\r\n'
-                + ''.join(f'Content-Length: {length}\r\n' for length in lengths) + '\r\n').encode()
+                + ''.join(f'Content-Length: {length}\r\n' for length in lengths) + more + '\r\n').encode()
         with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
             client.sendall(head + body)
             client.shutdown(socket.SHUT_WR)
@@ -462,7 +508,31 @@ class Adv2ContentLengthTests(GuiCase):
             # One length, for contrast: the same bytes are a Stop of the run they name.
             self.assertEqual(self.post_raw(gui, (whole,), self.WHOLE).split()[1], '200')
             self.assertEqual(fake.call.stops, [{'run_id': 'run-1234567890'}])
+            # A plain read is answered as before.
+            self.assertEqual(self.get(gui, '/')[0], 200)
             # A refused request holds no place among the readers or the answering threads afterwards.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and (gui.server._reading or gui.server._working):
+                time.sleep(0.02)
+            self.assertEqual((len(gui.server._reading), len(gui.server._working)), (0, 0))
+
+    def test_a_request_with_a_transfer_encoding_is_refused(self):
+        whole = len(self.WHOLE)
+        chunked = 'Transfer-Encoding: chunked\r\n'
+        fake, transport = control_over(FakeOperatorHost({}))
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            # With one length (the shorter one named run-12), with two, and with none; and another coding.
+            for lengths, more in (((whole - 8,), chunked), ((whole,), chunked), ((whole - 8, whole), chunked),
+                                  ((), chunked), ((whole,), 'Transfer-Encoding: identity\r\n'),
+                                  ((whole,), 'transfer-encoding: gzip, chunked\r\n')):
+                with self.subTest(content_lengths=lengths, header=more.strip()):
+                    status = self.post_raw(gui, lengths, self.WHOLE, more)
+                    self.assertEqual(status.split(None, 2)[1:], ['400', 'ambiguous request length'], status)
+                    self.assertEqual(fake.call.stops, [], 'a request with a transfer coding was acted on')
+            # One length and no transfer coding, for contrast: a Stop of the run the body names. And a plain read.
+            self.assertEqual(self.post_raw(gui, (whole,), self.WHOLE).split()[1], '200')
+            self.assertEqual(fake.call.stops, [{'run_id': 'run-1234567890'}])
+            self.assertEqual(self.get(gui, '/')[0], 200)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and (gui.server._reading or gui.server._working):
                 time.sleep(0.02)

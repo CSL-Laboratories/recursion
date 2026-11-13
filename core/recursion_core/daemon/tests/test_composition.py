@@ -1085,6 +1085,126 @@ class ComposedDaemonTest(unittest.TestCase):
         rid = self.start(api, 'helper=0 fast=1')  # the next start launches and stops as usual
         self.assertEqual(api.call('run.stop', {'run_id': rid})['code'], 'stopped')
 
+    def engine_row(self, api):
+        return next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+
+    def test_a_model_name_outside_the_id_grammar_starts_and_is_bound_as_given(self):
+        """The store records a model as the route gives it when it is printable ASCII with no space, so a
+        vendor's own spelling starts like any other name, and the run's binding holds the exact string."""
+        pristine = json.loads(json.dumps(self.routes))
+        for name in ('opus[1m]', 'claude-sonnet-4.5(beta)', 'a+b'):
+            with self.subTest(model=name):
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['model'] = name
+                _, composed = self.boot()
+                try:
+                    api = self.api(composed)
+                    launched = len(self.units.started)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                    'prompt': 'helper=0 fast=1'})
+                    self.assertEqual(answer['code'], 'started', answer)
+                    self.assertEqual(len(self.units.started), launched + 1)
+                    rid = answer['run']['run_id']
+                    self.assertEqual(composed.breaker._stored.check(rid, 'subscription:stand-in-login', 'host'),
+                                     {'provider': 'claude_code', 'model_version': name})
+                    self.assertNotIn('breaker_model_unrepresentable', self.engine_row(api)['blocker'])
+                    api.call('run.stop', {'run_id': rid})
+                finally:
+                    self.shutdown()
+
+    def test_a_model_the_store_cannot_record_is_refused_before_the_breaker_is_asked(self):
+        """Too long, a space, a control character, not ASCII: the run's binding could not hold the name. The start
+        is refused with a code of its own before the breaker is asked and before anything is launched,
+        and route.list names it as the route's blocker."""
+        pristine = json.loads(json.dumps(self.routes))
+        for name in ('m' * 129, 'claude sonnet 4.5', 'opus\x07', 'mod\u00e8le'):
+            with self.subTest(model=ascii(name)[:24]):
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['model'] = name
+                _, composed = self.boot()
+                try:
+                    api = self.api(composed)
+                    with mock.patch.object(composed.breaker, 'admit', wraps=composed.breaker.admit) as admit:
+                        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                        'prompt': 'helper=0 fast=1'})
+                    self.assertEqual(answer['code'], 'start_failed', answer)
+                    self.assertEqual(answer['start_error'],
+                                     {'code': 'breaker_model_unrepresentable', 'detail': 'model'})
+                    admit.assert_not_called()
+                    self.assertEqual(self.units.started, [], 'a refused start launched nothing')
+                    self.assertEqual(self.engine_row(api)['blocker'], 'breaker_model_unrepresentable: model')
+                finally:
+                    self.shutdown()
+
+    def test_a_fallback_model_the_store_cannot_record_refuses_only_a_list_the_daemon_would_launch_from(self):
+        """As for a connection id: a fallback list that is only shown to the user (``on_limit`` ask or
+        wait) is never launched from, so a model in it that the store cannot record blocks nothing. In
+        a list the daemon would launch from it refuses the start, wherever it stands in the list."""
+        pristine = json.loads(json.dumps(self.routes))
+
+        def listed(model, login):
+            return {'engine': 'claude_code', 'model': model, 'api_key_helper': 'absent',
+                    'connection': {'kind': 'subscription', 'id': login}}
+
+        cases = (('ask', 1, None), ('wait', 1, None),
+                 ('fallback', 1, 'fallback 1: model'), ('fallback', 2, 'fallback 2: model'))
+        for on_limit, place, refusal in cases:
+            with self.subTest(on_limit=on_limit, place_of_the_entry_in_the_list=place):
+                entries = [listed('fallback-model', f'fallback-login-{number}') for number in range(1, place)]
+                entries.append(listed('mod\u00e8le', 'fallback-login-9'))
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['limits'] = {'on_limit': on_limit, 'fallback': entries}
+                _, composed = self.boot()
+                try:
+                    api = self.api(composed)
+                    launched = len(self.units.started)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                    'prompt': 'helper=0 fast=1'})
+                    blocker = self.engine_row(api)['blocker']
+                    if refusal is None:
+                        self.assertEqual(answer['code'], 'started', answer)
+                        self.assertEqual(len(self.units.started), launched + 1)
+                        self.assertNotIn('breaker_model_unrepresentable', blocker)
+                        api.call('run.stop', {'run_id': answer['run']['run_id']})
+                    else:
+                        self.assertEqual((answer['code'], answer.get('start_error')), (
+                            'start_failed', {'code': 'breaker_model_unrepresentable', 'detail': refusal}), answer)
+                        self.assertEqual(len(self.units.started), launched, 'a refused start launched nothing')
+                        self.assertEqual(blocker, f'breaker_model_unrepresentable: {refusal}')
+                finally:
+                    self.shutdown()
+
+    def test_a_route_with_no_model_is_still_the_validators_to_refuse(self):
+        """A model that is missing, empty or not text is refused by the route validator, request_invalid,
+        as it was before the store's rule was looked at before launch. That check leaves such a route
+        alone, for the route itself and for a route in a fallback list the daemon would launch from."""
+        pristine = json.loads(json.dumps(self.routes))
+        for where in ('route', 'fallback'):
+            for model in ('', None, 7, 'no model key'):
+                with self.subTest(where=where, model=repr(model)):
+                    self.routes = json.loads(json.dumps(pristine))
+                    route = self.routes['claude_code']['route']
+                    target = route
+                    if where == 'fallback':
+                        target = {'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                                  'connection': {'kind': 'subscription', 'id': 'fallback-login'}}
+                        route['limits'] = {'on_limit': 'fallback', 'fallback': [target]}
+                    if model == 'no model key':
+                        del target['model']
+                    else:
+                        target['model'] = model
+                    _, composed = self.boot()
+                    try:
+                        api = self.api(composed)
+                        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                        'prompt': 'helper=0 fast=1'})
+                        self.assertEqual(answer['code'], 'start_failed', answer)
+                        self.assertEqual(answer['start_error'], {'code': 'request_invalid', 'detail': 'route.model'})
+                        self.assertEqual(self.units.started, [], 'a refused start launched nothing')
+                        self.assertNotIn('breaker_model_unrepresentable', self.engine_row(api)['blocker'])
+                    finally:
+                        self.shutdown()
+
     def test_a_breaker_store_that_cannot_be_read_refuses_starts_and_keeps_reads(self):
         path = daemon_breaker.store_path(self.state)
         Registry(self.state).close()

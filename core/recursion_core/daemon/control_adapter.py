@@ -243,6 +243,45 @@ def _no_custody(route):
     return None
 
 
+def route_unbindable(entry, breaker):
+    """Why no run on a loaded route entry could be bound in the breaker store: ``(code, detail)``, or None.
+
+    A run is bound in the breaker store to its connection and its model before its engine starts,
+    and a binding the store refuses stops the launch. Two things about a route make every binding
+    fail. One is a connection id the store cannot key (``breaker_connection_unrepresentable``); a
+    limit on such a connection could not be kept across a restart either. The other is a model the
+    store cannot record (``breaker_model_unrepresentable``): one longer than 128 characters, or one
+    with a space, a control character or a non-ASCII character in it. The start is refused for either
+    before the route service is asked, and ``route.list`` names the same refusal as the route's
+    blocker. Both read this one function, so they cannot differ. A model that is missing, empty or
+    not text is not refused here: the route validator answers ``request_invalid`` for it, as before.
+
+    As in ``route_unsupported``, the routes of a ``limits.fallback`` list count only when the daemon
+    would launch from the list (``on_limit: fallback``). A list that is only shown to the user
+    (``ask``, ``wait``) never refuses the entry. Every connection id that counts is looked at before
+    any model, and a model in the list is named by its place in it.
+    """
+    route = entry.get('route') if isinstance(entry, dict) else None
+    if breaker is None or not isinstance(route, dict):
+        return None
+    limits = route.get('limits')
+    fallbacks = limits.get('fallback', ()) if isinstance(limits, dict) and limits.get('on_limit') == 'fallback' and isinstance(limits.get('fallback'), list) else ()
+    for candidate in (route, *fallbacks):
+        if isinstance(candidate, dict):
+            conn = route_connection({'route': candidate})
+            if conn is not None and not breaker.representable(conn):
+                # A limit on this connection could never be kept across a restart: refuse, do not run unfenced.
+                return 'breaker_connection_unrepresentable', 'connection id'
+    model = route.get('model')
+    if isinstance(model, str) and model and not breaker.model_representable(model):
+        return 'breaker_model_unrepresentable', 'model'
+    for place, other in enumerate(fallbacks, 1):
+        model = other.get('model') if isinstance(other, dict) else None
+        if isinstance(model, str) and model and not breaker.model_representable(model):
+            return 'breaker_model_unrepresentable', f'fallback {place}: model'
+    return None
+
+
 class StartRefused(Exception):
     def __init__(self, code, detail=''):
         super().__init__(f'{code}: {detail}' if detail else code)
@@ -299,15 +338,10 @@ class RouteStarter:
             raise self._refuse(run_id, route_contract.LAUNCH_REFUSED, unsupported)
         if self._breaker_unavailable is not None:
             raise self._refuse(run_id, 'breaker_store_unavailable', self._breaker_unavailable)
-        if self._breaker is not None:
-            limits = entry['route'].get('limits')
-            fallbacks = limits.get('fallback', ()) if isinstance(limits, dict) and limits.get('on_limit') == 'fallback' and isinstance(limits.get('fallback'), list) else ()
-            for candidate in (entry['route'], *fallbacks):
-                if isinstance(candidate, dict):
-                    conn = route_connection({'route': candidate})
-                    if conn is not None and not self._breaker.representable(conn):
-                        # A limit on this connection could never be kept across a restart: refuse, do not run unfenced.
-                        raise self._refuse(run_id, 'breaker_connection_unrepresentable', 'connection id')
+        unbindable = route_unbindable(entry, self._breaker)
+        if unbindable is not None:
+            # No run on this route could be bound in the breaker store: refuse before the route service is asked.
+            raise self._refuse(run_id, *unbindable)
         request = {'contract': route_contract.CONTRACT_VERSION, 'request_id': run_id,
                    'tenant': params['tenant'], 'prompt': params['prompt'],
                    'deadline_s': entry['deadline_s'], 'route': json.loads(json.dumps(entry['route']))}
@@ -569,6 +603,9 @@ class DaemonControl:
                                              f'starts on this connection are refused; {NO_BAR_EVIDENCE}')
                     elif tripped or state != 'closed':
                         record['blocker'] = f'breaker {state} on this connection (typed limit); {NO_BAR_EVIDENCE}'
+                unbindable = route_unbindable(entry, self._breaker)
+                if unbindable is not None:  # every start on this route is refused before anything is launched
+                    record['blocker'] = f'{unbindable[0]}: {unbindable[1]}'
                 unsupported = route_unsupported(entry)
                 if unsupported is not None:  # every start on this route is refused, whatever the breaker says
                     record['blocker'] = f'{route_contract.LAUNCH_REFUSED}: {unsupported}'

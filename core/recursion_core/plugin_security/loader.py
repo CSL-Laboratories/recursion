@@ -23,27 +23,41 @@ any later spawn must use cgroup plus pidfd, never ``preexec_fn`` or ``PR_SET_PDE
 
 A failed load puts the import tables back. Every ``sys.modules`` name added
 during the attempt is dropped, and a name that was already loaded is put back
-to the module the snapshot recorded. For each package that was already loaded,
-the bindings of those dotted names are put back too: set to the pre-load value,
-or deleted if the attribute was absent. The snapshot decides, not whether the
-attribute object is the module being dropped. A stdlib import made by the
-failed attempt is dropped with the rest; importing it again yields one module.
+to the module the snapshot recorded. For each module that was already loaded,
+package or not, the bindings of those dotted names are put back too: set to
+the pre-load value, or deleted if the attribute was absent. The snapshot
+decides, not whether the attribute object is the module being dropped and not
+whether the parent has ``__path__``. A module-typed binding recorded in the
+snapshot is put back by identity when the attribute no longer holds that
+object, including when the ``sys.modules`` entry for that dotted name was left
+unchanged. A stdlib import made by the failed attempt is dropped with the
+rest; importing it again yields one module.
+
+A finalizer on a dropped module can insert another name before the load
+returns. That includes a finalizer a cycle holds until garbage collection.
+Those names are dropped again, up to ``_RESTORE_BOUND`` rounds, and
+``gc.collect()`` runs once so the cycle's finalizer runs before the load
+returns. A finalizer that keeps inserting a name past that bound is refused
+with ``plugin_import_state_unrestored``. A finalizer that re-arms itself past
+the bound can still leave a name. That residue is an owner decision.
 
 A second ``load`` on the same loader is refused, including a nested call on
 this thread and a call from another thread. The loader lock is not waited on.
 A load that starts while another loader's activation is inside exec is refused
 the same way. That import lock is not re-entered and it is not waited on.
 
-Three residuals stay, and this process cannot close them. The plugin can change
-attributes of modules the snapshot kept. A thread it started can put a module
-back after the restore. It can patch importlib classes (``PathFinder``,
-``FileFinder``, ``SourceFileLoader``) so a later import in this process runs
-attacker code. Closing those means running the plugin in a subprocess.
-Whether to do that is an owner decision. This loader does not spawn one.
+Residuals this process does not close: a non-module attribute changed on a
+module whose ``sys.modules`` entry stayed the same object; a thread the plugin
+started that puts a module back after the restore returns; a patch of
+importlib classes (``PathFinder``, ``FileFinder``, ``SourceFileLoader``) so a
+later import in this process runs attacker code. Closing those means running
+the plugin in a subprocess. Whether to do that is an owner decision. This
+loader does not spawn one.
 """
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.machinery
 import sys
@@ -273,13 +287,17 @@ class _ImportSnapshot:
         self.parent_bindings: dict[str, dict[str, object]] = {}
         paths: dict[str, tuple] = {}
         for name, module in self.modules.items():
+            # Every pre-loaded module, not only packages. ``os`` has no
+            # ``__path__`` and ``json.encoder`` has none either; a dotted name
+            # under either one still has a parent attribute to put back.
+            if isinstance(module, types.ModuleType):
+                self._remember_bindings(name, module)
             try:
                 pkg_path = getattr(module, "__path__", None)
             except Exception:
                 continue
             if pkg_path is None:
                 continue
-            self._remember_bindings(name, module)
             if isinstance(pkg_path, list):
                 try:
                     items = list(pkg_path)
@@ -298,7 +316,7 @@ class _ImportSnapshot:
         self.package_paths = paths
 
     def _remember_bindings(self, name: str, module: object) -> None:
-        """Copy one pre-loaded package's attributes. The values are the pre-load bindings."""
+        """Copy one pre-loaded module's attributes. The values are the pre-load bindings."""
         try:
             self.parent_bindings[name] = dict(vars(module))
         except Exception:
@@ -364,9 +382,9 @@ def _module_bindings_to_restore(snap: _ImportSnapshot, modules: dict,
     """Dotted names whose parent attribute must return to the pre-load value.
 
     That is every dotted name added to ``sys.modules``, every pre-loaded dotted
-    name whose entry was replaced or removed, and a module attribute that
-    appeared on a pre-loaded package for a name the snapshot did not have
-    (an import whose ``sys.modules`` entry was popped before the attempt ended).
+    name whose entry was replaced or removed, and a module binding the snapshot
+    recorded when the attribute no longer holds that object. That recorded
+    binding is compared by identity. ``__name__`` does not decide it.
     """
     names: set[str] = set()
     for name in added:
@@ -391,23 +409,64 @@ def _module_bindings_to_restore(snap: _ImportSnapshot, modules: dict,
             for attr, value in current.items():
                 if not isinstance(value, types.ModuleType):
                     continue
-                dotted = parent_name + "." + attr
-                if dotted in snap.modules:
-                    continue
                 previous = bindings.get(attr, _MISSING)
-                if previous is value:
+                if previous is value or isinstance(previous, types.ModuleType):
+                    # Recorded module bindings are compared by identity below.
                     continue
+                dotted = parent_name + "." + attr
                 if previous is _MISSING or getattr(value, "__name__", None) == dotted:
                     names.add(dotted)
+            for attr, value in bindings.items():
+                if isinstance(value, types.ModuleType) and current.get(attr, _MISSING) is not value:
+                    names.add(parent_name + "." + attr)
     return list(names)
 
 
-def _restore_import_state(snap: _ImportSnapshot) -> None:
-    """Put every snapshotted import table back.
+def _import_modules_dirty(snap: _ImportSnapshot, modules: dict) -> bool:
+    """True when ``sys.modules`` is not the snapshotted dictionary of modules."""
+    if sys.modules is not modules:
+        return True
+    for name in modules:
+        if name not in snap.modules:
+            return True
+    for name, module in snap.modules.items():
+        if modules.get(name) is not module:
+            return True
+    return False
+
+
+def _import_bindings_dirty(snap: _ImportSnapshot, modules: dict) -> bool:
+    """True when a recorded module binding, or a new import binding, is still wrong."""
+    for parent_name, bindings in snap.parent_bindings.items():
+        parent = modules.get(parent_name)
+        if not isinstance(parent, types.ModuleType):
+            continue
+        try:
+            current = vars(parent)
+        except Exception:
+            return True
+        for attr, value in bindings.items():
+            if isinstance(value, types.ModuleType) and current.get(attr, _MISSING) is not value:
+                return True
+        for attr, value in current.items():
+            if isinstance(value, types.ModuleType) and attr not in bindings:
+                return True
+    return False
+
+
+# Rounds of pop-and-restore on each side of the one ``gc.collect()``.
+# A finalizer that inserts a fresh name each time it runs can outlast this.
+_RESTORE_BOUND = 8
+
+
+def _apply_import_restore(snap: _ImportSnapshot) -> None:
+    """Put every snapshotted import table back once.
 
     Every name added during the attempt is dropped. A name that was already
     loaded is put back to the module the snapshot recorded. Parent attributes
-    of those dotted names are put back from the package snapshot.
+    of those dotted names are put back from the module snapshot. A finalizer
+    that runs during this pass can insert a name or change an attribute again;
+    the caller repeats the pass.
     """
     modules = snap.modules_dict
     if sys.modules is not modules:
@@ -456,6 +515,36 @@ def _restore_import_state(snap: _ImportSnapshot) -> None:
                 live_inner[:] = list(items)
         except Exception:
             continue
+
+
+def _restore_import_state(snap: _ImportSnapshot) -> None:
+    """Put the import tables back, then drop names a finalizer inserted.
+
+    ``gc.collect()`` runs once. Cycles do not call ``__del__`` until then, so
+    a pass that already looks clean can still be undone by that collection.
+    Names that are still appearing after the bound on both sides of the
+    collection raise ``plugin_import_state_unrestored``. A finalizer that
+    re-arms itself past the bound can leave a name in ``sys.modules``.
+    """
+    modules = snap.modules_dict
+
+    def settle(bound: int) -> bool:
+        for _ in range(bound):
+            _apply_import_restore(snap)
+            if not _import_modules_dirty(snap, modules) and not _import_bindings_dirty(snap, modules):
+                return True
+        # Attribute drift that could not be written back does not by itself
+        # refuse the load. A name that is still in ``sys.modules`` does.
+        return not _import_modules_dirty(snap, modules)
+
+    if not settle(_RESTORE_BOUND):
+        gc.collect()
+        if not settle(_RESTORE_BOUND):
+            raise Refused("plugin_import_state_unrestored")
+        return
+    gc.collect()
+    if not settle(_RESTORE_BOUND):
+        raise Refused("plugin_import_state_unrestored")
 
 
 class PluginLoader:

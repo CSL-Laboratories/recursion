@@ -1420,6 +1420,205 @@ class SharedImportRollbackTests(unittest.TestCase):
                 thread.join(1)
             sys.modules.pop("csl_same_cross_r6", None)
 
+    def _clear_hunt_modules(self) -> None:
+        import gc
+        gc.collect()
+        for name, mod in list(sys.modules.items()):
+            if not name.startswith("hunt_"):
+                continue
+            cls = type(mod)
+            if cls is not types.ModuleType:
+                try:
+                    cls.__del__ = lambda _dead: None
+                except Exception:
+                    pass
+        for name in list(sys.modules):
+            if name.startswith("hunt_"):
+                sys.modules.pop(name, None)
+        gc.collect()
+
+    def test_a_failed_load_restores_os_path_when_the_parent_is_not_a_package(self) -> None:
+        """``os`` has no ``__path__``. Replacing ``os.path`` must not outlive the failure.
+
+        ``sys.modules['os.path']`` is put back to the pre-load module. ``os.path``
+        and ``from os import path`` name that same module, whose ``join`` is not
+        the attacker's.
+        """
+        import os
+        real_mod = sys.modules["os.path"]
+        real_attr = os.path
+        self.assertIs(real_attr, real_mod)
+        source = (
+            "import os, sys, types\n"
+            "fake = types.ModuleType('os.path')\n"
+            "fake.join = lambda *parts: 'pwned'\n"
+            "sys.modules['os.path'] = fake\n"
+            "os.path = fake\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.os.path")
+            self.assertIs(sys.modules.get("os.path"), real_mod)
+            self.assertIs(os.path, real_attr)
+            from os import path
+            self.assertIs(path, real_attr)
+            self.assertNotEqual(path.join("a", "b"), "pwned")
+        finally:
+            sys.modules["os.path"] = real_mod
+            os.path = real_attr
+
+    def test_a_failed_load_drops_an_attribute_on_a_non_package_parent(self) -> None:
+        """``json.encoder`` is a module. A name added under it is removed from both tables."""
+        import json.encoder
+        encoder = json.encoder
+        self.assertNotIn("pwn", vars(encoder))
+        source = (
+            "import json.encoder, sys, types\n"
+            "mod = types.ModuleType('json.encoder.pwn')\n"
+            "mod.marker = 'pwned'\n"
+            "sys.modules['json.encoder.pwn'] = mod\n"
+            "json.encoder.pwn = mod\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.encoder.pwn")
+            self.assertNotIn("json.encoder.pwn", sys.modules)
+            self.assertNotIn("pwn", vars(encoder))
+            self.assertFalse(hasattr(encoder, "pwn"))
+            self.assertNotEqual(getattr(getattr(encoder, "pwn", None), "marker", None), "pwned")
+        finally:
+            sys.modules.pop("json.encoder.pwn", None)
+            if "pwn" in vars(encoder):
+                del encoder.pwn
+
+    def test_a_failed_load_restores_a_module_attribute_by_identity(self) -> None:
+        """A pre-existing package attribute is put back even when ``__name__`` does not match.
+
+        ``encpkg_match.encoder`` was the ``json`` module. The failed load sets it
+        to ``ModuleType('unrelated')``. Identity with the snapshot decides, not
+        ``__name__``.
+        """
+        import json
+        pkg = types.ModuleType("encpkg_match")
+        pkg.__path__ = []
+        pkg.encoder = json
+        sys.modules["encpkg_match"] = pkg
+        source = (
+            "import encpkg_match, types\n"
+            "encpkg_match.encoder = types.ModuleType('unrelated')\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.encpkg.match")
+            self.assertIs(getattr(pkg, "encoder", None), json)
+            self.assertNotEqual(getattr(pkg.encoder, "__name__", None), "unrelated")
+        finally:
+            sys.modules.pop("encpkg_match.encoder", None)
+            sys.modules.pop("encpkg_match", None)
+
+    def test_a_failed_load_restores_a_module_attribute_when_sys_modules_stays(self) -> None:
+        """Poisoning ``json.encoder`` without touching its ``sys.modules`` entry is rolled back."""
+        import json
+        import json.encoder as encoder
+        real = encoder
+        self.assertIs(sys.modules["json.encoder"], real)
+        self.assertIs(json.encoder, real)
+        source = (
+            "import json, types\n"
+            "json.encoder = types.ModuleType('unrelated')\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.json.encoder.attr")
+            self.assertIs(json.encoder, real)
+            self.assertIs(sys.modules["json.encoder"], real)
+        finally:
+            json.encoder = real
+            sys.modules["json.encoder"] = real
+
+    def test_a_failed_load_drops_a_module_a_finalizer_puts_back(self) -> None:
+        """Popping a module runs ``__del__``, which reinserts ``hunt_zombie3``. That name is dropped too."""
+        source = (
+            "import sys, types\n"
+            "def plant():\n"
+            "    class Zombie(types.ModuleType):\n"
+            "        def __del__(self):\n"
+            "            revived = types.ModuleType('hunt_zombie3')\n"
+            "            revived.marker = 'pwned'\n"
+            "            sys.modules['hunt_zombie3'] = revived\n"
+            "    sys.modules['hunt_carrier'] = Zombie('hunt_carrier')\n"
+            "plant()\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.zombie.ref")
+            self.assertNotIn("hunt_zombie3", sys.modules)
+            self.assertNotIn("hunt_carrier", sys.modules)
+            self.assertNotEqual(getattr(sys.modules.get("hunt_zombie3"), "marker", None), "pwned")
+        finally:
+            self._clear_hunt_modules()
+
+    def test_a_failed_load_drops_a_module_a_cyclic_finalizer_puts_back(self) -> None:
+        """A cycle keeps the finalizer until ``gc.collect()``. The name it reinserts is dropped."""
+        import gc
+        source = (
+            "import sys, types\n"
+            "def plant():\n"
+            "    class Zombie:\n"
+            "        def __del__(self):\n"
+            "            revived = types.ModuleType('hunt_cycle_z')\n"
+            "            revived.marker = 'pwned'\n"
+            "            sys.modules['hunt_cycle_z'] = revived\n"
+            "    first = types.ModuleType('hunt_cycle_z')\n"
+            "    other = types.ModuleType('hunt_cycle_o')\n"
+            "    first.other = other\n"
+            "    other.first = first\n"
+            "    first.zombie = Zombie()\n"
+            "    first.marker = 'pwned'\n"
+            "    sys.modules['hunt_cycle_z'] = first\n"
+            "    sys.modules['hunt_cycle_o'] = other\n"
+            "plant()\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            self._load_failing(source, plugin_id="bad.zombie.cycle")
+            self.assertNotIn("hunt_cycle_z", sys.modules)
+            self.assertNotIn("hunt_cycle_o", sys.modules)
+            gc.collect()
+            self.assertNotIn("hunt_cycle_z", sys.modules)
+            self.assertNotIn("hunt_cycle_o", sys.modules)
+            self.assertNotEqual(getattr(sys.modules.get("hunt_cycle_z"), "marker", None), "pwned")
+        finally:
+            self._clear_hunt_modules()
+
+    def test_a_rearming_finalizer_past_the_bound_is_refused(self) -> None:
+        """A finalizer that inserts itself again on every pop is refused once the bound is past.
+
+        The bound is finite. A finalizer that keeps re-arming past it can still
+        leave ``hunt_zombie3``; that residue is not cleaned here.
+        """
+        source = (
+            "import sys, types\n"
+            "def plant():\n"
+            "    class Rearm(types.ModuleType):\n"
+            "        def __del__(self):\n"
+            "            n = getattr(Rearm, '_n', 0) + 1\n"
+            "            Rearm._n = n\n"
+            "            if n > 1000:\n"
+            "                return\n"
+            "            again = Rearm('hunt_zombie3')\n"
+            "            again.marker = 'pwned'\n"
+            "            sys.modules['hunt_zombie3'] = again\n"
+            "    sys.modules['hunt_zombie3'] = Rearm('hunt_zombie3')\n"
+            "plant()\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            code = self._run_failing(source, plugin_id="bad.zombie.rearm")
+            self.assertEqual(code, "plugin_import_state_unrestored")
+        finally:
+            self._clear_hunt_modules()
+
 
 class RevocationPublishTests(unittest.TestCase):
     def test_a_failed_revoke_does_not_publish_a_generation_below_the_row(self) -> None:

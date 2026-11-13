@@ -1064,18 +1064,21 @@ class SystemdManagerTests(unittest.TestCase):
                 return ('mem', directory.ident)
             return real_identity(directory)
 
-        def children(directory):
+        def children(directory, remaining):
             if isinstance(directory, Node):
-                if directory.child is None:
-                    return []
-                return [directory.child]
-            if directory != root:
-                return real_children(directory)
-            if mode['kind'] == 'deep':
-                return [head]
-            if mode['kind'] == 'cycle':
-                return [loop]
-            return wide
+                kids = [] if directory.child is None else [directory.child]
+            elif directory != root:
+                return real_children(directory, remaining)
+            elif mode['kind'] == 'deep':
+                kids = [head]
+            elif mode['kind'] == 'cycle':
+                kids = [loop]
+            else:
+                kids = wide
+            if len(kids) > remaining[0]:
+                return None
+            remaining[0] -= len(kids)
+            return kids
 
         def read_level(directory):
             if isinstance(directory, Node):
@@ -1095,6 +1098,88 @@ class SystemdManagerTests(unittest.TestCase):
             self.assertIsNone(self.manager._subtree(root))
             self.assertNotEqual(self.manager.observe('a'), 'empty')
             self.assertFalse(self.manager.processes_gone('a'))
+
+    def test_wide_cgroup_listing_stops_before_read_and_stat(self):
+        # Real os.scandir on a temp directory, not a host cgroup. The wrapper
+        # counts DirEntries the walk actually pulls from that iterator.
+        group = '/user.slice/a.service'
+        self.events(group, 0)
+        root = self.root / group.lstrip('/')
+        (root / 'cgroup.procs').write_text('')
+        with os.scandir(root) as scan:
+            existing = sum(1 for _ in scan)
+        budget_entries = CGROUP_WALK_MAX_NODES - 1
+
+        def add_files(count, prefix):
+            for i in range(count):
+                fd = os.open(root / f'{prefix}{i}', os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(fd)
+
+        add_files(budget_entries - existing, 'e')
+        self.assertEqual(sum(1 for _ in os.scandir(root)), budget_entries)
+        real_scandir = os.scandir
+        real_listdir = os.listdir
+        pulled = []
+        listdir_calls = []
+
+        def counting_scandir(path):
+            iterator = real_scandir(path)
+
+            class Wrap:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    self.close()
+                    return False
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    item = next(iterator)
+                    pulled.append(item.name)
+                    return item
+
+                def close(self):
+                    iterator.close()
+
+            return Wrap()
+
+        def counting_listdir(path):
+            listdir_calls.append(path)
+            return real_listdir(path)
+
+        show = (
+            'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+            f'ControlGroup={group}\nMainPID=0\n'
+            'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
+            'ExecMainStartTimestampMonotonic=81234567\n')
+        self.manager._call = Mock(return_value=show)
+        with patch.object(os, 'scandir', counting_scandir), \
+             patch.object(os, 'listdir', counting_listdir), \
+             patch.object(self.manager, '_read_level', return_value=([], False)):
+            # The root already took one slot. Exactly the remaining entries
+            # is a finished walk, and every name is pulled.
+            self.assertEqual(self.manager._subtree(root), ([], False))
+            self.assertEqual(len(pulled), budget_entries)
+            before = len(pulled)
+            self.assertEqual(self.manager.observe('a'), 'empty')
+            self.assertEqual(len(pulled) - before, budget_entries)
+            # One past the budget is unknown. The extra name is peeked and
+            # the iterator is closed before the rest of the directory is read.
+            add_files(3 * CGROUP_WALK_MAX_NODES, 'w')
+            before = len(pulled)
+            self.assertIsNone(self.manager._subtree(root))
+            self.assertLessEqual(len(pulled) - before, CGROUP_WALK_MAX_NODES + 1)
+            self.assertLess(len(pulled) - before, 3 * CGROUP_WALK_MAX_NODES)
+            before = len(pulled)
+            self.assertNotEqual(self.manager.observe('a'), 'empty')
+            self.assertLessEqual(len(pulled) - before, CGROUP_WALK_MAX_NODES + 1)
+            before = len(pulled)
+            self.assertFalse(self.manager.processes_gone('a'))
+            self.assertLessEqual(len(pulled) - before, CGROUP_WALK_MAX_NODES + 1)
+        self.assertEqual(listdir_calls, [])
 
     def test_populated_one_active_is_running(self):
         self.events('/user.slice/a.service', 1)

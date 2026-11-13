@@ -163,42 +163,26 @@ class Adv2HungPluginTests(GuiCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             status, body = host.operator({'command': READ})
         self.assertEqual((status, body), (504, {'error': plugins.OPERATOR_TIMED_OUT}))
-        # A read into a stuck plugin answers 504 and makes no new call, without waiting for the turn and
-        # without starting a thread. Three checks hold it to that. A pause of the process at one read
-        # fails none of them, short of a pause of ten seconds at the first.
-        # 1. With the turn wait at 30 s, the first such read is answered in under 10 s: it did not wait
-        #    out the turn.
+        # Check the first six stuck reads directly, including the very first one.
+        # Keep the broad first-read watchdog and the fastest-of-five latency check.
+        # A one-off sleep below ten seconds is intentionally not rejected.
         host._operator_turn_wait_s = 30.0
-        started = time.monotonic()
-        status, body = host.operator({'command': READ})
-        first = time.monotonic() - started
-        self.assertLess(first, 10.0, 'a read into a stuck plugin waited for the turn')
-        self.assertEqual(status, 504)
-        self.assertIn('no new call was made', body['error'])
-        # 2. Of five more reads the fastest takes under a fifth of a second. A delay built into the stuck
-        #    path (a sleep, a wait) slows every one of the five and fails here; one slow read does not.
         fastest = None
-        for _ in range(5):
-            started = time.monotonic()
-            status, body = host.operator({'command': READ})
-            took = time.monotonic() - started
-            self.assertEqual(status, 504)
-            self.assertIn('no new call was made', body['error'])
-            fastest = took if fastest is None else min(fastest, took)
-        self.assertLess(fastest, 0.2, 'the fastest of five reads into a stuck plugin was not answered at once')
-        # 3. Six more reads with the two operations themselves forbidden: a stuck read that waits for the
-        #    turn or launches a thread fails here, whatever the clock says.
         with mock.patch.object(host._turn, 'wait_for',
                                side_effect=AssertionError('a stuck read waited for the turn')), \
                 mock.patch.object(threading.Thread, 'start',
                                   side_effect=AssertionError('a stuck read launched a new thread')):
-            for _ in range(6):
+            for attempt in range(6):
+                started = time.monotonic()
                 status, body = host.operator({'command': READ})
+                took = time.monotonic() - started
                 self.assertEqual(status, 504)
                 self.assertIn('no new call was made', body['error'])
-        # Not caught any more: a delay of under 10 s that only the first stuck read meets and that is
-        # neither a turn wait nor a new thread. The 0.2 s bound on that one read did catch it. It also
-        # failed, with nothing wrong in the host, when the process was paused for 0.3 s at that read.
+                if attempt == 0:
+                    self.assertLess(took, 10.0, 'a read into a stuck plugin waited for the turn')
+                else:
+                    fastest = took if fastest is None else min(fastest, took)
+        self.assertLess(fastest, 0.2, 'the fastest of five reads into a stuck plugin was not answered at once')
         self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')
         self.assertIn('a call has still not returned', host.inventory()['plugins'][0]['degraded'])
         self.assertIn('degraded', host.route_records()[0]['blocker'])

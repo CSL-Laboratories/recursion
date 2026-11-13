@@ -58,7 +58,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable
 
-from .canonical import canonical
+from .canonical import canonical, parse
 from .errors import Refused
 
 __all__ = ["EFFECT_SCHEMA", "SCOPE_FIELDS", "ApprovalGate", "check_effect", "effect_digest"]
@@ -77,6 +77,7 @@ def check_effect(effect: object) -> bytes:
     """Return the effect's canonical bytes, or refuse a malformed effect."""
     try:
         raw = canonical(effect)
+        effect = parse(raw)  # Validate exactly the immutable bytes the approval will draw.
     except Refused:
         raise Refused("effect_noncanonical") from None
     if type(effect) is not dict or set(effect) != _FIELDS or effect["schema"] != EFFECT_SCHEMA:

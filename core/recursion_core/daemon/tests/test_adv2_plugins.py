@@ -232,14 +232,93 @@ class Adv2FilesystemTests(Adv2HostCase):
 
     def test_install_json_shapes_that_are_not_valid_refuse_every_plugin(self):
         for body in ('[]', '{"grants": {}}', '{"grants": [{"plugin_id": "a"}]}', '{"trusted_keys": {"k": "zz"}}',
-                     '{"reserved": {"hosts": "x"}}', '{"authority_anchor": 5}', '{"extra": 1}', '\xff',
+                     '{"reserved": {"hosts": "x"}}', '{"authority_anchor": 5}',
+                     '{"extra": 1}', '\xff', '[' * 100_000 + ']' * 100_000,
                      '{"grants": [{"plugin_id": "a", "artifact_sha256": "0", "permissions": [["read"]]}]}'):
-            with self.subTest(body=body):
+            with self.subTest(body=body[:40]):
                 self.install(self.touch() + ANSWER)
                 (self.plugins / 'install.json').write_bytes(body.encode('latin-1'))
                 with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
                     host = self.host()
                 self.assertEqual(host.records[0]['state'], 'refused')
+                self.assertFalse(self.marker.exists())
+
+    def test_parser_overflow_artifact_refuses_typed(self):
+        # The plugin is unsigned, as everywhere in this file, so nothing here needs a signature backend.
+        deep = b'~' * 10_000 + b'1'
+        self.install(deep)
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            host = self.host()
+        self.assertEqual((host.records[0]['state'], host.records[0]['code']), ('refused', 'plugin_compile_failed'))
+
+    @unittest.skipIf(getattr(os, 'geteuid', lambda: -1)() == 0, 'root bypasses Unix file read modes')
+    def test_unreadable_stores_refuse_typed(self):
+        from recursion_core.plugin_security import create_ledger, create_revocation_store
+        self.install(self.touch() + ANSWER)
+        sec = self.state / 'plugin-security'
+        sec.mkdir(parents=True, mode=0o700, exist_ok=True)
+        rev = sec / 'revoked.sqlite3'
+        if not rev.exists():
+            create_revocation_store(str(rev))
+        os.chmod(rev, 0o000)
+        self.addCleanup(lambda: rev.exists() and os.chmod(rev, 0o600))
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            host2 = self.host()
+        self.assertEqual(host2.records[0]['code'], 'revocation_store_invalid')
+        self.assertFalse(self.marker.exists())
+        os.chmod(rev, 0o600)
+
+        # The ledger only has to be bound to an anchor in the right format. Nothing here signs with it or
+        # verifies against it, so a fixed public value does and no key is generated.
+        anchor = '11' * 32
+        fx.write_install(self.config, grants=[fx.grant_for(ANSWER)], authority_anchor=anchor)
+        fx.write_plugin(self.plugins / 'one', ANSWER)
+        ledger = sec / 'ledger.sqlite3'
+        create_ledger(str(ledger), anchor)
+        os.chmod(ledger, 0o000)
+        self.addCleanup(lambda: ledger.exists() and os.chmod(ledger, 0o600))
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            host3 = self.host()
+        self.assertEqual(host3.authority_state, 'unavailable: ledger_invalid')
+        self.assertIsNone(host3.authority)
+
+    def test_a_store_folder_that_cannot_be_used_refuses_typed(self):
+        """Not a store file that the store itself refuses, as above, but the folder the stores live in.
+        The failure is then the operating system's own error, raised before any store is opened. The host
+        answers it with the same typed code and loads nothing."""
+        sec = self.state / 'plugin-security'
+
+        def a_file_in_its_place():
+            sec.write_bytes(b'')
+
+        def a_folder_that_cannot_be_entered():
+            sec.mkdir(mode=0o700)
+            os.chmod(sec, 0o000)
+
+        def a_folder_that_cannot_be_written_to():
+            sec.mkdir(mode=0o700)
+            os.chmod(sec, 0o500)
+
+        shapes = [a_file_in_its_place]
+        if os.geteuid() != 0:  # root is not held back by Unix file modes
+            shapes += [a_folder_that_cannot_be_entered, a_folder_that_cannot_be_written_to]
+        for shape in shapes:
+            with self.subTest(shape=shape.__name__):
+                self.install(self.touch() + ANSWER)
+                self.state.mkdir(mode=0o700, exist_ok=True)
+                shape()
+                try:
+                    with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+                        host = self.host()
+                finally:
+                    if sec.is_dir():
+                        os.chmod(sec, 0o700)
+                        shutil.rmtree(sec)
+                    else:
+                        sec.unlink()
+                record = host.records[0]
+                self.assertEqual((record['state'], record['code'], record['detail']),
+                                 ('refused', 'revocation_store_invalid', 'PermissionError'))
                 self.assertFalse(self.marker.exists())
 
     def test_a_grant_for_another_digest_gives_no_permission(self):

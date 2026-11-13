@@ -23,11 +23,13 @@ engine linger plus an operator leaf is not containment (Lucas, 2026-11-07, on B6
 """
 from __future__ import annotations
 
+import ctypes
 import errno
 import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import signal
 import stat
@@ -42,6 +44,21 @@ log = logging.getLogger(__name__)
 # Leaf ids are run-[A-Za-z0-9_-]{1,64}. The dot in a systemd run-*.scope fails
 # this. Another tool can still use run-<id>, so the name is not ownership.
 LEAF_NAME = re.compile(r'run-[a-zA-Z0-9_-]{1,64}')
+# mkdirat name under the parent fd. Not a leaf id. Sweep does not remove it.
+_NEW_LEAF_PREFIX = '.recursion-new-'
+# linux/fs.h. rename() is not a substitute: it replaces an existing directory.
+_RENAME_NOREPLACE = 1
+# SYS_renameat2 from the kernel UAPI. An architecture that is not listed
+# fails closed (ENOSYS). asm/unistd_64.h is 316, asm/unistd_32.h is 353,
+# asm-generic/unistd.h (aarch64, riscv64) is 276.
+_SYS_RENAMEAT2 = {
+    'x86_64': 316,
+    'i386': 353,
+    'i686': 353,
+    'aarch64': 276,
+    'arm64': 276,
+    'riscv64': 276,
+}
 OWNERSHIP_XATTR = 'user.recursion.leaf'
 OWNERSHIP_VALUE = b'recursion-cgroup-leaf/1'
 CLEANUP_ATTEMPTS = 5  # bounded: an interrupt storm leaves the leaf to the sweep
@@ -221,59 +238,110 @@ def _discard_matching_inode(parent_fd, held):
     _discard_held_leaf(parent_fd, held, (info.st_dev, info.st_ino))
 
 
-def _mark_created_leaf(leaf):
-    """Mark the directory inode just created at ``leaf``.
+def _renameat2_noreplace(olddirfd, oldname, newdirfd, newname):
+    """``renameat2(old, new, RENAME_NOREPLACE)`` via ``SYS_renameat2``.
 
-    The directory is opened ``O_DIRECTORY|O_NOFOLLOW`` from the parent fd and
-    that fd stays open on the returned ``(st_dev, st_ino)``. The marker is
-    written only when ``lstat`` of the leaf name matches ``fstat`` of this fd.
-    A name that does not match is not marked and not removed. If the marker
-    write fails, only an entry whose ``lstat`` matches the held fd is
-    discarded.
+    Flag 1 is ``RENAME_NOREPLACE``. The final name is published only when
+    nothing is there. An unknown architecture, or ``ENOSYS`` from the kernel,
+    raises ``OSError(ENOSYS)``. There is no ``rename`` fallback: ``rename``
+    replaces a directory that already has the final name.
+    """
+    number = _SYS_RENAMEAT2.get(os.uname().machine)
+    if number is None:
+        raise OSError(errno.ENOSYS, 'renameat2 unavailable')
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = ctypes.CFUNCTYPE(
+        ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, use_errno=True,
+    )(('syscall', libc))
+    old = os.fsencode(oldname)
+    new = os.fsencode(newname)
+    rc = syscall(ctypes.c_long(number), ctypes.c_int(olddirfd), old,
+                 ctypes.c_int(newdirfd), new, ctypes.c_uint(_RENAME_NOREPLACE))
+    if rc != 0:
+        err = ctypes.get_errno() or errno.EIO
+        raise OSError(err, os.strerror(err), oldname)
+
+
+def _publish_marked_leaf(leaf):
+    """Create a marked directory and publish it as ``leaf``.
+
+    The parent directory fd is held for the whole call. ``mkdirat`` uses a
+    fresh ``.recursion-new-<token>`` name, ``openat`` is
+    ``O_DIRECTORY|O_NOFOLLOW`` on that name, and ``lstat`` of the temp name
+    must match ``fstat`` of that fd before ``fsetxattr`` marks it.
+    ``renameat2(RENAME_NOREPLACE)`` then moves the temp name onto ``leaf``.
+
+    The final name is never created first and is never opened to be marked.
+    On ``EEXIST`` or any other failure, only the inode the held fd pins is
+    removed, and the error is ``EBUSY``. That discard does not remove a
+    final name that was not proven to be this fd. If ``renameat2`` is
+    unavailable, the same path fails closed.
     """
     leaf = Path(leaf)
-    try:
-        parent_fd = os.open(leaf.parent, _DIR_OPEN)
-    except OSError as exc:
-        raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+    parent_fd = None
     fd = None
     try:
         try:
-            fd = os.open(leaf.name, _DIR_OPEN, dir_fd=parent_fd)
+            parent_fd = os.open(leaf.parent, _DIR_OPEN)
         except OSError as exc:
-            # Nothing is pinned. Do not remove whatever name now has an inode
-            # number sampled before this open.
+            raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+        temp = _NEW_LEAF_PREFIX + secrets.token_hex(16)
+        try:
+            os.mkdir(temp, 0o755, dir_fd=parent_fd)
+        except OSError as exc:
+            # The temp name was not pinned. Do not remove whatever has it.
+            raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+        try:
+            fd = os.open(temp, _DIR_OPEN, dir_fd=parent_fd)
+        except OSError as exc:
+            # Nothing is pinned. Do not rmdir the temp name: it may no longer
+            # be the directory mkdirat created.
             raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
         try:
             info = os.fstat(fd)
         except OSError as exc:
             raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+        identity = (info.st_dev, info.st_ino)
         if not stat.S_ISDIR(info.st_mode):
             raise OSError(errno.EBUSY, 'cgroup identity changed')
-        if _directory_entry_inode(parent_fd, leaf.name) != (info.st_dev, info.st_ino):
-            # The name is no longer the inode this fd pins. Do not mark it
-            # and do not remove it. Drop the pinned inode only if a parent
-            # entry still lstats as this fd.
-            _discard_matching_inode(parent_fd, fd)
+        if _directory_entry_inode(parent_fd, temp) != identity:
             raise OSError(errno.EBUSY, 'cgroup identity changed')
         try:
             mark_owned(fd)
-        except OSError:
-            _discard_matching_inode(parent_fd, fd)
-            raise
+        except OSError as exc:
+            raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+        # The marker went to the fd. Rename only if the temp name is still
+        # that inode. A directory swapped onto the temp name must not be
+        # published as the leaf, and the final name is not opened or marked.
+        if _directory_entry_inode(parent_fd, temp) != identity:
+            raise OSError(errno.EBUSY, 'cgroup identity changed')
+        try:
+            _renameat2_noreplace(parent_fd, temp, parent_fd, leaf.name)
+        except OSError as exc:
+            raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+        # Prove the published name is the pinned inode. If it is not, leave
+        # that name in place. Discard below removes only the pinned inode.
+        if _directory_entry_inode(parent_fd, leaf.name) != identity:
+            raise OSError(errno.EBUSY, 'cgroup identity changed')
         held = _HeldDirectory(info.st_dev, info.st_ino, fd)
         fd = None
         return held
+    except OSError:
+        if parent_fd is not None and fd is not None:
+            _discard_matching_inode(parent_fd, fd)
+        raise
     finally:
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        try:
-            os.close(parent_fd)
-        except OSError:
-            pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
 
 
 def cgroup_identity(path):
@@ -518,17 +586,20 @@ class Cgroup2:
         self.mount = Path(os.path.realpath(mount))
 
     def make_leaf(self, leaf: Path):
-        """Create ``leaf`` and mark that inode. Return ``(st_dev, st_ino)``.
+        """Create ``leaf`` and return ``(st_dev, st_ino)`` for that inode.
 
-        ``mkdir`` is exclusive: an existing leaf is never reused. The returned
-        tuple holds the ``O_DIRECTORY|O_NOFOLLOW`` fd opened on that inode
-        (``close`` or ``__del__`` releases it; ``LeafRun`` adopts it). The
-        marker is written only when ``lstat`` of the name matches ``fstat`` of
-        that fd. A swapped-in directory is not marked. A failed marker write
-        discards only an entry that still matches the held fd.
+        The returned tuple holds the ``O_DIRECTORY|O_NOFOLLOW`` fd opened on
+        the inode this call created (``close`` or ``__del__`` releases it;
+        ``LeafRun`` adopts it). An existing directory at ``leaf`` is never
+        reused. The final name is not created first: a parent fd is held,
+        ``mkdirat`` creates ``.recursion-new-<token>``, that inode is marked
+        only when ``lstat`` of the temp name matches ``fstat`` of its fd, and
+        ``renameat2(RENAME_NOREPLACE)`` publishes it. A directory swapped onto
+        the final name is not marked and not removed. Any failure removes
+        only the pinned temp inode and raises ``EBUSY``. If ``renameat2`` is
+        unavailable, creation fails closed; ``rename`` is not used.
         """
-        os.mkdir(leaf, 0o755)  # exclusive: an existing leaf is never reused
-        return _mark_created_leaf(leaf)
+        return _publish_marked_leaf(leaf)
 
     def open_procs(self, leaf: Path, dirfd=None) -> int:
         """Open ``cgroup.procs`` for writing. ``dirfd`` pins the directory."""
@@ -943,9 +1014,13 @@ class DelegatedRoot:
         ``run-*`` name that is not a leaf id, any other name, a leaf id
         without the marker, a leaf id whose marker cannot be read, an opened
         inode that is not the one just classified, and a symlink are left in
-        place and returned in ``reported``. They are not killed. A leaf whose
-        ``cgroup.procs`` still lists an id is not removed. Exits of swept leaves
-        are unseen, so they are never booked terminated.
+        place and returned in ``reported``. They are not killed. A leftover
+        ``.recursion-new-*`` directory is one of those names. Owner decision:
+        sweep does not remove it, marked or not. A crash between ``mkdirat``
+        and ``renameat2`` can leave the directory this launcher created, and
+        a foreign directory can use the same prefix; neither is deleted.
+        A leaf whose ``cgroup.procs`` still lists an id is not removed. Exits
+        of swept leaves are unseen, so they are never booked terminated.
         """
         if isinstance(keep, (str, bytes)):
             raise TypeError('keep must be a collection of leaf names, not a string')
@@ -974,7 +1049,11 @@ class DelegatedRoot:
                 continue
             # The run- prefix is not ownership. Only a leaf id can be ours,
             # and only together with the marker on the inode we just saw.
-            if LEAF_NAME.fullmatch(leaf.name) is None:
+            # Owner decision: a leftover ".recursion-new-*" name is not a
+            # leaf, marked or not. Do not delete it. A foreign directory may
+            # wear that prefix, and our own unpublished temp inode may too.
+            if (leaf.name.startswith(_NEW_LEAF_PREFIX)
+                    or LEAF_NAME.fullmatch(leaf.name) is None):
                 report(leaf.name, 'foreign-name')
                 continue
             classified = (info.st_dev, info.st_ino)

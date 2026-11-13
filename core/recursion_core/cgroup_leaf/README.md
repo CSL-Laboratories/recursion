@@ -12,11 +12,19 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   The launching process must itself be inside that subtree, because cgroup v2
   only lets an unprivileged writer migrate a process when it can write the
   common ancestor's `cgroup.procs`. Leaf names match `run-[A-Za-z0-9_-]{1,64}`;
-  an existing leaf is never reused. Creation opens that directory
-  `O_DIRECTORY|O_NOFOLLOW` from the parent directory fd, and `fsetxattr`s
-  `user.recursion.leaf` = `recursion-cgroup-leaf/1` only when `fstat` matches
-  the inode `mkdir` created. A directory swapped onto the name is not marked.
-  If the marker write fails, only that created inode is removed. Sweep and adopt
+  an existing leaf is never reused. Creation holds the parent directory fd,
+  `mkdirat`s an unguessable `.recursion-new-<token>` name, opens that inode
+  `O_DIRECTORY|O_NOFOLLOW`, and `fsetxattr`s `user.recursion.leaf` =
+  `recursion-cgroup-leaf/1` only when `lstat` of the temp name matches
+  `fstat` of that fd. `renameat2(RENAME_NOREPLACE)` (syscall
+  `SYS_renameat2`, flag 1) then publishes it as the leaf. The final name is
+  never created first and is never opened to be marked. `EEXIST` or any
+  other failure removes only the inode that fd pins and raises `EBUSY`. A
+  directory already at the leaf name, including one swapped onto it, is not
+  marked and not removed. If `renameat2` is unavailable (an architecture
+  whose syscall number is not known here, or `ENOSYS`), creation fails
+  closed the same way. There is no `rename` fallback, because `rename`
+  would replace an existing directory. Sweep and adopt
   trust a directory only when the name matches and that attribute is present.
   The `run-` prefix alone is not ownership.
 - No launch race: the parent opens the leaf's `cgroup.procs` and starts a small
@@ -88,7 +96,11 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   `run-*.scope.bak`, and `run-`), any other name, a leaf id without the
   marker (`ENODATA`, or a different value), an opened inode that is not the
   one just classified, and a symlink are left in place and listed in
-  `reported`. They are not killed. A leaf id whose marker cannot be read
+  `reported`. They are not killed. A leftover `.recursion-new-*` directory,
+  marked or not, is reported `foreign-name` and left in place. Owner
+  decision: that name is not a leaf id. A crash can leave the temp directory
+  `mkdirat` created, and a foreign directory can use the same prefix; sweep
+  does not delete either. A leaf id whose marker cannot be read
   (`EOPNOTSUPP`, or any error other than `ENODATA`) is reported as
   `marker-unreadable:<errno>` and is not killed: an unreadable marker is not
   proof the leaf is unmarked.

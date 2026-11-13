@@ -1121,6 +1121,40 @@ class RemovalContractTests(unittest.TestCase):
         self.assertEqual(self.fs.killed, ['run-ours'])
         self.assertEqual([path.name for path in self.fs.rmdir_calls], ['run-ours'])
 
+    def test_sweep_leaves_provisional_names(self):
+        # Owner decision: a leftover .recursion-new-* directory is not removed,
+        # whether or not it carries the marker. It is not a leaf id, and a
+        # foreign directory may use the prefix.
+        marked_name = cgroup_leaf._NEW_LEAF_PREFIX + ('ab' * 16)
+        unmarked_name = cgroup_leaf._NEW_LEAF_PREFIX + ('cd' * 16)
+        marked = self.root_path / marked_name
+        unmarked = self.root_path / unmarked_name
+        write_cgroup(marked, procs='')
+        write_cgroup(unmarked, procs='')
+        (marked / 'payload').write_text('marked')
+        (unmarked / 'payload').write_text('unmarked')
+        cgroup_leaf.mark_owned(marked)
+        root = DelegatedRoot(self.root_path, self.fs)
+        with self.assertLogs(cgroup_leaf.log.name, level='WARNING'):
+            result = root.sweep(keep=())
+        self.assertEqual(result.outcomes, {})
+        self.assertEqual(result.reported, (
+            (marked_name, 'foreign-name'),
+            (unmarked_name, 'foreign-name'),
+        ))
+        self.assertEqual((marked / 'payload').read_text(), 'marked')
+        self.assertEqual((unmarked / 'payload').read_text(), 'unmarked')
+        self.assertEqual((marked / 'cgroup.kill').read_text(), '')
+        self.assertEqual((unmarked / 'cgroup.kill').read_text(), '')
+        self.assertEqual(os.getxattr(marked, cgroup_leaf.OWNERSHIP_XATTR,
+                                     follow_symlinks=False),
+                         cgroup_leaf.OWNERSHIP_VALUE)
+        with self.assertRaises(OSError) as marker:
+            os.getxattr(unmarked, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+        self.assertEqual(marker.exception.errno, errno.ENODATA)
+        self.assertEqual(self.fs.killed, [])
+        self.assertEqual(self.fs.rmdir_calls, [])
+
     def _sweep_with_marker_errno(self, name, err):
         leaf = self.root_path / name
         write_cgroup(leaf, procs='')
@@ -1553,6 +1587,9 @@ class RemovalContractTests(unittest.TestCase):
         self.assertEqual(self.fs.rmdir_calls, [])
 
     def test_make_leaf_does_not_mark_swapped_scope(self):
+        # During the marker write the created inode is moved aside and a scope
+        # takes its name. The marker is fsetxattr on the fd, so it must not
+        # land on the scope, and the scope must not be removed or published.
         leaf = self.root_path / 'run-a'
         scope = self.root_path / 'run-1.scope'
         aside = self.root_path / 'run-a-aside'
@@ -1564,22 +1601,36 @@ class RemovalContractTests(unittest.TestCase):
         def swap_setxattr(path, attr, value, *args, **kwargs):
             if attr == cgroup_leaf.OWNERSHIP_XATTR and not swapped['done']:
                 swapped['done'] = True
-                if leaf.exists() and not aside.exists():
-                    leaf.rename(aside)
-                    scope.rename(leaf)
+                created = None
+                if isinstance(path, int):
+                    try:
+                        created = Path(os.readlink(f'/proc/self/fd/{path}'))
+                    except OSError:
+                        created = None
+                elif leaf.exists():
+                    created = leaf
+                if (created is not None and created.is_dir() and scope.exists()
+                        and not aside.exists()):
+                    created.rename(aside)
+                    scope.rename(created)
             return real(path, attr, value, *args, **kwargs)
 
-        with patch.object(cgroup_leaf.os, 'setxattr', swap_setxattr):
-            got = self.fs.make_leaf(leaf)
+        got = None
         try:
+            with patch.object(cgroup_leaf.os, 'setxattr', swap_setxattr):
+                with self.assertRaises(OSError) as caught:
+                    got = self.fs.make_leaf(leaf)
+            self.assertEqual(caught.exception.errno, errno.EBUSY)
             self.assertTrue(swapped['done'])
-            self.assertEqual(got, cgroup_identity(aside))
-            self.assertEqual(os.getxattr(aside, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False),
-                             cgroup_leaf.OWNERSHIP_VALUE)
-            with self.assertRaises(OSError) as caught:
-                os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
-            self.assertEqual(caught.exception.errno, errno.ENODATA)
-            self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+            self.assertFalse(leaf.exists())
+            self.assertFalse(aside.exists())
+            payloads = [path for path in self.root_path.rglob('payload')
+                        if path.read_text() == 'systemd']
+            self.assertEqual(len(payloads), 1)
+            with self.assertRaises(OSError) as marker:
+                os.getxattr(payloads[0].parent, cgroup_leaf.OWNERSHIP_XATTR,
+                            follow_symlinks=False)
+            self.assertEqual(marker.exception.errno, errno.ENODATA)
         finally:
             close = getattr(got, 'close', None)
             if close is not None:
@@ -1607,12 +1658,176 @@ class RemovalContractTests(unittest.TestCase):
         with patch.object(cgroup_leaf.os, 'setxattr', swap_and_enospc):
             with self.assertRaises(OSError) as caught:
                 self.fs.make_leaf(leaf)
-        self.assertEqual(caught.exception.errno, errno.ENOSPC)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertEqual(caught.exception.__cause__.errno, errno.ENOSPC)
         self.assertTrue(swapped['done'])
-        self.assertTrue((leaf / 'payload').is_file())
-        self.assertEqual((leaf / 'payload').read_text(), 'systemd')
-        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        self.assertFalse(leaf.exists())
         self.assertFalse(aside.exists())
+        self.assertTrue(scope.is_dir())
+        self.assertEqual((scope / 'payload').read_text(), 'systemd')
+        self.assertEqual((scope / 'cgroup.kill').read_text(), '')
+        with self.assertRaises(OSError) as marker:
+            os.getxattr(scope, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+        self.assertEqual(marker.exception.errno, errno.ENODATA)
+        self.assertFalse(any(name.startswith(cgroup_leaf._NEW_LEAF_PREFIX)
+                             for name in os.listdir(self.root_path)))
+
+    def test_make_leaf_does_not_replace_existing_name(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        (leaf / 'payload').write_text('foreign')
+        with self.assertRaises(OSError) as caught:
+            self.fs.make_leaf(leaf)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertEqual((leaf / 'payload').read_text(), 'foreign')
+        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        with self.assertRaises(OSError) as marker:
+            os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+        self.assertEqual(marker.exception.errno, errno.ENODATA)
+        self.assertFalse(any(name.startswith(cgroup_leaf._NEW_LEAF_PREFIX)
+                             for name in os.listdir(self.root_path)))
+
+    def test_make_leaf_busy_when_scope_swapped_onto_name_before_open(self):
+        # The foreign scope is renamed onto the leaf name before the created
+        # directory is opened. make_leaf must raise EBUSY and must not mark,
+        # join, or remove that scope. No child is started.
+        gc.collect()
+        before = len(os.listdir('/proc/self/fd'))
+        leaf = self.root_path / 'run-a'
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-a-aside'
+        write_cgroup(scope, procs='')
+        (scope / 'payload').write_text('systemd')
+        swapped = {'done': False}
+        real_open = os.open
+
+        def swap_open(path, flags, *args, **kwargs):
+            if (not swapped['done'] and not isinstance(path, int)
+                    and (flags & os.O_DIRECTORY)):
+                text = os.fsdecode(path)
+                if (text == leaf.name or Path(text) == leaf
+                        or Path(text) == leaf.parent):
+                    swapped['done'] = True
+                    if leaf.exists() and not aside.exists():
+                        leaf.rename(aside)
+                    if scope.exists():
+                        scope.rename(leaf)
+            return real_open(path, flags, *args, **kwargs)
+
+        root = DelegatedRoot(self.root_path, self.fs)
+        caught = None
+        run = None
+        try:
+            with patch.object(cgroup_leaf.os, 'open', swap_open):
+                try:
+                    run = root.launch('run-a', ['sleep', '30'], kill_timeout=0.4)
+                except Exception as exc:
+                    caught = exc
+            self.assertTrue(swapped['done'])
+            self.assertIsNone(run)
+            self.assertIsInstance(caught, OSError)
+            self.assertEqual(caught.errno, errno.EBUSY)
+            self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+            self.assertEqual((leaf / 'cgroup.procs').read_text().strip(), '')
+            self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+            with self.assertRaises(OSError) as marker:
+                os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+            self.assertEqual(marker.exception.errno, errno.ENODATA)
+            self.assertFalse(any(name.startswith(cgroup_leaf._NEW_LEAF_PREFIX)
+                                 for name in os.listdir(self.root_path)))
+        finally:
+            if run is not None:
+                try:
+                    run.close()
+                except Exception:
+                    pass
+                if run.pid and alive(run.pid):
+                    _stop_pid(run.pid)
+                run._release_held_fds()
+            if (leaf / 'cgroup.procs').is_file():
+                text = (leaf / 'cgroup.procs').read_text().strip()
+                if text.isdigit():
+                    _stop_pid(int(text))
+            gc.collect()
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
+    def test_make_leaf_swap_back_does_not_delete_foreign_scope(self):
+        # If the created name is opened after a scope has been swapped onto
+        # it, and the names are swapped back before the inode check, the
+        # pinned fd is the scope. Discarding that fd deletes the scope.
+        # The final name is not opened, so the scope stays.
+        gc.collect()
+        before = len(os.listdir('/proc/self/fd'))
+        leaf = self.root_path / 'run-a'
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-a-aside'
+        write_cgroup(scope, procs='')
+        (scope / 'payload').write_text('systemd')
+        (scope / 'extra').write_text('keep')
+        opened_leaf = {'done': False}
+        real_open = os.open
+
+        def swap_open(path, flags, *args, **kwargs):
+            if not opened_leaf['done'] and _is_leaf_directory_open(path, flags, leaf):
+                opened_leaf['done'] = True
+                if leaf.exists() and scope.exists() and not aside.exists():
+                    leaf.rename(aside)
+                    scope.rename(leaf)
+                fd = real_open(path, flags, *args, **kwargs)
+                if aside.exists() and leaf.exists() and not scope.exists():
+                    leaf.rename(scope)
+                    aside.rename(leaf)
+                return fd
+            return real_open(path, flags, *args, **kwargs)
+
+        got = None
+        caught = None
+        try:
+            with patch.object(cgroup_leaf.os, 'open', swap_open):
+                try:
+                    got = self.fs.make_leaf(leaf)
+                except OSError as exc:
+                    caught = exc
+            self.assertTrue(scope.is_dir())
+            self.assertEqual((scope / 'payload').read_text(), 'systemd')
+            self.assertEqual((scope / 'extra').read_text(), 'keep')
+            self.assertEqual((scope / 'cgroup.kill').read_text(), '')
+            self.assertFalse(opened_leaf['done'])
+            self.assertIsNone(caught)
+            self.assertEqual(tuple(got), cgroup_identity(leaf))
+            self.assertNotEqual(tuple(got), cgroup_identity(scope))
+            with self.assertRaises(OSError) as marker:
+                os.getxattr(scope, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+            self.assertEqual(marker.exception.errno, errno.ENODATA)
+        finally:
+            close = getattr(got, 'close', None)
+            if close is not None:
+                close()
+            gc.collect()
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
+    def test_make_leaf_renameat2_unavailable_fails_closed(self):
+        scope = self.root_path / 'run-1.scope'
+        leaf = self.root_path / 'run-a'
+        write_cgroup(scope, procs='')
+        (scope / 'payload').write_text('systemd')
+
+        def unavailable(*args, **kwargs):
+            raise OSError(errno.ENOSYS, 'renameat2 unavailable')
+
+        with patch.object(cgroup_leaf, '_renameat2_noreplace', unavailable):
+            with self.assertRaises(OSError) as caught:
+                self.fs.make_leaf(leaf)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertEqual(caught.exception.__cause__.errno, errno.ENOSYS)
+        self.assertFalse(leaf.exists())
+        self.assertEqual((scope / 'payload').read_text(), 'systemd')
+        self.assertEqual((scope / 'cgroup.kill').read_text(), '')
+        with self.assertRaises(OSError) as marker:
+            os.getxattr(scope, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+        self.assertEqual(marker.exception.errno, errno.ENODATA)
+        self.assertFalse(any(name.startswith(cgroup_leaf._NEW_LEAF_PREFIX)
+                             for name in os.listdir(self.root_path)))
 
     def test_make_leaf_does_not_mark_recycled_inode(self):
         # The first lstat of the new directory replaces it. ext4 reuses the
@@ -1675,11 +1890,23 @@ class RemovalContractTests(unittest.TestCase):
         real_open = os.open
 
         def fail_open(path, flags, *args, **kwargs):
-            if (not state['done'] and _is_leaf_directory_open(path, flags, leaf)
-                    and leaf.exists()):
+            # The created directory is the final name on the old publisher and
+            # the unguessable temp name once make_leaf mkdirats first. Either
+            # open is before the inode is pinned. A sibling that then reuses
+            # the inode number must not be removed.
+            created = None
+            if not state['done'] and not isinstance(path, int) and (flags & os.O_DIRECTORY):
+                text = os.fsdecode(path)
+                if (text == leaf.name or Path(text) == leaf) and leaf.exists():
+                    created = leaf
+                elif text.startswith(cgroup_leaf._NEW_LEAF_PREFIX):
+                    candidate = leaf.parent / text
+                    if candidate.is_dir():
+                        created = candidate
+            if created is not None:
                 state['done'] = True
-                original = os.lstat(leaf).st_ino
-                os.rmdir(leaf)
+                original = os.lstat(created).st_ino
+                os.rmdir(created)
                 os.mkdir(sibling)
                 (sibling / 'payload').write_text('keep')
                 state['reused'] = os.lstat(sibling).st_ino == original

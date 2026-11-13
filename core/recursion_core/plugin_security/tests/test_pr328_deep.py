@@ -1891,6 +1891,275 @@ class SharedImportRollbackTests(unittest.TestCase):
             sys.modules.pop("nest_keep", None)
             sys.modules.pop("nest_keep.child", None)
 
+    def _clear_import_latch(self) -> None:
+        import recursion_core.plugin_security.loader as loader_mod
+        loader_mod._import_restore_latched = False
+
+    def _repair_sys(self, modules, meta, hooks, cache, path) -> None:
+        """Put ``sys`` back if a repro left its class or import tables swapped."""
+        try:
+            object.__setattr__(sys, "__class__", types.ModuleType)
+        except Exception:
+            pass
+        try:
+            namespace = types.ModuleType.__dict__["__dict__"].__get__(sys)
+        except Exception:
+            self._clear_import_latch()
+            return
+        namespace["modules"] = modules
+        namespace["meta_path"] = meta
+        namespace["path_hooks"] = hooks
+        namespace["path_importer_cache"] = cache
+        namespace["path"] = path
+        modules.pop("pwn_sys", None)
+        self._clear_import_latch()
+
+    def test_a_raising_sys_class_cannot_keep_the_import_tables(self) -> None:
+        """A Guard class on ``sys`` must not abort settle before the tables are put back.
+
+        ``sys.modules = modules`` used to run while ``sys.__class__`` still
+        raised, so the ``RuntimeError`` skipped the class restore and left
+        the attacker's module dict and meta_path installed. That is not a
+        clean ``plugin_import_failed``. Fails on b1125f27.
+        """
+        source = (
+            "import sys, types\n"
+            "class Guard(types.ModuleType):\n"
+            "    def __setattr__(self, name, value):\n"
+            "        raise RuntimeError('no-set')\n"
+            "    def __delattr__(self, name):\n"
+            "        raise RuntimeError('no-del')\n"
+            "mapping = types.ModuleType.__dict__['__dict__'].__get__(sys)\n"
+            "evil = dict(mapping['modules'])\n"
+            "planted = types.ModuleType('pwn_sys')\n"
+            "planted.marker = 'pwned'\n"
+            "evil['pwn_sys'] = planted\n"
+            "mapping['modules'] = evil\n"
+            "mapping['meta_path'] = [object()]\n"
+            "object.__setattr__(sys, '__class__', Guard)\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        saved_modules = sys.modules
+        saved_meta = sys.meta_path
+        saved_hooks = sys.path_hooks
+        saved_cache = sys.path_importer_cache
+        saved_path = sys.path
+        try:
+            try:
+                code = self._run_failing(source, plugin_id="bad.sys.guard")
+            except Exception as exc:
+                code = type(exc).__name__
+            attacker = (
+                type(sys) is not types.ModuleType
+                or sys.modules is not saved_modules
+                or "pwn_sys" in sys.modules
+                or sys.meta_path is not saved_meta
+            )
+            self.assertFalse(attacker and code in ("plugin_import_failed", "RuntimeError"))
+            self.assertFalse(attacker)
+            self.assertIs(type(sys), types.ModuleType)
+            self.assertIs(sys.modules, saved_modules)
+            self.assertNotIn("pwn_sys", sys.modules)
+            self.assertIs(sys.meta_path, saved_meta)
+            self.assertEqual(code, "plugin_import_failed")
+            good = b"VALUE = 1\n"
+            dev_loader, raws, sigs = self._loader_for({"good.after.sys": good})
+            loaded = dev_loader.load(raws["good.after.sys"], sigs["good.after.sys"], good)
+            self.assertEqual(loaded.module.VALUE, 1)
+        finally:
+            self._repair_sys(saved_modules, saved_meta, saved_hooks, saved_cache, saved_path)
+            for name in list(sys.modules):
+                if name.startswith("csl_plugin_"):
+                    sys.modules.pop(name, None)
+
+    def test_a_failed_class_descriptor_restore_refuses_later_loads(self) -> None:
+        """A heap class attribute that cannot be removed is not a clean import failure.
+
+        The failed step latches the process: a later load is refused with
+        ``plugin_import_state_unrestored`` instead of running more plugin code.
+        Fails on b1125f27, which reports ``plugin_import_failed`` and leaves
+        the attribute in place.
+        """
+        class Meta(type):
+            def __delattr__(cls, name):
+                if name == "stuck":
+                    raise RuntimeError("no-del-class")
+                return type.__delattr__(cls, name)
+
+        class Heap(types.ModuleType, metaclass=Meta):
+            pass
+
+        host = Heap("latch_host")
+        sys.modules["latch_host"] = host
+        source = (
+            "import latch_host\n"
+            "type(latch_host).stuck = 'pwned'\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            code = self._run_failing(source, plugin_id="bad.latch.class")
+            stuck = Heap.__dict__.get("stuck") == "pwned"
+            self.assertFalse(stuck and code == "plugin_import_failed")
+            if stuck:
+                self.assertEqual(code, "plugin_import_state_unrestored")
+                later = self._run_failing(b"VALUE = 1\n", plugin_id="later.latch")
+                self.assertEqual(later, "plugin_import_state_unrestored")
+            else:
+                self.assertEqual(code, "plugin_import_failed")
+        finally:
+            try:
+                type.__delattr__(Heap, "stuck")
+            except Exception:
+                pass
+            sys.modules.pop("latch_host", None)
+            self._clear_import_latch()
+
+    def test_a_heap_module_property_cannot_plant_during_the_proof(self) -> None:
+        """A heap module property must not plant a module or a class attribute.
+
+        ``getattr`` during the proof used to run the property after the raw
+        dict had already been scanned. The property returns the snapshotted
+        module, writes another module into the dict, and adds ``pwn_crypto``.
+        That residue with ``plugin_import_failed`` is the bug. Fails on b1125f27.
+        A cryptography ``_ModuleWithDeprecations`` module is checked the same
+        way when that package is installed.
+        """
+        real = types.ModuleType("heap_host.real")
+        real.marker = "kept"
+        flag = types.ModuleType("heap_flag")
+        flag.on = False
+        sys.modules["heap_flag"] = flag
+
+        class Heap(types.ModuleType):
+            @property
+            def real(self):
+                if sys.modules["heap_flag"].on:
+                    planted = types.ModuleType("heap_host.planted")
+                    planted.marker = "pwned"
+                    namespace = types.ModuleType.__dict__["__dict__"].__get__(self)
+                    namespace["planted"] = planted
+                    type(self).pwn_crypto = property(lambda self, planted=planted: planted)
+                return real
+
+        host = Heap("heap_host")
+        namespace = types.ModuleType.__dict__["__dict__"].__get__(host)
+        namespace["real"] = real
+        sys.modules["heap_host"] = host
+        source = (
+            "import heap_flag, heap_host\n"
+            "heap_flag.on = True\n"
+            "heap_host.real\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            code = self._run_failing(source, plugin_id="bad.heap.prop")
+            flag.on = False
+            namespace = types.ModuleType.__dict__["__dict__"].__get__(host)
+            planted = namespace.get("planted")
+            residue = (
+                planted is not None
+                or "pwn_crypto" in type(host).__dict__
+                or getattr(planted, "marker", None) == "pwned"
+            )
+            self.assertFalse(residue and code == "plugin_import_failed")
+            if residue:
+                self.assertEqual(code, "plugin_import_state_unrestored")
+            else:
+                self.assertEqual(code, "plugin_import_failed")
+                self.assertIs(type(host), Heap)
+                self.assertIs(namespace.get("real"), real)
+                self.assertNotIn("planted", namespace)
+                self.assertNotIn("pwn_crypto", Heap.__dict__)
+                self.assertIs(host.real, real)
+        finally:
+            flag.on = False
+            try:
+                namespace = types.ModuleType.__dict__["__dict__"].__get__(host)
+                namespace.pop("planted", None)
+            except Exception:
+                pass
+            if "pwn_crypto" in Heap.__dict__:
+                try:
+                    del Heap.pwn_crypto
+                except Exception:
+                    try:
+                        type.__delattr__(Heap, "pwn_crypto")
+                    except Exception:
+                        pass
+            sys.modules.pop("heap_host", None)
+            sys.modules.pop("heap_flag", None)
+            sys.modules.pop("heap_host.planted", None)
+            sys.modules.pop("heap_host.real", None)
+            self._clear_import_latch()
+
+        crypto_types = None
+        try:
+            import cryptography.hazmat.primitives.asymmetric.types as crypto_types
+        except Exception:
+            crypto_types = None
+        if crypto_types is None:
+            return
+        crypto_cls = type(crypto_types)
+        crypto_flag = types.ModuleType("crypto_heap_flag")
+        crypto_flag.on = False
+        sys.modules["crypto_heap_flag"] = crypto_flag
+        crypto_source = (
+            "import crypto_heap_flag, types\n"
+            "import cryptography.hazmat.primitives.asymmetric.types as target\n"
+            "expected = types.ModuleType.__dict__['__dict__'].__get__(target).get('_module')\n"
+            "def getter(self):\n"
+            "    if not crypto_heap_flag.on:\n"
+            "        return expected\n"
+            "    planted = types.ModuleType('crypto_heap.planted')\n"
+            "    planted.marker = 'pwned'\n"
+            "    namespace = types.ModuleType.__dict__['__dict__'].__get__(self)\n"
+            "    namespace['planted'] = planted\n"
+            "    type(self).pwn_crypto = property(lambda self, planted=planted: planted)\n"
+            "    return expected\n"
+            "type(target)._module = property(getter)\n"
+            "crypto_heap_flag.on = True\n"
+            "target._module\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        try:
+            code = self._run_failing(crypto_source, plugin_id="bad.crypto.heap")
+            crypto_flag.on = False
+            namespace = types.ModuleType.__dict__["__dict__"].__get__(crypto_types)
+            shadow = crypto_cls.__dict__.get("_module")
+            residue = (
+                "planted" in namespace
+                or "pwn_crypto" in crypto_cls.__dict__
+                or isinstance(shadow, property)
+            )
+            self.assertFalse(residue and code == "plugin_import_failed")
+            if residue:
+                self.assertEqual(code, "plugin_import_state_unrestored")
+            else:
+                self.assertEqual(code, "plugin_import_failed")
+                self.assertNotIn("planted", namespace)
+                self.assertNotIn("pwn_crypto", crypto_cls.__dict__)
+                self.assertNotIsInstance(crypto_cls.__dict__.get("_module"), property)
+        finally:
+            crypto_flag.on = False
+            try:
+                namespace = types.ModuleType.__dict__["__dict__"].__get__(crypto_types)
+                namespace.pop("planted", None)
+            except Exception:
+                pass
+            for name in ("pwn_crypto", "_module"):
+                if name in crypto_cls.__dict__ and (
+                        name == "pwn_crypto" or isinstance(crypto_cls.__dict__.get(name), property)):
+                    try:
+                        delattr(crypto_cls, name)
+                    except Exception:
+                        try:
+                            type.__delattr__(crypto_cls, name)
+                        except Exception:
+                            pass
+            sys.modules.pop("crypto_heap_flag", None)
+            sys.modules.pop("crypto_heap.planted", None)
+            self._clear_import_latch()
+
 
 class RevocationPublishTests(unittest.TestCase):
     def test_a_failed_revoke_does_not_publish_a_generation_below_the_row(self) -> None:

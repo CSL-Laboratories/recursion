@@ -35,13 +35,21 @@ rest; importing it again yields one module.
 
 The snapshot records each pre-loaded module's class and the bindings of
 module objects reachable as module-typed attributes, two levels deep,
-deduplicated by identity, up to ``_MODULE_WALK_BOUND``. Restore puts the
-class back first, then writes the real module dict, so a swapped class whose
-``__setattr__`` raises cannot keep the old binding. The check reads that
-dict and, for every snapshotted module-valued name, ``getattr``. If the
-class cannot be restored, a write fails, or ``getattr`` is not the
-snapshotted object, the load is refused with
-``plugin_import_state_unrestored``.
+deduplicated by identity, up to ``_MODULE_WALK_BOUND``. A heap subclass of
+``ModuleType`` also records that class's ``__dict__``: the descriptors
+themselves, not the values ``getattr`` would return. Restore puts every
+recorded module's class back through ``object.__setattr__`` before it
+writes any attribute. ``sys.modules``, ``sys.path``, ``sys.meta_path``,
+``sys.path_hooks`` and ``sys.path_importer_cache`` are written through the
+module's real dict, not ``setattr``, so a class whose ``__setattr__``
+raises cannot abort the pass. Each of those steps runs on its own. One
+failure does not skip the rest. If any step fails, the load is refused
+with ``plugin_import_state_unrestored`` and further loads are refused the
+same way until the process restarts. The proof reads the real dict again
+and compares the heap class dict. It does not call ``getattr``, so a
+descriptor cannot plant a module or a class attribute while returning the
+expected value. An added or replaced descriptor on a heap module class is
+put back, or the load is refused with ``plugin_import_state_unrestored``.
 
 A finalizer on a dropped module can insert another name or binding before
 the load returns. That includes a finalizer a cycle holds until garbage
@@ -187,6 +195,19 @@ class _ImportRecord:
 _import_isolation = threading.Lock()
 _import_depth = threading.local()
 _import_finding = threading.local()
+# A restore step that cannot finish sets this. Later loads are refused until
+# the process restarts: this interpreter can no longer prove its import tables.
+_import_restore_latched = False
+
+
+def _latch_import_restore() -> None:
+    global _import_restore_latched
+    _import_restore_latched = True
+
+
+def _require_import_restorable() -> None:
+    if _import_restore_latched:
+        raise Refused("plugin_import_state_unrestored")
 
 
 def _finding_names() -> set[str]:
@@ -288,13 +309,16 @@ def _end_import_record(record: _ImportRecord) -> dict:
 class _ModuleView:
     """One module object as it stood before the plugin ran."""
 
-    __slots__ = ("module", "cls", "bindings", "visible", "names")
+    __slots__ = ("module", "cls", "bindings", "names", "class_attrs")
 
-    def __init__(self, module: object, cls: type, bindings: dict, visible: dict) -> None:
+    def __init__(self, module: object, cls: type, bindings: dict, class_attrs: object) -> None:
         self.module = module
         self.cls = cls
         self.bindings = bindings
-        self.visible = visible
+        # ``None`` for a non-heap class. A dict of descriptor objects for a
+        # heap ``ModuleType`` subclass. ``_UNREADABLE`` when that dict could
+        # not be copied; the proof then fails closed.
+        self.class_attrs = class_attrs
         # Import names this object was entered under. A new module whose
         # ``__name__`` is ``parent.attr`` is an import binding; a module stored
         # on a pre-existing non-module attribute under some other name is not.
@@ -347,6 +371,7 @@ class _ImportSnapshot:
         self._seen: set[int] = set()
         self.restore_blocked = False
         self.truncated = False
+        self._heap_classes: dict[int, bool] = {}
         paths: dict[str, tuple] = {}
         for name, module in self.modules.items():
             # Every pre-loaded module, not only packages. ``os`` has no
@@ -382,7 +407,7 @@ class _ImportSnapshot:
         self._capture_reachable()
 
     def _capture(self, module: object) -> _ModuleView | None:
-        """Record one module's class, real dict, and visible module bindings."""
+        """Record one module's class, real dict, and heap-class descriptors."""
         ident = id(module)
         if ident in self._seen:
             return self._views_by_id.get(ident)
@@ -390,17 +415,10 @@ class _ImportSnapshot:
         try:
             cls = type(module)
             bindings = dict(_module_mapping(module))
+            class_attrs = _snapshot_class_attrs(cls, self._heap_classes)
         except Exception:
             return None
-        visible: dict[str, object] = {}
-        for attr, value in bindings.items():
-            if not _is_module(value):
-                continue
-            try:
-                visible[attr] = getattr(module, attr)
-            except Exception:
-                visible[attr] = _UNREADABLE
-        view = _ModuleView(module, cls, bindings, visible)
+        view = _ModuleView(module, cls, bindings, class_attrs)
         self._views_by_id[ident] = view
         self.module_views.append(view)
         return view
@@ -431,21 +449,6 @@ class _ImportSnapshot:
                 queue.append((value, depth + 1))
 
 
-def _restore_list(owner: object, attr: str, original: list, items: list) -> None:
-    """Put the snapshotted list object back and refill it."""
-    current = getattr(owner, attr, None)
-    if current is not original:
-        try:
-            setattr(owner, attr, original)
-            current = original
-        except (AttributeError, TypeError):
-            pass
-    try:
-        current[:] = list(items)
-    except (AttributeError, TypeError, ValueError):
-        setattr(owner, attr, list(items))
-
-
 _MISSING = object()
 _UNREADABLE = object()
 
@@ -459,6 +462,158 @@ def _restore_module_class(module: object, cls: type) -> bool:
     except Exception:
         return False
     return type(module) is cls
+
+
+def _is_heap_module_class(cls: object, cache: dict[int, bool]) -> bool:
+    """True for a Python subclass of ``ModuleType`` whose ``__dict__`` can change.
+
+    Builtin ``ModuleType`` is not a heap type. A class statement subclass is.
+    The cache is per snapshot: almost every module shares one class.
+    """
+    ident = id(cls)
+    hit = cache.get(ident)
+    if hit is not None:
+        return hit
+    heap = False
+    try:
+        heap = (
+            isinstance(cls, type)
+            and cls is not types.ModuleType
+            and issubclass(cls, types.ModuleType)
+            and gc.is_tracked(cls)
+        )
+    except Exception:
+        heap = False
+    cache[ident] = heap
+    return heap
+
+
+def _snapshot_class_attrs(cls: object, cache: dict[int, bool]) -> object:
+    """Copy a heap class's descriptors, or ``None`` when the class is not one.
+
+    Iteration of ``cls.__dict__`` does not invoke those descriptors. ``_UNREADABLE``
+    means the copy failed and the proof must fail closed.
+    """
+    if not _is_heap_module_class(cls, cache):
+        return None
+    try:
+        return dict(getattr(cls, "__dict__", {}))
+    except Exception:
+        return _UNREADABLE
+
+
+def _mark_restore_failure(snap: _ImportSnapshot) -> None:
+    """One restore step could not finish. Refuse this load and every later one."""
+    snap.restore_blocked = True
+    _latch_import_restore()
+
+
+def _call_restore_step(snap: _ImportSnapshot, fn) -> None:
+    """Run one restore step. A failure does not escape, so later steps still run."""
+    try:
+        failed = fn() is False
+    except Exception:
+        failed = True
+    if failed:
+        _mark_restore_failure(snap)
+
+
+def _write_module_attr(module: object, name: str, value: object) -> bool:
+    """Assign ``name`` through the module's real dict, not ``__setattr__``."""
+    try:
+        namespace = _module_mapping(module)
+        if namespace.get(name, _MISSING) is not value:
+            namespace[name] = value
+        return namespace.get(name, _MISSING) is value
+    except Exception:
+        return False
+
+
+def _restore_sys_sequence(name: str, original: list, items: list) -> bool:
+    """Put one of ``sys``'s list attributes back through the real dict and refill it."""
+    wrote = _write_module_attr(sys, name, original)
+    try:
+        original[:] = list(items)
+    except Exception:
+        return False
+    return wrote
+
+
+def _restore_sys_cache(snap: _ImportSnapshot) -> bool:
+    """Put ``sys.path_importer_cache`` back through the real dict and refill it."""
+    wrote = _write_module_attr(sys, "path_importer_cache", snap.cache)
+    try:
+        snap.cache.clear()
+        snap.cache.update(snap.cache_items)
+    except Exception:
+        return False
+    return wrote
+
+
+def _class_attrs_match(view: _ModuleView) -> bool:
+    """True when a heap class's descriptors are still the snapshotted objects."""
+    saved = view.class_attrs
+    if saved is None:
+        return True
+    if saved is _UNREADABLE or not isinstance(saved, dict):
+        return False
+    try:
+        current = view.cls.__dict__
+    except Exception:
+        return False
+    if len(current) != len(saved):
+        return False
+    for key, value in saved.items():
+        if current.get(key, _MISSING) is not value:
+            return False
+    return True
+
+
+def _restore_class_attrs(view: _ModuleView) -> bool:
+    """Put a heap class's ``__dict__`` back. One key's failure does not skip the rest."""
+    saved = view.class_attrs
+    if saved is None:
+        return True
+    if saved is _UNREADABLE or not isinstance(saved, dict):
+        return False
+    cls = view.cls
+    ok = True
+    try:
+        current_keys = list(cls.__dict__)
+    except Exception:
+        return False
+    for key in current_keys:
+        if key in saved:
+            continue
+        try:
+            delattr(cls, key)
+        except Exception:
+            ok = False
+    for key, value in saved.items():
+        try:
+            live = cls.__dict__.get(key, _MISSING)
+        except Exception:
+            ok = False
+            continue
+        if live is value:
+            continue
+        try:
+            setattr(cls, key, value)
+        except Exception:
+            ok = False
+    return ok
+
+
+def _raw_import_dirty(view: _ModuleView, current: dict) -> bool:
+    """True when the real dict's import bindings are not the snapshot."""
+    for attr, previous in view.bindings.items():
+        live = current.get(attr, _MISSING)
+        if _binding_must_match(view, attr, previous, live) and live is not previous:
+            return True
+    for attr, live in current.items():
+        if attr not in view.bindings and _is_module(live):
+            return True
+    return False
 
 
 def _named_like_import(view: _ModuleView, attr: str, live: object) -> bool:
@@ -493,15 +648,25 @@ def _binding_must_match(view: _ModuleView, attr: str, previous: object, live: ob
 
 
 def _restore_module_view(view: _ModuleView) -> bool:
-    """Restore one module's class and its import bindings through the real dict.
+    """Restore one module's class, heap descriptors, and import bindings.
 
-    Returns False when the class or a binding cannot be written. The caller
-    refuses the load: a swallowed ``setattr`` would leave the attacker reachable
-    and still look like an ordinary import failure.
+    The binding write goes through the module's real dict. A class whose
+    ``__setattr__`` raises cannot keep the old binding. A failure of the
+    class or of one descriptor does not skip the binding write. Returns
+    False when any of those steps cannot be finished.
     """
     module = view.module
-    if not _restore_module_class(module, view.cls):
-        return False
+    ok = True
+    try:
+        if not _restore_module_class(module, view.cls):
+            ok = False
+    except Exception:
+        ok = False
+    try:
+        if not _restore_class_attrs(view):
+            ok = False
+    except Exception:
+        ok = False
     try:
         current = _module_mapping(module)
         for attr, previous in view.bindings.items():
@@ -514,30 +679,27 @@ def _restore_module_view(view: _ModuleView) -> bool:
             del current[attr]
     except Exception:
         return False
-    return True
+    return ok
 
 
 def _view_dirty(view: _ModuleView) -> bool:
-    """True when this module's class or import bindings are not the snapshot."""
+    """True when this module's class, heap descriptors, or import bindings differ.
+
+    The proof does not call ``getattr``. A data descriptor on a heap module
+    class can return the snapshotted module and, as a side effect, write
+    another module into the dict or add a class attribute. The class dict is
+    compared by descriptor identity. The real dict is read after that
+    comparison, so a descriptor the comparison invoked would show up as a
+    new or replaced module binding.
+    """
     module = view.module
     if type(module) is not view.cls:
         return True
     try:
-        current = _module_mapping(module)
-        for attr, previous in view.bindings.items():
-            live = current.get(attr, _MISSING)
-            if _binding_must_match(view, attr, previous, live) and live is not previous:
-                return True
-        for attr, live in current.items():
-            if attr not in view.bindings and _is_module(live):
-                return True
-        for attr, expected in view.visible.items():
-            try:
-                got = getattr(module, attr)
-            except Exception:
-                got = _UNREADABLE
-            if got is not expected:
-                return True
+        if not _class_attrs_match(view):
+            return True
+        if _raw_import_dirty(view, _module_mapping(module)):
+            return True
     except Exception:
         return True
     return False
@@ -626,8 +788,24 @@ def _module_bindings_to_restore(snap: _ImportSnapshot, modules: dict,
 
 
 def _import_modules_dirty(snap: _ImportSnapshot, modules: dict) -> bool:
-    """True when ``sys.modules`` is not the snapshotted dictionary of modules."""
-    if sys.modules is not modules:
+    """True when ``sys``'s import tables are not the snapshotted objects.
+
+    Identity is read from ``sys``'s real dict, not ``getattr``. A swapped
+    class whose ``__getattribute__`` lies cannot hide a replaced list.
+    """
+    try:
+        namespace = _module_mapping(sys)
+    except Exception:
+        return True
+    if namespace.get("modules", _MISSING) is not modules:
+        return True
+    if namespace.get("path", _MISSING) is not snap.path:
+        return True
+    if namespace.get("meta_path", _MISSING) is not snap.meta:
+        return True
+    if namespace.get("path_hooks", _MISSING) is not snap.hooks:
+        return True
+    if namespace.get("path_importer_cache", _MISSING) is not snap.cache:
         return True
     for name in modules:
         if name not in snap.modules:
@@ -639,7 +817,7 @@ def _import_modules_dirty(snap: _ImportSnapshot, modules: dict) -> bool:
 
 
 def _import_bindings_dirty(snap: _ImportSnapshot, _modules: dict) -> bool:
-    """True when a recorded module binding, class, or visible module is still wrong.
+    """True when a recorded module binding, class, or heap descriptor is still wrong.
 
     The snapshot holds the module objects themselves, including ones that were
     never entered in ``sys.modules``.
@@ -664,64 +842,91 @@ _GC_COLLECT_BOUND = 4
 def _apply_import_restore(snap: _ImportSnapshot) -> None:
     """Put every snapshotted import table back once.
 
-    Every name added during the attempt is dropped. A name that was already
-    loaded is put back to the module the snapshot recorded. Parent attributes
-    of those dotted names are put back from the module snapshot. A finalizer
-    that runs during this pass can insert a name or change an attribute again;
-    the caller repeats the pass.
+    Every module class is restored before any attribute is written. ``sys``'s
+    import tables are written through its real dict. Each step catches its
+    own failure so a raising ``__setattr__`` cannot skip the rest. A failed
+    step latches later loads. Every name added during the attempt is dropped.
+    A name that was already loaded is put back to the module the snapshot
+    recorded. Parent attributes of those dotted names are put back from the
+    module snapshot. A finalizer that runs during this pass can insert a
+    name or change an attribute again; the caller repeats the pass.
     """
     modules = snap.modules_dict
     snap.restore_blocked = False
-    if sys.modules is not modules:
-        sys.modules = modules
-    added = [name for name in list(modules) if name not in snap.modules]
-    dotted = _module_bindings_to_restore(snap, modules, added)
-    for name in added:
-        modules.pop(name, None)
-    for name, module in snap.modules.items():
-        if modules.get(name) is not module:
-            modules[name] = module
+    # Classes first. ``sys.modules = ...`` must not run while a plugin-swapped
+    # ``sys.__class__`` still raises on assignment.
     for view in snap.module_views:
-        if not _restore_module_view(view):
-            snap.restore_blocked = True
-    for name in dotted:
-        if not _restore_parent_binding(snap, modules, name):
-            snap.restore_blocked = True
-    _restore_list(sys, "path", snap.path, snap.path_items)
-    _restore_list(sys, "meta_path", snap.meta, snap.meta_items)
-    _restore_list(sys, "path_hooks", snap.hooks, snap.hooks_items)
-    cache = snap.cache
-    if sys.path_importer_cache is not cache:
-        sys.path_importer_cache = cache
-    cache.clear()
-    cache.update(snap.cache_items)
-    for name, (path_obj, items, inner) in snap.package_paths.items():
-        module = modules.get(name)
-        if module is None:
-            continue
         try:
-            current = getattr(module, "__path__", None)
-            if current is not path_obj:
-                try:
-                    setattr(module, "__path__", path_obj)
-                    current = path_obj
-                except Exception:
-                    pass
-            if inner is None:
-                if isinstance(current, list):
-                    current[:] = list(items)
-                continue
-            live_inner = getattr(current, "_path", None)
-            if live_inner is not inner:
-                try:
-                    setattr(current, "_path", inner)
-                    live_inner = inner
-                except Exception:
-                    pass
-            if isinstance(live_inner, list):
-                live_inner[:] = list(items)
+            restored = _restore_module_class(view.module, view.cls)
         except Exception:
-            continue
+            restored = False
+        if restored is False:
+            _mark_restore_failure(snap)
+    _call_restore_step(snap, lambda: _write_module_attr(sys, "modules", modules))
+    dotted: list[str] = []
+
+    def edit_modules() -> bool:
+        nonlocal dotted
+        added = [name for name in list(modules) if name not in snap.modules]
+        dotted = _module_bindings_to_restore(snap, modules, added)
+        for name in added:
+            modules.pop(name, None)
+        for name, module in snap.modules.items():
+            if modules.get(name) is not module:
+                modules[name] = module
+        return True
+
+    _call_restore_step(snap, edit_modules)
+    for view in snap.module_views:
+        try:
+            restored = _restore_module_view(view)
+        except Exception:
+            restored = False
+        if restored is False:
+            _mark_restore_failure(snap)
+
+    def restore_parents() -> bool:
+        ok = True
+        for name in dotted:
+            if not _restore_parent_binding(snap, modules, name):
+                ok = False
+        return ok
+
+    _call_restore_step(snap, restore_parents)
+    _call_restore_step(snap, lambda: _restore_sys_sequence("path", snap.path, snap.path_items))
+    _call_restore_step(snap, lambda: _restore_sys_sequence("meta_path", snap.meta, snap.meta_items))
+    _call_restore_step(snap, lambda: _restore_sys_sequence("path_hooks", snap.hooks, snap.hooks_items))
+    _call_restore_step(snap, lambda: _restore_sys_cache(snap))
+    try:
+        for name, (path_obj, items, inner) in snap.package_paths.items():
+            module = modules.get(name)
+            if module is None:
+                continue
+            try:
+                current = getattr(module, "__path__", None)
+                if current is not path_obj:
+                    try:
+                        setattr(module, "__path__", path_obj)
+                        current = path_obj
+                    except Exception:
+                        pass
+                if inner is None:
+                    if isinstance(current, list):
+                        current[:] = list(items)
+                    continue
+                live_inner = getattr(current, "_path", None)
+                if live_inner is not inner:
+                    try:
+                        setattr(current, "_path", inner)
+                        live_inner = inner
+                    except Exception:
+                        pass
+                if isinstance(live_inner, list):
+                    live_inner[:] = list(items)
+            except Exception:
+                continue
+    except Exception:
+        _mark_restore_failure(snap)
 
 
 def _restore_import_state(snap: _ImportSnapshot) -> None:
@@ -741,7 +946,10 @@ def _restore_import_state(snap: _ImportSnapshot) -> None:
     def settle(bound: int) -> bool:
         for _ in range(bound):
             _apply_import_restore(snap)
-            # Bindings second: a ``getattr`` check must not hide a name it just added.
+            # A failed step is not an ordinary import failure, and a later
+            # pass must not clear that. Finalizer dirtiness still retries.
+            if _import_restore_latched or snap.restore_blocked:
+                return False
             if not _import_bindings_dirty(snap, modules) and not _import_modules_dirty(snap, modules):
                 return True
         return False
@@ -755,6 +963,10 @@ def _restore_import_state(snap: _ImportSnapshot) -> None:
         return False
 
     if not settle(_RESTORE_BOUND):
+        # A step that could not write the tables is not repaired by another
+        # collection. Finalizer dirtiness still collects below.
+        if _import_restore_latched:
+            raise Refused("plugin_import_state_unrestored")
         # A cycle may be holding the finalizer that keeps a name or binding
         # in place. Collect before treating the bound as exhausted.
         if gc.collect() == 0 or not settle(_RESTORE_BOUND):
@@ -887,6 +1099,9 @@ class PluginLoader:
 
     def load(self, manifest_bytes: bytes, signature: object, artifact: bytes,
              registry_label: str | None = None, *, root: str | None = None) -> LoadedPlugin:
+        # A restore that could not finish leaves the process unable to prove
+        # its import tables. Refuse before taking the loader lock.
+        _require_import_restorable()
         # Non-blocking, and per thread. Waiting here deadlocks a nested call on
         # this thread and queues another thread behind the plugin still running.
         if getattr(self._load_depth, "depth", 0):
@@ -977,6 +1192,7 @@ class PluginLoader:
 
     def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
                   code_sha256: str) -> LoadedPlugin:
+        _require_import_restorable()
         if getattr(_import_depth, "depth", 0):
             raise Refused("plugin_load_busy")
         if not _import_isolation.acquire(blocking=False):

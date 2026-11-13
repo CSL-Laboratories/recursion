@@ -12,6 +12,8 @@ forked child that inherits that pin, failed on ef816f7c.
 A connect that follows a final-component symlink or a directory round-trip
 undone inside connect, and a reap of dead sockets the quarantine generator
 cannot name, failed on a4c6d121.
+A recheck that trusts a non-procfs ``/proc/self/fd`` and unlinks a live
+listener, failed on 57bacd18.
 """
 
 from __future__ import annotations
@@ -2186,6 +2188,249 @@ class QuarantineRestoreTests(_TmpCase):
         live.bind(path)
         live.listen(1)
         return live, path, os.lstat(path).st_ino
+
+
+def _fd_target_counts() -> dict[str, int]:
+    """How many open fds in this process resolve to each path."""
+    counts: dict[str, int] = {}
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{name}")
+        except OSError:
+            continue
+        counts[target] = counts.get(target, 0) + 1
+    return counts
+
+
+def _bind_dead_named(directory: str, names: list[str]) -> None:
+    """Bind and close a socket at each ``directory/name``. The name stays, nothing listens."""
+    for name in names:
+        path = os.path.join(directory, name)
+        if os.path.lexists(path):
+            continue
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(path)
+        finally:
+            sock.close()
+
+
+def _proc_inode_fd(addr: object) -> str | None:
+    """Fd number when ``addr`` is exactly ``/proc/self/fd/<digits>``."""
+    if not isinstance(addr, str) or not addr.startswith("/proc/self/fd/"):
+        return None
+    rest = addr[len("/proc/self/fd/"):]
+    if rest.isdigit():
+        return rest
+    return None
+
+
+@unittest.skipUnless(LINUX, "Linux is the tested path")
+class ProcFsGuardTests(_TmpCase):
+    """``/proc/self/fd`` is trusted only when it is procfs.
+
+    Each case failed on 57bacd18: a directory at that path was enough, so a
+    tmpfs stand-in full of dead sockets made the recheck return
+    ``ECONNREFUSED`` and ``start`` unlinked a live listener.
+    """
+
+    def _patch(self, name: str, value: object) -> None:
+        missing = object()
+        orig = getattr(unix, name, missing)
+        setattr(unix, name, value)
+
+        def restore() -> None:
+            if orig is missing:
+                try:
+                    delattr(unix, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(unix, name, orig)
+
+        self.addCleanup(restore)
+
+    def _stale(self, name: str = "control.sock") -> tuple[str, int]:
+        os.mkdir(self.sock_dir, 0o700)
+        path = os.path.join(self.sock_dir, name)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()
+        return path, os.lstat(path).st_ino
+
+    def _expect_left(self, path: str, inode: int) -> None:
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health(), name=os.path.basename(path))
+        self.addCleanup(srv.close)
+        with self.assertRaises(ct.InsecureSocketPath) as caught:
+            srv.start()
+        self.assertIn("Left in place", str(caught.exception))
+        listed = os.lstat(path)
+        self.assertEqual(listed.st_ino, inode)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertFalse(stat.S_ISLNK(listed.st_mode))
+        self.assertEqual([entry for entry in os.listdir(self.sock_dir) if entry.startswith(".")], [])
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(probe.close)
+        probe.settimeout(0.2)
+        with self.assertRaises(OSError) as refused:
+            probe.connect(path)
+        self.assertEqual(refused.exception.errno, errno.ECONNREFUSED)
+
+    def _plant_fd_sockets(self, directory: str) -> None:
+        os.mkdir(directory, 0o700)
+        _bind_dead_named(directory, [str(n) for n in range(256)])
+
+    def test_non_procfs_fd_directory_does_not_unlink_a_live_listener(self) -> None:
+        """A tmpfs stand-in for ``/proc/self/fd`` must not prove a listener dead.
+
+        The path connect is swapped to a dead socket for the duration of
+        ``connect``, which is what made the public name look like
+        ``ECONNREFUSED``. Dead sockets named by fd number sit in the
+        stand-in directory. On 57bacd18 the recheck connected to
+        ``/proc/self/fd/<fd>`` (hooked here onto that stand-in), ``start``
+        returned, and the live inode was gone.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        public = os.path.join(self.sock_dir, "control.sock")
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(live.close)
+        live.bind(public)
+        live.listen(1)
+        live_ino = os.lstat(public).st_ino
+        fake = os.path.join(self.base, "procfd")
+        self._plant_fd_sockets(fake)
+        dead_path = os.path.join(self.base, "dead.sock")
+        _bind_dead_named(self.base, ["dead.sock"])
+        self._patch("_proc_fd_dir", lambda: fake)
+        swaps = {"n": 0}
+        orig = socket.socket.connect
+
+        def fake_connect(sock: socket.socket, addr: object) -> None:
+            planted = _proc_inode_fd(addr)
+            if planted is not None:
+                path = os.path.join(fake, planted)
+                if not os.path.lexists(path):
+                    _bind_dead_named(fake, [planted])
+                orig(sock, path)
+                return
+            aside = None
+            if addr == public and os.path.lexists(public) and not os.path.islink(public):
+                aside = public + ".aside"
+                os.rename(public, aside)
+                os.symlink(dead_path, public)
+                swaps["n"] += 1
+            try:
+                orig(sock, addr)
+            finally:
+                if aside is not None and addr == public:
+                    if os.path.islink(public):
+                        os.unlink(public)
+                    if os.path.lexists(aside) and not os.path.lexists(public):
+                        os.rename(aside, public)
+
+        socket.socket.connect = fake_connect  # type: ignore[method-assign]
+        self.addCleanup(setattr, socket.socket, "connect", orig)
+        before = _fd_target_counts()
+        pins = set(unix._PIN_FDS)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        started = False
+        exc: BaseException | None = None
+        try:
+            try:
+                srv.start()
+                started = True
+            except BaseException as err:  # noqa: BLE001 - the assertion names the type
+                exc = err
+        finally:
+            socket.socket.connect = orig  # type: ignore[method-assign]
+        self.assertGreaterEqual(swaps["n"], 1)
+        self.assertFalse(started, (exc, os.listdir(self.sock_dir)))
+        self.assertIsInstance(exc, ct.InsecureSocketPath)
+        self.assertIn("Left in place", str(exc))
+        self.assertIsNone(srv._sock)
+        self.assertEqual(_fd_target_counts(), before)
+        self.assertEqual(set(unix._PIN_FDS), pins)
+        listed = os.lstat(public)
+        self.assertEqual(listed.st_ino, live_ino)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertFalse(stat.S_ISLNK(listed.st_mode))
+        self.assertEqual([entry for entry in os.listdir(self.sock_dir) if entry.startswith(".")], [])
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        live.settimeout(2)
+        client.connect(public)
+        conn, _ = live.accept()
+        conn.close()
+
+    def test_wrong_proc_magic_leaves_the_socket_in_place(self) -> None:
+        """``fstatfs`` reporting anything but procfs leaves the socket in place.
+
+        Failed on 57bacd18: there was no magic check, so a stale socket was
+        reclaimed while the helper returned ``TMPFS_MAGIC``.
+        """
+        path, inode = self._stale()
+        self._patch("_fstatfs_type", lambda _fd: 0x01021994)
+        self._expect_left(path, inode)
+
+    def test_proc_statfs_error_leaves_the_socket_in_place(self) -> None:
+        """``fstatfs`` failing, or libc having no ``fstatfs``, leaves the socket in place.
+
+        Failed on 57bacd18: the recheck did not call ``fstatfs``, so both
+        failures were ignored and the stale socket was removed.
+        """
+        path, inode = self._stale()
+        real = getattr(unix, "_fstatfs_type", None)
+
+        def boom(_fd: int) -> int:
+            raise OSError(errno.EIO, "fstatfs failed")
+
+        self._patch("_fstatfs_type", boom)
+        self._expect_left(path, inode)
+        if real is not None:
+            unix._fstatfs_type = real  # type: ignore[method-assign]
+        self._patch("_load_fstatfs", lambda: None)
+        self._expect_left(path, inode)
+
+    def test_procfs_check_failure_does_not_leak_fds(self) -> None:
+        """A refused procfs check closes the ``O_PATH`` directory fd it opened.
+
+        Failed on 57bacd18: ``start`` reclaimed the socket instead of raising,
+        so this loop did not stay on the failure path.
+        """
+        path, inode = self._stale()
+        fake = os.path.join(self.base, "procfd")
+        self._plant_fd_sockets(fake)
+        real = getattr(unix, "_fstatfs_type", None)
+        before = _fd_target_counts()
+        pins = set(unix._PIN_FDS)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+
+        def once() -> None:
+            with self.assertRaises(ct.InsecureSocketPath) as caught:
+                srv.start()
+            self.assertIn("Left in place", str(caught.exception))
+            self.assertEqual(os.lstat(path).st_ino, inode)
+            self.assertEqual(_fd_target_counts(), before)
+            self.assertEqual(set(unix._PIN_FDS), pins)
+
+        self._patch("_fstatfs_type", lambda _fd: 0x01021994)
+        for _ in range(8):
+            once()
+
+        def boom(_fd: int) -> int:
+            raise OSError(errno.EIO, "fstatfs failed")
+
+        unix._fstatfs_type = boom  # type: ignore[method-assign]
+        for _ in range(8):
+            once()
+        if real is not None:
+            unix._fstatfs_type = real  # type: ignore[method-assign]
+        self._patch("_proc_fd_dir", lambda: fake)
+        for _ in range(8):
+            once()
 
 
 if __name__ == "__main__":

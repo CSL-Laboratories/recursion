@@ -18,13 +18,20 @@ while an ``O_PATH`` fd holds that inode and ``renameat2(RENAME_NOREPLACE)``
 can move the directory entry aside. The hidden name is no longer than the
 socket's own name. The recheck opens that name with ``O_PATH|O_NOFOLLOW``,
 checks the fd is the inode just verified, and connects to
-``/proc/self/fd/<that fd>``. A symlink or a directory round-trip undone
-inside connect cannot redirect that fd. After ``ECONNREFUSED`` the name is
-lstat'd again (``AT_SYMLINK_NOFOLLOW``) and unlinked only when it is still
-that inode. Anything else moves the hidden name back with
-``RENAME_NOREPLACE``. If that move back fails, the error names the hidden
-entry. Without ``renameat2``, without ``O_PATH``, or when that proc path
-cannot be used, the socket stays in place.
+``/proc/self/fd/<that fd>`` only when that directory is procfs. An
+``O_PATH|O_DIRECTORY`` fd of the directory is ``fstatfs``'d and must report
+``PROC_SUPER_MAGIC`` (``0x9fa0``); the fd entry is opened relative to that
+directory and must be a procfs symlink. The directory fd stays open through
+the connect, and the same checks run again immediately before it, so a
+swap of the path between the check and the connect is not trusted. A
+symlink or a directory round-trip undone inside connect cannot redirect
+that fd. After ``ECONNREFUSED`` the name is lstat'd again
+(``AT_SYMLINK_NOFOLLOW``) and unlinked only when it is still that inode.
+Anything else moves the hidden name back with ``RENAME_NOREPLACE``. If
+that move back fails, the error names the hidden entry. Without
+``renameat2``, without ``O_PATH``, when ``fstatfs`` is missing or the
+magic is not procfs, or when that proc path cannot be used, the socket
+stays in place.
 
 ``start`` also removes our own earlier hidden sockets that are still
 ``ECONNREFUSED``, and only when the name is one the quarantine generator
@@ -589,33 +596,197 @@ def _open_matching_socket(dfd: int, name: str, verified: os.stat_result) -> int:
     return fd
 
 
-def _proc_inode_path(fd: int) -> str | None:
-    """``/proc/self/fd/<fd>`` when that string can be passed to ``connect``."""
-    proc = f"/proc/self/fd/{fd}"
+# Linux include/uapi/linux/magic.h. os.statvfs does not expose f_type.
+_PROC_SUPER_MAGIC = 0x9FA0
+_fstatfs = None
+_fstatfs_ready = False
+
+
+class _StatFS(ctypes.Structure):
+    """Prefix of Linux ``struct statfs``. The tail is padding so the buffer is large enough."""
+
+    _fields_ = [("f_type", ctypes.c_long), ("_rest", ctypes.c_char * 256)]
+
+
+def _proc_fd_dir() -> str:
+    """Directory of this process's file descriptors. ``/proc/self/fd`` in production."""
+    return "/proc/self/fd"
+
+
+def _load_fstatfs():
+    """``fstatfs`` from libc, or ``None`` when this platform has no such symbol."""
+    global _fstatfs, _fstatfs_ready
+    if _fstatfs_ready:
+        return _fstatfs
+    _fstatfs_ready = True
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.fstatfs
+    except (AttributeError, OSError):
+        _fstatfs = None
+        return None
+    fn.argtypes = (ctypes.c_int, ctypes.POINTER(_StatFS))
+    fn.restype = ctypes.c_int
+    _fstatfs = fn
+    return fn
+
+
+def _fstatfs_type(fd: int) -> int:
+    """``f_type`` from ``fstatfs(fd)``.
+
+    Raises ``OSError`` when libc has no ``fstatfs`` or the call fails.
+    ``EMFILE`` and ``ENFILE`` propagate so a full fd table is not reported
+    as "not procfs".
+    """
+    fn = _load_fstatfs()
+    if fn is None:
+        raise OSError(errno.ENOSYS, "fstatfs unavailable")
+    buf = _StatFS()
+    ctypes.set_errno(0)
+    if fn(fd, ctypes.byref(buf)) != 0:
+        err = ctypes.get_errno() or errno.EIO
+        raise OSError(err, os.strerror(err))
+    return int(buf.f_type)
+
+
+def _resource_exhausted(exc: OSError) -> bool:
+    return exc.errno in (errno.EMFILE, errno.ENFILE)
+
+
+def _procfs_fd(fd: int) -> bool:
+    """True when ``fstatfs(fd)`` reports procfs. Resource errors propagate."""
+    try:
+        magic = _fstatfs_type(fd)
+    except OSError as exc:
+        if _resource_exhausted(exc):
+            raise
+        return False
+    return magic == _PROC_SUPER_MAGIC
+
+
+def _open_proc_fd_dir(directory: str) -> int | None:
+    """Pinned ``O_PATH|O_DIRECTORY`` fd for ``directory``, or ``None``.
+
+    The caller closes it. ``EMFILE`` and ``ENFILE`` propagate. Any other
+    open failure is ``None`` with no fd left open.
+    """
+    if not _can_pin():
+        return None
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        opened = os.open(directory, flags)
+    except OSError as exc:
+        if _resource_exhausted(exc):
+            raise
+        return None
+    return _remember_pin(opened)
+
+
+def _proc_entry_is_procfs(dirfd: int, fd: int) -> bool:
+    """True when ``fd``'s name in ``dirfd`` is a procfs symlink.
+
+    ``O_PATH|O_NOFOLLOW`` opens the directory entry itself. On procfs that
+    entry is a symlink and ``fstatfs`` reports ``PROC_SUPER_MAGIC``. A
+    socket planted at that name is a different file type and a different
+    mount. The fd is closed before return.
+    """
+    flags = os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        entry = os.open(str(fd), flags, dir_fd=dirfd)
+    except OSError as exc:
+        if _resource_exhausted(exc):
+            raise
+        return False
+    entry = _remember_pin(entry)
+    try:
+        if not _procfs_fd(entry):
+            return False
+        try:
+            mode = os.fstat(entry).st_mode
+        except OSError as exc:
+            if _resource_exhausted(exc):
+                raise
+            return False
+        return stat.S_ISLNK(mode)
+    finally:
+        _close_pin(entry)
+
+
+def _proc_connect_ok(dirfd: int, fd: int, directory: str) -> bool:
+    """True when ``directory`` is still the procfs directory ``dirfd`` holds.
+
+    The fd entry is opened relative to ``dirfd`` (not by walking ``directory``
+    again) and must be a procfs symlink. ``directory/<fd>`` must lstat as a
+    symlink on that same mount: a dead socket swapped in at the connect path
+    does not.
+    """
+    if not _procfs_fd(dirfd):
+        return False
+    proc = f"{directory}/{fd}"
+    try:
+        held = os.fstat(dirfd)
+        current = os.stat(directory)
+        link = os.lstat(proc)
+    except OSError as exc:
+        if _resource_exhausted(exc):
+            raise
+        return False
+    if not stat.S_ISDIR(held.st_mode) or not stat.S_ISDIR(current.st_mode):
+        return False
+    if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+        return False
+    if link.st_dev != held.st_dev or not stat.S_ISLNK(link.st_mode):
+        return False
+    return _proc_entry_is_procfs(dirfd, fd)
+
+
+def _proc_inode_path(fd: int) -> tuple[str, int] | None:
+    """``(connect_path, proc_dir_fd)`` when ``/proc/self/fd/<fd>`` is procfs.
+
+    The directory fd stays open so the caller can re-check it and then
+    connect. ``None`` leaves no fd open. Any failure (not Linux, no
+    ``fstatfs``, wrong magic, a swapped directory) is ``None``: the caller
+    leaves the socket in place. ``EMFILE`` and ``ENFILE`` propagate.
+    """
+    if not isinstance(fd, int) or fd < 0:
+        return None
+    directory = _proc_fd_dir()
+    if not isinstance(directory, str) or not directory.startswith("/"):
+        return None
+    if directory != "/":
+        directory = directory.rstrip("/")
+    proc = f"{directory}/{fd}"
     if len(os.fsencode(proc)) > _MAX_SUN_PATH:
         return None
+    dirfd = _open_proc_fd_dir(directory)
+    if dirfd is None:
+        return None
     try:
-        st = os.stat("/proc/self/fd")
-    except OSError:
+        ok = _proc_connect_ok(dirfd, fd, directory)
+    except BaseException:
+        _close_pin(dirfd)
+        raise
+    if not ok:
+        _close_pin(dirfd)
         return None
-    if not stat.S_ISDIR(st.st_mode):
-        return None
-    return proc
+    return proc, dirfd
 
 
 def _recheck_hidden(dfd: int, directory: str, qname: str, verified: os.stat_result) -> int | None:
     """Probe the inode ``verified``, not the directory entry ``qname``.
 
     Opens ``qname`` with ``O_PATH|O_NOFOLLOW`` on ``dfd`` and connects to
-    ``/proc/self/fd/<that fd>``. Connect through that fd sees the inode: a
-    live listener succeeds and a dead socket returns ``ECONNREFUSED``. A
-    final-component symlink or a directory rename undone inside connect
-    cannot change which inode is probed. After ``ECONNREFUSED``, ``qname``
-    is lstat'd again and must still be ``verified``; a different inode is
-    not a finished reclaim. If ``O_PATH`` or the proc path cannot be used,
-    this raises and the caller leaves the socket in place. The parent
-    directory's ``(dev, ino)`` is checked immediately before and after the
-    connect. ``/proc/net/unix`` is not consulted.
+    ``/proc/self/fd/<that fd>`` when that directory is procfs. Connect
+    through that fd sees the inode: a live listener succeeds and a dead
+    socket returns ``ECONNREFUSED``. A final-component symlink or a
+    directory rename undone inside connect cannot change which inode is
+    probed. The proc directory fd is checked again immediately before the
+    connect. After ``ECONNREFUSED``, ``qname`` is lstat'd again and must
+    still be ``verified``; a different inode is not a finished reclaim.
+    If ``O_PATH`` or the proc path cannot be used, this raises and the
+    caller leaves the socket in place. The parent directory's ``(dev, ino)``
+    is checked immediately before and after the connect. ``/proc/net/unix``
+    is not consulted.
     """
     ident = os.fstat(dfd)
     held_dir = (ident.st_dev, ident.st_ino)
@@ -623,12 +794,19 @@ def _recheck_hidden(dfd: int, directory: str, qname: str, verified: os.stat_resu
         raise InsecureSocketPath(f"{directory} changed during reclaim")
     full = os.path.join(directory, qname)
     fd = _open_matching_socket(dfd, qname, verified)
+    dirfd: int | None = None
     try:
-        proc = _proc_inode_path(fd)
-        if proc is None:
+        opened = _proc_inode_path(fd)
+        if opened is None:
+            raise InsecureSocketPath(_left_in_place(full))
+        proc, dirfd = opened
+        # The directory fd is still the one fstatfs accepted. Check again
+        # immediately before connect so a swap of the path is not used.
+        if not _proc_connect_ok(dirfd, fd, os.path.dirname(proc)):
             raise InsecureSocketPath(_left_in_place(full))
         err = _probe_listener(proc)
     finally:
+        _close_pin(dirfd)
         _close_pin(fd)
     if not _same_dir(directory, held_dir) or err == errno.ENOENT:
         raise InsecureSocketPath(f"{directory} changed during reclaim")
@@ -762,10 +940,10 @@ def _clear_stale_socket(path: str) -> None:
     inode, so ``renameat2(RENAME_NOREPLACE)`` may move it aside. The hidden
     name is probed through an ``O_PATH`` fd of that same inode, not by the
     path. A replacement bound while the pin is open has a different inode:
-    the quarantine entry does not match and is moved back. Without ``O_PATH``,
-    without ``renameat2``, when the proc path cannot be used, or when the
-    socket name cannot hold a hidden name no longer than itself,
-    ``ECONNREFUSED`` is left in place rather than reclaimed.
+    the quarantine entry does not match and is moved back.     Without ``O_PATH``,
+    without ``renameat2``, when ``/proc/self/fd`` is not procfs, when the proc
+    path cannot be used, or when the socket name cannot hold a hidden name no
+    longer than itself, ``ECONNREFUSED`` is left in place rather than reclaimed.
 
     ``EACCES`` and ``EPERM`` do not reclaim: a live mode-000 or mode-070
     listener fails connect the same way a dead socket does. ``/proc/net/unix``

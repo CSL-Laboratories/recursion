@@ -940,6 +940,39 @@ class ComposedDaemonTest(unittest.TestCase):
         rid = self.start(self.api(composed), 'helper=0 fast=1')
         self.assertEqual(self.api(composed).call('run.stop', {'run_id': rid})['code'], 'stopped')
 
+    def test_only_a_fallback_list_the_daemon_would_launch_from_is_checked_for_its_connections(self):
+        """A fallback list that is only shown to the user (``on_limit`` ask or wait) is never launched
+        from, so a connection id in it that the breaker store cannot represent does not refuse the
+        route that lists it. A list the daemon would launch from (``on_limit`` fallback) still does,
+        and the route's own connection is checked whatever ``on_limit`` says."""
+        pristine = json.loads(json.dumps(self.routes))
+        listed = {'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                  'connection': {'kind': 'subscription', 'id': 'bad space id'}}  # valid for the route contract
+        for on_limit in ('ask', 'wait', 'fallback'):
+            for bad_primary in (False, True):
+                with self.subTest(on_limit=on_limit, bad_primary=bad_primary):
+                    self.routes = json.loads(json.dumps(pristine))
+                    route = self.routes['claude_code']['route']
+                    if bad_primary:
+                        route['connection']['id'] = 'bad primary id'
+                    route['limits'] = {'on_limit': on_limit, 'fallback': [dict(listed)]}
+                    _, composed = self.boot()
+                    try:
+                        api = self.api(composed)
+                        launched = len(self.units.started)
+                        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                        'prompt': 'helper=0 fast=1'})
+                        if bad_primary or on_limit == 'fallback':
+                            self.assertEqual((answer['code'], (answer.get('start_error') or {}).get('code')),
+                                             ('start_failed', 'breaker_connection_unrepresentable'), answer)
+                            self.assertEqual(len(self.units.started), launched, 'a refused start launched nothing')
+                        else:
+                            self.assertEqual(answer['code'], 'started', answer)
+                            self.assertEqual(len(self.units.started), launched + 1)
+                            api.call('run.stop', {'run_id': answer['run']['run_id']})
+                    finally:
+                        self.shutdown()
+
     def test_a_breaker_store_that_cannot_be_read_refuses_starts_and_keeps_reads(self):
         path = daemon_breaker.store_path(self.state)
         Registry(self.state).close()

@@ -285,7 +285,7 @@ class RouteStarter:
             raise self._refuse(run_id, 'breaker_store_unavailable', self._breaker_unavailable)
         if self._breaker is not None:
             limits = entry['route'].get('limits')
-            fallbacks = limits.get('fallback', ()) if isinstance(limits, dict) and isinstance(limits.get('fallback'), list) else ()
+            fallbacks = limits.get('fallback', ()) if isinstance(limits, dict) and limits.get('on_limit') == 'fallback' and isinstance(limits.get('fallback'), list) else ()
             for candidate in (entry['route'], *fallbacks):
                 if isinstance(candidate, dict):
                     conn = route_connection({'route': candidate})

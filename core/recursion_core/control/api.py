@@ -695,9 +695,13 @@ class ControlAPI:
             self._stale_stops.discard(run_id)
         elif moved:
             self._stale_stops.add(run_id)
-            if res.get("code") == STOPPED:
+            if res.get("code") == STOPPED or (res.get("code") == PENDING and
+                                              res.get("reason") == "cgroup_changed"):
                 # One read, for the reason only: a member seen alive now is named; anything else, an
-                # unreadable record included, is a record that changed.
+                # unreadable record included, is a record that changed. A retry already held as
+                # ``cgroup_changed`` gets this read too: a member may have joined after that retry read
+                # the record. One held as ``member_alive`` is left as it is, so a read that fails here
+                # does not un-name a member this Stop saw.
                 latest = self._reread(rec)
                 joined = latest is not None and self._block_stop(latest) == "member_alive"
                 res = self._held(rec, "member_alive" if joined else "cgroup_changed", checked=False)

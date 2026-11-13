@@ -1227,8 +1227,8 @@ class RoundThreeTest(unittest.TestCase):
 
 
 class StaleReconfirmTest(unittest.TestCase):
-    """Found by the Codex review of this PR: the ways out of a Stop that the "until a write lands" rule
-    did not cover."""
+    """Found by the review of this PR that ran at e8038043 (its ``s3-stale-reconfirm-down.py``): the ways
+    out of a Stop that the "until a write lands" rule did not cover."""
 
     def test_a_reconfirm_after_a_stale_write_keeps_the_rule_until_a_write_lands(self) -> None:
         """The stale write found the run on a second cgroup, so the Stop goes round once more and confirms
@@ -1300,6 +1300,124 @@ class StaleReconfirmTest(unittest.TestCase):
         self.assertEqual((held["code"], held.get("reason"), held.get("recorded")),
                          (a.PENDING, "cgroup_changed", False), held)
         self.assertEqual(api._launched["run-1"]["state"], "stop_pending")
+
+
+class FinalStaleReasonTest(unittest.TestCase):
+    """The reason a Stop gives once its stale retries are spent: ``member_alive`` when a member joined,
+    else ``cgroup_changed``. From the Codex review of this PR at b74a3a58, its finding B1."""
+
+    def test_member_join_on_last_retry_after_reconfirm_names_member_alive(self) -> None:
+        """Written by that review; its assertions are kept as it wrote them. The first empty Stop finds
+        the run on a second cgroup and spends its reconfirm. The next empty result finds a third, so
+        every retry is held as ``cgroup_changed``, and the last retry's write loses to a member that
+        joins. The answer names that member."""
+        class Moving(InMemoryRunRegistry):
+            def __init__(self) -> None:
+                super().__init__(processes=lambda pid: pid == 9999)
+                self.stopped = self.pending = 0
+
+            def move(self, group: str) -> None:
+                rec = super().get("run-x")
+                assert rec is not None
+                rec.update(cgroup=group, engine="update-" + str(self.pending))
+                super().put(rec)
+
+            def put(self, rec: dict):
+                if rec.get("state") == "stopped":
+                    self.stopped += 1
+                    self.move("/cg/two" if self.stopped == 1 else "/cg/three")
+                    raise StaleGeneration("run-x", rec.get("generation"), None)
+                if rec.get("state") == "stop_pending":
+                    self.pending += 1
+                    self.move("/cg/three")
+                    if self.pending == 3:
+                        latest = super().get("run-x")
+                        assert latest is not None
+                        super().join_member("run-x", latest["generation"], "joined", 9999)
+                    raise StaleGeneration("run-x", rec.get("generation"), None)
+                return super().put(rec)
+
+        class Kill:
+            def __init__(self) -> None:
+                self.requests: list[str] = []
+
+            def request_stop(self, group: str) -> None:
+                self.requests.append(group)
+
+            def confirm(self, group: str, timeout: float) -> str:
+                return EMPTY
+
+        registry, kill = Moving(), Kill()
+        registry.put({"run_id": "run-x", "tenant": "t", "engine": "codex", "state": "running",
+                      "cgroup": "/cg/one", "started_at": 1, "stop": None, "start_key": None})
+        api = ControlAPI(registry, kill, lambda p: None, lambda: 1000)
+        answer = api.call("run.stop", {"run_id": "run-x"})
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "member_alive"), answer)
+        self.assertIs(answer.get("recorded"), False)
+        self.assertEqual(kill.requests, ["/cg/one", "/cg/two"])
+        self.assertEqual(registry.pending, 3)
+        self.assertNotEqual(registry.get("run-x")["state"], "stopped")
+
+    def test_a_member_the_retry_saw_alive_stays_the_reason_when_the_registry_then_fails(self) -> None:
+        """The other side of that reason read. A retry that read a live member holds ``member_alive``.
+        When the disk refuses its write and the record cannot be read again, the member is still what
+        this Stop saw, so the reason is not swapped for ``cgroup_changed`` on the strength of a read
+        that failed."""
+        procs = FakeProcesses()
+        live_pid = procs.spawn()
+
+        class JoinsThenFails(InMemoryRunRegistry):
+            def __init__(self) -> None:
+                super().__init__(processes=procs.is_alive)
+                self.armed = self.down = False
+                self.stopped_writes = self.pending_writes = 0
+
+            def get(self, run_id: str):
+                if self.down:
+                    raise OSError("registry read failed")
+                return super().get(run_id)
+
+            def put(self, record: dict):
+                if self.armed and record.get("state") == "stopped":
+                    self.stopped_writes += 1
+                    if self.stopped_writes == 1:  # a member joins first: this write is stale
+                        cur = super().get(record["run_id"])
+                        assert cur is not None
+                        self.join_member(record["run_id"], cur["generation"], "live-child", live_pid)
+                elif self.armed and record.get("state") == "stop_pending":
+                    self.pending_writes += 1
+                    if self.pending_writes == 1:  # the disk refuses the retry's write, then reads fail too
+                        self.down = True
+                        raise OSError(28, "No space left on device")
+                return super().put(record)
+
+        reg = JoinsThenFails()
+
+        class ArmKill(FakeKillTree):
+            def confirm(self, cgroup: str, timeout_s: float) -> str:
+                reg.armed = True
+                return EMPTY
+
+        api, _, _, _ = make_api(ArmKill([EMPTY]), registry=reg)
+        run = _start(api)
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual((res["code"], res.get("reason"), res.get("recorded")),
+                         (a.PENDING, "member_alive", False), res)
+        self.assertEqual((reg.stopped_writes, reg.pending_writes), (1, 1))  # one stale write, one refused retry
+        # The registry is back. The member is on the record and alive, so the next Stop lands as pending
+        # for the same reason; once it has exited, the Stop is attested.
+        reg.down = False
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual((stored["state"], stored["members"]),
+                         ("running", [{"member_id": "live-child", "pid": live_pid}]))
+        again = api.call("run.stop", {"run_id": run})
+        self.assertEqual((again["code"], again.get("reason")), (a.PENDING, "member_alive"), again)
+        self.assertIsNot(again.get("recorded"), False)
+        procs.exit(live_pid)
+        last = api.call("run.stop", {"run_id": run})
+        self.assertEqual((last["code"], reg.get(run)["state"]), (a.STOPPED, "stopped"), last)
+        self.assertIsNot(last.get("recorded"), False)
 
 
 class StaleOutageTest(unittest.TestCase):

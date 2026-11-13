@@ -24,8 +24,28 @@ Nothing is frozen yet.
 | `driver.v2.json` | 1.0-draft.2 |
 | `mcp.task.v1.json` | 1.0-draft.2 |
 | `transcript.line.v1.json` | 1.0-draft.2 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.1 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.2 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## Fixtures that prove every closed object closed (Nov 13, 2026)
+
+A cross-family rerun found that three `additionalProperties: false` in `stop.result.v1.json` could be
+set to `true` with every check still green: no bad fixture carried an unknown field there, and the
+check that objects are closed only looked for the keyword, not for its value. Both are corrected, for
+every schema and not only that one:
+
+- The check now requires `additionalProperties` to be `false` (or a schema for a map's values).
+- A new check flips each `additionalProperties: false` to `true`, one at a time, and requires that a
+  bad fixture notices. There are 210 such objects in the two folders. Before, 27 of them were proved
+  by a fixture; now all 210 are.
+- 182 bad fixtures were added for it, named `u-<schema>.<where>.json`: each is a good fixture with one
+  field nobody defined (`x-nobody-defined-this`) added at exactly one object. 33 good fixtures were
+  added so that every object is reached by one (a successful answer for each method that is new, a
+  run with a member, a run view with a typed limit, and a few definitions on their own).
+
+One schema changed with it, and only in a definition used to check fixtures: in `methods.v1.json`
+(now `1.0-draft.2`), the answer of a `refused_exchange` is typed by its method's rule alone, so that
+no object is closed twice over the same value. Nothing a lane builds against moved.
 
 ## 1.0-draft.2 (Nov 13, 2026)
 

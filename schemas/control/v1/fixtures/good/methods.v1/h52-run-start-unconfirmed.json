@@ -1,0 +1,14 @@
+{
+  "method": "run.start",
+  "params": {
+    "tenant": "t1",
+    "engine": "claude_code",
+    "prompt": "Summarise the repository.",
+    "client_key": "k-1"
+  },
+  "answer": {
+    "code": "start_unconfirmed",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "detail": "registry_unavailable"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "seq": 3,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:03.111Z",
+  "type": "engine.output",
+  "source": "engine",
+  "trust": "untrusted",
+  "payload": {
+    "stream": "stdout",
+    "text": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reading the tests.\"}]}}\n",
+    "offset_start": 4096,
+    "offset_end": 4186,
+    "x-nobody-defined-this": true
+  }
+}

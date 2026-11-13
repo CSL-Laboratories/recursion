@@ -1,0 +1,16 @@
+{
+  "method": "operator.read",
+  "params": {
+    "command": {
+      "command": "operator.conditions.inspect"
+    },
+    "x-nobody-defined-this": true
+  },
+  "answer": {
+    "code": "ok",
+    "http_status": 200,
+    "body": {
+      "conditions": []
+    }
+  }
+}

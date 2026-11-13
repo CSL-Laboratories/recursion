@@ -109,6 +109,87 @@
       }
     },
     {
+      "file": "bad/api.v1/u-api.v1.call-context.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "The object described at api.v1.json#/$defs/call_context is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.call-context.principal.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "The object described at api.v1.json#/$defs/call_context/properties/principal is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/principal"
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.command.arguments.items.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command/properties/arguments/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/arguments/0"
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.command.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.registry.json",
+      "schema": "api.v1.json#/$defs/registry",
+      "rule": "The object described at api.v1.json#/$defs/registry is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.run-request.workspace.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The object described at api.v1.json#/$defs/run_request/properties/workspace is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/workspace"
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.subscription.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "rule": "The object described at api.v1.json#/$defs/subscription is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.surface.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "The object described at api.v1.json#/$defs/surface is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.tool.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "The object described at api.v1.json#/$defs/tool is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
       "file": "good/install.v1/h01-one-trusted-key-one-grant.json",
       "schema": "install.v1.json",
       "shows": "One trusted developer key and one grant bound to a digest and that key."
@@ -189,6 +270,15 @@
       "expect": {
         "keyword": "minLength",
         "at": "/reserved/hosts/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/u-install.v1.reserved.json",
+      "schema": "install.v1.json",
+      "rule": "The object described at install.v1.json#/properties/reserved is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/reserved"
       }
     },
     {
@@ -372,6 +462,33 @@
       "expect": {
         "keyword": "required",
         "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/u-revoked-keys.v1.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/ is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/u-revoked-keys.v1.keys.items.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/keys/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/keys/0"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/u-revoked-keys.v1.signature.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/signature is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/signature"
       }
     }
   ]

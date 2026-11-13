@@ -1,0 +1,25 @@
+{
+  "method": "budget.show",
+  "params": {
+    "connection_id": "subscription:personal-max"
+  },
+  "answer": {
+    "code": "ok",
+    "budgets": [
+      {
+        "connection_id": "subscription:personal-max",
+        "cap_usd": 0,
+        "spent_usd": {
+          "value": null,
+          "quality": "unknown",
+          "provenance": "unavailable"
+        },
+        "window_percent": null,
+        "window_reset_at": null,
+        "breaker_state": "closed",
+        "locked": false,
+        "x-nobody-defined-this": true
+      }
+    ]
+  }
+}

@@ -67,6 +67,7 @@ class PublishedFilesTest(unittest.TestCase):
             ("methods.v1.json", "/$defs/exchange/properties/params"),     # typed per method by the rules below it
             ("methods.v1.json", "/$defs/exchange/properties/answer"),     # typed per method by the rules below it
             ("methods.v1.json", "/$defs/refused_exchange/properties/params"),  # a malformed request, on purpose
+            ("methods.v1.json", "/$defs/refused_exchange/properties/answer"),  # typed per method by the rules below it
             ("methods.v1.json", "/$defs/params.operator.read/properties/command"),          # the operator plugin's
             ("methods.v1.json", "/$defs/answer.operator.read/anyOf/0/properties/body"),     # the operator plugin's
             ("methods.v1.json", "/$defs/params.plugin.call/properties/arguments"),          # the plugin's own
@@ -84,14 +85,19 @@ class PublishedFilesTest(unittest.TestCase):
             types = node.get("type")
             return types == "object" or (isinstance(types, list) and "object" in types)
 
+        def closed(node):
+            """additionalProperties is false, or a schema for the values of a map. True closes nothing."""
+            value = node.get("additionalProperties", True)
+            return value is False or isinstance(value, dict)
+
         def closes_itself(node):
             if "additionalProperties" in node:
-                return True
+                return closed(node)
             branches = node.get("oneOf")
-            if branches and all(isinstance(b, dict) and "additionalProperties" in b for b in branches):
+            if branches and all(isinstance(b, dict) and closed(b) for b in branches):
                 return True
             ifs = [rule for rule in node.get("allOf", ()) if isinstance(rule, dict) and "if" in rule]
-            return bool(ifs) and all("additionalProperties" in rule.get("then", {}) for rule in ifs)
+            return bool(ifs) and all(closed(rule.get("then", {})) for rule in ifs)
 
         def walk(node, path, refining):
             if isinstance(node, dict):
@@ -115,6 +121,63 @@ class PublishedFilesTest(unittest.TestCase):
                 self.assertEqual(sorted(found - open_on_purpose), [], f"{name}: object schemas that are not closed")
         if any("event.v1.json" in s.schemas for s in self.sets.values()):
             self.assertEqual(sorted(open_on_purpose - seen), [], "listed as open on purpose but not found: update the list")
+
+    def test_every_closed_object_is_proved_closed_by_a_fixture(self):
+        """Flip each ``additionalProperties: false`` to true, one at a time: a bad fixture must notice.
+
+        Saying an object is closed is not enough: for every object schema that says so, some bad fixture
+        carries a field nobody defined at that very object, and with that one ``false`` turned to ``true``
+        the fixture stops being refused for its own rule. So no closed object can be opened unnoticed.
+        """
+        for folder, schemas in self.sets.items():
+            sites = {}
+
+            def walk(node, name, path):
+                if isinstance(node, dict):
+                    if node.get("additionalProperties") is False:
+                        sites[id(node)] = (name, path, node)
+                    for key, value in node.items():
+                        walk(value, name, f"{path}/{key}")
+                elif isinstance(node, list):
+                    for i, item in enumerate(node):
+                        walk(item, name, f"{path}/{i}")
+
+            for name, schema in sorted(schemas.schemas.items()):
+                walk(schema, name, "")
+            # Which closed object refuses which bad fixture, found in one pass over the fixtures.
+            refused_by = {}
+            for entry in client.load_index(folder):
+                if not entry["file"].startswith("bad/"):
+                    continue
+                instance = client.read_json(folder / "fixtures" / entry["file"])
+                for error in client.error_objects(schemas.validator(entry["schema"]), instance):
+                    if error.validator == "additionalProperties" and id(error.schema) in sites:
+                        refused_by.setdefault(id(error.schema), []).append(entry)
+            # The method table is a data file, not a fixture: its own bad instance is the table with one
+            # unknown field at the top.
+            table_path = folder / "methods.table.v1.json"
+            spoiled_table = dict(client.read_json(table_path), **{"x-nobody-defined-this": True}) if table_path.is_file() else None
+
+            def table_is_refused():
+                errors = client.leaf_errors(schemas.validator("methods.v1.json"), spoiled_table)
+                return any(keyword == "additionalProperties" and location == "" for keyword, location, _ in errors)
+
+            unproved = []
+            for site, (name, path, node) in sites.items():
+                is_table_root = spoiled_table is not None and (name, path) == ("methods.v1.json", "")
+                if is_table_root:
+                    self.assertTrue(table_is_refused(), "the method table with an unknown field must be refused")
+                node["additionalProperties"] = True
+                try:
+                    noticed = any(client.check_entry(schemas, entry) is not None for entry in refused_by.get(site, ()))
+                    if is_table_root:
+                        noticed = not table_is_refused()
+                finally:
+                    node["additionalProperties"] = False
+                if not noticed:
+                    unproved.append(f"{name}#{path or '/'}")
+            self.assertEqual(unproved, [], f"{folder}: closed objects that no bad fixture proves closed")
+            self.assertTrue(sites, f"{folder}: no closed object found")
 
     def test_index_and_fixture_folders_list_the_same_files(self):
         for folder, schemas in self.sets.items():

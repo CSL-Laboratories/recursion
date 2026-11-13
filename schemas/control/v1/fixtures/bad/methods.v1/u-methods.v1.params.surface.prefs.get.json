@@ -1,0 +1,16 @@
+{
+  "method": "surface.prefs.get",
+  "params": {
+    "surface": "page",
+    "x-nobody-defined-this": true
+  },
+  "answer": {
+    "code": "ok",
+    "prefs": {
+      "surface": "page",
+      "layout": null,
+      "theme": "dusk",
+      "revision": 4
+    }
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "method": "approval.answer",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "approval_id": "apr-00c4",
+    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "answer": "deny",
+    "expected_revision": 2,
+    "surface": "tui"
+  },
+  "answer": {
+    "code": "ok",
+    "approval": {
+      "approval_id": "apr-00c4",
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": "turn-000c",
+      "source": "engine_tool",
+      "effect": {
+        "kind": "engine_tool",
+        "engine": "claude_code",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "tool": "Bash",
+        "input_json": "{\"command\":\"rm -rf build && make\",\"description\":\"clean build\"}",
+        "cwd": "/home/dev/projects/atlas"
+      },
+      "digest_form": "csl-cj/v0",
+      "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "display": [
+        {
+          "label": "Engine",
+          "value": "claude_code",
+          "trust": "trusted"
+        },
+        {
+          "label": "Why the engine says it wants this",
+          "value": "clean build",
+          "trust": "untrusted"
+        }
+      ],
+      "rendered": [
+        {
+          "text": "APPROVAL NEEDED",
+          "trust": "trusted"
+        },
+        {
+          "text": "Engine claude_code asks to run the tool Bash in /home/dev/projects/atlas",
+          "trust": "trusted"
+        },
+        {
+          "text": "command: rm -rf build && make",
+          "trust": "untrusted"
+        },
+        {
+          "text": "Answer by its number: 1 approve, 2 deny. Nothing is approved by default.",
+          "trust": "trusted"
+        }
+      ],
+      "requested_at": "2026-11-13T07:34:30.000Z",
+      "expires_at": "2026-11-13T07:49:30.000Z",
+      "state": "denied",
+      "opened_by": [
+        {
+          "principal": {
+            "kind": "owner",
+            "id": "local"
+          },
+          "surface": "tui",
+          "revision": 1,
+          "at": "2026-11-13T07:34:31.000Z"
+        }
+      ],
+      "answered_by": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "answer": "deny",
+      "answered_at": "2026-11-13T07:35:02.000Z",
+      "revision": 3
+    }
+  }
+}

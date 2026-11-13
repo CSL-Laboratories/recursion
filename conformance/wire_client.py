@@ -111,19 +111,28 @@ class SchemaSet:
                 yield name, ref
 
 
-def leaf_errors(validator: Draft202012Validator, instance: Any) -> list[tuple[str, str, str]]:
-    """Every error as ``(keyword, instance location, message)``, including those inside anyOf and oneOf."""
+def location_of(error) -> str:
+    """Where in the fixture an error is, as a JSON Pointer ('' for the whole value)."""
+    return "".join(f"/{part}" for part in error.absolute_path)
+
+
+def error_objects(validator: Draft202012Validator, instance: Any) -> list:
+    """Every error the validator reports, including those inside anyOf and oneOf."""
     found = []
 
     def visit(error):
-        location = "".join(f"/{part}" for part in error.absolute_path)
-        found.append((str(error.validator), location, error.message))
+        found.append(error)
         for inner in error.context or ():
             visit(inner)
 
     for error in validator.iter_errors(instance):
         visit(error)
     return found
+
+
+def leaf_errors(validator: Draft202012Validator, instance: Any) -> list[tuple[str, str, str]]:
+    """Every error as ``(keyword, instance location, message)``, including those inside anyOf and oneOf."""
+    return [(str(error.validator), location_of(error), error.message) for error in error_objects(validator, instance)]
 
 
 def load_index(folder: Path) -> list[dict]:

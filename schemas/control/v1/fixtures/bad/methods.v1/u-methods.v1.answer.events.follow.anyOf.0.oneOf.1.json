@@ -1,0 +1,33 @@
+{
+  "method": "events.follow",
+  "params": {
+    "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "after": 0,
+    "projection": "transcript",
+    "wait_ms": 20000
+  },
+  "answer": {
+    "code": "ok",
+    "projection": "transcript",
+    "lines": [
+      {
+        "seq": 3,
+        "time_rel_ms": 1840,
+        "event_type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "state": null,
+        "text": "Reading the tests.",
+        "speech": null,
+        "focus": null
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "seq": 3
+    },
+    "more": false,
+    "x-nobody-defined-this": true
+  }
+}

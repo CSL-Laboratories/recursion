@@ -18,7 +18,11 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
 
 - every schema is valid Draft 2020-12, carries a version tag, and has its file name as its `$id`;
 - every `$ref` written in a schema resolves;
-- every object is closed, except the few that are open on purpose, which are listed by name;
+- every object is closed (`additionalProperties` is `false`, or a schema for a map's values), except
+  the few that are open on purpose, which are listed by name;
+- every closed object is proved closed: each `additionalProperties: false` is flipped to `true`, one at
+  a time, and a bad fixture must notice. The fixtures named `u-*` exist for this: each is a good
+  fixture with one field nobody defined added at exactly one object;
 - the method table validates against its schema, and for every method the row, the params schema and
   the answer schema agree (the same codes, a `command_id` exactly where the row says, no `principal` or
   `owner` among the params), and only `run.stop` mutates without a key;

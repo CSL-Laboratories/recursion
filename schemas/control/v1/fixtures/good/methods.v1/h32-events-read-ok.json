@@ -1,0 +1,37 @@
+{
+  "method": "events.read",
+  "params": {
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "after": 41,
+    "limit": 200,
+    "projection": "raw"
+  },
+  "answer": {
+    "code": "ok",
+    "projection": "raw",
+    "events": [
+      {
+        "seq": 39,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:39.443Z",
+        "type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "payload": {
+          "stream": "stdout",
+          "text": "ok\n",
+          "offset_start": 0,
+          "offset_end": 3
+        }
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 42
+    },
+    "more": true
+  }
+}

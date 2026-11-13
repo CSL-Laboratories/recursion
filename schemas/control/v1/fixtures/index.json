@@ -232,6 +232,60 @@
       }
     },
     {
+      "file": "bad/approval.v1/u-approval.v1.approver.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/$defs/approver is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/opened_by/0/principal"
+      }
+    },
+    {
+      "file": "bad/approval.v1/u-approval.v1.display.items.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/properties/display/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/display/0"
+      }
+    },
+    {
+      "file": "bad/approval.v1/u-approval.v1.opened-by.items.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/properties/opened_by/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/opened_by/0"
+      }
+    },
+    {
+      "file": "bad/approval.v1/u-approval.v1.plugin-effect.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/$defs/plugin_effect is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/effect"
+      }
+    },
+    {
+      "file": "bad/approval.v1/u-approval.v1.plugin-effect.scope.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/$defs/plugin_effect/properties/scope is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/effect/scope"
+      }
+    },
+    {
+      "file": "bad/approval.v1/u-approval.v1.rendered.items.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/properties/rendered/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/rendered/0"
+      }
+    },
+    {
       "file": "good/common.v1/h01-cursor-before-the-first-event.json",
       "schema": "common.v1.json#/$defs/cursor",
       "shows": "A cursor that has read nothing yet: seq 0."
@@ -275,6 +329,16 @@
       "file": "good/common.v1/h09-cgroup-identity.json",
       "schema": "common.v1.json#/$defs/cgroup_identity",
       "shows": "A cgroup directory's device and inode numbers, read at launch."
+    },
+    {
+      "file": "good/common.v1/h10-hand-pick.json",
+      "schema": "common.v1.json#/$defs/hand_pick",
+      "shows": "The route a user named: an engine, and the engine's own default model."
+    },
+    {
+      "file": "good/common.v1/h11-lease.json",
+      "schema": "common.v1.json#/$defs/lease",
+      "shows": "Who holds a run for now, in which daemon epoch, and until when."
     },
     {
       "file": "bad/common.v1/b01-cursor-negative-seq.json",
@@ -403,6 +467,78 @@
       }
     },
     {
+      "file": "bad/common.v1/u-common.v1.cgroup-identity.json",
+      "schema": "common.v1.json#/$defs/cgroup_identity",
+      "rule": "The object described at common.v1.json#/$defs/cgroup_identity is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/u-common.v1.cursor.json",
+      "schema": "common.v1.json#/$defs/cursor",
+      "rule": "The object described at common.v1.json#/$defs/cursor is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/u-common.v1.hand-pick.json",
+      "schema": "common.v1.json#/$defs/hand_pick",
+      "rule": "The object described at common.v1.json#/$defs/hand_pick is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/u-common.v1.lease.json",
+      "schema": "common.v1.json#/$defs/lease",
+      "rule": "The object described at common.v1.json#/$defs/lease is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/u-common.v1.route-decision.candidates.items.json",
+      "schema": "common.v1.json#/$defs/route_decision",
+      "rule": "The object described at common.v1.json#/$defs/route_decision/properties/candidates/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/candidates/0"
+      }
+    },
+    {
+      "file": "bad/common.v1/u-common.v1.route-decision.json",
+      "schema": "common.v1.json#/$defs/route_decision",
+      "rule": "The object described at common.v1.json#/$defs/route_decision is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/u-common.v1.route.json",
+      "schema": "common.v1.json#/$defs/route",
+      "rule": "The object described at common.v1.json#/$defs/route is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/u-common.v1.workspace.json",
+      "schema": "common.v1.json#/$defs/workspace",
+      "rule": "The object described at common.v1.json#/$defs/workspace is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
       "file": "good/driver.v2/h01-one-turn-driver.json",
       "schema": "driver.v2.json",
       "shows": "Today's path as a version 2 driver: one prompt, input closed, read to the result. Every flag is false."
@@ -461,6 +597,11 @@
       "file": "good/driver.v2/h12-fork-at-a-turn.json",
       "schema": "driver.v2.json#/$defs/fork",
       "shows": "What fork takes: the state after that turn ended."
+    },
+    {
+      "file": "good/driver.v2/h13-interrupt-a-turn.json",
+      "schema": "driver.v2.json#/$defs/interrupt",
+      "shows": "What interrupt takes: the turn to interrupt."
     },
     {
       "file": "bad/driver.v2/b01-a-flag-left-out.json",
@@ -577,6 +718,78 @@
       "expect": {
         "keyword": "type",
         "at": "/at"
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.event-draft.json",
+      "schema": "driver.v2.json#/$defs/event_draft",
+      "rule": "The object described at driver.v2.json#/$defs/event_draft is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.fork.json",
+      "schema": "driver.v2.json#/$defs/fork",
+      "rule": "The object described at driver.v2.json#/$defs/fork is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.handle.json",
+      "schema": "driver.v2.json#/$defs/handle",
+      "rule": "The object described at driver.v2.json#/$defs/handle is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.input.allOf.0.then.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "rule": "The object described at driver.v2.json#/$defs/input/allOf/0/then is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.input.allOf.1.then.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "rule": "The object described at driver.v2.json#/$defs/input/allOf/1/then is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.interrupt.json",
+      "schema": "driver.v2.json#/$defs/interrupt",
+      "rule": "The object described at driver.v2.json#/$defs/interrupt is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.json",
+      "schema": "driver.v2.json",
+      "rule": "The object described at driver.v2.json#/ is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/u-driver.v2.refusal.json",
+      "schema": "driver.v2.json#/$defs/refusal",
+      "rule": "The object described at driver.v2.json#/$defs/refusal is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
       }
     },
     {
@@ -1053,6 +1266,240 @@
       }
     },
     {
+      "file": "bad/event.v1/u-event.v1.approval.answered.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/approval.answered is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.checkpoint.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/checkpoint is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.daemon-row.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/daemon_row is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload/post_image/daemon_row"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.diff.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/diff is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.dollar-amount.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/dollar_amount is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload/cost_usd"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.effect.outcome-unknown.effect.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/effect.outcome_unknown/properties/effect is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload/effect"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.effect.outcome-unknown.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/effect.outcome_unknown is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.engine.output.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/engine.output is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.fork.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/fork is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.interrupt.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/interrupt is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/ is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.limit.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/limit is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.replay.gap.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/replay.gap is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.result.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/result is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.state.changed.allOf.0.then.post-image.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/state.changed/allOf/0/then/properties/post_image is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload/post_image"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.state.changed.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/state.changed is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.steer.delivered.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/steer.delivered is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.steer.queued.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/steer.queued is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.stop.requested.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/stop.requested is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.token-count.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/token_count is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload/input_tokens"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.tool.call.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/tool.call is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.tool.result.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/tool.result is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.turn.started.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/turn.started is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.usage.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/usage is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.workspace.grant.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/workspace.grant is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/u-event.v1.workspace.revoke.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/workspace.revoke is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
       "file": "good/mcp.task.v1/h01-working.json",
       "schema": "mcp.task.v1.json",
       "shows": "A turn in progress."
@@ -1194,6 +1641,15 @@
       "expect": {
         "keyword": "type",
         "at": "/outcome"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/u-mcp.task.v1.of.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The object described at mcp.task.v1.json#/properties/of is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/of"
       }
     },
     {
@@ -1375,6 +1831,146 @@
       "file": "good/methods.v1/h19-row-of-session-fork.json",
       "schema": "methods.v1.json#/$defs/row",
       "shows": "The row of session.fork: it needs the driver's fork flag."
+    },
+    {
+      "file": "good/methods.v1/h20-session-start-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A session is started idle, with no first turn."
+    },
+    {
+      "file": "good/methods.v1/h21-session-steer-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A steer is accepted as a queue item with delivery steer."
+    },
+    {
+      "file": "good/methods.v1/h22-session-queue-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A message is queued for the next turn."
+    },
+    {
+      "file": "good/methods.v1/h23-session-interrupt-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "An interrupt was delivered to the turn in progress."
+    },
+    {
+      "file": "good/methods.v1/h24-session-resume-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A session is brought back with its worker."
+    },
+    {
+      "file": "good/methods.v1/h25-session-fork-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A fork answers with the new session."
+    },
+    {
+      "file": "good/methods.v1/h26-session-export-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "An export says where it was written and that no secret is in it."
+    },
+    {
+      "file": "good/methods.v1/h27-session-list-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A list of sessions."
+    },
+    {
+      "file": "good/methods.v1/h28-session-status-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A session with its queue."
+    },
+    {
+      "file": "good/methods.v1/h29-queue-update-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "An edit of a queued message raises its revision."
+    },
+    {
+      "file": "good/methods.v1/h30-queue-cancel-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A queued message is withdrawn."
+    },
+    {
+      "file": "good/methods.v1/h31-approval-answer-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "An answer is accepted: the request after it."
+    },
+    {
+      "file": "good/methods.v1/h32-events-read-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.read with projection 'raw' returns events."
+    },
+    {
+      "file": "good/methods.v1/h33-route-explain-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A dry run of routing: what would be chosen and why, with nothing launched."
+    },
+    {
+      "file": "good/methods.v1/h34-operator-read-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "One of the page's operator reads, answered by the loaded operator plugin."
+    },
+    {
+      "file": "good/methods.v1/h35-budget-show-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A budget row: a cap of zero, and what was spent is unknown, which is not 0."
+    },
+    {
+      "file": "good/methods.v1/h36-workspace-diff-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A diff, untracked files included."
+    },
+    {
+      "file": "good/methods.v1/h37-workspace-checkpoint-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A checkpoint was taken."
+    },
+    {
+      "file": "good/methods.v1/h38-workspace-restore-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The workspace was put back to a checkpoint."
+    },
+    {
+      "file": "good/methods.v1/h39-workspace-publish-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A review branch was pushed; never the default branch."
+    },
+    {
+      "file": "good/methods.v1/h40-plugin-status-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "One loaded plugin, with what it was trusted as and what it provides."
+    },
+    {
+      "file": "good/methods.v1/h41-plugin-call-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A plugin's command ran; the result is the plugin's own."
+    },
+    {
+      "file": "good/methods.v1/h42-key-list-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The keys that are stored: their names and where they are kept, never a value."
+    },
+    {
+      "file": "good/methods.v1/h43-surface-prefs-get-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A surface's layout and theme choice."
+    },
+    {
+      "file": "good/methods.v1/h44-surface-prefs-set-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A preference was changed."
+    },
+    {
+      "file": "good/methods.v1/h50-events-follow-as-a-transcript.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.follow with projection 'transcript' returns lines."
+    },
+    {
+      "file": "good/methods.v1/h51-plugin-list-with-a-loaded-and-a-refused-plugin.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The plugin inventory with one plugin loaded and one refused, each with its findings."
+    },
+    {
+      "file": "good/methods.v1/h52-run-start-unconfirmed.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The launch may be running and the registry could not confirm it: 'start_unconfirmed', never upgraded to 'started' by a retry."
     },
     {
       "file": "good/methods.v1/r01-run-start.json",
@@ -1774,6 +2370,924 @@
       }
     },
     {
+      "file": "bad/methods.v1/u-methods.v1.answer.approval.answer.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.approval.answer/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.approval.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.approval.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.approval.open.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.approval.open/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.budget.show.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.budget.show/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.doctor.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.doctor/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.events.follow.anyOf.0.oneOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.events.follow/anyOf/0/oneOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.events.follow.anyOf.0.oneOf.1.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.events.follow/anyOf/0/oneOf/1 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.events.read.anyOf.0.oneOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.events.read/anyOf/0/oneOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.key.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.key.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.key.list.anyOf.0.keys.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.key.list/anyOf/0/properties/keys/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/keys/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.methods.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.methods.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.methods.list.anyOf.0.methods.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.methods.list/anyOf/0/properties/methods/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/methods/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.operator.read.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.operator.read/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.plugin.call.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.plugin.call/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.plugin.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.plugin.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.plugin.status.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.plugin.status/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.queue.cancel.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.queue.cancel/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.queue.update.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.queue.update/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.route.explain.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.route.explain/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.route.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.route.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.run.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.run.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.run.status.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.run.status/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.export.anyOf.0.export.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.export/anyOf/0/properties/export is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/export"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.export.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.export/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.fork.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.fork/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.interrupt.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.interrupt/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.queue.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.queue/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.resume.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.resume/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.start.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.start/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.status.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.status/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.steer.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.steer/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.stop.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.stop/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.session.turn.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.turn/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.surface.prefs.get.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.surface.prefs.get/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.surface.prefs.get.anyOf.0.prefs.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.surface.prefs.get/anyOf/0/properties/prefs is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/prefs"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.surface.prefs.set.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.surface.prefs.set/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.surface.prefs.set.anyOf.0.prefs.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.surface.prefs.set/anyOf/0/properties/prefs is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/prefs"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.workspace.checkpoint.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.workspace.checkpoint/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.workspace.diff.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.workspace.diff/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.workspace.publish.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.workspace.publish/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.workspace.publish.anyOf.0.published.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.workspace.publish/anyOf/0/properties/published is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/published"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.workspace.restore.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.workspace.restore/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.budget-row.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/budget_row is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/budgets/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.diff.files.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/diff/properties/files/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/diff/files/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.diff.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/diff is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/diff"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.doctor-report.checks.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/doctor_report/properties/checks/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/report/checks/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.doctor-report.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/doctor_report is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/report"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.exchange.allOf.38.then.answer.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/exchange/allOf/38/then/properties/answer is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.exchange.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/exchange is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.finding.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/finding is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/plugin/findings/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.approval.answer.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.approval.answer is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.approval.list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.approval.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.approval.open.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.approval.open is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.budget.show.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.budget.show is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.doctor.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.doctor is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.events.follow.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.events.follow is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.events.read.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.events.read is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.key.list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.key.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.methods.list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.methods.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.operator.read.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.operator.read is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.plugin.call.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.plugin.call is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.plugin.list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.plugin.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.plugin.status.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.plugin.status is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.queue.cancel.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.queue.cancel is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.queue.update.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.queue.update is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.route.explain.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.route.explain is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.route.list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.route.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.run.list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.run.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.run.status.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.run.status is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.export.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.export is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.fork.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.fork is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.interrupt.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.interrupt is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.list.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.queue.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.queue is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.resume.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.resume is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.start.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.start is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.status.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.status is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.steer.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.steer is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.stop.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.stop is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.session.turn.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.session.turn is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.surface.prefs.get.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.surface.prefs.get is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.surface.prefs.set.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.surface.prefs.set is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.workspace.checkpoint.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.workspace.checkpoint is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.workspace.diff.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.workspace.diff is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.workspace.publish.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.workspace.publish is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.workspace.restore.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/params.workspace.restore is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.plugin-row.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/plugin_row is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/plugin"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.refusal.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/refusal is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.refused-exchange.json",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "rule": "The object described at methods.v1.json#/$defs/refused_exchange is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.request.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "The object described at methods.v1.json#/$defs/request is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.route-row.bars.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/route_row/properties/bars is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/routes/0/bars"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.route-row.breaker.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/route_row/properties/breaker is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/routes/0/breaker"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.route-row.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/route_row is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/routes/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.row.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.row.mcp.annotations.anyOf.1.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row/properties/mcp/properties/annotations/anyOf/1 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/mcp/annotations"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.row.mcp.json",
+      "schema": "methods.v1.json#/$defs/row",
+      "rule": "The object described at methods.v1.json#/$defs/row/properties/mcp is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/mcp"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.run-start-answer.allOf.0.then.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/run_start_answer/allOf/0/then is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.run-start-answer.allOf.1.then.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/run_start_answer/allOf/1/then is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.run-start-answer.allOf.2.then.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/run_start_answer/allOf/2/then is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.start-error.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/start_error is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/start_error"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.workspace-request.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/workspace_request is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params/workspace"
+      }
+    },
+    {
       "file": "good/queue.item.v1/h01-queued-for-the-next-turn.json",
       "schema": "queue.item.v1.json",
       "shows": "A message waiting for the current turn to end."
@@ -1939,6 +3453,11 @@
       "shows": "The effective launch snapshot of an API-key route: the NAME of the variable the key is handed over in, never the key; and the fallback it lists."
     },
     {
+      "file": "good/run.record.v1/h05-running-with-a-member.json",
+      "schema": "run.record.v1.json",
+      "shows": "A run with one recorded member process. A Stop is not attested while a member is alive."
+    },
+    {
       "file": "bad/run.record.v1/b01-stopped-without-an-attestation.json",
       "schema": "run.record.v1.json",
       "rule": "'stopped' is stored only with an attestation.",
@@ -2083,6 +3602,51 @@
       }
     },
     {
+      "file": "bad/run.record.v1/u-run.record.v1.launch-route.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch_route is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/route"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/u-run.record.v1.launch-route.limits.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch_route/properties/limits is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/route/limits"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/u-run.record.v1.members.items.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/members/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/members/0"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/u-run.record.v1.stop-attestation.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/stop_attestation is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/stop_attestation"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/u-run.record.v1.stop.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/stop is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/stop"
+      }
+    },
+    {
       "file": "good/run.view.v1/c01-start-answer-running.json",
       "schema": "run.view.v1.json",
       "shows": "Captured: the 'run' in the answer of run.start."
@@ -2146,6 +3710,11 @@
       "file": "good/run.view.v1/h03-run-with-a-session-and-a-workspace.json",
       "schema": "run.view.v1.json",
       "shows": "A run view that carries the version 1 additions."
+    },
+    {
+      "file": "good/run.view.v1/h04-ended-at-a-typed-limit.json",
+      "schema": "run.view.v1.json",
+      "shows": "A run that ended at a typed plan limit: the whole route result, with its limit signal and the adapter's own events. The route result is the adapter's record; typed limits for consumers are in the event log."
     },
     {
       "file": "bad/run.view.v1/b01-ended-without-the-recorded-state.json",
@@ -2217,6 +3786,69 @@
       "expect": {
         "keyword": "enum",
         "at": "/state"
+      }
+    },
+    {
+      "file": "bad/run.view.v1/u-run.view.v1.json",
+      "schema": "run.view.v1.json",
+      "rule": "The object described at run.view.v1.json#/ is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.view.v1/u-run.view.v1.observed.json",
+      "schema": "run.view.v1.json",
+      "rule": "The object described at run.view.v1.json#/$defs/observed is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/observed"
+      }
+    },
+    {
+      "file": "bad/run.view.v1/u-run.view.v1.output.oneOf.0.json",
+      "schema": "run.view.v1.json",
+      "rule": "The object described at run.view.v1.json#/$defs/output/oneOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/output"
+      }
+    },
+    {
+      "file": "bad/run.view.v1/u-run.view.v1.output.oneOf.1.json",
+      "schema": "run.view.v1.json",
+      "rule": "The object described at run.view.v1.json#/$defs/output/oneOf/1 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/output"
+      }
+    },
+    {
+      "file": "bad/run.view.v1/u-run.view.v1.result.oneOf.1.events.items.json",
+      "schema": "run.view.v1.json",
+      "rule": "The object described at run.view.v1.json#/$defs/result/oneOf/1/properties/events/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/result/events/0"
+      }
+    },
+    {
+      "file": "bad/run.view.v1/u-run.view.v1.result.oneOf.1.json",
+      "schema": "run.view.v1.json",
+      "rule": "The object described at run.view.v1.json#/$defs/result/oneOf/1 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/result"
+      }
+    },
+    {
+      "file": "bad/run.view.v1/u-run.view.v1.result.oneOf.1.limit.json",
+      "schema": "run.view.v1.json",
+      "rule": "The object described at run.view.v1.json#/$defs/result/oneOf/1/properties/limit is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/result/limit"
       }
     },
     {
@@ -2496,6 +4128,33 @@
       }
     },
     {
+      "file": "bad/session.v1/u-session.v1.turn-result.json",
+      "schema": "session.v1.json",
+      "rule": "The object described at session.v1.json#/$defs/turn_result is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/turns/0/result"
+      }
+    },
+    {
+      "file": "bad/session.v1/u-session.v1.turn.json",
+      "schema": "session.v1.json",
+      "rule": "The object described at session.v1.json#/$defs/turn is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/turns/0"
+      }
+    },
+    {
+      "file": "bad/session.v1/u-session.v1.worker.json",
+      "schema": "session.v1.json",
+      "rule": "The object described at session.v1.json#/properties/worker is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/worker"
+      }
+    },
+    {
       "file": "good/stop.result.v1/c01-pending-cgroup-populated.json",
       "schema": "stop.result.v1.json",
       "shows": "Captured: a Stop whose unit did not go away: pending, with the reason."
@@ -2664,6 +4323,33 @@
       "expect": {
         "keyword": "required",
         "at": "/fence"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/u-stop.result.v1.attestation.json",
+      "schema": "stop.result.v1.json",
+      "rule": "The object described at stop.result.v1.json#/$defs/attestation is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/attestation"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/u-stop.result.v1.fence.json",
+      "schema": "stop.result.v1.json",
+      "rule": "The object described at stop.result.v1.json#/$defs/fence is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/fence"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/u-stop.result.v1.json",
+      "schema": "stop.result.v1.json",
+      "rule": "The object described at stop.result.v1.json#/ is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
       }
     },
     {

@@ -1,0 +1,47 @@
+{
+  "answer": {
+    "code": "started",
+    "duplicate": false,
+    "run": {
+      "cgroup": "/test.slice/recursion-run-run-fd416edb7381434a8f809a30a2800e94.service",
+      "cgroup_marker": "cg-4da34291792f44eab0cebb8124c7b23f",
+      "engine": "claude_code",
+      "generation": 2,
+      "members": [],
+      "observed": {
+        "detail": "",
+        "state": "running",
+        "stop_requested": false,
+        "unit": "recursion-run-run-fd416edb7381434a8f809a30a2800e94.service"
+      },
+      "output": {
+        "bytes": 658,
+        "complete": false,
+        "lines": [
+          "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 196873, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
+          "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_stdin_eof\", \"note\": \"stdin closed; not treated as cancellation\"}",
+          "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 1\"}]}}"
+        ]
+      },
+      "run_id": "run-fd416edb7381434a8f809a30a2800e94",
+      "start_key": {
+        "client_key": "capture-2",
+        "engine": "claude_code",
+        "prompt_sha256": "3d7bb8776dad8b047d66746d9cd47c1b0c937eaba3ad596075a229b4a3137a98"
+      },
+      "started_at": 1794559511.0639439,
+      "state": "running",
+      "stop": null,
+      "stop_attestation": null,
+      "tenant": "t1"
+    },
+    "x-nobody-defined-this": true
+  },
+  "method": "run.start",
+  "params": {
+    "client_key": "capture-2",
+    "engine": "claude_code",
+    "prompt": "helper=0 fast=1",
+    "tenant": "t1"
+  }
+}

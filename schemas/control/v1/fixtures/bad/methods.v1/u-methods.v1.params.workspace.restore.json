@@ -1,0 +1,18 @@
+{
+  "method": "workspace.restore",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "checkpoint_id": "ckpt-0003",
+    "expected_revision": 9,
+    "x-nobody-defined-this": true
+  },
+  "answer": {
+    "code": "ok",
+    "checkpoint": {
+      "checkpoint_id": "ckpt-0003",
+      "ref": "refs/recursion/checkpoints/ses-7f3a9c2e51d04b6a/3",
+      "label": "before the refactor"
+    }
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "table_version": "1.0-draft.1",
+  "table_version": "1.0-draft.2",
   "methods": [
     {
       "name": "run.start",

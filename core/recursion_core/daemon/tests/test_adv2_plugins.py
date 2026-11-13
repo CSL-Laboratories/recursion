@@ -243,15 +243,14 @@ class Adv2FilesystemTests(Adv2HostCase):
                 self.assertEqual(host.records[0]['state'], 'refused')
                 self.assertFalse(self.marker.exists())
 
-    @needs_crypto
     def test_parser_overflow_artifact_refuses_typed(self):
+        # The plugin is unsigned, as everywhere in this file, so nothing here needs a signature backend.
         deep = b'~' * 10_000 + b'1'
         self.install(deep)
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             host = self.host()
         self.assertEqual((host.records[0]['state'], host.records[0]['code']), ('refused', 'plugin_compile_failed'))
 
-    @needs_crypto
     @unittest.skipIf(getattr(os, 'geteuid', lambda: -1)() == 0, 'root bypasses Unix file read modes')
     def test_unreadable_stores_refuse_typed(self):
         from recursion_core.plugin_security import create_ledger, create_revocation_store
@@ -269,11 +268,13 @@ class Adv2FilesystemTests(Adv2HostCase):
         self.assertFalse(self.marker.exists())
         os.chmod(rev, 0o600)
 
-        installer = Key()
-        fx.write_install(self.config, grants=[fx.grant_for(ANSWER)], authority_anchor=installer.public)
+        # The ledger only has to be bound to an anchor in the right format. Nothing here signs with it or
+        # verifies against it, so a fixed public value does and no key is generated.
+        anchor = '11' * 32
+        fx.write_install(self.config, grants=[fx.grant_for(ANSWER)], authority_anchor=anchor)
         fx.write_plugin(self.plugins / 'one', ANSWER)
         ledger = sec / 'ledger.sqlite3'
-        create_ledger(str(ledger), installer.public)
+        create_ledger(str(ledger), anchor)
         os.chmod(ledger, 0o000)
         self.addCleanup(lambda: ledger.exists() and os.chmod(ledger, 0o600))
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):

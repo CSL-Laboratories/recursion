@@ -8,18 +8,21 @@ Thread hooks deliberately schedule the gap and test real output and SQLite state
 from __future__ import annotations
 
 import importlib
+import os
 import sqlite3
 import threading
 import unittest
 from unittest import mock
 
-from recursion_core.plugin_security import ApprovalGate, Refused, canonical, check_effect, parse
-from recursion_core.plugin_security import approval as approval_module
-from recursion_core.plugin_security.tests.support import (
-    Clock, World, authenticate, effect, needs_crypto,
+from recursion_core.plugin_security import (
+    ApprovalGate, Authority, ConnectionBreaker, Refused, TrustStore, canonical, check_effect,
+    create_breaker_store, create_ledger, create_revocation_store, parse,
 )
+from recursion_core.plugin_security import approval as approval_module
+from recursion_core.plugin_security.tests.support import Clock, authenticate, effect, temp_dir
 
 canonical_module = importlib.import_module("recursion_core.plugin_security.canonical")
+ANCHOR = "11" * 32  # a public value in the anchor's format; nothing signs with it or verifies against it
 
 
 def mutate_in_thread(live, value):
@@ -128,11 +131,25 @@ class NotifyingLock:
         self.lock.release()
 
 
-@needs_crypto
 class StoreCloseTests(unittest.TestCase):
+    def stores(self):
+        """The three stores as the core opens them, over real SQLite files. Nothing is signed or
+        verified: the lock a close has to wait for is the same whatever the store holds, so this
+        needs no ``cryptography``."""
+        directory = temp_dir(self)
+        ledger, breaker, revoked = (os.path.join(directory, name)
+                                    for name in ("ledger.db", "breaker.db", "revoked.db"))
+        create_ledger(ledger, ANCHOR)
+        create_breaker_store(breaker)
+        create_revocation_store(revoked)
+        opened = (Authority(ANCHOR, ledger, Clock()), ConnectionBreaker(breaker),
+                  TrustStore({}, revocation_store=revoked))
+        for store in opened:
+            self.addCleanup(store.close)
+        return opened
+
     def test_close_waits_for_an_in_flight_database_critical_section(self):
-        world = World(self)
-        for store in (world.authority, world.breaker, world.loader._trust):
+        for store in self.stores():
             with self.subTest(store=type(store).__name__):
                 original_lock, database = store._lock, store._db
                 progress, finished = threading.Event(), threading.Event()

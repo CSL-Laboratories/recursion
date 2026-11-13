@@ -115,8 +115,12 @@ class Adv2HungPluginTests(GuiCase):
         return predicate()
 
     def test_a_second_read_is_not_held_forever_behind_a_hung_plugin(self):
-        # The original 3 s join also bounded the shipped turn wait; keep that bound as a constant check.
-        self.assertLessEqual(plugins.OPERATOR_TURN_WAIT_S, 3.0, 'the default turn wait holds an O7 read too long')
+        # The original 3 s join also bounded the shipped turn wait. That bound is kept as a check of the
+        # wait this host was built with and would really use (setUp passes none), before it is overridden:
+        # the constant alone says nothing about a constructor that ignores it.
+        self.assertEqual(self.host._operator_turn_wait_s, plugins.OPERATOR_TURN_WAIT_S,
+                         'a host built with no turn wait does not use the shipped default')
+        self.assertLessEqual(self.host._operator_turn_wait_s, 3.0, 'the default turn wait holds an O7 read too long')
         self.host._operator_turn_wait_s = 0.05
         first_answers, answers, errors = [], [], []
 
@@ -166,6 +170,20 @@ class Adv2HungPluginTests(GuiCase):
         self.assertLess(time.monotonic() - started, 10.0, 'a read into a stuck plugin waited for the turn')
         self.assertEqual(status, 504)
         self.assertIn('no new call was made', body['error'])
+        # The fast path itself, which the wide bound above does not hold to anything: while the plugin is
+        # stuck a read waits for nothing and calls nothing, so it answers 504 at once. One slow answer can
+        # be the machine, so the read is made five times and only the fastest is held to the bound. What
+        # this guarantees: the stuck path can answer in under half a second. A delay built into that path
+        # (a sleep, a wait) slows every one of the five and fails here; a busy machine does not.
+        fastest = None
+        for _ in range(5):
+            started = time.monotonic()
+            status, body = host.operator({'command': READ})
+            took = time.monotonic() - started
+            self.assertEqual(status, 504)
+            self.assertIn('no new call was made', body['error'])
+            fastest = took if fastest is None else min(fastest, took)
+        self.assertLess(fastest, 0.5, 'the fastest of five reads into a stuck plugin was not answered at once')
         self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')
         self.assertIn('a call has still not returned', host.inventory()['plugins'][0]['degraded'])
         self.assertIn('degraded', host.route_records()[0]['blocker'])

@@ -422,6 +422,44 @@ class StopTruthTest(unittest.TestCase):
         shutil.rmtree(directory)
         self.assertEqual(kill.confirm(GROUP, 0.3), EMPTY)
 
+    def test_a_stop_that_brings_another_path_than_the_recorded_one_needs_both_walked_empty(self):
+        """The control record names one cgroup and the Stop brings another, both for the run's unit. A
+        process alive in either keeps the row from ending and the kill tree from answering ``EMPTY``:
+        walking only the recorded path, or only the one the Stop brought, would end the row while the
+        other still holds a process."""
+        brought = '/moved.slice/' + UNIT
+        for live_in in ('recorded', 'brought'):
+            with self.subTest(process_alive_in=live_in):
+                proc = self.victim()
+                self.cgroup(GROUP, [proc.pid] if live_in == 'recorded' else [])
+                self.cgroup(brought, [proc.pid] if live_in == 'brought' else [])
+                manager = self.forgotten()
+                walked, walk = [], manager.recorded_cgroup_clear
+                manager.recorded_cgroup_clear = lambda unit, group: (walked.append(group), walk(unit, group))[1]
+                _, daemon = self.api(manager)  # the control record carries GROUP
+                try:
+                    clock = SteppedClock()
+                    kill = launcher.UnitKillTree(daemon, poll_s=0.1, clock=clock, sleep=clock.sleep)
+                    kill.request_stop(brought)
+                    row = daemon.registry.get('run-x')
+                    self.assertEqual((row.state, row.detail),
+                                     ('stopping', 'unit gone; the recorded cgroup still holds a process'))
+                    self.assertEqual(set(walked), {GROUP, brought})
+                    self.assertEqual(kill.confirm(brought, 0.3), POPULATED)
+                    self.assertEqual(daemon.registry.get('run-x').state, 'stopping')
+                    self.assertIsNone(proc.poll(), 'the process is still alive')
+                    # Once both read empty, the same Stop is confirmed and the row ends.
+                    proc.kill()
+                    proc.wait()
+                    self.cgroup(GROUP, [])
+                    self.cgroup(brought, [])
+                    self.assertEqual(kill.confirm(brought, 0.3), EMPTY)
+                    self.assertEqual(daemon.registry.get('run-x').state, 'terminated')
+                finally:
+                    daemon.close()
+                    shutil.rmtree(self.tmp / 'state', True)
+                    shutil.rmtree(self.root, True)
+
     def test_cgroup_clear_walks_only_under_a_recorded_stop(self):
         """The walk kills what it finds, so the daemon refuses it for a run nobody asked to stop."""
         manager = self.forgotten()

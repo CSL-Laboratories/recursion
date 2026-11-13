@@ -460,7 +460,7 @@ class ProductionLauncher:
         unit = f'recursion-run-{ctx.run_id}.service'
         if not UNIT.fullmatch(unit):
             raise refused('run_id')
-        stdin_fd = env_fd = None
+        stdin_fd = env_fd = pidfd = None
         process = None
         try:
             for name in ('stdin.fifo', 'env.fifo'):
@@ -496,6 +496,8 @@ class ProductionLauncher:
                 process.close()
             else:
                 self._fence_quietly(ctx.run_id)
+                if pidfd is not None:
+                    os.close(pidfd)
             if stdin_fd is not None:
                 os.close(stdin_fd)
             raise

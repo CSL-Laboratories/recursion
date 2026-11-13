@@ -98,6 +98,9 @@ class _Handler(WSGIRequestHandler):
 
     def parse_request(self):
         parsed = super().parse_request()
+        if parsed and len(self.headers.get_all("Content-Length", ())) > 1:
+            self.send_error(400, "duplicate Content-Length")
+            return False
         self._reader.deadline = time.monotonic() + BODY_DEADLINE_S
         if parsed and not self.server.headers_read(self.connection, self.command, self.path):
             self.send_error(503, "GUI busy: every request thread is answering; only Stop is taken now")

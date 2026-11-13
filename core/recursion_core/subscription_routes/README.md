@@ -14,7 +14,9 @@ reviewed or accepted.
   Pi and Hermes require `wrapper` (see Wrapper pins). Cursor and Antigravity CLI use
   `check_cursor_route` and `check_antigravity_route`.
 - `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher,
-  always with the checked env and `shell=False`. It refuses `env`, `shell`, `executable`,
+  with `shell=False` and the checked env rebuilt by `child_env.build_child_env` (a temp name
+  becomes one private temp root; the one checked credential is kept under the harness's own
+  name). That env is never `os.environ`. It refuses `env`, `shell`, `executable`,
   `preexec_fn`, fd, user and group options before any check, forwards `cwd`, and refuses
   any other option (see Launch options). `launcher` and `argv` are trusted, core-owned
   inputs: argv is not parsed beyond `argv[0]` and the model, so it must not carry a
@@ -100,7 +102,10 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_API_URL` (plus the `gh`
   selectors `GH_HOST`, `GH_CONFIG_DIR`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`) are
   removed from that run's child, as is every other provider credential (`*_API_KEY`, `*_TOKEN`, for
-  example `ANTHROPIC_API_KEY`). An optional `model` is checked (printable, no spaces, at most 128
+  example `ANTHROPIC_API_KEY`). Anything outside `child_env`'s base allowlist is removed too
+  (`GH_PAT`, `AWS_*`, `GIT_CONFIG_*`), and a proxy value with userinfo is removed. What remains
+  is rebuilt with `build_child_env` and started by `spawn_copilot_own_loop`. An optional `model`
+  is checked (printable, no spaces, at most 128
   characters) and carried on the decision. With no stored `copilot` login (or no probe, or a failing probe)
   the run refuses rather than fall back to `gh`. The probe is the caller's; nothing here opens a
   login store.
@@ -111,8 +116,10 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   and refuse. Adapters are `["nous"]` only; `xai` refuses (`adapter_must_stay_off`). Recursion holds
   no Nous token: token-like route fields and URL credentials refuse, and provider credential
   variables are removed from the child. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, any
-  case) are removed too, so loopback-bound traffic cannot be carried off the host. An optional
-  `model` is checked and carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
+  case) are removed too, so loopback-bound traffic cannot be carried off the host. Names outside
+  `child_env`'s base allowlist (`GH_PAT`, `AWS_*`, `GIT_CONFIG_*`) are removed as well.
+  `spawn_nous_own_loop` rebuilds what remains with `build_child_env` and starts the process.
+  An optional `model` is checked and carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
   `adapter_must_stay_off`).
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
@@ -210,8 +217,10 @@ pinned file passes, and argv reaches the launcher unchanged. OpenCode has no pin
 `guard_then_spawn` does not bind its `argv[0]`. Full access does not relax this. The check
 compares paths at guard time; it does not hold the file open across the launch.
 
-`guard_then_spawn` launches the env `check_route` accepted, not a second read of the
-caller's mapping. A subscription `model` must appear in argv (or as `--model` / `-m`);
+`guard_then_spawn` launches the env `check_route` accepted, rebuilt through `child_env`
+(`validated_launch.launch_env`), not a second read of the caller's mapping and not
+`os.environ`. `spawn_route_process` is the subprocess entry for that same env.
+A subscription `model` must appear in argv (or as `--model` / `-m`);
 otherwise the launch refuses `model_not_bound`. An empty model segment (`anthropic/`)
 refuses `model_name_empty`. `borrow_claude_code_login` is not a profile field.
 `repr(RouteDecision)` leaves out `child_env`, which holds the API key on an API-key route.

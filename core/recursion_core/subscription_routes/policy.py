@@ -513,7 +513,9 @@ def guard_then_spawn(
 ) -> tuple[RouteDecision, object]:
     """Run ``check_route`` and only then call the launcher with the env that check accepted.
 
-    A later change to ``child_env`` is not what launches: the launcher receives ``decision.child_env``.
+    A later change to ``child_env`` is not what launches. The launcher receives that checked
+    snapshot rebuilt by ``child_env.build_child_env`` (a private temp root when a temp name is
+    present, and the one checked credential under its own name). It is never ``os.environ``.
     A subscription route's ``model`` must be an argv element (or ``--model`` / ``-m``), so the engine is
     not left to its own default. On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
     the pinned ``wrapper.launcher_path`` (``argv0_not_pinned``); OpenCode has no pin and no such check.
@@ -556,7 +558,7 @@ def _check_home(
     ``own`` lists the engine's own login store entries a subscription sign-in may keep there.
     """
 
-    if os.name == "nt":
+    if os.name == "nt" or not hasattr(os, "geteuid"):
         raise SubscriptionRouteRefused(engine, "platform_unsupported")
     if not isinstance(route_home, str) or not os.path.isabs(route_home):
         raise SubscriptionRouteRefused(engine, "route_home_missing")
@@ -983,11 +985,23 @@ def _launch_checked(
         raise SubscriptionRouteRefused(decision.engine, "argv0_not_pinned")
     if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model):
         raise SubscriptionRouteRefused(decision.engine, "model_not_bound", decision.model)
+    # Rebuild before the Hermes write, so a refused environment does not leave a config behind.
+    # Imported here: validated_launch does not import this module.
+    from recursion_core.child_env import EnvRefused
+    from recursion_core.subscription_routes.validated_launch import launch_env
+
+    try:
+        _validated, launched = launch_env(
+            decision.child_env, route_home=route_home, credential_env=decision.credential_env,
+        )
+    except EnvRefused as exc:
+        detail = exc.cause if not exc.name else f"{exc.name}:{exc.cause}"
+        raise SubscriptionRouteRefused(decision.engine, "child_env_refused", detail) from None
     _apply_hermes_adopt_override(decision, route_home)
-    # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
-    # launch options _reject_launch_shape let through; none can replace env, shell or the model.
+    # ``launched`` is the rebuilt snapshot, not another read of the caller's mapping and not
+    # ``os.environ``. ``forward`` holds only the options _reject_launch_shape let through.
     return decision, launcher(
-        list(argv), env=dict(decision.child_env), shell=False,
+        list(argv), env=launched, shell=False,
         engine_config=decision.engine_config, model=decision.model, **forward,
     )
 

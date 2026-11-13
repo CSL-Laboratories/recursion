@@ -1,0 +1,210 @@
+# control: control API, CLI and Control MCP descriptors with truthful Stop (CSL-798)
+
+Candidate code for build item 8. Spec: PRODUCT.md at csl-research `055cc7a5c793b7135e5d0565dc4198cf96230531`
+(SHA-256 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, receipt pointer CSLR-D-011; first written
+against `398cd812`, whose 3.4 S6, 11.3, 11.8 and O41 text 055cc7a5 keeps): 3.4 S6 (Stop), 11.3 (#916
+procedure), 11.8 (control API), O41 (Codex control-tool posture, decided Nov 7 "All picks"; Q48 is
+recorded on F60, CSL-762).
+
+## What it is
+
+- `api.py`: `ControlAPI.call(method, params) -> dict` with `run.start`, `run.status`, `run.list` and
+  `run.stop`, each answering with a typed code. Every surface (this CLI now, the GUI and Control MCP
+  later) goes through it; none has its own Stop path.
+- Stop: the first `run.stop` asks the injected cleanup layer (`KillTree`, a cgroup v2 + pidfd
+  abstraction running the #916 procedure) to stop the run's tree, then to confirm. Only a confirmed
+  empty cgroup answers `stopped`. A populated cgroup, a confirm timeout, an unknown answer or a cleanup
+  error answers `pending` with that reason, never `stopped` or `terminated`. A repeat stop on a stopped
+  run sends nothing; on a pending run it only re-checks, unless the earlier cleanup request itself
+  raised, in which case the next stop sends it again. An unknown run is `run_unknown`. A start's
+  `client_key` dedupes retries per tenant and is bound to that start's engine and prompt digest; reusing
+  it for a different request is `request_invalid` / `client_key_reused`. The key and digest are stored in
+  the run record (`start_key`) and found through `RunRegistry.find_start`, so a durable registry keeps
+  dedupe across a daemon restart (11.3, B-17).
+- Launch intent first: `run.start` picks the run id, writes the record as `starting` (with its
+  `start_key`) and only then calls the injected starter with that `run_id`. If that first write fails,
+  nothing is launched (`registry_unavailable`). If the write after launch fails, the answer is
+  `start_unconfirmed` and the record stays `starting`, but the API keeps the starter's cgroup in memory:
+  `run.stop` aims the cleanup layer at it (even when the registry cannot be read at all, answering
+  `"recorded": false`), and a same-key retry records it once the registry answers.
+  A `run.stop` that arrives before the launch is recorded answers `pending` / `cgroup_unknown` and is
+  kept as a stop intent; the start acts on it once the launch is recorded and returns that stop result
+  under `stop`. A same-key retry never upgrades an unconfirmed or failed start to `started`: a starter
+  that raised is relaunched under the same run id (unless a Stop was asked for it, which answers
+  `start_failed` / `stop_requested`), and a `starting` record with no known cgroup (the starter handed
+  back none, or a daemon restart lost the in-memory cgroup) answers `start_unconfirmed`. Reconciling such
+  a record against the host after a restart (the startup sweep) belongs to the durable-registry item,
+  CSL-738.
+- Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
+  fails answers `registry_unavailable`. Once the cleanup layer has answered, Stop returns `stopped` or
+  `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
+  record and asks the cleanup layer again, which is safe to repeat. A write-back refused as stale is not
+  a failed write: the record moved under the Stop, so the decision is applied to a fresh read, at most
+  three times (`STALE_RETRIES`). From that stale write until a write of the run lands, what the API
+  holds of the record may be behind, so an empty result that did not land answers `pending` with
+  `"recorded": false` (`member_alive` when a member is alive on the record, else `cgroup_changed`),
+  never `stopped`; that covers a later Stop working from a kept launch record while the registry
+  cannot be read. For a launch whose own write failed,
+  the API keeps the Stop decision with that launch, so a later Stop or a same-key retry continues it
+  (re-sends a request that raised, writes back a confirmed `stopped`) and never records a bare `running`
+  over it. A failed start whose record cannot be re-read writes nothing, so it never erases a Stop
+  intent recorded during the launch.
+- Stop decisions and launch records are serialised per run, not API-wide, so one hung cleanup never
+  queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed
+  during it.
+- Starts are serialised only per `(tenant, client_key)`, so a slow or hung starter delays only a retry
+  of that same start; a start without a key, or with another tenant or key, never waits on it. That
+  lock is dropped once the in-flight starts for the key have returned, so distinct keys do not keep
+  locks for the life of the process.
+- A prompt that is not strict UTF-8 (an unpaired surrogate) is `request_invalid` / `prompt` on
+  `run.start`, keyed or not, and nothing is launched. The prompt digest is SHA-256 of the UTF-8 bytes.
+- **Unscoped (open decision).** `ControlAPI.call` takes no caller identity. `run.list` and `run.status`
+  return every tenant's records, and `run.stop` stops any run by id, whoever asks. Tenant is only a
+  namespace for `client_key`, not an access boundary. Caller scopes (11.8 / D3) are not built here.
+- Reads (`run.status`, `run.list`) return copies, change no state and never call the cleanup layer.
+- **`run.list` paging (ADV1-5).** Spec: PRODUCT.md d84cdd26 (CSLR-D-012), section 3.6 (the TUI is a
+  client of the same control API as the CLI and GUI, and anything the TUI can do the CLI can do).
+  Records are never pruned, so a full list can outgrow the socket's 1 MiB frame (about 1075 runs).
+  `run.list` takes two optional params, both additive:
+
+  | Param | Value | Refusal |
+  |---|---|---|
+  | `limit` | int, 1 to `LIST_LIMIT_MAX` (1000) | `request_invalid` / `limit` |
+  | `after` | a `run_id` from an earlier page | `request_invalid` / `after` (not a non-empty string), `request_invalid` / `after_unknown` (names no run) |
+
+  Runs are listed in `run_id` order, each entry exactly as before. A page that stops before the last
+  run answers `{"code": "ok", "runs": [...], "next_after": "<last run_id on the page>"}`; the last page
+  has no `next_after`. `after` set to the last run is a valid cursor and answers an empty last page;
+  an unknown cursor is refused, never answered with an empty page. With no params the API lists every
+  run; the daemon cuts that list to what one frame carries and adds `next_after` itself (see the
+  daemon README). A no-param list that fits is the same reply, byte for byte, as before.
+  `tui.protocol.list_all_runs` follows `next_after` for the CLI and TUI: it joins the pages, returns a
+  one-page answer unchanged, and answers `list_incomplete` (with a `detail`) when a cursor is not the
+  page's last run or does not move forward, a run is listed twice, or the walk passes 100 000 pages.
+  A failed later page is returned as it came. A run started during a walk whose id sorts before the
+  cursor is read on the next walk.
+- `registry.py`: the `RunRegistry` (`get`, `list`, `put`, `find_start`) and `KillTree` interfaces, plus an
+  in-memory registry for tests. `find_start` is an indexed lookup. If more than one record carries the
+  same `(tenant, client_key)`, the first one stored is the one returned; changing that record's key
+  leaves the next one indexed.
+  Every stored record has a `generation`. `put` of an existing run is a compare-and-swap on
+  `(generation, state)`: it stores only when `generation` is the one `get` returned and the write does
+  not leave `stopped`, then increments the generation. A stale writer raises and does not overwrite a
+  stop. `stopped` is terminal. It is stored only with an attestation (`proof: empty`, the cgroup path,
+  that cgroup's marker, the member ids, and that generation) and only when none of those members is
+  still alive; the member rows are then dropped. A later update that changes the cgroup identity is
+  refused, and a later `join_member` on a stopped run is refused. A cleanup request stores the cgroup
+  path and marker it was sent to; a different identity is requested again. `reap_orphans` samples each member
+  once, drops the members that sample says are gone, and does not by itself record `stopped`.
+  Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,
+  not under a thread id. One `acquire` sorts its keys, and a start key sorts before a run key, so a start
+  and a stop cannot deadlock by taking those locks in opposite orders. A key is deleted once nobody holds
+  it.
+  The durable registry (B8, B9) and the real cgroup/pidfd cleanup (B6) are other build items.
+- `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`. It
+  makes one API call, prints the API's answer verbatim as JSON and exits 0 (ok, started, stopped),
+  3 (pending), 4 (run_unknown), 1 (other error) or 2 (usage). It imports no `os`, `signal` or
+  `subprocess`. `recursion-control conditions` (CSL-799) reads `run.list` and prints the conditions it
+  exposes with the TUI's labels and words (`{"code": ..., "conditions": [{"label", "text"}]}`); the TUI
+  has the same command, and no control API method was added. `list` and `conditions` read every
+  `run.list` page (`list_all_runs`) and print one joined answer; a list that fits one page prints as
+  before.
+- `mcp_tools.py`: Control MCP tool descriptors with every annotation set explicitly, and `call_tool`,
+  which forwards to the control API:
+
+  | Tool | readOnlyHint | destructiveHint | idempotentHint | openWorldHint |
+  |---|---|---|---|---|
+  | `recursion_run_list`, `recursion_run_status` | true | false | true | false |
+
+  `recursion_run_list` takes the optional `limit` and `after` (paging above); the other tools' input
+  schemas are unchanged.
+  | `recursion_run_stop` | false | true | true | false |
+  | `recursion_run_start` | false | false | false | true |
+
+  Stop carries `destructiveHint: true` per 055cc7a5 O41; the older CSL-762/F60 handoff wording
+  (`destructiveHint: false` on start and stop) is superseded.
+- `codex_config.py`: `codex_operator_snippet(server_id, command, args)` writes the operator's Codex TOML,
+  setting `approval_mode = "approve"` under `mcp_servers.<id>.tools.recursion_run_stop`, so stop does not
+  prompt where that setting is in place. `strict_auto_review` or a managed approval requirement can still
+  force a prompt. Without the setting, stop prompts in Auto mode and is refused under `codex exec`. Start
+  is not auto-approved.
+
+## Operator inspect reads (read-only, for a separate local process)
+
+`operator_reads.py` and `operator_reads_socket.py` are a second, GET-only surface. It is apart from
+`ControlAPI`: it imports nothing from it, has no mutating method, and cannot start or stop a run.
+
+- **Reads.** `OperatorReads(sources=None, *, profile=None, clock=time.time).call(method, params) -> dict`
+  serves `operator.positions.inspect`, `operator.decisions.inspect` and `operator.budgets.inspect`.
+  `params` is `{}` or `None`. `call` never raises.
+- **Envelope (O7 v0).** `api_version` (`"o7.operator.v0"`), `command`, `request_id` (new per call),
+  `profile`, `authority_effect` (`"none"`), `order_path` (`"none"`), `code`, `status_code` (same string as
+  `code`), `result` (`{"positions" | "decisions" | "budgets": [rows]}` plus any `extra` fields of the
+  source), `errors` (`[]` when ok, else one `{code, status_code, message, recovery}`), `stale`,
+  `unreconciled`, `served_at`; `empty_reason` when an ok read has no rows; `detail` on a refusal.
+  `profile` is the host's summary or `{"profile_id": null, "signature_state": "no_profile"}`.
+- **Codes.** `ok`, `stale_or_unreconciled` (rows still shown), `method_not_allowed`, `request_invalid`,
+  `source_unavailable`, `source_invalid`, `row_invalid`, `venue_refused`; from the socket also
+  `request_too_large`, `request_timeout`, `busy`, `peer_refused`, `reply_too_large`; from the client
+  alone `control_api_unavailable`. A refusal has `result` `{}`: a read is served whole or not at all.
+- **Sources.** Recursion has no paper order book, approval-decision store or authority ledger on this
+  branch, so this code owns no state. The host that composes the server injects one zero-argument
+  callable per read (`sources={"positions": ..., "decisions": ..., "budgets": ...}`), each returning
+  `{"venue": "paper" | "stock", "rows": [...], "stale"?, "unreconciled"?, "empty_reason"?, "extra"?}`.
+  Once composed, positions are meant to come from the order book of the paper venue, decisions from the
+  approval gate's recorded decisions, and budgets from the authority ledger's budgets.
+  **Uncomposed reads answer ok-empty**: `code` `ok`, an empty list and `empty_reason`
+  `no_<read>_source_attached`. No rows are ever made up.
+- **Rows.** Each row is a flat dict of JSON scalars with snake_case keys. Every row is labelled with its
+  source's venue (`venue` is set when absent). A row naming another venue, or a source venue other than
+  `paper`/`stock`, answers `venue_refused`; a nested value, a non-finite float or a bad key answers
+  `row_invalid`. Nothing is dropped silently.
+- **Socket.** `OperatorReadsServer(reads, path=None, *, read_deadline_s=2.0, max_connections=8)` with
+  `start()`, `close()` and `with`; it serves on a daemon thread and accepts only an `OperatorReads`.
+  One request per connection: one JSON line `{"method": str, "params": {}}` of at most 4096 bytes, one
+  JSON reply line, close. Default path `$XDG_RUNTIME_DIR/recursion/operator-reads.sock`, else
+  `/run/user/<uid>/recursion/operator-reads.sock`: its own file, so it can never carry a control request.
+- **Security model.** No token. Owner-only socket: directory `0700` (created if missing; the server
+  refuses to serve if it is a symlink, not owned by this uid, or open to group or other), socket file
+  `0600`, and each peer's uid checked with `SO_PEERCRED` (another uid is answered `peer_refused` unread).
+  Any process of the same user can read. Linux only: where `AF_UNIX`, `SO_PEERCRED` or uids are missing
+  (macOS, Windows) the modules import, `start()` raises `PlatformNotSupported`, and the socket tests skip.
+- **Client.** `from recursion_core.control.operator_reads import connect`;
+  `connect(path: str | None = None, *, timeout_s: float = 5.0)` returns an object whose
+  `call(method, params) -> dict` opens one connection per call and never raises. Unreachable answers
+  `{"code": "control_api_unavailable", "delivered": false, "detail": ...}` (`detail`
+  `platform_unsupported` without `AF_UNIX` or uids); a request written with no complete reply answers
+  `"delivered": "unknown"`. A name that is not `operator.<name>.inspect` is refused locally
+  (`method_not_allowed`, `"delivered": false`).
+
+No host composes or starts this server yet; that belongs to the daemon adapter below.
+
+## Candidate and unwired
+
+No daemon serves this API yet, no MCP transport is implemented, the CLI has no packaged entry point (its
+API client factory is injected) and no real cleanup layer is wired. Nothing here talks to a real Codex or
+Claude Code client, a provider or the network; tests use fakes only.
+
+**Update (CSL-738 composition).** The daemon now builds this API itself:
+`recursion_core/daemon/control_adapter.py` constructs `ControlAPI` over a durable registry and the
+daemon's cleanup layer and serves it on the owner-only Unix socket. `python -m recursion_core.control`
+is the packaged CLI entry point; its API factory is `control/client.py` `SocketAPI`, and with the daemon
+down it answers `control_api_unavailable` (exit 1). See `daemon/README.md`, "Composition". The Control
+MCP transport is still not implemented. The paragraph below is the state before that composition.
+
+**Not built here, owner not assigned: the daemon adapter.** This PR does not build the production
+adapter that makes the daemon (recursion #324, CSL-738) construct a `ControlAPI`, hand its client to
+this CLI, and give the GUI a device/pairing door onto it. #324's body says #327 owns that adapter; this
+PR does not take it on, and no other lane or issue is named for it yet. Until one is, the daemon's GUI
+door answers 401 and `cli.run(..., None)` answers `control_api_unavailable`, so Stop through the GUI or
+the packaged CLI on Nov 11 (PRODUCT.md 2.1, 3.4 S6) has no owner. Which lane and issue own it is
+Lucas's call.
+
+## Tests
+
+From the repository root:
+
+```
+PYTHONPATH=core python3 -B -m unittest discover -s core/recursion_core/control/tests -t core -v
+PYTHONPATH=core python3.14t -X gil=0 -B -m unittest discover -s core/recursion_core/control/tests -t core -v
+```

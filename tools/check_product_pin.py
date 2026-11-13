@@ -110,7 +110,8 @@ def vault_errors(pin: dict, vault: Path) -> list[str]:
         return [f"cannot read {spec!a} from {str(vault)!a}: {_printable(exc)}"]
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = exc.stderr.decode("utf-8", "replace").strip() if hasattr(exc, "stderr") else exc
-        return [f"cannot read {spec} from {vault}: {detail}"]
+        # Windows hands a lone surrogate to git instead of raising ValueError, so escape here too.
+        return [_printable(f"cannot read {spec} from {vault}: {detail}")]
     digest = hashlib.sha256(blob).hexdigest()
     if digest != pin["sha256"]:
         return [f"sha256 mismatch for {spec}: pinned {pin['sha256']}, vault has {digest}"]

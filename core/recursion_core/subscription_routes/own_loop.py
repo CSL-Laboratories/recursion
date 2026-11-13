@@ -18,15 +18,26 @@ PRODUCT.md at csl-research #1074 head 055cc7a5 (section 3.3):
 Both checks run before any spawn or request and fail closed. Nothing here reads a credential, opens a
 login store, resolves a host name or touches the network: whether a stored ``copilot`` login exists is
 answered by a caller-supplied probe (``has_copilot_login``), and with no probe the route refuses.
+
+The child environment is not a copy of the parent. After the Copilot or Nous strip, only names on
+``child_env``'s base allowlist remain, and a proxy value that carries userinfo or fails the proxy
+rule is removed. ``spawn_copilot_own_loop`` and ``spawn_nous_own_loop`` then rebuild that mapping
+with ``build_child_env`` and start the process through ``child_env.spawn``.
 """
 
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Callable, Iterable, Mapping
+import subprocess
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from urllib.parse import urlsplit
+
+from recursion_core.child_env import build_child_env, spawn
+from recursion_core.child_env.policy import (
+    BASE_NAMES, VALUE_ALL_PROXY, VALUE_URLS, _ALL_PROXY_SCHEMES, _unsafe_proxy,
+)
 
 __all__ = [
     "COPILOT_TOKEN_ENV",
@@ -37,7 +48,14 @@ __all__ = [
     "check_copilot_own_loop",
     "check_nous_own_loop",
     "nous_proxy_doctor",
+    "spawn_copilot_own_loop",
+    "spawn_nous_own_loop",
 ]
+
+# ``child_env``'s base allowlist. A name outside it never reaches a Copilot or Nous child, so a
+# denylist cannot forget ``GH_PAT``, ``AWS_*`` or ``GIT_CONFIG_*``.
+_CHILD_ALLOW = frozenset(BASE_NAMES)
+_PROXY_VALUES = frozenset(VALUE_URLS + VALUE_ALL_PROXY)
 
 # The Copilot SDK reads these ahead of the stored ``copilot`` login (PRODUCT.md 055cc7a5, 3.3).
 COPILOT_TOKEN_ENV = ("GITHUB_COPILOT_API_TOKEN", "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
@@ -56,6 +74,38 @@ _TOKEN_HINTS = ("token", "key", "secret", "bearer", "password", "credential", "a
 # Proxy settings would send a loopback-bound request to another host (proxy-aware clients honour them).
 _PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "SOCKS_PROXY", "SOCKS5_PROXY"})
 _MODEL_MAX = 128
+
+
+def _ambient_secret(name: str) -> bool:
+    """True for the parent names a Copilot or Nous child must not see, even if an allowlist grows."""
+
+    upper = name.upper()
+    if upper.startswith(("AWS_", "GIT_CONFIG")) or upper.endswith("_PAT"):
+        return True
+    return upper in {"GITHUB_TOKEN", "GH_TOKEN", "GH_PAT", "GITHUB_COPILOT_API_TOKEN", "COPILOT_GITHUB_TOKEN",
+                     "COPILOT_API_URL"}
+
+
+def _proxy_value_refused(name: str, value: object) -> bool:
+    """A proxy value ``child_env`` would refuse (userinfo, a bad host, a bad scheme) does not launch."""
+
+    if name not in _PROXY_VALUES or not isinstance(value, str):
+        return False
+    schemes = _ALL_PROXY_SCHEMES if name in VALUE_ALL_PROXY else ("http", "https")
+    return _unsafe_proxy(value, schemes) is not None
+
+
+def _project_child(parent: Mapping[str, str], blocked: Callable[[str], bool]) -> tuple[dict[str, str], tuple[str, ...]]:
+    """The parent names that may reach the child, and the names that were removed."""
+
+    removed: list[str] = []
+    child: dict[str, str] = {}
+    for name, value in parent.items():
+        if blocked(name) or name not in _CHILD_ALLOW or _ambient_secret(name) or _proxy_value_refused(name, value):
+            removed.append(name)
+        else:
+            child[name] = value
+    return child, tuple(removed)
 
 
 def _model(engine: str, value: object) -> str:
@@ -138,8 +188,8 @@ def check_copilot_own_loop(
     model = _model("copilot", route.get("model"))
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
-    removed = tuple(n for n in parent_env if n in strip or _is_provider_credential(n))
-    child = {k: v for k, v in parent_env.items() if k not in removed}
+    # The allowlist then drops whatever the strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
+    child, removed = _project_child(parent_env, lambda name: name in strip or _is_provider_credential(name))
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
@@ -246,9 +296,11 @@ def check_nous_own_loop(
         if prefix != NOUS_ADAPTER:
             raise OwnLoopRouteRefused("nous", "nous_adapter_only", prefix)
     # Provider credentials, and proxy settings that would carry loopback traffic off the host.
-    strip = tuple(n for n in parent_env if _is_provider_credential(n) or n.upper() in _PROXY_ENV)
-    child = {k: v for k, v in parent_env.items() if k not in strip}
-    return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), strip, url, adapters,
+    # The allowlist then drops whatever that strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
+    child, removed = _project_child(
+        parent_env, lambda name: _is_provider_credential(name) or name.upper() in _PROXY_ENV,
+    )
+    return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), removed, url, adapters,
                            _shared_host_warning(current_user, interactive_users), model)
 
 
@@ -257,3 +309,44 @@ def _is_provider_credential(name: str) -> bool:
     if upper.startswith(("NOUS_", "XAI_", "GROK_", "HERMES_")):
         return True
     return upper.endswith(("_API_KEY", "_TOKEN", "_AUTH_TOKEN")) or upper in ("OPENAI_BASE_URL",)
+
+
+def _spawn_checked(argv: Sequence[str], decision: OwnLoopDecision, home: str, cwd: str | None) -> subprocess.Popen:
+    """Rebuild the checked child through ``build_child_env`` and start it. ``Popen`` is read at the call."""
+
+    parent = {name: value for name, value in decision.child_env.items() if name != "HOME"}
+    validated = build_child_env("codex", home=home, auth_mode="subscription", parent=parent)
+    return spawn(list(argv), validated, cwd=cwd, popen=subprocess.Popen)
+
+
+def spawn_copilot_own_loop(
+    route: Mapping[str, object],
+    parent_env: Mapping[str, str],
+    argv: Sequence[str],
+    *,
+    home: str,
+    has_copilot_login: Callable[[], bool] | None = None,
+    cwd: str | None = None,
+) -> tuple[OwnLoopDecision, subprocess.Popen]:
+    """``check_copilot_own_loop`` then ``child_env.spawn``. A refused env never reaches ``Popen``."""
+
+    decision = check_copilot_own_loop(route, parent_env, has_copilot_login=has_copilot_login)
+    return decision, _spawn_checked(argv, decision, home, cwd)
+
+
+def spawn_nous_own_loop(
+    route: Mapping[str, object],
+    parent_env: Mapping[str, str],
+    argv: Sequence[str],
+    *,
+    home: str,
+    current_user: str | None = None,
+    interactive_users: Iterable[str] | None = None,
+    cwd: str | None = None,
+) -> tuple[OwnLoopDecision, subprocess.Popen]:
+    """``check_nous_own_loop`` then ``child_env.spawn``. A refused env never reaches ``Popen``."""
+
+    decision = check_nous_own_loop(
+        route, parent_env, current_user=current_user, interactive_users=interactive_users,
+    )
+    return decision, _spawn_checked(argv, decision, home, cwd)

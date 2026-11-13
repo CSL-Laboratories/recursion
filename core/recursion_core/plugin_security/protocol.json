@@ -1,0 +1,23 @@
+{
+  "protocol": "csl-core/v0",
+  "status": "candidate",
+  "encoding": "csl-cj/v0 restricted canonical JSON (see canonical.py); requests and responses are canonical bytes",
+  "request": {"fields": ["args", "op", "protocol"]},
+  "response_ok": {"fields": ["ok", "protocol", "result"], "ok": true},
+  "response_refused": {"fields": ["ok", "protocol", "refusal"], "ok": false, "refusal_fields": ["code"]},
+  "caller": "bound by the core when it hands a client to a plugin or host adapter; never read from the request",
+  "ops": {
+    "plugin.permissions": {"caller": "any", "args": ["plugin_id"], "result": ["permissions"]},
+    "effect.request": {"caller": "plugin named in effect.plugin_id", "args": ["effect"], "result": ["approval_id", "digest"]},
+    "effect.authorize": {"caller": "plugin named in effect.plugin_id", "args": ["approval_id", "authority", "effect"], "result": ["authorized", "charge", "digest"],
+      "order_of_checks": ["core_health", "caller_is_effect_plugin", "permission", "run_owned_connection_not_faulted_not_tripped", "approval_one_use", "authority_profile_and_budgets"]},
+    "approval.decide": {"caller": "any; the credential decides and only operator_ui may approve", "args": ["approval_id", "credential", "decision", "digest"], "result": ["state"],
+      "veto_is_final": "after a veto of a digest, effect.request for that digest, approve of another approval for it and effect.authorize with one approved earlier refuse approval_vetoed; kept in memory only, so a restart forgets it"},
+    "run.bind": {"caller": "host", "args": ["connection", "model_version", "plugin_id", "provider", "run_id"], "result": []},
+    "run.fault": {"caller": "host", "args": ["run_id"], "result": []},
+    "breaker.report": {"caller": "host", "args": ["connection", "event_type"], "result": ["tripped"]},
+    "breaker.probe_begin": {"caller": "host", "args": ["connection"], "result": ["lease"]},
+    "breaker.probe_reset": {"caller": "host", "args": ["connection", "lease", "probe_ok"], "result": ["reset"]},
+    "key.revoke": {"caller": "host", "args": ["key_id"], "result": ["order_off", "revocation_generation"]}
+  }
+}

@@ -108,27 +108,28 @@ class PluginRefused(Exception):
         self.code, self.detail = code, detail
 
 
-def _os_thread_published(thread):
-    """True when ``thread``'s OS thread exists, so a failed ``start`` must not clear ``_busy``.
+def _os_thread_published(thread, entered=None):
+    """True unless it is provable that ``thread`` has no OS thread.
 
-    See ``control_adapter._os_thread_published``: ``Thread.start`` can raise after the OS
-    thread is running, and ``ident`` is unset until that thread is scheduled. A missing
-    ``_limbo`` or ``_active_limbo_lock`` is treated as published, the same as an inspection
-    error: a second read overlapping a live one is worse than leaving this one busy.
+    Same rule as ``control_adapter._os_thread_published``. ``ident``, ``_started``, limbo
+    membership and ``entered`` are read together under the limbo lock: ``ident`` observed
+    before that lock is stale once the new thread has run ``del _limbo[self]``. A missing
+    ``_limbo`` or ``_active_limbo_lock``, or any inspection error, is treated as published.
+    A second read overlapping a live one is worse than leaving this one busy.
     """
-    if getattr(thread, 'ident', None) is not None:
-        return True
-    try:
-        if thread.is_alive():
-            return True
-    except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
-        return True
     lock = getattr(threading, '_active_limbo_lock', None)
     limbo = getattr(threading, '_limbo', None)
     if lock is None or limbo is None:
         return True
     try:
         with lock:
+            if entered is not None and entered.is_set():
+                return True
+            if getattr(thread, 'ident', None) is not None:
+                return True
+            started = getattr(thread, '_started', None)
+            if started is not None and started.is_set():
+                return True
             return thread in limbo
     except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
         return True
@@ -253,6 +254,7 @@ class PluginHost:
         self._busy = False
         self._busy_token = None  # identity of the call that set _busy; a newer read replaces it
         self._stuck = None  # plugin id whose call passed its deadline and has not returned
+        self._stuck_token = None  # the call that set _stuck; a stale worker must not clear a newer mark
         self._operator_deadline_s, self._operator_turn_wait_s = operator_deadline_s, operator_turn_wait_s
         self.degraded = {}  # plugin id -> operator() calls that passed their deadline
         self.health = CoreHealth()
@@ -519,13 +521,12 @@ class PluginHost:
             self._busy = True
             token = object()
             self._busy_token = token
-        outcome, done = {}, threading.Event()
-        entered = {'ok': False}
+        outcome, done, entered = {}, threading.Event(), threading.Event()
 
         def run():
-            with self._turn:
-                # Published under the same lock the caller uses before it will clear _busy.
-                entered['ok'] = True
+            # Before any lock: the start probe reads this under the limbo lock. The caller may
+            # still hold the turn lock, so this must not wait on it.
+            entered.set()
             try:
                 outcome['body'] = json.loads(json.dumps(self._guarded(handler, command)))
             except BaseException as exc:  # noqa: BLE001 - the plugin's failure is reported, never guessed around
@@ -536,8 +537,9 @@ class PluginHost:
                     if self._busy_token is token:
                         self._busy = False
                         self._busy_token = None
-                    if self._stuck == plugin_id:
+                    if self._stuck_token is token:
                         self._stuck = None
+                        self._stuck_token = None
                         log.warning('operator plugin %s returned after its deadline; reads go to it again '
                                     '(it stays marked degraded)', plugin_id)
                     self._turn.notify_all()
@@ -546,12 +548,11 @@ class PluginHost:
         try:
             thread.start()
         except BaseException:
-            # run() clears _busy for this token. Clear it here only when that thread provably
-            # never started and this call still owns the reservation. KeyboardInterrupt from
-            # Thread.start's wait means the call is in flight.
+            # run() clears _busy for this token. Clear it here only when it is provable that
+            # no OS thread exists and this call still owns the reservation. KeyboardInterrupt
+            # from Thread.start's wait means the call is in flight, even after it has left _limbo.
             with self._turn:
-                if (not entered['ok'] and not _os_thread_published(thread)
-                        and self._busy_token is token):
+                if self._busy_token is token and not _os_thread_published(thread, entered):
                     self._busy = False
                     self._busy_token = None
                     self._turn.notify_all()
@@ -562,6 +563,7 @@ class PluginHost:
             if done.is_set():
                 return outcome
             self._stuck = plugin_id
+            self._stuck_token = token
             self.degraded[plugin_id] = self.degraded.get(plugin_id, 0) + 1
             self._turn.notify_all()
         log.error('operator plugin %s did not answer within %.1f s: answered %s; marked degraded, and no new '

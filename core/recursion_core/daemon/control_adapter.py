@@ -198,28 +198,34 @@ class StartRefused(Exception):
         self.code, self.detail = code, detail
 
 
-def _os_thread_published(thread):
-    """True when ``thread``'s OS thread exists, so a failed ``start`` must not drop its work.
+def _os_thread_published(thread, entered=None):
+    """True unless it is provable that ``thread`` has no OS thread.
 
-    CPython creates the OS thread and only then waits on ``_started``. ``ident`` and
-    ``is_alive`` stay unset until that thread is scheduled. ``_limbo`` is filled just
-    before creation and removed when creation fails, so a thread still there has been
-    handed off. A missing ``_limbo`` or ``_active_limbo_lock``, or any inspection error,
-    is treated as published: overlapping a live run is worse than leaving one start busy.
+    ``Thread.start`` puts the thread in ``_limbo``, creates the OS thread, then waits on
+    ``_started``. That thread sets ``ident`` and ``_started`` and only then leaves ``_limbo``.
+    Reading ``ident`` or ``is_alive`` before the limbo lock loses the race: the thread can
+    pass ``del _limbo[self]`` in the gap, and a check that then only looks at ``_limbo``
+    reports that nothing started. ``ident``, ``_started``, limbo membership and the
+    reservation's ``entered`` event (the target's first action) are therefore read together
+    under the lock. Any one of them means the thread exists.
+
+    Roll a reservation back only when this returns false. A missing ``_limbo`` or
+    ``_active_limbo_lock``, or any inspection error, is treated as published: overlapping a
+    live run is worse than leaving one start busy.
     """
-    if getattr(thread, 'ident', None) is not None:
-        return True
-    try:
-        if thread.is_alive():
-            return True
-    except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
-        return True
     lock = getattr(threading, '_active_limbo_lock', None)
     limbo = getattr(threading, '_limbo', None)
     if lock is None or limbo is None:
         return True
     try:
         with lock:
+            if entered is not None and entered.is_set():
+                return True
+            if getattr(thread, 'ident', None) is not None:
+                return True
+            started = getattr(thread, '_started', None)
+            if started is not None and started.is_set():
+                return True
             return thread in limbo
     except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
         return True
@@ -279,18 +285,19 @@ class RouteStarter:
             # _refuse takes the same lock. Raising it from inside this section deadlocks:
             # threading.Lock is not re-entrant, so a live run could never answer start_in_flight.
             raise self._refuse(run_id, 'start_in_flight', '')
+        ctx.entered = threading.Event()
         thread = threading.Thread(target=self._drive, args=(ctx, request), name=f'recursion-run-{run_id}',
                                   daemon=True)
         try:
             thread.start()
         except BaseException:
-            # Roll the run back only when the target never entered and the OS thread was never
-            # created, and only if this start still holds the slot. An exception from
-            # Thread.start's wait means the thread is running; its finally drops _active only
-            # for that same context. Clearing a newer reservation lets a second start overlap.
+            # Roll the run back only when this start still holds the slot and it is provable
+            # that no OS thread exists. KeyboardInterrupt from Thread.start's wait means the
+            # thread is running, even if it has already left _limbo; its finally drops _active
+            # only for this same context. Clearing a newer reservation lets a second start overlap.
             with self._lock:
-                if (not getattr(ctx, 'target_entered', False) and not _os_thread_published(thread)
-                        and self._active.get(run_id) is ctx):
+                if (self._active.get(run_id) is ctx
+                        and not _os_thread_published(thread, ctx.entered)):
                     self._active.pop(run_id, None)
             raise
         if ctx.wait_started(self._start_timeout_s):
@@ -307,9 +314,9 @@ class RouteStarter:
         return StartRefused(code, detail)
 
     def _drive(self, ctx, request):
-        with self._lock:
-            # The starter reads this under the same lock before it will drop the run.
-            ctx.target_entered = True
+        # Before any lock: the start probe reads this under the limbo lock. The caller may
+        # still hold the reservation lock, so this must not wait on it.
+        ctx.entered.set()
         try:
             with bound_run(ctx):
                 try:

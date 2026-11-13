@@ -1,0 +1,13 @@
+{
+  "answer": {
+    "approvals_drawn": 0,
+    "authority_profile": "not configured",
+    "code": "ok",
+    "containment": "none: plugins run in the daemon process and uid",
+    "core_poisoned": null,
+    "plugins": [],
+    "verification": "available"
+  },
+  "method": "plugin.list",
+  "params": {}
+}

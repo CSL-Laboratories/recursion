@@ -1,0 +1,11 @@
+{
+  "answer": {
+    "code": "start_failed",
+    "detail": "prompt"
+  },
+  "method": "run.start",
+  "params": {
+    "engine": "claude_code",
+    "tenant": "t1"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "answer": {
+    "breaker_store": "durable",
+    "code": "ok"
+  },
+  "method": "route.list",
+  "params": {}
+}

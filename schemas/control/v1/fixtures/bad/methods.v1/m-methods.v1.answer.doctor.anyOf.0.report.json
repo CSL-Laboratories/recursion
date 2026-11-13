@@ -1,0 +1,7 @@
+{
+  "method": "doctor",
+  "params": {},
+  "answer": {
+    "code": "ok"
+  }
+}

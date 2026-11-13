@@ -1,0 +1,15 @@
+{
+  "method": "workspace.diff",
+  "params": {
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "turn_id": "turn-000b"
+  },
+  "answer": {
+    "code": "ok",
+    "diff": {
+      "base_ref": "refs/heads/main",
+      "truncated": false,
+      "patch_ref": null
+    }
+  }
+}

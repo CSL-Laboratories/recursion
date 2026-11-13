@@ -1,0 +1,10 @@
+{
+  "method": "approval.answer",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "approval_id": "apr-00c4",
+    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "answer": "deny",
+    "surface": "tui"
+  }
+}

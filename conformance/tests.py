@@ -122,62 +122,45 @@ class PublishedFilesTest(unittest.TestCase):
         if any("event.v1.json" in s.schemas for s in self.sets.values()):
             self.assertEqual(sorted(open_on_purpose - seen), [], "listed as open on purpose but not found: update the list")
 
+    # A rule that is only written down is not proved. The four tests below take every rule of one kind away,
+    # one at a time, and require that a bad fixture notices: with the rule gone, a fixture that names that
+    # keyword at that place is accepted, or is no longer refused for its own rule. So no closed object can
+    # be opened, no required field made optional, and no list of allowed values or fixed value dropped
+    # without a fixture turning red. Rules inside an ``if`` or a ``not`` are conditions and prohibitions,
+    # not rules of these kinds. The method table's own root is proved from the table file (see
+    # ``wire_client.data_file_notices``).
+    _unproved: dict = {}
+
+    def unproved(self, kind):
+        """{folder: [rule, ...]} of the rules of ``kind`` that nothing proves; every folder has such rules."""
+        if not self._unproved:
+            for folder, schemas in self.sets.items():
+                self._unproved[folder] = (client.rules_of(schemas), client.unproved_rules(schemas))
+        found = {}
+        for folder, (rules, unproved) in self._unproved.items():
+            self.assertTrue(any(rule.kind == kind for rule in rules), f"{folder}: no {kind} rule found")
+            found[folder] = [str(rule) for rule in unproved if rule.kind == kind]
+        return found
+
     def test_every_closed_object_is_proved_closed_by_a_fixture(self):
-        """Flip each ``additionalProperties: false`` to true, one at a time: a bad fixture must notice.
-
-        Saying an object is closed is not enough: for every object schema that says so, some bad fixture
-        carries a field nobody defined at that very object, and with that one ``false`` turned to ``true``
-        the fixture stops being refused for its own rule. So no closed object can be opened unnoticed.
-        """
-        for folder, schemas in self.sets.items():
-            sites = {}
-
-            def walk(node, name, path):
-                if isinstance(node, dict):
-                    if node.get("additionalProperties") is False:
-                        sites[id(node)] = (name, path, node)
-                    for key, value in node.items():
-                        walk(value, name, f"{path}/{key}")
-                elif isinstance(node, list):
-                    for i, item in enumerate(node):
-                        walk(item, name, f"{path}/{i}")
-
-            for name, schema in sorted(schemas.schemas.items()):
-                walk(schema, name, "")
-            # Which closed object refuses which bad fixture, found in one pass over the fixtures.
-            refused_by = {}
-            for entry in client.load_index(folder):
-                if not entry["file"].startswith("bad/"):
-                    continue
-                instance = client.read_json(folder / "fixtures" / entry["file"])
-                for error in client.error_objects(schemas.validator(entry["schema"]), instance):
-                    if error.validator == "additionalProperties" and id(error.schema) in sites:
-                        refused_by.setdefault(id(error.schema), []).append(entry)
-            # The method table is a data file, not a fixture: its own bad instance is the table with one
-            # unknown field at the top.
-            table_path = folder / "methods.table.v1.json"
-            spoiled_table = dict(client.read_json(table_path), **{"x-nobody-defined-this": True}) if table_path.is_file() else None
-
-            def table_is_refused():
-                errors = client.leaf_errors(schemas.validator("methods.v1.json"), spoiled_table)
-                return any(keyword == "additionalProperties" and location == "" for keyword, location, _ in errors)
-
-            unproved = []
-            for site, (name, path, node) in sites.items():
-                is_table_root = spoiled_table is not None and (name, path) == ("methods.v1.json", "")
-                if is_table_root:
-                    self.assertTrue(table_is_refused(), "the method table with an unknown field must be refused")
-                node["additionalProperties"] = True
-                try:
-                    noticed = any(client.check_entry(schemas, entry) is not None for entry in refused_by.get(site, ()))
-                    if is_table_root:
-                        noticed = not table_is_refused()
-                finally:
-                    node["additionalProperties"] = False
-                if not noticed:
-                    unproved.append(f"{name}#{path or '/'}")
+        """Turn each ``additionalProperties: false`` to true, one at a time: a bad fixture must notice."""
+        for folder, unproved in self.unproved("additionalProperties").items():
             self.assertEqual(unproved, [], f"{folder}: closed objects that no bad fixture proves closed")
-            self.assertTrue(sites, f"{folder}: no closed object found")
+
+    def test_every_required_field_is_proved_required_by_a_fixture(self):
+        """Drop each name from each ``required`` list, one at a time: a bad fixture must notice."""
+        for folder, unproved in self.unproved("required").items():
+            self.assertEqual(unproved, [], f"{folder}: required fields that no bad fixture proves required")
+
+    def test_every_list_of_allowed_values_is_proved_by_a_fixture(self):
+        """Delete each ``enum``, one at a time: a bad fixture must notice."""
+        for folder, unproved in self.unproved("enum").items():
+            self.assertEqual(unproved, [], f"{folder}: lists of allowed values that no bad fixture proves")
+
+    def test_every_fixed_value_is_proved_by_a_fixture(self):
+        """Delete each ``const``, one at a time: a bad fixture must notice."""
+        for folder, unproved in self.unproved("const").items():
+            self.assertEqual(unproved, [], f"{folder}: fixed values that no bad fixture proves")
 
     def test_index_and_fixture_folders_list_the_same_files(self):
         for folder, schemas in self.sets.items():
@@ -243,11 +226,19 @@ class PublishedFilesTest(unittest.TestCase):
                     self.assertEqual(row["params"], f"#/$defs/params.{name}")
                     self.assertEqual(row["result"], f"#/$defs/answer.{name}")
                     params, answer = defs[f"params.{name}"], defs[f"answer.{name}"]
-                    # Every code the row lists is one the answer schema allows, and the other way round.
+                    # Every code the row lists is one the answer schema allows, and the other way round: the
+                    # codes the method's own answer types, and the bare refusals it may give.
                     refusals = answer["anyOf"][1]["allOf"][1]["properties"]["code"]["enum"]
-                    listed_refusals = [code for code in row["codes"] if code in defs["refusal"]["properties"]["code"]["enum"]]
-                    self.assertEqual(sorted(listed_refusals), sorted(refusals))
-                    self.assertTrue(set(row["codes"]) - set(refusals), "a row lists no success code")
+                    own = answer["anyOf"][0]
+                    if "$ref" in own:
+                        own = schemas.resolve(own["$ref"], base="methods.v1.json")
+                    code = own["properties"]["code"]
+                    typed = code["enum"] if "enum" in code else [code["const"]]
+                    self.assertEqual(sorted(row["codes"]), sorted(typed + refusals))
+                    self.assertLessEqual(set(refusals), set(defs["refusal"]["properties"]["code"]["enum"]))
+                    # A code the method's own answer types is never also a bare refusal: if it were, an
+                    # answer could carry the code and skip every field the typed answer requires.
+                    self.assertEqual(sorted(set(typed) & set(refusals)), [], "a typed code is also a bare refusal")
                     # What the row says about keys and revisions is what the params schema requires.
                     required = set(params.get("required", ()))
                     self.assertEqual("command_id" in required, row["idempotency"] == "command_id")

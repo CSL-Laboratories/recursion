@@ -1,0 +1,16 @@
+{
+  "seq": 32,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:32.184Z",
+  "type": "approval.answered",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "approval_id": "apr-00c4",
+    "answered_by": null,
+    "revision": 3,
+    "state": "expired"
+  }
+}

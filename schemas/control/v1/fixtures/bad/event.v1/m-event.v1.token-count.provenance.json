@@ -1,0 +1,45 @@
+{
+  "seq": 9,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:09.333Z",
+  "type": "usage",
+  "source": "engine",
+  "trust": "untrusted",
+  "payload": {
+    "connection_id": "subscription:personal-max",
+    "model": "claude-sonnet-5-5",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+      "value": 1824,
+      "quality": "known"
+    },
+    "output_tokens": {
+      "value": 356,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "reasoning_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+      "value": 15200,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cache_write_tokens": {
+      "value": 0,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cost_usd": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    }
+  }
+}

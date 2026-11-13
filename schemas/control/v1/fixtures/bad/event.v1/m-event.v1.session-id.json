@@ -1,0 +1,14 @@
+{
+  "seq": 9,
+  "run_id": null,
+  "turn_id": null,
+  "time": "2026-11-13T07:34:16.592Z",
+  "type": "replay.gap",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "from": 3,
+    "to": 9,
+    "reason": "retention"
+  }
+}

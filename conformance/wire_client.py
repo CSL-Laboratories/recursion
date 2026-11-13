@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -135,6 +136,162 @@ def leaf_errors(validator: Draft202012Validator, instance: Any) -> list[tuple[st
     return [(str(error.validator), location_of(error), error.message) for error in error_objects(validator, instance)]
 
 
+SWEPT = ("additionalProperties", "required", "enum", "const")
+DATA_FILES = {"methods.table.v1.json": "methods.v1.json"}  # a data file, and the schema whose root describes it
+
+
+class Rule:
+    """One rule a schema states, which can be taken away to see whether any fixture notices.
+
+    ``additionalProperties: false`` (taken away by setting it to true), one name in a ``required`` list
+    (taken away by dropping that name), an ``enum`` and a ``const`` (taken away by deleting the keyword).
+    """
+
+    def __init__(self, kind: str, file: str, pointer: str, node: dict, name: str | None = None) -> None:
+        self.kind, self.file, self.pointer, self.node, self.name = kind, file, pointer, node, name
+
+    @property
+    def key(self) -> tuple:
+        return (self.kind, id(self.node), self.name)
+
+    def __str__(self) -> str:
+        what = f"required '{self.name}'" if self.kind == "required" else self.kind
+        return f"{self.file}#{self.pointer or '/'}: {what}"
+
+    @contextmanager
+    def taken_away(self) -> Iterator[None]:
+        """The rule is gone from the loaded schema inside the ``with`` block and back afterwards."""
+        saved = self.node[self.kind]
+        if self.kind == "additionalProperties":
+            self.node[self.kind] = True
+        elif self.kind == "required":
+            self.node[self.kind] = [name for name in saved if name != self.name]
+        else:
+            del self.node[self.kind]
+        try:
+            yield
+        finally:
+            self.node[self.kind] = saved
+
+
+def rules_of(schemas: SchemaSet) -> list[Rule]:
+    """Every rule of the four swept kinds, in every schema of the folder.
+
+    The walk follows the schema, not the JSON: a property that happens to be called ``required`` or
+    ``enum`` is a name, not a keyword. What stands inside an ``if`` or a ``not`` is a condition or a
+    prohibition, not a rule of this kind, and is not listed.
+    """
+    found: list[Rule] = []
+
+    def walk(schema, file, pointer):
+        if not isinstance(schema, dict):
+            return
+        if schema.get("additionalProperties") is False:
+            found.append(Rule("additionalProperties", file, pointer, schema))
+        if isinstance(schema.get("required"), list):
+            found.extend(Rule("required", file, pointer, schema, name) for name in schema["required"])
+        if "enum" in schema:
+            found.append(Rule("enum", file, pointer, schema))
+        if "const" in schema:
+            found.append(Rule("const", file, pointer, schema))
+        for key in ("properties", "$defs", "patternProperties", "dependentSchemas"):
+            for name, sub in (schema.get(key) or {}).items():
+                walk(sub, file, f"{pointer}/{key}/{name}")
+        for key in ("items", "additionalProperties", "propertyNames", "contains", "then", "else"):
+            walk(schema.get(key), file, f"{pointer}/{key}")
+        for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+            for i, sub in enumerate(schema.get(key) or ()):
+                walk(sub, file, f"{pointer}/{key}/{i}")
+
+    for file, schema in sorted(schemas.schemas.items()):
+        walk(schema, file, "")
+    return found
+
+
+def rules_broken_by(schemas: SchemaSet, ref: str, instance: Any, rules: dict) -> list[tuple]:
+    """Which of ``rules`` (by key) refuse ``instance``, each with the place in the instance where it does."""
+    broken = []
+    for error in error_objects(schemas.validator(ref), instance):
+        kind = str(error.validator)
+        if kind not in SWEPT:
+            continue
+        names = [None]
+        if kind == "required" and isinstance(error.instance, dict):
+            names = [name for name in error.validator_value if name not in error.instance]
+        for name in names:
+            key = (kind, id(error.schema), name)
+            if key in rules:
+                broken.append((key, location_of(error)))
+    return broken
+
+
+def proofs_of(schemas: SchemaSet, rules: list[Rule]) -> dict:
+    """For each rule (by key), the bad fixtures it refuses with the very error the fixture names.
+
+    A bad fixture names one keyword at one place. It can only prove a rule that is the one refusing it
+    there: a rule that also happens to refuse it somewhere else is not what the fixture is about.
+    """
+    by_key = {rule.key: rule for rule in rules}
+    found: dict = {}
+    for entry in load_index(schemas.folder):
+        if not entry["file"].startswith("bad/") or entry["expect"]["keyword"] not in SWEPT:
+            continue
+        instance = read_json(schemas.folder / "fixtures" / entry["file"])
+        for key, location in rules_broken_by(schemas, entry["schema"], instance, by_key):
+            if key[0] == entry["expect"]["keyword"] and location == entry["expect"]["at"]:
+                proofs = found.setdefault(key, [])
+                if not any(entry is listed for listed, _ in proofs):
+                    proofs.append((entry, instance))
+    return found
+
+
+def data_file_notices(schemas: SchemaSet, rule: Rule) -> bool:
+    """Whether a data file of the folder proves a rule at the root of the schema that describes it.
+
+    The method table is data, not a fixture, and nothing else is an instance of its schema's root. Its
+    bad instance is the table itself with one change: a field nobody defined added, or a required field
+    gone. Taking the rule away must make that changed table stop being refused for it.
+    """
+    for data_name, schema_name in DATA_FILES.items():
+        path = schemas.folder / data_name
+        if rule.file != schema_name or rule.pointer or not path.is_file():
+            continue
+        spoiled = read_json(path)
+        if rule.kind == "additionalProperties":
+            spoiled["x-nobody-defined-this"] = True
+        elif rule.kind == "required" and rule.name in spoiled:
+            del spoiled[rule.name]
+        else:
+            continue
+
+        def refused() -> bool:
+            errors = leaf_errors(schemas.validator(schema_name), spoiled)
+            return any(keyword == rule.kind and location == "" for keyword, location, _ in errors)
+
+        if refused():
+            with rule.taken_away():
+                if not refused():
+                    return True
+    return False
+
+
+def unproved_rules(schemas: SchemaSet) -> list[Rule]:
+    """The rules that can be taken away, one at a time, without any bad fixture noticing.
+
+    A fixture notices when, with the rule gone, it is accepted or is no longer refused for its own rule.
+    """
+    rules = rules_of(schemas)
+    proofs = proofs_of(schemas, rules)
+    unproved = []
+    for rule in rules:
+        with rule.taken_away():
+            noticed = any(check_instance(schemas, entry, instance) is not None
+                          for entry, instance in proofs.get(rule.key, ()))
+        if not noticed and not data_file_notices(schemas, rule):
+            unproved.append(rule)
+    return unproved
+
+
 def load_index(folder: Path) -> list[dict]:
     index = read_json(folder / "fixtures" / "index.json")
     entries = index.get("fixtures") if isinstance(index, dict) else None
@@ -164,7 +321,11 @@ def fixture_files(folder: Path) -> set[str]:
 
 def check_entry(schemas: SchemaSet, entry: dict) -> str | None:
     """None when the fixture behaves as the index says, else what went wrong."""
-    instance = read_json(schemas.folder / "fixtures" / entry["file"])
+    return check_instance(schemas, entry, read_json(schemas.folder / "fixtures" / entry["file"]))
+
+
+def check_instance(schemas: SchemaSet, entry: dict, instance: Any) -> str | None:
+    """``check_entry`` for a fixture that is already read."""
     errors = leaf_errors(schemas.validator(entry["schema"]), instance)
     if entry["file"].startswith("good/"):
         if errors:

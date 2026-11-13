@@ -1,0 +1,13 @@
+{
+  "engine": "pi",
+  "flags": {
+    "multi_turn": false,
+    "mid_turn_input": false,
+    "interrupt": false,
+    "resume": false,
+    "fork": false,
+    "permission_bridge": false,
+    "typed_limits": false,
+    "usage": false
+  }
+}

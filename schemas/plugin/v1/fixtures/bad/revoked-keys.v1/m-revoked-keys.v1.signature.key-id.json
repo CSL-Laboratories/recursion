@@ -1,0 +1,11 @@
+{
+  "schema": "csl-revoked-keys/1",
+  "list_version": 1,
+  "issued_at": "2026-11-13T08:00:00.000Z",
+  "expires_at": "2026-11-20T08:00:00.000Z",
+  "keys": [],
+  "signature": {
+    "alg": "ed25519",
+    "value": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+  }
+}

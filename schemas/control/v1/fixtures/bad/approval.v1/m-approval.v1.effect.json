@@ -1,0 +1,28 @@
+{
+  "approval_id": "apr-00c5",
+  "session_id": null,
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": null,
+  "source": "plugin_effect",
+  "digest_form": "csl-cj/v0",
+  "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "display": [],
+  "rendered": [
+    {
+      "text": "APPROVAL NEEDED",
+      "trust": "trusted"
+    },
+    {
+      "text": "Plugin paper-desk asks to carry out order.place for USD 1250.00 on paper-main (paper)",
+      "trust": "trusted"
+    }
+  ],
+  "requested_at": "2026-11-13T07:34:30.000Z",
+  "expires_at": "2026-11-13T07:49:30.000Z",
+  "state": "pending",
+  "opened_by": [],
+  "answered_by": null,
+  "answer": null,
+  "answered_at": null,
+  "revision": 1
+}

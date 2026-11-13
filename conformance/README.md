@@ -20,12 +20,19 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
 - every `$ref` written in a schema resolves;
 - every object is closed (`additionalProperties` is `false`, or a schema for a map's values), except
   the few that are open on purpose, which are listed by name;
-- every closed object is proved closed: each `additionalProperties: false` is flipped to `true`, one at
-  a time, and a bad fixture must notice. The fixtures named `u-*` exist for this: each is a good
-  fixture with one field nobody defined added at exactly one object;
+- every rule of four kinds is proved by a fixture: each `additionalProperties: false`, each name in a
+  `required` list, each `enum` and each `const` is taken away, one at a time, and a bad fixture must
+  notice (one that names that keyword at that place, and that is accepted, or refused for another
+  reason, once the rule is gone). So no object can be opened, no required field made optional, and no
+  list of allowed values or fixed value dropped without a fixture turning red. Rules inside an `if` or
+  a `not` are conditions and prohibitions and are not counted. The generated fixtures exist for this:
+  each is a good fixture with one change (`u-*` a field nobody defined added, `m-*` a required field
+  removed, `v-*` a value replaced by one outside the list, `f-*` a fixed value replaced). The root of
+  the method table's schema is proved from the table file itself, changed the same way;
 - the method table validates against its schema, and for every method the row, the params schema and
   the answer schema agree (the same codes, a `command_id` exactly where the row says, no `principal` or
-  `owner` among the params), and only `run.stop` mutates without a key;
+  `owner` among the params), no code is both typed by a method's own answer and allowed as its bare
+  refusal, and only `run.stop` mutates without a key;
 - `fixtures/index.json` and the fixture folders list exactly the same files;
 - every file under `fixtures/good/` validates;
 - every file under `fixtures/bad/` is refused **for its own rule**: the index names the schema keyword
@@ -53,6 +60,10 @@ in another language checks the verdict (accepted or refused) and may report the 
 Put the record under `fixtures/good/<schema file without .json>/` or `fixtures/bad/...`, add its line
 to `fixtures/index.json`, and run the two commands above. A consumer lane sends its fixtures to lane
 SPINE, which adds them here.
+
+A schema change that adds a closed object, a required field, an `enum` or a `const` needs a bad
+fixture that breaks exactly that rule: the test names every rule that has none. Take a good fixture
+that reaches the rule, make the one change, and list it with the keyword and the place.
 
 ## Why the test file is named `tests.py`
 

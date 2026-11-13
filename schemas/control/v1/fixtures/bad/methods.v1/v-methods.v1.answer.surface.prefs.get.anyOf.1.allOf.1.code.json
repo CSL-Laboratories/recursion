@@ -1,0 +1,15 @@
+{
+  "method": "surface.prefs.get",
+  "params": {
+    "surface": "page"
+  },
+  "answer": {
+    "code": "method_unknown",
+    "prefs": {
+      "surface": "page",
+      "layout": null,
+      "theme": "dusk",
+      "revision": 4
+    }
+  }
+}

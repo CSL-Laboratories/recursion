@@ -1,0 +1,14 @@
+{
+  "seq": 20,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:20.740Z",
+  "type": "steer.delivered",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "item_id": "qi-0002",
+    "delivery_id": "dlv-0008"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "method": "events.follow",
+  "params": {
+    "after": 0,
+    "projection": "transcript",
+    "wait_ms": 20000
+  }
+}

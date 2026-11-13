@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "methods.v1.json",
   "title": "methods.v1: the method table of the control API",
-  "x-version": "1.0-draft.2",
+  "x-version": "1.0-draft.3",
   "description": "The method table of the control API, version 1: one row for every method, kept as data (methods.table.v1.json beside this file validates against this schema's root), and for every method the schema of its params and of everything it can answer. A request is {method, params}; a recorded request with its answer is an exchange ($defs/exchange). RULES, frozen with the table. (1) Unknown and unbuilt. A name that is not in the table is answered 'method_unknown'. A name that is in the table and has no handler in the running daemon is answered 'unsupported' with detail 'not_implemented'; methods.list says which are implemented now. (2) Idempotency. Every mutating method except run.start and run.stop takes a command_id. There is one identity domain: (tenant, method, command_id), kept durably across restarts, with no part that changes at a restart. run.start keeps client_key, which is its command id, under that name on every surface. run.stop takes neither a key nor a revision: an emergency Stop never needs fresh state. A client that is a model does not mint unique ids, so on a surface a model drives the server mints the id and hands it to the caller. (3) Order of checks. The caller is authorized first. Then the receipt is looked up: the same id with the same payload digest returns the first answer, even if the revision it named is stale by now; the same id with another digest is 'conflict' (detail command_id_reused). Only then is expected_revision or expected_turn_id checked: stale is 'conflict' (detail stale_revision or stale_turn). A live turn is 'busy'. A missing driver flag is 'unsupported', before any side effect. The payload digest is over the method and its params without the command_id. (4) Who may Stop. PROVISIONAL, the owner's decision. run.stop needs a currently held 'run' scope. An owner or a device holding 'run' may stop any run, including one whose record names no principal (every run from before version 1): no run is stranded. A session principal may stop only runs of its own session and of the sessions it started. A caller without 'run' cannot stop. The daemon's own recovery Stop is not a client's call and no authorizer applies to it. (5) Approvals. approval.list returns summaries and shows nothing. approval.open records that a surface displayed the prompt. approval.answer without an open record for the current revision is refused 'prompt_not_shown'. Neither is ever offered as an MCP tool. (6) Params are closed for a caller: a conforming client sends only what is listed. Today's daemon ignores a key it does not know on run.start; it never stores one. A principal, an owner, a budget's reservation and a session's identity are never taken from params.",
   "type": "object",
   "additionalProperties": false,
@@ -68,13 +68,14 @@
       ]
     },
     "code": {
-      "description": "Every code an answer can carry. The first five are not refusals.",
+      "description": "Every code an answer can carry. The first five are not refusals. 'start_unconfirmed' is run.start's own answer and no other method's. The rest are refusals; 'start_failed' is a refusal when a session method gives it, and run.start's own typed answer, with the run id, when run.start does.",
       "enum": [
         "started",
         "ok",
         "stopped",
         "pending",
         "ended",
+        "start_unconfirmed",
         "request_invalid",
         "method_unknown",
         "registry_unavailable",
@@ -90,7 +91,6 @@
         "approval_unknown",
         "plugin_unknown",
         "start_failed",
-        "start_unconfirmed",
         "workspace_invalid",
         "workspace_busy",
         "delegation_limit",
@@ -446,7 +446,6 @@
             "approval_unknown",
             "plugin_unknown",
             "start_failed",
-            "start_unconfirmed",
             "workspace_invalid",
             "workspace_busy",
             "delegation_limit",
@@ -1142,8 +1141,6 @@
               "properties": {
                 "code": {
                   "enum": [
-                    "start_failed",
-                    "start_unconfirmed",
                     "request_invalid",
                     "registry_unavailable",
                     "scope_refused",
@@ -5485,7 +5482,7 @@
       ]
     },
     "refused_exchange": {
-      "description": "A request the table calls malformed (a required param is missing, or a value is out of range), with the answer the daemon gave. The params are not checked here; the answer is the method's.",
+      "description": "A request the table calls malformed (a required param is missing, or a value is out of range), with the answer the daemon gave. The params are not checked here; the answer is the method's, and its code is request_invalid (every answer of every method carries a code, so the method's own answer schema is what requires it).",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -5502,9 +5499,6 @@
         },
         "answer": {
           "type": "object",
-          "required": [
-            "code"
-          ],
           "properties": {
             "code": {
               "const": "request_invalid"

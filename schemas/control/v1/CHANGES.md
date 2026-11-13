@@ -24,8 +24,48 @@ Nothing is frozen yet.
 | `driver.v2.json` | 1.0-draft.2 |
 | `mcp.task.v1.json` | 1.0-draft.2 |
 | `transcript.line.v1.json` | 1.0-draft.2 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.2 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.3 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## Fixtures that prove every required field, list of values and fixed value (Nov 13, 2026)
+
+The closed-object check of the next section is now one of four. Each `additionalProperties: false`,
+each name in a `required` list, each `enum` and each `const` is taken away, one at a time, and a bad
+fixture must notice: a fixture that names that keyword at that place, and that is accepted, or refused
+for some other reason, once the rule is gone. What stands inside an `if` or a `not` is a condition or a
+prohibition, not a rule of these kinds, and is not counted. In the two folders together:
+
+| Kind of rule | Rules | Proved by a fixture before | Proved now |
+|---|---|---|---|
+| Closed object (`additionalProperties: false`) | 210 | 210 | 210 |
+| Required field (one name in a `required` list) | 719 | 29 of 720 | 719 |
+| List of allowed values (`enum`) | 160 | 33 | 160 |
+| Fixed value (`const`) | 116 | 24 | 116 |
+
+For it there are now 1,085 generated bad fixtures (182 before). Each is a good fixture with one change,
+and its name says which: `u-` a field nobody defined added, `m-` a required field removed, `v-` a
+value replaced by one outside the list, `f-` a fixed value replaced. 11 good fixtures and 4 bad ones
+were written by hand so that every rule is reached: an approval answered with an approval, an
+interrupted turn, a launch snapshot with a key helper, a queue update of the delivery alone, refusals
+of `run.start`, `session.interrupt` and `session.stop`, the rows of `run.start` and `run.status`, a
+start error whose detail carries colons, and a plugin's run in a worktree.
+
+### `methods.v1.json` is `1.0-draft.3`: the sweep found a hole, and it is closed
+
+`start_failed` and `start_unconfirmed` are `run.start`'s own answers, typed by `run_start_answer`: a
+failed start names the run id and says why, and an unconfirmed start names the run. Both codes were
+also in `run.start`'s list of bare refusals, so an answer of `{"code": "start_unconfirmed"}` that names
+no run was accepted, and so was a bare `{"code": "start_failed"}`.
+
+| Change | What it breaks |
+|---|---|
+| `start_failed` and `start_unconfirmed` are no longer bare refusals of `run.start`; they are only its typed answers | An answer to `run.start` that carries one of the two codes without the run id (or the run). The daemon gives no such answer (`control/api.py`, lines 268 to 310: every one names the run), and its captured answers validate unchanged |
+| `start_unconfirmed` is no longer in the refusal codes at all: no other method gives it | A refusal of any other method with that code |
+| The table check refuses a code that is both typed by a method's own answer and listed as its bare refusal | Nothing published; it keeps the hole from coming back |
+| `refused_exchange.answer` no longer says `required: ["code"]` | Nothing: every method's own answer requires a code, and the rule was stated twice |
+
+The row of `run.start` lists the same codes as before. A start error's `code` stays a plain word and
+its `detail` stays free text (it may carry colons); a fixture now holds each of the two.
 
 ## Fixtures that prove every closed object closed (Nov 13, 2026)
 
@@ -44,7 +84,7 @@ every schema and not only that one:
   run with a member, a run view with a typed limit, and a few definitions on their own).
 
 One schema changed with it, and only in a definition used to check fixtures: in `methods.v1.json`
-(now `1.0-draft.2`), the answer of a `refused_exchange` is typed by its method's rule alone, so that
+(`1.0-draft.2` with that change), the answer of a `refused_exchange` is typed by its method's rule alone, so that
 no object is closed twice over the same value. Nothing a lane builds against moved.
 
 ## 1.0-draft.2 (Nov 13, 2026)

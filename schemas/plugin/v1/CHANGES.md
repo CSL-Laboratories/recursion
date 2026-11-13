@@ -4,6 +4,15 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## Fixtures that prove every rule (Nov 13, 2026)
+
+No schema changed. Each `additionalProperties: false`, each name in a `required` list, each `enum` and
+each `const` is now taken away, one at a time, and a bad fixture must notice (see
+`conformance/README.md`). In this folder: 17 closed objects (17 proved before), 54 required fields (6
+before), 6 lists of allowed values (3 before) and 8 fixed values (4 before); all 85 are proved now, by
+68 generated fixtures (`u-*`, `m-*`, `v-*`, `f-*`: a good fixture with one change) and one more good
+fixture written by hand (a run in a worktree).
+
 ## 1.0-draft.1 (Nov 13, 2026)
 
 First drafts. Nothing is frozen.

@@ -1,0 +1,29 @@
+{
+  "scope": "read",
+  "mutating": false,
+  "idempotency": "none",
+  "precondition": "none",
+  "requires": [],
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_run_status",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  "beta": false,
+  "codes": [
+    "ok",
+    "run_unknown",
+    "request_invalid",
+    "registry_unavailable",
+    "scope_refused"
+  ],
+  "lane": "CONTROL",
+  "params": "#/$defs/params.run.status",
+  "result": "#/$defs/answer.run.status"
+}

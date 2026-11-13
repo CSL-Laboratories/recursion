@@ -1,0 +1,25 @@
+{
+  "cgroup": "/test.slice/recursion-run-run-7af87d8421244ecdbc20ef7a4b9a7e44.service",
+  "cgroup_marker": "cg-0b5633272fcc41c5bfd9498c1c1e7858",
+  "engine": "claude_code",
+  "generation": 2,
+  "members": [],
+  "observed": {
+    "detail": "",
+    "state": "terminated",
+    "stop_requested": false,
+    "unit": "recursion-run-run-7af87d8421244ecdbc20ef7a4b9a7e44.service"
+  },
+  "recorded_state": "running",
+  "result": {
+    "code": null,
+    "detail": ""
+  },
+  "run_id": "run-7af87d8421244ecdbc20ef7a4b9a7e44",
+  "start_key": null,
+  "started_at": 1794559510.762937,
+  "state": "ended",
+  "stop": null,
+  "stop_attestation": null,
+  "tenant": "t1"
+}

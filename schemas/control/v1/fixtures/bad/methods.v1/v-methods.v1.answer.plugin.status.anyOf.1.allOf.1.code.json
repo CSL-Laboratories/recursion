@@ -1,0 +1,36 @@
+{
+  "method": "plugin.status",
+  "params": {
+    "plugin_id": "notes.search"
+  },
+  "answer": {
+    "code": "method_unknown",
+    "plugin": {
+      "source": "/home/dev/.config/recursion/plugins/notes-search",
+      "plugin_id": "notes.search",
+      "state": "loaded",
+      "code": null,
+      "detail": "",
+      "trust": "signed",
+      "signer_key_id": "ed25519:5f1d3e2a9b8c7d6e5f4a3b2c1d0e9f8a",
+      "registry_label": null,
+      "permissions": [
+        "read",
+        "panel"
+      ],
+      "artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "provides": [
+        "panels"
+      ],
+      "containment": "in process, same uid: not contained",
+      "findings": [
+        {
+          "stage": "verify",
+          "code": "manifest_ok",
+          "severity": "info",
+          "detail": "notes.search"
+        }
+      ]
+    }
+  }
+}

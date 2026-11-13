@@ -1,0 +1,7 @@
+{
+  "method": "queue.cancel",
+  "params": {
+    "item_id": "qi-0002",
+    "expected_revision": 2
+  }
+}

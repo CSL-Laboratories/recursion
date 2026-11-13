@@ -1,0 +1,12 @@
+{
+  "schema": "x-nobody-defined-this",
+  "list_version": 1,
+  "issued_at": "2026-11-13T08:00:00.000Z",
+  "expires_at": "2026-11-20T08:00:00.000Z",
+  "keys": [],
+  "signature": {
+    "key_id": "ed25519:0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "alg": "ed25519",
+    "value": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "item_id": "qi-0002",
+  "order": 2,
+  "text": "Stop refactoring; only fix the failing test.",
+  "revision": 3,
+  "delivery": "steer",
+  "state": "queued",
+  "delivery_id": null,
+  "turn_id": null,
+  "created_at": "2026-11-13T07:34:20.000Z"
+}

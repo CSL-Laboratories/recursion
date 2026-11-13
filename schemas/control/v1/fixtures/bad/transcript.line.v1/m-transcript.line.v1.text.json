@@ -1,0 +1,10 @@
+{
+  "seq": 10,
+  "time_rel_ms": 12400,
+  "event_type": "usage",
+  "source": "engine",
+  "trust": "untrusted",
+  "state": null,
+  "speech": null,
+  "focus": null
+}

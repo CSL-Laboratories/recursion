@@ -1,0 +1,17 @@
+{
+  "method": "workspace.publish",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "remote": "origin",
+    "draft_pr": false
+  },
+  "answer": {
+    "code": "method_unknown",
+    "published": {
+      "remote": "origin",
+      "branch": "recursion/review/ses-7f3a9c2e51d04b6a",
+      "pr_url": null
+    }
+  }
+}

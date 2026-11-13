@@ -1,0 +1,11 @@
+{
+  "name": "reindex",
+  "arguments": [
+    {
+      "name": "folder",
+      "required": false,
+      "summary": "Only this folder."
+    }
+  ],
+  "permission": "command"
+}

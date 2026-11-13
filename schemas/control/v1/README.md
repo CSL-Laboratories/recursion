@@ -37,9 +37,11 @@ them (see "Checking the fixtures").
 `fixtures/good/<schema>/` holds records that must validate; `fixtures/bad/<schema>/` holds records
 that must be refused. `fixtures/index.json` lists every one and says what it shows, or which rule it
 breaks and which schema keyword refuses it. Files named `c*` were captured from the daemon's own
-answers by `fixtures/capture_today.py`; files named `h*`, `r*` and `b*` were written by hand; files
-named `u-*` are a good fixture with one field nobody defined added at one object, one for every closed
-object, so that none can be opened unnoticed.
+answers by `fixtures/capture_today.py`; files named `h*`, `r*` and `b*` were written by hand. Files
+named `u-*`, `m-*`, `v-*` and `f-*` were generated: each is a good fixture with one change (a field
+nobody defined added, a required field removed, a value replaced by one outside its list, a fixed
+value replaced), one for every closed object, required field, list of allowed values and fixed value,
+so that none of them can be taken away unnoticed.
 
 ## Storage records and public records are different records
 

@@ -18,6 +18,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 from urllib.parse import urlencode
 
 from recursion_core.daemon import control_adapter as adapter
@@ -162,25 +163,20 @@ class Adv2HungPluginTests(GuiCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             status, body = host.operator({'command': READ})
         self.assertEqual((status, body), (504, {'error': plugins.OPERATOR_TIMED_OUT}))
-        # A read that waited for the turn (or made a new call) would take the 30 s turn wait; a stuck
-        # plugin is answered without it. The wide bound tells that apart whatever the machine is doing.
+        # A read into a stuck plugin answers 504 and makes no new call, without waiting for the turn and
+        # without starting a thread. Three checks hold it to that. A pause of the process at one read
+        # fails none of them, short of a pause of ten seconds at the first.
+        # 1. With the turn wait at 30 s, the first such read is answered in under 10 s: it did not wait
+        #    out the turn.
         host._operator_turn_wait_s = 30.0
         started = time.monotonic()
         status, body = host.operator({'command': READ})
         first = time.monotonic() - started
         self.assertLess(first, 10.0, 'a read into a stuck plugin waited for the turn')
-        # The bound this first read had before the wide one, kept beside it: the first read into a stuck
-        # plugin is itself answered at once, so a delay that only the first such read meets is noticed. It
-        # is one read against the clock. A machine that stalls for a fifth of a second at this point fails
-        # it with nothing wrong in the host.
-        self.assertLess(first, 0.2, 'a read into a stuck plugin is answered at once')
         self.assertEqual(status, 504)
         self.assertIn('no new call was made', body['error'])
-        # The fast path again: while the plugin is stuck a read waits for nothing and calls nothing, so it
-        # answers 504 at once. One slow answer can be the machine, so the read is made five more times and
-        # only the fastest is held to the bound. What this guarantees: the stuck path can answer in under a
-        # fifth of a second. A delay built into that path (a sleep, a wait) slows every one of the five and
-        # fails here. A busy machine fails it only by slowing all five, which is unlikely, not impossible.
+        # 2. Of five more reads the fastest takes under a fifth of a second. A delay built into the stuck
+        #    path (a sleep, a wait) slows every one of the five and fails here; one slow read does not.
         fastest = None
         for _ in range(5):
             started = time.monotonic()
@@ -190,6 +186,19 @@ class Adv2HungPluginTests(GuiCase):
             self.assertIn('no new call was made', body['error'])
             fastest = took if fastest is None else min(fastest, took)
         self.assertLess(fastest, 0.2, 'the fastest of five reads into a stuck plugin was not answered at once')
+        # 3. Six more reads with the two operations themselves forbidden: a stuck read that waits for the
+        #    turn or launches a thread fails here, whatever the clock says.
+        with mock.patch.object(host._turn, 'wait_for',
+                               side_effect=AssertionError('a stuck read waited for the turn')), \
+                mock.patch.object(threading.Thread, 'start',
+                                  side_effect=AssertionError('a stuck read launched a new thread')):
+            for _ in range(6):
+                status, body = host.operator({'command': READ})
+                self.assertEqual(status, 504)
+                self.assertIn('no new call was made', body['error'])
+        # Not caught any more: a delay of under 10 s that only the first stuck read meets and that is
+        # neither a turn wait nor a new thread. The 0.2 s bound on that one read did catch it. It also
+        # failed, with nothing wrong in the host, when the process was paused for 0.3 s at that read.
         self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')
         self.assertIn('a call has still not returned', host.inventory()['plugins'][0]['degraded'])
         self.assertIn('degraded', host.route_records()[0]['blocker'])

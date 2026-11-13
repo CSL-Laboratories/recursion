@@ -795,13 +795,6 @@ class _ObjectStore:
         if hashlib.sha1(header + content).digest() != oid:
             raise _ObjectMissing(f"object {oid.hex()} does not match its bytes")
 
-    def _find_pack(self, oid: bytes) -> tuple[_PackIndex, int] | None:
-        for pack in self.packs:
-            offset = pack.offset(oid)
-            if offset is not None:
-                return pack, offset
-        return None
-
     def _loose(self, oid: bytes) -> tuple[bytes, bytes] | None:
         """Return a valid loose object.
 
@@ -824,52 +817,144 @@ class _ObjectStore:
         """Resolve one pack object, following deltas iteratively.
 
         Visited pack offsets stop a self-delta or a loop without walking the
-        depth cap. The cap is git's ``pack.depth`` maximum.
+        depth cap. The cap is git's ``pack.depth`` maximum. A REF base uses the
+        same rule as ``get``: the loose object, then each pack copy, keeping the
+        first copy whose bytes hash to that oid. A copy that does not hash is
+        skipped and is not cached.
         """
-        deltas: list[bytes] = []
         seen: set[tuple[int, int]] = set()
-        depth = 0
-        current_pack = pack
-        current_offset = offset
-        typ = b""
-        content = b""
+        trail: list[tuple[int, int]] = []
+
+        def undo(to: int) -> None:
+            while len(trail) > to:
+                seen.remove(trail.pop())
+
+        def fail(exc: _ObjectMissing) -> None:
+            undo(frames[-1]["trail_at"])
+            if len(frames) == 1:
+                raise exc
+            frames[-2]["error"] = exc
+            frames.pop()
+
+        frames: list[dict] = [
+            {
+                "pack": pack,
+                "offset": offset,
+                "depth": 0,
+                "deltas": [],
+                "typ": b"",
+                "content": b"",
+                "mode": "walk",
+                "base_oid": b"",
+                "cursor": 0,
+                "error": None,
+                "trail_at": 0,
+                "expect": None,
+            }
+        ]
         while True:
-            if depth > _MAX_DELTA_DEPTH:
-                raise _ObjectMissing("delta chain is too deep")
-            marker = (id(current_pack), current_offset)
-            if marker in seen:
-                raise _ObjectMissing("delta chain is too deep")
-            seen.add(marker)
-            obj_type, payload, extra = _pack_object_at(current_pack.pack, current_offset)
-            if obj_type in _OBJ_TYPE:
-                typ = _OBJ_TYPE[obj_type]
-                content = payload
-                break
-            deltas.append(payload)
-            depth += 1
-            if obj_type == 6:
-                if not isinstance(extra, int):
-                    raise _ObjectMissing("ofs-delta base is invalid")
-                base_marker = (id(current_pack), extra)
-                if base_marker in seen:
-                    raise _ObjectMissing("delta chain is too deep")
-                if extra < 12 or extra >= current_offset or extra >= len(current_pack.pack) - 20:
-                    raise _ObjectMissing("ofs-delta base is invalid")
-                current_offset = extra
+            frame = frames[-1]
+            if frame["mode"] == "walk":
+                try:
+                    if frame["depth"] > _MAX_DELTA_DEPTH:
+                        raise _ObjectMissing("delta chain is too deep")
+                    marker = (id(frame["pack"]), frame["offset"])
+                    if marker in seen:
+                        raise _ObjectMissing("delta chain is too deep")
+                    seen.add(marker)
+                    trail.append(marker)
+                    obj_type, payload, extra = _pack_object_at(frame["pack"].pack, frame["offset"])
+                    if obj_type in _OBJ_TYPE:
+                        frame["typ"] = _OBJ_TYPE[obj_type]
+                        frame["content"] = payload
+                        frame["mode"] = "apply"
+                        continue
+                    frame["deltas"].append(payload)
+                    frame["depth"] += 1
+                    if obj_type == 6:
+                        if not isinstance(extra, int):
+                            raise _ObjectMissing("ofs-delta base is invalid")
+                        base_marker = (id(frame["pack"]), extra)
+                        if base_marker in seen:
+                            raise _ObjectMissing("delta chain is too deep")
+                        if extra < 12 or extra >= frame["offset"] or extra >= len(frame["pack"].pack) - 20:
+                            raise _ObjectMissing("ofs-delta base is invalid")
+                        frame["offset"] = extra
+                        continue
+                    if not isinstance(extra, bytes) or len(extra) != 20:
+                        raise _ObjectMissing("ref-delta oid is truncated")
+                    base = self._cached_or_loose(extra)
+                    if base is not None:
+                        frame["typ"], frame["content"] = base
+                        frame["mode"] = "apply"
+                        continue
+                    frame["base_oid"] = extra
+                    frame["cursor"] = 0
+                    frame["error"] = None
+                    frame["mode"] = "search"
+                except _ObjectMissing as exc:
+                    fail(exc)
                 continue
-            if not isinstance(extra, bytes) or len(extra) != 20:
-                raise _ObjectMissing("ref-delta oid is truncated")
-            base = self._cached_or_loose(extra)
-            if base is not None:
-                typ, content = base
-                break
-            found = self._find_pack(extra)
-            if found is None:
-                raise _ObjectMissing(extra.hex())
-            current_pack, current_offset = found
-        for delta in reversed(deltas):
-            content = _apply_delta(content, delta)
-        return typ, content
+            if frame["mode"] == "search":
+                # The base object itself is one more step. Past the cap, every
+                # copy is too deep, so do not scan the rest of the packs.
+                if frame["depth"] > _MAX_DELTA_DEPTH:
+                    fail(_ObjectMissing("delta chain is too deep"))
+                    continue
+                pushed = False
+                while frame["cursor"] < len(self.packs):
+                    cand = self.packs[frame["cursor"]]
+                    frame["cursor"] += 1
+                    off = cand.offset(frame["base_oid"])
+                    if off is None:
+                        continue
+                    if (id(cand), off) in seen:
+                        frame["error"] = _ObjectMissing("delta chain is too deep")
+                        continue
+                    frames.append(
+                        {
+                            "pack": cand,
+                            "offset": off,
+                            "depth": frame["depth"],
+                            "deltas": [],
+                            "typ": b"",
+                            "content": b"",
+                            "mode": "walk",
+                            "base_oid": b"",
+                            "cursor": 0,
+                            "error": None,
+                            "trail_at": len(trail),
+                            "expect": frame["base_oid"],
+                        }
+                    )
+                    pushed = True
+                    break
+                if pushed:
+                    continue
+                exc = frame["error"]
+                if exc is None:
+                    exc = _ObjectMissing(frame["base_oid"].hex())
+                fail(exc)
+                continue
+            content = frame["content"]
+            try:
+                for delta in reversed(frame["deltas"]):
+                    content = _apply_delta(content, delta)
+                expect = frame["expect"]
+                if expect is not None:
+                    self._verify(expect, frame["typ"], content)
+                    self.cache[expect] = (frame["typ"], content)
+            except _ObjectMissing as exc:
+                fail(exc)
+                continue
+            undo(frame["trail_at"])
+            if len(frames) == 1:
+                return frame["typ"], content
+            parent = frames[-2]
+            parent["typ"] = frame["typ"]
+            parent["content"] = content
+            parent["mode"] = "apply"
+            frames.pop()
 
     def _cached_or_loose(self, oid: bytes) -> tuple[bytes, bytes] | None:
         cached = self.cache.get(oid)

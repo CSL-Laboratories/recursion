@@ -985,6 +985,35 @@ def _single_blob_pack(content: bytes) -> bytes:
     return body + hashlib.sha1(body).digest()
 
 
+def _content_oid(content: bytes) -> bytes:
+    header = b"blob " + str(len(content)).encode("ascii") + b"\0"
+    return hashlib.sha1(header + content).digest()
+
+
+def _append_delta(base: bytes, suffix: bytes) -> bytes:
+    """Copy `base` and insert `suffix`. The result is base + suffix."""
+    if len(base) > 255 or len(suffix) > 127:
+        raise AssertionError("test append delta is limited to a short base and suffix")
+    body = _encode_size(len(base)) + _encode_size(len(base) + len(suffix))
+    if base:
+        body += bytes([0x90, len(base)])
+    if suffix:
+        body += bytes([len(suffix)]) + suffix
+    return body
+
+
+def _ref_append_pack(base: bytes, suffix: bytes) -> tuple[bytes, bytes, bytes]:
+    """Undeltified base plus a type-7 REF delta that appends `suffix`."""
+    delta = _append_delta(base, suffix)
+    base_oid = _content_oid(base)
+    delta_oid = _content_oid(base + suffix)
+    buf = bytearray(b"PACK" + (2).to_bytes(4, "big") + (2).to_bytes(4, "big"))
+    buf += _encode_obj_header(3, len(base)) + zlib.compress(base)
+    buf += _encode_obj_header(7, len(delta)) + base_oid + zlib.compress(delta)
+    pack = bytes(buf) + hashlib.sha1(bytes(buf)).digest()
+    return pack, base_oid, delta_oid
+
+
 def _idx_v2_one(oid: bytes, offset: int, pack: bytes) -> bytes:
     fanout = bytearray(256 * 4)
     for index in range(oid[0], 256):
@@ -1235,6 +1264,49 @@ class DeepObjectStoreTests(VaultTests):
         typ, content = store.get(oid_b)
         self.assertEqual((typ, content), (b"blob", self.body))
         self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+
+    def test_ref_delta_skips_same_length_poison_base_in_an_earlier_pack(self) -> None:
+        """A REF delta whose base is wrong in an earlier pack still matches git.
+
+        The good pack is an undeltified base plus a type-7 delta that appends
+        ``-TAIL``, and ``git index-pack`` accepts it. ``aaa.pack`` sorts first.
+        Its index maps the base oid at the poison object: different bytes, same
+        length, so the delta would apply and then fail the hash. A fresh store
+        has not cached the base. ``get`` on the delta must return the bytes
+        ``git cat-file --batch`` returns.
+        """
+        base = b"base-bytes"
+        suffix = b"-TAIL"
+        poison = b"BASE-BYTES"
+        self.assertEqual(len(poison), len(base))
+        self.assertNotEqual(poison, base)
+        delta = _append_delta(base, suffix)
+        self.assertEqual(pin_check._apply_delta(base, delta), base + suffix)
+        self.assertNotEqual(pin_check._apply_delta(poison, delta), base + suffix)
+        pack, base_oid, delta_oid = _ref_append_pack(base, suffix)
+        repo = Path(self.tmp.name) / "ref-poison"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        self._install_pack(repo, pack)
+        bad = _single_blob_pack(poison)
+        packdir = repo / ".git" / "objects" / "pack"
+        (packdir / "aaa.pack").write_bytes(bad)
+        (packdir / "aaa.idx").write_bytes(_idx_v2_one(base_oid, 12, bad))
+        raw = subprocess.check_output(
+            ["git", "-C", str(repo), "cat-file", "--batch"],
+            input=delta_oid.hex().encode() + b"\n",
+        )
+        header, _, rest = raw.partition(b"\n")
+        git_oid, git_type, git_size = header.split()
+        size = int(git_size)
+        self.assertEqual(git_oid, delta_oid.hex().encode())
+        self.assertEqual((git_type, rest[:size]), (b"blob", base + suffix))
+        store = pin_check._ObjectStore(repo / ".git" / "objects")
+        self.assertEqual(len(store.packs), 2)
+        self.assertEqual(store.packs[0].offset(base_oid), 12)
+        self.assertIsNone(store.packs[0].offset(delta_oid))
+        self.assertIsNotNone(store.packs[1].offset(delta_oid))
+        self.assertEqual(store.cache, {})
+        self.assertEqual(store.get(delta_oid), (b"blob", rest[:size]))
 
     def test_corrupt_loose_without_a_pack_is_refused(self) -> None:
         repo = Path(self.tmp.name) / "loose-only-bad"

@@ -345,6 +345,10 @@ class Adv2BreakerTests(unittest.TestCase):
         route['connection'] = {'kind': 'subscription', 'id': 'adv2-login'}
         route['model'] = 'opus[1m]'
         self.assertEqual(blocker(), adapter.NO_BAR_EVIDENCE)
+        # A model the validator refuses is not named as the store's blocker.
+        for model in ('', None, 7):
+            route['model'] = model
+            self.assertEqual(blocker(), adapter.NO_BAR_EVIDENCE, repr(model))
         # With no breaker no run is bound, so nothing about the model blocks the route.
         route['model'] = 'mod\u00e8le'
         bare = adapter.DaemonControl(None, None, None, None, self.tmp, routes=routes)
@@ -387,8 +391,7 @@ class Adv2StarterTests(unittest.TestCase):
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(Clock()), stored)
         for model in ('m', 'opus[1m]', 'a+b', '"quoted"', 'm' * 128):
             self.assertTrue(durable.model_representable(model), model)
-        for model in ('', 'm' * 129, ' ', 'claude sonnet 4.5', 'opus[1m]\n', 'opus\x07',
-                      'mod\u00e8le', None, 7):
+        for model in ('m' * 129, ' ', 'claude sonnet 4.5', 'opus[1m]\n', 'opus\x07', 'mod\u00e8le'):
             with self.subTest(model=ascii(model)[:24]):
                 self.assertFalse(durable.model_representable(model))
                 starter = self.starter('ok', breaker=durable)
@@ -399,6 +402,19 @@ class Adv2StarterTests(unittest.TestCase):
                                  ('breaker_model_unrepresentable', 'model'))
                 self.assertEqual(starter.failures['run-1'],
                                  {'code': 'breaker_model_unrepresentable', 'detail': 'model'})
+        # A model that is missing, empty or not text is the route validator's to refuse (request_invalid:
+        # route.model, as before this rule): the store would not record it, and this check says nothing.
+        for model in ('', None, 7):
+            with self.subTest(left_to_the_validator=repr(model)):
+                self.assertFalse(durable.model_representable(model))
+                entry = {'route': {'engine': 'codex', 'model': model,
+                                   'connection': {'kind': 'subscription', 'id': 'ok'}}}
+                self.assertIsNone(adapter.route_unbindable(entry, durable))
+                listed = {'engine': 'codex', 'model': 'm', 'connection': {'kind': 'subscription', 'id': 'ok'},
+                          'limits': {'on_limit': 'fallback', 'fallback': [dict(entry['route'])]}}
+                self.assertIsNone(adapter.route_unbindable({'route': listed}, durable))
+        entry = {'route': {'engine': 'codex', 'connection': {'kind': 'subscription', 'id': 'ok'}}}
+        self.assertIsNone(adapter.route_unbindable(entry, durable), 'a route with no model at all')
         # Asking wrote nothing: no run is bound and no connection is tripped.
         with self.assertRaises(Refused) as caught:
             stored.check('run-1', 'subscription:ok', 'host')

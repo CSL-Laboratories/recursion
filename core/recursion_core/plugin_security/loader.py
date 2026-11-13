@@ -20,14 +20,25 @@ processes. Every check here binds honest plugins and records what happened; none
 holds against hostile in-process code (fleet F35, P1, measures that; B17 tracks the
 same-uid authority anchor). Nothing here spawns a process, so there is no cleanup path;
 any later spawn must use cgroup plus pidfd, never ``preexec_fn`` or ``PR_SET_PDEATHSIG``.
+
+A failed load puts the import tables back to the snapshot taken before the attempt
+and drops every module name that snapshot did not already have. It does not keep an
+import that looks genuine: origin, loader, and spec are under the plugin's control.
+An honest stdlib or core module imported during the attempt is removed, and so is a
+module another thread imported in that window. Callers import those names again.
+
+Three residuals stay, and this process cannot close them. The plugin can change
+attributes of modules the snapshot kept. A thread it started can put a module back
+after the restore. It can replace the per-load import recorder and its finder while
+the attempt runs; the restore does not consult them. Closing those means running
+the plugin in a subprocess. Whether to do that is an owner decision. This loader
+does not spawn one.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib.machinery
-import importlib.util
-import os
 import sys
 import threading
 import types
@@ -92,36 +103,6 @@ def _module_name(plugin_id: str) -> str:
     return "csl_plugin_" + encoded
 
 
-def _module_origins(module: object) -> tuple[str, ...]:
-    if module is None:
-        return ()
-    origins: list[str] = []
-    file_origin = getattr(module, "__file__", None)
-    if type(file_origin) is str and file_origin:
-        origins.append(file_origin)
-    spec = getattr(module, "__spec__", None)
-    spec_origin = getattr(spec, "origin", None) if spec is not None else None
-    if type(spec_origin) is str and spec_origin and spec_origin not in origins:
-        origins.append(spec_origin)
-    return tuple(origins)
-
-
-def _under_plugin_root(module: object, root: str | None) -> bool:
-    if type(root) is not str or not root:
-        return False
-    try:
-        root_real = os.path.realpath(root)
-    except (OSError, ValueError):
-        return False
-    for origin in _module_origins(module):
-        try:
-            if os.path.commonpath([root_real, os.path.realpath(origin)]) == root_real:
-                return True
-        except (OSError, ValueError):
-            continue
-    return False
-
-
 class _ImportRecord:
     """Modules the import system created during one load.
 
@@ -153,7 +134,10 @@ class _ImportRecord:
             return found
 
 
-_imports = _ImportRecord()
+# One activation at a time. Loaders share the process import tables, so a second
+# snapshot taken while the first is still inside exec would freeze the first
+# load's modules in place.
+_import_isolation = threading.Lock()
 _import_finding = threading.local()
 
 
@@ -168,8 +152,9 @@ def _finding_names() -> set[str]:
 class _RecordingLoader:
     """Run the real loader and remember the module object it was given."""
 
-    def __init__(self, inner: object) -> None:
+    def __init__(self, inner: object, record: _ImportRecord) -> None:
         self._inner = inner
+        self._record = record
 
     def create_module(self, spec):
         create = getattr(self._inner, "create_module", None)
@@ -180,7 +165,7 @@ class _RecordingLoader:
     def exec_module(self, module) -> None:
         name = getattr(module, "__name__", None)
         if type(name) is str:
-            _imports.remember(name, module)
+            self._record.remember(name, module)
         if getattr(module, "__loader__", None) is self:
             try:
                 module.__loader__ = self._inner
@@ -197,7 +182,7 @@ class _RecordingLoader:
     def load_module(self, fullname: str):
         module = self._inner.load_module(fullname)
         current = sys.modules.get(fullname, module)
-        _imports.remember(fullname, current if current is not None else module)
+        self._record.remember(fullname, current if current is not None else module)
         return module
 
     def __getattr__(self, name: str):
@@ -205,11 +190,14 @@ class _RecordingLoader:
 
 
 class _RecordingFinder:
-    """Meta-path finder that records modules created while a load is executing."""
+    """Meta-path finder for one load. It does not decide what a failure keeps."""
+
+    def __init__(self, record: _ImportRecord) -> None:
+        self._record = record
 
     def find_spec(self, fullname, path, target=None):
         finding = _finding_names()
-        if not _imports.recording or fullname in finding:
+        if not self._record.recording or fullname in finding:
             return None
         finding.add(fullname)
         try:
@@ -222,145 +210,115 @@ class _RecordingFinder:
                     continue
                 loader = getattr(spec, "loader", None)
                 if loader is not None and not isinstance(loader, _RecordingLoader):
-                    spec.loader = _RecordingLoader(loader)
+                    spec.loader = _RecordingLoader(loader, self._record)
                 return spec
             return None
         finally:
             finding.discard(fullname)
 
 
-_recording_finder = _RecordingFinder()
+def _begin_import_record(record: _ImportRecord) -> None:
+    record.reset()
+    record.finder = _RecordingFinder(record)
+    sys.meta_path.insert(0, record.finder)
 
 
-def _begin_import_record() -> None:
-    _imports.reset()
-    if _recording_finder not in sys.meta_path:
-        sys.meta_path.insert(0, _recording_finder)
-
-
-def _end_import_record() -> dict[str, object]:
-    try:
-        sys.meta_path.remove(_recording_finder)
-    except ValueError:
-        pass
-    return _imports.stop()
-
-
-def _origin_file(origin: object) -> str | None:
-    if type(origin) is not str or not origin or origin in ("built-in", "frozen"):
-        return None
-    try:
-        real = os.path.realpath(origin)
-    except (OSError, ValueError):
-        return None
-    if os.path.isfile(real):
-        return real
-    return None
-
-
-def _origins_match(module_origin: object, found_origin: object) -> bool:
-    if type(module_origin) is not str or type(found_origin) is not str:
-        return False
-    if module_origin in ("built-in", "frozen") or found_origin in ("built-in", "frozen"):
-        return module_origin == found_origin
-    left = _origin_file(module_origin)
-    right = _origin_file(found_origin)
-    return left is not None and left == right
-
-
-def _find_real_spec(name: str, path_before: list, meta_before: list):
-    """``find_spec`` without this load's ``sys.path`` or meta-path additions.
-
-    The candidate is removed first. ``find_spec`` otherwise returns the
-    ``__spec__`` already stored under that name.
-    """
-    saved_path = sys.path[:]
-    saved_meta = list(sys.meta_path)
-    had = name in sys.modules
-    saved = sys.modules.get(name) if had else None
-    if had:
+def _end_import_record(record: _ImportRecord) -> None:
+    finder = getattr(record, "finder", None)
+    if finder is not None:
         try:
-            del sys.modules[name]
-        except KeyError:
-            had = False
-    try:
-        _restore_sequence(sys, "path", path_before)
-        _restore_sequence(sys, "meta_path", meta_before)
-        return importlib.util.find_spec(name)
-    except (ImportError, ValueError, AttributeError, TypeError, KeyError):
-        return None
-    finally:
-        _restore_sequence(sys, "path", saved_path)
-        _restore_sequence(sys, "meta_path", saved_meta)
-        if had and name not in sys.modules:
-            sys.modules[name] = saved
+            sys.meta_path.remove(finder)
+        except ValueError:
+            pass
+    record.stop()
 
 
-def _genuine_import(name: object, module: object, root: str | None, path_before: list,
-                    meta_before: list, created: dict) -> tuple[bool, object]:
-    """The import-created module, when its file is the one ``find_spec`` names.
+class _ImportSnapshot:
+    """Import tables as they stood before one plugin attempt."""
 
-    The file is resolved with this load's ``sys.path`` additions and meta-path
-    additions removed, and it must not lie under the plugin root. A name under
-    ``recursion_core.*`` or ``csl_plugin_*`` stays only on that same rule.
-    The second result is the object the import system created.
-    """
-    if type(name) is not str:
-        return False, module
-    recorded = created.get(name)
-    if recorded is None:
-        return False, module
-    module = recorded
-    spec = getattr(module, "__spec__", None)
-    if type(spec) is not importlib.machinery.ModuleSpec:
-        return False, module
-    if spec.name != name or getattr(module, "__name__", None) != name:
-        return False, module
-    if _under_plugin_root(module, root):
-        return False, module
-    found = _find_real_spec(name, path_before, meta_before)
-    if type(found) is not importlib.machinery.ModuleSpec:
-        return False, module
-    return _origins_match(spec.origin, found.origin), module
+    def __init__(self) -> None:
+        modules = sys.modules
+        self.modules_dict = modules
+        self.modules = dict(modules)
+        self.path = sys.path
+        self.path_items = list(sys.path)
+        self.meta = sys.meta_path
+        self.meta_items = list(sys.meta_path)
+        self.hooks = sys.path_hooks
+        self.hooks_items = list(sys.path_hooks)
+        cache = sys.path_importer_cache
+        self.cache = cache
+        self.cache_items = dict(cache)
+        paths: dict[str, tuple] = {}
+        for name, module in self.modules.items():
+            try:
+                pkg_path = getattr(module, "__path__", None)
+            except Exception:
+                continue
+            if not isinstance(pkg_path, list):
+                continue
+            try:
+                items = list(pkg_path)
+            except Exception:
+                continue
+            paths[name] = (pkg_path, items)
+        self.package_paths = paths
 
 
-def _restore_sequence(owner: object, attr: str, snapshot: list) -> None:
-    """Put ``attr`` back. Slice assignment keeps the list object other code holds."""
+def _restore_list(owner: object, attr: str, original: list, items: list) -> None:
+    """Put the snapshotted list object back and refill it."""
     current = getattr(owner, attr, None)
-    try:
-        current[:] = list(snapshot)
-    except (AttributeError, TypeError, ValueError):
-        setattr(owner, attr, list(snapshot))
-
-
-def _restore_sys_modules(before: dict, root: str | None, path_before: list, meta_before: list,
-                         created: dict) -> None:
-    """Put back entries this load replaced, then drop names it planted.
-
-    A name that was not in the snapshot stays only when the import system
-    created it and its origin is the file ``find_spec`` finds without this
-    load's path additions. An assigned module is removed even when its
-    ``__file__`` points outside the plugin root. ``sys.path`` and
-    ``sys.meta_path`` return to the snapshot.
-    """
-    for name, module in before.items():
-        if sys.modules.get(name) is not module:
-            sys.modules[name] = module
-    _restore_sequence(sys, "path", path_before)
-    _restore_sequence(sys, "meta_path", meta_before)
-    for name in list(sys.modules):
-        if name in before:
-            continue
-        module = sys.modules.get(name)
+    if current is not original:
         try:
-            keep, recorded = _genuine_import(name, module, root, path_before, meta_before, created)
+            setattr(owner, attr, original)
+            current = original
+        except (AttributeError, TypeError):
+            pass
+    try:
+        current[:] = list(items)
+    except (AttributeError, TypeError, ValueError):
+        setattr(owner, attr, list(items))
+
+
+def _restore_import_state(snap: _ImportSnapshot) -> None:
+    """Put every snapshotted import table back and drop names added since.
+
+    Nothing added during the attempt is kept. A rewritten spec, a finder, or
+    the per-load recorder is not evidence that a module is genuine.
+    """
+    modules = snap.modules_dict
+    if sys.modules is not modules:
+        sys.modules = modules
+    for name in list(modules):
+        if name not in snap.modules:
+            modules.pop(name, None)
+    for name, module in snap.modules.items():
+        if modules.get(name) is not module:
+            modules[name] = module
+    _restore_list(sys, "path", snap.path, snap.path_items)
+    _restore_list(sys, "meta_path", snap.meta, snap.meta_items)
+    _restore_list(sys, "path_hooks", snap.hooks, snap.hooks_items)
+    cache = snap.cache
+    if sys.path_importer_cache is not cache:
+        sys.path_importer_cache = cache
+    cache.clear()
+    cache.update(snap.cache_items)
+    for name, (path_obj, items) in snap.package_paths.items():
+        module = modules.get(name)
+        if module is None:
+            continue
+        try:
+            current = getattr(module, "__path__", None)
+            if current is not path_obj:
+                try:
+                    setattr(module, "__path__", path_obj)
+                    current = path_obj
+                except Exception:
+                    pass
+            if isinstance(current, list):
+                current[:] = list(items)
         except Exception:
-            keep, recorded = False, module
-        if keep:
-            if recorded is not None and sys.modules.get(name) is not recorded:
-                sys.modules[name] = recorded
-        else:
-            sys.modules.pop(name, None)
+            continue
 
 
 class PluginLoader:
@@ -542,7 +500,7 @@ class PluginLoader:
                 self.last_findings = updated.findings
                 return updated
             return self._activate(manifest, trust, kid, label, perms, code, findings,
-                                  hashlib.sha256(artifact).hexdigest(), root)
+                                  hashlib.sha256(artifact).hexdigest())
 
     def _gil_gate(self, name: str, findings: list) -> bool:
         """Read the GIL; if it is on, poison the core and drop every active plugin."""
@@ -555,33 +513,30 @@ class PluginLoader:
         return True
 
     def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
-                  code_sha256: str, root: str | None = None) -> LoadedPlugin:
-        before = dict(sys.modules)
-        path_before = list(sys.path)
-        meta_before = list(sys.meta_path)
-        module = types.ModuleType(_module_name(manifest.plugin_id))
-        failure: BaseException | None = None
-        gil_on = False
-        created: dict = {}
-        _begin_import_record()
-        try:
+                  code_sha256: str) -> LoadedPlugin:
+        with _import_isolation:
+            snap = _ImportSnapshot()
+            record = _ImportRecord()
+            module = types.ModuleType(_module_name(manifest.plugin_id))
+            failure: BaseException | None = None
+            gil_on = False
+            _begin_import_record(record)
             try:
-                exec(code, module.__dict__)
-            except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
-                failure = exc
+                try:
+                    exec(code, module.__dict__)
+                except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
+                    failure = exc
+                finally:
+                    for name in sorted(set(sys.modules) - set(snap.modules)):
+                        origin = getattr(sys.modules.get(name), "__file__", None) or ""
+                        if origin.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
+                            findings.append(_finding("active", "extension_module_loaded", "warn", name))
+                    gil_on = self._gil_gate(manifest.plugin_id, findings)
+                    self.last_findings = tuple(findings)
             finally:
-                for name in sorted(set(sys.modules) - set(before)):
-                    origin = getattr(sys.modules.get(name), "__file__", None) or ""
-                    if origin.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
-                        findings.append(_finding("active", "extension_module_loaded", "warn", name))
-                gil_on = self._gil_gate(manifest.plugin_id, findings)
-                self.last_findings = tuple(findings)
-        finally:
-            created = _end_import_record()
-        # A refused load drops assigned modules and imports that exist only because
-        # this load changed the path. A genuine import of a real file stays.
-        if gil_on or failure is not None:
-            _restore_sys_modules(before, root, path_before, meta_before, created)
+                _end_import_record(record)
+                if gil_on or failure is not None:
+                    _restore_import_state(snap)
         if gil_on:
             raise Refused("core_poisoned_gil_enabled", manifest.plugin_id) from failure
         if failure is not None:

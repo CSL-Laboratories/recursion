@@ -220,13 +220,16 @@ def _alter_revoked_generation(db: sqlite3.Connection) -> None:
 
 
 def _stripped_script_component(part: str) -> bool:
-    """True when ``part`` is empty, ``.``, ``..``, or Win32 would make it one of those.
+    """True when ``part`` is empty, ``.``, ``..``, a stream, or Win32 would make it one of those.
 
     Windows strips trailing spaces and dots from every component, so ``.. `` and
-    ``...`` walk out of the plugin tree on that host. A component that ends in a
-    space or a dot is refused on every host.
+    ``...`` walk out of the plugin tree on that host. A colon names an alternate
+    data stream (``install.sh:stream``, ``::$DATA``, ``::$INDEX_ALLOCATION``).
+    Both are refused on every host.
     """
     if part in ("", ".", ".."):
+        return True
+    if ":" in part:
         return True
     if part.endswith(" ") or part.endswith("."):
         return True
@@ -234,7 +237,7 @@ def _stripped_script_component(part: str) -> bool:
 
 
 def _script_escapes(value: str) -> bool:
-    """An install-script name that is absolute or walks out with ``..``."""
+    """An install-script name that is absolute, a stream, or walks out with ``..``."""
     if os.path.isabs(value) or "\\" in value:
         return True
     parts = value.split("/")

@@ -210,22 +210,51 @@ class WindowsPathTests(unittest.TestCase):
                     parse_manifest(raw)
                 self.assertEqual(ctx.exception.code, "manifest_install_scripts")
 
+    def test_an_install_script_stream_component_is_refused_on_every_host(self) -> None:
+        # A colon in a component is a Win32 alternate data stream.
+        dev = Key()
+        for script in (
+            "scripts/install.sh:stream",
+            "scripts/install.sh::$DATA",
+            "..:$DATA",
+            "..::$INDEX_ALLOCATION",
+        ):
+            with self.subTest(script=script):
+                raw = manifest_bytes(dev.public, install_scripts=(script,))
+                with self.assertRaises(Refused) as ctx:
+                    parse_manifest(raw)
+                self.assertEqual(ctx.exception.code, "manifest_install_scripts")
+        raw = manifest_bytes(dev.public, install_scripts=("scripts/install.sh",))
+        self.assertEqual(parse_manifest(raw).install_scripts, ("scripts/install.sh",))
+
 
 @needs_crypto
 class SharedImportRollbackTests(unittest.TestCase):
-    def _load_failing(self, source: bytes, *, plugin_id: str = "bad.plugin", root: str | None = None):
+    def _run_failing(self, source: bytes, *, plugin_id: str = "bad.plugin",
+                     root: str | None = None) -> str | None:
         dev = Key()
         kid = key_id(dev.public)
         trust = TrustStore({"dev": dev.public})
         raw = manifest_bytes(dev.public, plugin_id=plugin_id, source=source, permissions=("read",))
         grant = Grant(plugin_id, hashlib.sha256(source).hexdigest(), kid, ("read",))
         loader = _loader(trust, {plugin_id: grant})
-        with self.assertRaises(Refused) as ctx:
+        try:
             loader.load(raw, dev.sign(raw), source, root=root)
-        self.assertEqual(ctx.exception.code, "plugin_import_failed")
+        except Refused as exc:
+            return exc.code
+        return None
+
+    def _load_failing(self, source: bytes, *, plugin_id: str = "bad.plugin", root: str | None = None):
+        self.assertEqual(self._run_failing(source, plugin_id=plugin_id, root=root), "plugin_import_failed")
         return plugin_id
 
     def test_a_failed_load_keeps_stdlib_imported_during_the_load(self) -> None:
+        """A stdlib module first imported by the failed attempt is dropped.
+
+        The loader used to keep that import. Origin and spec are chosen by the
+        plugin, so the attempt no longer gets to leave ``graphlib`` loaded.
+        The cost is that the process imports it again afterwards.
+        """
         sys.modules.pop("graphlib", None)
         plugin_id = "bad.plugin"
         source = (
@@ -236,13 +265,17 @@ class SharedImportRollbackTests(unittest.TestCase):
         )
         try:
             self._load_failing(source, plugin_id=plugin_id)
-            self.assertIn("graphlib", sys.modules)
-            self.assertNotIn(_module_name(plugin_id), sys.modules)
+            self.assertIsNone(sys.modules.get("graphlib"))
+            self.assertIsNone(sys.modules.get(_module_name(plugin_id)))
         finally:
             sys.modules.pop("graphlib", None)
             sys.modules.pop(_module_name(plugin_id), None)
 
     def test_a_failed_load_keeps_a_module_imported_by_another_thread(self) -> None:
+        """``netrc`` imported by another thread during the attempt is dropped.
+
+        The snapshot cannot tell that import from one the plugin performed.
+        """
         sys.modules.pop("netrc", None)
         gate = threading.Event()
         done = threading.Event()
@@ -268,7 +301,7 @@ class SharedImportRollbackTests(unittest.TestCase):
         try:
             self._load_failing(source)
             self.assertTrue(done.is_set())
-            self.assertIn("netrc", sys.modules)
+            self.assertIsNone(sys.modules.get("netrc"))
         finally:
             worker.join(5)
             sys.modules.pop("netrc", None)
@@ -323,8 +356,10 @@ class SharedImportRollbackTests(unittest.TestCase):
         ).encode()
         try:
             self._load_failing(source)
-            real = sys.modules.get("graphlib")
-            self.assertIsNotNone(real)
+            # A real import made by the failed attempt is dropped with the planted names.
+            self.assertIsNone(sys.modules.get("graphlib"))
+            import importlib
+            real = importlib.import_module("graphlib")
             self.assertTrue(hasattr(real, "TopologicalSorter"))
             self.assertNotEqual(getattr(real, "marker", None), "pwned")
             import importlib
@@ -376,6 +411,14 @@ class SharedImportRollbackTests(unittest.TestCase):
             sys.modules.pop("calendar", None)
 
     def test_a_failed_load_keeps_a_genuine_core_import(self) -> None:
+        """A core module imported during a failed load is dropped.
+
+        Keeping it meant reading the live spec and calling ``find_spec``, both
+        of which the plugin can point at a module it just loaded. The cost is
+        that ``recursion_core.child_env.launch`` is removed and imported again.
+        An attribute already set on a package that was loaded before the attempt
+        is not part of this rollback.
+        """
         name = "recursion_core.child_env.launch"
         saved = sys.modules.pop(name, None)
         parent = sys.modules.get("recursion_core.child_env")
@@ -383,8 +426,9 @@ class SharedImportRollbackTests(unittest.TestCase):
         source = b"import recursion_core.child_env.launch\nraise RuntimeError('boom')\n"
         try:
             self._load_failing(source)
-            module = sys.modules.get(name)
-            self.assertIsNotNone(module)
+            self.assertIsNone(sys.modules.get(name))
+            import importlib
+            module = importlib.import_module(name)
             self.assertTrue(hasattr(module, "spawn"))
             self.assertNotEqual(getattr(module, "marker", None), "pwned")
         finally:
@@ -414,6 +458,233 @@ class SharedImportRollbackTests(unittest.TestCase):
             sys.modules.pop("planted_helper", None)
             while outside in sys.path:
                 sys.path.remove(outside)
+
+    def test_a_failed_load_drops_a_path_shadow_rewritten_to_the_stdlib_file(self) -> None:
+        """A path-shadowed stdlib module is dropped after its spec is rewritten.
+
+        The plugin loads ``colorsys`` from a directory it inserted, then points
+        ``__spec__.origin`` and ``__file__`` at the real stdlib file. Cleanup
+        must not read that live spec and keep the attacker module.
+        """
+        import importlib.util
+        name = "colorsys"
+        saved = sys.modules.pop(name, None)
+        real = importlib.util.find_spec(name)
+        self.assertIsNotNone(real)
+        self.assertIsInstance(real.origin, str)
+        sys.modules.pop(name, None)
+        shadow = temp_dir(self)
+        with open(os.path.join(shadow, "colorsys.py"), "w", encoding="utf-8") as fh:
+            fh.write("marker = 'pwned'\n")
+        stdlib_dir = os.path.dirname(real.origin)
+        had_cache = stdlib_dir in sys.path_importer_cache
+        saved_cache = sys.path_importer_cache.get(stdlib_dir)
+        saved_hooks = list(sys.path_hooks)
+        source = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import colorsys\n"
+            "colorsys.__spec__.origin = %r\n"
+            "colorsys.__file__ = %r\n"
+            "def _hook(path):\n"
+            "    return None\n"
+            "sys.path_hooks.append(_hook)\n"
+            "raise RuntimeError('boom')\n" % (shadow, real.origin, real.origin)
+        ).encode()
+        try:
+            self._load_failing(source)
+            self.assertIsNone(sys.modules.get(name))
+            self.assertNotIn(shadow, sys.path)
+            self.assertEqual(list(sys.path_hooks), saved_hooks)
+            import importlib
+            module = importlib.import_module(name)
+            self.assertTrue(hasattr(module, "rgb_to_hsv"))
+            self.assertNotEqual(getattr(module, "marker", None), "pwned")
+            had_cache = stdlib_dir in sys.path_importer_cache
+            saved_cache = sys.path_importer_cache.get(stdlib_dir)
+            cache_source = (
+                "import sys\n"
+                "sys.path_importer_cache[%r] = None\n"
+                "raise RuntimeError('boom')\n" % stdlib_dir
+            ).encode()
+            self._load_failing(cache_source, plugin_id="bad.cache")
+            if had_cache:
+                self.assertIs(sys.path_importer_cache.get(stdlib_dir), saved_cache)
+            else:
+                self.assertNotIn(stdlib_dir, sys.path_importer_cache)
+        finally:
+            sys.modules.pop(name, None)
+            if saved is not None:
+                sys.modules[name] = saved
+            while shadow in sys.path:
+                sys.path.remove(shadow)
+            sys.path_hooks[:] = saved_hooks
+            if had_cache:
+                sys.path_importer_cache[stdlib_dir] = saved_cache
+            elif stdlib_dir in sys.path_importer_cache and sys.path_importer_cache[stdlib_dir] is None:
+                sys.path_importer_cache.pop(stdlib_dir, None)
+
+    def test_a_failed_load_drops_a_meta_path_spec_with_an_evil_loader(self) -> None:
+        """A finder at index 1 cannot leave its module in ``sys.modules``.
+
+        The finder returns a ``ModuleSpec`` whose loader is the attacker's and
+        whose origin is the real file, or ``built-in``. That includes a fake
+        ``recursion_core.child_env.launch``. The failed load drops both names.
+        """
+        import importlib.machinery
+        import importlib.util
+        launch_name = "recursion_core.child_env.launch"
+        saved_launch = sys.modules.pop(launch_name, None)
+        parent = sys.modules.get("recursion_core.child_env")
+        saved_attr = getattr(parent, "launch", None) if parent is not None else None
+        spec = importlib.util.find_spec(launch_name)
+        self.assertIsNotNone(spec)
+        self.assertIsInstance(spec.origin, str)
+        sys.modules.pop(launch_name, None)
+        builtin_name = next(
+            name for name in sys.builtin_module_names
+            if name not in sys.modules and name.isidentifier())
+        saved_builtin = sys.modules.pop(builtin_name, None)
+
+        class _EvilLoader:
+            def create_module(self, module_spec):
+                return None
+
+            def exec_module(self, module) -> None:
+                module.marker = "pwned"
+                helper.loaded.append(module.__name__)
+
+        class _EvilFinder:
+            def find_spec(self, fullname, path, target=None):
+                if fullname == launch_name:
+                    return importlib.machinery.ModuleSpec(
+                        fullname, _EvilLoader(), origin=spec.origin)
+                if fullname == builtin_name:
+                    return importlib.machinery.ModuleSpec(
+                        fullname, _EvilLoader(), origin="built-in")
+                return None
+
+        helper = types.ModuleType("csl_a2_helper")
+        helper.loaded = []
+        helper.install = lambda: sys.meta_path.insert(1, _EvilFinder())
+        helper.finder_type = _EvilFinder
+        sys.modules["csl_a2_helper"] = helper
+        source = (
+            "import csl_a2_helper\n"
+            "csl_a2_helper.install()\n"
+            "import %s\n"
+            "import %s\n"
+            "raise RuntimeError('boom')\n" % (launch_name, builtin_name)
+        ).encode()
+        try:
+            self._load_failing(source)
+            self.assertEqual(helper.loaded, [launch_name, builtin_name])
+            self.assertIsNone(sys.modules.get(launch_name))
+            self.assertIsNone(sys.modules.get(builtin_name))
+            self.assertNotEqual(getattr(sys.modules.get(launch_name), "marker", None), "pwned")
+            self.assertNotEqual(getattr(sys.modules.get(builtin_name), "marker", None), "pwned")
+            self.assertFalse(any(isinstance(item, _EvilFinder) for item in sys.meta_path))
+        finally:
+            sys.meta_path[:] = [item for item in sys.meta_path if not isinstance(item, _EvilFinder)]
+            sys.modules.pop(launch_name, None)
+            sys.modules.pop(builtin_name, None)
+            sys.modules.pop("csl_a2_helper", None)
+            if saved_launch is not None:
+                sys.modules[launch_name] = saved_launch
+            if saved_builtin is not None:
+                sys.modules[builtin_name] = saved_builtin
+            if parent is not None:
+                if saved_attr is None:
+                    if hasattr(parent, "launch"):
+                        try:
+                            delattr(parent, "launch")
+                        except (AttributeError, TypeError):
+                            pass
+                else:
+                    parent.launch = saved_attr
+
+    def test_a_failed_load_restores_a_package_path_and_drops_the_submodule(self) -> None:
+        """``logging.__path__`` is put back and the attacker submodule is dropped."""
+        import logging
+        attacker = temp_dir(self)
+        with open(os.path.join(attacker, "pwned_sub.py"), "w", encoding="utf-8") as fh:
+            fh.write("marker = 'pwned'\n")
+        before_path = list(logging.__path__)
+        source = (
+            "import logging\n"
+            "logging.__path__.insert(0, %r)\n"
+            "import logging.pwned_sub\n"
+            "raise RuntimeError('boom')\n" % attacker
+        ).encode()
+        try:
+            self._load_failing(source)
+            self.assertIsNone(sys.modules.get("logging.pwned_sub"))
+            self.assertNotIn(attacker, list(logging.__path__))
+            self.assertEqual(list(logging.__path__), before_path)
+            self.assertNotEqual(getattr(sys.modules.get("logging.pwned_sub"), "marker", None), "pwned")
+        finally:
+            sys.modules.pop("logging.pwned_sub", None)
+            if hasattr(logging, "pwned_sub"):
+                try:
+                    delattr(logging, "pwned_sub")
+                except (AttributeError, TypeError):
+                    pass
+            try:
+                logging.__path__[:] = before_path
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+    def test_concurrent_loads_do_not_share_one_import_recorder(self) -> None:
+        """Two ``PluginLoader.load`` calls must not share one import recorder.
+
+        The recorder used to be one module global. Overlapping loads wrote the
+        same ``created`` dict, so one load's cleanup judged the other's import.
+        """
+        holder = types.ModuleType("csl_coord_a6")
+        holder.box = []
+        holder.codes = []
+        holder.lock = threading.Lock()
+        sys.modules["csl_coord_a6"] = holder
+        source = (
+            "import csl_coord_a6, sys\n"
+            "import recursion_core.plugin_security.loader as loader_mod\n"
+            "finder = sys.meta_path[0]\n"
+            "recorder = getattr(loader_mod, '_imports', None)\n"
+            "if recorder is None:\n"
+            "    recorder = getattr(finder, '_record', None)\n"
+            "with csl_coord_a6.lock:\n"
+            "    csl_coord_a6.box.append(id(recorder.created))\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        errors: list = []
+
+        def run(plugin_id: str) -> None:
+            try:
+                code = self._run_failing(source, plugin_id=plugin_id)
+            except Exception as exc:  # noqa: BLE001 - the assertion is on the main thread
+                errors.append(exc)
+                return
+            with holder.lock:
+                holder.codes.append(code)
+
+        threads = [
+            threading.Thread(target=run, args=("bad.one",)),
+            threading.Thread(target=run, args=("bad.two",)),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(holder.codes), ["plugin_import_failed", "plugin_import_failed"])
+            self.assertEqual(len(holder.box), 2)
+            self.assertNotEqual(holder.box[0], holder.box[1])
+        finally:
+            for thread in threads:
+                thread.join(5)
+            sys.modules.pop("csl_coord_a6", None)
 
 
 class RevocationPublishTests(unittest.TestCase):

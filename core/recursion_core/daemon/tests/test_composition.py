@@ -1049,6 +1049,42 @@ class ComposedDaemonTest(unittest.TestCase):
         rid = self.start(self.api(composed), 'helper=0 fast=1')  # with the record, the same start launches
         self.assertEqual(self.api(composed).call('run.stop', {'run_id': rid})['code'], 'stopped')
 
+    def test_the_pidfd_is_closed_when_the_process_wrapper_cannot_be_made(self):
+        """The pidfd of the unit's main process is opened just before the wrapper that then owns it. When
+        the wrapper cannot be made nothing owns the descriptor, and the launcher closes it with the rest
+        of the failed launch. It stayed open before: one descriptor lost for each such failure."""
+        _, composed = self.boot()
+        api = self.api(composed)
+        opened = []
+        real_open = ProcessUnitManager.open_main_pidfd
+
+        def open_and_note(manager, group, pid):
+            pidfd = real_open(manager, group, pid)
+            opened.append((pidfd, os.readlink(f'/proc/self/fd/{pidfd}')))  # the link names what the number is
+            return pidfd
+
+        def still_that_pidfd(pidfd, link):
+            try:
+                return os.readlink(f'/proc/self/fd/{pidfd}') == link
+            except OSError:
+                return False
+
+        with mock.patch.object(ProcessUnitManager, 'open_main_pidfd', open_and_note), \
+                mock.patch.object(launcher, 'UnitEngineProcess',
+                                  side_effect=OSError('the process wrapper could not be made')):
+            answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+            self.assertEqual(answer['code'], 'start_failed', answer)
+            self.assertEqual(len(opened), 1, 'the launch never got as far as the pidfd: nothing was tested')
+            closed = until(lambda: not still_that_pidfd(*opened[0]), 5)
+            if not closed:
+                os.close(opened[0][0])  # not left open in the test process either
+            self.assertTrue(closed, 'the pidfd of the failed launch was left open')
+        self.assertEqual(len(self.units.started), 1)
+        self.assertTrue(until(lambda: all(proc.poll() is not None for proc in self.units.procs.values())),
+                        'the unit of the failed launch was left running')
+        rid = self.start(api, 'helper=0 fast=1')  # the next start launches and stops as usual
+        self.assertEqual(api.call('run.stop', {'run_id': rid})['code'], 'stopped')
+
     def test_a_breaker_store_that_cannot_be_read_refuses_starts_and_keeps_reads(self):
         path = daemon_breaker.store_path(self.state)
         Registry(self.state).close()

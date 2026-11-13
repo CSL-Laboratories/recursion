@@ -150,6 +150,13 @@ class DurableRouteBreaker:
             pass
         return True
 
+    def model_representable(self, model):
+        """Whether the store can record this model with a run's binding (``bind_run`` would take it).
+
+        The rule is the store's own (``ConnectionBreaker.model_recordable``); nothing is read or written.
+        """
+        return StoredBreaker.model_recordable(model)
+
     def state(self, connection):
         return self._inner.state(connection)
 

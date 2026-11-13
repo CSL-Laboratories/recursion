@@ -247,6 +247,16 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
   connection or model cannot reuse that run id. Start with a new client key to
   request a different route. Stop without a recorded cgroup remains
   `pending` / `cgroup_unknown`; it is not evidence that an engine is still alive.
+
+  The store records a model as `routes.json` gives it when it is 1 to 128 printable ASCII
+  characters with no space among them, so a vendor's own spelling such as `opus[1m]` is
+  recorded as it is. An empty name, a longer one, and one with a space, a control character
+  or a non-ASCII character cannot be recorded: the start is refused `start_failed` /
+  `breaker_model_unrepresentable` before the route service is asked, and nothing is launched.
+  A connection id the store cannot key is refused at the same point, as
+  `breaker_connection_unrepresentable`. Both look at the route itself and, with
+  `"on_limit": "fallback"`, at every route in its `fallback` list; a list that is only shown
+  to the user refuses nothing. `route.list` names either one as the route's blocker.
 - **Routes.** `$XDG_CONFIG_HOME/recursion/routes.json` (operator-owned, not group or other
   writable) names the route per engine: `{"routes": {"claude_code": {"model": ...,
   "connection": {"kind": "subscription", "id": ...}, "api_key_helper": "absent",

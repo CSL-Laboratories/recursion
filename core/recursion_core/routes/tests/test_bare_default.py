@@ -48,6 +48,33 @@ class ClassifyHelpTest(unittest.TestCase):
         text = help_with_bare("Minimal mode. --bare is the default for -p, not a future release.")
         self.assertEqual(bd.classify_help(text), "present")
 
+    def test_future_qualifier_anywhere_blocks_present(self) -> None:
+        # A future or planned word anywhere in the sentence blocks present, including
+        # across a comma. A present claim joined to a future default with "and" is unknown.
+        blocked = (
+            "In a future release, --bare is the default for -p.",
+            "--bare is the default for -p, in a future release.",
+            "This is the default for -p, coming in a future release.",
+            "planned, --bare is the default for -p.",
+            "--bare is the default for -p and will become the default in a future release.",
+        )
+        for desc in blocked:
+            with self.subTest(desc=desc):
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "unknown")
+        kept = {
+            "--bare is the default for -p, not a future release.": "present",
+            "This is the default for -p.": "present",
+            "On by default in print mode.": "present",
+            "--bare will become the default for -p in a future release.": "absent",
+        }
+        for desc, state in kept.items():
+            with self.subTest(desc=desc):
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), state)
+        for version in ("2.1.312", "2.1.314", "2.1.321"):
+            with self.subTest(version=version):
+                text = (FIXTURE.parent / f"claude-{version}-help.txt").read_text()
+                self.assertEqual(bd.classify_help(text), "unknown")
+
     def test_present_and_future_default_claims_are_unknown(self) -> None:
         text = help_with_bare(
             "Minimal mode. --bare is the default for -p, or it will become the default in a future release.")

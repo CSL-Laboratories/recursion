@@ -258,6 +258,86 @@ class ClaudeCodeTest(unittest.TestCase):
         self.assertEqual(boom.fenced, ["engine_error"])
         self.assertEqual(service._breaker.state("subscription:login-A"), "closed")
 
+    def test_fence_failure_after_launch_returns_engine_error_and_opens_breaker(self) -> None:
+        class Dead:
+            def __init__(self) -> None:
+                self.fenced: list[str] = []
+                self.killed: list[str] = []
+
+            def send(self, line: str) -> None:
+                raise RuntimeError("boom")
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                return None
+
+            def fence(self, reason: str) -> None:
+                self.fenced.append(reason)
+                raise OSError("cgroup")
+
+            def kill(self) -> None:
+                self.killed.append("kill")
+
+        clock = FakeClock()
+        dead = Dead()
+        calls: list[list[str]] = []
+
+        def launch(argv, **kwargs):
+            calls.append(list(argv))
+            return dead
+
+        adapter = ClaudeCodeAdapter(launch, clock, credentials, PARENT_ENV, wall_clock=clock)
+        service = RouteService({"claude_code": adapter}, ConnectionBreaker(clock), clock)
+        res = service.handle(request())
+        self.assertEqual(res["code"], c.ENGINE_ERROR)
+        self.assertEqual(res["detail"], "fence failed: OSError")
+        self.assertNotIn("boom", res["detail"])
+        self.assertNotIn("cgroup", res["detail"])
+        self.assertEqual(dead.fenced, ["engine_error", "engine_error"])
+        self.assertEqual(dead.killed, ["kill"])
+        self.assertEqual(res["breaker_effect"], "opened")
+        self.assertEqual(service._breaker.state("subscription:login-A"), "open")
+        again = service.handle(request(rid="r2"))
+        self.assertEqual(again["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(calls), 1)
+
+    def test_fence_retry_then_success_keeps_the_typed_result(self) -> None:
+        class Flaky:
+            def __init__(self) -> None:
+                self.fenced: list[str] = []
+                self.killed: list[str] = []
+
+            def send(self, line: str) -> None:
+                raise RuntimeError("boom")
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                return None
+
+            def fence(self, reason: str) -> None:
+                self.fenced.append(reason)
+                if len(self.fenced) == 1:
+                    raise RuntimeError("cgroup")
+
+            def kill(self) -> None:
+                self.killed.append("kill")
+
+        clock = FakeClock()
+        flaky = Flaky()
+        adapter = ClaudeCodeAdapter(lambda argv, **kwargs: flaky, clock, credentials, PARENT_ENV, wall_clock=clock)
+        service = RouteService({"claude_code": adapter}, ConnectionBreaker(clock), clock)
+        res = service.handle(request())
+        self.assertEqual((res["code"], res["detail"]), (c.ENGINE_ERROR, "unexpected: RuntimeError"))
+        self.assertNotIn("boom", res["detail"])
+        self.assertNotIn("cgroup", res["detail"])
+        self.assertEqual(flaky.fenced, ["engine_error", "engine_error"])
+        self.assertEqual(flaky.killed, [])
+        self.assertEqual(service._breaker.state("subscription:login-A"), "closed")
+
 
 class TenantIsolationTest(unittest.TestCase):
     def test_one_tenants_deadline_or_fault_never_fences_another(self) -> None:
@@ -371,6 +451,60 @@ class CodexTest(unittest.TestCase):
         methods = [m.get("method") for m in h.launcher.processes[0].sent]
         self.assertNotIn("thread/start", methods)
         self.assertNotIn("turn/start", methods)
+
+    def test_api_key_ignores_only_the_exact_chatgpt_auth_shape(self) -> None:
+        # Substring "chatgpt" + "auth" must not start a turn. Typed codexErrorInfo in any
+        # shape that is not a recognized benign auth code fails closed before thread/start.
+        auth = "chatgpt authentication required to read rate limits"
+        text_cases = {
+            "You've hit your ChatGPT Plus limit. Re-authenticate to continue.": c.ENGINE_ERROR,
+            "rate limit exceeded for chatgpt oauth users": c.SHORT_FAULT,
+            "author of the chatgpt plugin failed": c.ENGINE_ERROR,
+        }
+        for message, code in text_cases.items():
+            with self.subTest(message=message):
+                script = [{"id": 1, "result": {"userAgent": "fake"}},
+                          {"id": 2, "error": {"code": -32000, "message": message}},
+                          {"id": 3, "result": {"thread": {"id": "th-1"}}},
+                          {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+                          {"method": "turn/completed",
+                           "params": {"turn": {"id": "tu-1", "status": "completed"}}}]
+                h, res = self.codex([script], kind="api_key", conn_id="key-1", credential_env="OPENAI_API_KEY")
+                self.assertEqual(res["code"], code)
+                methods = [m.get("method") for m in h.launcher.processes[0].sent]
+                self.assertNotIn("thread/start", methods)
+                self.assertNotIn("turn/start", methods)
+        typed = (
+            {"message": auth, "data": {"codexErrorInfo": "quotaExceeded"}},
+            {"message": auth, "data": {"codexErrorInfo": "UsageLimitExceeded"}},
+            {"message": auth, "data": {"codexErrorInfo": ["usageLimitExceeded"]}},
+            {"message": auth, "data": {"codexErrorInfo": {"type": "usageLimitExceeded"}}},
+            {"message": auth, "data": {"codexErrorInfo": {"detail": "x", "usageLimitExceeded": {}}}},
+            {"message": auth, "codexErrorInfo": None, "data": {"codexErrorInfo": "usageLimitExceeded"}},
+        )
+        for error in typed:
+            with self.subTest(error=error):
+                script = [{"id": 1, "result": {"userAgent": "fake"}},
+                          {"id": 2, "error": {"code": -32000, **error}},
+                          {"id": 3, "result": {"thread": {"id": "th-1"}}},
+                          {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+                          {"method": "item/completed",
+                           "params": {"item": {"type": "agentMessage", "text": "should-not-run"}}},
+                          {"method": "turn/completed",
+                           "params": {"turn": {"id": "tu-1", "status": "completed"}}}]
+                h, res = self.codex([script], kind="api_key", conn_id="key-1", credential_env="OPENAI_API_KEY")
+                self.assertEqual(res["code"], c.PLAN_LIMIT)
+                self.assertEqual(res["breaker_effect"], "opened")
+                self.assertEqual(h.breaker.state("api_key:key-1"), "open")
+                info = error.get("data", {}).get("codexErrorInfo")
+                if info == "quotaExceeded":
+                    self.assertEqual(res["limit"]["source"], "codex.quotaExceeded")
+                else:
+                    self.assertEqual(res["limit"]["source"], "codex.usageLimitExceeded")
+                methods = [m.get("method") for m in h.launcher.processes[0].sent]
+                self.assertNotIn("thread/start", methods)
+                self.assertNotIn("turn/start", methods)
+                self.assertNotEqual(res.get("text"), "should-not-run")
 
     def test_api_key_route_ignores_a_chatgpt_rate_limit_read_error(self) -> None:
         script = [{"id": 1, "result": {"userAgent": "fake"}},

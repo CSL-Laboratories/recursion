@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
-from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol
+from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol, stop_child
 from recursion_core.subscription_routes import ENGINES, SAFE_ENV, SubscriptionRouteRefused, guard_then_spawn
 
 # driver(process, request, deadline_at, events) -> contract result
@@ -68,14 +68,18 @@ class ProfileRouteAdapter(RouteAdapter):
         try:
             return self._driver(process, request, deadline_at, events)
         except Deadline:
-            process.fence("deadline")
+            stop_child(process, "deadline")
             return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
         except _Protocol as err:
-            process.fence("protocol_error")
+            stop_child(process, "protocol_error")
             return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
         except OSError as err:
-            process.fence("io_error")
+            stop_child(process, "io_error")
             return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+        except Exception as err:
+            # Same post-launch rule as RouteAdapter: fence the child. The detail names the type only.
+            stop_child(process, "engine_error")
+            return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"unexpected: {type(err).__name__}")
 
 
 def profile_adapters(launcher, clock, credentials: Callable[[str, str], str], parent_env: Mapping[str, str], *,

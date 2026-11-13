@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
 from recursion_core.routes import limits as lim
-from recursion_core.routes.base import RouteAdapter
+from recursion_core.routes.base import ChildStopError, RouteAdapter
 from recursion_core.routes.breaker import ConnectionBreaker
 
 
@@ -76,6 +76,12 @@ class RouteService:
             return c.result(rid, admit["code"], detail=admit["key"], retry_at=admit["retry_at"])
         try:
             res = adapter.run(req, deadline_at)
+        except ChildStopError as err:
+            # fence() failed after launch. Retry and kill already ran. Open the breaker
+            # and return a typed engine error so the child is not left running quietly.
+            res = c.result(rid, c.ENGINE_ERROR, detail=f"fence failed: {err.kind}")
+            res["breaker_effect"] = self._breaker.note_fence_failure(connection, admit["probe"])
+            return res
         except BaseException:
             self._breaker.record(connection, model, tenant, {"code": c.ENGINE_ERROR}, admit["probe"])
             raise

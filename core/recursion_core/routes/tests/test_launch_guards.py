@@ -82,6 +82,73 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         return request(engine=engine, model="m", kind="api_key", conn_id="k1", credential_env="ANTHROPIC_API_KEY",
                        profile=profile, home=self.home, **kw)
 
+    def test_driver_runtime_error_after_launch_is_fenced(self) -> None:
+        def drive(process, req, deadline_at, events):
+            raise RuntimeError("boom secret")
+
+        adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
+                                    {"PATH": "/usr/bin", "HOME": "/home/operator"},
+                                    argv=lambda req: ["pi"], driver=drive, operator_home="/home/operator")
+        service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
+        res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
+                                              "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
+        self.assertEqual(res["code"], c.ENGINE_ERROR)
+        self.assertEqual(res["detail"], "unexpected: RuntimeError")
+        self.assertNotIn("boom secret", res["detail"])
+        self.assertEqual(self.launcher.processes[-1].fenced, ["engine_error"])
+        self.assertEqual(service._breaker.state("api_key:k1"), "closed")
+
+    def test_driver_fence_failure_returns_engine_error_and_opens_breaker(self) -> None:
+        class Dead:
+            def __init__(self) -> None:
+                self.fenced: list[str] = []
+                self.killed: list[str] = []
+
+            def send(self, line: str) -> None:
+                return None
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                return None
+
+            def fence(self, reason: str) -> None:
+                self.fenced.append(reason)
+                raise OSError("cgroup")
+
+            def kill(self) -> None:
+                self.killed.append("kill")
+
+        dead = Dead()
+        calls: list[list[str]] = []
+
+        def launch(argv, **kwargs):
+            calls.append(list(argv))
+            return dead
+
+        def drive(process, req, deadline_at, events):
+            raise RuntimeError("boom secret")
+
+        adapters = profile_adapters(launch, self.clock, lambda cid, name: "sk-test",
+                                    {"PATH": "/usr/bin", "HOME": "/home/operator"},
+                                    argv=lambda req: ["pi"], driver=drive, operator_home="/home/operator")
+        service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
+        res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
+                                              "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
+        self.assertEqual(res["code"], c.ENGINE_ERROR)
+        self.assertEqual(res["detail"], "fence failed: OSError")
+        self.assertNotIn("boom secret", res["detail"])
+        self.assertNotIn("cgroup", res["detail"])
+        self.assertEqual(dead.fenced, ["engine_error", "engine_error"])
+        self.assertEqual(dead.killed, ["kill"])
+        self.assertEqual(res["breaker_effect"], "opened")
+        self.assertEqual(service._breaker.state("api_key:k1"), "open")
+        again = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
+                                                "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
+        self.assertEqual(again["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(calls), 1)
+
     def test_driver_deadline_is_fenced_and_typed(self) -> None:
         def drive(process, req, deadline_at, events):
             raise Deadline()

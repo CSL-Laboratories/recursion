@@ -249,6 +249,16 @@ class ConnectionBreaker:
         return "probe_released"
 
     # -- operator -----------------------------------------------------------------------------
+    def note_fence_failure(self, connection: str, probe: str | None = None) -> str:
+        """Open the connection. A child that could not be fenced must not admit another launch."""
+
+        with self._lock:
+            now = self._clock()
+            self._open(connection, {
+                "scope": "connection", "model": None, "reset_at": None, "source": "recursion.fence",
+            }, now, probe)
+            return "opened"
+
     def reset(self, connection: str, model: str | None = None) -> None:
         """Close a connection (and its model buckets) or one model bucket at once."""
 

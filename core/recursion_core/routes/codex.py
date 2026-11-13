@@ -30,6 +30,7 @@ app-server daemon mode is ever used, its config must hold ``updater.autoUpdateEn
 from __future__ import annotations
 
 import json
+import re
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter, _Protocol, scalar
@@ -49,6 +50,13 @@ NO_UPDATE_OVERRIDE = ("-c", "check_for_update_on_startup=false")
 DEFAULT_LIMIT_ID = "codex"  # name of the credential-wide bucket (unverified)
 _LIMIT_ERRORS = ("usageLimitExceeded",)  # codexErrorInfo values (unverified)
 _AUTH_ERRORS = ("unauthorized",)  # codexErrorInfo values (unverified)
+# The one account/rateLimits/read rejection an api_key route may ignore. Word boundaries,
+# so "author" and "oauth" are not this phrase. Any other limit or quota wording fails closed.
+_CHATGPT_AUTH_REQUIRED = re.compile(
+    r"\Achatgpt\b authentication\b required\b to\b read\b rate\b limits\b\.?\Z",
+    re.IGNORECASE)
+_LIMIT_QUOTA_WORD = re.compile(r"\b(?:quota|limit|limits|exceeded)\b", re.IGNORECASE)
+_INFO_SKIP = {"type", "detail", "message", "data"}
 
 
 def daemon_config() -> dict:
@@ -194,44 +202,104 @@ def _exhausted(snapshot: object, source: str, events: list, translate) -> dict |
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
-def _error_info(error: dict) -> object:
-    data = error.get("data") if isinstance(error.get("data"), dict) else {}
-    info = error.get("codexErrorInfo", data.get("codexErrorInfo"))
-    if isinstance(info, dict):  # a tagged variant: {"usageLimitExceeded": {...}} (shape unverified)
-        info = next(iter(info), None)
-    return info
+def _codes_in(info: object) -> list[str]:
+    """Codes from one ``codexErrorInfo`` value: a string, a list, ``type``, or a tagged key."""
+
+    if isinstance(info, str):
+        text = info.strip()
+        return [text] if text else []
+    if isinstance(info, list):
+        found: list[str] = []
+        for item in info:
+            found.extend(_codes_in(item))
+        return found
+    if isinstance(info, dict):
+        kind = info.get("type")
+        if isinstance(kind, str) and kind.strip():
+            return [kind.strip()]
+        return [key for key in info
+                if isinstance(key, str) and key not in _INFO_SKIP and key.casefold() != "codexerrorinfo"]
+    return []
+
+
+def _typed_codes(error: object) -> list[str]:
+    """Every typed ``codexErrorInfo`` anywhere in the error. A null value hides nothing below it."""
+
+    found: list[str] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if isinstance(key, str) and key.casefold() == "codexerrorinfo" and val is not None:
+                    found.extend(_codes_in(val))
+                if isinstance(val, (dict, list)):
+                    walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(error)
+    return found
+
+
+def _canonical(code: str) -> str:
+    folded = code.casefold()
+    for known in (*_LIMIT_ERRORS, *_AUTH_ERRORS):
+        if folded == known.casefold():
+            return known
+    return code
+
+
+def _is_limit_code(code: str) -> bool:
+    folded = code.casefold()
+    if any(folded == known.casefold() for known in _LIMIT_ERRORS):
+        return True
+    return "limit" in folded or "quota" in folded
+
+
+def _is_auth_code(code: str) -> bool:
+    return any(code.casefold() == known.casefold() for known in _AUTH_ERRORS)
 
 
 def _chatgpt_auth_required(error: dict) -> bool:
-    """True only for the ChatGPT-login rejection of ``account/rateLimits/read``.
+    """True only for the exact ChatGPT-login rejection of ``account/rateLimits/read``.
 
-    A typed usage-limit or auth ``codexErrorInfo`` is never this rejection.
+    Any typed ``codexErrorInfo`` fails closed instead. The message must be the known
+    phrase, on word boundaries, with no limit or quota wording beyond that phrase.
     """
 
-    info = _error_info(error)
-    if info in _LIMIT_ERRORS or info in _AUTH_ERRORS:
+    if _typed_codes(error):
         return False
     message = error.get("message")
     if not isinstance(message, str):
         return False
-    text = message.lower()
-    return "chatgpt" in text and "auth" in text
+    text = " ".join(message.split())
+    if _CHATGPT_AUTH_REQUIRED.fullmatch(text) is None:
+        return False
+    rest = re.sub(r"(?i)\brate\s+limits\b", " ", text)
+    return _LIMIT_QUOTA_WORD.search(rest) is None
 
 
 def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
-    info = _error_info(error)
-    if info in _AUTH_ERRORS:
-        return c.result(rid, c.AUTH_FAILED, events=events, detail=str(info))
-    if info in _LIMIT_ERRORS:
-        return c.result(rid, c.PLAN_LIMIT, limit=limit or c.limit_signal("connection", f"codex.{info}"),
+    codes = _typed_codes(error)
+    limit_code = next((code for code in codes if _is_limit_code(code)), None)
+    if limit_code is not None:
+        name = _canonical(limit_code)
+        return c.result(rid, c.PLAN_LIMIT, limit=limit or c.limit_signal("connection", f"codex.{name}"),
                         events=events, detail="typed limit")
+    if codes and all(_is_auth_code(code) for code in codes):
+        return c.result(rid, c.AUTH_FAILED, events=events, detail=str(_canonical(codes[0])))
     # A saved exhausted-bucket signal is a typed limit even when the turn then fails with untyped text.
     # Auth (above) keeps precedence. EOF after that signal is the same limit, not an exit.
     if limit is not None:
         return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events,
                         detail="exit after limit" if error.get("_eof") else "typed limit")
+    if codes:
+        # A typed code that is not exactly a recognized benign auth code does not start a turn.
+        return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(_canonical(codes[0])))
     if error.get("_eof"):
         return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before turn/completed")
     if c.sounds_like_quota(error.get("message")):
         return c.result(rid, c.SHORT_FAULT, events=events, detail=f"untyped quota-like text on {model}")
-    return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(scalar(info) or scalar(error.get("code")) or "error"))
+    return c.result(rid, c.ENGINE_ERROR, events=events,
+                    detail=str(scalar(error.get("code")) or "error"))

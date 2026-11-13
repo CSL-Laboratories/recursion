@@ -17,6 +17,38 @@ class Deadline(Exception):
     """Recursion's own deadline passed. Request-local: never an engine fault (PRODUCT.md S4)."""
 
 
+class ChildStopError(Exception):
+    """``fence`` never succeeded, so the child may still be running."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+def stop_child(process, reason: str) -> None:
+    """Fence the child. Retry once, then ``kill`` if the process offers it.
+
+    A fence that never succeeds raises ``ChildStopError``. The service turns that
+    into a structured engine error and opens the breaker. The exception message is
+    the fence exception's type name only.
+    """
+
+    last: Exception | None = None
+    for _ in range(2):
+        try:
+            process.fence(reason)
+            return
+        except Exception as err:
+            last = err
+    kill = getattr(process, "kill", None)
+    if callable(kill):
+        try:
+            kill()
+        except Exception:
+            pass
+    raise ChildStopError(type(last).__name__ if last is not None else "Exception")
+
+
 class RouteAdapter:
     """One engine behind the route contract. Subclasses build argv/env and drive the protocol."""
 
@@ -51,22 +83,22 @@ class RouteAdapter:
             out = self.drive(process, request, deadline_at, events)
         except Deadline:
             self._run_label = None
-            process.fence("deadline")  # fenced for this request only; the breaker never hears of it
+            stop_child(process, "deadline")  # fenced for this request only; the breaker never hears of it
             return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
         except _Protocol as err:
             self._run_label = None
-            process.fence("protocol_error")
+            stop_child(process, "protocol_error")
             return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
         except OSError as err:
             # A child that exits before the request is written raises BrokenPipeError. That stays a
             # typed result, and the process is fenced, instead of escaping the route boundary.
             self._run_label = None
-            process.fence("io_error")
+            stop_child(process, "io_error")
             return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
         except Exception as err:
             # Anything else after launch fences the child. The detail names the type only.
             self._run_label = None
-            process.fence("engine_error")
+            stop_child(process, "engine_error")
             return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"unexpected: {type(err).__name__}")
         return self._apply_run_label(out)
 

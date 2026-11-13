@@ -1,0 +1,11 @@
+{
+  "seq": 7,
+  "time_rel_ms": 9120,
+  "event_type": "approval.requested",
+  "source": "core",
+  "trust": "trusted",
+  "state": null,
+  "text": "Approval needed: claude_code wants to run Bash",
+  "speech": "Approval needed",
+  "focus": "approval"
+}

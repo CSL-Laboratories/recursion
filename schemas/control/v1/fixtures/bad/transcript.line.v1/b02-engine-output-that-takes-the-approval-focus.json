@@ -1,0 +1,11 @@
+{
+  "seq": 3,
+  "time_rel_ms": 1840,
+  "event_type": "engine.output",
+  "source": "engine",
+  "trust": "untrusted",
+  "state": null,
+  "text": "Reading the tests.",
+  "speech": null,
+  "focus": "approval"
+}

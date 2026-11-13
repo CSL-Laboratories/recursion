@@ -1,0 +1,202 @@
+{
+  "about": "Every fixture of this folder. A file under good/ must validate against 'schema'. A file under bad/ must be refused, and 'rule' says which rule it breaks; 'expect' names the schema keyword that refuses it and the place in the fixture where it does (a JSON Pointer, '' for the whole value). The keys and digests are made up for the fixtures.",
+  "fixtures": [
+    {
+      "file": "good/install.v1/h01-one-trusted-key-one-grant.json",
+      "schema": "install.v1.json",
+      "shows": "One trusted developer key and one grant bound to a digest and that key."
+    },
+    {
+      "file": "good/install.v1/h02-empty.json",
+      "schema": "install.v1.json",
+      "shows": "An empty object: no trusted key and no grant, so nothing gets a permission."
+    },
+    {
+      "file": "good/install.v1/h03-manual-grant-to-an-unsigned-plugin.json",
+      "schema": "install.v1.json",
+      "shows": "A manual grant to an unsigned plugin (no signing key), with 'order' acknowledged behind the warning, and names reserved for an effect owner."
+    },
+    {
+      "file": "good/install.v1/h04-order-turned-back-on-after-a-revocation.json",
+      "schema": "install.v1.json",
+      "shows": "The user turned 'order' back on after the signing key was revoked."
+    },
+    {
+      "file": "bad/install.v1/b01-a-field-the-reader-does-not-know.json",
+      "schema": "install.v1.json",
+      "rule": "Today's reader refuses a top-level field it does not know, so version 1 adds none.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/install.v1/b02-a-grant-without-its-digest.json",
+      "schema": "install.v1.json",
+      "rule": "A grant is bound to one artifact digest.",
+      "expect": {
+        "keyword": "required",
+        "at": "/grants/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/b03-a-grant-of-a-permission-nobody-defined.json",
+      "schema": "install.v1.json",
+      "rule": "A grant lists permissions the manifest schema defines.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/grants/0/permissions/1"
+      }
+    },
+    {
+      "file": "bad/install.v1/b04-a-trusted-key-that-is-not-a-key.json",
+      "schema": "install.v1.json",
+      "rule": "A trusted key is 64 lower-case hex digits.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/trusted_keys/notes-dev"
+      }
+    },
+    {
+      "file": "bad/install.v1/b05-a-signer-that-is-not-a-key-id.json",
+      "schema": "install.v1.json",
+      "rule": "A signer is 'ed25519:' and 32 hex digits, or null for an unsigned plugin.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/grants/0/signer_key_id"
+      }
+    },
+    {
+      "file": "bad/install.v1/b06-a-secret-in-a-grant.json",
+      "schema": "install.v1.json",
+      "rule": "A grant holds ids, digests and permission names; a grant field the reader does not know is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/grants/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/b07-an-empty-reserved-host.json",
+      "schema": "install.v1.json",
+      "rule": "A reserved host is a non-empty string.",
+      "expect": {
+        "keyword": "minLength",
+        "at": "/reserved/hosts/0"
+      }
+    },
+    {
+      "file": "good/manifest.v1/h01-read-and-panel.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that reads and draws a panel. Every file of the package is listed with its digest."
+    },
+    {
+      "file": "good/manifest.v1/h02-network-and-credential.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that asks for one network destination and one credential by name."
+    },
+    {
+      "file": "good/manifest.v1/h03-the-version-1-permissions.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that asks for the five permissions that are new, and provisional, in version 1."
+    },
+    {
+      "file": "bad/manifest.v1/b01-the-old-schema-name.json",
+      "schema": "manifest.v1.json",
+      "rule": "This is the schema of 'csl-plugin-manifest/1'; a vNext manifest is read by the old parser.",
+      "expect": {
+        "keyword": "const",
+        "at": "/schema"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b02-no-files-map.json",
+      "schema": "manifest.v1.json",
+      "rule": "Version 1 lists every file of the package: the signature covers the whole package.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b03-a-path-that-leaves-the-package.json",
+      "schema": "manifest.v1.json",
+      "rule": "A path has no '..', no '.' segment and does not start with a slash.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b04-network-permission-with-no-destination.json",
+      "schema": "manifest.v1.json",
+      "rule": "'network' is asked together with at least one destination.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/network_destinations"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b05-a-destination-without-the-permission.json",
+      "schema": "manifest.v1.json",
+      "rule": "A destination is listed only with the network permission.",
+      "expect": {
+        "keyword": "maxItems",
+        "at": "/network_destinations"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b06-a-permission-nobody-defined.json",
+      "schema": "manifest.v1.json",
+      "rule": "A new permission is appended to the list in the schema; a manifest cannot invent one.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/permissions/1"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b07-claiming-the-cores-own-name.json",
+      "schema": "manifest.v1.json",
+      "rule": "'host' is the core's name and no plugin may claim it.",
+      "expect": {
+        "keyword": "not",
+        "at": "/plugin_id"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b08-a-runtime-nobody-defined.json",
+      "schema": "manifest.v1.json",
+      "rule": "The only runtime in this draft is 'python-inprocess/1'.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/runtime"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b09-a-credential-in-place-of-its-name.json",
+      "schema": "manifest.v1.json",
+      "rule": "credential_refs holds names. A value with spaces or capitals is not a name.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/credential_refs/0"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b10-a-digest-that-is-not-a-digest.json",
+      "schema": "manifest.v1.json",
+      "rule": "A digest is 64 lower-case hex digits.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files/plugin.py"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b11-an-untyped-field.json",
+      "schema": "manifest.v1.json",
+      "rule": "The manifest is a closed set of fields: the signed bytes mean one thing.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    }
+  ]
+}

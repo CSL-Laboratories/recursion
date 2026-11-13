@@ -21,6 +21,15 @@ First drafts. Nothing is frozen.
 | `queue.item.v1.json` | 1.0-draft.1 | |
 | `event.v1.json` | 1.0-draft.1 | Twenty-one types, one payload shape each |
 
+Added on Nov 13, 2026, also as first drafts:
+
+| Schema | Version | Notes |
+|---|---|---|
+| `approval.v1.json` | 1.0-draft.1 | The public view and, described only, the daemon's private binding |
+| `driver.v2.json` | 1.0-draft.1 | Declaration, inputs, handle, fork, refusal, event drafts |
+| `mcp.task.v1.json` | 1.0-draft.1 | The derivation of a Task from a turn or a run |
+| `transcript.line.v1.json` | 1.0-draft.1 | The projection of an event for a linear reader |
+
 ### Provisional choices in this draft
 
 These are built as recommended and are **not decided**. Each is the owner's decision or another lane's
@@ -28,7 +37,7 @@ vocabulary.
 
 | Choice | Built as | Alternative | Whose |
 |---|---|---|---|
-| Canonical form behind `tool.call.input_digest` (and the approval digest to come) | `csl-cj/v0`, named in the record | RFC 8785 | The owner's |
+| Canonical form behind `tool.call.input_digest` and the approval digest | `csl-cj/v0`, named in the record as `digest_form`. Because that form takes ASCII text and whole numbers only, an engine tool's input is carried inside the effect as an escaped JSON string (`input_json`) | RFC 8785, for engine effects or for all | The owner's |
 | Names of the containment levels | `host_integrated`, `engine_user`, `contained` | Any other set | Lane STOP's, on the owner's decision |
 | Keys of the Stop sentences | `cgroup_empty_whole_run_unverified`, `cgroup_removed_whole_run_unverified` | Any other set | Lane STOP's, on the owner's decision |
 

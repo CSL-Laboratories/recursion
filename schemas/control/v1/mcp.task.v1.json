@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mcp.task.v1.json",
+  "title": "mcp.task.v1: an MCP Task, derived from a turn or a run",
+  "x-version": "1.0-draft.1",
+  "description": "How the Control MCP server answers for a Task. A Task is not stored anywhere of its own: it is DERIVED, at the moment it is asked for, from the daemon's records and the event log, so it survives a restart of the MCP server and of the daemon. This record is that derivation; the server maps its fields onto the wire names of the protocol version it speaks (in the '2025-06-18' version the same facts are returned by the plain start, status and stop tools; in the '2026-07-28' version by the Tasks methods). task_id is the turn_id for work started with session.start or session.turn, and the run_id for work started with run.start. status is derived as follows. For a turn: queued or running with no approval pending -> 'working'; an approval pending for it -> 'input_required'; ended -> 'completed'; failed -> 'failed'; interrupted or stopped -> 'cancelled'. For a run: starting, running or unknown -> 'working' (an approval pending -> 'input_required'); ended with a result whose code is null -> 'completed'; ended with a result whose code is not null, start_failed, or lost_reboot -> 'failed'; stopped -> 'cancelled'. A cancel is a Stop: it answers 'pending' until the Stop is confirmed, and while it is pending the status stays as it was and cancel_requested is true. 'cancelled' is shown only after the Stop is confirmed (run.stop answered 'stopped'), never before. result is present exactly when the status is 'completed' or 'failed'; it is read from the event log's 'result' event. expires_at is when the Task can no longer be read; null means for as long as the daemon keeps the record, which today is for ever. An approval is never answered through a Task: 'input_required' tells the client that a person must answer on a surface that draws approvals.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "of", "status", "cancel_requested", "status_message", "pending_approval_ids", "created_at", "updated_at", "expires_at", "poll_interval_ms", "result"],
+  "properties": {
+    "task_id": {
+      "description": "A turn_id or a run_id, as 'of' says.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "of": {
+      "description": "What the Task is derived from.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "session_id", "run_id", "turn_id"],
+      "properties": {
+        "kind": {"enum": ["turn", "run"]},
+        "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/session_id"}]},
+        "run_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]},
+        "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["kind"], "properties": {"kind": {"const": "turn"}}},
+          "then": {"properties": {"session_id": {"type": "string"}, "turn_id": {"type": "string"}}}
+        },
+        {
+          "if": {"required": ["kind"], "properties": {"kind": {"const": "run"}}},
+          "then": {"properties": {"run_id": {"type": "string"}, "turn_id": {"type": "null"}}}
+        }
+      ]
+    },
+    "status": {"enum": ["working", "input_required", "completed", "failed", "cancelled"]},
+    "cancel_requested": {
+      "description": "True while a Stop has been asked and is not confirmed.",
+      "type": "boolean"
+    },
+    "status_message": {"type": ["string", "null"], "maxLength": 500},
+    "pending_approval_ids": {
+      "type": "array",
+      "items": {"$ref": "common.v1.json#/$defs/approval_id"},
+      "uniqueItems": true
+    },
+    "created_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "updated_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "expires_at": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]},
+    "poll_interval_ms": {
+      "description": "How long a client should wait before asking again; null when the daemon gives no advice.",
+      "type": ["integer", "null"],
+      "minimum": 100
+    },
+    "result": {
+      "description": "The payload of the 'result' event, plus the final text when there is one.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["code", "detail", "text"],
+      "properties": {
+        "code": {"anyOf": [{"type": "null"}, {"$ref": "event.v1.json#/$defs/code_word"}]},
+        "detail": {"type": "string"},
+        "text": {"type": ["string", "null"]}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["status"], "properties": {"status": {"const": "completed"}}},
+      "then": {"properties": {"result": {"type": "object", "properties": {"code": {"type": "null"}}}, "cancel_requested": {"const": false}, "pending_approval_ids": {"maxItems": 0}}}
+    },
+    {
+      "if": {"required": ["status"], "properties": {"status": {"const": "failed"}}},
+      "then": {"properties": {"result": {"type": "object", "properties": {"code": {"type": "string"}}}, "cancel_requested": {"const": false}, "pending_approval_ids": {"maxItems": 0}}}
+    },
+    {
+      "if": {"required": ["status"], "properties": {"status": {"const": "cancelled"}}},
+      "then": {"properties": {"result": {"type": "null"}, "cancel_requested": {"const": false}, "pending_approval_ids": {"maxItems": 0}}}
+    },
+    {
+      "if": {"required": ["status"], "properties": {"status": {"const": "working"}}},
+      "then": {"properties": {"result": {"type": "null"}, "pending_approval_ids": {"maxItems": 0}}}
+    },
+    {
+      "if": {"required": ["status"], "properties": {"status": {"const": "input_required"}}},
+      "then": {"properties": {"result": {"type": "null"}, "pending_approval_ids": {"minItems": 1}}}
+    }
+  ]
+}

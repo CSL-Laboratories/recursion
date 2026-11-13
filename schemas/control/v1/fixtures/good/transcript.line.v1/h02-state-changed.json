@@ -1,0 +1,11 @@
+{
+  "seq": 1,
+  "time_rel_ms": 0,
+  "event_type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "state": "running",
+  "text": "run started",
+  "speech": "run started",
+  "focus": null
+}

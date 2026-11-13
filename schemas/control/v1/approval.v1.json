@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "approval.v1.json",
+  "title": "approval.v1: one approval request, as a client reads it",
+  "x-version": "1.0-draft.1",
+  "description": "PUBLIC record. The core draws every approval, on every surface, from this record and from nothing else. approval_id is minted by the core, never by an engine or a plugin. source says where the request came from: 'engine_tool' (an engine asked permission for a tool call) or 'plugin_effect' (a plugin asked to carry out an effect). effect is exactly what is being approved, and digest is the SHA-256 of effect's canonical bytes in the form digest_form names: what is drawn is what is approved. display is extra text for the reader (labels and values, in order); it is OUTSIDE the digest, each entry says whether it is trusted, and no surface may show it as if it were the effect. Nothing defaults to approve: a request nobody answers is 'expired' at expires_at, and expired means denied. opened_by lists every principal and surface that showed the request; an answer from a principal and surface that never showed it is refused 'prompt_not_shown'. An answer names the digest that was drawn and the revision it read; the first valid answer wins and a later one is refused. Only an 'owner' or a 'device' principal may answer: an engine, a plugin and a session token never can. 'approved' becomes 'consumed' when the effect is carried out, once. 'vetoed' is a refusal that is final for that digest. No credential appears in this record. The daemon also keeps a private binding from the approval to the engine's own pending request ($defs/binding); it never leaves the daemon.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approval_id", "session_id", "run_id", "turn_id", "source", "effect", "digest_form", "digest", "display", "requested_at", "expires_at", "state", "opened_by", "answered_by", "answer", "answered_at", "revision"],
+  "properties": {
+    "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
+    "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/log_id"}]},
+    "run_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]},
+    "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
+    "source": {"enum": ["engine_tool", "plugin_effect"]},
+    "effect": {"type": "object"},
+    "digest_form": {
+      "description": "The canonical form the digest is taken over. PROVISIONAL (recommended, not decided): 'csl-cj/v0', the restricted canonical JSON of plugin_security/canonical.py. A later form is a new name here, never a silent change.",
+      "enum": ["csl-cj/v0"]
+    },
+    "digest": {"$ref": "common.v1.json#/$defs/sha256"},
+    "display": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "value", "trust"],
+        "properties": {
+          "label": {"type": "string", "minLength": 1, "maxLength": 64},
+          "value": {"type": "string", "maxLength": 4096},
+          "trust": {"enum": ["trusted", "untrusted"]}
+        }
+      }
+    },
+    "requested_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "expires_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "state": {"enum": ["pending", "approved", "denied", "expired", "consumed", "vetoed"]},
+    "opened_by": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["principal", "surface", "at"],
+        "properties": {
+          "principal": {"$ref": "common.v1.json#/$defs/principal"},
+          "surface": {"$ref": "#/$defs/surface"},
+          "at": {"$ref": "common.v1.json#/$defs/timestamp"}
+        }
+      }
+    },
+    "answered_by": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/approver"}]},
+    "answer": {"enum": ["approve", "deny", null]},
+    "answered_at": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]},
+    "revision": {"$ref": "common.v1.json#/$defs/revision"}
+  },
+  "allOf": [
+    {
+      "if": {"required": ["source"], "properties": {"source": {"const": "engine_tool"}}},
+      "then": {"properties": {"effect": {"$ref": "#/$defs/engine_tool_effect"}, "run_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["source"], "properties": {"source": {"const": "plugin_effect"}}},
+      "then": {"properties": {"effect": {"$ref": "#/$defs/plugin_effect"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"enum": ["pending", "expired"]}}},
+      "then": {"properties": {"answered_by": {"type": "null"}, "answer": {"type": "null"}, "answered_at": {"type": "null"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"enum": ["approved", "consumed"]}}},
+      "then": {"properties": {"answered_by": {"type": "object"}, "answer": {"const": "approve"}, "answered_at": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"enum": ["denied", "vetoed"]}}},
+      "then": {"properties": {"answered_by": {"type": "object"}, "answer": {"const": "deny"}, "answered_at": {"type": "string"}}}
+    }
+  ],
+  "$defs": {
+    "surface": {
+      "description": "The kind of surface that drew the request.",
+      "enum": ["cli", "tui", "page", "phone"]
+    },
+    "approver": {
+      "description": "Who answered. Only the owner or a paired device may.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["owner", "device"]},
+        "id": {"$ref": "common.v1.json#/$defs/token"}
+      }
+    },
+    "engine_tool_effect": {
+      "description": "An engine asked permission for one tool call. input_json is the tool's input as the core serialised it: JSON with sorted keys, no spaces, and every character outside printable ASCII written as a \\u escape, so the whole effect fits the restricted canonical form (which takes ASCII text and whole numbers only) while the input itself may hold any text and any number. The digest binds that exact string, and the core draws the input from that exact string. cwd is the directory the call would run in, null when the engine does not say.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "engine", "session_id", "run_id", "tool", "input_json", "cwd"],
+      "properties": {
+        "kind": {"const": "engine_tool"},
+        "engine": {"$ref": "common.v1.json#/$defs/engine_name"},
+        "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/log_id"}]},
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+        "tool": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[\\x20-\\x7e]+$", "not": {"pattern": "[\\r\\n]"}},
+        "input_json": {"type": "string", "pattern": "^[\\x20-\\x7e]*$", "not": {"pattern": "[\\r\\n]"}},
+        "cwd": {"type": ["string", "null"], "minLength": 1, "pattern": "^[\\x20-\\x7e]+$", "not": {"pattern": "[\\r\\n]"}}
+      }
+    },
+    "plugin_effect": {
+      "description": "A plugin asked to carry out an effect: the 'csl-effect/vNext' object the approval gate already checks (plugin_security/approval.py). scope names the account, venue, contract family, adapter and environment, so a paper effect and a live one have different digests. amount_minor is in whole minor units of currency. payload is the plugin's own data; the core never interprets it and draws it only as the canonical bytes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "kind", "plugin_id", "run_id", "connection", "scope", "currency", "amount_minor", "payload"],
+      "properties": {
+        "schema": {"const": "csl-effect/vNext"},
+        "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$", "not": {"pattern": "[\\r\\n]"}},
+        "plugin_id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{1,63}$", "not": {"pattern": "[\\r\\n]"}},
+        "run_id": {"type": "string", "minLength": 1},
+        "connection": {"type": "string", "minLength": 1},
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["account", "venue", "contract_family", "adapter", "environment"],
+          "properties": {
+            "account": {"type": "string", "minLength": 1},
+            "venue": {"type": "string", "minLength": 1},
+            "contract_family": {"type": "string", "minLength": 1},
+            "adapter": {"type": "string", "minLength": 1},
+            "environment": {"type": "string", "minLength": 1}
+          }
+        },
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$", "not": {"pattern": "[\\r\\n]"}},
+        "amount_minor": {"type": "integer", "minimum": 0},
+        "payload": {"type": "object"}
+      }
+    },
+    "binding": {
+      "description": "PRIVATE. Never sent to any client and never written to the event log. What the daemon keeps so that an answer reaches the right pending request of the right engine: the approval, the run, and the engine's own id for its permission request. A driver answers the engine only through this binding; engine output can neither open nor answer an approval. No credential appears here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approval_id", "run_id", "engine", "engine_request_id", "bound_at"],
+      "properties": {
+        "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+        "engine": {"$ref": "common.v1.json#/$defs/engine_name"},
+        "engine_request_id": {"type": "string", "minLength": 1, "maxLength": 256, "not": {"pattern": "[\\r\\n]"}},
+        "bound_at": {"$ref": "common.v1.json#/$defs/timestamp"}
+      }
+    }
+  }
+}

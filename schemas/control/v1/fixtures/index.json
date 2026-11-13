@@ -2,6 +2,195 @@
   "about": "Every fixture of this folder. A file under good/ must validate against 'schema'. A file under bad/ must be refused, and 'rule' says which rule it breaks; 'expect' names the schema keyword that refuses it and the place in the fixture where it does (a JSON Pointer, '' for the whole value). Files named c* were captured from the daemon by capture_today.py; files named h* and b* were written by hand.",
   "fixtures": [
     {
+      "file": "good/approval.v1/h01-tool-call-pending-shown-on-the-terminal.json",
+      "schema": "approval.v1.json",
+      "shows": "An engine asked to run a command. One surface has shown it; nobody has answered."
+    },
+    {
+      "file": "good/approval.v1/h02-tool-call-approved.json",
+      "schema": "approval.v1.json",
+      "shows": "The owner approved it on the surface that showed it."
+    },
+    {
+      "file": "good/approval.v1/h03-tool-input-with-text-outside-ascii.json",
+      "schema": "approval.v1.json",
+      "shows": "A tool input that holds accented text and a fraction. input_json carries it as an escaped JSON string, so the effect still fits the restricted canonical form."
+    },
+    {
+      "file": "good/approval.v1/h04-plugin-effect-pending.json",
+      "schema": "approval.v1.json",
+      "shows": "A plugin asked to carry out an effect. The effect is the gate's own canonical object; it belongs to no turn."
+    },
+    {
+      "file": "good/approval.v1/h05-expired-unanswered.json",
+      "schema": "approval.v1.json",
+      "shows": "Nobody answered before the deadline. Expired means denied; nobody is recorded as having answered."
+    },
+    {
+      "file": "good/approval.v1/h06-vetoed-plugin-effect.json",
+      "schema": "approval.v1.json",
+      "shows": "The owner refused a plugin effect. A veto is final for that digest."
+    },
+    {
+      "file": "good/approval.v1/h07-consumed.json",
+      "schema": "approval.v1.json",
+      "shows": "An approved effect was carried out. It can never be used again."
+    },
+    {
+      "file": "good/approval.v1/h08-denied-from-a-paired-phone.json",
+      "schema": "approval.v1.json",
+      "shows": "Two surfaces showed it; the answer came from the phone."
+    },
+    {
+      "file": "good/approval.v1/h09-private-binding.json",
+      "schema": "approval.v1.json#/$defs/binding",
+      "shows": "What the daemon keeps to route the answer to the engine's own pending request. Never sent."
+    },
+    {
+      "file": "bad/approval.v1/b01-pending-with-an-answer.json",
+      "schema": "approval.v1.json",
+      "rule": "A 'pending' request has no answer yet.",
+      "expect": {
+        "keyword": "type",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b02-approved-by-nobody.json",
+      "schema": "approval.v1.json",
+      "rule": "An 'approved' request names who approved it.",
+      "expect": {
+        "keyword": "type",
+        "at": "/answered_by"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b03-answered-by-a-session-token.json",
+      "schema": "approval.v1.json",
+      "rule": "An engine acting with a session token can never answer an approval.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answered_by/kind"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b04-answered-by-a-plugin.json",
+      "schema": "approval.v1.json",
+      "rule": "A plugin can never answer an approval.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answered_by/kind"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b05-denied-but-recorded-as-approve.json",
+      "schema": "approval.v1.json",
+      "rule": "A 'denied' request carries the answer 'deny'.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b06-tool-input-as-an-object.json",
+      "schema": "approval.v1.json",
+      "rule": "A tool's input rides in input_json, the exact string the digest binds, not as a loose object.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/effect"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b07-input-json-with-a-raw-accent.json",
+      "schema": "approval.v1.json",
+      "rule": "input_json is printable ASCII: text outside it is written as a \\u escape.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/effect/input_json"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b08-display-entry-without-its-trust.json",
+      "schema": "approval.v1.json",
+      "rule": "Every display entry says whether it is trusted.",
+      "expect": {
+        "keyword": "required",
+        "at": "/display/0"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b09-an-id-the-core-did-not-mint.json",
+      "schema": "approval.v1.json",
+      "rule": "An approval id starts with 'apr-': an engine's own request id is not one.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/approval_id"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b10-a-digest-form-nobody-defined.json",
+      "schema": "approval.v1.json",
+      "rule": "A new canonical form is a new name in the schema, never a silent change.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/digest_form"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b11-a-device-token-in-the-record.json",
+      "schema": "approval.v1.json",
+      "rule": "No credential appears in an approval.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/approval.v1/b12-expired-with-an-answer.json",
+      "schema": "approval.v1.json",
+      "rule": "An 'expired' request was answered by nobody.",
+      "expect": {
+        "keyword": "type",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b13-a-fraction-of-a-minor-unit.json",
+      "schema": "approval.v1.json",
+      "rule": "A plugin effect is in whole minor units.",
+      "expect": {
+        "keyword": "type",
+        "at": "/effect/amount_minor"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b14-a-tool-call-of-no-run.json",
+      "schema": "approval.v1.json",
+      "rule": "An engine tool call always belongs to a run.",
+      "expect": {
+        "keyword": "type",
+        "at": "/run_id"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b15-a-surface-nobody-defined.json",
+      "schema": "approval.v1.json",
+      "rule": "A request is shown by the CLI, the terminal client, the page or the phone page.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/opened_by/0/surface"
+      }
+    },
+    {
+      "file": "bad/approval.v1/b16-binding-carrying-a-secret.json",
+      "schema": "approval.v1.json#/$defs/binding",
+      "rule": "The private binding holds ids only.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
       "file": "good/common.v1/h01-cursor-before-the-first-event.json",
       "schema": "common.v1.json#/$defs/cursor",
       "shows": "A cursor that has read nothing yet: seq 0."
@@ -119,6 +308,174 @@
       "expect": {
         "keyword": "type",
         "at": "/connection"
+      }
+    },
+    {
+      "file": "good/driver.v2/h01-one-turn-driver.json",
+      "schema": "driver.v2.json",
+      "shows": "Today's path as a version 2 driver: one prompt, input closed, read to the result. Every flag is false."
+    },
+    {
+      "file": "good/driver.v2/h02-a-driver-with-a-worker.json",
+      "schema": "driver.v2.json",
+      "shows": "A driver that keeps a worker between turns, takes input mid-turn, and bridges permission prompts. It cannot fork."
+    },
+    {
+      "file": "good/driver.v2/h03-resume-only.json",
+      "schema": "driver.v2.json",
+      "shows": "A driver that can resume a conversation in a new run but keeps no worker."
+    },
+    {
+      "file": "good/driver.v2/h04-input-user-message.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "shows": "One input of a turn."
+    },
+    {
+      "file": "good/driver.v2/h05-input-approval-answer.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "shows": "The core's answer to the engine's own permission request."
+    },
+    {
+      "file": "good/driver.v2/h06-input-close.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "shows": "End the worker's input."
+    },
+    {
+      "file": "good/driver.v2/h07-start.json",
+      "schema": "driver.v2.json#/$defs/start",
+      "shows": "What start is given. The environment is handed over separately and is in no record."
+    },
+    {
+      "file": "good/driver.v2/h08-handle.json",
+      "schema": "driver.v2.json#/$defs/handle",
+      "shows": "What start gives back, before the engine has reported its own session id."
+    },
+    {
+      "file": "good/driver.v2/h09-draft-usage.json",
+      "schema": "driver.v2.json#/$defs/event_draft",
+      "shows": "A draft from parse: a usage payload exactly as event.v1 has it."
+    },
+    {
+      "file": "good/driver.v2/h10-draft-engine-output.json",
+      "schema": "driver.v2.json#/$defs/event_draft",
+      "shows": "A draft from parse: a span of output."
+    },
+    {
+      "file": "good/driver.v2/h11-refusal-before-any-side-effect.json",
+      "schema": "driver.v2.json#/$defs/refusal",
+      "shows": "A fork asked of a driver that cannot fork. Nothing happened before this answer."
+    },
+    {
+      "file": "good/driver.v2/h12-fork-at-a-turn.json",
+      "schema": "driver.v2.json#/$defs/fork",
+      "shows": "What fork takes."
+    },
+    {
+      "file": "bad/driver.v2/b01-a-flag-left-out.json",
+      "schema": "driver.v2.json",
+      "rule": "Every flag is always present: an absent flag is not false.",
+      "expect": {
+        "keyword": "required",
+        "at": "/flags"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b02-a-flag-nobody-defined.json",
+      "schema": "driver.v2.json",
+      "rule": "A new capability is a new flag in the schema.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/flags"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b03-mid-turn-input-without-a-worker.json",
+      "schema": "driver.v2.json",
+      "rule": "Input in the middle of a turn needs a worker that keeps its input open.",
+      "expect": {
+        "keyword": "const",
+        "at": "/flags/multi_turn"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b04-contract-version-one.json",
+      "schema": "driver.v2.json",
+      "rule": "This is the declaration of a version 2 driver.",
+      "expect": {
+        "keyword": "const",
+        "at": "/driver"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b05-input-of-a-kind-nobody-defined.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "rule": "send takes a user message, an approval answer, or close.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/kind"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b06-an-answer-that-is-not-approve-or-deny.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "rule": "The engine gets 'approve' or 'deny' and nothing else.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/decision"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b07-a-user-message-of-no-turn.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "rule": "Every user message belongs to a turn.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/b08-close-with-text.json",
+      "schema": "driver.v2.json#/$defs/input",
+      "rule": "close carries nothing.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/b09-a-driver-drafting-an-approval-request.json",
+      "schema": "driver.v2.json#/$defs/event_draft",
+      "rule": "A driver never drafts an approval request: it asks the approval queue, and the core writes the event.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b10-draft-usage-unknown-as-zero.json",
+      "schema": "driver.v2.json#/$defs/event_draft",
+      "rule": "A draft payload obeys event.v1: unknown is null, never 0.",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/output_tokens"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b11-start-carrying-the-environment.json",
+      "schema": "driver.v2.json#/$defs/start",
+      "rule": "The environment is never in a record.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/b12-a-refusal-with-another-code.json",
+      "schema": "driver.v2.json#/$defs/refusal",
+      "rule": "A missing capability is refused 'unsupported'.",
+      "expect": {
+        "keyword": "const",
+        "at": "/code"
       }
     },
     {
@@ -471,6 +828,127 @@
       "expect": {
         "keyword": "enum",
         "at": "/source"
+      }
+    },
+    {
+      "file": "good/mcp.task.v1/h01-working.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A turn in progress."
+    },
+    {
+      "file": "good/mcp.task.v1/h02-input-required.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "An approval is pending: a person must answer it on a surface that draws approvals."
+    },
+    {
+      "file": "good/mcp.task.v1/h03-completed.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The turn ended with a result."
+    },
+    {
+      "file": "good/mcp.task.v1/h04-failed.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The turn failed with a typed code."
+    },
+    {
+      "file": "good/mcp.task.v1/h05-cancelled-after-a-confirmed-stop.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The Stop was confirmed. 'cancelled' is never shown before that."
+    },
+    {
+      "file": "good/mcp.task.v1/h06-working-with-a-stop-pending.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A cancel was asked and the Stop is not confirmed: still working, with cancel_requested true."
+    },
+    {
+      "file": "good/mcp.task.v1/h07-run-started-with-run-start.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "Work started with run.start: the Task id is the run id and there is no turn."
+    },
+    {
+      "file": "good/mcp.task.v1/h08-run-that-failed-to-start.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A run whose start failed."
+    },
+    {
+      "file": "bad/mcp.task.v1/b01-completed-without-a-result.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A 'completed' Task carries its result.",
+      "expect": {
+        "keyword": "type",
+        "at": "/result"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b02-cancelled-with-the-cancel-still-pending.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "'cancelled' is shown only after the Stop is confirmed.",
+      "expect": {
+        "keyword": "const",
+        "at": "/cancel_requested"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b03-input-required-with-no-approval.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "'input_required' names the approval that is pending.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/pending_approval_ids"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b04-working-with-a-result.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task that is still working has no result.",
+      "expect": {
+        "keyword": "type",
+        "at": "/result"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b05-failed-with-no-code.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A 'failed' Task says why, with a typed code.",
+      "expect": {
+        "keyword": "type",
+        "at": "/result/code"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b06-a-status-nobody-defined.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A pending cancel is the flag cancel_requested, not a status.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/status"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b07-a-turn-task-with-no-turn.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task derived from a turn names the turn.",
+      "expect": {
+        "keyword": "type",
+        "at": "/of/turn_id"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b08-completed-with-an-error-code.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A result with a code is a failure, not 'completed'.",
+      "expect": {
+        "keyword": "type",
+        "at": "/result/code"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b09-an-approval-answer-in-a-task.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "An approval is never answered through a Task.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
       }
     },
     {
@@ -1117,6 +1595,127 @@
       "expect": {
         "keyword": "required",
         "at": ""
+      }
+    },
+    {
+      "file": "good/transcript.line.v1/h01-engine-output.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for an engine.output event: the payload's text, sanitised, still untrusted, nothing announced."
+    },
+    {
+      "file": "good/transcript.line.v1/h02-state-changed.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for a state.changed event: state is the event's 'to'."
+    },
+    {
+      "file": "good/transcript.line.v1/h03-turn-started.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for a turn.started event: the input as sent."
+    },
+    {
+      "file": "good/transcript.line.v1/h04-approval-requested-moves-focus.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for an approval.requested event. Only this line, from the core, moves focus to the approval."
+    },
+    {
+      "file": "good/transcript.line.v1/h05-tool-call.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for a tool.call event: a sentence the core's renderer wrote from typed fields; still untrusted because the name came from the engine."
+    },
+    {
+      "file": "good/transcript.line.v1/h06-stop-result-pending.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for a stop.result event: state is its code, and the condition is announced."
+    },
+    {
+      "file": "good/transcript.line.v1/h07-replay-gap.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "The line for a replay.gap event."
+    },
+    {
+      "file": "good/transcript.line.v1/h08-usage-with-no-text.json",
+      "schema": "transcript.line.v1.json",
+      "shows": "A line may have no text: the event is in the transcript, and a plain reader prints nothing for it."
+    },
+    {
+      "file": "bad/transcript.line.v1/b01-engine-text-marked-trusted.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "A line whose content came from an engine is untrusted.",
+      "expect": {
+        "keyword": "const",
+        "at": "/trust"
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b02-engine-output-that-takes-the-approval-focus.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "Only an approval.requested line moves focus to the approval.",
+      "expect": {
+        "keyword": "const",
+        "at": "/event_type"
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b03-an-approval-request-from-an-engine.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "An approval.requested line comes from the core, trusted, or it is not one.",
+      "expect": {
+        "keyword": "const",
+        "at": "/source"
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b04-a-state-on-a-line-that-reports-none.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "state is null unless the event reports a state.",
+      "expect": {
+        "keyword": "type",
+        "at": "/state"
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b05-state-changed-without-its-state.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "A state.changed line carries the new state.",
+      "expect": {
+        "keyword": "type",
+        "at": "/state"
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b06-a-negative-time.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "time_rel_ms counts up from the first event of the log.",
+      "expect": {
+        "keyword": "minimum",
+        "at": "/time_rel_ms"
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b07-the-wire-events-field-names.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "The transcript is a projection: it has time_rel_ms and event_type, not the event's time and type.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b08-engine-output-with-no-text.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "An engine.output line carries the payload's text.",
+      "expect": {
+        "keyword": "type",
+        "at": "/text"
+      }
+    },
+    {
+      "file": "bad/transcript.line.v1/b09-a-focus-nobody-defined.json",
+      "schema": "transcript.line.v1.json",
+      "rule": "focus is one of the listed places, or null.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/focus"
       }
     }
   ]

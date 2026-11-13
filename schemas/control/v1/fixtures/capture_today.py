@@ -38,13 +38,19 @@ class Capture(tc.ComposedDaemonTest):
         pass
 
 
-def capture(out_dir: Path) -> dict[str, object]:
+def capture(out_dir: Path, with_exchanges: bool = False) -> dict[str, object]:
     case = Capture('runTest')
     case.setUp()
     files: dict[str, object] = {}
     try:
         daemon, composed = case.boot(confirm_timeout_s=0.3)
         api = case.api(composed)
+
+        def exchange(name, method, params, socket=None):
+            """One request and its whole answer, kept as a fixture of the method table."""
+            answer = (socket or api).call(method, params)
+            files[f'good/methods.v1/{name}.json'] = {'method': method, 'params': params, 'answer': answer}
+            return answer
 
         def status(run_id):
             return api.call('run.status', {'run_id': run_id})['run']
@@ -102,6 +108,32 @@ def capture(out_dir: Path) -> dict[str, object]:
         files['good/run.view.v1/c08-status-start-failed.json'] = status(refused['run_id'])
         files['good/run.record.v1/c05-start-failed.json'] = stored(refused['run_id'])
 
+        # Whole exchanges of the six methods the daemon answers today, refusals included. They are fixtures of
+        # the method table, which is not in this folder yet: capture them only when asked (--with-exchanges).
+        keyed = {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1', 'client_key': 'capture-2'}
+        if not with_exchanges:
+            exchange = lambda name, method, params: api.call(method, params)  # noqa: E731 - same calls, nothing kept
+        run_x = exchange('c01-run-start-started', 'run.start', keyed)['run']['run_id']
+        exchange('c02-run-start-same-key-again', 'run.start', keyed)
+        exchange('c03-run-start-key-reused-for-another-prompt', 'run.start', dict(keyed, prompt='another prompt'))
+        exchange('c04-run-start-no-route-for-the-engine', 'run.start', {'tenant': 't1', 'engine': 'pi', 'prompt': 'x'})
+        exchange('c05-run-start-without-a-prompt', 'run.start', {'tenant': 't1', 'engine': 'claude_code'})
+        assert tc.until(lambda: (status(run_x).get('output') or {}).get('lines'))
+        exchange('c06-run-status', 'run.status', {'run_id': run_x})
+        exchange('c07-run-status-of-no-run', 'run.status', {'run_id': 'run-none'})
+        exchange('c08-run-status-without-a-run-id', 'run.status', {})
+        exchange('c09-run-list-one-page', 'run.list', {'limit': 2})
+        exchange('c10-run-list-after-an-unknown-run', 'run.list', {'after': 'run-none'})
+        exchange('c11-run-list-limit-out-of-range', 'run.list', {'limit': 0})
+        case.units.stubborn.add(unit(run_x))
+        exchange('c12-run-stop-pending', 'run.stop', {'run_id': run_x})
+        case.units.stubborn.clear()
+        exchange('c13-run-stop-stopped', 'run.stop', {'run_id': run_x})
+        exchange('c14-run-stop-of-no-run', 'run.stop', {'run_id': 'run-none'})
+        exchange('c15-route-list', 'route.list', {})
+        exchange('c16-plugin-list', 'plugin.list', {})
+        exchange('c17-a-method-the-daemon-does-not-know', 'run.kill', {})
+
         # A unit the manager can no longer observe is never reported running.
         run_d = case.start(api)
         proc = case.units.procs.pop(unit(run_d))
@@ -135,9 +167,11 @@ def capture(out_dir: Path) -> dict[str, object]:
 
 
 def main(argv: list[str]) -> int:
-    out_dir = Path(argv[1]) if len(argv) > 1 else HERE
+    with_exchanges = '--with-exchanges' in argv
+    paths = [arg for arg in argv[1:] if not arg.startswith('--')]
+    out_dir = Path(paths[0]) if paths else HERE
     try:
-        written = capture(out_dir)
+        written = capture(out_dir, with_exchanges)
     except unittest.SkipTest as skipped:
         print(f'not captured: {skipped}')
         return 2

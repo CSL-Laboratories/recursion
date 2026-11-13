@@ -1,0 +1,17 @@
+{
+  "type": "usage",
+  "payload": {
+    "connection_id": "subscription:personal-max",
+    "model": "claude-sonnet-5-5",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": 1824,
+    "output_tokens": 356,
+    "reasoning_tokens": null,
+    "cache_read_tokens": 15200,
+    "cache_write_tokens": 0,
+    "cost_usd": null,
+    "quality": "known",
+    "provenance": "observed"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "engine": "codex",
+  "driver": 2,
+  "flags": {
+    "multi_turn": false,
+    "mid_turn_input": false,
+    "interrupt": false,
+    "resume": true,
+    "fork": false,
+    "permission_bridge": false,
+    "typed_limits": false,
+    "usage": true
+  }
+}

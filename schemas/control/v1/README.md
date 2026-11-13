@@ -22,11 +22,23 @@ Nothing here adds behaviour to the daemon. The first drafts describe what the da
 | `stop.result.v1.json` | public | What a Stop answers: `stopped` or `pending`, with the evidence. | control API | STOP, CONTROL, TUI, PAGE, MCP |
 | `session.v1.json` | public and storage | One session and its turns. | SESSIONS | SESSIONS, TUI, PAGE, MCP, DRIVER-CC, DRIVER-CX |
 | `queue.item.v1.json` | public and storage | One queued message of a session. | SESSIONS | SESSIONS, TUI, PAGE |
-| `event.v1.json` | public and storage | One event of a session's log, with one payload shape per type. | EVENTS and every lane that emits | EVENTS, DRIVER-CC, DRIVER-CX, APPROVALS, QUOTA, TUI, PAGE, MCP, STOP |
+| `event.v1.json` | public and storage | One event of a session's log, with one payload shape per type. | EVENTS and every lane that emits | EVENTS, DRIVER-CC, DRIVER-CX, APPROVALS, QUOTA, ROUTING, WORKSPACE, LOOP, TUI, PAGE, MCP, STOP |
+| `approval.v1.json` | public | One approval request as a client reads it, and (described, never sent) the daemon's private binding to the engine's own request. | APPROVALS | APPROVALS, DRIVER-CC, DRIVER-CX, TUI, PAGE, PLUGIN-HOST |
+| `driver.v2.json` | internal | What an engine driver declares (its flags), what `send` takes, what `start` gives back, and the event drafts `parse` returns. | each engine lane | DRIVER-CC, DRIVER-CX, LOOP, SESSIONS |
+| `mcp.task.v1.json` | public | An MCP Task, derived from a turn or a run at the moment it is asked for. | MCP | MCP |
+| `transcript.line.v1.json` | public | One line of a session's transcript: a projection of an event for a linear reader. | EVENTS (projection), TUI | TUI, EVENTS |
 
-Still to come in this folder: `methods.v1`, `approval.v1`, `driver.v2`, `mcp.task.v1`,
-`transcript.line.v1`, `session.token.v1`; and under `schemas/plugin/v1/` the plugin manifest and
-`install.json`.
+Still to come in this folder: `methods.v1` (the method table) and `session.token.v1`. The plugin
+manifest and `install.json` are under `schemas/plugin/v1/`.
+
+**Not yet folded in.** The build plan was revised while these drafts were being written, and a second
+cross-family read of the plan made further points about the records. Draft 1 does not have them yet:
+on the run record a `cgroup_identity`, a `launch_manifest` and an `owner`; on the Stop result a third
+answer, `ended`, and a fence fact; on `usage` separate quality and provenance for tokens and for cost;
+`bucket` on `limit`; an `outcome` on `turn.ended`; a `route.decision` payload of chosen, reason,
+candidates and hand pick; `rendered` lines on an approval; what `approval.requested` carries so that a
+log can be replayed without a lookup; an `effect.outcome_unknown` event type; and how a surface is
+recorded as having shown an approval. Each will be a `1.0-draft.2` with its line in `CHANGES.md`.
 
 `fixtures/good/<schema>/` holds records that must validate; `fixtures/bad/<schema>/` holds records
 that must be refused. `fixtures/index.json` lists every one and says what it shows, or which rule it
@@ -69,7 +81,10 @@ the bad fixtures show both.
 
 - **Closed.** Every object lists its properties and refuses any other. Consumer data never rides in an
   untyped `payload`, `labels` or `metadata`. If you need a field, a type or a code, ask lane SPINE
-  (through the Liaison); do not add it yourself.
+  (through the Liaison); do not add it yourself. Four objects are open on purpose, because they hold an
+  engine's, an adapter's or a plugin's own data that no consumer reads typed fields out of: a tool
+  call's `input`, the route result's `events[].data` and `limit_notice` in the run view, and a plugin
+  effect's `payload`. The conformance client lists them and fails if another appears.
 - **Present, with null.** In the records that are new in version 1, every field is always present and
   uses `null` for "none". The one exception is `run.record.v1`, whose additions are absent or have a
   value, because records written before version 1 do not have them.
@@ -100,6 +115,11 @@ show up as a failing fixture, not as a surprise.
 | `causation_id` is a loose reference | `event.v1.json` | It may be tightened to a command id or a sequence number |
 | Money (`cost_usd`, `cap_usd`) is a JSON number | `event.v1.json`, `common.v1.json` | One vault record proposes whole numbers only. QUOTA confirms |
 | The kinds of `principal` | `common.v1.json` | Lane CONTROL owns scopes and may add a kind |
+| An engine tool's input rides in the approval's effect as `input_json`, an escaped JSON string | `approval.v1.json` | The recommended canonical form takes ASCII text and whole numbers only, and tool inputs hold any text and any number. This keeps one canonical form. The alternative is a second form for engine effects. It goes with the digest decision |
+| `surface` (who showed an approval) is `cli`, `tui`, `page` or `phone` | `approval.v1.json` | APPROVALS confirms; how a surface is recorded as having shown a request is not in draft 1 |
+| The transcript's `state`, `speech` and `focus` | `transcript.line.v1.json` | Lane SPINE wrote their meanings from the contract's one sentence. TUI owns them |
+| The Task's `expires_at`, `poll_interval_ms` and the status derived for `unknown` and `lost_reboot` runs | `mcp.task.v1.json` | MCP confirms against the protocol versions it speaks |
+| `driver.v2`: the shapes of `start`, `handle` and `fork` | `driver.v2.json` | DRIVER-CC lands the interface; these are its data |
 | Id prefixes for new records | `common.v1.json` | Firm unless a consumer objects before the first slice lands |
 
 What will not move without a new major version: the twelve stored run fields; the fields and states

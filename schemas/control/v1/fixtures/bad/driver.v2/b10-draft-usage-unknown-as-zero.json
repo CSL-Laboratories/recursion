@@ -1,0 +1,17 @@
+{
+  "type": "usage",
+  "payload": {
+    "connection_id": "subscription:personal-max",
+    "model": null,
+    "bucket": null,
+    "span": "turn",
+    "input_tokens": null,
+    "output_tokens": 0,
+    "reasoning_tokens": null,
+    "cache_read_tokens": null,
+    "cache_write_tokens": null,
+    "cost_usd": null,
+    "quality": "unknown",
+    "provenance": "unavailable"
+  }
+}

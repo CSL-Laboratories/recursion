@@ -47,27 +47,61 @@ class PublishedFilesTest(unittest.TestCase):
                     schemas.resolve(ref, base=name)
 
     def test_every_object_schema_is_closed(self):
-        """An object that lists properties and has no parent to close it says additionalProperties."""
-        def walk(node, path, closed_by_parent):
+        """An object schema that lists properties refuses every other property.
+
+        It does so itself (``additionalProperties``), or in every one of its forms: each branch of its
+        ``oneOf``, or each ``then`` of the ``if`` rules in its ``allOf``. A sub-schema inside a rule
+        (``allOf``, ``if``, ``then``, ``else``, ``not``) refines an object that is closed where it is
+        defined, so it is not asked again. Seven objects are open on purpose and are listed here, each with its reason
+        in the schema: they hold an engine's, a vendor's or a plugin's own data, and no consumer reads
+        typed fields out of them.
+        """
+        open_on_purpose = {
+            ("event.v1.json", "/properties/payload"),                     # typed per type by the rules below it
+            ("event.v1.json", "/$defs/tool.call/properties/input"),       # the tool's own input, untrusted
+            ("run.view.v1.json", "/$defs/result/oneOf/1/properties/events/items/properties/data"),  # the adapter's
+            ("run.view.v1.json", "/$defs/result/oneOf/1/properties/limit_notice"),                  # the adapter's
+            ("approval.v1.json", "/properties/effect"),                   # typed per source by the rules below it
+            ("approval.v1.json", "/$defs/plugin_effect/properties/payload"),  # the plugin's own data, never read
+            ("driver.v2.json", "/$defs/event_draft/properties/payload"),  # typed per type by the rules below it
+        }
+        rules = ("allOf", "if", "then", "else", "not")
+
+        def is_object(node):
+            types = node.get("type")
+            return types == "object" or (isinstance(types, list) and "object" in types)
+
+        def closes_itself(node):
+            if "additionalProperties" in node:
+                return True
+            branches = node.get("oneOf")
+            if branches and all(isinstance(b, dict) and "additionalProperties" in b for b in branches):
+                return True
+            ifs = [rule for rule in node.get("allOf", ()) if isinstance(rule, dict) and "if" in rule]
+            return bool(ifs) and all("additionalProperties" in rule.get("then", {}) for rule in ifs)
+
+        def walk(node, path, refining):
             if isinstance(node, dict):
-                types = node.get("type")
-                is_object = types == "object" or (isinstance(types, list) and "object" in types)
-                if is_object and "properties" in node and "additionalProperties" not in node and not closed_by_parent:
+                if is_object(node) and not refining and not closes_itself(node):
                     yield path
                 for key, value in node.items():
-                    # Sub-schemas under allOf/if/then/else/oneOf/anyOf refine an object their parent closes.
-                    inside = key in ("allOf", "anyOf", "oneOf", "if", "then", "else", "not") or closed_by_parent and key != "properties"
-                    yield from walk(value, f"{path}/{key}", inside)
+                    if key in ("properties", "$defs") and isinstance(value, dict):
+                        for name, sub in value.items():
+                            yield from walk(sub, f"{path}/{key}/{name}", refining and key != "$defs")
+                    else:
+                        yield from walk(value, f"{path}/{key}", refining or key in rules)
             elif isinstance(node, list):
                 for i, item in enumerate(node):
-                    yield from walk(item, f"{path}/{i}", closed_by_parent)
+                    yield from walk(item, f"{path}/{i}", refining)
 
+        seen = set()
         for schemas in self.sets.values():
             for name, schema in schemas.schemas.items():
-                # "result" in run.view.v1 closes each of its two forms inside oneOf; its parent lists the shared keys.
-                open_objects = [path for path in walk(schema, "", False)
-                                if not (name == "run.view.v1.json" and path == "/$defs/result")]
-                self.assertEqual(open_objects, [], f"{name}: object schemas that are not closed")
+                found = {(name, path) for path in walk(schema, "", False)}
+                seen |= found
+                self.assertEqual(sorted(found - open_on_purpose), [], f"{name}: object schemas that are not closed")
+        if any("event.v1.json" in s.schemas for s in self.sets.values()):
+            self.assertEqual(sorted(open_on_purpose - seen), [], "listed as open on purpose but not found: update the list")
 
     def test_index_and_fixture_folders_list_the_same_files(self):
         for folder, schemas in self.sets.items():

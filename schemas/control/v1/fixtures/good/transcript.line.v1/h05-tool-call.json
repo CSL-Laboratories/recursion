@@ -1,0 +1,11 @@
+{
+  "seq": 4,
+  "time_rel_ms": 2210,
+  "event_type": "tool.call",
+  "source": "engine",
+  "trust": "untrusted",
+  "state": null,
+  "text": "tool call: Bash",
+  "speech": null,
+  "focus": null
+}

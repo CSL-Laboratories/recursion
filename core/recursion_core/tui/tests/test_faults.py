@@ -22,6 +22,13 @@ def wait_for(cond, timeout: float = 3.0) -> bool:
     return False
 
 
+def _list_answer_applied(app: TuiApp, before_seq: int) -> bool:
+    """True once the run.list answer event is logged, which is after the snapshot decision."""
+
+    latest = app.log.latest("answer")
+    return latest is not None and latest.seq > before_seq and latest.text.startswith("answer run.list")
+
+
 class _HoldReads(RecordingAPI):
     """Completes one armed read, then holds that answer so a Stop can land before it is applied."""
 
@@ -296,6 +303,77 @@ class LoopSurvivesBadInputTest(unittest.TestCase):
         self.assertTrue(wait_for(lambda: api.saw("run.start") or any("watch_only" in err for err in app.errors)))
         self.assertFalse(api.saw("run.start"))
         self.assertEqual([r.get("run_id") for r in app.runs], ["r"])
+
+    def test_a_dict_row_without_a_string_run_id_on_the_loop_keeps_the_snapshot(self) -> None:
+        # Same fail-open on the threaded Loop: an all-dict run.list with no non-empty string
+        # run_id (or no string state) replaced the snapshot and the next Start was dispatched.
+        run = {"run_id": "r", "state": "running", "engine": "e", "tenant": "t"}
+        shapes = (
+            [{}],
+            [{"state": "running"}],
+            [{"run_id": None}],
+            [{"run_id": "other"}, {}],
+            [{"run_id": "other", "state": None}],
+            [{"run_id": "", "state": "running"}],
+        )
+
+        class API:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self._lock = threading.Lock()
+                self.rows: list = [dict(run)]
+
+            def call(self, method, params=None):
+                with self._lock:
+                    self.calls.append(method)
+                    rows = self.rows
+                if method == "run.list":
+                    return {"code": "ok", "runs": rows}
+                if method == "run.start":
+                    return {"code": "started", "run": {**run, "run_id": "new", "state": "running"}}
+                return {"code": "ok", "run": dict(run)}
+
+            def count(self, method: str) -> int:
+                with self._lock:
+                    return self.calls.count(method)
+
+            def set_rows(self, rows) -> None:
+                with self._lock:
+                    self.rows = rows
+
+        api = API()
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"}, width=80, height=24)
+        loop = Loop(app, api)
+        loop.start()
+        self.addCleanup(loop.shutdown)
+        self.assertTrue(wait_for(lambda: [r.get("run_id") for r in app.runs] == ["r"]))
+        for rows in shapes:
+            with self.subTest(rows=rows):
+                self.assertTrue(wait_for(lambda: app.in_flight["run.list"] == 0 and app.in_flight["run.start"] == 0))
+                app.runs = [dict(run)]
+                app.selected = "r"
+                app.mode, app.line = "keys", ""
+                app.refresh_failed = "earlier read failed"
+                app.list_stale = False
+                api.set_rows(rows)
+                before = app.log.last_seq
+                list_at = api.count("run.list")
+                start_at = api.count("run.start")
+                err_at = len(app.errors)
+                loop.press("r")
+                self.assertTrue(wait_for(lambda: _list_answer_applied(app, before) and app.in_flight["run.list"] == 0))
+                self.assertGreater(api.count("run.list"), list_at)
+                self.assertEqual([r.get("run_id") for r in app.runs], ["r"])
+                self.assertEqual(app.selected, "r")
+                self.assertEqual(app.refresh_failed, "run.list answered ok with a malformed run")
+                self.assertTrue(app.watch_only)
+                for key in ":start --tenant t1 --engine codex --prompt p":
+                    loop.press(key)
+                loop.press("enter")
+                self.assertTrue(wait_for(lambda: len(app.errors) > err_at or api.count("run.start") > start_at))
+                self.assertEqual(api.count("run.start"), start_at)
+                self.assertTrue(any("watch_only" in err for err in app.errors[err_at:]))
+                self.assertEqual([r.get("run_id") for r in app.runs], ["r"])
 
     def test_keyboard_interrupt_is_not_turned_into_a_dropped_answer(self) -> None:
         api = RecordingAPI(FakeDriver().api)

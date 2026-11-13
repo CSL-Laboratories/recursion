@@ -385,6 +385,52 @@ class StaleWatchOnlyTest(unittest.TestCase):
                 self.assertNotIn("run.start", api.calls)
                 self.assertIn("watch_only", app.errors[-1])
 
+    def test_a_dict_row_without_a_string_run_id_does_not_replace_the_snapshot(self) -> None:
+        # All-dict rows still committed: {}, {"state": "running"}, {"run_id": None}, and a mix of a
+        # real id with {}. The snapshot dropped run r, the refresh latch cleared, and Start ran.
+        run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}
+        shapes = (
+            [{}],
+            [{"state": "running"}],
+            [{"run_id": None}],
+            [{"run_id": "other"}, {}],
+            [{"run_id": "other", "state": None}],
+            [{"run_id": "", "state": "running"}],
+        )
+
+        class API:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.rows: list = [run]
+
+            def call(self, method: str, params: dict | None = None) -> dict:
+                self.calls.append(method)
+                if method == "run.list":
+                    return {"code": "ok", "runs": self.rows}
+                if method == "run.start":
+                    return {"code": "started", "run": {**run, "run_id": "new"}}
+                return {"code": "ok", "run": dict(run)}
+
+        api = API()
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        self.assertEqual([row["run_id"] for row in app.runs], ["r"])
+        for rows in shapes:
+            with self.subTest(rows=rows):
+                api.rows = rows
+                api.calls.clear()
+                app.runs = [dict(run)]
+                app.selected = "r"
+                app.refresh_failed = "earlier read failed"
+                app.request("run.list", {})
+                self.assertEqual([row.get("run_id") for row in app.runs], ["r"])
+                self.assertEqual(app.selected, "r")
+                self.assertEqual(app.refresh_failed, "run.list answered ok with a malformed run")
+                self.assertTrue(app.watch_only)
+                app.command("start --tenant t1 --engine codex --prompt p")
+                self.assertNotIn("run.start", api.calls)
+                self.assertIn("watch_only", app.errors[-1])
+
 
 class ErrorStaysTest(unittest.TestCase):
     def test_error_is_never_redrawn_away(self) -> None:

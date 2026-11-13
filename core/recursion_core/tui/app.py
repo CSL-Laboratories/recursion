@@ -38,6 +38,15 @@ CONDITION_ROWS = 4
 _TRUNCATED = "⟦truncated⟧"
 
 
+def _listed_run(row: object) -> bool:
+    """A run.list row may be committed only with a non-empty string id and a string state."""
+
+    if not isinstance(row, dict):
+        return False
+    run_id = row.get("run_id")
+    return isinstance(run_id, str) and bool(run_id) and isinstance(row.get("state"), str)
+
+
 def _fmt(params: Mapping) -> str:
     return " ".join(f"{k}={field(v)}" for k, v in sorted(params.items()))
 
@@ -193,9 +202,10 @@ class TuiApp:
         code = answer.get("code")
         if method == "run.list":
             runs = answer.get("runs")
-            # A non-dict row (null, a string) is not an empty snapshot. Filtering it out and
-            # committing the rest used to clear the latch and drop a live run, so Start ran.
-            if code == "ok" and isinstance(runs, list) and all(isinstance(r, dict) for r in runs):
+            # A row that is not a dict, or a dict without a non-empty string run_id and a string
+            # state, is not an empty snapshot. Committing it cleared the latch and dropped a live
+            # run, so Start ran. One bad row fails the whole list.
+            if code == "ok" and isinstance(runs, list) and all(_listed_run(r) for r in runs):
                 incoming = runs
                 merged, seen = [], set()
                 for run in incoming:

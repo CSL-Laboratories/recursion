@@ -202,6 +202,40 @@ class StopTest(unittest.TestCase):
         self.assertEqual(second["code"], a.STOPPED)
         self.assertEqual(kill.requests, ["/cg/r"])
 
+    def test_non_bool_requested_still_signals(self) -> None:
+        # Truthiness treated a stored "false" / "False" / "0" / 1.0 / "true" as already sent.
+        # An empty cgroup then answered stopped and request_stop was never called.
+        for requested in ("false", "False", "0", 1.0, "true"):
+            with self.subTest(requested=requested):
+                kill = FakeKillTree([EMPTY])
+                registry = self._plant({
+                    "requested": requested, "requested_at": 1.0, "checks": 0, "reason": None,
+                })
+                api, _, _, _ = make_api(kill, registry)
+                res = api.call("run.stop", {"run_id": "r"})
+                self.assertEqual(kill.requests, ["/cg/r"])
+                self.assertEqual((res["code"], res["state"]), (a.STOPPED, "stopped"))
+                self.assertIs(registry.get("r")["stop"]["requested"], True)
+
+    def test_non_bool_requested_is_stored_as_false_when_the_signal_fails(self) -> None:
+        # A failed send must not leave the registry string in place, or the next stop looks sent.
+        for requested in ("false", "False", "0", 1.0, "true"):
+            with self.subTest(requested=requested):
+                kill = FakeKillTree([EMPTY], request_error=PermissionError("denied"))
+                registry = self._plant({
+                    "requested": requested, "requested_at": 1.0, "checks": 0, "reason": None,
+                })
+                api, _, _, _ = make_api(kill, registry)
+                res = api.call("run.stop", {"run_id": "r"})
+                self.assertEqual(kill.requests, ["/cg/r"])
+                self.assertEqual((res["code"], res["reason"]), (a.PENDING, "cleanup_error:PermissionError"))
+                self.assertIs(registry.get("r")["stop"]["requested"], False)
+                kill.request_error = None
+                again = api.call("run.stop", {"run_id": "r"})
+                self.assertEqual(again["code"], a.STOPPED)
+                self.assertEqual(kill.requests, ["/cg/r", "/cg/r"])
+                self.assertIs(registry.get("r")["stop"]["requested"], True)
+
     def test_non_dict_stop_is_a_fresh_intent_and_stays_inside_call(self) -> None:
         kill = FakeKillTree([EMPTY])
         registry = self._plant(1)

@@ -35,9 +35,9 @@ record against the host after a restart is the CSL-738 startup sweep.
 Stop: the first call asks the cleanup layer to stop the run's tree, then asks it to confirm. Only a
 confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown answer or a
 cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
-pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested`` is
-missing or false: it was never recorded, it raised, or it is a stop intent from before the launch was
-recorded), in which case it sends it
+pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested``
+is not exactly True: it was never recorded, it raised, a non-bool was stored, or it is a stop intent
+from before the launch was recorded), in which case it sends it
 (``cgroup.kill`` and pidfd signals are safe to repeat).
 Reads never change state and never call the cleanup layer.
 
@@ -293,9 +293,9 @@ class ControlAPI:
         self._stop_wanted.discard(run_id)
         first = rec["state"] != "stop_pending"
         self._stop_record(rec)
-        if not rec["stop"]["requested"]:
-            # Missing or false: the cleanup request was not sent (absent field, a failed request, or a
-            # stop intent left during launch). (Re)send it.
+        if rec["stop"]["requested"] is not True:
+            # Only an exact True means the cleanup request was sent. Anything else (absent, False, or a
+            # non-bool such as the string "false") was not. (Re)send it.
             try:
                 self._kill.request_stop(rec["cgroup"])
             except Exception as err:
@@ -315,8 +315,9 @@ class ControlAPI:
     def _stop_record(self, rec: dict) -> dict:
         """The stop record on ``rec``, safe to update. A non-dict is a fresh unsent intent.
 
-        A missing ``requested`` means the cleanup request was not sent. A missing or non-integer
-        ``checks`` starts at 0, so a later increment cannot raise out of ``call``.
+        A missing or non-bool ``requested`` means the cleanup request was not sent, and is stored as
+        False. Only an exact True is kept. A missing or non-integer ``checks`` starts at 0, so a later
+        increment cannot raise out of ``call``.
         """
 
         stop = rec.get("stop")
@@ -324,8 +325,7 @@ class ControlAPI:
             stop = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
         else:
             stop = dict(stop)
-            if "requested" not in stop:
-                stop["requested"] = False
+            stop["requested"] = stop.get("requested") is True
             checks = stop.get("checks")
             if isinstance(checks, bool) or not isinstance(checks, int):
                 stop["checks"] = 0

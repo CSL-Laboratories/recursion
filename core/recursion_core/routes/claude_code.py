@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 
+from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter, scalar
 from recursion_core.routes.launch import child_env
@@ -58,6 +59,9 @@ API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_C
 # parent" (its own key comes from custody instead).
 CLAUDE_CREDENTIAL_ENV = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
 API_KEY_HELPER_STATES = ("absent", "present")
+# B20 (CSL-726): whether this claude build makes --bare the -p default, as reported by the surface from
+# bare_default.probe_auth_mode(). Unknown refuses; a documented opt-out is passed explicitly.
+BARE_DEFAULT_STATES = ("absent", "present", "unknown")
 # Passthrough route: the method the user picked gets its own variables for this run, and nothing else from
 # the daemon's environment (no other engine's key, no stray ANTHROPIC_API_KEY that would move the run to the
 # API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude Code's public docs (code.claude.com/docs/en/
@@ -119,6 +123,7 @@ class ClaudeCodeAdapter(RouteAdapter):
         self._binary = binary
 
     def argv(self, request: dict) -> list[str]:
+        self._run_label = None
         route = request["route"]
         kind = route["connection"]["kind"]
         bare = route.get("bare", False)
@@ -127,10 +132,16 @@ class ClaudeCodeAdapter(RouteAdapter):
         if bare and kind == "subscription":
             # --bare ignores the sign-in. API-key and other user-picked built-in methods may use it.
             raise c.RouteError(c.LAUNCH_REFUSED, "--bare ignores the sign-in: not on the subscription route")
+        auth_args = []
         if kind == "subscription":
+            # Every subscription launch goes through the measured-hash gate. Missing
+            # build or help refuses. A beta admission launches with no --bare and
+            # carries the beta label. Unknown is not an allow.
+            auth_args = self._subscription_auth_args(route)
             self._check_api_key_helper(route)
+            self._run_label = "beta"
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
-        return [self._binary, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
+        return [self._binary, *auth_args, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
                 "--output-format", "stream-json", "--verbose", "--model", route["model"]]
 
     def env(self, request: dict) -> dict[str, str]:
@@ -166,6 +177,27 @@ class ClaudeCodeAdapter(RouteAdapter):
                     env[name] = env[name].strip().lower()
             return env
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
+
+    @staticmethod
+    def _subscription_auth_args(route: dict) -> list[str]:
+        """Admit a subscription launch only through the measured-help gate.
+
+        Missing ``claude_build`` or ``help_text`` refuses. ``bare_default: absent``
+        does not launch and does not skip the beta label. A match returns no auth
+        flag: the measured fixture has neither ``--bare`` nor ``--no-bare``. Help
+        that differs names the build and says it needs re-measuring. A build below
+        the 2.1.314 floor refuses. Unknown is not beta.
+        """
+        state = route.get("bare_default")
+        flag = route.get("bare_opt_out")
+        if state is not None and state not in BARE_DEFAULT_STATES:
+            raise c.RouteError(c.REQUEST_INVALID, "route.bare_default")
+        if flag not in (None, "--no-bare"):
+            raise c.RouteError(c.REQUEST_INVALID, "route.bare_opt_out")
+        decision = bd.subscription_beta(route.get("claude_build"), route.get("help_text"))
+        if decision["disposition"] != "beta" or decision["label"] != "beta":
+            raise c.RouteError(c.LAUNCH_REFUSED, decision["detail"])
+        return []
 
     @staticmethod
     def _check_api_key_helper(route: dict) -> None:

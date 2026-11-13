@@ -16,6 +16,10 @@ Request::
                               "method": "<built-in method>",  # passthrough (claude_code only)
                               "metered_per_model": false},
                "bare": false,                             # claude_code: refused on subscription only
+               "bare_opt_out": "--no-bare" | null,         # only if reported by this build help
+               "bare_default": "absent" | "present" | "unknown",  # claude_code subscription: reported (B20)
+               "claude_build": "<major.minor.patch>",     # subscription: required; missing refuses
+               "help_text": "<claude --help text>",       # subscription: required; one measured hash is beta
                "api_key_helper": "absent" | "present",    # claude_code subscription: reported by the surface
                "billing_ack": "api_key_helper",           # the user chose to run billing their API key
                "limits": {"on_limit": "ask" | "wait" | "fallback", "fallback": [<route>, ...]},

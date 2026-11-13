@@ -198,6 +198,33 @@ class StartRefused(Exception):
         self.code, self.detail = code, detail
 
 
+def _os_thread_published(thread):
+    """True when ``thread``'s OS thread exists, so a failed ``start`` must not drop its work.
+
+    CPython creates the OS thread and only then waits on ``_started``. ``ident`` and
+    ``is_alive`` stay unset until that thread is scheduled. ``_limbo`` is filled just
+    before creation and removed when creation fails, so a thread still there has been
+    handed off. An inspection error is treated as published: overlapping a live run is
+    worse than leaving one start busy.
+    """
+    if getattr(thread, 'ident', None) is not None:
+        return True
+    try:
+        if thread.is_alive():
+            return True
+    except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
+        return True
+    lock = getattr(threading, '_active_limbo_lock', None)
+    limbo = getattr(threading, '_limbo', None)
+    if lock is None or limbo is None:
+        return False
+    try:
+        with lock:
+            return thread in limbo
+    except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
+        return True
+
+
 class RouteStarter:
     """``starter(params) -> {"cgroup"}`` for the control API.
 
@@ -244,19 +271,25 @@ class RouteStarter:
                    'deadline_s': entry['deadline_s'], 'route': json.loads(json.dumps(entry['route']))}
         ctx = RunContext(run_id)
         with self._lock:
-            if run_id in self._active:
-                raise self._refuse(run_id, 'start_in_flight', '')
-            self._active[run_id] = ctx
-            self.failures.pop(run_id, None)
+            in_flight = run_id in self._active
+            if not in_flight:
+                self._active[run_id] = ctx
+                self.failures.pop(run_id, None)
+        if in_flight:
+            # _refuse takes the same lock. Raising it from inside this section deadlocks:
+            # threading.Lock is not re-entrant, so a live run could never answer start_in_flight.
+            raise self._refuse(run_id, 'start_in_flight', '')
         thread = threading.Thread(target=self._drive, args=(ctx, request), name=f'recursion-run-{run_id}',
                                   daemon=True)
         try:
             thread.start()
         except BaseException:
-            # The thread never ran, so _drive will not drop the run. Leave it out or every later
-            # start of this run_id refuses start_in_flight.
+            # Roll the run back only when the target never entered and the OS thread was never
+            # created. An exception from Thread.start's wait means the thread is running; its
+            # finally drops _active. Clearing it here lets a second start of this run_id overlap.
             with self._lock:
-                self._active.pop(run_id, None)
+                if not getattr(ctx, 'target_entered', False) and not _os_thread_published(thread):
+                    self._active.pop(run_id, None)
             raise
         if ctx.wait_started(self._start_timeout_s):
             return {'cgroup': ctx.cgroup}
@@ -272,6 +305,9 @@ class RouteStarter:
         return StartRefused(code, detail)
 
     def _drive(self, ctx, request):
+        with self._lock:
+            # The starter reads this under the same lock before it will drop the run.
+            ctx.target_entered = True
         try:
             with bound_run(ctx):
                 try:
@@ -336,16 +372,18 @@ def _read_regular(path, tail=None):
 
     ``tail`` is the maximum number of trailing bytes. A symlink, or anything that is not a
     regular file, raises ``OSError`` (``O_NOFOLLOW``), the same refusal the launcher uses when
-    it creates the file.
+    it creates the file. The open is non-blocking, so a FIFO with no writer cannot stall the
+    caller; ``fstat`` then refuses anything that is not a regular file.
     """
     nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    nonblock = getattr(os, 'O_NONBLOCK', 0)
     if not nofollow:
         # A platform without O_NOFOLLOW (the simulated-Windows suite strips it) still must not
         # follow a symlink. The running daemon refuses to start unless O_NOFOLLOW exists.
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise OSError('not a regular file')
-    fd = os.open(path, os.O_RDONLY | nofollow | getattr(os, 'O_CLOEXEC', 0))
+    fd = os.open(path, os.O_RDONLY | nofollow | nonblock | getattr(os, 'O_CLOEXEC', 0))
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):

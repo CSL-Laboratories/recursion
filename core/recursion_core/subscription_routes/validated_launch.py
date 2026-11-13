@@ -2,8 +2,8 @@
 
 The route policy decides which names a Pi, Hermes, OpenCode, Cursor or Antigravity child may
 carry. This module is the only place those decisions become a process environment: it rebuilds
-the checked snapshot with ``build_child_env`` and passes that result to ``Popen``. The parent
-environment and ``os.environ`` are not the mapping ``Popen`` receives.
+the checked snapshot with ``build_child_env`` and passes that result through ``spawn`` to
+``Popen``. The parent environment and ``os.environ`` are not the mapping ``Popen`` receives.
 
 ``child_env`` knows Claude Code and Codex, not these harnesses. An Anthropic API key is the
 Claude profile's route key, so it is inside the ``ValidatedEnv``. Any other credential the route
@@ -14,7 +14,6 @@ harness reads. Copilot and Nous own-loop children have no such credential; they 
 
 from __future__ import annotations
 
-import os
 import subprocess
 from collections.abc import Mapping, Sequence
 
@@ -93,16 +92,11 @@ def spawn_route_process(
 ) -> subprocess.Popen:
     """Start ``argv`` with ``launch_env``. ``Popen`` is looked up at the call, so a test can patch it.
 
-    When the launched mapping is exactly the ``ValidatedEnv``, ``child_env.spawn`` is the caller.
-    A harness credential that profile does not name is passed as an explicit ``env`` on that same
-    ``Popen``, still not ``os.environ`` and still not the parent mapping.
+    A harness credential the profile does not name is grafted onto the validated mapping.
+    ``spawn`` passes that mapping to ``Popen`` after the same argv0 file checks, so a mode
+    ``0777`` executable is refused ``argv0_value_file_unsafe``. The child environment is
+    still not ``os.environ`` and still not the parent mapping.
     """
 
     validated, launched = launch_env(child_env, route_home=route_home, credential_env=credential_env)
-    popen = subprocess.Popen
-    if launched == validated.to_dict():
-        return spawn(argv, validated, cwd=cwd, popen=popen)
-    return popen(
-        list(argv), env=dict(launched), cwd=cwd, shell=False, close_fds=True,
-        start_new_session=os.name != "nt",
-    )
+    return spawn(argv, validated, cwd=cwd, popen=subprocess.Popen, launched=launched)

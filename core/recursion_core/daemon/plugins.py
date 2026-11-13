@@ -108,6 +108,30 @@ class PluginRefused(Exception):
         self.code, self.detail = code, detail
 
 
+def _os_thread_published(thread):
+    """True when ``thread``'s OS thread exists, so a failed ``start`` must not clear ``_busy``.
+
+    See ``control_adapter._os_thread_published``: ``Thread.start`` can raise after the OS
+    thread is running, and ``ident`` is unset until that thread is scheduled.
+    """
+    if getattr(thread, 'ident', None) is not None:
+        return True
+    try:
+        if thread.is_alive():
+            return True
+    except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
+        return True
+    lock = getattr(threading, '_active_limbo_lock', None)
+    limbo = getattr(threading, '_limbo', None)
+    if lock is None or limbo is None:
+        return False
+    try:
+        with lock:
+            return thread in limbo
+    except Exception:  # noqa: BLE001 - an unreadable thread state is treated as started
+        return True
+
+
 def _finding(code, severity, detail=''):
     return {'stage': 'daemon', 'code': code, 'severity': severity, 'detail': detail}
 
@@ -491,8 +515,12 @@ class PluginHost:
                 return 503, {'error': 'unavailable: operator plugin busy with an earlier read; nothing was read'}
             self._busy = True
         outcome, done = {}, threading.Event()
+        entered = {'ok': False}
 
         def run():
+            with self._turn:
+                # Published under the same lock the caller uses before it will clear _busy.
+                entered['ok'] = True
             try:
                 outcome['body'] = json.loads(json.dumps(self._guarded(handler, command)))
             except BaseException as exc:  # noqa: BLE001 - the plugin's failure is reported, never guessed around
@@ -511,10 +539,12 @@ class PluginHost:
         try:
             thread.start()
         except BaseException:
-            # run() is what clears _busy. A thread that never started must not leave every later read busy.
+            # run() clears _busy. Clear it here only when that thread provably never started.
+            # KeyboardInterrupt from Thread.start's wait means the call is in flight.
             with self._turn:
-                self._busy = False
-                self._turn.notify_all()
+                if not entered['ok'] and not _os_thread_published(thread):
+                    self._busy = False
+                    self._turn.notify_all()
             raise
         if done.wait(self._operator_deadline_s):
             return outcome

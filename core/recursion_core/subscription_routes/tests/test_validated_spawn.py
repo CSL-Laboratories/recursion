@@ -260,6 +260,21 @@ class OwnLoopSpawnTests(unittest.TestCase):
             )
         popen.assert_not_called()
 
+    def test_a_world_writable_argv0_is_refused_when_a_credential_is_grafted(self) -> None:
+        # A non-Anthropic credential is grafted onto the validated env. That path must still
+        # refuse an other-writable argv0, the same file rule spawn() applies.
+        loose = self.root / "loose-engine"
+        loose.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        loose.chmod(0o777)
+        child = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "OPENAI_API_KEY": FAKE_KEY}
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused) as caught:
+            spawn_route_process(
+                [str(loose), "run"], child, route_home=str(self.home),
+                credential_env="OPENAI_API_KEY", cwd=str(self.home),
+            )
+        self.assertEqual(caught.exception.cause, "argv0_value_file_unsafe")
+        popen.assert_not_called()
+
     def test_a_missing_non_anthropic_credential_is_refused(self) -> None:
         with self.assertRaises(EnvRefused) as caught:
             launch_env(

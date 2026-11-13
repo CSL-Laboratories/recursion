@@ -1,9 +1,10 @@
 """Child-launch boundary for engine children in the new core (CSL-785, candidate).
 
 ``spawn`` is the one place a new-core engine child is started. It takes only a
-``ValidatedEnv`` from ``policy.build_child_env`` and always passes it to Popen as an
-explicit ``env=``. Popen with ``env=None`` would inherit the parent environment, which
-is the bypass the old transport has (``os.environ.copy()``); here that cannot happen.
+``ValidatedEnv`` from ``policy.build_child_env`` and always passes an explicit ``env=``
+to Popen: that validated mapping, or ``launched`` when a route credential was grafted
+onto it. Popen with ``env=None`` would inherit the parent environment, which is the
+bypass the old transport has (``os.environ.copy()``); here that cannot happen.
 
 The executable is resolved on the validated PATH (or the absolute argv[0]) and must pass
 the same file rule as any other value, so a bare name never resolves through the parent's
@@ -17,7 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from recursion_core.child_env.policy import EnvRefused, ValidatedEnv, _posix_supported, _unsafe_file
 
@@ -34,9 +35,14 @@ def spawn(
     *,
     cwd: str | None = None,
     popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    launched: Mapping[str, str] | None = None,
     **popen_kwargs: object,
 ) -> subprocess.Popen:
-    """Start one engine child with exactly ``env``. Raises ``TypeError`` or ``EnvRefused`` before any spawn."""
+    """Start one engine child. Raises ``TypeError`` or ``EnvRefused`` before any spawn.
+
+    ``Popen`` receives ``env`` exactly, or ``launched`` when that mapping is the validated
+    env plus a grafted route credential. Argv0 is resolved on ``env`` either way.
+    """
 
     if not _posix_supported():
         raise EnvRefused(None, "platform_unsupported")
@@ -50,7 +56,14 @@ def spawn(
     if bad:
         raise EnvRefused(None, "launch_option_denied:" + ",".join(bad))
     executable = _resolve_executable(argv[0], env)
-    child_env = env.to_dict()
+    base = env.to_dict()
+    if launched is None:
+        child_env = base
+    else:
+        # The graft may add a credential. It may not replace a name build_child_env already kept.
+        child_env = dict(launched)
+        if any(child_env.get(key) != value for key, value in base.items()):
+            raise EnvRefused(None, "launched_env_mismatch")
     kwargs: dict[str, object] = dict(popen_kwargs)
     kwargs.update(env=child_env, cwd=cwd, close_fds=True, shell=False)
     if os.name != "nt":

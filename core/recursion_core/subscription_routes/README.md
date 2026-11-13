@@ -274,19 +274,22 @@ How the switch is written:
   it. This package does not remove one today; the driver can, or it goes with the route
   home.
 
-The last check before the launcher re-reads the pinned descriptor, then the names.
-`fstat`, `pread`, `fstat`: size, `mtime_ns` and `ctime_ns` must match each other and the
-pin, and the bytes must be the recorded bytes. A same-size `O_TRUNC` that restores
-`mtime_ns` still changes `ctime_ns` once the inode clock moves, so it refuses. A rewrite
-that keeps the same `ctime_ns` is not distinguished. `.hermes` is opened from the held
-route-home fd and `fstat` of that fd must be the inode the listing recorded. `config.yaml`
-is then stat'd by name through that fd and must be the pinned inode. The directory is
-listed again (`.env`, `.op.env`, and on an API-key route any other name, refuse). `.hermes`
-is stat'd by name on the held route-home fd (`follow_symlinks=False`) and must be that fd's
-inode and the inode the listing recorded. `config.yaml` is stat'd once more, and `.env` and
-`.op.env` must be absent (`stat` returns `ENOENT`). A mismatch refuses and nothing is
-unlinked. A same-uid change after that final check remains (pre-existing residual): the
-child opens `config.yaml` and HOME by path. Subscription extra names, other than `.env`
+The last check before the launcher runs the same observation twice. One observation is
+`fstat` and `pread` of the pinned `config.yaml` descriptor, then `config.yaml` stat'd by
+name through the `.hermes` fd and compared with `fstat` of that descriptor, then `.hermes`
+stat'd by name on the held route-home fd (`follow_symlinks=False`) and compared with
+`fstat` of the directory fd, then `listdir` with the name rules. `.env`, `.op.env`, and on
+an API-key route any other name, refuse. `.env` and `.op.env` must also be absent (`stat`
+returns `ENOENT`). The config name is stat'd once more after that listing. The two
+observations must be identical — bytes, size, `mtime_ns`, `ctime_ns`, device and inode of
+`config.yaml` and of `.hermes`, and the sorted listing — and those stamps and bytes equal
+the pin. After the two observations agree, `.hermes` and `config.yaml` are stat'd by name
+once more. `fstat` and `pread` of the config descriptor are the last step. Any difference
+refuses and nothing is unlinked. A same-size rewrite that keeps `mtime_ns` and `ctime_ns`
+still fails the next read of the bytes.
+
+A same-uid change after the final pread/listdir returns remains (pre-existing residual):
+the child opens `config.yaml` and HOME by path. Subscription extra names, other than `.env`
 and `.op.env`, stay allowed. Allowing them is an owner decision (Lucas, PRODUCT.md
 `055cc7a5` section 2).
 

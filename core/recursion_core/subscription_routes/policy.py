@@ -35,19 +35,20 @@ once before the adopt-switch write, so a refusal there does not create ``.hermes
 ``.hermes`` is listed through the directory fd held since the home check (``listdir`` on that fd).
 At that listing ``config.yaml`` is opened ``O_RDONLY|O_NOFOLLOW`` from the ``.hermes`` fd. The bytes,
 the size, ``mtime_ns`` and ``ctime_ns`` from that descriptor are the pin. After the walk that follows
-the listing, the recheck samples that descriptor before any name: ``fstat``, ``pread`` from offset 0,
-``fstat`` again. Size, ``mtime_ns`` and ``ctime_ns`` must be identical on both results and equal to
-the pin, and the bytes must be the recorded bytes. A same-size ``O_TRUNC`` that restores ``mtime_ns``
-still changes ``ctime_ns`` once the inode clock moves, so it refuses. A rewrite that keeps the same
-``ctime_ns`` is not distinguished. ``.hermes`` is opened again from the held route-home fd
-and ``fstat`` of that fd must be the pair the listing recorded. Then ``config.yaml`` is stat'd
-by name through that fd (``follow_symlinks=False``) and must be the pinned inode. The fd is
-listed: ``.env``, ``.op.env`` and, on an API-key route, any other name refuse. Then ``.hermes``
-is stat'd by name on
-the held route-home fd (``follow_symlinks=False``) and its device and inode must be the opened fd's
-and the pair the listing recorded. Then ``config.yaml`` is stat'd by name once more, and ``.env`` and
-``.op.env`` must be absent (``stat`` returns ``ENOENT``). A mismatch refuses and is left in place:
-this recheck does not unlink. ``.env`` and ``.op.env`` are not read, and refuse as a file, a symlink
+the listing, the recheck takes the same observation twice. One observation is ``fstat`` and ``pread``
+from offset 0 of that descriptor, ``config.yaml`` stat'd by name through the ``.hermes`` fd
+(``follow_symlinks=False``) and compared with ``fstat`` of the descriptor, ``.hermes`` stat'd by name
+on the held route-home fd and compared with ``fstat`` of the directory fd, then ``listdir`` and the
+name rules. ``.env``, ``.op.env`` and, on an API-key route, any other name refuse, and ``.env`` and
+``.op.env`` must also be absent (``stat`` returns ``ENOENT``). The config name is stat'd once more
+after that listing. The two observations must be identical: bytes, size, ``mtime_ns``, ``ctime_ns``,
+device and inode of ``config.yaml`` and of ``.hermes``, and the sorted listing. The config
+bytes, size, ``mtime_ns``, ``ctime_ns`` and both inodes equal the pin. After the second
+listing, ``.hermes`` and ``config.yaml`` are stat'd by name once more, then ``fstat`` and
+``pread`` of the config descriptor are the last step. Any difference refuses and is left
+in place: this recheck does not unlink. A same-size ``O_TRUNC`` that
+keeps ``mtime_ns`` and ``ctime_ns`` still changes the bytes the next read sees, so it refuses.
+``.env`` and ``.op.env`` are not read, and refuse as a file, a symlink
 or a directory: Hermes ``load_hermes_dotenv`` loads ``~/.hermes/.env`` over the process environment,
 and ``.op.env`` beside it, before ``config.yaml``, so ``HERMES_HOME`` there selects a different config
 that defaults ``adopt_external_logins`` to true. An API-key ``.hermes`` may contain only
@@ -56,9 +57,9 @@ owner decision (Lucas, PRODUCT.md 055cc7a5 section 2); they stay ``own_login_sto
 and whether to read them is still open for him. The launcher receives ``route_home_fd``, a dup of
 the held directory, valid only during that call. ``env["HOME"]`` stays the path the profile named.
 ``HOME=/proc/self/fd/N`` is not set: that path would name this process, not a child. A same-uid
-change after the recheck's final check remains (pre-existing residual): a child that re-opens
+change after the final pread/listdir returns remains (pre-existing residual): a child that re-opens
 ``env["HOME"]`` or ``config.yaml`` by path is outside this bind, and a rewrite or a new name that
-lands after the recheck returns, and before the launcher returns, is still unbound. Closing
+lands after that return is still unbound. Closing
 ``route_home_fd`` when this call returns can close a reused descriptor number if the launcher
 already closed it. On a platform without ``O_PATH`` the ancestor open falls back to ``O_RDONLY`` and
 a search-only ancestor still refuses. ``PROJECT_ROOT/.env`` in the Hermes install tree is a separate
@@ -1516,6 +1517,162 @@ def _pinned_config_stamp(
             and st.st_ctime_ns == ctime_ns)
 
 
+def _read_pinned_config_fd(
+    engine: str,
+    config_fd: int,
+    pin_id: tuple[int, int],
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    recorded: bytes,
+) -> tuple[os.stat_result, bytes]:
+    """``fstat`` then ``pread`` the pinned descriptor. Both must be the pin."""
+
+    try:
+        st = os.fstat(config_fd)
+        # One byte past the pin catches an append that lands between this fstat and the read.
+        data = os.pread(config_fd, len(recorded) + 1, 0)
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    if not _pinned_config_stamp(st, pin_id, size, mtime_ns, ctime_ns) or data != recorded:
+        raise _refuse_hermes_config(engine, "config.yaml")
+    return st, data
+
+
+def _require_config_name_matches_fd(
+    engine: str,
+    hermes_fd: int,
+    config_fd: int,
+    pin_id: tuple[int, int],
+) -> None:
+    """``config.yaml`` by name through ``hermes_fd`` is the pinned descriptor.
+
+    Device and inode only. Size, ``mtime_ns`` and ``ctime_ns`` come from ``fstat``
+    of ``config_fd``: a hard link updates ``ctime_ns`` without changing the inode,
+    and that stamp is what the descriptor read compares to the pin.
+    """
+
+    try:
+        named = os.stat("config.yaml", dir_fd=hermes_fd, follow_symlinks=False)
+        opened = os.fstat(config_fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    named_id = (named.st_dev, named.st_ino)
+    opened_id = (opened.st_dev, opened.st_ino)
+    if (not stat.S_ISREG(named.st_mode) or not stat.S_ISREG(opened.st_mode)
+            or named_id != pin_id or opened_id != pin_id or named_id != opened_id):
+        raise _refuse_hermes_config(engine, "config.yaml")
+
+
+def _require_hermes_name_matches_fd(
+    engine: str,
+    home_fd: int,
+    hermes_fd: int,
+    hermes_dev: int,
+    hermes_ino: int,
+) -> tuple[int, int]:
+    """``.hermes`` by name on the held home fd is the directory ``hermes_fd`` has open.
+
+    The name is stat'd first. ``fstat`` of the fd does not see a replacement that lands
+    after that stat returns; the next observation opens the name again.
+    """
+
+    try:
+        named = os.stat(".hermes", dir_fd=home_fd, follow_symlinks=False)
+        opened = os.fstat(hermes_fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    opened_id = (opened.st_dev, opened.st_ino)
+    if (not stat.S_ISDIR(named.st_mode) or not stat.S_ISDIR(opened.st_mode)
+            or (named.st_dev, named.st_ino) != opened_id
+            or opened_id != (hermes_dev, hermes_ino)):
+        raise _refuse_hermes_config(engine, ".hermes")
+    return opened_id
+
+
+def _hermes_listing_names(engine: str, hermes_fd: int, auth: str) -> tuple[str, ...]:
+    """The sorted names in ``hermes_fd``, after the dotenv and API-key rules.
+
+    ``.env`` and ``.op.env`` refuse from the listing and again when ``stat`` does not
+    return ``ENOENT``, so a name created after ``listdir`` is still seen. On an API-key
+    route any other name refuses from this snapshot. A subscription route may keep other
+    names. Allowing those extra names is an owner decision (Lucas, PRODUCT.md 055cc7a5
+    section 2); this check does not make it.
+    """
+
+    try:
+        names = os.listdir(hermes_fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    ordered = tuple(sorted(names))
+    for name in ordered:
+        if name in _HERMES_DOTENV_NAMES:
+            _reject_hermes_dotenv(engine, hermes_fd, name)
+    if "config.yaml" not in ordered:
+        raise _refuse_hermes_config(engine, "config.yaml")
+    if auth != "subscription":
+        extra = sorted(set(ordered) - _HERMES_LAUNCH_ALLOW)
+        if extra:
+            raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", extra[0])
+    for name in sorted(_HERMES_DOTENV_NAMES):
+        try:
+            os.stat(name, dir_fd=hermes_fd, follow_symlinks=False)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                continue
+            raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name) from None
+        raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name)
+    return ordered
+
+
+def _observe_pinned_hermes(
+    engine: str,
+    home_fd: int,
+    config_fd: int,
+    pin_id: tuple[int, int],
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    recorded: bytes,
+    hermes_dev: int,
+    hermes_ino: int,
+    auth: str,
+) -> tuple:
+    """One full look at the pin, the names, and the directory. Mismatch refuses.
+
+    The result is the bytes, size, ``mtime_ns``, ``ctime_ns`` and device/inode of the
+    config descriptor, the device/inode of ``.hermes``, and the sorted listing. The
+    config name is stat'd again after the listing. A new inode during the listing
+    fails that stat; one that lands after it returns is stat'd by the next observation.
+    """
+
+    st, data = _read_pinned_config_fd(
+        engine, config_fd, pin_id, size, mtime_ns, ctime_ns, recorded)
+    try:
+        hermes_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=home_fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    try:
+        try:
+            opened_dir = os.fstat(hermes_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        if (not stat.S_ISDIR(opened_dir.st_mode)
+                or (opened_dir.st_dev, opened_dir.st_ino) != (hermes_dev, hermes_ino)):
+            raise _refuse_hermes_config(engine, ".hermes")
+        _require_config_name_matches_fd(engine, hermes_fd, config_fd, pin_id)
+        hermes_id = _require_hermes_name_matches_fd(
+            engine, home_fd, hermes_fd, hermes_dev, hermes_ino)
+        names = _hermes_listing_names(engine, hermes_fd, auth)
+        # After the names. A new inode during the listing fails here, and the next
+        # observation stats the name again.
+        _require_config_name_matches_fd(engine, hermes_fd, config_fd, pin_id)
+    finally:
+        os.close(hermes_fd)
+    return (data, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_dev, st.st_ino,
+            hermes_id[0], hermes_id[1], names)
+
+
 def _recheck_pinned_hermes_config(
     engine: str,
     route_home: str,
@@ -1526,28 +1683,21 @@ def _recheck_pinned_hermes_config(
 ) -> None:
     """The pinned switch is unchanged, and the names still point at that pin.
 
-    Content is sampled on the pinned descriptor before any name is looked up again.
-    ``fstat``, ``pread`` from offset 0, ``fstat`` again: size, ``mtime_ns`` and
-    ``ctime_ns`` must be identical on both results and equal to the pin, and the bytes
-    must be the recorded bytes. A same-size ``O_TRUNC`` that restores ``mtime_ns`` still
-    changes ``ctime_ns`` once the inode clock moves, so that rewrite refuses. A rewrite
-    that keeps the same ``ctime_ns`` (one coarse tick) is not distinguished by this stamp.
+    The observation in ``_observe_pinned_hermes`` runs twice. The two results must be
+    identical and equal to the pin: bytes, size, ``mtime_ns``, ``ctime_ns``, device and
+    inode of ``config.yaml`` and of ``.hermes``, and the sorted listing. A same-size
+    ``O_TRUNC`` that keeps ``mtime_ns`` and ``ctime_ns`` still changes the bytes, so the
+    second read refuses it. A new inode, a replaced ``.hermes``, a ``.env`` created after
+    its ``ENOENT`` stat, or an API-key extra created after ``listdir`` is in the second
+    observation.
 
-    ``.hermes`` is then opened from the held route-home fd. ``fstat`` of that fd must be
-    the pair the listing recorded: a directory swapped in before this open is not listed.
-    Then ``config.yaml`` is stat'd by name through that fd (``follow_symlinks=False``)
-    and must be the pinned inode. The fd is listed. ``.env`` and ``.op.env`` refuse, and
-    so does any other name on an API-key route.
-    A subscription route may keep other names. Allowing those extra names is an owner
-    decision (Lucas, PRODUCT.md 055cc7a5 section 2); this check does not make it.
-    Then ``.hermes`` is stat'd by name on the held route-home fd (``follow_symlinks=False``)
-    and its device and inode must be the opened fd's and the pair the listing recorded.
-    Then ``config.yaml`` is stat'd by name once more, and ``.env`` and ``.op.env`` must be
-    absent (``stat`` returns ``ENOENT``). A mismatch refuses. This function does not unlink.
+    After the second listing, ``.hermes`` and ``config.yaml`` are stat'd by name once
+    more, then ``fstat`` and ``pread`` of the config descriptor are the last step. Any
+    difference refuses. This function does not unlink.
 
-    A same-uid change after that final check remains. It is the pre-existing residual:
-    the child opens ``config.yaml`` and ``HOME`` by path, and a rewrite, a rename or a
-    new name that lands after this returns is not seen.
+    A same-uid change after that final pread/listdir returns remains. It is the
+    pre-existing residual: the child opens ``config.yaml`` and ``HOME`` by path, and a
+    rewrite, a rename or a new name that lands after that return is not seen.
     """
 
     hold = _route_home_for(engine, route_home)
@@ -1560,19 +1710,18 @@ def _recheck_pinned_hermes_config(
             or recorded_mtime is None or recorded_ctime is None):
         raise _refuse_hermes_config(engine, "config.yaml")
     pin_id = (hold.config_dev, hold.config_ino)
-    try:
-        before = os.fstat(config_fd)
-        got = os.pread(config_fd, recorded_size, 0)
-        after = os.fstat(config_fd)
-    except OSError:
-        raise _refuse_hermes_config(engine, "config.yaml") from None
-    if (not _pinned_config_stamp(before, pin_id, recorded_size, recorded_mtime, recorded_ctime)
-            or not _pinned_config_stamp(after, pin_id, recorded_size, recorded_mtime, recorded_ctime)
-            or before.st_size != after.st_size
-            or before.st_mtime_ns != after.st_mtime_ns
-            or before.st_ctime_ns != after.st_ctime_ns
-            or got != recorded):
-        raise _refuse_hermes_config(engine, "config.yaml")
+    first = _observe_pinned_hermes(
+        engine, hold.fd, config_fd, pin_id, recorded_size, recorded_mtime, recorded_ctime,
+        recorded, hermes_dev, hermes_ino, auth)
+    second = _observe_pinned_hermes(
+        engine, hold.fd, config_fd, pin_id, recorded_size, recorded_mtime, recorded_ctime,
+        recorded, hermes_dev, hermes_ino, auth)
+    if first != second:
+        if first[:6] != second[:6]:
+            raise _refuse_hermes_config(engine, "config.yaml")
+        raise _refuse_hermes_config(engine, ".hermes")
+    # After the second listing. A replaced directory or a new config inode that
+    # landed during that observation is still before the last read.
     try:
         hermes_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=hold.fd)
     except OSError:
@@ -1585,52 +1734,19 @@ def _recheck_pinned_hermes_config(
         if (not stat.S_ISDIR(opened_dir.st_mode)
                 or (opened_dir.st_dev, opened_dir.st_ino) != (hermes_dev, hermes_ino)):
             raise _refuse_hermes_config(engine, ".hermes")
-        try:
-            live = os.stat("config.yaml", dir_fd=hermes_fd, follow_symlinks=False)
-        except OSError:
-            raise _refuse_hermes_config(engine, "config.yaml") from None
-        if not stat.S_ISREG(live.st_mode) or (live.st_dev, live.st_ino) != pin_id:
-            raise _refuse_hermes_config(engine, "config.yaml")
-        try:
-            names = os.listdir(hermes_fd)
-        except OSError:
-            raise _refuse_hermes_config(engine, ".hermes") from None
-        for name in sorted(names):
-            if name in _HERMES_DOTENV_NAMES:
-                _reject_hermes_dotenv(engine, hermes_fd, name)
-        if "config.yaml" not in names:
-            raise _refuse_hermes_config(engine, "config.yaml")
-        if auth != "subscription":
-            extra = sorted(set(names) - _HERMES_LAUNCH_ALLOW)
-            if extra:
-                raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", extra[0])
-        try:
-            named = os.stat(".hermes", dir_fd=hold.fd, follow_symlinks=False)
-            opened_dir = os.fstat(hermes_fd)
-        except OSError:
-            raise _refuse_hermes_config(engine, ".hermes") from None
-        # The name can move after the open above. fstat of the fd does not see that.
-        opened_id = (opened_dir.st_dev, opened_dir.st_ino)
-        if (not stat.S_ISDIR(named.st_mode) or not stat.S_ISDIR(opened_dir.st_mode)
-                or (named.st_dev, named.st_ino) != opened_id
-                or opened_id != (hermes_dev, hermes_ino)):
-            raise _refuse_hermes_config(engine, ".hermes")
-        try:
-            again = os.stat("config.yaml", dir_fd=hermes_fd, follow_symlinks=False)
-        except OSError:
-            raise _refuse_hermes_config(engine, "config.yaml") from None
-        if not stat.S_ISREG(again.st_mode) or (again.st_dev, again.st_ino) != pin_id:
-            raise _refuse_hermes_config(engine, "config.yaml")
-        for name in sorted(_HERMES_DOTENV_NAMES):
-            try:
-                os.stat(name, dir_fd=hermes_fd, follow_symlinks=False)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    continue
-                raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name) from None
-            raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name)
+        _require_hermes_name_matches_fd(engine, hold.fd, hermes_fd, hermes_dev, hermes_ino)
+        _require_config_name_matches_fd(engine, hermes_fd, config_fd, pin_id)
     finally:
         os.close(hermes_fd)
+    # Last step. Nothing in this function stats or lists after this pread returns.
+    try:
+        last = os.fstat(config_fd)
+        last_bytes = os.pread(config_fd, len(recorded) + 1, 0)
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    if (not _pinned_config_stamp(last, pin_id, recorded_size, recorded_mtime, recorded_ctime)
+            or last_bytes != recorded):
+        raise _refuse_hermes_config(engine, "config.yaml")
 
 
 def _refuse_hermes_dir_entries(engine: str, route_home: str, auth: str, hermes_dev: int, hermes_ino: int) -> int:
@@ -1717,10 +1833,11 @@ def _launch_checked(
             # Read the switch through the held dirfd, then lstat the paths, then walk every
             # ancestor from / and list .hermes through the held fd. The listing pins
             # config.yaml and records its bytes, size, mtime_ns and ctime_ns. The walk runs
-            # again after the listing. The recheck fstats that fd, preads, and fstats again
-            # before any name lookup, then lstats config.yaml, lists the directory, stats
-            # .hermes by name on the held home fd, lstats config.yaml again and requires
-            # .env and .op.env to be absent. A same-uid change after that final check remains
+            # again after the listing. The recheck takes that observation twice (fstat and
+            # pread of the pinned fd, the config name against that fd, .hermes by name
+            # against the held directory fd, the listing and the name rules) and requires
+            # the two to match each other and the pin. fstat and pread of the config fd are
+            # the last step. A same-uid change after that final pread/listdir returns remains
             # (pre-existing residual): the child opens config.yaml and HOME by path.
             # Subscription extra names stay an owner decision (Lucas). Also residual: a
             # route_home_fd number reused after the launcher closed it.

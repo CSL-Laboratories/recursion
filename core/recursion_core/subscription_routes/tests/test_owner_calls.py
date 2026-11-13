@@ -52,6 +52,13 @@ def _stack_has(name: str) -> bool:
     return False
 
 
+def _clone_stat(st: os.stat_result) -> os.stat_result:
+    """A ``stat_result`` the recheck can be shown again, including the nanosecond stamps."""
+
+    reduced = st.__reduce__()
+    return reduced[0](*reduced[1])
+
+
 class _Calls(_Base):
     def setUp(self) -> None:
         super().setUp()
@@ -1232,6 +1239,243 @@ class HermesHomeReuseTests(_Calls):
         self.assertTrue(planted)
         self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
         self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / ".env").read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_same_tick_same_size_trunc_between_pread_and_second_fstat_refuses(self) -> None:
+        # Between pread and the fstat after it, a same-size O_TRUNC that restores
+        # mtime_ns often keeps ctime_ns (one coarse tick; no sleep). The recheck
+        # is shown that pre-trunc stamp. The bytes on the inode are not the pin.
+        # The second read has to refuse, and the rewritten file stays.
+        same = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(same))
+        rewritten = False
+        frozen: os.stat_result | None = None
+        real_pread, real_fstat = os.pread, os.fstat
+
+        def racing_pread(fd: int, count: int, offset: int, *args: object, **kwargs: object):
+            nonlocal rewritten, frozen
+            data = real_pread(fd, count, offset, *args, **kwargs)
+            if rewritten or not _stack_has("_recheck_pinned_hermes_config"):
+                return data
+            rewritten = True
+            before = real_fstat(fd)
+            write = os.open(self.config(), os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+            try:
+                self.assertEqual(len(same), os.write(write, same))
+            finally:
+                os.close(write)
+            os.utime(self.config(), ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = os.lstat(self.config())
+            self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+            self.assertEqual(before.st_size, after.st_size)
+            self.assertEqual(before.st_mtime_ns, after.st_mtime_ns)
+            self.assertEqual(len(same), after.st_size)
+            # Publish the pre-trunc stamp. A tick that did move ctime_ns is not
+            # what this window shows the recheck.
+            frozen = _clone_stat(before)
+            self.assertEqual(before.st_ctime_ns, frozen.st_ctime_ns)
+            return data
+
+        def racing_fstat(fd: int, *args: object, **kwargs: object):
+            st = real_fstat(fd, *args, **kwargs)
+            if (frozen is None or not _stack_has("_recheck_pinned_hermes_config")
+                    or (st.st_dev, st.st_ino) != (frozen.st_dev, frozen.st_ino)):
+                return st
+            return frozen
+
+        with mock.patch.object(policy.os, "pread", side_effect=racing_pread), \
+                mock.patch.object(policy.os, "fstat", side_effect=racing_fstat):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self.assertTrue(rewritten)
+        self.assertIsNotNone(frozen)
+        self.assertEqual(same, self.config().read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_same_size_rewrite_after_second_fstat_refuses(self) -> None:
+        # After the second fstat of the pinned descriptor, later checks used to
+        # compare dev/ino only. A same-size rewrite there still launched. No sleep:
+        # the next pread has to see the new bytes, and the file is not removed.
+        same = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(same))
+        rewritten = False
+        fstats = 0
+        config_id: tuple[int, int] | None = None
+        real_fstat = os.fstat
+
+        def racing_fstat(fd: int, *args: object, **kwargs: object):
+            nonlocal rewritten, fstats, config_id
+            st = real_fstat(fd, *args, **kwargs)
+            if not stat.S_ISREG(st.st_mode) or not _stack_has("_recheck_pinned_hermes_config"):
+                return st
+            if config_id is None:
+                live = os.lstat(self.config())
+                config_id = (live.st_dev, live.st_ino)
+            if (st.st_dev, st.st_ino) != config_id:
+                return st
+            fstats += 1
+            if fstats != 2 or rewritten:
+                return st
+            rewritten = True
+            before = os.lstat(self.config())
+            write = os.open(self.config(), os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+            try:
+                self.assertEqual(len(same), os.write(write, same))
+            finally:
+                os.close(write)
+            os.utime(self.config(), ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = os.lstat(self.config())
+            self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+            self.assertEqual(before.st_size, after.st_size)
+            self.assertEqual(len(same), after.st_size)
+            return st
+
+        with mock.patch.object(policy.os, "fstat", side_effect=racing_fstat):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self.assertTrue(rewritten)
+        self.assertGreaterEqual(fstats, 2)
+        self.assertEqual(same, self.config().read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_new_inode_after_second_config_stat_refuses(self) -> None:
+        # The second stat of config.yaml used to be the last look at the name.
+        # A new inode after it returned still launched: the pinned fd held the
+        # old bytes. The new file is left where it is.
+        user = b"# owner config, left in place\nmodel: theirs\n"
+        planted = self.root / "user-config.yaml"
+        planted.write_bytes(user)
+        swapped = False
+        stats = 0
+        real_stat = os.stat
+
+        def racing_stat(path: object, *args: object, **kwargs: object):
+            nonlocal swapped, stats
+            result = real_stat(path, *args, **kwargs)
+            if path != "config.yaml" or not _stack_has("_recheck_pinned_hermes_config"):
+                return result
+            stats += 1
+            if stats != 2 or swapped:
+                return result
+            swapped = True
+            os.rename(planted, self.config())
+            live = os.lstat(self.config())
+            self.assertNotEqual(result.st_ino, live.st_ino)
+            self.assertEqual(user, self.config().read_bytes())
+            return result
+
+        with mock.patch.object(policy.os, "stat", side_effect=racing_stat):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self.assertTrue(swapped)
+        self.assertGreaterEqual(stats, 2)
+        self.assertEqual(user, self.config().read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_hermes_replaced_between_by_name_stat_and_dir_fstat_refuses(self) -> None:
+        # stat(".hermes") on the home fd returns, then the name is replaced,
+        # then fstat of the fd still sees the directory that was opened. The
+        # returned stat matches that fd. The new directory is what a path open
+        # gets, and it is left in place, .env included.
+        swapped = False
+        real_stat = os.stat
+        evil = b"auth:\n  adopt_external_logins: true \n"
+
+        def racing_stat(path: object, *args: object, **kwargs: object):
+            nonlocal swapped
+            result = real_stat(path, *args, **kwargs)
+            if swapped or path != ".hermes" or not _stack_has("_recheck_pinned_hermes_config"):
+                return result
+            swapped = True
+            aside = self.home / ".hermes.aside"
+            os.rename(self.home / ".hermes", aside)
+            self._private(self.home / ".hermes")
+            fd = os.open(self.config(), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                self.assertEqual(len(evil), os.write(fd, evil))
+            finally:
+                os.close(fd)
+            env = os.open(
+                self.home / ".hermes" / ".env",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                os.write(env, b"HERMES_HOME=/not-the-route\n")
+            finally:
+                os.close(env)
+            self.assertNotEqual(result.st_ino, os.lstat(self.home / ".hermes").st_ino)
+            return result
+
+        with mock.patch.object(policy.os, "stat", side_effect=racing_stat):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual(".hermes", exc.detail)
+        self.assertTrue(swapped)
+        self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
+        aside = self.home / ".hermes.aside"
+        self.assertEqual(ADOPT_YAML, (aside / "config.yaml").read_bytes())
+        self.assertEqual(evil, self.config().read_bytes())
+        self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / ".env").read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_dotenv_created_after_enoent_stat_refuses(self) -> None:
+        # stat(".env") returns ENOENT, then the name is created. The next
+        # absence check has to see it. The planted file is not removed.
+        planted = False
+        real_stat = os.stat
+
+        def racing_stat(path: object, *args: object, **kwargs: object):
+            nonlocal planted
+            try:
+                return real_stat(path, *args, **kwargs)
+            except OSError as exc:
+                if (planted or path != ".env" or exc.errno != errno.ENOENT
+                        or not _stack_has("_recheck_pinned_hermes_config")):
+                    raise
+                planted = True
+                dir_fd = kwargs.get("dir_fd")
+                env = os.open(
+                    ".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd,
+                )
+                try:
+                    os.write(env, b"HERMES_HOME=/not-the-route\n")
+                finally:
+                    os.close(env)
+                raise
+
+        with mock.patch.object(policy.os, "stat", side_effect=racing_stat):
+            exc = self.refused("hermes_dotenv_in_home", self.launch, "hermes")
+        self.assertEqual(".env", exc.detail)
+        self.assertTrue(planted)
+        self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
+        self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / ".env").read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_api_key_state_db_created_after_listdir_refuses(self) -> None:
+        # The API-key extra-name check used the listdir snapshot. state.db
+        # created after that snapshot returned was not in it, so the launch
+        # proceeded. The next listing has to refuse, and the file stays.
+        planted = False
+        real_listdir = os.listdir
+
+        def racing_listdir(path: object, *args: object, **kwargs: object):
+            nonlocal planted
+            names = real_listdir(path, *args, **kwargs)
+            if planted or not isinstance(path, int) or not _stack_has("_recheck_pinned_hermes_config"):
+                return names
+            planted = True
+            fd = os.open("state.db", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=path)
+            try:
+                os.write(fd, b"x")
+            finally:
+                os.close(fd)
+            return names
+
+        with mock.patch.object(policy.os, "listdir", side_effect=racing_listdir):
+            exc = self.refused("engine_store_in_route_home", self.launch, "hermes")
+        self.assertEqual("state.db", exc.detail)
+        self.assertTrue(planted)
+        self.assertEqual(b"x", (self.home / ".hermes" / "state.db").read_bytes())
         self.launcher.assert_not_called()
 
     def test_replaced_hermes_dir_keeping_the_config_inode_refuses(self) -> None:

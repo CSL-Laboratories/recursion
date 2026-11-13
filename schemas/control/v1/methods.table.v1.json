@@ -1,5 +1,5 @@
 {
-  "table_version": "1.0-draft.3",
+  "table_version": "1.0-draft.4",
   "methods": [
     {
       "name": "run.start",
@@ -330,7 +330,9 @@
       "mutating": true,
       "idempotency": "command_id",
       "precondition": "expected_turn_id",
-      "requires": [],
+      "requires": [
+        "interrupt"
+      ],
       "page_allowed": true,
       "mcp": {
         "exposed": true,

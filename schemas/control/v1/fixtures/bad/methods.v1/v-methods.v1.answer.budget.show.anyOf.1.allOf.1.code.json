@@ -5,20 +5,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "budgets": [
-      {
-        "connection_id": "subscription:personal-max",
-        "cap_usd": 0,
-        "spent_usd": {
-          "value": null,
-          "quality": "unknown",
-          "provenance": "unavailable"
-        },
-        "window_percent": null,
-        "window_reset_at": null,
-        "breaker_state": "closed",
-        "locked": false
-      }
-    ]
+    "detail": "not_implemented"
   }
 }

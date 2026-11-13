@@ -4,22 +4,22 @@
     {
       "file": "good/approval.v1/h01-tool-call-pending-shown-on-the-terminal.json",
       "schema": "approval.v1.json",
-      "shows": "An engine asked to run a command. One surface has shown it, at revision 1; nobody has answered."
+      "shows": "An engine asked to run a command. One surface has shown it; nobody has answered. Showing it did not raise its revision."
     },
     {
       "file": "good/approval.v1/h02-tool-call-approved.json",
       "schema": "approval.v1.json",
-      "shows": "The owner approved it on the surface that showed it."
+      "shows": "The owner approved it on the surface that showed it. The answer raised the revision to 2."
     },
     {
-      "file": "good/approval.v1/h03-tool-input-with-text-outside-ascii.json",
+      "file": "good/approval.v1/h03-tool-call-with-text-outside-ascii.json",
       "schema": "approval.v1.json",
-      "shows": "A tool input that holds accented text and a fraction. input_json carries it as an escaped JSON string, so the effect still fits the restricted canonical form."
+      "shows": "A tool call whose file name, content and directory hold accented text, with a fraction among its input. The call holds the text itself; the digest is over its RFC 8785 bytes; the lines show it as it is."
     },
     {
       "file": "good/approval.v1/h04-plugin-effect-pending-shown-nowhere.json",
       "schema": "approval.v1.json",
-      "shows": "A plugin asked to carry out an effect. The effect is the gate's own canonical object; it belongs to no turn; no surface has shown it yet."
+      "shows": "A plugin asked to carry out an effect. The effect is the gate's own canonical object; every field of it and of its payload is on a line; it belongs to no turn; no surface has shown it yet."
     },
     {
       "file": "good/approval.v1/h05-expired-unanswered.json",
@@ -39,7 +39,7 @@
     {
       "file": "good/approval.v1/h08-denied-from-a-paired-phone.json",
       "schema": "approval.v1.json",
-      "shows": "Two surfaces showed it; the answer came from the phone."
+      "shows": "Two surfaces showed it, both at revision 1; the answer came from the phone."
     },
     {
       "file": "good/approval.v1/h09-private-binding.json",
@@ -50,6 +50,16 @@
       "file": "good/approval.v1/h10-summary-as-approval-list-returns-it.json",
       "schema": "approval.v1.json#/$defs/summary",
       "shows": "A summary: enough to list the request and count down its deadline. Reading it is not showing the request."
+    },
+    {
+      "file": "good/approval.v1/h11-tool-call-with-no-input-and-no-directory.json",
+      "schema": "approval.v1.json",
+      "shows": "A call with an empty input, from an engine that does not say where it would run: the lines say so, they do not leave it out."
+    },
+    {
+      "file": "good/approval.v1/h12-a-call-on-its-own.json",
+      "schema": "approval.v1.json#/$defs/call",
+      "shows": "The call of h03 on its own: a tool's name, its input and its directory, in any alphabet."
     },
     {
       "file": "bad/approval.v1/b01-pending-with-an-answer.json",
@@ -97,21 +107,21 @@
       }
     },
     {
-      "file": "bad/approval.v1/b06-tool-input-as-an-object.json",
+      "file": "bad/approval.v1/b06-the-call-as-a-string-someone-serialised.json",
       "schema": "approval.v1.json",
-      "rule": "A tool's input rides in input_json, the exact string the digest binds, not as a loose object.",
+      "rule": "An engine's call is bound as a value under RFC 8785, not as a string that some serialiser wrote: two serialisers disagree, one canonical form does not.",
       "expect": {
         "keyword": "additionalProperties",
         "at": "/effect"
       }
     },
     {
-      "file": "bad/approval.v1/b07-input-json-with-a-raw-accent.json",
+      "file": "bad/approval.v1/b07-an-engine-call-under-the-plugin-form.json",
       "schema": "approval.v1.json",
-      "rule": "input_json is printable ASCII: text outside it is written as a \\u escape.",
+      "rule": "An engine's call is bound under 'rfc8785/v1'; 'csl-cj/v0' is the form of plugin effects.",
       "expect": {
-        "keyword": "pattern",
-        "at": "/effect/input_json"
+        "keyword": "const",
+        "at": "/digest_form"
       }
     },
     {
@@ -232,12 +242,30 @@
       }
     },
     {
+      "file": "bad/approval.v1/b21-a-plugin-effect-under-the-engine-form.json",
+      "schema": "approval.v1.json",
+      "rule": "A plugin effect keeps 'csl-cj/v0', the form the approval gate and every signature use today.",
+      "expect": {
+        "keyword": "const",
+        "at": "/digest_form"
+      }
+    },
+    {
       "file": "bad/approval.v1/f-approval.v1.allOf.3.then.answer.json",
       "schema": "approval.v1.json",
       "rule": "The value at /answer is fixed by approval.v1.json#/allOf/3/then/properties/answer.",
       "expect": {
         "keyword": "const",
         "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/approval.v1/f-approval.v1.engine-tool-effect.call-form.json",
+      "schema": "approval.v1.json",
+      "rule": "The value at /effect/call_form is fixed by approval.v1.json#/$defs/engine_tool_effect/properties/call_form.",
+      "expect": {
+        "keyword": "const",
+        "at": "/effect/call_form"
       }
     },
     {
@@ -358,6 +386,33 @@
       }
     },
     {
+      "file": "bad/approval.v1/m-approval.v1.call.cwd.json",
+      "schema": "approval.v1.json#/$defs/call",
+      "rule": "The object described at approval.v1.json#/$defs/call always carries 'cwd'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/approval.v1/m-approval.v1.call.input.json",
+      "schema": "approval.v1.json#/$defs/call",
+      "rule": "The object described at approval.v1.json#/$defs/call always carries 'input'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/approval.v1/m-approval.v1.call.tool.json",
+      "schema": "approval.v1.json#/$defs/call",
+      "rule": "The object described at approval.v1.json#/$defs/call always carries 'tool'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
       "file": "bad/approval.v1/m-approval.v1.digest-form.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/ always carries 'digest_form'.",
@@ -412,9 +467,18 @@
       }
     },
     {
-      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.cwd.json",
+      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.call-form.json",
       "schema": "approval.v1.json",
-      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'cwd'.",
+      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'call_form'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/effect"
+      }
+    },
+    {
+      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.call.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'call'.",
       "expect": {
         "keyword": "required",
         "at": "/effect"
@@ -424,15 +488,6 @@
       "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.engine.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'engine'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/effect"
-      }
-    },
-    {
-      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.input-json.json",
-      "schema": "approval.v1.json",
-      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'input_json'.",
       "expect": {
         "keyword": "required",
         "at": "/effect"
@@ -460,15 +515,6 @@
       "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.session-id.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'session_id'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/effect"
-      }
-    },
-    {
-      "file": "bad/approval.v1/m-approval.v1.engine-tool-effect.tool.json",
-      "schema": "approval.v1.json",
-      "rule": "The object described at approval.v1.json#/$defs/engine_tool_effect always carries 'tool'.",
       "expect": {
         "keyword": "required",
         "at": "/effect"
@@ -646,6 +692,15 @@
       }
     },
     {
+      "file": "bad/approval.v1/m-approval.v1.rendered-form.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/ always carries 'rendered_form'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
       "file": "bad/approval.v1/m-approval.v1.rendered.items.text.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/properties/rendered/items always carries 'text'.",
@@ -817,6 +872,15 @@
       }
     },
     {
+      "file": "bad/approval.v1/u-approval.v1.call.json",
+      "schema": "approval.v1.json",
+      "rule": "The object described at approval.v1.json#/$defs/call is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/effect/call"
+      }
+    },
+    {
       "file": "bad/approval.v1/u-approval.v1.display.items.json",
       "schema": "approval.v1.json",
       "rule": "The object described at approval.v1.json#/properties/display/items is closed: a field nobody defined is refused.",
@@ -877,6 +941,15 @@
       "expect": {
         "keyword": "enum",
         "at": "/display/0/trust"
+      }
+    },
+    {
+      "file": "bad/approval.v1/v-approval.v1.rendered-form.json",
+      "schema": "approval.v1.json",
+      "rule": "The value at /rendered_form must be one of the values listed at approval.v1.json#/properties/rendered_form.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/rendered_form"
       }
     },
     {
@@ -2465,6 +2538,15 @@
       "expect": {
         "keyword": "type",
         "at": "/payload/run_id"
+      }
+    },
+    {
+      "file": "bad/event.v1/b40-a-done-turn-with-an-error-code.json",
+      "schema": "event.v1.json",
+      "rule": "A turn that ended without failing carries no error code: with one, its outcome is 'failed'. (The Task of a turn already required this; the event did not.)",
+      "expect": {
+        "keyword": "type",
+        "at": "/payload/result/code"
       }
     },
     {
@@ -4542,6 +4624,16 @@
       "shows": "Captured: a method that is not in the table is answered method_unknown."
     },
     {
+      "file": "good/methods.v1/c18-run-status-of-an-id-that-is-not-one.json",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "shows": "Captured: run.status of an id that is not a well-formed run id. Today's daemon does not check the form: it looks the id up and answers run_unknown, echoing it as it was given."
+    },
+    {
+      "file": "good/methods.v1/c19-run-stop-of-an-id-that-is-not-one.json",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "shows": "Captured: the same for run.stop."
+    },
+    {
       "file": "good/methods.v1/h01-session-turn-ok.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "A turn is accepted: the session after it, and the new turn."
@@ -4810,6 +4902,161 @@
       "file": "good/methods.v1/h59-a-start-error-whose-detail-carries-colons.json",
       "schema": "methods.v1.json#/$defs/start_error",
       "shows": "The detail of a start error is the launch path's own text: it may carry colons, as when one refusal wraps the code of another."
+    },
+    {
+      "file": "good/methods.v1/n01-session-start-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.start is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n02-session-turn-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.turn is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n03-session-steer-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.steer is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n04-session-queue-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.queue is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n05-session-interrupt-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.interrupt is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n06-session-resume-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.resume is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n07-session-fork-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.fork is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n08-session-export-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.export is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n09-session-list-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.list is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n10-session-status-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.status is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n11-session-stop-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "session.stop is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n12-queue-update-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "queue.update is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n13-queue-cancel-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "queue.cancel is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n14-approval-list-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "approval.list is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n15-approval-open-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "approval.open is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n16-approval-answer-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "approval.answer is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n17-events-read-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.read is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n18-events-follow-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.follow is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n19-route-explain-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "route.explain is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n20-operator-read-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "operator.read is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n21-budget-show-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "budget.show is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n22-workspace-diff-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "workspace.diff is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n23-workspace-checkpoint-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "workspace.checkpoint is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n24-workspace-restore-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "workspace.restore is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n25-workspace-publish-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "workspace.publish is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n26-plugin-status-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "plugin.status is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n27-plugin-call-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "plugin.call is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n28-key-list-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "key.list is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n29-surface-prefs-get-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "surface.prefs.get is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n30-surface-prefs-set-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "surface.prefs.set is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
+    },
+    {
+      "file": "good/methods.v1/n31-doctor-not-built-yet.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "doctor is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
     },
     {
       "file": "good/methods.v1/r01-run-start.json",
@@ -5435,7 +5682,7 @@
     },
     {
       "file": "bad/methods.v1/f-methods.v1.answer.run.list.anyOf.0.code.json",
-      "schema": "methods.v1.json#/$defs/exchange",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
       "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/answer.run.list/anyOf/0/properties/code.",
       "expect": {
         "keyword": "const",
@@ -5444,7 +5691,7 @@
     },
     {
       "file": "bad/methods.v1/f-methods.v1.answer.run.status.anyOf.0.code.json",
-      "schema": "methods.v1.json#/$defs/exchange",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
       "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/answer.run.status/anyOf/0/properties/code.",
       "expect": {
         "keyword": "const",
@@ -5590,15 +5837,6 @@
       "file": "bad/methods.v1/f-methods.v1.answer.workspace.restore.anyOf.0.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/answer.workspace.restore/anyOf/0/properties/code.",
-      "expect": {
-        "keyword": "const",
-        "at": "/answer/code"
-      }
-    },
-    {
-      "file": "bad/methods.v1/f-methods.v1.refused-exchange.answer.code.json",
-      "schema": "methods.v1.json#/$defs/refused_exchange",
-      "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/refused_exchange/properties/answer/properties/code.",
       "expect": {
         "keyword": "const",
         "at": "/answer/code"
@@ -9016,12 +9254,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.approval.answer.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.approval.answer/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.approval.list.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.approval.list/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.approval.list.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.approval.list/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9034,6 +9290,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.approval.open.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.approval.open/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.budget.show.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.budget.show/anyOf/1/allOf/1/properties/code.",
@@ -9043,12 +9308,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.budget.show.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.budget.show/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.doctor.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.doctor/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.doctor.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.doctor/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9070,6 +9353,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.events.follow.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.events.follow/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.events.read.anyOf.0.projection.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/projection must be one of the values listed at methods.v1.json#/$defs/answer.events.read/anyOf/0/properties/projection.",
@@ -9085,6 +9377,15 @@
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.events.read.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.events.read/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9106,6 +9407,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.key.list.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.key.list/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.methods.list.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.methods.list/anyOf/1/allOf/1/properties/code.",
@@ -9124,12 +9434,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.operator.read.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.operator.read/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.plugin.call.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.plugin.call/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.plugin.call.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.plugin.call/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9151,12 +9479,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.plugin.status.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.plugin.status/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.queue.cancel.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.queue.cancel/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.queue.cancel.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.queue.cancel/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9169,12 +9515,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.queue.update.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.queue.update/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.route.explain.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.route.explain/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.route.explain.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.route.explain/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9223,12 +9587,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.export.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.export/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.session.fork.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.session.fork/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.fork.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.fork/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9250,12 +9632,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.interrupt.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.interrupt/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.session.list.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.session.list/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.list.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.list/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9268,12 +9668,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.queue.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.queue/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.session.resume.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.session.resume/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.resume.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.resume/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9286,6 +9704,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.start.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.start/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.session.status.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.session.status/anyOf/1/allOf/1/properties/code.",
@@ -9295,12 +9722,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.status.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.status/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.session.steer.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.session.steer/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.steer.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.steer/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9331,12 +9776,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.stop.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.stop/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.session.turn.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.session.turn/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.session.turn.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.session.turn/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9358,6 +9821,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.surface.prefs.get.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.surface.prefs.get/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.surface.prefs.set.anyOf.0.prefs.surface.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/prefs/surface must be one of the values listed at methods.v1.json#/$defs/answer.surface.prefs.set/anyOf/0/properties/prefs/properties/surface.",
@@ -9376,12 +9848,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.surface.prefs.set.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.surface.prefs.set/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.workspace.checkpoint.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.workspace.checkpoint/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.workspace.checkpoint.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.workspace.checkpoint/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9394,6 +9884,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.workspace.diff.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.workspace.diff/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.workspace.publish.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.workspace.publish/anyOf/1/allOf/1/properties/code.",
@@ -9403,12 +9902,30 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.workspace.publish.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.workspace.publish/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.workspace.restore.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.workspace.restore/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.workspace.restore.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.workspace.restore/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -9530,11 +10047,20 @@
     },
     {
       "file": "bad/methods.v1/v-methods.v1.refusal.allOf.1.then.detail.json",
-      "schema": "methods.v1.json#/$defs/exchange",
-      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/refusal/allOf/1/then/properties/detail.",
+      "schema": "methods.v1.json#/$defs/refusal",
+      "rule": "The value at /detail must be one of the values listed at methods.v1.json#/$defs/refusal/allOf/1/then/properties/detail.",
       "expect": {
         "keyword": "enum",
-        "at": "/answer/detail"
+        "at": "/detail"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.refused-exchange.answer.code.json",
+      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/refused_exchange/properties/answer/properties/code.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/code"
       }
     },
     {
@@ -9593,7 +10119,7 @@
     },
     {
       "file": "bad/methods.v1/v-methods.v1.run-start-answer.code.json",
-      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/run_start_answer/properties/code.",
       "expect": {
         "keyword": "enum",
@@ -11303,6 +11829,15 @@
       "expect": {
         "keyword": "type",
         "at": "/turns/2/outcome"
+      }
+    },
+    {
+      "file": "bad/session.v1/b40-an-ended-turn-with-an-error-code.json",
+      "schema": "session.v1.json",
+      "rule": "A turn whose state is 'ended' carries a result with no error code: a turn with one is 'failed'.",
+      "expect": {
+        "keyword": "type",
+        "at": "/turns/0/result/code"
       }
     },
     {

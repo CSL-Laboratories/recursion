@@ -1,11 +1,12 @@
 {
-  "answer": {
-    "code": "x-nobody-defined-this",
-    "detail": "prompt"
-  },
   "method": "run.start",
   "params": {
+    "tenant": "t1",
     "engine": "claude_code",
-    "tenant": "t1"
+    "prompt": "Summarise the repository.",
+    "client_key": "k-1"
+  },
+  "answer": {
+    "code": "x-nobody-defined-this"
   }
 }

@@ -9,8 +9,6 @@
   },
   "answer": {
     "code": "x-nobody-defined-this",
-    "result": {
-      "indexed": 212
-    }
+    "detail": "not_implemented"
   }
 }

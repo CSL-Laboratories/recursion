@@ -7,9 +7,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "http_status": 200,
-    "body": {
-      "conditions": []
-    }
+    "detail": "not_implemented"
   }
 }

@@ -1,20 +1,13 @@
 {
   "method": "events.follow",
   "params": {
-    "session_id": "ses-7f3a9c2e51d04b6a",
-    "after": 42,
+    "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "after": 0,
+    "projection": "transcript",
     "wait_ms": 20000
   },
   "answer": {
     "code": "x-nobody-defined-this",
-    "projection": "raw",
-    "events": [],
-    "cursor": {
-      "epoch": 3,
-      "session_id": "ses-7f3a9c2e51d04b6a",
-      "seq": 42
-    },
-    "more": false,
-    "timed_out": true
+    "detail": "not_implemented"
   }
 }

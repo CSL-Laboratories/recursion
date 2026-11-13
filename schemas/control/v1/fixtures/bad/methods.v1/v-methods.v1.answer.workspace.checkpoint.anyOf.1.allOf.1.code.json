@@ -7,10 +7,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "checkpoint": {
-      "checkpoint_id": "ckpt-0003",
-      "ref": "refs/recursion/checkpoints/ses-7f3a9c2e51d04b6a/3",
-      "label": "before the refactor"
-    }
+    "detail": "not_implemented"
   }
 }

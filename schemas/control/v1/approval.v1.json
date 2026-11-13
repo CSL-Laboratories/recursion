@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "approval.v1.json",
   "title": "approval.v1: one approval request, as a client reads it",
-  "x-version": "1.0-draft.2",
-  "description": "PUBLIC record. The core draws every approval, on every surface, from this record and from nothing else. approval_id is minted by the core, never by an engine or a plugin. source says where the request came from: 'engine_tool' (an engine asked permission for a tool call) or 'plugin_effect' (a plugin asked to carry out an effect). effect is exactly what is being approved, and digest is the SHA-256 of effect's canonical bytes in the form digest_form names: what is drawn is what is approved. display is extra text for the reader (labels and values, in order); it is OUTSIDE the digest, each entry says whether it is trusted, and no surface may show it as if it were the effect. rendered is the lines the core's own renderer produced for this request: a surface prints these lines and composes no approval text of its own. Nothing defaults to approve: a request nobody answers is 'expired' at expires_at, and expired means denied. THE PROTOCOL: approval.list returns summaries ($defs/summary) and does not count as showing anything. A surface calls approval.open when it actually displays the prompt; that records the principal, the surface and the request's revision in opened_by and returns this record. approval.answer names the digest that was drawn and the revision it read; from a principal and surface with no open record for the current revision it is refused 'prompt_not_shown'. The first valid answer wins and a later one is refused. Only an 'owner' or a 'device' principal may open or answer: an engine, a plugin and a session token never can. 'approved' becomes 'consumed' when the effect is carried out, once. 'vetoed' is a refusal that is final for that digest. No credential appears in this record. The daemon also keeps a private binding from the approval to the engine's own pending request ($defs/binding); it never leaves the daemon.",
+  "x-version": "1.0-draft.3",
+  "description": "PUBLIC record. The core draws every approval, on every surface, from this record and from nothing else. approval_id is minted by the core, never by an engine or a plugin. source says where the request came from: 'engine_tool' (an engine asked permission for a tool call) or 'plugin_effect' (a plugin asked to carry out an effect). ONE RULE BINDS WHAT IS SHOWN TO WHAT IS APPROVED, and conformance/rules.py states it as code that the vectors in vectors/ check: (1) effect is exactly what is being approved. (2) digest is the SHA-256, in lower-case hex, of effect's canonical bytes in the form digest_form names. (3) rendered is the lines of that same effect in the form rendered_form names: every field of the effect is on a line, nothing else is, and nothing is ever cut. A record whose digest is not the digest of its effect, or whose lines are not the lines of its effect, is not an approval, whatever a schema says of its shape. A surface prints the rendered lines in full, in order, and composes no approval text of its own. display is extra text for the reader (labels and values, in order). It is OUTSIDE the digest, each entry says whether it is trusted, and a surface shows it only after the rendered lines and apart from them: it never replaces, contradicts or hides a line of the effect. Nothing defaults to approve: a request nobody answers is 'expired' at expires_at, and expired means denied. REVISION. revision is the revision of the request and of what it shows. It starts at 1 and rises by one at every change of the request: an answer, the effect being carried out, a veto, the deadline passing. What a pending request shows (effect, digest, rendered, display, the two times) never changes; a different effect is a new request with a new id. Recording that a surface showed the request is a note about the request, not a change of it: it does not raise the revision, and the note carries the revision that was shown. THE PROTOCOL. approval.list returns summaries ($defs/summary) and does not count as showing anything. A surface calls approval.open when it actually displays the lines; that adds one entry to opened_by (the principal, the surface, the revision shown, the time) and returns this record. The same principal on the same surface at the same revision is recorded once; another surface adds its own entry and changes no other. approval.answer names the digest that was drawn and the revision it read. The order of its checks: the caller is an 'owner' or a 'device' (an engine, a plugin and a session token never are); the same command id with the same params returns the first answer; a request that is no longer pending is 'conflict' (already_resolved), so the first valid answer wins; a revision that is not the current one is 'conflict' (stale_revision); a principal and surface with no opening at the current revision is 'prompt_not_shown'; a digest that is not this record's is 'conflict' (digest_mismatch). 'approved' becomes 'consumed' when the effect is carried out, once. 'vetoed' is a refusal that is final for that digest. No credential appears in this record. The daemon also keeps a private binding from the approval to the engine's own pending request ($defs/binding); it never leaves the daemon. DECIDED by the owner on Nov 13, 2026, and marked for follow-up research in case it needs to be reworked: an engine's call is bound under RFC 8785 ('rfc8785/v1'); plugin effects, and every signature that exists today, keep 'csl-cj/v0'. README.md has the profile in full.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["approval_id", "session_id", "run_id", "turn_id", "source", "effect", "digest_form", "digest", "display", "rendered", "requested_at", "expires_at", "state", "opened_by", "answered_by", "answer", "answered_at", "revision"],
+  "required": ["approval_id", "session_id", "run_id", "turn_id", "source", "effect", "digest_form", "digest", "display", "rendered_form", "rendered", "requested_at", "expires_at", "state", "opened_by", "answered_by", "answer", "answered_at", "revision"],
   "properties": {
     "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
     "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/log_id"}]},
@@ -15,8 +15,8 @@
     "source": {"enum": ["engine_tool", "plugin_effect"]},
     "effect": {"type": "object"},
     "digest_form": {
-      "description": "The canonical form the digest is taken over. PROVISIONAL (recommended, not decided): 'csl-cj/v0', the restricted canonical JSON of plugin_security/canonical.py. A later form is a new name here, never a silent change.",
-      "enum": ["csl-cj/v0"]
+      "description": "The canonical form the digest is taken over (conformance/rules.py, effect_bytes). 'rfc8785/v1': the UTF-8 bytes of the whole effect written as RFC 8785 writes it; used for an engine's tool call. 'csl-cj/v0': the restricted canonical JSON of plugin_security/canonical.py; used for a plugin's effect, as the approval gate and every signature use it today. The name carries its version: a later form is a new name here, never a silent change.",
+      "enum": ["rfc8785/v1", "csl-cj/v0"]
     },
     "digest": {"$ref": "common.v1.json#/$defs/sha256"},
     "display": {
@@ -33,8 +33,12 @@
         }
       }
     },
+    "rendered_form": {
+      "description": "The rule the rendered lines follow. 'csl-approval-lines/v0' is conformance/rules.py, approval_lines: a line of the core's own words is trusted; a line that carries anything an engine or a plugin supplied is untrusted, and that text is written as JSON text, quotes included, with every character a surface must never be handed raw (controls, the marks that reorder or hide text, private use and the like: rules.py, NOT_SHOWN_RAW) written as a \\u escape, so nothing can reorder, hide or forge part of a line and two different values never draw the same line. A later rule is a new name here, never a silent change.",
+      "enum": ["csl-approval-lines/v0"]
+    },
     "rendered": {
-      "description": "The request as the core's renderer wrote it, line by line: a fixed header, then the effect, then any text that came from an engine or a plugin, passed through the sanitizer and marked untrusted. Every surface prints exactly these lines.",
+      "description": "The lines of the effect, in the form rendered_form names. Every surface prints exactly these lines. For an engine's tool call: a header, the engine, the run, the tool, the directory, the number of input fields, then each field of the input as its key and its value. For a plugin's effect: a header, then every field of the effect, then each field of the payload. A value longer than 4,000 characters continues on lines that start with two spaces. An effect that would need more than 200 lines is never drawn and never approved: the core denies it without asking.",
       "type": "array",
       "minItems": 1,
       "maxItems": 200,
@@ -52,7 +56,7 @@
     "expires_at": {"$ref": "common.v1.json#/$defs/timestamp"},
     "state": {"$ref": "#/$defs/state"},
     "opened_by": {
-      "description": "Every showing of the request that was recorded by approval.open: who, on which surface, at which revision of the request, and when.",
+      "description": "Every showing of the request that approval.open recorded: who, on which surface, which revision of the request was shown, and when. One entry for each principal, surface and revision. Adding an entry does not raise the request's revision.",
       "type": "array",
       "items": {
         "type": "object",
@@ -74,11 +78,11 @@
   "allOf": [
     {
       "if": {"required": ["source"], "properties": {"source": {"const": "engine_tool"}}},
-      "then": {"properties": {"effect": {"$ref": "#/$defs/engine_tool_effect"}, "run_id": {"type": "string"}}}
+      "then": {"properties": {"effect": {"$ref": "#/$defs/engine_tool_effect"}, "run_id": {"type": "string"}, "digest_form": {"const": "rfc8785/v1"}}}
     },
     {
       "if": {"required": ["source"], "properties": {"source": {"const": "plugin_effect"}}},
-      "then": {"properties": {"effect": {"$ref": "#/$defs/plugin_effect"}}}
+      "then": {"properties": {"effect": {"$ref": "#/$defs/plugin_effect"}, "digest_form": {"const": "csl-cj/v0"}}}
     },
     {
       "if": {"required": ["state"], "properties": {"state": {"enum": ["pending", "expired"]}}},
@@ -130,22 +134,32 @@
       }
     },
     "engine_tool_effect": {
-      "description": "An engine asked permission for one tool call. input_json is the tool's input as the core serialised it: JSON with sorted keys, no spaces, and every character outside printable ASCII written as a \\u escape, so the whole effect fits the restricted canonical form (which takes ASCII text and whole numbers only) while the input itself may hold any text and any number. The digest binds that exact string, and the core draws the input from that exact string. cwd is the directory the call would run in, null when the engine does not say.",
+      "description": "An engine asked permission for one tool call. kind, engine, session_id and run_id are the core's own. Everything the engine supplied is in call: the tool's name, the tool's input and the directory the call would run in ($defs/call), in the profile call_form names. PROFILE 'csl-call/v1' (conformance/rules.py: read_strict, check_call, text_of). Reading what the engine sent: the input is JSON text and an object; an object that names a key twice, at any depth, is refused, never resolved to the first or the last; NaN and the infinities are refused; a whole number written without a fraction or an exponent must lie within -(2^53 - 1) .. 2^53 - 1, checked on its digits before any conversion that could lose it, or the call is refused (a larger one is sent as a string, or not at all); a number with a fraction or an exponent is read as a binary64 and must be finite; half of a surrogate pair on its own is refused; nesting stops at 64; strings are kept exactly as written, with no Unicode normalisation. The tool's name and the directory are text under the same rules: any alphabet, no half pair, nothing normalised. What is bound: the digest is taken over the UTF-8 bytes of the WHOLE effect as RFC 8785 writes it (keys in the order of their UTF-16 code units; numbers as ECMAScript writes them, so 1.0 is 1 and 1e-7 is 1e-7; strings as themselves), so the core's fields and the engine's call are under one form. Size: the call's RFC 8785 text is at most 262,144 bytes of UTF-8, and its lines at most 200. A call that does not fit is never cut and never drawn: the core denies it without asking. What is carried out is the call that was bound: where an engine's permission protocol lets the answer carry the input, the driver sends back the bound input, and otherwise the private binding to the engine's own pending request is the link.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "engine", "session_id", "run_id", "tool", "input_json", "cwd"],
+      "required": ["kind", "engine", "session_id", "run_id", "call_form", "call"],
       "properties": {
         "kind": {"const": "engine_tool"},
         "engine": {"$ref": "common.v1.json#/$defs/engine_name"},
         "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/log_id"}]},
         "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
-        "tool": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[\\x20-\\x7e]+$", "not": {"pattern": "[\\r\\n]"}},
-        "input_json": {"type": "string", "pattern": "^[\\x20-\\x7e]*$", "not": {"pattern": "[\\r\\n]"}},
-        "cwd": {"type": ["string", "null"], "minLength": 1, "pattern": "^[\\x20-\\x7e]+$", "not": {"pattern": "[\\r\\n]"}}
+        "call_form": {"const": "csl-call/v1"},
+        "call": {"$ref": "#/$defs/call"}
+      }
+    },
+    "call": {
+      "description": "Everything an engine supplied for one tool call: the tool's name, its input (the tool's own object, never interpreted by the core) and the directory the call would run in, null when the engine does not say. A schema cannot refuse a key named twice, half a surrogate pair or a whole number too large to keep; conformance/rules.py, check_call, does, and the vectors in vectors/call.profile hold each case.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cwd", "input", "tool"],
+      "properties": {
+        "cwd": {"type": ["string", "null"], "minLength": 1},
+        "input": {"type": "object"},
+        "tool": {"type": "string", "minLength": 1, "maxLength": 256}
       }
     },
     "plugin_effect": {
-      "description": "A plugin asked to carry out an effect: the 'csl-effect/vNext' object the approval gate already checks (plugin_security/approval.py). scope names the account, venue, contract family, adapter and environment, so a paper effect and a live one have different digests. amount_minor is in whole minor units of currency. payload is the plugin's own data; the core never interprets it and draws it only as the canonical bytes.",
+      "description": "A plugin asked to carry out an effect: the 'csl-effect/vNext' object the approval gate already checks (plugin_security/approval.py). scope names the account, venue, contract family, adapter and environment, so a paper effect and a live one have different digests. amount_minor is in whole minor units of currency. payload is the plugin's own data; the core never interprets it, and draws each of its fields as its key and the text of its value.",
       "type": "object",
       "additionalProperties": false,
       "required": ["schema", "kind", "plugin_id", "run_id", "connection", "scope", "currency", "amount_minor", "payload"],

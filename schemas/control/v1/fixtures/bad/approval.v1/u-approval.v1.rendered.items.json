@@ -9,41 +9,59 @@
     "engine": "claude_code",
     "session_id": "ses-7f3a9c2e51d04b6a",
     "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-    "tool": "Bash",
-    "input_json": "{\"command\":\"rm -rf build && make\",\"description\":\"clean build\"}",
-    "cwd": "/home/dev/projects/atlas"
+    "call_form": "csl-call/v1",
+    "call": {
+      "cwd": "/home/dev/projects/atlas",
+      "input": {
+        "description": "clean build",
+        "command": "rm -rf build && make"
+      },
+      "tool": "Bash"
+    }
   },
-  "digest_form": "csl-cj/v0",
-  "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "digest_form": "rfc8785/v1",
+  "digest": "b2f03e58c884b88b4a04c063dfc3991bfd8896cb54cc0bbf9d8b5174e42cdd3d",
   "display": [
-    {
-      "label": "Engine",
-      "value": "claude_code",
-      "trust": "trusted"
-    },
     {
       "label": "Why the engine says it wants this",
       "value": "clean build",
       "trust": "untrusted"
     }
   ],
+  "rendered_form": "csl-approval-lines/v0",
   "rendered": [
     {
-      "text": "APPROVAL NEEDED",
+      "text": "Tool call waiting for an answer",
       "trust": "trusted",
       "x-nobody-defined-this": true
     },
     {
-      "text": "Engine claude_code asks to run the tool Bash in /home/dev/projects/atlas",
+      "text": "engine: claude_code",
       "trust": "trusted"
     },
     {
-      "text": "command: rm -rf build && make",
+      "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "trust": "trusted"
+    },
+    {
+      "text": "tool: \"Bash\"",
       "trust": "untrusted"
     },
     {
-      "text": "Answer by its number: 1 approve, 2 deny. Nothing is approved by default.",
+      "text": "directory: \"/home/dev/projects/atlas\"",
+      "trust": "untrusted"
+    },
+    {
+      "text": "input fields: 2",
       "trust": "trusted"
+    },
+    {
+      "text": "\"command\": \"rm -rf build && make\"",
+      "trust": "untrusted"
+    },
+    {
+      "text": "\"description\": \"clean build\"",
+      "trust": "untrusted"
     }
   ],
   "requested_at": "2026-11-13T07:34:30.000Z",
@@ -63,5 +81,5 @@
   "answered_by": null,
   "answer": null,
   "answered_at": null,
-  "revision": 2
+  "revision": 1
 }

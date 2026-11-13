@@ -8,17 +8,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "item": {
-      "item_id": "qi-0002",
-      "session_id": "ses-7f3a9c2e51d04b6a",
-      "order": 2,
-      "text": "Only fix the failing test.",
-      "revision": 2,
-      "delivery": "next_turn",
-      "state": "queued",
-      "delivery_id": null,
-      "turn_id": null,
-      "created_at": "2026-11-13T07:34:20.000Z"
-    }
+    "detail": "not_implemented"
   }
 }

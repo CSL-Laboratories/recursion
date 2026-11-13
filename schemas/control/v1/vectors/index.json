@@ -1,0 +1,215 @@
+{
+  "about": "Every vector of this folder. A vector is checked against a rule that no schema can state (conformance/rules.py), named by 'rule'. call.profile: one tool call as an engine wrote it (tool, cwd, input_text) and the text that is bound for it (call_text: the call as RFC 8785 writes it), or the code it is refused with. approval.binding: one approval record of the right shape, and exactly what does not agree inside it (an empty list when everything does); effect_text, where present, is the text whose UTF-8 bytes the digest is taken over. approval.lifecycle: one request, then calls on it one after another, each with who is calling, the answer, and the record after it. The call texts, the effect texts, three whole sets of lines and the order of the answers were written by hand and then checked against the rule, not copied from it. These files are plain ASCII: a character outside it is written as a JSON escape.",
+  "vectors": [
+    {
+      "file": "call.profile/p01-a-plain-call.json",
+      "rule": "call.profile",
+      "shows": "A plain call: keys come out sorted, with no spaces, whatever order and spacing the engine used."
+    },
+    {
+      "file": "call.profile/p02-numbers-have-one-spelling.json",
+      "rule": "call.profile",
+      "shows": "Numbers are written as ECMAScript writes them: 1.0 is 1, 1e-7 stays 1e-7, 1E3 is 1000, minus zero is 0, 1e21 is 1e+21. Two serialisers that spell a number differently (1.0 against 1, 1e-07 against 1e-7) cannot give two digests, because neither spelling is what is hashed."
+    },
+    {
+      "file": "call.profile/p03-key-order-above-the-basic-plane.json",
+      "rule": "call.profile",
+      "shows": "Keys are ordered by their UTF-16 code units, not by code point: U+10000 sorts before U+E000. (A sort by code point would put them the other way round.)"
+    },
+    {
+      "file": "call.profile/p04-an-escaped-letter-is-the-letter.json",
+      "rule": "call.profile",
+      "shows": "A string has one spelling: the engine wrote the letter a as an escape, and the bound text holds the letter."
+    },
+    {
+      "file": "call.profile/p05-the-letter-itself.json",
+      "rule": "call.profile",
+      "shows": "The same call as p04, written plainly by the engine: the same text, so the same digest."
+    },
+    {
+      "file": "call.profile/p06-text-outside-ascii-everywhere.json",
+      "rule": "call.profile",
+      "shows": "Accented text in the tool's name, in the directory (a Windows path, with backslashes) and in the input, and a character above U+FFFF: each stands as itself. No field of an engine's call is held to one alphabet."
+    },
+    {
+      "file": "call.profile/p07-control-characters.json",
+      "rule": "call.profile",
+      "shows": "A tab keeps its short escape; any other character below U+0020 is a lower-case \\u escape; U+007F stands as itself in the bound text (the lines a surface prints escape it: see the approval vectors)."
+    },
+    {
+      "file": "call.profile/p08-nested-values.json",
+      "rule": "call.profile",
+      "shows": "Arrays keep their order; objects inside are sorted too; true, false and null are themselves."
+    },
+    {
+      "file": "call.profile/p09-nothing-is-normalised.json",
+      "rule": "call.profile",
+      "shows": "The letter e with an acute accent written as one character, and written as e followed by a combining accent, are two different strings and stay two: the core never normalises."
+    },
+    {
+      "file": "call.profile/r01-a-key-named-twice.json",
+      "rule": "call.profile",
+      "shows": "An object that names a key twice is refused: the core never picks the first or the last."
+    },
+    {
+      "file": "call.profile/r02-a-key-named-twice-deeper.json",
+      "rule": "call.profile",
+      "shows": "The same, at any depth."
+    },
+    {
+      "file": "call.profile/r03-not-a-number.json",
+      "rule": "call.profile",
+      "shows": "NaN is not JSON."
+    },
+    {
+      "file": "call.profile/r04-infinity.json",
+      "rule": "call.profile",
+      "shows": "Neither is Infinity."
+    },
+    {
+      "file": "call.profile/r05-a-whole-number-too-large-to-keep.json",
+      "rule": "call.profile",
+      "shows": "A whole number beyond 2^53 - 1 would be changed by a binary64 reader (9007199254740993 becomes 9007199254740992), so the call is refused before anything can change it; such a number is sent as a string."
+    },
+    {
+      "file": "call.profile/r06-a-very-long-whole-number.json",
+      "rule": "call.profile",
+      "shows": "The same, for a number of twenty digits."
+    },
+    {
+      "file": "call.profile/r07-a-number-that-is-not-finite.json",
+      "rule": "call.profile",
+      "shows": "A number with an exponent that no binary64 holds."
+    },
+    {
+      "file": "call.profile/r08-half-a-surrogate-pair.json",
+      "rule": "call.profile",
+      "shows": "Half of a surrogate pair on its own is not text."
+    },
+    {
+      "file": "call.profile/r09-half-a-surrogate-pair-in-a-key.json",
+      "rule": "call.profile",
+      "shows": "The same, in a key."
+    },
+    {
+      "file": "call.profile/r10-text-that-is-not-json.json",
+      "rule": "call.profile",
+      "shows": "An input that is not JSON is refused, never shown as if it were."
+    },
+    {
+      "file": "call.profile/r11-empty-text.json",
+      "rule": "call.profile",
+      "shows": "So is no input at all."
+    },
+    {
+      "file": "call.profile/r12-an-input-that-is-not-an-object.json",
+      "rule": "call.profile",
+      "shows": "A tool's input is an object."
+    },
+    {
+      "file": "call.profile/r13-a-leading-zero.json",
+      "rule": "call.profile",
+      "shows": "A number with a leading zero is not JSON."
+    },
+    {
+      "file": "call.profile/r14-nested-too-deep.json",
+      "rule": "call.profile",
+      "shows": "Nesting stops at 64."
+    },
+    {
+      "file": "call.profile/r15-a-tool-with-no-name.json",
+      "rule": "call.profile",
+      "shows": "A call names its tool."
+    },
+    {
+      "file": "approval.binding/g01-a-tool-call.json",
+      "rule": "approval.binding",
+      "shows": "A request for a tool call: its digest is the SHA-256 of the UTF-8 bytes of effect_text, which is the whole effect as RFC 8785 writes it, and its lines are the lines of that effect."
+    },
+    {
+      "file": "approval.binding/g02-a-tool-call-with-text-outside-ascii.json",
+      "rule": "approval.binding",
+      "shows": "Accented text in the input and in the directory, and a fraction written 1.50 by the engine: the bound text holds the text itself and the number as 1.5, and the lines show the same."
+    },
+    {
+      "file": "approval.binding/g03-a-plugin-effect.json",
+      "rule": "approval.binding",
+      "shows": "A plugin effect, under csl-cj/v0 as before: every field of it, and every field of its payload, is on a line."
+    },
+    {
+      "file": "approval.binding/g04-characters-a-surface-is-never-handed-raw.json",
+      "rule": "approval.binding",
+      "shows": "A file name with a right-to-left override in it (it would read notes/exe.png on a terminal), a zero-width space and U+007F. The bound text holds them as they are; the lines show each as an escape, so what is drawn cannot be reordered or hidden."
+    },
+    {
+      "file": "approval.binding/x01-lines-of-another-call.json",
+      "rule": "approval.binding",
+      "shows": "The effect is a Write to a menu file; the lines are those of a Bash call that removes a build folder. The owner would be shown one thing and approve another. (This is the mistake the first draft's fixtures made.)"
+    },
+    {
+      "file": "approval.binding/x02-the-digest-of-nothing.json",
+      "rule": "approval.binding",
+      "shows": "The digest is the SHA-256 of no bytes at all, not of the effect."
+    },
+    {
+      "file": "approval.binding/x03-the-digest-of-another-effect.json",
+      "rule": "approval.binding",
+      "shows": "The digest is another effect's: an answer that names it would approve that other effect."
+    },
+    {
+      "file": "approval.binding/x04-the-digest-of-another-serialisation.json",
+      "rule": "approval.binding",
+      "shows": "The digest is taken over the same effect as an everyday serialiser writes it, with escapes for the accented letters. Those are other bytes, so it is another digest: one canonical form, one digest."
+    },
+    {
+      "file": "approval.binding/x05-a-field-left-off-the-lines.json",
+      "rule": "approval.binding",
+      "shows": "The last field of the input is not on a line. Nothing may be hidden."
+    },
+    {
+      "file": "approval.binding/x06-a-comforting-line-added.json",
+      "rule": "approval.binding",
+      "shows": "A line nobody bound is added, in the core's own voice."
+    },
+    {
+      "file": "approval.binding/x07-an-untrusted-line-marked-trusted.json",
+      "rule": "approval.binding",
+      "shows": "The engine's own text is marked as the core's."
+    },
+    {
+      "file": "approval.binding/x08-a-payload-summed-up.json",
+      "rule": "approval.binding",
+      "shows": "A plugin effect drawn as one line of summary: the payload's fields (what is bought, how much) are not shown."
+    },
+    {
+      "file": "approval.binding/x09-a-raw-override-on-a-line.json",
+      "rule": "approval.binding",
+      "shows": "The lines carry the right-to-left override raw instead of as an escape: on a terminal the file name would read as another."
+    },
+    {
+      "file": "approval.binding/x10-a-whole-number-too-large-to-keep.json",
+      "rule": "approval.binding",
+      "shows": "The call holds a whole number beyond 2^53 - 1. A schema cannot refuse it; the profile does, so the record has no canonical bytes, no digest and no lines."
+    },
+    {
+      "file": "approval.binding/x11-shown-at-a-revision-not-reached.json",
+      "rule": "approval.binding",
+      "shows": "An opening that names revision 2 on a request that is at revision 1."
+    },
+    {
+      "file": "approval.binding/x12-the-same-showing-twice.json",
+      "rule": "approval.binding",
+      "shows": "The same principal on the same surface at the same revision is recorded once."
+    },
+    {
+      "file": "approval.lifecycle/s01-open-answer-replay.json",
+      "rule": "approval.lifecycle",
+      "shows": "One request from the moment the core drew it: an answer before any showing, two surfaces showing it, a wrong digest, a stale revision, the answer, the same command again, the same command id with another answer, a second answer, an engine trying to answer, and a look after it is settled."
+    },
+    {
+      "file": "approval.lifecycle/s02-a-plugin-effect-approved-on-the-command-line.json",
+      "rule": "approval.lifecycle",
+      "shows": "A plugin effect: shown on the command line, then approved there."
+    }
+  ]
+}

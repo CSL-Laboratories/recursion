@@ -1,10 +1,8 @@
 {
   "answer": {
     "code": "x-nobody-defined-this",
-    "run_id": "run-none"
+    "detail": "run_id"
   },
   "method": "run.status",
-  "params": {
-    "run_id": "run-none"
-  }
+  "params": {}
 }

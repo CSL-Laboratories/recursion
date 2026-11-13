@@ -1,40 +1,48 @@
 {
-  "approval_id": "apr-00c5",
-  "session_id": null,
+  "approval_id": "apr-00c4",
+  "session_id": "ses-7f3a9c2e51d04b6a",
   "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-  "turn_id": null,
-  "source": "plugin_effect",
+  "turn_id": "turn-000c",
+  "source": "engine_tool",
   "effect": {
-    "schema": "csl-effect/vNext",
-    "kind": "order.place",
-    "plugin_id": "paper-desk",
+    "kind": "engine_tool",
+    "engine": "claude_code",
+    "session_id": "ses-7f3a9c2e51d04b6a",
     "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-    "connection": "api_key:paper-1",
-    "scope": {
-      "account": "paper-main",
-      "venue": "sim",
-      "contract_family": "spot",
-      "adapter": "sim-v1",
-      "environment": "paper"
-    },
-    "currency": "USD",
-    "amount_minor": 125000,
-    "payload": {
-      "side": "buy",
-      "symbol": "TEST",
-      "quantity": 5
+    "call_form": "csl-call/v1",
+    "call": {
+      "cwd": null,
+      "input": {},
+      "tool": "TodoRead"
     }
   },
-  "digest_form": "csl-cj/v0",
-  "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "digest_form": "rfc8785/v1",
+  "digest": "9b4e43a64f948e7bb5fcf2b277be5176537d612e70c85350fcd117a5471bca1f",
   "display": [],
+  "rendered_form": "csl-approval-lines/v0",
   "rendered": [
     {
-      "text": "APPROVAL NEEDED",
+      "text": "Tool call waiting for an answer",
       "trust": "trusted"
     },
     {
-      "text": "Plugin paper-desk asks to carry out order.place for USD 1250.00 on paper-main (paper)",
+      "text": "engine: claude_code",
+      "trust": "trusted"
+    },
+    {
+      "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "trust": "trusted"
+    },
+    {
+      "text": "tool: \"TodoRead\"",
+      "trust": "untrusted"
+    },
+    {
+      "text": "directory: null",
+      "trust": "untrusted"
+    },
+    {
+      "text": "input fields: 0",
       "trust": "trusted"
     }
   ],

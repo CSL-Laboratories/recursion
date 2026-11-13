@@ -4,6 +4,14 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `install.v1.json` is `1.0-draft.2` (Nov 13, 2026)
+
+A grant lists only the seven permissions today's reader takes. Draft 1 let a grant list the five names
+that are new in the version 1 manifest (`surface`, `command`, `subscribe`, `tool`, `run`), and today's
+reader refuses such a file (`daemon/plugins.py`, `read_install`), so the schema's own claim, that a
+file written to it is read by today's daemon, was false. What it breaks: an install file that grants
+one of the five. Granting them needs the reader to change first; this schema will say so when it does.
+
 ## Fixtures that prove every rule (Nov 13, 2026)
 
 No schema changed. Each `additionalProperties: false`, each name in a `required` list, each `enum` and

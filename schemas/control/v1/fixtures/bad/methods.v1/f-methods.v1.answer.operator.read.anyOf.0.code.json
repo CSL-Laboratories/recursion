@@ -7,9 +7,6 @@
   },
   "answer": {
     "code": "x-nobody-defined-this",
-    "http_status": 200,
-    "body": {
-      "conditions": []
-    }
+    "detail": "not_implemented"
   }
 }

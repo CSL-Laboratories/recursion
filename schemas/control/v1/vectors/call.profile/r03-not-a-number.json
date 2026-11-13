@@ -1,0 +1,8 @@
+{
+  "tool": "Bash",
+  "cwd": null,
+  "input_text": "{\"a\": NaN}",
+  "expect": {
+    "refused": "not_a_number"
+  }
+}

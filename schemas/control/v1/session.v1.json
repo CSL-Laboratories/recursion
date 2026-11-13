@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "session.v1.json",
   "title": "session.v1: one session and its turns",
-  "x-version": "1.0-draft.2",
+  "x-version": "1.0-draft.3",
   "description": "PUBLIC record, and the row lane SESSIONS stores. Meanings that are frozen with this record: a RUN is one supervised unit with its own Stop. A TURN is one input and the engine's work until it yields. With a driver that declares multi_turn, several turns of a session share one run_id (one worker stays alive between turns); with any other driver each turn has its own run. Stop acts on a run. Interrupt acts on a turn. A session has at most one live unit. 'idle' with a worker that is alive is a persistent worker waiting for input; 'live' is a turn in progress; 'stop_pending' is a Stop that is not confirmed, and no new turn starts while it lasts; 'ended' is final. A turn's result is stored with the turn: a run's result file is the run's, not a turn's, because several turns can share one run. No token, cookie or key appears in this record.",
   "type": "object",
   "additionalProperties": false,
@@ -135,7 +135,7 @@
         },
         {
           "if": {"required": ["state"], "properties": {"state": {"const": "ended"}}},
-          "then": {"properties": {"run_id": {"type": "string"}, "started_at": {"type": "string"}, "ended_at": {"type": "string"}, "outcome": {"enum": ["candidate_done", "done", "waiting", "paused"]}, "result": {"type": "object"}}}
+          "then": {"properties": {"run_id": {"type": "string"}, "started_at": {"type": "string"}, "ended_at": {"type": "string"}, "outcome": {"enum": ["candidate_done", "done", "waiting", "paused"]}, "result": {"type": "object", "properties": {"code": {"type": "null"}}}}}
         },
         {
           "if": {"required": ["state"], "properties": {"state": {"const": "interrupted"}}},

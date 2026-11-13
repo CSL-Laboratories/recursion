@@ -9,8 +9,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "result": {
-      "indexed": 212
-    }
+    "detail": "not_implemented"
   }
 }

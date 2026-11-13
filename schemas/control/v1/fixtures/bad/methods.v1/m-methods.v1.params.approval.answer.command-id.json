@@ -2,9 +2,9 @@
   "method": "approval.answer",
   "params": {
     "approval_id": "apr-00c4",
-    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "digest": "b2f03e58c884b88b4a04c063dfc3991bfd8896cb54cc0bbf9d8b5174e42cdd3d",
     "answer": "deny",
-    "expected_revision": 2,
+    "expected_revision": 1,
     "surface": "tui"
   }
 }

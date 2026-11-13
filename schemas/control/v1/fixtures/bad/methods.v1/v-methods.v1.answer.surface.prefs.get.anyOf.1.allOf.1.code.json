@@ -5,11 +5,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "prefs": {
-      "surface": "page",
-      "layout": null,
-      "theme": "dusk",
-      "revision": 4
-    }
+    "detail": "not_implemented"
   }
 }

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""A client of the published control records that knows nothing but the schemas and their fixtures.
+"""A client of the published control records that knows nothing but the schemas, their fixtures and
+their vectors.
 
 It reads the JSON Schemas under ``schemas/control/v1`` and ``schemas/plugin/v1`` and the fixtures beside
 them, and checks that every good fixture validates and every bad fixture is refused, for the reason the
-fixture index gives. It imports the standard library and ``jsonschema`` (Draft 2020-12) and nothing from
-the product: a client in any language can do the same from the same files.
+fixture index gives. It also checks the vectors (``vectors/index.json``) against the rules a schema
+cannot state, which ``rules.py`` beside this file states as code. It imports the standard library and
+``jsonschema`` (Draft 2020-12) and nothing from the product: a client in any language can do the same
+from the same files.
 
-    python conformance/wire_client.py            # prints one line per fixture, exits 1 on any failure
-    python -m unittest discover -s conformance   # the same checks as tests
+    python -m unittest discover -s conformance   # everything, the consistency checks included
+    python conformance/wire_client.py            # the fixtures and the vectors only, one line each
 
 The fixture index (``fixtures/index.json`` in each schema folder) lists every fixture file::
 
@@ -32,7 +35,13 @@ from jsonschema.exceptions import SchemaError
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
-REPO = Path(__file__).resolve().parent.parent
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import rules  # noqa: E402  beside this file: the rules a schema cannot state (standard library only)
+
+REPO = HERE.parent
 SCHEMA_FOLDERS = ("schemas/control/v1", "schemas/plugin/v1")
 DIALECT = "https://json-schema.org/draft/2020-12/schema"
 MIN_GOOD = MIN_BAD = 3
@@ -341,21 +350,149 @@ def check_instance(schemas: SchemaSet, entry: dict, instance: Any) -> str | None
     return None
 
 
+VECTOR_RULES = ("call.profile", "approval.binding", "approval.lifecycle")
+
+
+def load_vectors(folder: Path) -> list[dict]:
+    """The vectors of a folder (``vectors/index.json``), or none when the folder has no vectors.
+
+    A fixture is one record checked against one schema. A vector is checked against a RULE that no
+    schema can state (``rules.py``): that a digest is the digest of its effect, that the lines of an
+    approval are the lines of that effect, that a sequence of calls is answered the way the protocol
+    says. Each entry names its file, its rule and what it shows.
+    """
+    path = folder / "vectors" / "index.json"
+    if not path.is_file():
+        return []
+    index = read_json(path)
+    entries = index.get("vectors") if isinstance(index, dict) else None
+    if not isinstance(entries, list):
+        raise ConformanceError(f"{path}: no 'vectors' list")
+    for entry in entries:
+        if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) and entry[key]
+                                                  for key in ("file", "rule", "shows")):
+            raise ConformanceError(f"{path}: an entry needs 'file', 'rule' and 'shows'")
+        if entry["rule"] not in VECTOR_RULES:
+            raise ConformanceError(f"{entry['file']}: no rule named {entry['rule']!r}")
+    return entries
+
+
+def vector_files(folder: Path) -> set[str]:
+    root = folder / "vectors"
+    return {path.relative_to(root).as_posix() for path in root.rglob("*.json") if path.name != "index.json"} if root.is_dir() else set()
+
+
+def approvals_in(value: Any) -> Iterator[dict]:
+    """Every approval record inside a JSON value: on its own, in an event's payload, in a method's answer."""
+    if isinstance(value, dict):
+        if {"approval_id", "effect", "digest", "rendered"} <= value.keys():
+            yield value
+        for item in value.values():
+            yield from approvals_in(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from approvals_in(item)
+
+
+def _misfit(schemas: SchemaSet, ref: str, instance: Any) -> str | None:
+    errors = leaf_errors(schemas.validator(ref), instance)
+    if not errors:
+        return None
+    keyword, location, message = errors[0]
+    return f"{keyword} at {location or '/'}: {message[:160]}"
+
+
+def check_vector(schemas: SchemaSet, entry: dict) -> str | None:
+    """None when the vector agrees with its rule, else what does not."""
+    vector = read_json(schemas.folder / "vectors" / entry["file"])
+    rule = entry["rule"]
+    if rule == "call.profile":
+        # One tool call as an engine wrote it, and the text that is bound for it, or the reason it is refused.
+        expect = vector["expect"]
+        try:
+            call = rules.call_of(vector["tool"], vector["input_text"], vector["cwd"])
+        except rules.Refused as refusal:
+            return None if expect.get("refused") == refusal.code else f"refused as '{refusal.code}', expected {expect}"
+        text = rules.text_of(call)
+        if "refused" in expect:
+            return f"taken as {text[:80]}, expected the refusal '{expect['refused']}'"
+        if text != expect["call_text"]:
+            return f"the call's text is {text[:200]!r}, expected {expect['call_text'][:200]!r}"
+        misfit = _misfit(schemas, "approval.v1.json#/$defs/call", call)
+        return f"the call does not fit its schema: {misfit}" if misfit else None
+    if rule == "approval.binding":
+        # One approval record of the right shape, and exactly what does not agree inside it.
+        record = vector["record"]
+        misfit = _misfit(schemas, "approval.v1.json", record)
+        if misfit:
+            return f"the record does not fit approval.v1: {misfit}"
+        found = rules.approval_problems(record)
+        if found != vector["expect"]:
+            return f"the rule finds {found}, the vector says {vector['expect']}"
+        if "effect_text" in vector:      # the bytes the digest is taken over, written out
+            try:
+                text = rules.effect_bytes(record["digest_form"], record["effect"]).decode("utf-8")
+            except rules.Refused as refusal:
+                return f"the effect has no canonical bytes ({refusal.code}), and the vector gives some"
+            if text != vector["effect_text"]:
+                return "the effect's canonical text differs from the vector's"
+        return None
+    if rule == "approval.lifecycle":
+        # One request, and calls on it one after another: each answer and each record after it.
+        model = rules.ApprovalModel(vector["record"])
+        records = [("the starting record", vector["record"])]
+        for number, step in enumerate(vector["steps"], 1):
+            request = step["request"]
+            answer = model.call(step["principal"], request["method"], request["params"], step["at"])
+            if answer != step["answer"]:
+                return f"step {number}: the rule answers {answer}, the vector says {step['answer']}"
+            if model.record != step["record"]:
+                return f"step {number}: the record after the call is not the vector's"
+            misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", dict(request, answer=answer))
+            if misfit:
+                return f"step {number}: the call and its answer do not fit the method table: {misfit}"
+            records.append((f"step {number}", step["record"]))
+        for where, record in records:
+            misfit = _misfit(schemas, "approval.v1.json", record)
+            if misfit:
+                return f"{where}: the record does not fit approval.v1: {misfit}"
+            found = rules.approval_problems(record)
+            if found:
+                return f"{where}: the record does not agree with itself: {found}"
+        return None
+    return f"no rule named {rule!r}"
+
+
 def folders() -> list[Path]:
     return [REPO / name for name in SCHEMA_FOLDERS if (REPO / name).is_dir()]
 
 
 def main() -> int:
+    """One line for every fixture and every vector. This is NOT everything: the checks that the published
+    files agree with each other (``tests.py``) run only with ``python -m unittest discover -s conformance``.
+    """
     failures = total = 0
     for folder in folders():
         schemas = SchemaSet(folder)
+        name = folder.relative_to(REPO).as_posix()
         for entry in load_index(folder):
             total += 1
             problem = check_entry(schemas, entry)
             failures += problem is not None
-            print(f"{'FAIL' if problem else 'ok  '} {folder.relative_to(REPO).as_posix()}/fixtures/{entry['file']}"
-                  + (f": {problem}" if problem else ""))
-    print(f"{total} fixtures, {failures} failed")
+            print(f"{'FAIL' if problem else 'ok  '} {name}/fixtures/{entry['file']}" + (f": {problem}" if problem else ""))
+            if problem is None and entry["file"].startswith("good/"):
+                for record in approvals_in(read_json(folder / "fixtures" / entry["file"])):
+                    found = rules.approval_problems(record)
+                    if found:
+                        failures += 1
+                        print(f"FAIL {name}/fixtures/{entry['file']}: an approval in it does not agree with itself: {found}")
+        for entry in load_vectors(folder):
+            total += 1
+            problem = check_vector(schemas, entry)
+            failures += problem is not None
+            print(f"{'FAIL' if problem else 'ok  '} {name}/vectors/{entry['file']}" + (f": {problem}" if problem else ""))
+    print(f"{total} fixtures and vectors, {failures} failed. The consistency checks are not run by this command: "
+          "python -m unittest discover -s conformance")
     return 1 if failures or not total else 0
 
 

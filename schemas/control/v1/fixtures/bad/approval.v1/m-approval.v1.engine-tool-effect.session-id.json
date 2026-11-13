@@ -8,58 +8,49 @@
     "kind": "engine_tool",
     "engine": "claude_code",
     "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-    "tool": "Bash",
-    "input_json": "{\"command\":\"rm -rf build && make\",\"description\":\"clean build\"}",
-    "cwd": "/home/dev/projects/atlas"
-  },
-  "digest_form": "csl-cj/v0",
-  "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "display": [
-    {
-      "label": "Engine",
-      "value": "claude_code",
-      "trust": "trusted"
-    },
-    {
-      "label": "Why the engine says it wants this",
-      "value": "clean build",
-      "trust": "untrusted"
+    "call_form": "csl-call/v1",
+    "call": {
+      "cwd": null,
+      "input": {},
+      "tool": "TodoRead"
     }
-  ],
+  },
+  "digest_form": "rfc8785/v1",
+  "digest": "9b4e43a64f948e7bb5fcf2b277be5176537d612e70c85350fcd117a5471bca1f",
+  "display": [],
+  "rendered_form": "csl-approval-lines/v0",
   "rendered": [
     {
-      "text": "APPROVAL NEEDED",
+      "text": "Tool call waiting for an answer",
       "trust": "trusted"
     },
     {
-      "text": "Engine claude_code asks to run the tool Bash in /home/dev/projects/atlas",
+      "text": "engine: claude_code",
       "trust": "trusted"
     },
     {
-      "text": "command: rm -rf build && make",
+      "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "trust": "trusted"
+    },
+    {
+      "text": "tool: \"TodoRead\"",
       "trust": "untrusted"
     },
     {
-      "text": "Answer by its number: 1 approve, 2 deny. Nothing is approved by default.",
+      "text": "directory: null",
+      "trust": "untrusted"
+    },
+    {
+      "text": "input fields: 0",
       "trust": "trusted"
     }
   ],
   "requested_at": "2026-11-13T07:34:30.000Z",
   "expires_at": "2026-11-13T07:49:30.000Z",
   "state": "pending",
-  "opened_by": [
-    {
-      "principal": {
-        "kind": "owner",
-        "id": "local"
-      },
-      "surface": "tui",
-      "revision": 1,
-      "at": "2026-11-13T07:34:31.000Z"
-    }
-  ],
+  "opened_by": [],
   "answered_by": null,
   "answer": null,
   "answered_at": null,
-  "revision": 2
+  "revision": 1
 }

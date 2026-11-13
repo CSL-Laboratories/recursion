@@ -1,10 +1,10 @@
 {
   "answer": {
     "code": "x-nobody-defined-this",
-    "detail": "after_unknown"
+    "detail": "limit"
   },
   "method": "run.list",
   "params": {
-    "after": "run-none"
+    "limit": 0
   }
 }

@@ -3,7 +3,7 @@
   "params": {},
   "answer": {
     "code": "x-nobody-defined-this",
-    "table_version": "1.0-draft.3",
+    "table_version": "1.0-draft.4",
     "methods": [
       {
         "name": "run.stop",

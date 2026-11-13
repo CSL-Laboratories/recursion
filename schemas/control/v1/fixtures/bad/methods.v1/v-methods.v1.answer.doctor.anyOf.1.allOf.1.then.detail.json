@@ -1,0 +1,8 @@
+{
+  "method": "doctor",
+  "params": {},
+  "answer": {
+    "code": "unsupported",
+    "detail": "multi_turn"
+  }
+}

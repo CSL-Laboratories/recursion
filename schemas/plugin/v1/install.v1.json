@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "install.v1.json",
   "title": "install.v1: the plugin install file, install.json",
-  "x-version": "1.0-draft.1",
+  "x-version": "1.0-draft.2",
   "description": "The file '$XDG_CONFIG_HOME/recursion/plugins/install.json' as the daemon reads it today (core/recursion_core/daemon/plugins.py, read_install): this install's trusted developer keys, the grants its user made, the destinations and credential names reserved for effect owners, and the installer's key for the authority ledger. Version 1 is today's format with nothing added, so a file written to this schema is read by today's daemon; it has no version field because today's reader refuses a field it does not know. Every top-level field may be left out; a missing file means no trusted key and no grant, so nothing gets a permission. The file is owner-only and is written by the install commands, never by a plugin. A grant is bound to one artifact digest and one signing key: a grant for another digest or key grants nothing. Two rules the reader enforces cannot be written in a schema: no two grants name the same plugin_id; and the file must be a regular file of the operator's that no one else can write.",
   "type": "object",
   "additionalProperties": false,
@@ -52,8 +52,9 @@
         "artifact_sha256": {"$ref": "#/$defs/hex64"},
         "signer_key_id": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]},
         "permissions": {
+          "description": "The seven permissions today's reader takes (plugin_security/manifest.py, PERMISSIONS). The five names that are new in the version 1 manifest are NOT here: today's reader refuses a grant that lists one (daemon/plugins.py, read_install), so a file that granted one would not be read by today's daemon. Granting them needs the reader to change first; when it does, this list grows and this schema says so.",
           "type": "array",
-          "items": {"$ref": "manifest.v1.json#/$defs/permission"}
+          "items": {"enum": ["read", "propose", "panel", "network", "credential", "process", "order"]}
         },
         "unsigned_order_acknowledged": {"type": "boolean"},
         "order_after_revoked_key": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]},

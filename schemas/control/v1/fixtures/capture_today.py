@@ -133,6 +133,9 @@ def capture(out_dir: Path, with_exchanges: bool = False) -> dict[str, object]:
         exchange('c15-route-list', 'route.list', {})
         exchange('c16-plugin-list', 'plugin.list', {})
         exchange('c17-a-method-the-daemon-does-not-know', 'run.kill', {})
+        # A run id that is not well formed is looked up like any other, and echoed in the answer as it was given.
+        exchange('c18-run-status-of-an-id-that-is-not-one', 'run.status', {'run_id': 'not/a/run'})
+        exchange('c19-run-stop-of-an-id-that-is-not-one', 'run.stop', {'run_id': 'not/a/run'})
 
         # A unit the manager can no longer observe is never reported running.
         run_d = case.start(api)

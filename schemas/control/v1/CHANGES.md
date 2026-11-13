@@ -17,15 +17,86 @@ Nothing is frozen yet.
 | `run.record.v1.json` | 1.0-draft.2 |
 | `run.view.v1.json` | 1.0-draft.2 |
 | `stop.result.v1.json` | 1.0-draft.2 |
-| `session.v1.json` | 1.0-draft.2 |
-| `queue.item.v1.json` | 1.0-draft.2 |
-| `event.v1.json` | 1.0-draft.2 |
-| `approval.v1.json` | 1.0-draft.2 |
+| `session.v1.json` | 1.0-draft.3 |
+| `queue.item.v1.json` | 1.0-draft.3 |
+| `event.v1.json` | 1.0-draft.3 |
+| `approval.v1.json` | 1.0-draft.3 |
 | `driver.v2.json` | 1.0-draft.2 |
 | `mcp.task.v1.json` | 1.0-draft.2 |
 | `transcript.line.v1.json` | 1.0-draft.2 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.3 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.4 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## After the second cross-family read of these drafts (Nov 13, 2026)
+
+Another model family read these drafts at their second commit and judged them not yet a contract that
+lanes can build against. This section is what changed for it, and two decisions the owner made the
+same night.
+
+### Decided by the owner, and marked for follow-up research (Nov 13, 2026)
+
+Both are decided. The owner asked that both be marked as decisions that may be looked at again.
+
+| Decision | What it is |
+|---|---|
+| The digest form of an engine's call | RFC 8785 for engine effects only (`rfc8785/v1`). Plugin effects and every signature that exists keep `csl-cj/v0`; nothing signed is migrated. The form's name carries its version, so a later change is a new value of `digest_form` |
+| Hosted CI runs the conformance checks | One new file, `tools/test_wire_conformance.py`, loads the conformance suite where the gate's own runner collects it. The gate is not edited |
+
+### `approval.v1.json` is `1.0-draft.3`
+
+The read found that the good fixtures showed one action and bound another: a Write to a menu file
+whose lines said a build folder would be removed; every digest the SHA-256 of no bytes; an opening
+recorded at a revision the request had passed. The fixtures were wrong because nothing made them
+right. Now one rule makes them (`conformance/rules.py`), vectors check it, and every approval inside
+any good fixture is checked against it.
+
+| Change | What it breaks |
+|---|---|
+| An engine's call is `call` (the value `{cwd, input, tool}`) with `call_form` `csl-call/v1`; `tool`, `input_json` and `cwd` are gone from the effect | Every producer and reader of an engine approval's effect |
+| `digest_form` is `rfc8785/v1` for an engine's call and `csl-cj/v0` for a plugin's effect, fixed by the source | Every digest of an engine approval. A directory or a tool name outside ASCII is no longer refused |
+| `rendered_form` is new and required; the lines follow `csl-approval-lines/v0`: every field of the effect, nothing else, nothing cut, engine text drawn as JSON text with unsafe characters escaped | Any lines a producer composed its own way; a plugin effect drawn as a summary |
+| A call larger than 262,144 bytes, or needing more than 200 lines, is denied without asking | An approval of a larger call (PROVISIONAL) |
+| `revision` is the request's own: an answer raises it, a showing does not; an opening carries the revision shown; `approval.answer` checks, in order, the caller, the receipt, already resolved, the revision, the showing, the digest | A producer that raised the revision at `approval.open`. A pending request is at revision 1 |
+| `$defs/call` is new | Nothing |
+
+### `session.v1.json` and `event.v1.json` are `1.0-draft.3`
+
+A turn that ended without failing carries a result with no error code (`session.v1` turn, `event.v1`
+`turn.ended`). The Task of a turn already refused that; the producer's records allowed it. What it
+breaks: a record of a `done`, `candidate_done`, `waiting` or `paused` turn that carries a code.
+
+### `queue.item.v1.json` is `1.0-draft.3`
+
+`delivering` is the daemon's COMMITTED intent to deliver, and that commit comes before anything is
+written toward the engine, so a crash between the two can never lead to a second send. What it breaks:
+an implementation that writes first and records after. How the core learns that an engine took an
+input sent into a turn in progress is not settled: the options are with the build's coordinator, and
+this record's `delivered` keeps its draft-2 wording until they are.
+
+### `methods.v1.json` is `1.0-draft.4`
+
+| Change | What it breaks |
+|---|---|
+| A refusal's `run_id` is any non-empty string: today's daemon looks up an id that is not well formed and answers `run_unknown` with it, as given. Two such answers are captured (`c18`, `c19`) | Nothing. A reader must not assume an echoed run id is well formed |
+| A method's `unsupported` names `not_implemented` or a driver flag its row requires, and nothing else; the table check holds the row's `requires` to exactly those flags | An `unsupported` that names a flag the method does not require |
+| `requires` means: without the flag the method is refused, whatever else is true. `session.interrupt` now requires `interrupt`. A method that only behaves differently without a flag does not list it | A caller that expected `session.interrupt` to answer `ok` on a driver that cannot interrupt |
+| The payload digest of a command has a named form: SHA-256 of the UTF-8 bytes of the params without the command id, as RFC 8785 writes them | Nothing published |
+| Said in the rules, not new: a name with no row is `method_unknown`, a reserved name included, and `methods.list` never lists it; a row without a handler answers `unsupported`, `not_implemented` (31 exchanges now show it, one for each method not built yet). `run.start`'s key reused with another engine or prompt stays `request_invalid` with detail `client_key_reused`, as today (`control/api.py`), and is not turned into a new code | Nothing |
+
+### Not changed yet, on purpose
+
+`mcp.task.v1.json` stays at draft 2. The Task of a run that has no session needs facts the run record
+does not keep (why a start failed, after a restart; when the state last changed) and a rule from a
+run's result to the Task's. Those cross lanes; the options are with the build's coordinator, and no
+lane should treat that half of the Task as agreed. The transcript fixtures are not yet checked as
+projections of the events they are paired with; that is next.
+
+### The checks themselves
+
+`conformance/rules.py` and `vectors/` are new (42 vectors: 24 of the call profile, 16 of what an
+approval binds, 2 sequences of calls). `wire_client.py` run as a command checks the fixtures and the
+vectors and says in its last line that the consistency checks are only run by the unittest command.
+No fixture may be checked against a schema that refuses nothing.
 
 ## Fixtures that prove every required field, list of values and fixed value (Nov 13, 2026)
 

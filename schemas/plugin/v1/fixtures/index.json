@@ -539,6 +539,15 @@
       }
     },
     {
+      "file": "bad/install.v1/b08-a-grant-of-a-permission-the-reader-does-not-take-yet.json",
+      "schema": "install.v1.json",
+      "rule": "'run' is a permission of the version 1 manifest, and today's reader refuses a grant that lists it: an install file holds only what today's daemon reads.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/grants/0/permissions/1"
+      }
+    },
+    {
       "file": "bad/install.v1/m-install.v1.grant.permissions.json",
       "schema": "install.v1.json",
       "rule": "The object described at install.v1.json#/$defs/grant always carries 'permissions'.",

@@ -1,0 +1,10 @@
+{
+  "method": "approval.list",
+  "params": {
+    "state": "pending"
+  },
+  "answer": {
+    "code": "unsupported",
+    "detail": "multi_turn"
+  }
+}

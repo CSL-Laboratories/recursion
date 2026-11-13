@@ -1,16 +1,30 @@
 # Conformance client
 
-A client of the published control records that knows nothing but the schemas and their fixtures. It
-is the check that someone outside the product can build against what is published: it imports the
-Python standard library and `jsonschema` (Draft 2020-12), and nothing from `recursion_core`.
+A client of the published control records that knows nothing but the schemas, their fixtures and
+their vectors. It is the check that someone outside the product can build against what is published:
+it imports the Python standard library and `jsonschema` (Draft 2020-12), and nothing from
+`recursion_core`.
 
 ```
-python3.12 -m unittest discover -s conformance      # one test per fixture, plus consistency checks
-python3.12 conformance/wire_client.py               # one line per fixture; exit 1 on any failure
+python3.12 -m unittest discover -s conformance      # EVERYTHING: one test per fixture and per vector, and the consistency checks
+python3.12 conformance/wire_client.py               # the fixtures and the vectors only, one line each; exit 1 on any failure
 ```
+
+The second command is the quick one and is not the whole check: it does not run the consistency checks
+listed below (that the index and the folders agree, that every reference resolves, that every rule is
+proved by a fixture, that the method table agrees with its schema). It says so in its last line.
 
 Run it on Python 3.12 with `jsonschema` installed (`requirements-ci.txt`). The daemon's own
 interpreter does not have `jsonschema`, and nothing under `core/` may import it.
+
+Three files:
+
+- `wire_client.py`: reads the schemas, the fixtures and the vectors, and checks one of each.
+- `rules.py`: the rules a JSON Schema cannot state, as plain functions over plain values, importing the
+  standard library alone: the strict reading of a tool's input, the text of a value as RFC 8785 writes
+  it, the digest of an effect, the lines of an approval, and `approval.open` and `approval.answer` one
+  call at a time. A client in another language implements these and checks the same vectors.
+- `tests.py`: all of it as tests.
 
 ## What it checks
 
@@ -33,7 +47,18 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   the answer schema agree (the same codes, a `command_id` exactly where the row says, no `principal` or
   `owner` among the params), no code is both typed by a method's own answer and allowed as its bare
   refusal, and only `run.stop` mutates without a key;
-- `fixtures/index.json` and the fixture folders list exactly the same files;
+- every vector agrees with its rule (`vectors/index.json`): a tool call becomes exactly the text that is
+  bound for it, or is refused with exactly its code; an approval record of the right shape has exactly
+  the problems its vector lists (none, or a digest that is not its effect's, lines that are not its
+  effect's, a call outside its profile); a sequence of `approval.open` and `approval.answer` calls is
+  answered step by step as the protocol says. Every rule has vectors that agree and vectors it must
+  catch;
+- every approval inside a good fixture, wherever it sits, has the digest of its effect and the lines
+  of its effect;
+- no fixture is checked against a schema that refuses nothing (the root of a file that only holds
+  definitions, say);
+- `fixtures/index.json` and the fixture folders list exactly the same files, and so do
+  `vectors/index.json` and the vector folders;
 - every file under `fixtures/good/` validates;
 - every file under `fixtures/bad/` is refused **for its own rule**: the index names the schema keyword
   that refuses it and the place in the fixture where it does, and the client checks that this very
@@ -65,9 +90,13 @@ A schema change that adds a closed object, a required field, an `enum` or a `con
 fixture that breaks exactly that rule: the test names every rule that has none. Take a good fixture
 that reaches the rule, make the one change, and list it with the keyword and the place.
 
-## Why the test file is named `tests.py`
+## How the hosted gate runs this
 
-The hosted gate (`tools/ci_gate.py`) fails when it finds a file named `test_*.py` outside the folders
-it runs, and it does not run this folder. `unittest discover` finds `tests.py` by its default pattern,
-and the gate does not count it. So today these checks run where someone runs the commands above; the
-hosted gate does not run them. Making the gate run them is a change to the gate, which is frozen.
+The hosted gate (`tools/ci_gate.py`) runs every file named `tools/test_*.py` and does not reach this
+folder. `tools/test_wire_conformance.py` is the bridge: it loads the test cases of `tests.py` where
+the gate's own runner collects them, and adds no check of its own. The gate is not edited. This was
+the owner's decision of Nov 13, 2026, marked for follow-up research.
+
+The test file here is still named `tests.py`, not `test_*.py`: the gate fails when it finds a
+test-named file outside the folders it runs, and `unittest discover` finds `tests.py` by its default
+pattern all the same.

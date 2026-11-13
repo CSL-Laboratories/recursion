@@ -43,6 +43,12 @@ nobody defined added, a required field removed, a value replaced by one outside 
 value replaced), one for every closed object, required field, list of allowed values and fixed value,
 so that none of them can be taken away unnoticed.
 
+`vectors/` holds what a schema cannot check: each vector is checked against a rule that
+`conformance/rules.py` states as code (that a digest is the digest of its effect, that an approval's
+lines are the lines of that effect, how a tool call becomes the one string that is bound, how
+`approval.open` and `approval.answer` are answered one after another). `vectors/index.json` lists
+them. A client in another language implements the same rules and checks the same vectors.
+
 ## Storage records and public records are different records
 
 The registry stores `run.record.v1`. A client never reads that. It reads `run.view.v1`, which adds:
@@ -113,6 +119,67 @@ the bad fixtures show both.
   from the payload, and reads on. A reader never guesses a missing field. A reader compares digests; it
   does not recompute them.
 
+## What an approval binds
+
+One rule binds what is shown to what is approved, and `conformance/rules.py` states it as code:
+
+1. `effect` is exactly what is being approved.
+2. `digest` is the SHA-256 of the effect's canonical bytes, in the form `digest_form` names.
+3. `rendered` is the lines of that same effect, in the form `rendered_form` names: every field of the
+   effect is on a line, nothing else is, and nothing is ever cut.
+
+A schema can check none of the three. The vectors in `vectors/` do: records that agree, and records of
+the right shape that do not (lines of another call, the digest of nothing, the digest of another
+serialisation, a field left off, a comforting line added, a payload summed up in one line, a raw
+right-to-left override), each caught for its own reason. Every approval inside a good fixture, wherever
+it sits, is checked the same way.
+
+**The digest form: decided Nov 13, 2026, and marked for follow-up research.** An engine's tool call is
+bound under RFC 8785 (`digest_form` `rfc8785/v1`). A plugin's effect, and every signature that exists
+today, keeps `csl-cj/v0`; nothing signed is migrated. The owner decided this and asked that it be
+marked as possibly revisited: the form's name carries its version, so a later change is a new value in
+`digest_form`, not a new record.
+
+**The call of an engine tool** (profile `csl-call/v1`). Everything an engine supplied is in `call`:
+the tool's name, its input and the directory. It is read strictly and bound as a value:
+
+| Question | Rule |
+|---|---|
+| What is read | The input is JSON text and an object. The tool's name and the directory are text under the same rules as the input: any alphabet, in every field |
+| A key named twice in one object, at any depth | Refused. The core never picks the first or the last |
+| `NaN`, `Infinity` | Refused |
+| A whole number written without a fraction or an exponent | Kept exactly if it lies within -(2^53 - 1) .. 2^53 - 1, checked on its digits before any conversion that could lose it; refused outside it. A larger one is sent as a string, or not at all |
+| A number with a fraction or an exponent | Read as a binary64; refused if it is not finite |
+| Half of a surrogate pair on its own, in a string or a key | Refused |
+| Unicode normalisation | None. A string is kept as it was written |
+| Depth | 64 at most |
+| What is hashed | The UTF-8 bytes of the WHOLE effect as RFC 8785 writes it: the core's own fields and the engine's call under one form. Keys in the order of their UTF-16 code units (U+10000 sorts before U+E000); numbers as ECMAScript writes them (`1.0` is `1`, `1e-7` is `1e-7`, minus zero is `0`, `1e21` is `1e+21`); strings as themselves |
+| Size | The call's text is at most 262,144 bytes and the approval's lines at most 200. A call that does not fit is never cut and never drawn: the core denies it without asking |
+| What the lines show | The same text, except that a character a surface must never be handed raw is written as a `\u` escape: controls, the marks that reorder or hide text, private use, tags (the list is in `rules.py`, `NOT_SHOWN_RAW`, and is explicit so that it does not move with a Unicode version). Text an engine supplied is always drawn as JSON text, quotes included, so two different values never draw the same line |
+| What is carried out | The call that was bound. Where an engine's permission protocol lets the answer carry the input, the driver sends back the bound input; otherwise the private binding to the engine's own pending request is the link |
+
+`vectors/call.profile/` holds each row as a case: what an engine wrote, and the text that is bound for
+it or the code it is refused with. The cases where two everyday serialisers disagree are among them
+(`1.0` against `1`, `1e-07` against `1e-7`, keys above U+FFFF, whole numbers above 2^53, a key named
+twice). Three things were checked against implementations that are not this one, on the lane's
+machine: every plugin effect's bytes against the product's own `canonical`; every engine effect's
+digest and every call text against what Node gives with its own `JSON.parse`, a recursive key sort and
+`JSON.stringify`; and nine thousand numbers against Node's own writing of them.
+
+Still PROVISIONAL, and for the APPROVALS lane to refine: the wording and order of the lines, the list
+of characters shown as escapes, and the size rule. The alternative to "deny without asking" is a
+prompt that shows part of the call and makes the owner read the rest before an answer is taken, which
+is a protocol of its own.
+
+**Revision.** `revision` is the revision of the request and of what it shows. It starts at 1 and rises
+by one at every change of the request: an answer, the effect being carried out, a veto, the deadline
+passing. Recording that a surface showed the request (`approval.open`) is a note about the request, not
+a change of it: it does not raise the revision, and the note carries the revision that was shown. What
+a pending request shows never changes, so a pending request is at revision 1 and an answer names
+`expected_revision` 1. `vectors/approval.lifecycle/` walks one request through an answer before any
+showing, two surfaces, a wrong digest, a stale revision, the answer, a retry of the same command, the
+same command id with another answer, a second answer, and an engine trying to answer.
+
 ## The method table
 
 `methods.table.v1.json` is data: one row per method. `methods.v1.json` gives, for every method, the
@@ -154,7 +221,7 @@ Each of these has a fixture, so a change shows up as a failing fixture, not as a
 | `usage.bucket`, the `budget.show` row | `event.v1.json`, `methods.v1.json` | QUOTA |
 | `containment_level` names, `claim` keys, the `attestation` and `fence` shapes | `stop.result.v1.json` | The lane that owns Stop, on a decision that is still open |
 | The launch snapshot (`route` on the run record): which of the route contract's fields it keeps | `run.record.v1.json` | DRIVER-CC, ROUTING |
-| An engine tool's input rides in the approval's effect as `input_json`, an escaped JSON string | `approval.v1.json` | Goes with the digest decision (below) |
+| The lines of an approval (`csl-approval-lines/v0`): their wording and order, the characters shown as escapes, and the rule that a call too large to show whole is denied without asking | `approval.v1.json`, `conformance/rules.py` | APPROVALS |
 | `surface` (who showed an approval) is `cli`, `tui`, `page` or `phone` | `approval.v1.json` | APPROVALS |
 | The transcript's `state`, `speech` and `focus` | `transcript.line.v1.json` | TUI |
 | The Task's `poll_interval_ms`, and the status derived for `unknown` and `lost_reboot` runs | `mcp.task.v1.json` | MCP |
@@ -170,16 +237,22 @@ of the run view and today's Stop answer (captured); the event envelope's field n
 and digest forms; `run:<run_id>` as the log of a run without a session; the id prefixes; and that
 every object is closed.
 
+## Decided by the owner, and marked for follow-up research
+
+Both were decided on Nov 13, 2026, and the owner asked that both be marked as decisions that may be
+looked at again if they need to be reworked.
+
+- **The digest form of an engine's call.** RFC 8785 for engine effects only (`rfc8785/v1`); plugin
+  effects and every existing signature keep `csl-cj/v0`. The profile is in "What an approval binds",
+  above. The alternative that was set aside: keep `csl-cj/v0` for everything and carry the call as one
+  escaped string.
+- **Hosted CI runs the conformance checks.** One file, `tools/test_wire_conformance.py`, loads the
+  conformance suite where the gate's own runner collects it. The gate itself is not edited.
+
 ## What is not decided
 
 Each is built as recommended, marked PROVISIONAL in its schema, and is the owner's decision.
 
-- **The digest's canonical form.** Recommended: `csl-cj/v0` (the restricted canonical JSON that
-  `plugin_security/canonical.py` implements), named in the record as `digest_form` so that a later form
-  is a new name. That form takes ASCII text and whole numbers only, and an engine tool's input holds any
-  text and any number, so the effect carries the input as `input_json`, a string the core serialised
-  with every non-ASCII character escaped; the digest binds that string and the prompt is drawn from it.
-  The alternative is RFC 8785, for engine effects or for everything.
 - **Who may Stop.** Recommended: `run.stop` needs a currently held `run` scope; an owner or a device
   holding it may stop any run, including runs from before version 1; a session principal may stop only
   its own session's runs and its descendants'; the daemon's own recovery Stop is not a client's call.

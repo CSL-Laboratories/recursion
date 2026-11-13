@@ -4,7 +4,7 @@
     "command_id": "tui-7c1e.0042",
     "approval_id": "apr-00c4",
     "answer": "deny",
-    "expected_revision": 2,
+    "expected_revision": 1,
     "surface": "tui"
   }
 }

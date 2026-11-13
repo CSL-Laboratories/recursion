@@ -77,6 +77,7 @@ class PublishedFilesTest(unittest.TestCase):
             ("api.v1.json", "/$defs/tool/properties/input_schema"),       # a JSON Schema, the plugin's own
             ("approval.v1.json", "/properties/effect"),                   # typed per source by the rules below it
             ("approval.v1.json", "/$defs/plugin_effect/properties/payload"),  # the plugin's own data, never read
+            ("approval.v1.json", "/$defs/call/properties/input"),         # the tool's own input, never interpreted
             ("driver.v2.json", "/$defs/event_draft/properties/payload"),  # typed per type by the rules below it
         }
         rules = ("allOf", "if", "then", "else", "not")
@@ -176,6 +177,17 @@ class PublishedFilesTest(unittest.TestCase):
                     # A fixture lives in the folder named after the schema file it is checked against.
                     self.assertEqual(entry["file"].split("/")[1] + ".json", entry["schema"].split("#")[0])
 
+    def test_no_fixture_is_checked_against_a_schema_that_refuses_nothing(self):
+        """A good fixture proves nothing against a schema that takes every value (the root of a file that
+        only holds definitions, say): no fixture may name such a target."""
+        anything = (None, False, 0, "", [], {})
+        for folder, schemas in self.sets.items():
+            for target in sorted({entry["schema"] for entry in client.load_index(folder)}):
+                with self.subTest(schema=target):
+                    validator = schemas.validator(target)
+                    self.assertTrue(any(client.leaf_errors(validator, value) for value in anything),
+                                    f"{target} refuses nothing, so a fixture checked against it proves nothing")
+
     def test_every_record_schema_has_enough_fixtures(self):
         for folder, schemas in self.sets.items():
             counts = {}
@@ -239,6 +251,13 @@ class PublishedFilesTest(unittest.TestCase):
                     # A code the method's own answer types is never also a bare refusal: if it were, an
                     # answer could carry the code and skip every field the typed answer requires.
                     self.assertEqual(sorted(set(typed) & set(refusals)), [], "a typed code is also a bare refusal")
+                    # 'unsupported' names not_implemented or a flag the row requires, and the row requires
+                    # exactly the flags the answer can name.
+                    limits = answer["anyOf"][1]["allOf"][1]
+                    if "unsupported" in refusals:
+                        self.assertEqual(limits["then"]["properties"]["detail"]["enum"], ["not_implemented"] + row["requires"])
+                    else:
+                        self.assertEqual(row["requires"], [], "a row requires a flag and cannot answer 'unsupported'")
                     # What the row says about keys and revisions is what the params schema requires.
                     required = set(params.get("required", ()))
                     self.assertEqual("command_id" in required, row["idempotency"] == "command_id")
@@ -265,7 +284,8 @@ class PublishedFilesTest(unittest.TestCase):
             self.assertLessEqual(set(record["required"]), set(view["required"]))
 
     def test_this_client_imports_nothing_from_the_product(self):
-        allowed = {"jsonschema", "referencing", "wire_client"} | set(sys.stdlib_module_names)
+        """Nothing here imports the product, and the rules import the standard library alone."""
+        allowed = {"jsonschema", "referencing", "wire_client", "rules"} | set(sys.stdlib_module_names)
         for path in sorted(HERE.glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
@@ -276,6 +296,46 @@ class PublishedFilesTest(unittest.TestCase):
                     names = [node.module or ""]
                 for name in names:
                     self.assertIn(name.split(".")[0], allowed, f"{path.name} imports {name}")
+                    if path.name == "rules.py":
+                        self.assertIn(name.split(".")[0], sys.stdlib_module_names, f"rules.py imports {name}")
+
+    def test_vector_index_and_vector_folders_list_the_same_files(self):
+        for folder in self.sets:
+            listed = [entry["file"] for entry in client.load_vectors(folder)]
+            self.assertEqual(len(listed), len(set(listed)), f"{folder}: a vector is listed twice")
+            self.assertEqual(set(listed), client.vector_files(folder), f"{folder}: vector index and folders differ")
+
+    def test_every_rule_has_a_vector_that_agrees_and_one_that_is_caught(self):
+        """A rule with only agreeing vectors proves nothing: each rule also has a vector it must catch."""
+        seen = {}
+        for folder in self.sets:
+            for entry in client.load_vectors(folder):
+                vector = client.read_json(folder / "vectors" / entry["file"])
+                expect = vector.get("expect")
+                if entry["rule"] == "call.profile":
+                    kinds = {"caught" if "refused" in expect else "agrees"}
+                elif entry["rule"] == "approval.binding":
+                    kinds = {"caught" if expect else "agrees"}
+                else:
+                    codes = {step["answer"]["code"] for step in vector["steps"]}
+                    kinds = ({"agrees"} if "ok" in codes else set()) | ({"caught"} if codes - {"ok"} else set())
+                seen.setdefault(entry["rule"], set()).update(kinds)
+        self.assertEqual({rule: sorted(kinds) for rule, kinds in seen.items()},
+                         {rule: ["agrees", "caught"] for rule in client.VECTOR_RULES})
+
+    def test_every_approval_in_a_good_fixture_shows_what_it_binds(self):
+        """Wherever a good fixture holds an approval (on its own, in an event, in an answer), its digest is
+        the digest of its effect and its lines are the lines of its effect."""
+        found = 0
+        for folder, schemas in self.sets.items():
+            for entry in client.load_index(folder):
+                if not entry["file"].startswith("good/"):
+                    continue
+                for record in client.approvals_in(client.read_json(folder / "fixtures" / entry["file"])):
+                    found += 1
+                    with self.subTest(fixture=entry["file"]):
+                        self.assertEqual(client.rules.approval_problems(record), [])
+        self.assertGreater(found, 10, "the walk found too few approvals to mean anything")
 
 
 class FixtureTest(unittest.TestCase):
@@ -306,6 +366,36 @@ def _add_fixture_tests():
 
 
 _add_fixture_tests()
+
+
+class VectorTest(unittest.TestCase):
+    """One test per vector; the methods are added below from the vector index."""
+
+    sets: dict = {}
+
+    @classmethod
+    def schemas_for(cls, folder):
+        if folder not in cls.sets:
+            cls.sets[folder] = client.SchemaSet(folder)
+        return cls.sets[folder]
+
+
+def _add_vector_tests():
+    for folder in client.folders():
+        area = folder.relative_to(client.REPO).parts[1]
+        for entry in client.load_vectors(folder):
+            def test(self, folder=folder, entry=entry):
+                problem = client.check_vector(self.schemas_for(folder), entry)
+                self.assertIsNone(problem, f"{entry['file']}: {problem}")
+
+            name = "test_" + re.sub(r"[^a-z0-9]+", "_", f"{area}_{entry['file'][:-5]}".lower())
+            if hasattr(VectorTest, name):
+                raise client.ConformanceError(f"two vectors map to {name}")
+            test.__doc__ = entry["shows"]
+            setattr(VectorTest, name, test)
+
+
+_add_vector_tests()
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 {
   "answer": {
-    "code": "method_unknown",
+    "code": "run_unknown",
     "detail": "limit"
   },
   "method": "run.list",

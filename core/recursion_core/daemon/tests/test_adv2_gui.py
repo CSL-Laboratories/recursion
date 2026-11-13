@@ -115,15 +115,39 @@ class Adv2HungPluginTests(GuiCase):
         return predicate()
 
     def test_a_second_read_is_not_held_forever_behind_a_hung_plugin(self):
-        first = threading.Thread(target=self.host.operator, args=({'command': READ, 'request_id': 'r1'},), daemon=True)
+        # The original 3 s join also bounded the shipped turn wait; keep that bound as a constant check.
+        self.assertLessEqual(plugins.OPERATOR_TURN_WAIT_S, 3.0, 'the default turn wait holds an O7 read too long')
+        self.host._operator_turn_wait_s = 0.05
+        first_answers, answers, errors = [], [], []
+
+        def read(command, target):
+            try:
+                target.append(self.host.operator(command))
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=read, args=({'command': READ, 'request_id': 'r1'}, first_answers),
+                                 daemon=True)
+        second = threading.Thread(target=read, args=({'command': 'operator.health.inspect'}, answers), daemon=True)
         first.start()
-        self.assertTrue(self.wait_for(lambda: self.module.CALLS))
-        answers = []
-        second = threading.Thread(target=lambda: answers.append(self.host.operator({'command': 'operator.health.inspect'})),
-                                  daemon=True)
-        second.start()
-        second.join(3)
-        self.assertFalse(second.is_alive(), 'the second O7 read is still waiting on the hung plugin after 3 s')
+        try:
+            self.assertTrue(self.wait_for(lambda: self.module.CALLS))
+            second.start()
+            second.join(10)  # watchdog, not a speed assertion; the first read is still held by GATE
+            self.assertFalse(second.is_alive(), 'the second O7 read is still blocked')
+            self.assertEqual(errors, [], 'an operator read raised instead of returning a typed answer')
+            self.assertEqual(answers, [(503, {'error': 'unavailable: operator plugin busy with an earlier read; '
+                                                      'nothing was read'})])
+            self.assertEqual(self.module.CALLS, [READ], 'the busy refusal must not invoke the plugin')
+        finally:
+            self.module.GATE.set()
+            first.join(10)
+            if second.ident is not None:
+                second.join(10)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([answer[0] for answer in first_answers], [200])
 
     def test_a_timed_out_call_answers_504_marks_the_plugin_degraded_and_no_second_call_is_made(self):
         host = plugins.PluginHost(self.tmp / 'config' / 'recursion', self.tmp / 'state', gil_probe=FakeGilProbe(),
@@ -134,9 +158,12 @@ class Adv2HungPluginTests(GuiCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             status, body = host.operator({'command': READ})
         self.assertEqual((status, body), (504, {'error': plugins.OPERATOR_TIMED_OUT}))
+        # "Answered at once" without a scheduler-sensitive bound: a read that waited for the turn
+        # (or made a new call) would take the 30 s turn wait; a stuck plugin is answered without it.
+        host._operator_turn_wait_s = 30.0
         started = time.monotonic()
         status, body = host.operator({'command': READ})
-        self.assertLess(time.monotonic() - started, 0.2, 'a read into a stuck plugin is answered at once')
+        self.assertLess(time.monotonic() - started, 10.0, 'a read into a stuck plugin waited for the turn')
         self.assertEqual(status, 504)
         self.assertIn('no new call was made', body['error'])
         self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')

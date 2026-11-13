@@ -161,6 +161,8 @@ class NothingRegisteredTest(Composed):
                          (200, {'code': 'run_unknown', 'run_id': 'run-none'}))
         self.assertEqual(self.page(composed, 'POST', '/v1/operator', {'command': 'operator.health.inspect'})[0], 503)
         self.assertEqual(self.page(composed, 'POST', '/v1/control', {'method': 'run.list', 'params': {}}), (404, {'error': 'not_found'}))
+        for body in (b'', b'not json', b'[]', b'{"method": 7}'):   # the path is not there at all: no body is even read
+            self.assertEqual(control.page_transport('POST', '/v1/control', body), (404, b'{"error": "not_found"}'))
         # What the page is handed is the transport with the seams; the method it was handed before is still there,
         # reads only what it read (a stand-in with ``call``, ``route_records`` and ``plugins`` is enough) and has no fourth path.
         self.assertEqual(composed.client._transport, control.page_transport)
@@ -740,10 +742,29 @@ class DriveOwnerSeamTest(unittest.TestCase):
         return adapter.RouteStarter(service, self.ROUTES, mock.Mock(closed=False), folder, hooks=made,
                                     start_timeout_s=HELD_BOUND_S), service
 
-    def refused(self, starter, params=None):
+    def refused(self, starter, params=None, *record):
         with self.assertRaises(adapter.StartRefused) as caught:
-            starter(dict(params or self.PARAMS))
+            starter(dict(params or self.PARAMS), *record)
         return caught.exception.code, caught.exception.detail
+
+    def test_the_starter_builds_the_launch_context_from_the_stored_record_or_refuses_it(self):
+        launch = {'route_entry': None, 'route_decision': None, 'workspace': None, 'containment_level': None,
+                  'session_id': 'ses-1', 'turn_id': 'turn-1', 'owner': 'host', 'budget': {'cap_usd': 0}}
+        record = {'run_id': 'run-1', 'launch': launch, 'principal': {'kind': 'session', 'id': 'ses-1'}}
+        starter, service = self.starter()
+        self.assertEqual(self.refused(starter, None, record), ('launch_refused', 'fake service'))
+        self.assertEqual(self.refused(starter, None, {'run_id': 'run-1'}), ('launch_refused', 'fake service'))   # a legacy record
+        self.assertEqual(self.refused(starter), ('launch_refused', 'fake service'))                               # the path that is off
+        contexts = [ctx.launch for _, ctx in service.requests]
+        self.assertEqual(contexts, [H.LaunchContext.from_record(record), None, None])
+        self.assertEqual((contexts[0].session_id, contexts[0].principal), ('ses-1', H.Principal('session', 'ses-1')))
+        # A stored launch object that is not whole is never launched as if there were none.
+        for broken in ({'run_id': 'run-1', 'launch': {'owner': 'host'}}, {'run_id': 'run-1', 'launch': 'x'},
+                       {'run_id': 'run-1', 'launch': launch, 'principal': {'kind': 'root', 'id': 'x'}},
+                       {'run_id': 'run-1', 'launch': dict(launch, extra=1)}):
+            with self.subTest(record=broken):
+                self.assertEqual(self.refused(starter, None, broken), ('launch_refused', 'launch_snapshot_invalid'))
+        self.assertEqual(len(service.requests), 3, 'a refused snapshot reached no adapter')
 
     def test_with_no_owner_the_run_is_driven_as_today(self):
         asked = []
@@ -1038,8 +1059,14 @@ class ChangeMarkerRegistryTest(unittest.TestCase):
             with self.assertRaises(daemon_module.RegistryDurabilityError):
                 registry.control_put('run-x', doc('run-x', state='starting'))   # renamed into place, then the sync failed
             self.assertEqual(marker.take(), (set(), False), 'a writer that raised marked nothing')
+            # While the registry refuses reads, both reads of the source are refused, each by the guard in itself:
+            # the consumer waits and tries again.
             with self.assertRaises(daemon_module.RegistryDurabilityError):
-                registry.run_ids(None, 10)    # while the registry refuses reads, the consumer waits and tries again
+                registry.snapshot('run-x')
+            with self.assertRaises(daemon_module.RegistryDurabilityError):
+                registry.run_ids(None, 10)
+        # The first read after the sync can finish is a snapshot: it reads the file, where the record is.
+        self.assertEqual(registry.snapshot('run-x'), (None, doc('run-x', state='starting')))
         consumer.scan()                       # the same registry object: no restart
         self.assertEqual([(run_id, control) for run_id, _, control in consumer.events[1:]],
                          [('run-x', {'run_id': 'run-x', 'state': 'starting'})])
@@ -1082,6 +1109,14 @@ class ChangeMarkerStopTest(Composed):
         daemon, composed = self.boot(hooks_of(lambda made: made.enable_changes()))
         self.assertEqual(daemon.registry.mark_changed, composed.hooks.mark_changed)
         return daemon, composed, composed.hooks.changes
+
+    def test_a_close_takes_the_marker_off_the_registry(self):
+        daemon, composed, marker = self.marked()
+        run_id = self.start(composed.control)
+        self.assertIn(run_id, marker.take()[0])
+        self.assertEqual(composed.control.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.shutdown()
+        self.assertIsNone(daemon.registry.mark_changed, 'a closed composition leaves nothing of its own on the daemon\'s registry')
 
     def shape(self, composed, run_id, answer):
         """What a Stop answered and left, without the values that name the run."""

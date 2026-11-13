@@ -1729,7 +1729,14 @@ class StartPathOnTest(unittest.TestCase):
 
     def test_with_no_registrant_that_chooses_a_start_names_its_engine_as_today(self) -> None:
         api, registry, starter = self.api(routing=False)
-        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p'}), {'code': 'request_invalid', 'detail': 'engine'})
+        looked_up = []
+        find_start = registry.find_start
+        registry.find_start = lambda tenant, key: looked_up.append(key) or find_start(tenant, key)
+        for request in ({'tenant': 't1', 'prompt': 'p'}, {'tenant': 't1', 'prompt': 'p', 'client_key': 'k9'},
+                        {'tenant': 't1', 'prompt': 'p', 'workspace': {'path': '/a'}}, {'tenant': 't1', 'engine': None, 'prompt': 'p'}):
+            self.assertEqual(api.call('run.start', request), {'code': 'request_invalid', 'detail': 'engine'})
+        # Refused at validation, as today: no key is looked up and no registrant is asked.
+        self.assertEqual((looked_up, self.log, registry.list()), ([], [], []))
         self.assertEqual(api.call('run.start', KEYED)['code'], 'started')
         record = registry.get('run-1')
         self.assertIsNone(record['launch']['route_entry'], 'no registrant chose an entry: the starter looks it up, as today')

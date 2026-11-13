@@ -436,6 +436,10 @@ class ProductionLauncher:
             if error is not None:
                 raise refused('breaker_bind_failed:' + error)
             ctx.bound = True
+            if ctx.cancelled:
+                # The bind can wait on the store for longer than the start waits. The start has then
+                # given up and been answered: launch nothing for it.
+                raise refused('start_abandoned')
         validated = self.child_environment(env)
         try:
             executable = _resolve_executable(argv[0], validated)

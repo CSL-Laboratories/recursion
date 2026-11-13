@@ -18,8 +18,13 @@ was restored is not. Untracked and ignored files are refused when Python could i
 place of that source: a bytecode cache (a timestamp or unchecked-hash `.pyc` runs even under
 `-B`), an extension module, a package directory sitting on a module, any other importable file
 under a directory pin, and an untracked top-level name on the `core/` path the driver inserts.
-A file such as `scratch.txt` that cannot be a module and does not create a directory is left
-alone. `git` is `/usr/bin/git` when that binary exists, not whatever `PATH` names, and `git`
+A symlink anywhere under `core/` is refused unless that path is a symlink in the checkout's
+`HEAD` and the link text matches. A nested `.git` file or directory under `core/` is refused.
+An untracked directory in `core/` or in a measured package directory is refused too, including
+one `git ls-files` prints as a single name. Each tracked file's parents must be real
+directories (`lstat`, not a followed link). A file such as `scratch.txt` that cannot be a
+module and does not create a directory is left alone. `git` is `/usr/bin/git` when that binary
+exists, not whatever `PATH` names, and `git`
 variables that select another repository (`GIT_DIR` and the rest) are ignored. Any other tree
 skips with a message naming both heads; `RACE_STRESS_UNPINNED=1` measures it anyway. Earlier
 heads of this PR measured #324 `55a31508`/`9aa03185`, #326 `82247cbc` and #328 `0264628b`.

@@ -14,6 +14,7 @@ import json
 import os
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -102,41 +103,217 @@ def prepare_tree_import(tree: str) -> None:
     importlib.invalidate_caches()
 
 
+def _lexical(path: str) -> str:
+    """Absolute path with ``.`` and ``..`` removed. Symlinks stay as written."""
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _relative_to(path: str, parent: str) -> str | None:
+    try:
+        rel = Path(path).relative_to(parent)
+    except ValueError:
+        return None
+    if ".." in rel.parts:
+        return None
+    text = rel.as_posix()
+    return "" if text == "." else text
+
+
+def _chain_symlink(root: str, rel: str) -> str | None:
+    """First symlink in ``rel`` walked from ``root`` without following, or None.
+
+    Scope stays on the path the importer recorded. ``Path.resolve`` is not used: it
+    would follow ``core/dataclasses`` out of the tree and hide the shadow.
+    """
+    parts = [part for part in Path(rel).parts if part not in ("", ".")]
+    if not parts:
+        return None
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return rel
+    try:
+        acc: list[str] = []
+        for index, part in enumerate(parts):
+            acc.append(part)
+            shown = "/".join(acc)
+            try:
+                st = os.stat(part, dir_fd=dirfd, follow_symlinks=False)
+            except OSError:
+                return shown
+            if stat.S_ISLNK(st.st_mode):
+                return shown
+            if index == len(parts) - 1:
+                return None
+            if not stat.S_ISDIR(st.st_mode):
+                return shown
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+            except OSError:
+                return shown
+            os.close(dirfd)
+            dirfd = nxt
+        return None
+    finally:
+        try:
+            os.close(dirfd)
+        except OSError:
+            pass
+
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        left, right = os.lstat(a), os.lstat(b)
+    except OSError:
+        return False
+    if stat.S_ISLNK(left.st_mode) or stat.S_ISLNK(right.st_mode):
+        return False
+    if not stat.S_ISREG(left.st_mode) or not stat.S_ISREG(right.st_mode):
+        return False
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _fs_locations(module) -> list[str]:
+    """``__file__``, spec origin, and package search paths that name a filesystem location."""
+    locs: list[str] = []
+    file = getattr(module, "__file__", None)
+    if isinstance(file, str):
+        locs.append(file)
+    spec = getattr(module, "__spec__", None)
+    origin = getattr(spec, "origin", None) if spec is not None else None
+    if isinstance(origin, str):
+        locs.append(origin)
+    path = getattr(module, "__path__", None)
+    if path:
+        locs.extend(str(item) for item in path)
+    sub = getattr(spec, "submodule_search_locations", None) if spec is not None else None
+    if sub:
+        locs.extend(str(item) for item in sub)
+    out: list[str] = []
+    for loc in locs:
+        if not loc or loc in ("built-in", "frozen") or loc.startswith("<"):
+            continue
+        if loc not in out:
+            out.append(loc)
+    return out
+
+
+def _shadow_candidates(core: Path, top: str) -> list[str]:
+    """Files under ``core/`` that FileFinder could load as the top-level name ``top``."""
+    found: list[str] = []
+    base = core / top
+    try:
+        base_link = base.is_symlink()
+        base_dir = base.is_dir()
+    except OSError:
+        base_link = False
+        base_dir = False
+    if base_link or base_dir:
+        for suffix in _IMPORT_SUFFIXES:
+            init = base / f"__init__{suffix}"
+            try:
+                if init.is_symlink() or init.is_file():
+                    found.append(str(init))
+            except OSError:
+                continue
+        found.append(str(base))
+    for suffix in _IMPORT_SUFFIXES:
+        file = core / f"{top}{suffix}"
+        try:
+            if file.is_symlink() or file.is_file():
+                found.append(str(file))
+        except OSError:
+            continue
+    return found
+
+
+def _inode_matches(path: str, candidates: list[str]) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    for candidate in candidates:
+        try:
+            other = os.stat(candidate)
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == (other.st_dev, other.st_ino):
+            return True
+    return False
+
+
+_IMPORT_SUFFIXES = tuple(
+    importlib.machinery.EXTENSION_SUFFIXES
+    + importlib.machinery.SOURCE_SUFFIXES
+    + importlib.machinery.BYTECODE_SUFFIXES)
+
+
+def _require_source(module, tree_lex: str, relpath: str) -> None:
+    wanted = _lexical(str(Path(tree_lex) / relpath))
+    name = getattr(module, "__name__", module)
+    file_origin = getattr(module, "__file__", None)
+    spec = getattr(module, "__spec__", None)
+    spec_origin = getattr(spec, "origin", None) if spec is not None else None
+    if not isinstance(file_origin, str) or not isinstance(spec_origin, str):
+        raise SystemExit(f"{name} loaded from {file_origin}, not pinned source {wanted}")
+    for origin in (file_origin, spec_origin):
+        lex = _lexical(origin)
+        rel = _relative_to(lex, tree_lex)
+        link = None if rel is None else _chain_symlink(tree_lex, rel)
+        if lex != wanted or rel is None or link is not None or not _same_file(lex, wanted):
+            raise SystemExit(f"{name} loaded from {origin}, not pinned source {wanted}")
+
+
+def _refuse_loaded_shadow(name, module, tree_lex: str, core: Path, core_lex: str, stdlib) -> None:
+    top = name.split(".", 1)[0]
+    candidates: list[str] | None = None
+    for loc in _fs_locations(module):
+        lex = _lexical(loc)
+        rel_core = _relative_to(lex, core_lex)
+        rel_tree = _relative_to(lex, tree_lex)
+        if rel_core is not None:
+            parts = Path(rel_core).parts
+            if not parts or parts[0] != "recursion_core":
+                raise SystemExit(
+                    f"{name} loaded from {loc}; that top-level name on the inserted core/ path shadows the import")
+            if rel_tree is not None and _chain_symlink(tree_lex, rel_tree) is not None:
+                raise SystemExit(
+                    f"{name} loaded from {loc}; path is not a real file in the pinned tree")
+            if any(Path(lex).name.endswith(suffix) for suffix in _EXTENSION_SUFFIXES):
+                raise SystemExit(f"{name} loaded extension {loc}, not the pinned source")
+        elif top in stdlib:
+            if candidates is None:
+                candidates = _shadow_candidates(core, top)
+            if candidates and _inode_matches(lex, candidates):
+                raise SystemExit(
+                    f"{name} loaded from {loc}; that top-level name on the inserted core/ path shadows the import")
+    cached = getattr(module, "__cached__", None)
+    file = getattr(module, "__file__", None)
+    if isinstance(cached, str) and isinstance(file, str):
+        rel_core = _relative_to(_lexical(file), core_lex)
+        if (rel_core is not None and Path(rel_core).parts[:1] == ("recursion_core",)
+                and Path(cached).is_file()):
+            raise SystemExit(f"{name} loaded with bytecode cache {cached}")
+
+
 def verify_loaded(tree: str, expected: list[tuple[object, str]]) -> None:
     """Exit when an imported module is not the pinned source.
 
-    ``expected`` is ``(module, path relative to tree)``. A package directory or extension
-    that took the place of that source, a bytecode cache beside a loaded file, or any other
-    loaded module whose file sits at the top of the inserted ``core/`` directory
-    (``core/dataclasses.py`` shadowing the standard library) is refused.
+    ``expected`` is ``(module, path relative to tree)``. Origins are compared as written
+    and by ``lstat`` from the tree root; symlinks are not resolved to decide whether a
+    file sits under ``core/``. A package directory or extension that took the place of
+    the pinned source, a bytecode cache beside a loaded file, a module whose path leaves
+    the tree through a symlink, or a standard-library name loaded from ``core/`` (or from
+    the directory a ``core/`` symlink names) is refused.
     """
-    core = (Path(tree) / "core").resolve()
+    tree_lex = _lexical(tree)
+    core = Path(tree_lex) / "core"
+    core_lex = _lexical(str(core))
     for module, relpath in expected:
-        wanted = (Path(tree) / relpath).resolve()
-        origin = getattr(module, "__file__", None)
-        got = None if origin is None else Path(origin).resolve()
-        if got != wanted:
-            name = getattr(module, "__name__", module)
-            raise SystemExit(f"{name} loaded from {origin}, not pinned source {wanted}")
+        _require_source(module, tree_lex, relpath)
+    stdlib = getattr(sys, "stdlib_module_names", frozenset())
     for name, module in list(sys.modules.items()):
-        origin = getattr(module, "__file__", None)
-        if not origin:
-            continue
-        try:
-            got = Path(origin).resolve()
-        except OSError:
-            continue
-        if core not in got.parents:
-            continue
-        rel = got.relative_to(core)
-        if not rel.parts or rel.parts[0] != "recursion_core":
-            raise SystemExit(
-                f"{name} loaded from {got}; that top-level name on the inserted core/ path shadows the import")
-        if any(got.name.endswith(suffix) for suffix in _EXTENSION_SUFFIXES):
-            raise SystemExit(f"{name} loaded extension {got}, not the pinned source")
-        cached = getattr(module, "__cached__", None)
-        if cached and Path(cached).is_file():
-            raise SystemExit(f"{name} loaded with bytecode cache {cached}")
+        _refuse_loaded_shadow(name, module, tree_lex, core, core_lex, stdlib)
 
 
 class Violations:

@@ -397,6 +397,191 @@ class PinTests(unittest.TestCase):
             self.assertFalse(ok, message)
             self.assertIn("core/dataclasses.py", message)
 
+    def _outside_package(self, path: Path, body: str = "SHADOW = True\n") -> Path:
+        path.mkdir(parents=True)
+        (path / "__init__.py").write_text(body)
+        return path
+
+    def test_untracked_symlink_package_on_core_path_is_refused(self) -> None:
+        # git ls-files --others prints the symlink and not the __init__.py it points at.
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                f"{rel}/__init__.py": "from dataclasses import dataclass\nVALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            outside = self._outside_package(Path(tmp) / "dataclasses", "SHADOW = True\n")
+            (repo / "core" / "dataclasses").symlink_to(outside)
+            listed = subprocess.check_output(
+                ["git", "ls-files", "-z", "--others", "--", "core"],
+                cwd=repo, env=_git_env())
+            names = [n for n in listed.split(b"\0") if n]
+            self.assertTrue(any(n == b"core/dataclasses" for n in names), names)
+            self.assertFalse(any(b"__init__.py" in n for n in names), names)
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "import dataclasses; print(dataclasses.SHADOW)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "True")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("core/dataclasses", message)
+            self.assertIn("symlink", message)
+
+    def test_untracked_symlinks_for_other_stdlib_names_are_refused(self) -> None:
+        # Names the pinned daemon imports, refused before any of them is imported.
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {f"{rel}/__init__.py": "VALUE = 1\n", f"{rel}/registry.py": "VALUE = 1\n"}
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            for name in ("fcntl", "re", "contextlib", "typing"):
+                outside = self._outside_package(Path(tmp) / name)
+                (repo / "core" / name).symlink_to(outside)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            for name in ("fcntl", "re", "contextlib", "typing"):
+                self.assertIn(f"core/{name}", message)
+
+    def test_nested_git_directory_on_core_path_is_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {f"{rel}/__init__.py": "VALUE = 1\n", f"{rel}/registry.py": "VALUE = 1\n"}
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            shadow = repo / "core" / "dataclasses"
+            shadow.mkdir()
+            (shadow / "__init__.py").write_text("SHADOW = True\n")
+            subprocess.check_call(["git", "init", "-q"], cwd=shadow, env=_git_env())
+            listed = subprocess.check_output(
+                ["git", "ls-files", "--others", "--", "core"],
+                cwd=repo, env=_git_env(), text=True)
+            self.assertIn("dataclasses", listed)
+            self.assertNotIn("__init__.py", listed)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("core/dataclasses", message)
+            self.assertIn("nested git", message)
+
+    def test_nested_git_file_under_a_pin_is_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {f"{rel}/__init__.py": "VALUE = 1\n", f"{rel}/registry.py": "VALUE = 1\n"}
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            (repo / rel / ".git").write_text("gitdir: /tmp/nowhere\n")
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--", rel],
+                cwd=repo, env=_git_env(), text=True)
+            self.assertNotIn(".git", status)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("nested git", message)
+            self.assertIn(".git", message)
+
+    def test_untracked_symlink_package_shadowing_a_file_pin_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, rel = self._pinned_file(tmp)
+            outside = self._outside_package(Path(tmp) / "breaker", "VALUE = 'pkg'\n")
+            (repo / "core/recursion_core/routes/breaker").symlink_to(outside)
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.routes.breaker import VALUE; print(VALUE)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "pkg")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("core/recursion_core/routes/breaker", message)
+            self.assertIn("symlink", message)
+
+    def test_untracked_symlink_package_shadowing_a_directory_pin_is_refused(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {f"{rel}/__init__.py": "VALUE = 1\n", f"{rel}/registry.py": "VALUE = 1\n"}
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            outside = self._outside_package(Path(tmp) / "registry", "VALUE = 'pkg'\n")
+            (repo / rel / "registry").symlink_to(outside)
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.daemon.registry import VALUE; print(VALUE)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "pkg")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("registry", message)
+            self.assertIn("symlink", message)
+
+    def test_tracked_directory_replaced_by_a_matching_symlink_is_refused(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        contract = "core/recursion_core/routes/contract.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            head = _repo(repo, {rel: "v1\n", contract: "c1\n"})
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel, contract])
+            copy = Path(tmp) / "copy"
+            shutil.copytree(repo / "core/recursion_core/routes", copy)
+            pkg = copy / "breaker" / "__init__.py"
+            pkg.parent.mkdir()
+            pkg.write_text("VALUE = 'pkg'\n")
+            routes = repo / "core/recursion_core/routes"
+            shutil.rmtree(routes)
+            routes.symlink_to(copy)
+            work = subprocess.check_output(
+                ["git", "hash-object", "--no-filters", "--", rel],
+                cwd=repo, env=_git_env(), text=True).strip()
+            oid = subprocess.check_output(
+                ["git", "rev-parse", f"HEAD:{rel}"], cwd=repo, env=_git_env(), text=True).strip()
+            self.assertEqual(work, oid)
+            env = _git_env()
+            env["PYTHONPATH"] = str(repo / "core")
+            out = subprocess.check_output(
+                [sys.executable, "-B", "-P", "-c",
+                 "from recursion_core.routes.breaker import VALUE; print(VALUE)"],
+                env=env, text=True, cwd=repo)
+            self.assertEqual(out.strip(), "pkg")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("symlink", message)
+            self.assertIn("not a real directory", message)
+
+    def test_tracked_symlink_matching_head_is_allowed_until_retargeted(self) -> None:
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            head = _repo(repo, {
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+                "core/readme.txt": "hello\n",
+            })
+            link = repo / "core" / "note-link"
+            link.symlink_to("readme.txt")
+            subprocess.check_call(["git", "add", "--", "core/note-link"], cwd=repo, env=_git_env())
+            subprocess.check_call(["git", "commit", "-q", "-m", "link"], cwd=repo, env=_git_env())
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, env=_git_env(), text=True).strip()
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            link.unlink()
+            link.symlink_to("missing-target")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("note-link", message)
+
     def test_path_git_cannot_make_a_dirty_tree_look_pinned(self) -> None:
         rel = "core/recursion_core/routes/breaker.py"
         lie = "0" * 40
@@ -1030,6 +1215,74 @@ class DriverExitTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("shadows the import", proc.stderr)
         self.assertNotIn("violation_count", proc.stdout)
+
+    def test_driver_rejects_a_symlinked_stdlib_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tree"
+            outside = Path(tmp) / "dataclasses"
+            outside.mkdir()
+            (outside / "__init__.py").write_text(
+                "def dataclass(cls=None, **kwargs):\n"
+                "    return (lambda c: c) if cls is None else cls\n"
+                "SHADOW = True\n")
+            _write(root, {
+                "core/recursion_core/__init__.py": "",
+                "core/recursion_core/daemon/__init__.py":
+                    "from dataclasses import dataclass\n" + DAEMON_FAKE,
+            })
+            (root / "core" / "dataclasses").symlink_to(outside)
+            proc = subprocess.run(
+                [sys.executable, "-B", str(DRIVERS / "daemon_324.py"), "--tree", str(root),
+                 "--iters", "1", "--threads", "1", "--seed", "1"],
+                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("shadows the import", proc.stderr)
+        self.assertIn("dataclasses", proc.stderr)
+        self.assertNotIn("violation_count", proc.stdout)
+
+    def test_run_driver_ignores_pythonpath_sitecustomize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tree"
+            _write(root, {
+                "core/recursion_core/__init__.py": "",
+                "core/recursion_core/routes/__init__.py": "",
+                "core/recursion_core/routes/contract.py":
+                    "PLAN_LIMIT='PLAN_LIMIT'\nSHORT_FAULT='SHORT_FAULT'\n",
+                "core/recursion_core/routes/breaker.py": ROUTES_FAKE,
+            })
+            real = root / "core/recursion_core/routes/breaker.py"
+            site = Path(tmp) / "site"
+            site.mkdir()
+            (site / "sitecustomize.py").write_text(
+                "import sys\n"
+                "from types import SimpleNamespace\n"
+                "tree = sys.argv[sys.argv.index('--tree') + 1]\n"
+                "real = tree + '/core/recursion_core/routes/breaker.py'\n"
+                "mod = type(sys)('recursion_core.routes.breaker')\n"
+                "mod.__file__ = real\n"
+                "mod.__spec__ = SimpleNamespace(origin=real, name=mod.__name__,\n"
+                "    submodule_search_locations=None)\n"
+                "class ConnectionBreaker:\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        raise RuntimeError('sitecustomize-shadow')\n"
+                "mod.ConnectionBreaker = ConnectionBreaker\n"
+                "sys.modules['recursion_core.routes.breaker'] = mod\n")
+            self.assertTrue(real.is_file())
+            from recursion_core.race_stress.tests.test_race_stress import run_driver
+            old = os.environ.get("PYTHONPATH")
+            os.environ["PYTHONPATH"] = str(site) + (os.pathsep + old if old else "")
+            try:
+                try:
+                    result = run_driver("breaker_326.py", str(root), iters=1)
+                except AssertionError as exc:
+                    self.fail(f"pinned driver did not run; startup path leaked: {exc}")
+            finally:
+                if old is None:
+                    os.environ.pop("PYTHONPATH", None)
+                else:
+                    os.environ["PYTHONPATH"] = old
+        self.assertGreater(result["violation_count"], 0)
+        self.assertNotIn("sitecustomize-shadow", str(result))
 
     def test_driver_rejects_a_loaded_package_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

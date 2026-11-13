@@ -9,6 +9,9 @@ pointed at a checkout by environment variable and skipped when it is unset:
 
 ``RACE_STRESS_ITERS`` (default 20) and ``RACE_STRESS_SEED`` (default random, printed) tune the
 runs. On a free-threaded build the child runs with ``-X gil=0`` and ``PYTHON_GIL=0``.
+The child is started with ``-I`` and does not inherit ``PYTHONPATH``, ``PYTHONHOME``,
+``PYTHONSTARTUP``, ``PYTHONUSERBASE``, or ``PYTHONSAFEPATH``. ``PYTHONNOUSERSITE=1``.
+The driver directory is put on ``sys.path`` explicitly.
 """
 
 from __future__ import annotations
@@ -31,18 +34,44 @@ from recursion_core.race_stress.pins import require_pinned
 
 FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
+# Startup variables that choose import locations. The child gets none of them.
+# PYTHONSAFEPATH is dropped with the path-related variables around it.
+_PYTHON_IMPORT_ENV = (
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
+    "PYTHONSAFEPATH",
+    "PYTHONPLATLIBDIR",
+)
+
+# -I does not put the script directory on sys.path. Insert the driver directory, then
+# run the script so prepare_tree_import can put the measured core/ first.
+_DRIVER_BOOTSTRAP = (
+    "import sys, runpy\n"
+    "drivers, script = sys.argv[1], sys.argv[2]\n"
+    "sys.path.insert(0, drivers)\n"
+    "sys.argv = [script, *sys.argv[3:]]\n"
+    "runpy.run_path(script, run_name='__main__')\n"
+)
+
+
+def _driver_env() -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in _PYTHON_IMPORT_ENV}
+    env["PYTHONNOUSERSITE"] = "1"
+    if FREE_THREADED:
+        env["PYTHON_GIL"] = "0"
+    return env
+
 
 def run_driver(script: str, tree: str, *, iters: int | None = None, mutant: bool = False) -> dict:
-    argv = [sys.executable, "-B"] + (["-X", "gil=0"] if FREE_THREADED else []) + [str(DRIVERS / script),
-                                                                                 "--tree", tree]
+    argv = [sys.executable, "-I", "-B"] + (["-X", "gil=0"] if FREE_THREADED else [])
+    argv += ["-c", _DRIVER_BOOTSTRAP, str(DRIVERS), str(DRIVERS / script), "--tree", tree]
     if iters is not None:
         argv += ["--iters", str(iters)]
     if mutant:
         argv.append("--mutant")
-    env = dict(os.environ)
-    if FREE_THREADED:
-        env["PYTHON_GIL"] = "0"
-    out = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=1800, env=env)
+    out = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=1800, env=_driver_env())
     if mutant and out.returncode < 0:
         # An unguarded mutant may take the interpreter down (a signal) before it can report.
         print(f"\n{script} --mutant: killed by signal {-out.returncode}", file=sys.stderr)

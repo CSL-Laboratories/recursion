@@ -5,12 +5,14 @@ Fakes only. No engine binary is executed. T3 Code has no route here.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import unittest
 from unittest import mock
 
 from recursion_core.subscription_routes import (
     SubscriptionRouteRefused,
+    WrapperPinRefused,
     check_antigravity_route,
     check_cursor_route,
     check_route,
@@ -19,6 +21,9 @@ from recursion_core.subscription_routes import (
     measure_package_pin,
 )
 from recursion_core.subscription_routes.tests.test_subscription_routes import _Base
+
+_MIB = 1024 * 1024
+_GIB = 1024 * _MIB
 
 
 @unittest.skipIf(os.name == "nt", "POSIX home checks")
@@ -94,6 +99,64 @@ class WrapperPinTests(_Base):
         after = measure_package_pin(str(self.install / "launcher.js"), str(self.install))
         self.assertNotEqual(before.launcher_sha256, after.launcher_sha256)
         self.assertNotEqual(before.package_files, after.package_files)
+
+    def sparse(self, name: str, size: int) -> str:
+        # truncate leaves a hole: the file reads as zero bytes and uses no disk blocks.
+        path = self.install / name
+        with open(path, "wb") as handle:
+            handle.truncate(size)
+        return str(path)
+
+    def small_launcher(self) -> str:
+        launcher = self.install / "agy-launch"
+        launcher.write_text("agy-launch\n", encoding="ascii")
+        return str(launcher)
+
+    def test_antigravity_measures_a_binary_over_the_package_file_cap(self) -> None:
+        binary = self.sparse("agy", 40 * _MIB)
+        pin = measure_antigravity_pin("1.5.5", binary, self.small_launcher())
+        expected = hashlib.sha256()
+        for _ in range(40):
+            expected.update(bytes(_MIB))
+        self.assertEqual(pin.binary_sha256, expected.hexdigest())
+        self.assertEqual(pin.launcher_sha256, hashlib.sha256(b"agy-launch\n").hexdigest())
+
+    def test_antigravity_refuses_a_binary_over_one_gib(self) -> None:
+        binary = self.sparse("agy", _GIB + 1)
+        with self.assertRaises(WrapperPinRefused) as caught:
+            measure_antigravity_pin("1.5.5", binary, self.small_launcher())
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_too_large", "binary"))
+
+    def test_antigravity_refuses_a_launcher_over_one_gib(self) -> None:
+        binary = self.install / "agy"
+        binary.write_text("agy-binary\n", encoding="ascii")
+        launcher = self.sparse("agy-launch", _GIB + 1)
+        with self.assertRaises(WrapperPinRefused) as caught:
+            measure_antigravity_pin("1.5.5", str(binary), launcher)
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_file_too_large", "launcher"))
+
+    def test_package_file_over_the_old_cap_measures(self) -> None:
+        self.sparse("big.bin", 40 * _MIB)
+        pin = measure_package_pin(str(self.install / "launcher.js"), str(self.install))
+        expected = hashlib.sha256()
+        for _ in range(40):
+            expected.update(bytes(_MIB))
+        self.assertEqual(dict(pin.package_files)["big.bin"], expected.hexdigest())
+
+    def test_a_self_update_of_the_pinned_binary_fails_the_pin(self) -> None:
+        binary = self.install / "agy"
+        binary.write_text("agy-1.5.5\n", encoding="ascii")
+        launcher = self.small_launcher()
+        pin = measure_antigravity_pin("1.5.5", str(binary), launcher)
+        # agy replaces its own bytes in place: same path, same stated version.
+        with open(binary, "r+b") as handle:
+            handle.write(b"agy-1.5.6\n")
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            check_antigravity_route(
+                self.bare(), version="1.5.5", binary_path=str(binary), launcher_path=launcher, pin=pin,
+                route_home=str(self.home), parent_env=self.parent(), operator_home=str(self.operator),
+            )
+        self.assertEqual((caught.exception.cause, caught.exception.detail), ("wrapper_pin_mismatch", "binary"))
 
 
 if __name__ == "__main__":

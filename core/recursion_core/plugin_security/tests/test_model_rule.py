@@ -6,8 +6,8 @@ id grammar the other four fields keep.
 
 ``subscription_routes.own_loop`` applies the same rule to the model of an own-loop route. Neither
 package imports the other, so nothing but ``ModelRuleDriftTests`` holds the two together: it fails
-when either one moves. An authority profile names its model more narrowly, in the id grammar;
-``ProfileModelTests`` says how the two stand.
+when either one moves. An authority profile names its model by the store's rule, which it asks of
+the store; ``ProfileModelTests`` holds that.
 
 Nothing here signs or verifies, so these run where ``cryptography`` is missing too.
 """
@@ -100,35 +100,31 @@ class ModelRuleTests(unittest.TestCase):
 
 
 class ProfileModelTests(unittest.TestCase):
-    """An authority profile names its model in the id grammar, which is narrower than what the store
-    records. Before the store's rule was widened the two were one grammar, so that every model a run
-    could be bound to could be named in a profile (``test_gate``'s
-    ``test_a_bindable_model_name_can_be_named_in_a_profile``). That no longer holds for a name outside
-    the id grammar. This says so where it can fail: whoever widens the profile's rule, or narrows the
-    store's, meets this test."""
+    """An authority profile can name exactly the models a run can be bound to. Its check asks the store
+    and keeps no copy of the rule, so the two cannot part: a run on ``opus[1m]`` is bound, and a profile
+    can name ``opus[1m]``. The provider keeps the id grammar in both places; ``test_gate`` holds that,
+    and the whole path through a signed profile."""
 
-    def test_a_profile_can_name_a_model_only_if_a_run_can_be_bound_to_it(self) -> None:
+    def test_a_profile_can_name_a_model_exactly_when_a_run_can_be_bound_to_it(self) -> None:
         from recursion_core.plugin_security import authority
-        for model in RECORDED + NOT_RECORDED:
+        for model in RECORDED + NOT_RECORDED + NOT_TEXT + (Name("opus"),):
             with self.subTest(model=ascii(model)[:24]):
-                if authority._MODEL_VALUE.fullmatch(model):
-                    self.assertTrue(ConnectionBreaker.model_recordable(model))
+                self.assertEqual(authority._model_version_ok(model), ConnectionBreaker.model_recordable(model))
         for code in CHARACTERS:
             with self.subTest(code=hex(code)):
                 model = "a" + chr(code) + "b"
-                if authority._MODEL_VALUE.fullmatch(model):
-                    self.assertTrue(ConnectionBreaker.model_recordable(model))
+                self.assertEqual(authority._model_version_ok(model), ConnectionBreaker.model_recordable(model))
 
-    def test_a_run_can_be_bound_to_a_model_that_no_profile_can_name(self) -> None:
+    def test_a_name_outside_the_id_grammar_can_be_bound_and_named(self) -> None:
         from recursion_core.plugin_security import authority
-        for model in ("opus[1m]", "a+b", "claude-sonnet-4.5(beta)"):
+        for model in ("opus[1m]", "a+b", "claude-sonnet-4.5(beta)", "opus", "vendor/model", "model@rev"):
             with self.subTest(model=model):
                 self.assertTrue(ConnectionBreaker.model_recordable(model))
-                self.assertIsNone(authority._MODEL_VALUE.fullmatch(model))
-        for model in ("opus", "vendor/model", "model@rev", "us.anthropic.claude-x-v1:0"):
-            with self.subTest(model=model):
-                self.assertTrue(ConnectionBreaker.model_recordable(model))
-                self.assertIsNotNone(authority._MODEL_VALUE.fullmatch(model))
+                self.assertTrue(authority._model_version_ok(model))
+        for model in ("bad model", "", "x" * 129, "opus[1m]" + chr(10)):
+            with self.subTest(model=ascii(model)[:24]):
+                self.assertFalse(ConnectionBreaker.model_recordable(model))
+                self.assertFalse(authority._model_version_ok(model))
 
 
 def own_loop_takes(model: str) -> bool:

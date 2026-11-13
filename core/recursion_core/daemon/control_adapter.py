@@ -283,16 +283,19 @@ class RouteStarter:
             raise self._refuse(run_id, route_contract.LAUNCH_REFUSED, unsupported)
         if self._breaker_unavailable is not None:
             raise self._refuse(run_id, 'breaker_store_unavailable', self._breaker_unavailable)
-        connection = route_connection(entry)
-        if self._breaker is not None and connection is not None:
-            if not self._breaker.representable(connection):
-                # A limit on this connection could never be kept across a restart: refuse, do not run unfenced.
-                raise self._refuse(run_id, 'breaker_connection_unrepresentable', 'connection id')
-            self._breaker.bind_run(run_id, connection, engine, str(entry['route'].get('model')))
+        if self._breaker is not None:
+            limits = entry['route'].get('limits')
+            fallbacks = limits.get('fallback', ()) if isinstance(limits, dict) and isinstance(limits.get('fallback'), list) else ()
+            for candidate in (entry['route'], *fallbacks):
+                if isinstance(candidate, dict):
+                    conn = route_connection({'route': candidate})
+                    if conn is not None and not self._breaker.representable(conn):
+                        # A limit on this connection could never be kept across a restart: refuse, do not run unfenced.
+                        raise self._refuse(run_id, 'breaker_connection_unrepresentable', 'connection id')
         request = {'contract': route_contract.CONTRACT_VERSION, 'request_id': run_id,
                    'tenant': params['tenant'], 'prompt': params['prompt'],
                    'deadline_s': entry['deadline_s'], 'route': json.loads(json.dumps(entry['route']))}
-        ctx = RunContext(run_id)
+        ctx = RunContext(run_id, breaker=self._breaker)
         with self._lock:
             in_flight = run_id in self._active
             if not in_flight:

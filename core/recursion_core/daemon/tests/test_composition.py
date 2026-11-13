@@ -899,6 +899,47 @@ class ComposedDaemonTest(unittest.TestCase):
             stored.check(run_id, 'subscription:stand-in-login', 'host')
         self.assertEqual(caught.exception.code, 'run_faulted')
 
+    def test_fallback_route_validates_representable_connection_and_binds_launched_route(self):
+        self.routes['claude_code']['route']['limits'] = {
+            'on_limit': 'fallback',
+            'fallback': [{'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                          'connection': {'kind': 'subscription', 'id': 'bad space id'}}]}
+        _, composed = self.boot()
+        api = self.api(composed)
+        refused = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+        self.assertEqual((refused['code'], (refused.get('start_error') or {}).get('code')),
+                         ('start_failed', 'breaker_connection_unrepresentable'), refused)
+        self.shutdown()
+
+        self.routes['claude_code']['route']['limits'] = {
+            'on_limit': 'fallback',
+            'fallback': [{'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                          'connection': {'kind': 'subscription', 'id': 'fallback-login'}}]}
+        _, composed = self.boot()
+        composed.breaker._stored.report('subscription:stand-in-login', 'plan_limit')
+        api = self.api(composed)
+        started = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 ticks=1 fast=1'})
+        self.assertEqual(started['code'], 'started', started)
+        rid = started['run']['run_id']
+        until(lambda: (api.call('run.status', {'run_id': rid})['run'].get('result') or {}).get('status') == 'ok')
+        bound = composed.breaker._stored.check(rid, 'subscription:fallback-login', 'host')
+        self.assertEqual(bound, {'provider': 'claude_code', 'model_version': 'fallback-model'})
+
+    def test_cached_connection_cannot_launch_without_durable_binding(self):
+        import sqlite3
+        _, composed = self.boot()
+        self.assertTrue(composed.breaker.admit('subscription:stand-in-login', 'm', 't1')['admitted'])
+        with mock.patch.object(composed.breaker._stored, 'bind_run',
+                               side_effect=sqlite3.OperationalError('disk I/O error')):
+            answer = self.api(composed).call('run.start', {
+                'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+        self.assertEqual(answer['code'], 'start_failed', answer)
+        self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+        self.assertIn('breaker_bind_failed:', answer['start_error']['detail'])
+        self.assertEqual(self.units.started, [])
+        rid = self.start(self.api(composed), 'helper=0 fast=1')
+        self.assertEqual(self.api(composed).call('run.stop', {'run_id': rid})['code'], 'stopped')
+
     def test_a_breaker_store_that_cannot_be_read_refuses_starts_and_keeps_reads(self):
         path = daemon_breaker.store_path(self.state)
         Registry(self.state).close()

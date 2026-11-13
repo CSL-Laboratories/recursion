@@ -93,8 +93,11 @@ def require_launcher_platform():
 class RunContext:
     """One control-API run while its route request is in flight. Set by the starter, read by the launcher."""
 
-    def __init__(self, run_id):
+    def __init__(self, run_id, *, breaker=None):
         self.run_id = run_id
+        self.breaker = breaker
+        self.admitted = None
+        self.bound = False
         self.cgroup = None
         self.process = None
         self.result = None
@@ -428,6 +431,11 @@ class ProductionLauncher:
             # One unit per run id. A second launch for the same run (a fallback route) needs its own
             # run record, which the control API does not have yet.
             raise refused('run_already_launched')
+        if ctx.breaker is not None and ctx.admitted is not None and not ctx.bound:
+            error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1])
+            if error is not None:
+                raise refused('breaker_bind_failed:' + error)
+            ctx.bound = True
         validated = self.child_environment(env)
         try:
             executable = _resolve_executable(argv[0], validated)

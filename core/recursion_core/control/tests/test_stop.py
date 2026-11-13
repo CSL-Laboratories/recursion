@@ -182,6 +182,56 @@ class StopTest(unittest.TestCase):
         self.assertEqual((again["code"], again["detail"]), (a.START_FAILED, "stop_requested"))
         self.assertEqual(kill.requests, [])
 
+    def _plant(self, stop, *, state: str = "running", cgroup: str | None = "/cg/r"):
+        registry = InMemoryRunRegistry([{
+            "run_id": "r", "tenant": "t1", "engine": "codex", "state": state,
+            "cgroup": cgroup, "started_at": 1.0, "stop": stop, "start_key": None,
+        }])
+        return registry
+
+    def test_missing_requested_means_the_cleanup_was_not_sent(self) -> None:
+        # .get("requested", True) treated a missing field as already sent, so retries never signalled.
+        kill = FakeKillTree([POPULATED, EMPTY])
+        registry = self._plant({"requested_at": 1.0, "checks": 0, "reason": None})
+        api, _, _, _ = make_api(kill, registry)
+        first = api.call("run.stop", {"run_id": "r"})
+        self.assertEqual((first["code"], first["reason"]), (a.PENDING, "cgroup_populated"))
+        self.assertEqual(kill.requests, ["/cg/r"])
+        self.assertIs(registry.get("r")["stop"]["requested"], True)
+        second = api.call("run.stop", {"run_id": "r"})
+        self.assertEqual(second["code"], a.STOPPED)
+        self.assertEqual(kill.requests, ["/cg/r"])
+
+    def test_non_dict_stop_is_a_fresh_intent_and_stays_inside_call(self) -> None:
+        kill = FakeKillTree([EMPTY])
+        registry = self._plant(1)
+        api, _, _, _ = make_api(kill, registry)
+        res = api.call("run.stop", {"run_id": "r"})
+        self.assertEqual(res["code"], a.STOPPED)
+        self.assertEqual(kill.requests, ["/cg/r"])
+        self.assertIs(registry.get("r")["stop"]["requested"], True)
+        self.assertIsInstance(registry.get("r")["stop"], dict)
+
+    def test_stop_missing_checks_still_returns_pending_after_the_signal(self) -> None:
+        kill = FakeKillTree([POPULATED])
+        registry = self._plant({"requested": False, "reason": None})
+        api, _, _, _ = make_api(kill, registry)
+        res = api.call("run.stop", {"run_id": "r"})
+        self.assertEqual((res["code"], res["state"], res["reason"]), (a.PENDING, "pending", "cgroup_populated"))
+        self.assertEqual(kill.requests, ["/cg/r"])
+        self.assertEqual(registry.get("r")["stop"]["checks"], 1)
+        self.assertEqual(registry.get("r")["state"], "stop_pending")
+
+    def test_non_dict_stop_before_launch_does_not_escape(self) -> None:
+        kill = FakeKillTree([EMPTY])
+        registry = self._plant(1, state="starting", cgroup=None)
+        api, _, _, _ = make_api(kill, registry)
+        res = api.call("run.stop", {"run_id": "r"})
+        self.assertEqual((res["code"], res["reason"]), (a.PENDING, "cgroup_unknown"))
+        self.assertEqual(kill.requests, [])
+        self.assertIsInstance(registry.get("r")["stop"], dict)
+        self.assertEqual(registry.get("r")["stop"]["checks"], 1)
+
 
 class ReadsAndStartTest(unittest.TestCase):
     def test_reads_have_no_side_effects(self) -> None:

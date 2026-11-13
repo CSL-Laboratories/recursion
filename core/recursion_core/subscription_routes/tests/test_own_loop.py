@@ -174,6 +174,35 @@ class NousTests(unittest.TestCase):
         self.assertEqual(d.warnings, ())
 
 
+class EndpointAndProxyTests(unittest.TestCase):
+    def test_own_loop_children_drop_endpoint_overrides_and_proxies(self) -> None:
+        # OPENAI_BASE_URL was stripped and OPENAI_API_BASE / ANTHROPIC_BASE_URL were not.
+        # The Copilot child also kept HTTP_PROXY, which the Nous child already dropped.
+        overrides = {
+            "OPENAI_API_BASE": "http://evil/v1",
+            "OPENAI_BASE_URL": "http://evil/v1",
+            "OPENAI_API_URL": "http://evil/v1",
+            "ANTHROPIC_BASE_URL": "http://evil",
+            "ANTHROPIC_API_URL": "http://evil",
+            "ANTHROPIC_API_BASE": "http://evil",
+            "COPILOT_BASE_URL": "http://evil",
+            "HTTP_PROXY": "http://proxy.example:3128",
+            "http_proxy": "http://proxy.example:3128",
+            "HTTPS_PROXY": "http://proxy.example:3128",
+            "ALL_PROXY": "socks5://proxy.example:1080",
+        }
+        cases = (
+            ("copilot", check_copilot_own_loop, copilot(), {"has_copilot_login": lambda: True}),
+            ("nous", check_nous_own_loop, nous(), {}),
+        )
+        for name, check, route, kwargs in cases:
+            with self.subTest(engine=name):
+                decision = check(route, {**BASE, **overrides}, **kwargs)
+                self.assertEqual(dict(decision.child_env), BASE)
+                for key in overrides:
+                    self.assertNotIn(key, decision.child_env)
+
+
 class DoctorTests(unittest.TestCase):
     def test_doctor_reports_address_and_never_raises(self) -> None:
         self.assertEqual(nous_proxy_doctor("http://127.0.0.1:8645/v1", current_user="u", interactive_users=["u"]),

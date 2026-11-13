@@ -351,6 +351,40 @@ class StaleWatchOnlyTest(unittest.TestCase):
         self.assertIsNone(app.status_refresh_failed)
         self.assertFalse(app.watch_only)
 
+    def test_a_malformed_list_row_does_not_replace_the_snapshot(self) -> None:
+        # Sync path of the same fail-open: [null] (and any other non-dict row) is not an empty list.
+        run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}
+
+        class API:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.rows: list = [run]
+
+            def call(self, method: str, params: dict | None = None) -> dict:
+                self.calls.append(method)
+                if method == "run.list":
+                    return {"code": "ok", "runs": self.rows}
+                if method == "run.start":
+                    return {"code": "started", "run": {**run, "run_id": "new"}}
+                return {"code": "ok", "run": dict(run)}
+
+        api = API()
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        self.assertEqual([r["run_id"] for r in app.runs], ["r"])
+        for rows in ([None], ["nope"], [{"run_id": "other", "state": "running"}, None]):
+            with self.subTest(rows=rows):
+                api.rows = rows
+                api.calls.clear()
+                app.refresh_failed = "earlier read failed"
+                app.request("run.list", {})
+                self.assertEqual([row["run_id"] for row in app.runs], ["r"])
+                self.assertIsNotNone(app.refresh_failed)
+                self.assertTrue(app.watch_only)
+                app.command("start --tenant t1 --engine codex --prompt p")
+                self.assertNotIn("run.start", api.calls)
+                self.assertIn("watch_only", app.errors[-1])
+
 
 class ErrorStaysTest(unittest.TestCase):
     def test_error_is_never_redrawn_away(self) -> None:

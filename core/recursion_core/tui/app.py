@@ -192,8 +192,11 @@ class TuiApp:
         self.last, self.last_method = answer, method
         code = answer.get("code")
         if method == "run.list":
-            if code == "ok" and isinstance(answer.get("runs"), list):
-                incoming = [r for r in answer["runs"] if isinstance(r, dict)]
+            runs = answer.get("runs")
+            # A non-dict row (null, a string) is not an empty snapshot. Filtering it out and
+            # committing the rest used to clear the latch and drop a live run, so Start ran.
+            if code == "ok" and isinstance(runs, list) and all(isinstance(r, dict) for r in runs):
+                incoming = runs
                 merged, seen = [], set()
                 for run in incoming:
                     chosen = self._consider(run)
@@ -213,16 +216,19 @@ class TuiApp:
                 ids = [str(r.get("run_id")) for r in self.runs]
                 if self.selected not in ids:
                     self.selected = ids[0] if ids else None
+            elif code == "ok" and isinstance(runs, list):
+                self.refresh_failed = "run.list answered ok with a malformed run"
             else:
                 self.refresh_failed = f"run.list answered {field(code)}"
         elif method == "run.status":
             # An unavailable status stays failed until a later status succeeds. A refusal is an answer,
             # not a failed read, and a successful list must not clear it (bot review 4503920903).
             # ``code`` ok with no run was not applied: call_api drops a cyclic run and keeps ``code``.
-            # Clearing the failure here would turn watch_only off and allow Start on that answer.
+            # Clearing the failure before the merge would turn watch_only off when the merge raises
+            # (a non-dict ``stop``) and Loop drops the answer, which lets Start run.
             if code == "ok" and isinstance(answer.get("run"), dict):
-                self.status_refresh_failed = None
                 self._merge(answer["run"])
+                self.status_refresh_failed = None
             elif code == "ok":
                 self.status_refresh_failed = "run.status answered ok without a run"
                 self._error("run.status answered ok without a run")
@@ -300,7 +306,10 @@ class TuiApp:
             return run
         over = dict(run)
         over["state"] = mark[1]
-        over["stop"] = {**(over.get("stop") or {}), "reason": mark[2]}
+        prior = over.get("stop")
+        # ``stop: 1`` is not a record. Spreading it raised after the status latch was cleared.
+        base = prior if isinstance(prior, dict) else {}
+        over["stop"] = {**base, "reason": mark[2]}
         return over
 
     def _merge(self, run: dict) -> None:

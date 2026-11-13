@@ -120,8 +120,9 @@ def check_copilot_own_loop(
     has_copilot_login: Callable[[], bool] | None = None,
 ) -> OwnLoopDecision:
     """Decide one Copilot own-loop run. ``route``: engine="copilot", auth="subscription",
-    method="copilot_cli_sign_in" (optional ``model``). Returns the child env with every token variable
-    and ``COPILOT_API_URL`` removed, or raises ``OwnLoopRouteRefused``.
+    method="copilot_cli_sign_in" (optional ``model``). Returns the child env with every token variable,
+    ``COPILOT_API_URL``, other provider endpoint overrides and proxy variables removed, or raises
+    ``OwnLoopRouteRefused``.
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
@@ -138,7 +139,8 @@ def check_copilot_own_loop(
     model = _model("copilot", route.get("model"))
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
-    removed = tuple(n for n in parent_env if n in strip or _is_provider_credential(n))
+    removed = tuple(n for n in parent_env
+                    if n in strip or _is_provider_credential(n) or n.upper() in _PROXY_ENV)
     child = {k: v for k, v in parent_env.items() if k not in removed}
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
@@ -245,7 +247,7 @@ def check_nous_own_loop(
             raise OwnLoopRouteRefused("nous", "adapter_must_stay_off", prefix)
         if prefix != NOUS_ADAPTER:
             raise OwnLoopRouteRefused("nous", "nous_adapter_only", prefix)
-    # Provider credentials, and proxy settings that would carry loopback traffic off the host.
+    # Provider credentials, endpoint overrides, and proxy settings that would carry traffic off the host.
     strip = tuple(n for n in parent_env if _is_provider_credential(n) or n.upper() in _PROXY_ENV)
     child = {k: v for k, v in parent_env.items() if k not in strip}
     return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), strip, url, adapters,
@@ -253,7 +255,12 @@ def check_nous_own_loop(
 
 
 def _is_provider_credential(name: str) -> bool:
+    """A provider secret, or an endpoint override that would aim this child at another host."""
+
     upper = name.upper()
     if upper.startswith(("NOUS_", "XAI_", "GROK_", "HERMES_")):
         return True
-    return upper.endswith(("_API_KEY", "_TOKEN", "_AUTH_TOKEN")) or upper in ("OPENAI_BASE_URL",)
+    if upper.endswith(("_API_KEY", "_TOKEN", "_AUTH_TOKEN")):
+        return True
+    return upper.startswith(("OPENAI_", "ANTHROPIC_", "CLAUDE_", "COPILOT_")) and upper.endswith(
+        ("_BASE_URL", "_API_BASE", "_API_URL"))

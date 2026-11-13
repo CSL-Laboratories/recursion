@@ -36,7 +36,8 @@ Stop: the first call asks the cleanup layer to stop the run's tree, then asks it
 confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown answer or a
 cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
 pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested`` is
-false: it raised, or it is a stop intent from before the launch was recorded), in which case it sends it
+missing or false: it was never recorded, it raised, or it is a stop intent from before the launch was
+recorded), in which case it sends it
 (``cgroup.kill`` and pidfd signals are safe to repeat).
 Reads never change state and never call the cleanup layer.
 
@@ -291,11 +292,10 @@ class ControlAPI:
                 return self._recorded({"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}, rec)
         self._stop_wanted.discard(run_id)
         first = rec["state"] != "stop_pending"
-        if rec.get("stop") is None:
-            rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
-        if not rec["stop"].get("requested", True):
-            # First stop, a stop intent left during launch, or an earlier request raised before it was known
-            # to be sent: (re)send it.
+        self._stop_record(rec)
+        if not rec["stop"]["requested"]:
+            # Missing or false: the cleanup request was not sent (absent field, a failed request, or a
+            # stop intent left during launch). (Re)send it.
             try:
                 self._kill.request_stop(rec["cgroup"])
             except Exception as err:
@@ -312,13 +312,36 @@ class ControlAPI:
         res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first}
         return self._recorded(res, rec)
 
+    def _stop_record(self, rec: dict) -> dict:
+        """The stop record on ``rec``, safe to update. A non-dict is a fresh unsent intent.
+
+        A missing ``requested`` means the cleanup request was not sent. A missing or non-integer
+        ``checks`` starts at 0, so a later increment cannot raise out of ``call``.
+        """
+
+        stop = rec.get("stop")
+        if not isinstance(stop, dict):
+            stop = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
+        else:
+            stop = dict(stop)
+            if "requested" not in stop:
+                stop["requested"] = False
+            checks = stop.get("checks")
+            if isinstance(checks, bool) or not isinstance(checks, int):
+                stop["checks"] = 0
+            if "reason" not in stop:
+                stop["reason"] = None
+            if "requested_at" not in stop:
+                stop["requested_at"] = self._clock()
+        rec["stop"] = stop
+        return stop
+
     def _stop_intent(self, rec: dict) -> dict:
         # Red-team r3 finding 2: the Stop is kept (in the record and in memory), and the start that is
         # still launching acts on it once the launch is recorded. The record keeps its launch state.
         self._stop_wanted.add(rec["run_id"])
-        if rec.get("stop") is None:
-            rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
-        rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason="cgroup_unknown")
+        stop = self._stop_record(rec)
+        stop.update(checks=stop["checks"] + 1, reason="cgroup_unknown")
         res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": "cgroup_unknown"}
         if not self._try_put(rec):
             res["recorded"] = False
@@ -335,7 +358,9 @@ class ControlAPI:
         if not self._try_put(rec):
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
-                self._launched[rec["run_id"]] = dict(rec, stop=dict(rec["stop"]) if rec.get("stop") else None)
+                stop = rec.get("stop")
+                kept = dict(stop) if isinstance(stop, dict) and stop else None
+                self._launched[rec["run_id"]] = dict(rec, stop=kept)
         else:
             self._launched.pop(rec["run_id"], None)  # the cgroup is in the registry now
         return res

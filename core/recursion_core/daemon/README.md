@@ -193,8 +193,9 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
   broken pipe; stdin is a FIFO.
 - **Stop.** Units carry `KillSignal=SIGINT`, `TimeoutStopSec=2s`, `KillMode=control-group`,
   so `systemctl --user stop` is the #916 procedure. `run.stop` records the Stop intent,
-  stops the unit and answers `stopped` only when the sweep attested the tree gone; anything
-  else is `pending` with a reason. A deadline or protocol error fences the run the same way.
+  stops the unit and answers `stopped` only after the cgroup path it names read absent or
+  empty in the same call (see "Behaviour"); anything else is `pending` with a reason. A
+  deadline or protocol error fences the run the same way.
 - **Restart.** After the startup sweep, `DaemonControl.reconcile` finishes any Stop the
   registry recorded but the control record did not, records the cgroup of a launch the
   previous daemon did not finish recording, and marks a start that never reached a unit
@@ -257,6 +258,34 @@ route result is not produced), bar evidence for any route, the O7 interventions,
 that can approve or veto an effect, and an installer for the plugin files, the authority
 ledger and the breaker store.
 
+Also not done: three defects found in review on Nov 12, 2026, left as they are on this branch
+for the Stop lane on master.
+
+- **One lock for every run's unit calls.** `Daemon.start`, `Daemon.stop`, `Daemon.reconcile`,
+  `Daemon.cgroup_clear` and the whole of `Daemon.sweep` hold the daemon's one lock while they
+  call the unit manager, and each `systemd-run` or `systemctl` call may wait up to 15 seconds
+  (`SystemdUserManager._call`). A Stop or a reconcile of one run can make three of them in a row
+  (the stop, a `show`, and a second `show` before an end is recorded), and wait up to 2 seconds
+  per cgroup path for a kill in between. A start makes two (`systemd-run`, then `show`). A sweep
+  keeps the lock for its whole pass: that work for every run not yet ended, then one
+  `list-units`, then a stop for each leftover unit. While one of these waits on a slow manager,
+  a Stop of any other run waits for the lock. It is answered late, and `pending` if its confirm
+  window has run out by then. The wait changes when Stop answers, not what it reads: `stopped`
+  still needs the row ended and the cgroup walked empty in that same call. The control API's
+  per-run locks and the socket's reserved Stop connections do not shorten the wait.
+- **A failed launch cannot be retried under the same run id.** The launcher creates
+  `stdin.fifo`, `stdout.jsonl` and `stderr.log` in the run's directory without looking for an
+  earlier attempt, and `Daemon.start` inserts the run's row the same way. When a launch fails,
+  only `env.fifo` is removed. The control API relaunches a `start_failed` run under its old id
+  when the same `client_key` is sent again, so a relaunch of an attempt that got that far fails
+  on the files or the row it left.
+- **A short write of the environment is not noticed.** The engine's environment goes to
+  `env.fifo` as one frame in one nonblocking `os.write`, and the count that call returns is not
+  checked. The frame may be up to 60,000 bytes, on the assumption that a FIFO buffers 64 KiB.
+  Where a FIFO holds less, part of the frame is written, the launcher takes the drained FIFO
+  for an environment that was read, and `engine_exec` rejects the truncated frame: the engine
+  never runs, and the start may already have been answered as launched.
+
 Evidence: `evidence_ns.sh` runs `evidence_e2e.py`, which drives the real daemon and CLI
 against a real `systemd --user` manager with a stand-in engine
 (`evidence_standin_engine.py`): start, stream, inspect, Stop, cleanup, restart, a signed
@@ -316,10 +345,11 @@ when the bind succeeds. A bad plugin registry still stops the service, and it is
 cherry-pick so its real HTTP test is self-contained; merge order is not assumed.
 
 The control-API device door and `ControlClient` can be injected into `main`.
-Without the #327 adapter the production default refuses authentication on every
-request (401); it does not silently trust loopback, invent data, or manufacture a
+With neither injected, `main` composes its own (`control_adapter.compose_control`; the
+`DeviceDoor` under "Composition"). A `LoopbackGUI` built with no door refuses authentication
+on every request (401); it does not silently trust loopback, invent data, or manufacture a
 token. Tests inject a fake API/device door and prove a real GET returns the page.
-Control-API credential/pairing integration remains with #327, not claimed here.
+A browser pairing step for the device token is not done (see "Not done").
 
 An installed operator plugin is a directory (`manifest.json`, `manifest.sig`, `plugin.py`)
 under `$XDG_CONFIG_HOME/recursion/plugins/`, or named with `--plugin <DIR>` (absolute). The
@@ -333,6 +363,7 @@ it is unset. `/panel?id=...` renders only the named O7 reads, through the one sh
 venue-data filter (`gui/panels.py` `filter_venue_rows`; the daemon has no copy of it), with
 no panel order verb and no panel Stop. Run Stop stays in the core page.
 
-Contract: `contracts/PRODUCT.md` at
+Contract: this section was written against `contracts/PRODUCT.md` at
 `055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
-`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`.
+`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`. That version is
+superseded; the pinned one is `d84cdd26` (`contract/PRODUCT.pin.json`).

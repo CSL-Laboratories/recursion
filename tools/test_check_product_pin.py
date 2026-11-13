@@ -1015,18 +1015,26 @@ def _ref_append_pack(base: bytes, suffix: bytes) -> tuple[bytes, bytes, bytes]:
 
 
 def _idx_v2_one(oid: bytes, offset: int, pack: bytes) -> bytes:
+    return _idx_v2_entries([(oid, offset)], pack)
+
+
+def _idx_v2_entries(entries: list[tuple[bytes, int]], pack: bytes) -> bytes:
+    """Version-2 index. Names must be unique; fanout counts every first byte."""
+    entries = sorted(entries)
+    if len({oid for oid, _offset in entries}) != len(entries):
+        raise AssertionError("duplicate pack index names")
+    counts = [0] * 256
+    for oid, _offset in entries:
+        counts[oid[0]] += 1
     fanout = bytearray(256 * 4)
-    for index in range(oid[0], 256):
-        fanout[index * 4 : index * 4 + 4] = (1).to_bytes(4, "big")
-    body = (
-        b"\xfftOc"
-        + (2).to_bytes(4, "big")
-        + bytes(fanout)
-        + oid
-        + (0).to_bytes(4, "big")
-        + offset.to_bytes(4, "big")
-        + pack[-20:]
-    )
+    running = 0
+    for index, count in enumerate(counts):
+        running += count
+        fanout[index * 4 : index * 4 + 4] = running.to_bytes(4, "big")
+    names = b"".join(oid for oid, _offset in entries)
+    crc = b"\0" * (len(entries) * 4)
+    offsets = b"".join(offset.to_bytes(4, "big") for _oid, offset in entries)
+    body = b"\xfftOc" + (2).to_bytes(4, "big") + bytes(fanout) + names + crc + offsets + pack[-20:]
     return body + hashlib.sha1(body).digest()
 
 
@@ -1079,6 +1087,103 @@ def _ofs_chain_pack(tip: bytes, depth: int) -> tuple[bytes, int]:
         buf += _encode_obj_header(6, len(delta)) + _encode_ofs(relative) + payload
     pack = bytes(buf)
     return pack + hashlib.sha1(pack).digest(), offsets[-1]
+
+
+def _pack_bytes(objects: list[bytes]) -> tuple[bytes, list[int]]:
+    buf = bytearray(b"PACK" + (2).to_bytes(4, "big") + len(objects).to_bytes(4, "big"))
+    offsets = []
+    for obj in objects:
+        offsets.append(len(buf))
+        buf += obj
+    pack = bytes(buf)
+    return pack + hashlib.sha1(pack).digest(), offsets
+
+
+def _blob_obj(content: bytes) -> bytes:
+    return _encode_obj_header(3, len(content)) + zlib.compress(content)
+
+
+def _ref_obj(base_oid: bytes, delta: bytes) -> bytes:
+    return _encode_obj_header(7, len(delta)) + base_oid + zlib.compress(delta)
+
+
+def _ofs_obj(relative: int, delta: bytes) -> bytes:
+    return _encode_obj_header(6, len(delta)) + _encode_ofs(relative) + zlib.compress(delta)
+
+
+def _write_store(root: Path, packs: list[tuple[str, bytes, bytes]]) -> None:
+    packdir = root / "pack"
+    packdir.mkdir(parents=True, exist_ok=True)
+    for name, pack, idx in packs:
+        (packdir / f"{name}.pack").write_bytes(pack)
+        (packdir / f"{name}.idx").write_bytes(idx)
+
+
+def _write_loose(objects: Path, oid: bytes, content: bytes) -> None:
+    raw = zlib.compress(b"blob " + str(len(content)).encode("ascii") + b"\0" + content)
+    path = objects / oid.hex()[:2] / oid.hex()[2:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+
+
+def _poison_ref_chain(depth: int, claimed_tip: bytes) -> tuple[bytes, bytes]:
+    """`depth` REF deltas named as `claimed_tip`, ending in a blob with the wrong hash.
+
+    The same chain in two packs is what makes a resolver that forgets a failed
+    base re-walk every copy: ``2**(depth + 2) - 1`` pack reads.
+    """
+    leaf = b"poison-leaf"
+    delta = _insert_delta(leaf, b"Z")
+    bases = [bytes([index + 1]) + b"\x5a" * 19 for index in range(depth)]
+    if claimed_tip in bases:
+        raise AssertionError("claimed tip collides with a synthetic base")
+    objects = []
+    entries_at = []
+    for index in range(depth):
+        entries_at.append(len(objects))
+        objects.append(_ref_obj(bases[index], delta))
+    entries_at.append(len(objects))
+    objects.append(_blob_obj(leaf))
+    pack, offsets = _pack_bytes(objects)
+    entries = []
+    for index in range(depth):
+        name = claimed_tip if index == 0 else bases[index - 1]
+        entries.append((name, offsets[entries_at[index]]))
+    entries.append((bases[-1], offsets[entries_at[-1]]))
+    return pack, _idx_v2_entries(entries, pack)
+
+
+def _ref_chain_onto(depth: int, leaf: bytes) -> tuple[bytes, bytes, bytes, bytes]:
+    """`depth` REF deltas that rebuild ``i.to_bytes(2)`` on top of `leaf`.
+
+    Returns the pack, its index, the tip oid and the leaf oid. The leaf itself
+    is not in the pack.
+    """
+    contents = [leaf]
+    for index in range(1, depth + 1):
+        contents.append(index.to_bytes(2, "big"))
+    oids = [_content_oid(content) for content in contents]
+    objects = []
+    for index in range(1, depth + 1):
+        delta = _insert_delta(contents[index - 1], contents[index])
+        objects.append(_ref_obj(oids[index - 1], delta))
+    pack, offsets = _pack_bytes(objects)
+    entries = [(oids[index], offsets[index - 1]) for index in range(1, depth + 1)]
+    return pack, _idx_v2_entries(entries, pack), oids[-1], oids[0]
+
+
+def _count_pack_reads(call) -> tuple[int, object]:
+    calls = 0
+    real = pin_check._pack_object_at
+
+    def wrapped(pack: bytes, offset: int, real=real) -> tuple:
+        nonlocal calls
+        calls += 1
+        return real(pack, offset)
+
+    with mock.patch.object(pin_check, "_pack_object_at", wrapped):
+        result = call()
+    return calls, result
 
 
 def _peak(call) -> tuple[BaseException | None, int]:
@@ -1331,6 +1436,236 @@ class DeepObjectStoreTests(VaultTests):
         midx.write_bytes(self._craft_midx(["../" + idx_name], version=2))
         problems = self._assert_refused(repo, self._pin_for(commit))
         self.assertIn("multi-pack-index", problems[0])
+
+    def test_no_delta_base_offset_pack_matches_git(self) -> None:
+        """A pack written with REF deltas only resolves to the same blob git reads."""
+        repo = Path(self.tmp.name) / "no-delta-base"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        body = b"A" * 200
+        target = repo / "contracts" / "recursion" / "PRODUCT.md"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(body + b"-ONE")
+        (repo / "other.txt").write_bytes(body + b"-TWO")
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "contract"], check=True)
+        commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        oid = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", f"{commit}:contracts/recursion/PRODUCT.md"],
+            text=True,
+        ).strip()
+        packdir = repo / ".git" / "objects" / "pack"
+        packdir.mkdir(parents=True, exist_ok=True)
+        done = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "pack-objects",
+                "--all",
+                "--no-delta-base-offset",
+                "--window=10",
+                "--depth=5",
+                str(packdir / "nodelta"),
+            ],
+            capture_output=True,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        packs = list(packdir.glob("nodelta-*.pack"))
+        self.assertEqual(len(packs), 1, packs)
+        self.assertTrue(_pack_has_ref_delta(packs[0].read_bytes()))
+        for loose in (repo / ".git" / "objects").glob("[0-9a-f][0-9a-f]/*"):
+            loose.unlink()
+        got = subprocess.check_output(["git", "-C", str(repo), "cat-file", "blob", oid])
+        self.assertEqual(got, body + b"-ONE")
+        pin = {**PINNED, "commit": commit, "sha256": hashlib.sha256(body + b"-ONE").hexdigest()}
+        self.assertEqual(pin_check.vault_errors(pin, repo), [])
+
+
+def _pack_has_ref_delta(pack: bytes) -> bool:
+    """True when the pack contains a type-7 REF delta."""
+    pos = 12
+    count = int.from_bytes(pack[8:12], "big")
+    found = False
+    for _ in range(count):
+        if pos >= len(pack) - 20:
+            break
+        byte = pack[pos]
+        pos += 1
+        obj_type = (byte >> 4) & 7
+        size = byte & 15
+        shift = 4
+        while byte & 0x80:
+            byte = pack[pos]
+            pos += 1
+            size |= (byte & 0x7F) << shift
+            shift += 7
+        if obj_type == 6:
+            byte = pack[pos]
+            pos += 1
+            while byte & 0x80:
+                byte = pack[pos]
+                pos += 1
+        elif obj_type == 7:
+            pos += 20
+            found = True
+        stream = zlib.decompressobj()
+        payload = stream.decompress(pack[pos:])
+        if len(payload) != size:
+            return False
+        pos = len(pack) - len(stream.unused_data)
+    return found
+
+
+class DeltaChainBoundTests(unittest.TestCase):
+    def test_two_poison_ref_packs_do_not_rewalk_a_failed_base(self) -> None:
+        """Two poison copies of one REF chain must not re-search a failed base.
+
+        Forgetting the failure reads ``2**(depth + 2) - 1`` objects (262143 at
+        depth 16). Each distinct pack offset is expanded once, then the real
+        blob is read.
+        """
+        depth = 16
+        content = b"real-bytes"
+        oid = _content_oid(content)
+        poison, pidx = _poison_ref_chain(depth, oid)
+        valid = _single_blob_pack(content)
+        vidx = _idx_v2_one(oid, 12, valid)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_store(root, [("a", poison, pidx), ("b", poison, pidx), ("c", valid, vidx)])
+            store = pin_check._ObjectStore(root)
+            calls, got = _count_pack_reads(lambda: store.get(oid))
+        self.assertEqual(got, (b"blob", content))
+        self.assertLessEqual(calls, 2 * (depth + 1) + 1, calls)
+        self.assertGreater(calls, 0)
+
+    def test_loose_and_cached_leaf_uses_the_packed_depth_cap(self) -> None:
+        """4095 REF deltas onto a loose or cached leaf resolve; 4096 are refused.
+
+        Packed chains already stop at 4096. The leaf after the last increment
+        has to use that same cap when it comes from a loose file or the cache.
+        """
+        leaf = b"L"
+        for kind in ("loose", "cached"):
+            for depth in (4095, 4096):
+                with self.subTest(kind=kind, depth=depth):
+                    pack, idx, tip, leaf_oid = _ref_chain_onto(depth, leaf)
+                    with tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        _write_store(root, [("a", pack, idx)])
+                        if kind == "loose":
+                            _write_loose(root, leaf_oid, leaf)
+                        store = pin_check._ObjectStore(root)
+                        if kind == "cached":
+                            store.cache[leaf_oid] = (b"blob", leaf)
+                        if depth <= pin_check._MAX_DELTA_DEPTH:
+                            self.assertEqual(store.get(tip), (b"blob", depth.to_bytes(2, "big")))
+                        else:
+                            with self.assertRaises(pin_check._ObjectMissing) as caught:
+                                store.get(tip)
+                            self.assertEqual(caught.exception.message, "delta chain is too deep")
+
+    def test_mutual_ref_cycle_uses_a_later_real_blob(self) -> None:
+        """A REF cycle in an earlier pack does not hide the real blob in a later pack."""
+        content = b"real-bytes"
+        oid = _content_oid(content)
+        other = b"\x11" * 20
+        junk = _insert_delta(b"x", b"y")
+        objects = [_ref_obj(other, junk), _ref_obj(oid, junk)]
+        pack, offsets = _pack_bytes(objects)
+        idx = _idx_v2_entries([(oid, offsets[0]), (other, offsets[1])], pack)
+        valid = _single_blob_pack(content)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_store(
+                root,
+                [("a", pack, idx), ("b", valid, _idx_v2_one(oid, 12, valid))],
+            )
+            store = pin_check._ObjectStore(root)
+            self.assertEqual(store.get(oid), (b"blob", content))
+
+    def test_ref_delta_uses_a_base_stored_in_a_later_pack(self) -> None:
+        """The delta may be the only copy of the tip, with its base in a later pack."""
+        base = b"base-bytes"
+        suffix = b"-TAIL"
+        base_oid = _content_oid(base)
+        tip_oid = _content_oid(base + suffix)
+        delta = _append_delta(base, suffix)
+        # Earlier pack also has a REF cycle copy of the base, which must be skipped.
+        junk = _insert_delta(base, b"nope")
+        objects = [_ref_obj(base_oid, delta), _ref_obj(tip_oid, junk)]
+        pack, offsets = _pack_bytes(objects)
+        earlier = _idx_v2_entries([(tip_oid, offsets[0]), (base_oid, offsets[1])], pack)
+        later_objects = [_blob_obj(base)]
+        later, later_offsets = _pack_bytes(later_objects)
+        later_idx = _idx_v2_entries([(base_oid, later_offsets[0])], later)
+        self.assertLess(offsets[0], offsets[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_store(root, [("a", pack, earlier), ("b", later, later_idx)])
+            store = pin_check._ObjectStore(root)
+            self.assertEqual(store.get(tip_oid), (b"blob", base + suffix))
+
+    def test_forward_ref_delta_matches_its_base(self) -> None:
+        """A REF delta may sit at a lower offset than the base it names."""
+        base = b"base-bytes"
+        suffix = b"-TAIL"
+        base_oid = _content_oid(base)
+        tip_oid = _content_oid(base + suffix)
+        objects = [_ref_obj(base_oid, _append_delta(base, suffix)), _blob_obj(base)]
+        pack, offsets = _pack_bytes(objects)
+        self.assertLess(offsets[0], offsets[1])
+        idx = _idx_v2_entries([(tip_oid, offsets[0]), (base_oid, offsets[1])], pack)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_store(root, [("a", pack, idx)])
+            store = pin_check._ObjectStore(root)
+            self.assertEqual(store.get(tip_oid), (b"blob", base + suffix))
+
+    def test_ofs_delta_ignores_a_poison_ref_base_in_an_earlier_pack(self) -> None:
+        """An OFS delta uses the base at its offset, not a same-named poison REF."""
+        base = b"base-bytes"
+        suffix = b"-TAIL"
+        poison = b"BASE-BYTES"
+        self.assertEqual(len(poison), len(base))
+        base_oid = _content_oid(base)
+        tip_oid = _content_oid(base + suffix)
+        delta = _append_delta(base, suffix)
+        bad = _single_blob_pack(poison)
+        bad_idx = _idx_v2_one(base_oid, 12, bad)
+        base_obj = _blob_obj(base)
+        # Placeholder so the relative offset can be computed after both sizes are known.
+        relative = len(base_obj)
+        ofs = _ofs_obj(relative, delta)
+        pack, offsets = _pack_bytes([base_obj, ofs])
+        self.assertEqual(offsets[1] - offsets[0], relative)
+        idx = _idx_v2_entries([(base_oid, offsets[0]), (tip_oid, offsets[1])], pack)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_store(root, [("a", bad, bad_idx), ("b", pack, idx)])
+            store = pin_check._ObjectStore(root)
+            self.assertEqual(store.packs[0].offset(base_oid), 12)
+            self.assertEqual(store.get(tip_oid), (b"blob", base + suffix))
+
+    def test_corrupt_loose_base_falls_through_to_the_packed_base(self) -> None:
+        """A loose base that will not inflate does not hide the packed base."""
+        base = b"base-bytes"
+        suffix = b"-TAIL"
+        base_oid = _content_oid(base)
+        tip_oid = _content_oid(base + suffix)
+        objects = [_ref_obj(base_oid, _append_delta(base, suffix)), _blob_obj(base)]
+        pack, offsets = _pack_bytes(objects)
+        idx = _idx_v2_entries([(tip_oid, offsets[0]), (base_oid, offsets[1])], pack)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_store(root, [("a", pack, idx)])
+            _write_loose(root, base_oid, base)
+            loose = root / base_oid.hex()[:2] / base_oid.hex()[2:]
+            loose.write_bytes(b"this is not a zlib stream")
+            store = pin_check._ObjectStore(root)
+            self.assertEqual(store.get(tip_oid), (b"blob", base + suffix))
 
 
 if __name__ == "__main__":

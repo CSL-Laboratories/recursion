@@ -76,6 +76,48 @@ class _ObjectMissing(Exception):
         self.message = message
 
 
+class _DeltaCycle(_ObjectMissing):
+    """This path refers to an object already being resolved.
+
+    That is a property of the path, not a reason to remember the oid as
+    missing. The message matches the depth cap so callers see one refusal.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("delta chain is too deep")
+
+
+class _DeltaTooDeep(_ObjectMissing):
+    """The chain, counting this base, is deeper than git's pack.depth maximum."""
+
+    def __init__(self) -> None:
+        super().__init__("delta chain is too deep")
+
+
+class _HashMismatch(_ObjectMissing):
+    """These bytes inflate, but they are not the object named by this oid."""
+
+
+class _DeltaMemo:
+    """Results remembered for the duration of one ``get`` call.
+
+    A base oid is stored only when the outcome does not depend on an object
+    still on the current path. A cycle is not a stored miss. Each pack
+    offset is inflated at most once, and an offset that failed for a reason
+    other than a cycle or the depth cap is not expanded again.
+    """
+
+    def __init__(self) -> None:
+        self.oid_ok: dict[bytes, tuple[bytes, bytes]] = {}
+        self.oid_fail: dict[bytes, _ObjectMissing] = {}
+        self.cycle_block: set[bytes] = set()
+        self.inflight: set[bytes] = set()
+        self.off_ok: dict[tuple[int, int], tuple[bytes, bytes]] = {}
+        self.off_fail: dict[tuple[int, int], _ObjectMissing] = {}
+        self.off_raw: dict[tuple[int, int], tuple[int, bytes, int | bytes]] = {}
+        self.rejected: dict[tuple[bytes, int, int], _HashMismatch] = {}
+
+
 class _LooseUnusable(_ObjectMissing):
     """A loose file is present, but it is not a usable copy of its object name."""
 
@@ -753,6 +795,7 @@ class _ObjectStore:
         self.objects = objects
         self.packs = _load_packs(objects / "pack", objects)
         self.cache: dict[bytes, tuple[bytes, bytes]] = {}
+        self._memo: _DeltaMemo | None = None
 
     def get(self, oid: bytes) -> tuple[bytes, bytes]:
         cached = self.cache.get(oid)
@@ -770,30 +813,39 @@ class _ObjectStore:
             return loose
         # The first pack that names this oid may not hash to it. Try each later
         # copy and keep only bytes that verify. Unreadable copies are skipped the
-        # same way; nothing is cached until the hash matches.
-        pack_error: _ObjectMissing | None = None
-        for pack in self.packs:
-            offset = pack.offset(oid)
-            if offset is None:
-                continue
-            try:
-                typ, content = self._resolve(pack, offset)
-                self._verify(oid, typ, content)
-            except _ObjectMissing as exc:
-                pack_error = exc
-                continue
-            self.cache[oid] = (typ, content)
-            return typ, content
-        if pack_error is not None:
-            raise pack_error
-        if loose_error is not None:
-            raise loose_error
-        raise _ObjectMissing(oid.hex())
+        # same way; nothing is cached until the hash matches. The memo is shared
+        # by every copy tried for this call, so a failed base is not re-walked.
+        # This oid stays in flight so a REF chain back to it is a cycle for this
+        # branch, not a stored miss that would hide a later real copy.
+        memo = _DeltaMemo()
+        self._memo = memo
+        memo.inflight.add(oid)
+        try:
+            pack_error: _ObjectMissing | None = None
+            for pack in self.packs:
+                offset = pack.offset(oid)
+                if offset is None:
+                    continue
+                try:
+                    typ, content = self._resolve(pack, offset)
+                    self._verify(oid, typ, content)
+                except _ObjectMissing as exc:
+                    pack_error = exc
+                    continue
+                self.cache[oid] = (typ, content)
+                return typ, content
+            if pack_error is not None:
+                raise pack_error
+            if loose_error is not None:
+                raise loose_error
+            raise _ObjectMissing(oid.hex())
+        finally:
+            self._memo = None
 
     def _verify(self, oid: bytes, typ: bytes, content: bytes) -> None:
         header = typ + b" " + str(len(content)).encode("ascii") + b"\0"
         if hashlib.sha1(header + content).digest() != oid:
-            raise _ObjectMissing(f"object {oid.hex()} does not match its bytes")
+            raise _HashMismatch(f"object {oid.hex()} does not match its bytes")
 
     def _loose(self, oid: bytes) -> tuple[bytes, bytes] | None:
         """Return a valid loose object.
@@ -817,11 +869,31 @@ class _ObjectStore:
         """Resolve one pack object, following deltas iteratively.
 
         Visited pack offsets stop a self-delta or a loop without walking the
-        depth cap. The cap is git's ``pack.depth`` maximum. A REF base uses the
-        same rule as ``get``: the loose object, then each pack copy, keeping the
-        first copy whose bytes hash to that oid. A copy that does not hash is
-        skipped and is not cached.
+        depth cap. The cap is git's ``pack.depth`` maximum. It is checked
+        again after each delta, so a loose or cached leaf counts the same as
+        a packed one: 4095 deltas resolve and 4096 are refused. A REF base
+        uses the same rule as ``get``: the loose object, then each pack copy,
+        keeping the first copy whose bytes hash to that oid. A copy that does
+        not hash is skipped and is not cached.
+
+        For this ``get``, each base oid is resolved at most once and each pack
+        offset is inflated at most once. A failure is remembered when it does
+        not depend on an oid still on the current path. A cycle is only for
+        this branch.
         """
+        # Tests build a store with ``__new__`` and call ``_resolve`` directly.
+        own_memo = getattr(self, "_memo", None) is None
+        if own_memo:
+            self._memo = _DeltaMemo()
+        memo = self._memo
+        assert memo is not None
+        try:
+            return self._resolve_memo(pack, offset, memo)
+        finally:
+            if own_memo:
+                self._memo = None
+
+    def _resolve_memo(self, pack: _PackIndex, offset: int, memo: _DeltaMemo) -> tuple[bytes, bytes]:
         seen: set[tuple[int, int]] = set()
         trail: list[tuple[int, int]] = []
 
@@ -829,18 +901,39 @@ class _ObjectStore:
             while len(trail) > to:
                 seen.remove(trail.pop())
 
+        def release(dying: dict) -> None:
+            if dying.get("holds_inflight"):
+                memo.inflight.discard(dying["base_oid"])
+                dying["holds_inflight"] = False
+
+        def note(target: dict, exc: _ObjectMissing) -> None:
+            target["error"] = exc
+            if isinstance(exc, _DeltaCycle):
+                target["cycle_blocked"] = True
+            elif isinstance(exc, _DeltaTooDeep):
+                target["depth_blocked"] = True
+            else:
+                target["hard_error"] = exc
+
         def fail(exc: _ObjectMissing) -> None:
-            undo(frames[-1]["trail_at"])
+            dying = frames[-1]
+            release(dying)
+            root = dying.get("root_marker")
+            if root is not None and not isinstance(exc, (_DeltaCycle, _DeltaTooDeep, _HashMismatch)):
+                memo.off_fail.setdefault(root, exc)
+            if isinstance(exc, _HashMismatch) and dying.get("expect") is not None and root is not None:
+                memo.rejected[(dying["expect"], root[0], root[1])] = exc
+            undo(dying["trail_at"])
             if len(frames) == 1:
                 raise exc
-            frames[-2]["error"] = exc
+            note(frames[-2], exc)
             frames.pop()
 
-        frames: list[dict] = [
-            {
-                "pack": pack,
-                "offset": offset,
-                "depth": 0,
+        def new_frame(obj_pack: _PackIndex, obj_offset: int, depth: int, trail_at: int, expect: bytes | None) -> dict:
+            return {
+                "pack": obj_pack,
+                "offset": obj_offset,
+                "depth": depth,
                 "deltas": [],
                 "typ": b"",
                 "content": b"",
@@ -848,22 +941,51 @@ class _ObjectStore:
                 "base_oid": b"",
                 "cursor": 0,
                 "error": None,
-                "trail_at": 0,
-                "expect": None,
+                "trail_at": trail_at,
+                "expect": expect,
+                "root_marker": (id(obj_pack), obj_offset),
+                "hard_error": None,
+                "cycle_blocked": False,
+                "depth_blocked": False,
+                "lookup_started": False,
+                "holds_inflight": False,
             }
-        ]
+
+        def finish_base(target: dict, typ: bytes, content: bytes) -> None:
+            oid = target["base_oid"]
+            resolved = (typ, content)
+            self.cache[oid] = resolved
+            memo.oid_ok[oid] = resolved
+            release(target)
+            target["typ"] = typ
+            target["content"] = content
+            target["mode"] = "apply"
+
+        frames: list[dict] = [new_frame(pack, offset, 0, 0, None)]
         while True:
             frame = frames[-1]
             if frame["mode"] == "walk":
                 try:
                     if frame["depth"] > _MAX_DELTA_DEPTH:
-                        raise _ObjectMissing("delta chain is too deep")
+                        raise _DeltaTooDeep()
                     marker = (id(frame["pack"]), frame["offset"])
+                    failed = memo.off_fail.get(marker)
+                    if failed is not None:
+                        raise failed
+                    resolved = memo.off_ok.get(marker)
+                    if resolved is not None:
+                        frame["typ"], frame["content"] = resolved
+                        frame["mode"] = "apply"
+                        continue
                     if marker in seen:
-                        raise _ObjectMissing("delta chain is too deep")
+                        raise _DeltaCycle()
                     seen.add(marker)
                     trail.append(marker)
-                    obj_type, payload, extra = _pack_object_at(frame["pack"].pack, frame["offset"])
+                    raw = memo.off_raw.get(marker)
+                    if raw is None:
+                        raw = _pack_object_at(frame["pack"].pack, frame["offset"])
+                        memo.off_raw[marker] = raw
+                    obj_type, payload, extra = raw
                     if obj_type in _OBJ_TYPE:
                         frame["typ"] = _OBJ_TYPE[obj_type]
                         frame["content"] = payload
@@ -871,12 +993,16 @@ class _ObjectStore:
                         continue
                     frame["deltas"].append(payload)
                     frame["depth"] += 1
+                    # The base is one more step. Check before a loose, cached,
+                    # or packed leaf so 4096 is refused on every path.
+                    if frame["depth"] > _MAX_DELTA_DEPTH:
+                        raise _DeltaTooDeep()
                     if obj_type == 6:
                         if not isinstance(extra, int):
                             raise _ObjectMissing("ofs-delta base is invalid")
                         base_marker = (id(frame["pack"]), extra)
                         if base_marker in seen:
-                            raise _ObjectMissing("delta chain is too deep")
+                            raise _DeltaCycle()
                         if extra < 12 or extra >= frame["offset"] or extra >= len(frame["pack"].pack) - 20:
                             raise _ObjectMissing("ofs-delta base is invalid")
                         frame["offset"] = extra
@@ -891,6 +1017,10 @@ class _ObjectStore:
                     frame["base_oid"] = extra
                     frame["cursor"] = 0
                     frame["error"] = None
+                    frame["hard_error"] = None
+                    frame["cycle_blocked"] = False
+                    frame["depth_blocked"] = False
+                    frame["lookup_started"] = False
                     frame["mode"] = "search"
                 except _ObjectMissing as exc:
                     fail(exc)
@@ -899,51 +1029,88 @@ class _ObjectStore:
                 # The base object itself is one more step. Past the cap, every
                 # copy is too deep, so do not scan the rest of the packs.
                 if frame["depth"] > _MAX_DELTA_DEPTH:
-                    fail(_ObjectMissing("delta chain is too deep"))
+                    fail(_DeltaTooDeep())
                     continue
+                if not frame["lookup_started"]:
+                    frame["lookup_started"] = True
+                    oid = frame["base_oid"]
+                    cached = self.cache.get(oid) or memo.oid_ok.get(oid)
+                    if cached is not None:
+                        finish_base(frame, cached[0], cached[1])
+                        continue
+                    missed = memo.oid_fail.get(oid)
+                    if missed is not None:
+                        fail(missed)
+                        continue
+                    if oid in memo.inflight or oid in memo.cycle_block:
+                        fail(_DeltaCycle())
+                        continue
+                    memo.inflight.add(oid)
+                    frame["holds_inflight"] = True
                 pushed = False
-                while frame["cursor"] < len(self.packs):
+                while frame["cursor"] < len(self.packs) and frame["mode"] == "search":
                     cand = self.packs[frame["cursor"]]
                     frame["cursor"] += 1
                     off = cand.offset(frame["base_oid"])
                     if off is None:
                         continue
-                    if (id(cand), off) in seen:
-                        frame["error"] = _ObjectMissing("delta chain is too deep")
+                    marker = (id(cand), off)
+                    failed = memo.off_fail.get(marker)
+                    if failed is not None:
+                        note(frame, failed)
                         continue
-                    frames.append(
-                        {
-                            "pack": cand,
-                            "offset": off,
-                            "depth": frame["depth"],
-                            "deltas": [],
-                            "typ": b"",
-                            "content": b"",
-                            "mode": "walk",
-                            "base_oid": b"",
-                            "cursor": 0,
-                            "error": None,
-                            "trail_at": len(trail),
-                            "expect": frame["base_oid"],
-                        }
-                    )
+                    rejected = memo.rejected.get((frame["base_oid"], marker[0], marker[1]))
+                    if rejected is not None:
+                        note(frame, rejected)
+                        continue
+                    if marker in seen:
+                        note(frame, _DeltaCycle())
+                        continue
+                    resolved = memo.off_ok.get(marker)
+                    if resolved is not None:
+                        try:
+                            self._verify(frame["base_oid"], resolved[0], resolved[1])
+                        except _HashMismatch as exc:
+                            memo.rejected[(frame["base_oid"], marker[0], marker[1])] = exc
+                            note(frame, exc)
+                            continue
+                        finish_base(frame, resolved[0], resolved[1])
+                        break
+                    frames.append(new_frame(cand, off, frame["depth"], len(trail), frame["base_oid"]))
                     pushed = True
                     break
-                if pushed:
+                if frame["mode"] == "apply" or pushed:
                     continue
-                exc = frame["error"]
-                if exc is None:
-                    exc = _ObjectMissing(frame["base_oid"].hex())
-                fail(exc)
+                oid = frame["base_oid"]
+                if frame["cycle_blocked"]:
+                    # Every usable copy ran into an oid still on this path.
+                    # Remember that so the next parent does not walk them again,
+                    # without recording the oid as missing.
+                    memo.cycle_block.add(oid)
+                    fail(_DeltaCycle())
+                elif frame["depth_blocked"]:
+                    # A copy was only too deep from here. A shallower chain may
+                    # still resolve it, so this is not a stored miss.
+                    fail(frame["hard_error"] or _DeltaTooDeep())
+                else:
+                    exc = frame["hard_error"] or frame["error"] or _ObjectMissing(oid.hex())
+                    if not isinstance(exc, (_DeltaCycle, _DeltaTooDeep)):
+                        memo.oid_fail[oid] = exc
+                    fail(exc)
                 continue
             content = frame["content"]
             try:
                 for delta in reversed(frame["deltas"]):
                     content = _apply_delta(content, delta)
+                root = frame.get("root_marker")
+                if root is not None:
+                    memo.off_ok[root] = (frame["typ"], content)
                 expect = frame["expect"]
                 if expect is not None:
                     self._verify(expect, frame["typ"], content)
-                    self.cache[expect] = (frame["typ"], content)
+                    resolved = (frame["typ"], content)
+                    self.cache[expect] = resolved
+                    memo.oid_ok[expect] = resolved
             except _ObjectMissing as exc:
                 fail(exc)
                 continue
@@ -951,6 +1118,7 @@ class _ObjectStore:
             if len(frames) == 1:
                 return frame["typ"], content
             parent = frames[-2]
+            release(parent)
             parent["typ"] = frame["typ"]
             parent["content"] = content
             parent["mode"] = "apply"
@@ -960,6 +1128,11 @@ class _ObjectStore:
         cached = self.cache.get(oid)
         if cached is not None:
             return cached
+        memo = getattr(self, "_memo", None)
+        if memo is not None:
+            found = memo.oid_ok.get(oid)
+            if found is not None:
+                return found
         try:
             loose = self._loose(oid)
         except _LooseUnusable:
@@ -968,6 +1141,8 @@ class _ObjectStore:
             return None
         self._verify(oid, loose[0], loose[1])
         self.cache[oid] = loose
+        if memo is not None:
+            memo.oid_ok[oid] = loose
         return loose
 
 

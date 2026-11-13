@@ -14,6 +14,8 @@ undone inside connect, and a reap of dead sockets the quarantine generator
 cannot name, failed on a4c6d121.
 A recheck that trusts a non-procfs ``/proc/self/fd`` and unlinks a live
 listener, failed on 57bacd18.
+A procfs fd entry that names a different socket, including another pid's
+fd directory bind-mounted on ``/proc/<pid>/fd``, failed on 881a32e2.
 """
 
 from __future__ import annotations
@@ -22,9 +24,13 @@ import builtins
 import errno
 import io
 import os
+import shutil
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -2227,11 +2233,14 @@ def _proc_inode_fd(addr: object) -> str | None:
 
 @unittest.skipUnless(LINUX, "Linux is the tested path")
 class ProcFsGuardTests(_TmpCase):
-    """``/proc/self/fd`` is trusted only when it is procfs.
+    """``/proc/self/fd`` is trusted only when it is this process's procfs.
 
     Each case failed on 57bacd18: a directory at that path was enough, so a
     tmpfs stand-in full of dead sockets made the recheck return
     ``ECONNREFUSED`` and ``start`` unlinked a live listener.
+    A symlink to a different socket, and another pid's fd directory mounted
+    on this one, failed on 881a32e2: procfs magic and a symlink entry were
+    enough, and ``start`` replaced the live listener.
     """
 
     def _patch(self, name: str, value: object) -> None:
@@ -2431,6 +2440,336 @@ class ProcFsGuardTests(_TmpCase):
         self._patch("_proc_fd_dir", lambda: fake)
         for _ in range(8):
             once()
+
+    def test_fd_symlink_to_another_socket_does_not_unlink_a_live_listener(self) -> None:
+        """A proc stand-in whose entry names another socket must not unlink.
+
+        No mount: ``_proc_fd_dir`` is a directory of symlinks to a second
+        bound socket, and ``fstatfs`` is reported as procfs so the magic
+        check is not what refuses. Failed on 881a32e2: that symlink was
+        enough, connect returned ``ECONNREFUSED``, and ``start`` replaced
+        the live listener.
+        """
+        os.mkdir(self.sock_dir, 0o700)
+        public = os.path.join(self.sock_dir, "control.sock")
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(live.close)
+        live.bind(public)
+        live.listen(1)
+        live_ino = os.lstat(public).st_ino
+        dead_path = os.path.join(self.base, "dead.sock")
+        _bind_dead_named(self.base, ["dead.sock"])
+        self.assertNotEqual(os.lstat(dead_path).st_ino, live_ino)
+        fake = os.path.join(self.base, "procfd")
+        os.mkdir(fake, 0o700)
+        highest = 64
+        for name in os.listdir("/proc/self/fd"):
+            if name.isdigit():
+                highest = max(highest, int(name))
+        for number in range(highest + 128):
+            os.symlink(dead_path, os.path.join(fake, str(number)))
+        self._patch("_proc_fd_dir", lambda: fake)
+        self._patch("_fstatfs_type", lambda _fd: unix._PROC_SUPER_MAGIC)
+        swaps = {"n": 0}
+        orig = socket.socket.connect
+
+        def fake_connect(sock: socket.socket, addr: object) -> None:
+            aside = None
+            if addr == public and os.path.lexists(public) and not os.path.islink(public):
+                aside = public + ".aside"
+                os.rename(public, aside)
+                os.symlink(dead_path, public)
+                swaps["n"] += 1
+            try:
+                orig(sock, addr)
+            finally:
+                if aside is not None and addr == public:
+                    if os.path.islink(public):
+                        os.unlink(public)
+                    if os.path.lexists(aside) and not os.path.lexists(public):
+                        os.rename(aside, public)
+
+        socket.socket.connect = fake_connect  # type: ignore[method-assign]
+        self.addCleanup(setattr, socket.socket, "connect", orig)
+        before = _fd_target_counts()
+        pins = set(unix._PIN_FDS)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        started = False
+        exc: BaseException | None = None
+        try:
+            try:
+                srv.start()
+                started = True
+            except BaseException as err:  # noqa: BLE001 - the assertion names the type
+                exc = err
+        finally:
+            socket.socket.connect = orig  # type: ignore[method-assign]
+        self.assertGreaterEqual(swaps["n"], 1)
+        self.assertFalse(started, (exc, os.listdir(self.sock_dir)))
+        self.assertIsInstance(exc, ct.InsecureSocketPath)
+        self.assertIn("Left in place", str(exc))
+        self.assertIsNone(srv._sock)
+        self.assertEqual(_fd_target_counts(), before)
+        self.assertEqual(set(unix._PIN_FDS), pins)
+        listed = os.lstat(public)
+        self.assertEqual(listed.st_ino, live_ino)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertFalse(stat.S_ISLNK(listed.st_mode))
+        self.assertEqual([entry for entry in os.listdir(self.sock_dir) if entry.startswith(".")], [])
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        live.settimeout(2)
+        client.connect(public)
+        conn, _ = live.accept()
+        conn.close()
+
+    def test_proc_identity_emfile_propagates_and_leaves_the_socket(self) -> None:
+        """``EMFILE`` while identifying the fd directory is not a stale socket.
+
+        Failed on 881a32e2: nothing opened ``..`` from the proc directory, so
+        this ``os.open`` error never fired and ``start`` removed the socket.
+        """
+        path, inode = self._stale()
+        real_open = os.open
+
+        def fail_parent(file: object, flags: int, *args: object, **kwargs: object) -> int:
+            if file == "..":
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_open(file, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        os.open = fail_parent  # type: ignore[method-assign]
+        self.addCleanup(setattr, os, "open", real_open)
+        before = _fd_target_counts()
+        pins = set(unix._PIN_FDS)
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        try:
+            with self.assertRaises(OSError) as caught:
+                srv.start()
+            self.assertEqual(caught.exception.errno, errno.EMFILE)
+        finally:
+            os.open = real_open  # type: ignore[method-assign]
+        self.assertIsNone(srv._sock)
+        self.assertEqual(_fd_target_counts(), before)
+        self.assertEqual(set(unix._PIN_FDS), pins)
+        listed = os.lstat(path)
+        self.assertEqual(listed.st_ino, inode)
+        self.assertTrue(stat.S_ISSOCK(listed.st_mode))
+        self.assertEqual([entry for entry in os.listdir(self.sock_dir) if entry.startswith(".")], [])
+
+    def test_mounted_foreign_fd_directory_does_not_unlink_a_live_listener(self) -> None:
+        """Another pid's procfs fd directory mounted on ours must not unlink.
+
+        ``unshare -Ur -m`` bind-mounts a helper's ``/proc/<pid>/fd`` onto
+        this process's fd directory. Magic, the path and a procfs symlink
+        all pass, and ``..`` is still this pid. Failed on 881a32e2:
+        connect hit the helper's socket and ``start`` replaced the listener.
+        Skipped when user namespaces are unavailable.
+        """
+        binary = _unshare_user_mount()
+        if binary is None:
+            self.skipTest("unshare -Ur -m unavailable")
+        env = dict(os.environ)
+        core_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        previous = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = core_root + (os.pathsep + previous if previous else "")
+        result = subprocess.run(
+            [binary, "-Ur", "-m", sys.executable, "-B", "-c", _FOREIGN_FD_MOUNT],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            "stdout:\n" + result.stdout + "\nstderr:\n" + result.stderr,
+        )
+        self.assertIn("Left in place", result.stdout)
+        self.assertIn("intact", result.stdout)
+
+
+def _unshare_user_mount() -> str | None:
+    """``unshare`` when ``unshare -Ur -m`` runs, else None."""
+    binary = shutil.which("unshare")
+    if not binary:
+        return None
+    try:
+        probe = subprocess.run(
+            [binary, "-Ur", "-m", "true"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0:
+        return None
+    return binary
+
+
+_FOREIGN_FD_MOUNT = textwrap.dedent(
+    r"""
+    import ctypes
+    import os
+    import signal
+    import socket
+    import stat
+    import sys
+    import tempfile
+
+    from recursion_core import control_transport as ct
+    from recursion_core.control_transport import unix
+    from recursion_core.control_transport.unix import UnixControlServer
+
+    def main() -> int:
+        base = tempfile.mkdtemp(prefix="ct-foreign-fd-", dir="/tmp")
+        os.chmod(base, 0o700)
+        sock_dir = os.path.join(base, "run")
+        os.mkdir(sock_dir, 0o700)
+        public = os.path.join(sock_dir, "control.sock")
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        live.bind(public)
+        live.listen(1)
+        live_ino = os.lstat(public).st_ino
+        dead_path = os.path.join(base, "dead.sock")
+        ready_r, ready_w = os.pipe()
+        helper = os.fork()
+        if helper == 0:
+            os.close(ready_r)
+            held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            held.bind(dead_path)
+            covered = 0
+            for number in range(3, 1024):
+                if number in (held.fileno(), ready_w):
+                    continue
+                try:
+                    os.dup2(held.fileno(), number)
+                except OSError:
+                    break
+                covered += 1
+            os.write(ready_w, b"1" if covered >= 64 else b"0")
+            if covered < 64:
+                os.close(ready_w)
+                os._exit(2)
+            # The pipe fd must also name the dead socket. Stop only after that.
+            os.dup2(held.fileno(), ready_w)
+            os.kill(os.getpid(), signal.SIGSTOP)
+            os._exit(0)
+        os.close(ready_w)
+        try:
+            got = os.read(ready_r, 1)
+            os.close(ready_r)
+            if got != b"1":
+                print("helper did not cover fds")
+                return 2
+            _pid, status = os.waitpid(helper, os.WUNTRACED)
+            if not os.WIFSTOPPED(status):
+                print("helper was not stopped", status)
+                return 2
+            foreign = "/proc/%d/fd/10" % helper
+            link = os.readlink(foreign)
+            if not link.startswith("socket:"):
+                print("helper fd is", link)
+                return 2
+            self_fd = "/proc/%d/fd" % os.getpid()
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.mount.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+            ]
+            libc.mount.restype = ctypes.c_int
+            rc = libc.mount(("/proc/%d/fd" % helper).encode(), self_fd.encode(), None, 4096, None)
+            if rc != 0:
+                err = ctypes.get_errno()
+                print("mount failed", err, os.strerror(err))
+                return 2
+            orig = socket.socket.connect
+            swaps = {"n": 0}
+
+            def fake_connect(sock, addr):
+                aside = None
+                if addr == public and os.path.lexists(public) and not os.path.islink(public):
+                    aside = public + ".aside"
+                    os.rename(public, aside)
+                    os.symlink(dead_path, public)
+                    swaps["n"] += 1
+                try:
+                    return orig(sock, addr)
+                finally:
+                    if aside is not None and addr == public:
+                        if os.path.islink(public):
+                            os.unlink(public)
+                        if os.path.lexists(aside) and not os.path.lexists(public):
+                            os.rename(aside, public)
+
+            socket.socket.connect = fake_connect
+            pins = set(unix._PIN_FDS)
+            srv = UnixControlServer(sock_dir, ct.with_ping_health())
+            started = False
+            exc = None
+            try:
+                try:
+                    srv.start()
+                    started = True
+                except BaseException as err:
+                    exc = err
+            finally:
+                socket.socket.connect = orig
+            print("swaps", swaps["n"])
+            print("started", started)
+            print("exc", type(exc).__name__ if exc else None, exc)
+            print("pins", set(unix._PIN_FDS) == pins, sorted(unix._PIN_FDS))
+            listed = os.lstat(public)
+            same = (
+                listed.st_ino == live_ino
+                and stat.S_ISSOCK(listed.st_mode)
+                and not stat.S_ISLNK(listed.st_mode)
+            )
+            hidden = [entry for entry in os.listdir(sock_dir) if entry.startswith(".")]
+            print("same", same, "hidden", hidden)
+            ok = (
+                swaps["n"] >= 1
+                and not started
+                and exc is not None
+                and type(exc) is ct.InsecureSocketPath
+                and "Left in place" in str(exc)
+                and srv._sock is None
+                and set(unix._PIN_FDS) == pins
+                and same
+                and hidden == []
+            )
+            if ok:
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(2)
+                live.settimeout(2)
+                client.connect(public)
+                conn, _ = live.accept()
+                conn.close()
+                client.close()
+                print("intact")
+            srv.close()
+            live.close()
+            return 0 if ok else 1
+        finally:
+            try:
+                os.kill(helper, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.waitpid(helper, 0)
+            except OSError:
+                pass
+
+    sys.exit(main())
+    """
+)
 
 
 if __name__ == "__main__":

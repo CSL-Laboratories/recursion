@@ -196,6 +196,63 @@ class Adv2HungPluginTests(GuiCase):
                     reader.join(10)
         self.assertEqual(fake.call.stops, [{'run_id': 'run-2'}])
 
+    def test_evicted_buffered_connections_cannot_bypass_max_request_threads(self):
+        import socket
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        lock = threading.Lock()
+        active = [0]
+        peak = [0]
+
+        class CountingHost:
+            def operator(self, command):
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                gate.wait(10)
+                with lock:
+                    active[0] -= 1
+                return 200, {'status_code': 'ok', 'result': {}}
+
+        _, transport = control_over(CountingHost())
+        total = daemon_gui.MAX_REQUEST_THREADS + 6
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            port = gui.address[1]
+            orig = gui.server.headers_read
+            seen = [0]
+            arrived = threading.Event()
+
+            def sync_headers(req, method, path):
+                with lock:
+                    seen[0] += 1
+                    if seen[0] >= total:
+                        arrived.set()
+                arrived.wait(2.0)
+                return orig(req, method, path)
+
+            gui.server.headers_read = sync_headers
+            threads = []
+            for _ in range(total):
+                def hit():
+                    try:
+                        s = socket.create_connection(('127.0.0.1', port), timeout=5)
+                        s.sendall(f'GET /read?command={READ} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n'.encode())
+                        s.recv(4096)
+                        s.close()
+                    except OSError:
+                        pass
+                t = threading.Thread(target=hit, daemon=True)
+                t.start()
+                threads.append(t)
+                time.sleep(0.01)
+            self.wait_for(lambda: seen[0] >= total, seconds=3)
+            time.sleep(0.2)
+            observed_peak = peak[0]
+            gate.set()
+            for t in threads:
+                t.join(5)
+        self.assertLessEqual(observed_peak, daemon_gui.MAX_REQUEST_THREADS)
+
     def _read_quietly(self, gui):
         try:
             self.get(gui, '/read?command=' + READ, timeout=40)

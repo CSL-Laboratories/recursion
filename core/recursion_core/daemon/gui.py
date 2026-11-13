@@ -152,7 +152,7 @@ class _Server(ThreadingMixIn, WSGIServer):
         stop = (method, path.split("?", 1)[0]) == ("POST", "/stop")
         with self._gate:
             if request not in self._reading:
-                return True  # evicted: its next read fails and the thread leaves
+                return False  # evicted: never dispatch a buffered GET/POST past the thread cap
             limit = MAX_REQUEST_THREADS + STOP_RESERVED_THREADS if stop else MAX_REQUEST_THREADS
             if len(self._working) >= limit:
                 return False

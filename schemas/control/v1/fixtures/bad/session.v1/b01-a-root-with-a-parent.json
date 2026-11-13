@@ -1,0 +1,29 @@
+{
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "tenant": "t1",
+  "principal": {
+    "kind": "owner",
+    "id": "local"
+  },
+  "parent_session_id": "ses-2c4e6a8b0d1f3a5c",
+  "spawn_kind": "root",
+  "state": "idle",
+  "workspace": {
+    "path": "/home/dev/projects/atlas",
+    "mode": "direct",
+    "base_ref": null,
+    "worktree_path": null
+  },
+  "route": {
+    "engine": "claude_code",
+    "model": "claude-sonnet-5-5",
+    "connection": "subscription:personal-max"
+  },
+  "engine_session_id": null,
+  "worker": null,
+  "active_turn_id": null,
+  "turns": [],
+  "budget": null,
+  "revision": 1,
+  "created_at": "2026-11-13T07:30:00.000Z"
+}

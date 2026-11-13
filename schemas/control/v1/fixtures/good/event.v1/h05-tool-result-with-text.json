@@ -1,0 +1,19 @@
+{
+  "seq": 5,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:05.185Z",
+  "type": "tool.result",
+  "source": "engine",
+  "trust": "untrusted",
+  "payload": {
+    "call_id": "toolu_01H8",
+    "status": "ok",
+    "text": "41 passed in 3.20s\n",
+    "output_ref": null,
+    "truncated": false
+  },
+  "correlation_id": "toolu_01H8",
+  "causation_id": "4"
+}

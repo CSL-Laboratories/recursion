@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "queue.item.v1.json",
+  "title": "queue.item.v1: one queued message of a session",
+  "x-version": "1.0-draft.1",
+  "description": "PUBLIC record. A message a user queued for a session. delivery 'next_turn' sends it as the next turn once the current one ends; 'steer' sends it into the turn in progress where the driver can take input mid-turn, and otherwise interrupts and then sends. The item can be edited (queue.update) or withdrawn (queue.cancel) while its state is 'queued'; each edit raises revision. From 'delivering' on it cannot change. 'delivered' and 'cancelled' are final. An item is delivered at most once, across a daemon restart too.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["item_id", "session_id", "text", "revision", "delivery", "state", "created_at", "turn_id"],
+  "properties": {
+    "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+    "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+    "text": {"type": "string", "minLength": 1},
+    "revision": {"$ref": "common.v1.json#/$defs/revision"},
+    "delivery": {"enum": ["next_turn", "steer"]},
+    "state": {"enum": ["queued", "delivering", "delivered", "cancelled"]},
+    "created_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "turn_id": {
+      "description": "The turn the message was delivered into; null until delivery begins.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["state"], "properties": {"state": {"enum": ["queued", "cancelled"]}}},
+      "then": {"properties": {"turn_id": {"type": "null"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "delivered"}}},
+      "then": {"properties": {"turn_id": {"type": "string"}}}
+    }
+  ]
+}

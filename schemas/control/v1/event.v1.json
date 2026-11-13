@@ -1,0 +1,402 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "event.v1.json",
+  "title": "event.v1: one event of a session's log",
+  "x-version": "1.0-draft.1",
+  "description": "PUBLIC record, and the row lane EVENTS stores. Each session has one ordered, append-only log; everything a client shows comes from it. seq starts at 1 in each log and has no holes. session_id names the log: a session id, or 'run:<run_id>' for a run started without a session. run_id and turn_id are null for an event that belongs to no run or no turn. time is when the core wrote the event. source says where the event's content came from: 'core' (the daemon's own code), 'engine' (an engine's output or its typed stream), 'plugin', or 'client' (something a user or a calling program sent). trust says whether the content may be shown as the product's own words: content from an engine or a plugin is always 'untrusted', and a core event that carries engine text is 'untrusted' too. Each type has exactly one payload shape, below. Only the core writes approval.requested: a surface opens its approval state on that event and on nothing an engine printed. A number that is not known is null, never 0. A reader that meets a type it does not know keeps the envelope, shows nothing from the payload, and reads on.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["seq", "session_id", "run_id", "turn_id", "time", "type", "source", "trust", "payload"],
+  "properties": {
+    "seq": {"$ref": "common.v1.json#/$defs/seq"},
+    "session_id": {"$ref": "common.v1.json#/$defs/log_id"},
+    "run_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]},
+    "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
+    "time": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "type": {
+      "enum": [
+        "state.changed", "engine.output", "tool.call", "tool.result",
+        "approval.requested", "approval.answered", "usage", "limit", "result", "replay.gap",
+        "turn.started", "turn.ended", "steer.queued", "steer.delivered", "interrupt",
+        "stop.requested", "stop.result", "diff", "checkpoint", "fork", "route.decision"
+      ]
+    },
+    "source": {"enum": ["core", "engine", "plugin", "client"]},
+    "trust": {"enum": ["trusted", "untrusted"]},
+    "payload": {"type": "object"},
+    "causation_id": {
+      "description": "What caused this event: a command_id, or an event of the same log written as '<seq>'.",
+      "$ref": "common.v1.json#/$defs/token"
+    },
+    "correlation_id": {
+      "description": "Ties together every event of one piece of work, for example one tool call and its result.",
+      "$ref": "common.v1.json#/$defs/token"
+    },
+    "command_id": {
+      "description": "The client's id of the request that this event answers, when there is one.",
+      "$ref": "common.v1.json#/$defs/command_id"
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["source"], "properties": {"source": {"enum": ["engine", "plugin"]}}},
+      "then": {"properties": {"trust": {"const": "untrusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "state.changed"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/state.changed"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "engine.output"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/engine.output"}, "source": {"const": "engine"}, "run_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "tool.call"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/tool.call"}, "source": {"enum": ["engine", "plugin"]}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "tool.result"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/tool.result"}, "source": {"enum": ["engine", "plugin"]}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "approval.requested"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/approval.requested"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "approval.answered"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/approval.answered"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "usage"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/usage"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "limit"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/limit"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "result"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/result"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "replay.gap"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/replay.gap"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "turn.started"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/turn.started"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "turn.ended"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/turn.ended"}, "source": {"const": "core"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "steer.queued"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/steer.queued"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "steer.delivered"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/steer.delivered"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "interrupt"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/interrupt"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "stop.requested"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/stop.requested"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "stop.result"}}},
+      "then": {"properties": {"payload": {"$ref": "stop.result.v1.json"}, "source": {"const": "core"}, "trust": {"const": "trusted"}, "run_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "diff"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/diff"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "checkpoint"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/checkpoint"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "fork"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/fork"}, "source": {"const": "core"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "route.decision"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/route.decision"}, "source": {"const": "core"}, "trust": {"const": "trusted"}}}
+    }
+  ],
+  "$defs": {
+    "state_word": {
+      "type": "string",
+      "pattern": "^[a-z][a-z_]{0,31}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "code_word": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "state.changed": {
+      "description": "One record changed state. entity says which kind and entity_id which one. from is null when the record was created. registry_seq is the row number of this change in the run registry's outbox when the change came from the registry, so replay can be matched to the registry exactly; it is null for every other change.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "entity_id", "from", "to", "registry_seq"],
+      "properties": {
+        "entity": {"enum": ["run", "session", "turn", "queue_item", "approval"]},
+        "entity_id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}},
+        "from": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/state_word"}]},
+        "to": {"$ref": "#/$defs/state_word"},
+        "registry_seq": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
+    "engine.output": {
+      "description": "A span of the engine's output file, as text. offset_start and offset_end are byte offsets into that file (the end is exclusive), so a reader that restarts can resume without losing or repeating a line. Untrusted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream", "text", "offset_start", "offset_end"],
+      "properties": {
+        "stream": {"enum": ["stdout", "stderr"]},
+        "text": {"type": "string"},
+        "offset_start": {"type": "integer", "minimum": 0},
+        "offset_end": {"type": "integer", "minimum": 0}
+      }
+    },
+    "tool.call": {
+      "description": "The engine asked to use a tool. call_id is the engine's id for the call and pairs it with its tool.result. input_digest is the SHA-256 of the input in the canonical form the approval record names. input is the tool's input as the engine gave it, or null when it is not carried (too large, or withheld); its inside is the tool's own shape and is untrusted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call_id", "name", "input_digest", "input"],
+      "properties": {
+        "call_id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}},
+        "name": {"type": "string", "minLength": 1, "maxLength": 256, "not": {"pattern": "[\\r\\n]"}},
+        "input_digest": {"$ref": "common.v1.json#/$defs/sha256"},
+        "input": {"type": ["object", "null"]}
+      }
+    },
+    "tool.result": {
+      "description": "What a tool call returned. Exactly one of text and output_ref is not null: text carries the output; output_ref names where a large output was put. truncated is true when the text is shorter than what the tool produced.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call_id", "status", "text", "output_ref", "truncated"],
+      "properties": {
+        "call_id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}},
+        "status": {"enum": ["ok", "error", "denied", "cancelled"]},
+        "text": {"type": ["string", "null"]},
+        "output_ref": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/token"}]},
+        "truncated": {"type": "boolean"}
+      },
+      "oneOf": [
+        {"properties": {"text": {"type": "string"}, "output_ref": {"type": "null"}}},
+        {"properties": {"text": {"type": "null"}, "output_ref": {"type": "string"}}}
+      ]
+    },
+    "approval.requested": {
+      "description": "The core opened an approval request. The request itself is read with approval.list (approval.v1); the log carries only its id.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approval_id"],
+      "properties": {"approval_id": {"$ref": "common.v1.json#/$defs/approval_id"}}
+    },
+    "approval.answered": {
+      "description": "An approval request left 'pending'. state is what it became.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approval_id", "state"],
+      "properties": {
+        "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
+        "state": {"enum": ["approved", "denied", "expired", "vetoed"]}
+      }
+    },
+    "usage": {
+      "description": "Tokens and cost, as far as they are known. span says what the numbers cover: 'call' (one model call), 'turn' (the envelope's turn), or 'session_total' (everything the engine has counted for its session so far: a running total, which a ledger must not add to earlier events). quality: 'known' means every number given is exact; 'lower_bound' means every number given is at least that; 'unknown' means nothing is known, and then every number is null. A single number that is not reported is null. provenance says where the numbers came from: 'observed' in the engine's typed stream, 'modelled' from a price table, 'inferred' from other evidence, or 'unavailable'. Nothing is ever written as 0 because it was not known. reasoning_tokens is the part of output_tokens the engine reports as reasoning, when it reports one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connection_id", "model", "bucket", "span", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd", "quality", "provenance"],
+      "properties": {
+        "connection_id": {"$ref": "common.v1.json#/$defs/connection_id"},
+        "span": {"enum": ["call", "turn", "session_total"]},
+        "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "model": {"type": ["string", "null"], "minLength": 1},
+        "bucket": {
+          "description": "The vendor's limit bucket the call counted against, when the vendor names one.",
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cache_read_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cache_write_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0},
+        "quality": {"enum": ["known", "lower_bound", "unknown"]},
+        "provenance": {"enum": ["observed", "modelled", "inferred", "unavailable"]}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["quality"], "properties": {"quality": {"const": "unknown"}}},
+          "then": {
+            "properties": {
+              "input_tokens": {"type": "null"},
+              "output_tokens": {"type": "null"},
+              "reasoning_tokens": {"type": "null"},
+              "cache_read_tokens": {"type": "null"},
+              "cache_write_tokens": {"type": "null"},
+              "cost_usd": {"type": "null"},
+              "provenance": {"const": "unavailable"}
+            }
+          },
+          "else": {"properties": {"provenance": {"enum": ["observed", "modelled", "inferred"]}}}
+        }
+      ]
+    },
+    "limit": {
+      "description": "A limit was met. kind: 'plan_limit' is a typed limit signal from the vendor; 'short_fault' is a brief fence after quota-sounding text outside the model's output; 'spend_cap' is the user's own dollar cap. scope says whether the whole connection or one model on it is limited; model is a string exactly when scope is 'model'. reset_at is when it may clear, null when not known.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connection_id", "scope", "model", "kind", "reset_at"],
+      "properties": {
+        "connection_id": {"$ref": "common.v1.json#/$defs/connection_id"},
+        "scope": {"enum": ["connection", "model"]},
+        "model": {"type": ["string", "null"], "minLength": 1},
+        "kind": {"enum": ["plan_limit", "short_fault", "spend_cap"]},
+        "reset_at": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["scope"], "properties": {"scope": {"const": "model"}}},
+          "then": {"properties": {"model": {"type": "string"}}},
+          "else": {"properties": {"model": {"type": "null"}}}
+        }
+      ]
+    },
+    "result": {
+      "description": "A run or a turn produced its result. code is null when it succeeded and a typed code when it did not. detail may carry engine text; when it does, the event's trust is 'untrusted'.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail"],
+      "properties": {
+        "code": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/code_word"}]},
+        "detail": {"type": "string"}
+      }
+    },
+    "replay.gap": {
+      "description": "The events numbered from..to (both included) of this log cannot be given. The gap event takes the place of that span and carries the sequence number 'to', so the numbers a reader sees still have no holes. reason: 'retention' (old events were dropped by policy), 'store_reset' (the store was lost or rebuilt), 'output_lost' (a span of an engine's output file could not be read).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "reason"],
+      "properties": {
+        "from": {"$ref": "common.v1.json#/$defs/seq"},
+        "to": {"$ref": "common.v1.json#/$defs/seq"},
+        "reason": {"enum": ["retention", "store_reset", "output_lost"]}
+      }
+    },
+    "turn.started": {
+      "description": "A turn began. index is its place in the session (from 0). text is the input as it was sent to the engine.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "text"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "text": {"type": "string"}
+      }
+    },
+    "turn.ended": {
+      "description": "A turn reached a final state. code is null unless it failed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "code"],
+      "properties": {
+        "state": {"enum": ["ended", "interrupted", "failed", "stopped"]},
+        "code": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/code_word"}]}
+      }
+    },
+    "steer.queued": {
+      "description": "A message was queued, edited or withdrawn. The message itself is the queue item (queue.item.v1), read with the session; the log carries its id, how it is to be delivered, and the item's revision after this change.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "delivery", "revision", "state"],
+      "properties": {
+        "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+        "delivery": {"enum": ["next_turn", "steer"]},
+        "revision": {"$ref": "common.v1.json#/$defs/revision"},
+        "state": {"enum": ["queued", "cancelled"]}
+      }
+    },
+    "steer.delivered": {
+      "description": "A queued message reached the engine. how: 'mid_turn' (sent into the turn in progress), 'interrupt_then_send' (the turn was interrupted and the message sent after it), 'next_turn' (sent as a new turn after the previous one ended). The envelope's turn_id is the turn it went into.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "how"],
+      "properties": {
+        "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+        "how": {"enum": ["mid_turn", "interrupt_then_send", "next_turn"]}
+      }
+    },
+    "interrupt": {
+      "description": "An interrupt of the envelope's turn. phase: 'requested', then 'delivered' or 'failed'. how: 'driver_cancel' (the driver's own cancel), 'run_stop' (the run was stopped because the driver has no cancel), null while it is only requested.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "how"],
+      "properties": {
+        "phase": {"enum": ["requested", "delivered", "failed"]},
+        "how": {"enum": ["driver_cancel", "run_stop", null]}
+      }
+    },
+    "stop.requested": {
+      "description": "A Stop was asked. scope: 'run' (run.stop on one run), 'self' (session.stop on this session), 'subtree' (this session and every session it started). principal is who asked; null when the daemon's own recovery asked.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "principal"],
+      "properties": {
+        "scope": {"enum": ["run", "self", "subtree"]},
+        "principal": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/principal"}]}
+      }
+    },
+    "diff": {
+      "description": "The workspace changed. The counts are of the change since base_ref; the text of the diff is read with workspace.diff. truncated is true when the counts stopped at a limit.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_ref", "files_changed", "insertions", "deletions", "truncated"],
+      "properties": {
+        "base_ref": {"type": ["string", "null"], "minLength": 1},
+        "files_changed": {"type": "integer", "minimum": 0},
+        "insertions": {"type": "integer", "minimum": 0},
+        "deletions": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "checkpoint": {
+      "description": "A checkpoint of the workspace was taken. ref is the git ref or commit that holds it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkpoint_id", "ref", "label"],
+      "properties": {
+        "checkpoint_id": {"$ref": "common.v1.json#/$defs/token"},
+        "ref": {"type": "string", "minLength": 1, "maxLength": 256, "not": {"pattern": "[\\r\\n]"}},
+        "label": {"type": ["string", "null"]}
+      }
+    },
+    "fork": {
+      "description": "A new session was forked from this one. at_turn_id is the turn it was forked at; null means the session's latest state.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["child_session_id", "at_turn_id"],
+      "properties": {
+        "child_session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+        "at_turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]}
+      }
+    },
+    "route.decision": {
+      "description": "Routing chose a route. basis: 'hand_pick' (the user named it; a hand pick always wins), 'config' (the routing config chose it), 'default' (the default engine).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "basis", "detail"],
+      "properties": {
+        "route": {"$ref": "common.v1.json#/$defs/route"},
+        "basis": {"enum": ["hand_pick", "config", "default"]},
+        "detail": {"type": "string"}
+      }
+    }
+  }
+}

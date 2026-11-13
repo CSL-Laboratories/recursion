@@ -1,0 +1,17 @@
+{
+  "seq": 1,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": null,
+  "time": "2026-11-13T07:34:01.037Z",
+  "type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "entity": "run",
+    "entity_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "from": "starting",
+    "to": "running",
+    "registry_seq": 12
+  }
+}

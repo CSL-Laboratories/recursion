@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.v1.json",
+  "title": "common.v1: definitions shared by the control records",
+  "x-version": "1.0-draft.1",
+  "description": "Shared definitions. Nothing here is a record on its own; the record schemas beside this file refer to these by '$ref': 'common.v1.json#/$defs/<name>'. Every string pattern is written for ECMA 262 and is paired with a 'not' that refuses a line break, because some regular expression engines let '$' match before a final newline.",
+  "$defs": {
+    "run_id": {
+      "description": "Names one run. A run is one supervised unit with its own Stop. The daemon accepts 1 to 64 characters from A-Z a-z 0-9 _ and -; the control API mints 'run-' followed by 32 hex digits.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "session_id": {
+      "description": "Names one session. Minted by the core. Always starts with 'ses-'.",
+      "type": "string",
+      "pattern": "^ses-[A-Za-z0-9_-]{1,60}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "log_id": {
+      "description": "Names one event log. It is a session id, or, for a run that was started without a session, 'run:' followed by that run's id. Sequence numbers are counted per log.",
+      "type": "string",
+      "pattern": "^(ses-[A-Za-z0-9_-]{1,60}|run:[A-Za-z0-9_-]{1,64})$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "turn_id": {
+      "description": "Names one turn. A turn is one input and the engine's work until it yields. Minted by the core. Always starts with 'turn-'.",
+      "type": "string",
+      "pattern": "^turn-[A-Za-z0-9_-]{1,59}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "item_id": {
+      "description": "Names one queued message. Minted by the core. Always starts with 'qi-'.",
+      "type": "string",
+      "pattern": "^qi-[A-Za-z0-9_-]{1,61}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "approval_id": {
+      "description": "Names one approval request. Minted by the core, never by an engine or a plugin. Always starts with 'apr-'.",
+      "type": "string",
+      "pattern": "^apr-[A-Za-z0-9_-]{1,60}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "command_id": {
+      "description": "A client's own id for one mutating request, so a retry is recognised. Minted by the client. 8 to 128 characters from A-Z a-z 0-9 . _ : and -.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "token": {
+      "description": "A short opaque reference: 1 to 128 characters from A-Z a-z 0-9 . _ : and -.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "sha256": {
+      "description": "A SHA-256 digest as 64 lower-case hex digits.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "timestamp": {
+      "description": "A moment in UTC as RFC 3339 with exactly three decimal places and a 'Z', for example 2026-11-13T07:40:00.000Z. Every record that is new in version 1 uses this form.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)\\.[0-9]{3}Z$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "epoch_seconds": {
+      "description": "A moment as Unix seconds with a fraction. Only the stored run record uses this form, because that is what the registry has written since before version 1.",
+      "type": "number",
+      "minimum": 0
+    },
+    "seq": {
+      "description": "A position in one event log. The first event of a log is 1 and each later event is one more: there are no holes.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "revision": {
+      "description": "Counts the changes to one record. It starts at 1 and rises by one with every change. A mutating request names the revision it read; a request that names an older one is refused 'conflict'.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "epoch": {
+      "description": "The daemon's epoch: a whole number that rises each time a daemon opens the event store. A cursor carries it so a client can tell that the daemon restarted between two reads.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "tenant": {
+      "description": "The tenant a run or session belongs to, as run.start takes it today: any non-empty string.",
+      "type": "string",
+      "minLength": 1
+    },
+    "engine_name": {
+      "description": "An engine's name in the engine table, for example claude_code, codex or recursion_loop. Lower-case letters, digits and underscores, at most 32 characters, starting with a letter.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "connection_id": {
+      "description": "The meter a route is billed through: the connection's kind, a colon, and the login or key label (routes/contract.py connection_key). It is a label. It is never a credential and never contains one.",
+      "type": "string",
+      "pattern": "^(subscription|api_key|passthrough):.+$",
+      "maxLength": 256,
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "principal": {
+      "description": "Who asked. 'owner' is the user on the owner-only socket; 'device' is a paired device on the page's door; 'session' is an engine acting with a token scoped to its own session; 'plugin' is a loaded plugin; 'internal' is the daemon's own code. The id is a label for that principal. A token, a cookie or a key never appears here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["owner", "device", "session", "plugin", "internal"]},
+        "id": {"$ref": "#/$defs/token"}
+      }
+    },
+    "workspace": {
+      "description": "Where a session or run works. 'path' is the launch folder the user chose. In 'direct' mode the engine works in that folder and worktree_path is null. In 'worktree' mode the engine works in worktree_path, a git worktree cut from base_ref, and both are strings.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "mode", "base_ref", "worktree_path"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["direct", "worktree"]},
+        "base_ref": {"type": ["string", "null"], "minLength": 1},
+        "worktree_path": {"type": ["string", "null"], "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["mode"], "properties": {"mode": {"const": "worktree"}}},
+          "then": {"properties": {"base_ref": {"type": "string"}, "worktree_path": {"type": "string"}}}
+        },
+        {
+          "if": {"required": ["mode"], "properties": {"mode": {"const": "direct"}}},
+          "then": {"properties": {"worktree_path": {"type": "null"}}}
+        }
+      ]
+    },
+    "route": {
+      "description": "The route a session or run uses once routing has decided: the engine, the model (null when the engine's own default is used) and the connection it is billed through.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "model", "connection"],
+      "properties": {
+        "engine": {"$ref": "#/$defs/engine_name"},
+        "model": {"type": ["string", "null"], "minLength": 1},
+        "connection": {"$ref": "#/$defs/connection_id"}
+      }
+    },
+    "budget": {
+      "description": "The dollar reservation of a run or session. reservation_id names the reservation in the quota ledger; cap_usd is the most this run or session may spend, null when no cap is set. It is never a key and never names one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reservation_id", "cap_usd"],
+      "properties": {
+        "reservation_id": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/token"}]},
+        "cap_usd": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "lease": {
+      "description": "Who holds the run for now. owner labels the holder, epoch is the daemon epoch it was taken in, and after expires_at another holder may take it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "epoch", "expires_at"],
+      "properties": {
+        "owner": {"$ref": "#/$defs/token"},
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "expires_at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "cursor": {
+      "description": "A client's place in one event log: the epoch it read in, the log, and the last sequence number it has (0 before the first event). A read that names an older epoch still reads on by seq; a span the store can no longer give is answered with a replay.gap event, never skipped silently.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["epoch", "session_id", "seq"],
+      "properties": {
+        "epoch": {"$ref": "#/$defs/epoch"},
+        "session_id": {"$ref": "#/$defs/log_id"},
+        "seq": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

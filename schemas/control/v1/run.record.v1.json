@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run.record.v1.json",
+  "title": "run.record.v1: the run record as the registry stores it",
+  "x-version": "1.0-draft.1",
+  "description": "STORAGE record. This is the JSON document the daemon's registry keeps for one run (core/recursion_core/control/registry.py). The twelve required fields are exactly what is stored today and none of them changes in version 1. The other fields are optional additions: each is either absent or carries a value, and null is not used for them. What a client reads from run.status and run.list is a different record, run.view.v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "tenant", "engine", "state", "cgroup", "started_at", "stop", "start_key", "generation", "cgroup_marker", "members", "stop_attestation"],
+  "properties": {
+    "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+    "tenant": {"$ref": "common.v1.json#/$defs/tenant"},
+    "engine": {"$ref": "#/$defs/engine_as_given"},
+    "state": {"$ref": "#/$defs/stored_state"},
+    "cgroup": {"$ref": "#/$defs/cgroup"},
+    "started_at": {"$ref": "common.v1.json#/$defs/epoch_seconds"},
+    "stop": {"$ref": "#/$defs/stop"},
+    "start_key": {"$ref": "#/$defs/start_key"},
+    "generation": {"$ref": "#/$defs/generation"},
+    "cgroup_marker": {"$ref": "#/$defs/cgroup_marker"},
+    "members": {"$ref": "#/$defs/members"},
+    "stop_attestation": {"$ref": "#/$defs/stop_attestation"},
+    "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+    "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
+    "workspace": {"$ref": "common.v1.json#/$defs/workspace"},
+    "route": {"$ref": "common.v1.json#/$defs/route"},
+    "engine_session_id": {"$ref": "#/$defs/engine_session_id"},
+    "continues": {"$ref": "#/$defs/continues"},
+    "principal": {"$ref": "common.v1.json#/$defs/principal"},
+    "budget": {"$ref": "common.v1.json#/$defs/budget"},
+    "lease": {"$ref": "common.v1.json#/$defs/lease"}
+  },
+  "allOf": [{"$ref": "#/$defs/stopped_rules"}],
+  "$defs": {
+    "engine_as_given": {
+      "description": "The engine name the start asked for, as given: run.start accepts any non-empty string and a start that names an engine with no route is recorded as start_failed with that name.",
+      "type": "string",
+      "minLength": 1
+    },
+    "stored_state": {
+      "description": "starting: the launch intent is written and no cgroup is recorded yet. start_failed: the launch path refused or failed. running: the unit's cgroup is recorded. stop_pending: a Stop was asked and is not confirmed. stopped: terminal, and stored only with an attestation.",
+      "enum": ["starting", "start_failed", "running", "stop_pending", "stopped"]
+    },
+    "cgroup": {
+      "description": "The unit's cgroup path, or null until the launch is recorded.",
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "cgroup_marker": {
+      "description": "An identity for that cgroup which a new path never inherits, or null while there is no cgroup.",
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "generation": {
+      "description": "Rises by one with every stored write. A write names the generation it read; one that names an older generation is refused.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["member_id", "pid"],
+        "properties": {
+          "member_id": {"type": "string", "minLength": 1},
+          "pid": {"type": "integer"}
+        }
+      }
+    },
+    "stop": {
+      "description": "null until a Stop is asked. requested is true only once the cleanup request was sent to the cgroup named by this object's own cgroup and cgroup_marker, which are written at that moment (control/api.py, _stop_attempt) and are absent on a Stop kept as an intent.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["requested_at", "checks", "reason", "requested"],
+      "properties": {
+        "requested_at": {"$ref": "common.v1.json#/$defs/epoch_seconds"},
+        "checks": {"type": "integer", "minimum": 0},
+        "reason": {"anyOf": [{"type": "null"}, {"$ref": "stop.result.v1.json#/$defs/pending_reason"}]},
+        "requested": {"type": "boolean"},
+        "cgroup": {"type": ["string", "null"], "minLength": 1},
+        "cgroup_marker": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "start_key": {
+      "description": "null for a start with no client_key. Otherwise what a retried start is compared with: the key, the engine, and the SHA-256 of the prompt's UTF-8 bytes (the prompt itself is not stored). request_identity is new in version 1 and optional: when the start was normalised (workspace, route, model, profile), it is the digest of that normalised request, and a retry with the same key and another identity is refused client_key_reused. A stored key without one is compared as today.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["client_key", "engine", "prompt_sha256"],
+      "properties": {
+        "client_key": {"type": "string"},
+        "engine": {"$ref": "#/$defs/engine_as_given"},
+        "prompt_sha256": {"$ref": "common.v1.json#/$defs/sha256"},
+        "request_identity": {"$ref": "common.v1.json#/$defs/sha256"}
+      }
+    },
+    "stop_attestation": {
+      "anyOf": [{"type": "null"}, {"$ref": "stop.result.v1.json#/$defs/attestation"}]
+    },
+    "engine_session_id": {
+      "description": "The engine's own id for its conversation, used to resume or fork it. It is the engine's value and is treated as untrusted text.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "continues": {
+      "description": "The run this run continues: the run a fallback took over from after a limit, or the earlier run of a worker that was brought back.",
+      "$ref": "common.v1.json#/$defs/run_id"
+    },
+    "stopped_rules": {
+      "description": "The registry's own rules for 'stopped', which the public view shares.",
+      "allOf": [
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "stopped"}}},
+          "then": {
+            "properties": {
+              "cgroup": {"type": "string"},
+              "cgroup_marker": {"type": "string"},
+              "stop_attestation": {"type": "object"},
+              "members": {"maxItems": 0}
+            }
+          },
+          "else": {"properties": {"stop_attestation": {"type": "null"}}}
+        }
+      ]
+    }
+  }
+}

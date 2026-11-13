@@ -1,0 +1,23 @@
+{
+  "seq": 42,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:42.554Z",
+  "type": "stop.result",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "code": "stopped",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "state": "stopped",
+    "repeat": false,
+    "attestation": {
+      "proof": "unit_inactive",
+      "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+      "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
+      "member_ids": [],
+      "generation": 3
+    }
+  }
+}

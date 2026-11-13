@@ -1,0 +1,34 @@
+{
+  "cgroup": "/test.slice/recursion-run-run-39b3dc932efc444589d45cbbe934e734.service",
+  "cgroup_marker": "cg-531048d0e17247f7857522aebf7b8bb2",
+  "engine": "claude_code",
+  "generation": 2,
+  "members": [],
+  "observed": {
+    "detail": "started in boot boot-1; not relaunched",
+    "state": "lost_reboot",
+    "stop_requested": false,
+    "unit": "recursion-run-run-39b3dc932efc444589d45cbbe934e734.service"
+  },
+  "output": {
+    "bytes": 1176,
+    "complete": true,
+    "lines": [
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 85841, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_stdin_eof\", \"note\": \"stdin closed; not treated as cancellation\"}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 1\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 2\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 3\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 4\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_sigint\", \"note\": \"SIGINT received: the daemon told the engine to stop\"}"
+    ]
+  },
+  "recorded_state": "running",
+  "run_id": "run-39b3dc932efc444589d45cbbe934e734",
+  "start_key": null,
+  "started_at": 1794555973.0167675,
+  "state": "lost_reboot",
+  "stop": null,
+  "stop_attestation": null,
+  "tenant": "t1"
+}

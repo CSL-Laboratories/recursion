@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run.view.v1.json",
+  "title": "run.view.v1: a run as run.status and run.list answer it",
+  "x-version": "1.0-draft.1",
+  "description": "PUBLIC record. This is the 'run' object inside the answers of run.start and run.status, and each element of 'runs' in the answer of run.list, as the daemon answers them today (core/recursion_core/daemon/control_adapter.py, _observe). It is the stored record (run.record.v1) plus what the daemon last observed of the unit. Three public states exist that the registry never stores: 'ended' (the run finished on its own; nobody stopped it), 'lost_reboot' (it belonged to an earlier boot) and 'unknown' (the unit could not be observed). When one of them is shown, recorded_state keeps the stored word. Reading never writes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "tenant", "engine", "state", "cgroup", "started_at", "stop", "start_key", "generation", "cgroup_marker", "members", "stop_attestation", "observed"],
+  "properties": {
+    "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+    "tenant": {"$ref": "common.v1.json#/$defs/tenant"},
+    "engine": {"$ref": "run.record.v1.json#/$defs/engine_as_given"},
+    "state": {"$ref": "#/$defs/public_state"},
+    "cgroup": {"$ref": "run.record.v1.json#/$defs/cgroup"},
+    "started_at": {"$ref": "common.v1.json#/$defs/epoch_seconds"},
+    "stop": {"$ref": "run.record.v1.json#/$defs/stop"},
+    "start_key": {"$ref": "run.record.v1.json#/$defs/start_key"},
+    "generation": {"$ref": "run.record.v1.json#/$defs/generation"},
+    "cgroup_marker": {"$ref": "run.record.v1.json#/$defs/cgroup_marker"},
+    "members": {"$ref": "run.record.v1.json#/$defs/members"},
+    "stop_attestation": {"$ref": "run.record.v1.json#/$defs/stop_attestation"},
+    "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+    "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
+    "workspace": {"$ref": "common.v1.json#/$defs/workspace"},
+    "route": {"$ref": "common.v1.json#/$defs/route"},
+    "engine_session_id": {"$ref": "run.record.v1.json#/$defs/engine_session_id"},
+    "continues": {"$ref": "run.record.v1.json#/$defs/continues"},
+    "principal": {"$ref": "common.v1.json#/$defs/principal"},
+    "budget": {"$ref": "common.v1.json#/$defs/budget"},
+    "lease": {"$ref": "common.v1.json#/$defs/lease"},
+    "observed": {"$ref": "#/$defs/observed"},
+    "recorded_state": {
+      "description": "The stored state, shown only when 'state' was replaced by what the daemon observed.",
+      "enum": ["starting", "running"]
+    },
+    "result": {"$ref": "#/$defs/result"},
+    "output": {"$ref": "#/$defs/output"}
+  },
+  "allOf": [
+    {"$ref": "run.record.v1.json#/$defs/stopped_rules"},
+    {
+      "if": {"required": ["state"], "properties": {"state": {"enum": ["ended", "lost_reboot", "unknown"]}}},
+      "then": {"required": ["recorded_state"]},
+      "else": {"not": {"required": ["recorded_state"]}}
+    }
+  ],
+  "$defs": {
+    "public_state": {
+      "description": "The five stored states, and three that only a view shows: ended, lost_reboot, unknown.",
+      "enum": ["starting", "start_failed", "running", "stop_pending", "stopped", "ended", "lost_reboot", "unknown"]
+    },
+    "observed": {
+      "description": "What the daemon last observed of the run's unit. null: no unit was ever recorded for this run. An object with only state 'unknown' and a detail: the daemon's own registry could not be read. Otherwise the unit row: its state, a detail, the unit's name and whether a Stop is recorded for it.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["state", "detail"],
+      "properties": {
+        "state": {
+          "description": "The daemon's word for the unit. 'terminated' is an attested end in this boot; 'lost_reboot' is a unit of an earlier boot; 'unknown' is a unit that could not be observed.",
+          "enum": ["starting", "running", "stopping", "terminated", "lost_reboot", "unknown"]
+        },
+        "detail": {"type": "string"},
+        "unit": {"type": "string", "pattern": "^recursion-run-[A-Za-z0-9_-]{1,64}\\.service$", "not": {"pattern": "[\\r\\n]"}},
+        "stop_requested": {"type": "boolean"}
+      },
+      "dependentRequired": {"unit": ["stop_requested"], "stop_requested": ["unit"]}
+    },
+    "result": {
+      "description": "The route result, once there is one. run.status carries the whole result (the 'recursion.route/v0' record of core/recursion_core/routes/contract.py); run.list carries only status, code and detail. The route result is the engine adapter's record and is typed loosely here on purpose: 'events[].data' and 'limit_notice' are shaped by the adapter. A consumer that needs typed tool calls, usage or limits reads the event log (event.v1), not this field.",
+      "type": "object",
+      "required": ["status", "code", "detail"],
+      "properties": {
+        "status": {"enum": ["ok", "error"]},
+        "code": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "detail": {"type": "string"}
+      },
+      "oneOf": [
+        {
+          "title": "As run.list answers it",
+          "additionalProperties": false,
+          "properties": {"status": true, "code": true, "detail": true}
+        },
+        {
+          "title": "As run.status answers it",
+          "additionalProperties": false,
+          "required": ["contract", "request_id", "text", "limit", "events", "retry_at", "breaker_effect", "limit_notice"],
+          "properties": {
+            "status": true,
+            "code": true,
+            "detail": true,
+            "contract": {"const": "recursion.route/v0"},
+            "request_id": {"type": "string", "minLength": 1},
+            "text": {"type": "string"},
+            "limit": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "required": ["scope", "model", "reset_at", "source"],
+              "properties": {
+                "scope": {"enum": ["connection", "model"]},
+                "model": {"type": ["string", "null"]},
+                "reset_at": {"type": ["number", "null"]},
+                "source": {"type": "string"}
+              }
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "source", "data"],
+                "properties": {
+                  "kind": {"type": "string", "minLength": 1},
+                  "source": {"type": "string"},
+                  "data": {"type": "object"}
+                }
+              }
+            },
+            "retry_at": {"type": ["number", "null"]},
+            "breaker_effect": {"enum": ["none", "opened", "short_fault", "closed", "probe_released"]},
+            "limit_notice": {"type": ["object", "null"]}
+          }
+        }
+      ]
+    },
+    "output": {
+      "description": "The tail of the engine's standard output file, on run.status only: at most the last 50 whole lines of the last 64 KiB, newest last. bytes is the file's size. complete is true only once the unit is recorded ended. When the file exists and cannot be read, the object is {\"unavailable\": \"<error name>\"}. Engine output is untrusted text.",
+      "type": "object",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": ["bytes", "lines", "complete"],
+          "properties": {
+            "bytes": {"type": "integer", "minimum": 0},
+            "lines": {"type": "array", "maxItems": 50, "items": {"type": "string"}},
+            "complete": {"type": "boolean"}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["unavailable"],
+          "properties": {"unavailable": {"type": "string", "minLength": 1}}
+        }
+      ]
+    }
+  }
+}

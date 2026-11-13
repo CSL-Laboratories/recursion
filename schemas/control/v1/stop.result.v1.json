@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stop.result.v1.json",
+  "title": "stop.result.v1: what a Stop answers",
+  "x-version": "1.0-draft.1",
+  "description": "The answer of run.stop when the run exists: 'stopped' or 'pending'. 'stopped' is answered only on evidence that the run's supervised cgroup holds no process; without that evidence the answer is 'pending' with a reason, never 'stopped'. The first three fields and 'repeat', 'reason' and 'recorded' are what the daemon answers today. 'attestation', 'containment_level' and 'claim' are new in version 1 and optional until lane STOP writes them. A client that meets a 'proof' it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "run_id", "state"],
+  "properties": {
+    "code": {"enum": ["stopped", "pending"]},
+    "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+    "state": {
+      "description": "The same word as 'code'. It is kept because today's answer carries both.",
+      "enum": ["stopped", "pending"]
+    },
+    "reason": {"$ref": "#/$defs/pending_reason"},
+    "repeat": {
+      "description": "False for the first Stop asked of a run. True when a Stop had already been asked: the run was already stopped, or an earlier Stop was pending and this one confirmed it.",
+      "type": "boolean"
+    },
+    "recorded": {
+      "description": "False when the answer could not be written to the registry. Today the field is present only when it is false; an absent field means the write landed. 'Not recorded' is its own fact: the cleanup answer above is still true.",
+      "type": "boolean"
+    },
+    "attestation": {"$ref": "#/$defs/attestation"},
+    "containment_level": {"$ref": "#/$defs/containment_level"},
+    "claim": {"$ref": "#/$defs/claim"}
+  },
+  "allOf": [
+    {
+      "if": {"required": ["code"], "properties": {"code": {"const": "stopped"}}},
+      "then": {
+        "required": ["repeat"],
+        "properties": {"state": {"const": "stopped"}},
+        "not": {"required": ["reason"]}
+      }
+    },
+    {
+      "if": {"required": ["code"], "properties": {"code": {"const": "pending"}}},
+      "then": {
+        "required": ["reason"],
+        "properties": {"state": {"const": "pending"}},
+        "not": {"anyOf": [{"required": ["repeat"]}, {"required": ["attestation"]}, {"required": ["claim"]}]}
+      }
+    }
+  ],
+  "$defs": {
+    "pending_reason": {
+      "description": "Why a Stop is not confirmed. cgroup_populated: a process is still in the cgroup. confirm_timeout: the check did not finish in time. confirm_unknown: the check gave no usable answer. member_alive: a recorded member process is still alive. cgroup_changed: the record moved to another cgroup while the Stop ran. cgroup_unknown: the launch has not recorded a cgroup yet, so the Stop is kept as an intent. cleanup_error:<Name>: the cleanup layer raised the named error.",
+      "type": "string",
+      "anyOf": [
+        {"enum": ["cgroup_populated", "confirm_timeout", "confirm_unknown", "member_alive", "cgroup_changed", "cgroup_unknown"]},
+        {"pattern": "^cleanup_error:[A-Za-z_][A-Za-z0-9_]{0,127}$"}
+      ],
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "attestation": {
+      "description": "The evidence a 'stopped' rests on. proof 'empty' (today): the cgroup named here was read empty and every member listed was gone, at this generation of the record. proof 'removed' (lane STOP): the cgroup directory recorded at launch, identified by its device and inode numbers, no longer exists or is a different directory, as observed at removed_at. A client that meets any other proof treats the run as NOT stopped.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proof", "cgroup", "cgroup_marker", "member_ids", "generation"],
+      "properties": {
+        "proof": {"enum": ["empty", "removed"]},
+        "cgroup": {"type": "string", "minLength": 1},
+        "cgroup_marker": {"type": "string", "minLength": 1},
+        "member_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "generation": {"type": "integer", "minimum": 1},
+        "cgroup_dev": {"description": "st_dev of the unit's cgroup directory, read at launch.", "type": "integer", "minimum": 0},
+        "cgroup_ino": {"description": "st_ino of the unit's cgroup directory, read at launch.", "type": "integer", "minimum": 0},
+        "removed_at": {"$ref": "common.v1.json#/$defs/timestamp"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["proof"], "properties": {"proof": {"const": "removed"}}},
+          "then": {"required": ["cgroup_dev", "cgroup_ino", "removed_at"]}
+        },
+        {
+          "if": {"required": ["proof"], "properties": {"proof": {"const": "empty"}}},
+          "then": {"not": {"anyOf": [{"required": ["cgroup_dev"]}, {"required": ["cgroup_ino"]}, {"required": ["removed_at"]}]}}
+        }
+      ]
+    },
+    "containment_level": {
+      "description": "How the run was contained when it launched. host_integrated: the engine ran as the daemon's own user in a delegated unit (the only level that exists today). engine_user: the engine ran as a separate operating-system user. contained: the unit also ran with the verified restrictions lane STOP defines. PROVISIONAL: the level names are lane STOP's and wait on a decision.",
+      "enum": ["host_integrated", "engine_user", "contained"]
+    },
+    "claim": {
+      "description": "The key of the sentence a surface shows for this Stop. No surface writes its own wording. cgroup_empty_whole_run_unverified: the supervised cgroup was read empty; nothing is claimed about a process that left it. cgroup_removed_whole_run_unverified: the supervised cgroup is gone; nothing is claimed about a process that left it. PROVISIONAL: lane STOP owns the list of keys.",
+      "enum": ["cgroup_empty_whole_run_unverified", "cgroup_removed_whole_run_unverified"]
+    }
+  }
+}

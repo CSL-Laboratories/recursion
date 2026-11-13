@@ -1,0 +1,31 @@
+{
+  "cgroup": "/test.slice/recursion-run-run-26b009676bce471fa86d592c09df1adc.service",
+  "cgroup_marker": "cg-9a28a77cc36d4c5a89fe7284e4bf823a",
+  "engine": "claude_code",
+  "generation": 4,
+  "members": [],
+  "run_id": "run-26b009676bce471fa86d592c09df1adc",
+  "start_key": {
+    "client_key": "capture-1",
+    "engine": "claude_code",
+    "prompt_sha256": "3d7bb8776dad8b047d66746d9cd47c1b0c937eaba3ad596075a229b4a3137a98"
+  },
+  "started_at": 1794555971.7227964,
+  "state": "stopped",
+  "stop": {
+    "cgroup": "/test.slice/recursion-run-run-26b009676bce471fa86d592c09df1adc.service",
+    "cgroup_marker": "cg-9a28a77cc36d4c5a89fe7284e4bf823a",
+    "checks": 2,
+    "reason": null,
+    "requested": true,
+    "requested_at": 1794555971.8236315
+  },
+  "stop_attestation": {
+    "cgroup": "/test.slice/recursion-run-run-26b009676bce471fa86d592c09df1adc.service",
+    "cgroup_marker": "cg-9a28a77cc36d4c5a89fe7284e4bf823a",
+    "generation": 3,
+    "member_ids": [],
+    "proof": "empty"
+  },
+  "tenant": "t1"
+}

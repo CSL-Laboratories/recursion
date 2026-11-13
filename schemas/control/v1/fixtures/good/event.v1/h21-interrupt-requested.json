@@ -1,0 +1,15 @@
+{
+  "seq": 21,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:21.777Z",
+  "type": "interrupt",
+  "source": "client",
+  "trust": "trusted",
+  "payload": {
+    "phase": "requested",
+    "how": null
+  },
+  "command_id": "tui-7c1e.0009"
+}

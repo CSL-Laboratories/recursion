@@ -1,0 +1,16 @@
+{
+  "seq": 31,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": null,
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:31.147Z",
+  "type": "engine.output",
+  "source": "engine",
+  "trust": "untrusted",
+  "payload": {
+    "stream": "stdout",
+    "text": "ok\n",
+    "offset_start": 0,
+    "offset_end": 3
+  }
+}

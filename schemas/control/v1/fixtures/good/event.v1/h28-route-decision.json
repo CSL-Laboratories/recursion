@@ -1,0 +1,19 @@
+{
+  "seq": 28,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": null,
+  "turn_id": null,
+  "time": "2026-11-13T07:34:28.036Z",
+  "type": "route.decision",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "route": {
+      "engine": "claude_code",
+      "model": "claude-sonnet-5-5",
+      "connection": "subscription:personal-max"
+    },
+    "basis": "hand_pick",
+    "detail": ""
+  }
+}

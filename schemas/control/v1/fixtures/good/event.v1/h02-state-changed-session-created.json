@@ -1,0 +1,18 @@
+{
+  "seq": 2,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": null,
+  "turn_id": null,
+  "time": "2026-11-13T07:34:02.074Z",
+  "type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "entity": "session",
+    "entity_id": "ses-7f3a9c2e51d04b6a",
+    "from": null,
+    "to": "idle",
+    "registry_seq": null
+  },
+  "command_id": "tui-7c1e.0001"
+}

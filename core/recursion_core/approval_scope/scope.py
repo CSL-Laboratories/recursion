@@ -21,7 +21,9 @@ caller text. The core assigns the request id: ``open`` ignores whatever id the r
 object carries and returns an ``OpenedRequest`` holding the request under a fresh
 core-chosen id. One opener principal may hold at most ``MAX_OPEN_PER_OPENER`` open
 (pending, unexpired) requests at a time; past that ``open`` refuses with
-``open_cap_reached``, so one plugin cannot flood the operator's inbox.
+``open_cap_reached``, so one plugin cannot flood the operator's inbox. The cap
+counts latched state: an expired request is not open, and stepping the clock
+backward cannot make it open again.
 
 The approver reads the prompt the core drew from the core, not from the opener:
 ``pending`` (the inbox, ``approval.list``) and ``show`` return the stored prompt text to an
@@ -37,10 +39,17 @@ id and digest passed along by a plugin are not enough to approve.
 * bound to fixed ``(request_id, digest)`` pairs, never a wildcard. One pair is a
   one-use grant; several pairs are a scoped grant, and each pair is still used once;
 * carrying ``expires_at`` (integer UNIX seconds), no later than the earliest expiry of
-  the requests it covers. At ``expires_at`` and after, the scope refuses.
+  the requests it covers. At ``expires_at`` and after, the scope refuses. The first
+  observation of that expiry latches it: the request or scope is terminal, and a
+  later clock reading below ``expires_at`` does not clear the latch. The authority
+  also keeps the greatest time it has observed, so a backward step cannot un-expire
+  a row that this process has already seen past.
 
 The first valid answer to a request wins; any later answer, through this scope or
-another, is refused. State lives only in memory: a restart can only ask again.
+another, is refused. Answered, expired and fully used rows are dropped. A bounded
+tombstone of their ids remains so a replay is refused; an id that falls out of that
+tombstone is still refused. One request holds at most ``MAX_GRANTS_PER_REQUEST``
+live grants. State lives only in memory: a restart can only ask again.
 """
 
 from __future__ import annotations
@@ -55,9 +64,9 @@ from typing import Callable
 from .errors import Refused
 from .prompt import _PRINCIPAL, ApprovalRequest, render_prompt
 
-__all__ = ["APPROVER_KINDS", "KINDS", "MAX_BINDINGS", "MAX_OPEN_PER_OPENER", "SCOPE_SCHEMA",
-           "SCOPES", "ApprovalAuthority", "ApprovalScope", "Credential", "CredentialRegistry",
-           "OpenedRequest"]
+__all__ = ["APPROVER_KINDS", "KINDS", "MAX_BINDINGS", "MAX_GRANTS_PER_REQUEST",
+           "MAX_OPEN_PER_OPENER", "SCOPE_SCHEMA", "SCOPES", "ApprovalAuthority", "ApprovalScope",
+           "Credential", "CredentialRegistry", "OpenedRequest"]
 
 SCOPE_SCHEMA = "csl-approval-scope/v0"
 KINDS = frozenset({"operator_ui", "paired_device", "agent", "plugin"})
@@ -66,8 +75,15 @@ SCOPES = frozenset({"observe", "control", "manage", "approve"})
 MAX_BINDINGS = 16
 # Open (pending, unexpired) requests one opener principal may hold at once.
 MAX_OPEN_PER_OPENER = 32
+# Live grants one request may hold at once. Expired and fully used grants are not live.
+MAX_GRANTS_PER_REQUEST = 8
 # Draws for a fresh id. Past this, refuse instead of spinning under the locks.
 _ID_ATTEMPTS = 8
+# Detailed terminal records kept so a replay still resolves to a specific refusal.
+# Past this, the id is remembered only as retired and every later use is refused.
+_MAX_TOMBSTONES = 64
+# Live grants retained at once, across every request. Terminal grants are not live.
+_MAX_LIVE_GRANTS = 256
 # Revoked token ids retained so a just-revoked id is not minted on the next draw.
 # After this many later revokes the id may recur. Shown prompts and grants bind to
 # the per-credential serial, so recurrence does not revive the revoked credential.
@@ -89,6 +105,36 @@ def _mint_id(taken: Callable[[str], bool]) -> str:
         if not taken(candidate):
             return candidate
     raise Refused("id_exhausted")
+
+
+class _IdBloom:
+    """Fixed-size set of ids. A hit can be wrong; a stored id is not forgotten.
+
+    Retired request and scope ids land here once their detailed tombstone is
+    dropped. A false hit refuses an id the authority never issued. A stored id
+    cannot later look unknown and be minted or approved again.
+    """
+
+    _BITS = 1 << 16
+    _MASK = _BITS - 1
+
+    def __init__(self) -> None:
+        self._words = [0] * (self._BITS // 64)
+
+    def add(self, key: str) -> None:
+        for bit in self._bits(key):
+            self._words[bit >> 6] |= 1 << (bit & 63)
+
+    def __contains__(self, key: object) -> bool:
+        if type(key) is not str:
+            return False
+        return all(self._words[bit >> 6] & (1 << (bit & 63)) for bit in self._bits(key))
+
+    def _bits(self, key: str) -> tuple[int, int, int, int]:
+        digest = hmac.new(b"csl-approval-tomb/v0", key.encode("ascii"), "sha256").digest()
+        mixed = int.from_bytes(digest[:8], "big")
+        mask = self._MASK
+        return (mixed & mask, (mixed >> 16) & mask, (mixed >> 32) & mask, (mixed >> 48) & mask)
 
 
 @dataclass(frozen=True)
@@ -277,6 +323,8 @@ class _Grant:
     scope: ApprovalScope
     holder_serial: int
     used: set[str] = field(default_factory=set)
+    # Latched when any call observes now >= scope.expires_at. Never cleared.
+    expired: bool = False
 
 
 class ApprovalAuthority:
@@ -288,22 +336,133 @@ class ApprovalAuthority:
         self._clock = clock
         self._registry = registry
         self._lock = threading.Lock()
+        self._seen_at: int | None = None
         self._requests: dict[str, _Request] = {}
+        self._request_tombs: dict[str, str] = {}
+        self._request_bloom = _IdBloom()
         self._grants: dict[str, _Grant] = {}
+        self._grant_tombs: dict[str, _Grant] = {}
+        self._grant_bloom = _IdBloom()
 
     def _now(self) -> int:
-        """The clock's current instant.
+        """The latest instant this authority has observed.
 
         Called with this authority's lock held. A commit also calls it while the
         registry lock is held, so the expiry check and ``decided_at`` see the time
         after both locks, not a sample taken while waiting on the registry.
         The clock must not call this authority or its registry: neither lock is
         reentrant, and a clock that did would deadlock.
+
+        The returned value is the high-water mark of every instant observed so far.
+        A later reading from the clock that is lower leaves this mark where it is.
         """
         now = self._clock()
         if type(now) is not int:
             raise Refused("clock")
-        return now
+        if self._seen_at is None or now > self._seen_at:
+            self._seen_at = now
+        return self._seen_at
+
+    def _remember(self, tombs: dict, bloom: _IdBloom, key: str, value: object) -> None:
+        """Keep a bounded tombstone. An id pushed out is retired in ``bloom``."""
+        if key in tombs:
+            del tombs[key]
+        elif len(tombs) >= _MAX_TOMBSTONES:
+            dropped = next(iter(tombs))
+            del tombs[dropped]
+            bloom.add(dropped)
+        tombs[key] = value
+
+    def _evict_request(self, request_id: str, terminal: str) -> None:
+        self._requests.pop(request_id, None)
+        self._remember(self._request_tombs, self._request_bloom, request_id, terminal)
+
+    def _evict_grant(self, scope_id: str) -> None:
+        grant = self._grants.pop(scope_id, None)
+        if grant is None:
+            grant = self._grant_tombs.get(scope_id)
+            if grant is None:
+                return
+        self._remember(self._grant_tombs, self._grant_bloom, scope_id, grant)
+
+    def _sweep(self, now: int) -> None:
+        """Latch and drop every terminal row visible at ``now``.
+
+        Pending rows whose ``expires_at`` has arrived become ``expired``. Expired
+        and fully used grants leave the live map. Caller holds the authority lock.
+        """
+        for request_id, entry in list(self._requests.items()):
+            if entry.state != "pending" or entry.request.expires_at <= now:
+                terminal = "expired" if entry.state == "pending" else entry.state
+                self._evict_request(request_id, terminal)
+        for scope_id, grant in list(self._grants.items()):
+            if grant.expired or now >= grant.scope.expires_at:
+                grant.expired = True
+                self._evict_grant(scope_id)
+            elif len(grant.used) >= len(grant.scope.bindings):
+                self._evict_grant(scope_id)
+
+    def _request_id_taken(self, candidate: str) -> bool:
+        return (candidate in self._requests or candidate in self._request_tombs
+                or candidate in self._request_bloom)
+
+    def _scope_id_taken(self, candidate: str) -> bool:
+        return (candidate in self._grants or candidate in self._grant_tombs
+                or candidate in self._grant_bloom)
+
+    def _request_terminal(self, request_id: object) -> str | None:
+        """Latched outcome of a request that is no longer live, if this id is known."""
+        if type(request_id) is not str:
+            return None
+        found = self._request_tombs.get(request_id)
+        if found is not None:
+            return found
+        if request_id in self._request_bloom:
+            # The detailed outcome was dropped. Refuse as expired, never as unknown.
+            return "expired"
+        return None
+
+    def _refuse_if_terminal(self, request_id: object) -> None:
+        terminal = self._request_terminal(request_id)
+        if terminal == "expired":
+            raise Refused("request_expired")
+        if terminal in ("approved", "denied"):
+            raise Refused("request_answered")
+
+    def _grant_for(self, scope_id: object) -> _Grant:
+        if type(scope_id) is not str:
+            raise Refused("scope_unknown")
+        grant = self._grants.get(scope_id)
+        if grant is None:
+            grant = self._grant_tombs.get(scope_id)
+        if grant is None:
+            if scope_id in self._grant_bloom:
+                raise Refused("scope_expired")
+            raise Refused("scope_unknown")
+        return grant
+
+    def _live_request(self, request_id: object, now: int) -> _Request:
+        entry = self._requests.get(request_id) if type(request_id) is str else None
+        if entry is None:
+            self._refuse_if_terminal(request_id)
+            raise Refused("request_unknown")
+        if entry.state != "pending":
+            raise Refused("request_answered")
+        if entry.request.expires_at <= now:
+            self._evict_request(request_id, "expired")
+            raise Refused("request_expired")
+        return entry
+
+    def _grant_count(self, request_id: str) -> int:
+        return sum(1 for grant in self._grants.values()
+                   if any(rid == request_id for rid, _digest in grant.scope.bindings))
+
+    def _require_grant_room(self, request_ids: list[str]) -> None:
+        if len(self._grants) >= _MAX_LIVE_GRANTS:
+            raise Refused("grant_cap_reached")
+        for request_id in dict.fromkeys(request_ids):
+            if self._grant_count(request_id) >= MAX_GRANTS_PER_REQUEST:
+                raise Refused("grant_cap_reached")
 
     def open(self, credential: object, request: ApprovalRequest) -> "OpenedRequest":
         """Register ``request`` for ``credential`` under a core-assigned id.
@@ -312,7 +471,7 @@ class ApprovalAuthority:
         the prompt the core drew. The prompt's requester is ``credential.principal``. Any
         kind may open a request, but only with the ``control`` scope; ``observe`` alone
         is read-only. Each opener principal holds at most ``MAX_OPEN_PER_OPENER`` open
-        requests.
+        requests, counted by latched state.
         """
         opener = self._registry.resolve(credential)
         if "control" not in opener.scopes:
@@ -323,17 +482,19 @@ class ApprovalAuthority:
         def commit(opener: Credential) -> OpenedRequest:
             # After both locks: the registry lock is held by _call_if_current.
             now = self._now()
+            self._sweep(now)
             if "control" not in opener.scopes:
                 raise Refused("open_scope_required")
             if request.expires_at <= now:
                 raise Refused("request_expired")
-            held = sum(1 for e in self._requests.values()
-                       if e.requester == opener.principal and e.state == "pending"
-                       and e.request.expires_at > now)
+            # Latched state only: sweep already dropped expired and answered rows.
+            held = sum(1 for entry in self._requests.values()
+                       if entry.requester == opener.principal and entry.state == "pending")
             if held >= MAX_OPEN_PER_OPENER:
                 raise Refused("open_cap_reached")
             # The core picks the id; the caller's draft id is discarded.
-            request_id = _mint_id(self._requests.__contains__)
+            # Tombstoned and retired ids stay taken so a replay cannot be reopened.
+            request_id = _mint_id(self._request_id_taken)
             opened = replace(request, request_id=request_id)
             # Render before registering: a request whose prompt cannot be drawn is not open.
             text = render_prompt(opened, opener.principal)
@@ -352,10 +513,11 @@ class ApprovalAuthority:
 
         def commit(viewer: Credential) -> list[dict]:
             now = self._now()
+            self._sweep(now)
             _require_approver(viewer)
             out = []
             for rid, entry in self._requests.items():
-                if entry.state != "pending" or entry.request.expires_at <= now:
+                if entry.state != "pending":
                     continue
                 entry.shown.add(viewer.serial)
                 out.append(self._inbox_item(rid, entry))
@@ -370,14 +532,9 @@ class ApprovalAuthority:
 
         def commit(viewer: Credential) -> dict:
             now = self._now()
+            self._sweep(now)
             _require_approver(viewer)
-            entry = self._requests.get(request_id) if type(request_id) is str else None
-            if entry is None:
-                raise Refused("request_unknown")
-            if entry.state != "pending":
-                raise Refused("request_answered")
-            if entry.request.expires_at <= now:
-                raise Refused("request_expired")
+            entry = self._live_request(request_id, now)
             entry.shown.add(viewer.serial)
             return self._inbox_item(request_id, entry)
 
@@ -404,22 +561,18 @@ class ApprovalAuthority:
 
         def commit(holder: Credential) -> ApprovalScope:
             now = self._now()
+            self._sweep(now)
             _require_approver(holder)
             pairs = []
             expires_at = now + ttl_seconds
             for rid in request_ids:
-                entry = self._requests.get(rid) if type(rid) is str else None
-                if entry is None:
-                    raise Refused("request_unknown")
-                if entry.state != "pending":
-                    raise Refused("request_answered")
-                if entry.request.expires_at <= now:
-                    raise Refused("request_expired")
+                entry = self._live_request(rid, now)
                 if holder.serial not in entry.shown:
                     raise Refused("prompt_not_shown")
                 pairs.append((rid, entry.request.digest))
                 expires_at = min(expires_at, entry.request.expires_at)
-            scope_id = _mint_id(self._grants.__contains__)
+            self._require_grant_room([rid for rid, _digest in pairs])
+            scope_id = _mint_id(self._scope_id_taken)
             scope = ApprovalScope(scope_id=scope_id, holder=holder.token_id,
                                   bindings=tuple(sorted(pairs)), expires_at=expires_at)
             self._grants[scope.scope_id] = _Grant(scope, holder.serial)
@@ -436,12 +589,15 @@ class ApprovalAuthority:
 
     def state(self, request_id: str) -> str:
         with self._lock:
+            now = self._now()
+            self._sweep(now)
             entry = self._requests.get(request_id)
-            if entry is None:
-                return "unknown"
-            if entry.state == "pending" and entry.request.expires_at <= self._now():
-                return "expired"
-            return entry.state
+            if entry is not None:
+                return entry.state
+            terminal = self._request_terminal(request_id)
+            if terminal is not None:
+                return terminal
+            return "unknown"
 
     def _decide(self, credential: object, scope_id: object, request_id: object,
                 digest: object, outcome: str) -> dict:
@@ -451,15 +607,16 @@ class ApprovalAuthority:
 
         def commit(holder: Credential) -> dict:
             now = self._now()
+            self._sweep(now)
             _require_approver(holder)
-            grant = self._grants.get(scope_id) if type(scope_id) is str else None
-            if grant is None:
-                raise Refused("scope_unknown")
+            grant = self._grant_for(scope_id)
             scope = grant.scope
             if (not hmac.compare_digest(scope.holder, holder.token_id)
                     or holder.serial != grant.holder_serial):
                 raise Refused("scope_not_delegable")
-            if now >= scope.expires_at:
+            if grant.expired or now >= scope.expires_at:
+                grant.expired = True
+                self._evict_grant(scope.scope_id)
                 raise Refused("scope_expired")
             bound = dict(scope.bindings).get(request_id) if type(request_id) is str else None
             if bound is None:
@@ -468,16 +625,16 @@ class ApprovalAuthority:
                 raise Refused("scope_replay")
             if not hmac.compare_digest(bound, digest):
                 raise Refused("digest_mismatch")
-            entry = self._requests[request_id]
-            if entry.state != "pending":
-                raise Refused("request_answered")
-            if now >= entry.request.expires_at:
-                raise Refused("request_expired")
+            entry = self._live_request(request_id, now)
             grant.used.add(request_id)
             entry.state = outcome
-            return {"request_id": request_id, "digest": bound, "outcome": outcome,
-                    "principal": holder.principal, "requester": entry.requester,
-                    "scope_id": scope.scope_id, "decided_at": now}
+            result = {"request_id": request_id, "digest": bound, "outcome": outcome,
+                      "principal": holder.principal, "requester": entry.requester,
+                      "scope_id": scope.scope_id, "decided_at": now}
+            self._evict_request(request_id, outcome)
+            if len(grant.used) >= len(scope.bindings):
+                self._evict_grant(scope.scope_id)
+            return result
 
         with self._lock:
             return self._registry._call_if_current(credential, commit)

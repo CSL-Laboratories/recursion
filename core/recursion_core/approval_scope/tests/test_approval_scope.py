@@ -708,16 +708,18 @@ class ScopeExpiryTests(unittest.TestCase):
         # A ttl shorter than every request still wins.
         self.assertEqual(grant(self.auth, self.device, ids, ttl_seconds=30).expires_at, T0 + 30)
         scope = grant(self.auth, self.device, ids, ttl_seconds=10_000)
-        # The later requests are still open, but this scope has ended with the earliest.
-        self.clock.now = T0 + 300
-        for r in (reqs[0], reqs[2]):
-            self.assertEqual(self.auth.state(r.request_id), "pending")
-            with self.assertRaises(Refused) as ctx:
-                self.auth.approve(self.device, scope.scope_id, r.request_id, r.digest)
-            self.assertEqual(ctx.exception.code, "scope_expired")
+        # Sample the still-valid instant before any observation of expiry. A later
+        # step backward must not be required to accept: expiry latches.
         self.clock.now = T0 + 299
-        out = self.auth.approve(self.device, scope.scope_id, reqs[2].request_id, reqs[2].digest)
+        out = self.auth.approve(self.device, scope.scope_id, reqs[0].request_id, reqs[0].digest)
         self.assertEqual(out["outcome"], "approved")
+        self.assertEqual(out["decided_at"], T0 + 299)
+        # The later request is still open, but this scope has ended with the earliest.
+        self.clock.now = T0 + 300
+        self.assertEqual(self.auth.state(reqs[2].request_id), "pending")
+        with self.assertRaises(Refused) as ctx:
+            self.auth.approve(self.device, scope.scope_id, reqs[2].request_id, reqs[2].digest)
+        self.assertEqual(ctx.exception.code, "scope_expired")
 
     def test_unknown_scope_refuses(self) -> None:
         with self.assertRaises(Refused) as ctx:
@@ -778,7 +780,9 @@ class PostLockClockTests(unittest.TestCase):
             registry._lock = real
         self.assertEqual(seen["n"], 2)
         # The decision did not land. state() then reports expiry at the new time.
-        self.assertEqual(auth._requests[opened.request_id].state, "pending")
+        entry = auth._requests.get(opened.request_id)
+        if entry is not None:
+            self.assertNotEqual(entry.state, "approved")
         self.assertEqual(auth.state(opened.request_id), "expired")
 
     def test_decided_at_is_the_time_after_both_locks(self) -> None:
@@ -837,12 +841,17 @@ class PostLockClockTests(unittest.TestCase):
                         self.assertEqual(len(auth._requests), 0)
                     elif name == "pending":
                         self.assertEqual(auth.pending(device), [])
-                        self.assertEqual(auth._requests[opened.request_id].shown, set())
+                        entry = auth._requests.get(opened.request_id)
+                        if entry is not None:
+                            self.assertEqual(entry.shown, set())
+                        self.assertEqual(auth.state(opened.request_id), "expired")
                     elif name == "show":
                         with self.assertRaises(Refused) as ctx:
                             auth.show(device, opened.request_id)
                         self.assertEqual(ctx.exception.code, "request_expired")
-                        self.assertEqual(auth._requests[opened.request_id].shown, set())
+                        entry = auth._requests.get(opened.request_id)
+                        if entry is not None:
+                            self.assertEqual(entry.shown, set())
                     else:
                         with self.assertRaises(Refused) as ctx:
                             auth.grant(device, [opened.request_id], ttl_seconds=60)
@@ -937,6 +946,153 @@ class CredentialRetentionTests(unittest.TestCase):
         else:
             self.assertEqual(len(auth._grants), 1)
             auth.grant(device, [opened.request_id], ttl_seconds=60)
+
+
+class ExpiryLatchTests(unittest.TestCase):
+    """Expiry latches, the open cap counts that latch, and terminal rows stay bounded."""
+
+    def _world(self):
+        clock = Clock(T0)
+        registry = CredentialRegistry()
+        auth = ApprovalAuthority(clock, registry)
+        plugin = cred(registry, "plugin", {"control"})
+        device = cred(registry, "paired_device", {"approve"})
+        return clock, auth, plugin, device
+
+    def test_clock_rollback_does_not_approve_an_expired_scope(self) -> None:
+        # Repro: request and scope both end at T0+5. Observing that instant refuses.
+        # Stepping the clock back to T0+1 must not let the same scope approve.
+        clock, auth, plugin, device = self._world()
+        opened = auth.open(plugin, request(expires_at=T0 + 5))
+        auth.show(device, opened.request_id)
+        scope = auth.grant(device, [opened.request_id], ttl_seconds=100)
+        self.assertEqual(scope.expires_at, T0 + 5)
+        clock.now = scope.expires_at
+        self.assertEqual(auth.state(opened.request_id), "expired")
+        with self.assertRaises(Refused) as ctx:
+            auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+        self.assertEqual(ctx.exception.code, "scope_expired")
+        clock.now = T0 + 1
+        with self.assertRaises(Refused) as ctx:
+            auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+        self.assertEqual(ctx.exception.code, "scope_expired")
+        self.assertEqual(auth.state(opened.request_id), "expired")
+        self.assertNotIn(opened.request_id, auth._requests)
+
+    def test_clock_rollback_cannot_exceed_the_open_cap(self) -> None:
+        clock, auth, plugin, device = self._world()
+        early = []
+        for i in range(MAX_OPEN_PER_OPENER):
+            opened = auth.open(plugin, request(expires_at=T0 + 5, effect={"n": i}))
+            early.append(opened)
+        auth.pending(device)
+        scopes = [auth.grant(device, [opened.request_id], ttl_seconds=100) for opened in early]
+        clock.now = T0 + 5
+        later = []
+        for i in range(MAX_OPEN_PER_OPENER):
+            later.append(auth.open(plugin, request(expires_at=T0 + 50, effect={"n": i, "b": 1})))
+        with self.assertRaises(Refused) as ctx:
+            auth.open(plugin, request(expires_at=T0 + 50, effect={"n": "extra", "b": 1}))
+        self.assertEqual(ctx.exception.code, "open_cap_reached")
+        clock.now = T0 + 1
+        listed = auth.pending(device)
+        self.assertLessEqual(len(listed), MAX_OPEN_PER_OPENER)
+        self.assertEqual(len(listed), MAX_OPEN_PER_OPENER)
+        self.assertLessEqual(len(auth._requests), MAX_OPEN_PER_OPENER)
+        listed_ids = {item["request_id"] for item in listed}
+        for opened, scope in zip(early, scopes):
+            self.assertNotIn(opened.request_id, listed_ids)
+            self.assertEqual(auth.state(opened.request_id), "expired")
+            with self.assertRaises(Refused) as ctx:
+                auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+            self.assertEqual(ctx.exception.code, "scope_expired")
+        # A latched expiry does not freeze a request that is still inside its window.
+        fresh = later[0]
+        auth.show(device, fresh.request_id)
+        fresh_scope = auth.grant(device, [fresh.request_id], ttl_seconds=10)
+        out = auth.approve(device, fresh_scope.scope_id, fresh.request_id, fresh.digest)
+        self.assertEqual(out["outcome"], "approved")
+
+    def test_terminal_rows_stay_bounded_across_cycles(self) -> None:
+        clock, auth, plugin, device = self._world()
+        for i in range(2000):
+            opened = auth.open(plugin, request(expires_at=clock.now + 5, effect={"n": i}))
+            auth.show(device, opened.request_id)
+            scope = auth.grant(device, [opened.request_id], ttl_seconds=100)
+            clock.now = opened.request.expires_at
+            self.assertEqual(auth.state(opened.request_id), "expired")
+            with self.assertRaises(Refused):
+                auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+        self.assertLessEqual(len(auth._requests), 1)
+        self.assertLessEqual(len(auth._grants), 1)
+        self.assertLessEqual(len(auth._request_tombs), scope_mod._MAX_TOMBSTONES)
+        self.assertLessEqual(len(auth._grant_tombs), scope_mod._MAX_TOMBSTONES)
+
+    def test_grants_per_request_are_bounded(self) -> None:
+        _clock, auth, plugin, device = self._world()
+        opened = auth.open(plugin, request())
+        auth.show(device, opened.request_id)
+        granted = 0
+        for _ in range(2000):
+            try:
+                auth.grant(device, [opened.request_id], ttl_seconds=60)
+            except Refused as exc:
+                self.assertEqual(exc.code, "grant_cap_reached")
+                break
+            granted += 1
+        else:
+            self.fail("grants on one request were not bounded")
+        self.assertGreater(granted, 0)
+        self.assertLessEqual(granted, scope_mod.MAX_GRANTS_PER_REQUEST)
+        self.assertLessEqual(len(auth._grants), scope_mod.MAX_GRANTS_PER_REQUEST)
+        kept = next(iter(auth._grants.values())).scope
+        out = auth.approve(device, kept.scope_id, opened.request_id, opened.digest)
+        self.assertEqual(out["outcome"], "approved")
+
+    def test_replay_of_evicted_id_is_refused(self) -> None:
+        clock, auth, plugin, device = self._world()
+        opened = auth.open(plugin, request(expires_at=clock.now + 5, effect={"n": 0}))
+        auth.show(device, opened.request_id)
+        scope = auth.grant(device, [opened.request_id], ttl_seconds=30)
+        cycles = getattr(scope_mod, "_MAX_TOMBSTONES", 0) + 2
+        for i in range(1, cycles):
+            nxt = auth.open(plugin, request(expires_at=clock.now + 5, effect={"n": i}))
+            auth.show(device, nxt.request_id)
+            nxt_scope = auth.grant(device, [nxt.request_id], ttl_seconds=30)
+            clock.now = nxt.request.expires_at
+            self.assertEqual(auth.state(nxt.request_id), "expired")
+            with self.assertRaises(Refused):
+                auth.approve(device, nxt_scope.scope_id, nxt.request_id, nxt.digest)
+        # The first id has been pushed out of the detailed tombstones. Rolling the
+        # clock under its expires_at must still refuse, not treat it as open.
+        clock.now = T0 + 1
+        self.assertEqual(auth.state(opened.request_id), "expired")
+        self.assertNotIn(opened.request_id, auth._requests)
+        with self.assertRaises(Refused) as ctx:
+            auth.show(device, opened.request_id)
+        self.assertEqual(ctx.exception.code, "request_expired")
+        with self.assertRaises(Refused) as ctx:
+            auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+        self.assertEqual(ctx.exception.code, "scope_expired")
+        draft = request(expires_at=T0 + 100_000, effect={"n": "reopen"})
+        real = scope_mod.secrets.token_hex
+        once = {"pending": True}
+
+        def fake(n, _real=real, _once=once, _old=opened.request_id):
+            if _once["pending"]:
+                _once["pending"] = False
+                return _old
+            return _real(n)
+
+        scope_mod.secrets.token_hex = fake
+        try:
+            reopened = auth.open(plugin, draft)
+        finally:
+            scope_mod.secrets.token_hex = real
+        with self.assertRaises(Refused):
+            auth.approve(device, scope.scope_id, reopened.request_id, reopened.digest)
+        self.assertNotEqual(auth.state(reopened.request_id), "approved")
+        self.assertNotEqual(reopened.request_id, opened.request_id)
 
 
 if __name__ == "__main__":

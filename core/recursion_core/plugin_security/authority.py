@@ -70,8 +70,11 @@ _FIELDS = frozenset({"schema", "profile_id", "issuer", "plugin_id", "artifact_sh
 _BUDGETS = frozenset({"currency", "max_effect_minor", "total_minor"})
 _ID = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}")
 _SCOPE_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
-# Provider and model version use the same grammar ``ConnectionBreaker.bind_run`` accepts (``breaker._ID``),
-# so every model a run can be bound to (``vendor/model``, ``model@rev``) can also be named in a profile.
+# Provider and model version use the id grammar of ``ConnectionBreaker.bind_run`` (``breaker._ID``), so
+# every model in that grammar (``vendor/model``, ``model@rev``) can be bound to a run and named in a
+# profile. ``bind_run`` records a model version more widely than this, as any 1 to 128 printable ASCII
+# characters with no space. A run can therefore be bound to a model no profile can name (``opus[1m]``,
+# ``a+b``), and an order effect that cites such a run is refused ``profile_model_mismatch``.
 _MODEL_VALUE = re.compile(r"[A-Za-z0-9_.:@/-]{1,128}")
 _KIND = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 _LEDGER_MAGIC = "csl-authority-ledger/v0"

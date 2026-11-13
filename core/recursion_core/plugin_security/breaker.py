@@ -39,12 +39,25 @@ __all__ = ["ConnectionBreaker", "TYPED_LIMITS", "create_breaker_store"]
 TYPED_LIMITS = frozenset({"plan_limit", "rate_limit", "usage_window_exhausted"})
 _NOT_ENGINE_FAULTS = frozenset({"core_timeout", "core_deadline", "caller_cancelled"})
 _ID = re.compile(r"[A-Za-z0-9_.:@/-]{1,128}")
+# A model version is recorded as the route gives it: 1 to 128 printable ASCII characters with no
+# space in it (0x21 to 0x7E). It is a field of a run's row, never a key, and it is written and read
+# as a bound parameter, so it does not need the id grammar; a vendor's own spelling such as
+# "opus[1m]" does not fit that grammar. This is the one statement of the rule in this package.
+# ``subscription_routes.own_loop`` states the same rule for the model of its own routes. Neither
+# package imports the other, and ``tests/test_model_rule.py`` holds the two rules together.
+_MODEL = re.compile(r"[\x21-\x7e]{1,128}")
 _STORE_MAGIC = "csl-breaker-store/v0"
 
 
 def _check_id(value: object, code: str) -> str:
     if type(value) is not str or not _ID.fullmatch(value):
         raise Refused(code)
+    return value
+
+
+def _check_model(value: object) -> str:
+    if type(value) is not str or not _MODEL.fullmatch(value):
+        raise Refused("invalid_model_version")
     return value
 
 
@@ -87,12 +100,21 @@ class ConnectionBreaker:
         self._lease_seconds = probe_lease_seconds
         self._leases: dict[str, tuple[str, float]] = {}
 
+    @staticmethod
+    def model_recordable(model_version: object) -> bool:
+        """Whether ``bind_run`` would record this model version. Needs no store and writes nothing."""
+        try:
+            _check_model(model_version)
+        except Refused:
+            return False
+        return True
+
     def bind_run(self, run_id: str, connection: str, plugin_id: str, provider: str,
                  model_version: str) -> None:
         """Record a run's connection, owner, provider and model; a run cannot move any of them."""
         row = (_check_id(run_id, "invalid_run_id"), _check_id(connection, "invalid_connection"),
                _check_id(plugin_id, "invalid_plugin_id"), _check_id(provider, "invalid_provider"),
-               _check_id(model_version, "invalid_model_version"))
+               _check_model(model_version))
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:

@@ -18,7 +18,7 @@ import os
 import subprocess
 from collections.abc import Mapping, Sequence
 
-from recursion_core.child_env import ChildRoute, ValidatedEnv, build_child_env, spawn
+from recursion_core.child_env import ChildRoute, EnvRefused, ValidatedEnv, build_child_env, spawn
 
 __all__ = ["launch_env", "spawn_route_process"]
 
@@ -60,7 +60,13 @@ def launch_env(
     """
 
     checked = dict(child_env)
-    credential = credential_env if isinstance(credential_env, str) else ""
+    if not isinstance(credential_env, str) or credential_env not in ("", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        raise EnvRefused(None, "route_key_malformed")
+    credential = credential_env
+    if credential:
+        value = checked.get(credential)
+        if not isinstance(value, str) or not value or "\0" in value:
+            raise EnvRefused(credential, "route_key_malformed")
     parent = {
         name: value for name, value in checked.items()
         if name not in ("HOME", credential) and not _blocked_secret(name)
@@ -94,10 +100,10 @@ def spawn_route_process(
     """
 
     validated, launched = launch_env(child_env, route_home=route_home, credential_env=credential_env)
-    popen = subprocess.Popen
-    if launched == validated.to_dict():
-        return spawn(argv, validated, cwd=cwd, popen=popen)
-    return popen(
-        list(argv), env=dict(launched), cwd=cwd, shell=False, close_fds=True,
-        start_new_session=os.name != "nt",
-    )
+    def launch(resolved_argv, **kwargs):
+        # Only launch_env's checked credential overlay differs from the validated
+        # mapping. Executable resolution and process options always go through spawn.
+        kwargs["env"] = dict(launched)
+        return subprocess.Popen(resolved_argv, **kwargs)
+
+    return spawn(argv, validated, cwd=cwd, popen=launch)

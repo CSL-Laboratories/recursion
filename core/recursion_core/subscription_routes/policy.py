@@ -28,20 +28,30 @@ login entry. No credential file is opened or read. The one file read is a Hermes
 ``.hermes/config.yaml`` that is already exactly the size of the adopt switch Recursion writes there
 (37 bytes), to confirm it is that switch; a config of any other size refuses unread. Immediately
 before a Hermes launch the real path is walked from ``/`` with ``openat`` and ``O_NOFOLLOW`` on
-each component, and ``.hermes`` is listed through the directory fd held since the home check
-(``listdir`` on that fd). ``.env`` and ``.op.env`` are opened ``O_NOFOLLOW`` and not read, and
-refuse as a file, a symlink or a directory: Hermes ``load_hermes_dotenv`` loads ``~/.hermes/.env``
-over the process environment, and ``.op.env`` beside it, before ``config.yaml``, so ``HERMES_HOME``
-there selects a different config that defaults ``adopt_external_logins`` to true. An API-key
-``.hermes`` may contain only ``config.yaml``. A subscription route may still hold other names;
-those stay ``own_login_store_not_inspected`` (whether to read them is open for Lucas, PRODUCT.md
-055cc7a5 section 2). The launcher receives ``route_home_fd``, a dup of the held directory, valid
-only during that call. ``env["HOME"]`` stays the path the profile named. ``HOME=/proc/self/fd/N``
-is not set: that path would name this process, not a child. A same-uid swap of the path after the
-walk returns is not closed here; a child that re-opens ``env["HOME"]`` is outside this bind. A
-same-inode rewrite of ``config.yaml`` after the read is still unbound. A ``.env`` created in the
-held directory after the listing returns is not re-listed. ``PROJECT_ROOT/.env`` in the Hermes
-install tree is a separate file ``load_hermes_dotenv`` can load and is not checked here.
+each component. Ancestor directories are opened ``O_PATH|O_DIRECTORY`` and checked with ``fstat``,
+so the walk needs search permission: ``O_RDONLY`` would refuse a mode ``0111`` directory that path
+lookup can still traverse. The final route directory is the one opened for read. That walk runs
+once before the adopt-switch write, so a refusal there does not create ``.hermes/config.yaml``.
+``.hermes`` is listed through the directory fd held since the home check (``listdir`` on that fd).
+At that listing ``config.yaml`` is opened ``O_RDONLY|O_NOFOLLOW`` from the ``.hermes`` fd and its
+bytes are checked from that fd. After the walk that follows the listing, ``fstatat`` of the name
+must still match the pinned fd's ``st_dev``, ``st_ino``, size and ``mtime_ns``. ``.env`` and
+``.op.env`` are opened ``O_NOFOLLOW`` and not read, and refuse as a file, a symlink or a directory:
+Hermes ``load_hermes_dotenv`` loads ``~/.hermes/.env`` over the process environment, and ``.op.env``
+beside it, before ``config.yaml``, so ``HERMES_HOME`` there selects a different config that defaults
+``adopt_external_logins`` to true. An API-key ``.hermes`` may contain only ``config.yaml``. A
+subscription route may still hold other names; those stay ``own_login_store_not_inspected``
+(whether to read them is open for Lucas, PRODUCT.md 055cc7a5 section 2). The launcher receives
+``route_home_fd``, a dup of the held directory, valid only during that call. ``env["HOME"]`` stays
+the path the profile named. ``HOME=/proc/self/fd/N`` is not set: that path would name this process,
+not a child. A same-uid swap of the path after the walk returns is not closed here; a child that
+re-opens ``env["HOME"]`` is outside this bind. A same-inode rewrite of ``config.yaml`` that keeps
+the pinned device, inode, size and ``mtime_ns``, or that lands after the ``fstatat``, is still
+unbound. Closing ``route_home_fd`` when this call returns can close a reused descriptor number if
+the launcher already closed it. A ``.env`` created in the held directory after the listing returns
+is not re-listed. On a platform without ``O_PATH`` the ancestor open falls back to ``O_RDONLY`` and
+a search-only ancestor still refuses. ``PROJECT_ROOT/.env`` in the Hermes install tree is a separate
+file ``load_hermes_dotenv`` can load and is not checked here.
 
 ``guard_then_spawn`` takes the launcher and argv as trusted, core-owned inputs: it does not parse
 argv, so an engine flag that selects a provider or config is the caller's responsibility. On a
@@ -746,6 +756,10 @@ _HERMES_DOTENV_NAMES = frozenset({".env", ".op.env"})
 # (a crash between mkdir and rename) is never read as Hermes state.
 _HERMES_STAGING_PREFIX = ".hermes.recursion-"
 _DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+# Ancestors need search, not read. O_RDONLY is 0, so without O_PATH this is _DIR_OPEN_FLAGS.
+_ANCESTOR_OPEN_FLAGS = (
+    getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
 _HERMES_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
                       | getattr(os, "O_NOCTTY", 0))
 
@@ -1321,9 +1335,9 @@ def _bind_hermes_launch_path(engine: str, route_home: str, hermes_dev: int, herm
 
     A same-inode rewrite after the read cannot be bound: the child opens ``config.yaml``
     by path, and ``lstat`` cannot see new bytes in the inode just read. This check does
-    not try to close that window. The caller walks the ancestors and lists ``.hermes``
-    through the held directory fd after this returns; a swap that lands after those
-    later checks is still outside this function.
+    not try to close that window. The caller lists ``.hermes`` through the held directory
+    fd and pins ``config.yaml``; a same-inode rewrite that keeps the pinned device, inode,
+    size and ``mtime_ns``, or a swap after that ``fstatat``, is still outside this function.
     """
 
     hold = _route_home_for(engine, route_home)
@@ -1360,8 +1374,11 @@ def _bind_route_home_from_root(engine: str, route_home: str) -> None:
 
     ``os.lstat`` of the final path follows ancestor symlinks, so a retargeted ancestor can
     still report the held inode until the next look. Each real-path component is opened
-    ``O_NOFOLLOW``. A symlink component, a replaced parent, or a final inode other than
-    the held directory refuses. This does not cover a swap that happens after it returns.
+    ``O_NOFOLLOW``. Ancestors use ``O_PATH|O_DIRECTORY`` and ``fstat``: path lookup needs
+    search permission, and ``O_RDONLY`` refuses a mode ``0111`` directory. The final route
+    directory is opened with the read flags. A symlink component, a replaced parent, or a
+    final inode other than the held directory refuses. This does not cover a swap that
+    happens after it returns.
     """
 
     hold = _route_home_for(engine, route_home)
@@ -1379,8 +1396,10 @@ def _bind_route_home_from_root(engine: str, route_home: str) -> None:
     dir_fd = -1
     opened: tuple[int, int] | None = None
     try:
-        dir_fd = os.open(os.sep, _DIR_OPEN_FLAGS)
-        for part in parts:
+        dir_fd = os.open(os.sep, _ANCESTOR_OPEN_FLAGS)
+        for index, part in enumerate(parts):
+            # The route directory itself is readable by its owner. Ancestors may not be.
+            flags = _DIR_OPEN_FLAGS if index == len(parts) - 1 else _ANCESTOR_OPEN_FLAGS
             try:
                 st = os.stat(part, dir_fd=dir_fd, follow_symlinks=False)
             except OSError:
@@ -1388,11 +1407,14 @@ def _bind_route_home_from_root(engine: str, route_home: str) -> None:
             if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
                 raise SubscriptionRouteRefused(engine, "route_home_not_private")
             try:
-                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+                next_fd = os.open(part, flags, dir_fd=dir_fd)
             except OSError:
                 raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
             os.close(dir_fd)
             dir_fd = next_fd
+            checked = os.fstat(dir_fd)
+            if stat.S_ISLNK(checked.st_mode) or not stat.S_ISDIR(checked.st_mode):
+                raise SubscriptionRouteRefused(engine, "route_home_not_private")
         final = os.fstat(dir_fd)
         opened = (final.st_dev, final.st_ino)
     except SubscriptionRouteRefused:
@@ -1423,13 +1445,86 @@ def _reject_hermes_dotenv(engine: str, hermes_fd: int, name: str) -> None:
     raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name)
 
 
-def _refuse_hermes_dir_entries(engine: str, route_home: str, auth: str, hermes_dev: int, hermes_ino: int) -> None:
+def _pin_hermes_config_fd(engine: str, hermes_fd: int, hold: _RouteHome) -> int:
+    """Open ``config.yaml`` under the held ``.hermes`` and require the false adopt switch.
+
+    ``O_RDONLY|O_NOFOLLOW`` (plus the non-blocking, non-controlling flags used for every
+    switch read). The bytes are read from this descriptor. The caller keeps it open until
+    the post-listing walk has re-checked the name.
+    """
+
+    fd = -1
+    data = b""
+    try:
+        fd = os.open("config.yaml", _HERMES_OPEN_FLAGS, dir_fd=hermes_fd)
+        opened = os.fstat(fd)
+        data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+    except OSError:
+        if fd >= 0:
+            os.close(fd)
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    if (hold.config_dev is not None and hold.config_ino is not None
+            and stat.S_ISREG(opened.st_mode) and opened.st_uid == os.geteuid()
+            and opened.st_size == len(_HERMES_ADOPT_YAML)
+            and (opened.st_dev, opened.st_ino) == (hold.config_dev, hold.config_ino)
+            and data == _HERMES_ADOPT_YAML):
+        return fd
+    if _is_true_variant(data):
+        seen = (opened.st_dev, opened.st_ino)
+        os.close(fd)
+        _neutralize_true_variant(hermes_fd, seen)
+    else:
+        os.close(fd)
+    raise _refuse_hermes_config(engine, "config.yaml")
+
+
+def _config_stat_id(st: os.stat_result) -> tuple[int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _recheck_pinned_hermes_config(engine: str, route_home: str, config_fd: int) -> None:
+    """The name ``config.yaml`` still matches the descriptor pinned at listing.
+
+    ``fstatat`` is on ``.hermes`` opened from the held route directory. A different
+    device, inode, size or ``mtime_ns`` refuses. A different inode is unlinked so the
+    refusal does not leave ``adopt_external_logins: true`` under that name. A same-inode
+    rewrite that keeps all four fields is not visible here.
+    """
+
+    hold = _route_home_for(engine, route_home)
+    try:
+        pinned = os.fstat(config_fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    try:
+        hermes_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=hold.fd)
+    except OSError:
+        raise _refuse_hermes_config(engine, ".hermes") from None
+    try:
+        try:
+            live = os.stat("config.yaml", dir_fd=hermes_fd, follow_symlinks=False)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        if stat.S_ISREG(live.st_mode) and _config_stat_id(live) == _config_stat_id(pinned):
+            return
+        if (live.st_dev, live.st_ino) != (pinned.st_dev, pinned.st_ino):
+            try:
+                os.unlink("config.yaml", dir_fd=hermes_fd)
+            except OSError:
+                pass
+        raise _refuse_hermes_config(engine, "config.yaml")
+    finally:
+        os.close(hermes_fd)
+
+
+def _refuse_hermes_dir_entries(engine: str, route_home: str, auth: str, hermes_dev: int, hermes_ino: int) -> int:
     """List the held ``.hermes`` and refuse a dotenv name, or any other name on an API-key route.
 
     The directory is opened from the route-home descriptor (``O_NOFOLLOW``). ``listdir`` uses
     that fd. A ``.env`` planted after an earlier listing is still in this one. A subscription
-    route may keep other names; those are the uninspected own store. This does not see a name
-    created after it returns.
+    route may keep other names; those are the uninspected own store. ``config.yaml`` is opened
+    from this fd and returned still open; the caller closes it after the post-listing walk.
+    This does not see a name created after it returns.
     """
 
     hold = _route_home_for(engine, route_home)
@@ -1437,6 +1532,7 @@ def _refuse_hermes_dir_entries(engine: str, route_home: str, auth: str, hermes_d
         hermes_fd = os.open(".hermes", _DIR_OPEN_FLAGS, dir_fd=hold.fd)
     except OSError:
         raise _refuse_hermes_config(engine, ".hermes") from None
+    pinned = -1
     try:
         try:
             hermes_st = os.fstat(hermes_fd)
@@ -1458,11 +1554,16 @@ def _refuse_hermes_dir_entries(engine: str, route_home: str, auth: str, hermes_d
         if (hold.config_dev is None or hold.config_ino is None or not stat.S_ISREG(cfg.st_mode)
                 or (cfg.st_dev, cfg.st_ino) != (hold.config_dev, hold.config_ino)):
             raise _refuse_hermes_config(engine, "config.yaml")
+        pinned = _pin_hermes_config_fd(engine, hermes_fd, hold)
         if auth != "subscription":
             extra = sorted(set(names) - _HERMES_LAUNCH_ALLOW)
             if extra:
                 raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", extra[0])
+        kept, pinned = pinned, -1
+        return kept
     finally:
+        if pinned >= 0:
+            os.close(pinned)
         os.close(hermes_fd)
 
 
@@ -1481,6 +1582,9 @@ def _launch_checked(
     if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model):
         raise SubscriptionRouteRefused(decision.engine, "model_not_bound", decision.model)
     _recheck_route_home(decision.engine, route_home)
+    if decision.engine == "hermes":
+        # Before the adopt write. A refusal here must not create .hermes/config.yaml.
+        _bind_route_home_from_root(decision.engine, route_home)
     _apply_hermes_adopt_override(decision, route_home)
     _recheck_route_home(decision.engine, route_home)
     # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
@@ -1488,19 +1592,27 @@ def _launch_checked(
     # route_home_fd is a dup of the held directory. It is closed when this call returns, so a
     # real launcher must dup it or spawn before returning. Re-opening env HOME by path is not
     # bound: a same-uid rename after the walk below can make that path a different directory.
+    # Residual: if the launcher closed route_home_fd and the process reused that number, the
+    # close below closes the new descriptor.
     home_fd = -1
     try:
         forwarded = dict(forward)
         if decision.engine == "hermes":
             # Read the switch through the held dirfd, then lstat the paths, then walk every
-            # ancestor from / and list .hermes through the held fd. The walk runs again after
-            # the listing so a path swapped during the listing still refuses. A swap after
-            # that second walk, and a .env created after the listing, are not seen here.
+            # ancestor from / and list .hermes through the held fd. The listing pins
+            # config.yaml. The walk runs again after the listing, and fstatat must still
+            # match the pin. A same-inode rewrite that keeps dev, ino, size and mtime_ns,
+            # a swap after that fstatat, and a .env created after the listing, are not seen.
             hermes_dev, hermes_ino = _reverify_hermes_switch(decision.engine, route_home)
             _bind_hermes_launch_path(decision.engine, route_home, hermes_dev, hermes_ino)
             _bind_route_home_from_root(decision.engine, route_home)
-            _refuse_hermes_dir_entries(decision.engine, route_home, decision.auth, hermes_dev, hermes_ino)
-            _bind_route_home_from_root(decision.engine, route_home)
+            config_fd = _refuse_hermes_dir_entries(
+                decision.engine, route_home, decision.auth, hermes_dev, hermes_ino)
+            try:
+                _bind_route_home_from_root(decision.engine, route_home)
+                _recheck_pinned_hermes_config(decision.engine, route_home, config_fd)
+            finally:
+                os.close(config_fd)
             try:
                 home_fd = os.dup(_route_home_for(decision.engine, route_home).fd)
             except OSError:

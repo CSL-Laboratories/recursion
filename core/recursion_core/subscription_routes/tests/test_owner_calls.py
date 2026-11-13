@@ -904,6 +904,89 @@ class HermesHomeReuseTests(_Calls):
         self.assertFalse((decoy / "home" / ".hermes").exists())
         self.assertEqual(ADOPT_YAML, (home / ".hermes" / "config.yaml").read_bytes())
 
+    def test_search_only_ancestor_launches_and_the_root_walk_sees_no_adopt_write(self) -> None:
+        # Mode 0111 is searchable. Opening it O_RDONLY needs read permission and
+        # refuses route_home_not_private after the adopt switch was already written.
+        parent = self.root / "noread"
+        parent.mkdir(mode=0o700)
+        home = parent / "route"
+        self._private(home)
+        os.chmod(parent, 0o111)
+        try:
+            seen: list[bool] = []
+            real = policy._bind_route_home_from_root
+
+            def wrapped(engine: str, route_home: str) -> None:
+                seen.append(os.path.lexists(os.path.join(route_home, ".hermes", "config.yaml")))
+                real(engine, route_home)
+
+            refused: SubscriptionRouteRefused | None = None
+            try:
+                with mock.patch.object(policy, "_bind_route_home_from_root", side_effect=wrapped):
+                    self._hermes_at(home)
+            except SubscriptionRouteRefused as exc:
+                refused = exc
+            self.assertEqual((None, False), (None if refused is None else refused.cause, seen[0] if seen else None))
+            self.assertEqual(ADOPT_YAML, (home / ".hermes" / "config.yaml").read_bytes())
+            self.assertIn("route_home_fd", self.launcher.call_args.kwargs)
+            self.assertEqual(1, self.launcher.call_count)
+        finally:
+            os.chmod(parent, 0o700)
+
+    def test_new_inode_config_at_the_post_listing_root_walk_refuses(self) -> None:
+        # The listing stats config.yaml. Replacing that inode at the start of the
+        # walk after the listing must not launch: path and route_home_fd would
+        # both see the new bytes.
+        evil = b"auth:\n  adopt_external_logins: true \n"
+        self.assertEqual(len(ADOPT_YAML), len(evil))
+        listed = False
+        swapped = False
+        real_list = policy._refuse_hermes_dir_entries
+        real_walk = policy._bind_route_home_from_root
+
+        def listing(*args: object, **kwargs: object):
+            nonlocal listed
+            result = real_list(*args, **kwargs)
+            listed = True
+            return result
+
+        def walk(engine: str, route_home: str) -> None:
+            nonlocal swapped
+            if listed and not swapped:
+                swapped = True
+                cfg = os.path.join(route_home, ".hermes", "config.yaml")
+                os.link(cfg, os.path.join(route_home, "kept-config-inode"))
+                os.unlink(cfg)
+                fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    os.write(fd, evil)
+                finally:
+                    os.close(fd)
+            real_walk(engine, route_home)
+
+        def spy(_argv: list[str], **kwargs: object) -> str:
+            fd = kwargs["route_home_fd"]
+            self.assertIsInstance(fd, int)
+            hermes_fd = os.open(".hermes", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                cfg_fd = os.open("config.yaml", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=hermes_fd)
+                try:
+                    via_fd = os.read(cfg_fd, 64)
+                finally:
+                    os.close(cfg_fd)
+            finally:
+                os.close(hermes_fd)
+            via_path = (self.home / ".hermes" / "config.yaml").read_bytes()
+            raise AssertionError(f"launched path={via_path!r} fd={via_fd!r}")
+
+        self.launcher.side_effect = spy
+        with mock.patch.object(policy, "_refuse_hermes_dir_entries", side_effect=listing), \
+                mock.patch.object(policy, "_bind_route_home_from_root", side_effect=walk):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self.assertTrue(swapped)
+        self.launcher.assert_not_called()
+
     def test_launcher_gets_the_held_route_home_fd_and_not_a_proc_self_home(self) -> None:
         # The fake launcher does not spawn. HOME=/proc/self/fd/N would name this
         # process, not a child. The contract is the held directory fd, valid
@@ -1039,11 +1122,21 @@ class HermesHomeReuseTests(_Calls):
             return os.stat_result((*st[:4], st.st_uid + 1, *st[5:]))
 
         closed.clear()
+        opened_fds: list[int] = []
+
+        def spy_open_fd(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            fd = real_open(path, flags, *args, **kwargs)
+            opened_fds.append(fd)
+            return fd
+
         with mock.patch.object(policy.os, "fstat", side_effect=other_owner), \
+                mock.patch.object(policy.os, "open", side_effect=spy_open_fd), \
                 mock.patch.object(policy.os, "close", side_effect=spy_close):
             self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
-        # .hermes, config.yaml, and the route-home directory held from _check_home.
-        self.assertEqual(3, len(closed))
+        # The owner mismatch refuses while reading the existing switch. Every descriptor
+        # this launch opened, including the ancestor walk and the route home, is closed.
+        self.assertTrue(opened_fds)
+        self.assertEqual(sorted(opened_fds), sorted(closed))
         self.launcher.assert_not_called()
 
     def test_other_engines_still_refuse_a_hermes_dir_that_holds_the_switch(self) -> None:

@@ -328,6 +328,150 @@ class Adv2HungPluginTests(GuiCase):
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
+class Adv2EvictedStopTests(GuiCase):
+    """A connection still among the readers when their room is full is closed to make way for a new
+    one. Its request may already be in the daemon's hands by then. A read on it is dropped (the test
+    above this class); a Stop that has arrived is carried out, and counted like any other Stop."""
+
+    def wait_for(self, predicate, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not predicate():
+            time.sleep(0.02)
+        return predicate()
+
+    def stop_bytes(self, port, sent, length=None):
+        """A ``POST /stop`` whose body is ``sent``; ``length`` is the Content-Length when it says more."""
+        length = len(sent) if length is None else length
+        return (f'POST /stop HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n'
+                f'Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {length}\r\n\r\n').encode() + sent
+
+    def evict_a_held_stop(self, gui, payload):
+        """Send ``payload``, hold its thread where its headers have just been read, and open quiet
+        connections until that connection is the one evicted. Then let the thread go on and wait
+        until it is done with the request."""
+        import socket
+        port = gui.address[1]
+        real = gui.server.headers_read
+        at_gate, go, seen = threading.Event(), threading.Event(), {}
+        self.addCleanup(go.set)
+
+        def held(request, method, path):
+            if method != 'POST' or 'request' in seen:
+                return real(request, method, path)
+            seen['request'] = request
+            at_gate.set()
+            go.wait(30)
+            seen['answer'] = real(request, method, path)
+            return seen['answer']
+
+        gui.server.headers_read = held
+        client = socket.create_connection(('127.0.0.1', port), timeout=5)
+        self.addCleanup(client.close)
+        client.sendall(payload)
+        self.assertTrue(at_gate.wait(10), 'the Stop never reached headers_read')
+        for _ in range(4 * daemon_gui.MAX_REQUEST_THREADS):
+            if seen['request'] not in gui.server._reading:
+                break
+            quiet = socket.create_connection(('127.0.0.1', port), timeout=5)  # connects and sends nothing
+            self.addCleanup(quiet.close)
+            time.sleep(0.02)
+        self.assertNotIn(seen['request'], gui.server._reading, 'the Stop was never evicted: nothing was tested')
+        go.set()
+        # Taken or not, the thread is done once headers_read has answered and the request is not being worked on.
+        self.assertTrue(self.wait_for(lambda: 'answer' in seen and seen['request'] not in gui.server._working),
+                        'the thread of the evicted connection did not finish')
+
+    def test_a_stop_that_had_arrived_is_carried_out_when_its_connection_is_evicted(self):
+        for busy in (False, True):
+            with self.subTest(every_request_thread_is_answering=busy):
+                release = threading.Event()
+                self.addCleanup(release.set)
+
+                class BlockedHost:
+                    def operator(self, command):
+                        release.wait(30)
+                        return 200, {'status_code': 'ok', 'result': {}}
+
+                def read_quietly(gui):
+                    try:
+                        self.get(gui, '/read?command=' + READ, timeout=40)
+                    except OSError:
+                        pass
+
+                fake, transport = control_over(BlockedHost())
+                with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+                    readers = [threading.Thread(target=read_quietly, args=(gui,), daemon=True)
+                               for _ in range(daemon_gui.MAX_REQUEST_THREADS if busy else 0)]
+                    for reader in readers:
+                        reader.start()
+                    try:
+                        self.assertTrue(self.wait_for(lambda: len(gui.server._working) == len(readers)))
+                        body = b'run_id=run-evicted&confirm=explicit'
+                        self.evict_a_held_stop(gui, self.stop_bytes(gui.address[1], body))
+                        self.assertEqual(fake.call.stops, [{'run_id': 'run-evicted'}],
+                                         'a Stop the daemon had received was dropped with its connection')
+                    finally:
+                        release.set()
+                        for reader in readers:
+                            reader.join(10)
+
+    def test_evicted_stops_are_counted_under_the_allowance_stop_has(self):
+        import socket
+        gate, lock = threading.Event(), threading.Lock()
+        self.addCleanup(gate.set)
+        active, peak, taken = [0], [0], [0]
+
+        def call(method, params=None):
+            with lock:
+                active[0] += 1
+                taken[0] += 1
+                peak[0] = max(peak[0], active[0])
+            gate.wait(20)
+            with lock:
+                active[0] -= 1
+            return {'code': 'pending', 'run_id': (params or {}).get('run_id'), 'state': 'stop_pending'}
+
+        fake = types.SimpleNamespace(call=call, plugins=FakeOperatorHost({}), route_records=lambda: [])
+        allowance = daemon_gui.MAX_REQUEST_THREADS + daemon_gui.STOP_RESERVED_THREADS
+        connections = allowance + 12  # so the oldest ones are evicted with their Stop already read
+        with LoopbackGUI(ControlClient(lambda method, path, body: adapter.DaemonControl.gui_transport(
+                fake, method, path, body)), lambda env: True, port=0) as gui:
+            port = gui.address[1]
+            real = gui.server.headers_read
+            go, arrived = threading.Event(), [0]
+            self.addCleanup(go.set)
+
+            def all_together(request, method, path):
+                with lock:
+                    arrived[0] += 1
+                go.wait(30)
+                return real(request, method, path)
+
+            gui.server.headers_read = all_together
+            for number in range(connections):
+                client = socket.create_connection(('127.0.0.1', port), timeout=5)
+                self.addCleanup(client.close)
+                client.sendall(self.stop_bytes(port, b'run_id=run-%d&confirm=explicit' % number))
+                # one at a time: every Stop is in the daemon's hands before a later connection evicts it
+                self.assertTrue(self.wait_for(lambda: arrived[0] > number), 'a Stop never reached headers_read')
+            go.set()
+            self.assertTrue(self.wait_for(lambda: taken[0] >= allowance),
+                            'fewer Stops were carried out than Stop has room for: evicted ones were dropped')
+            time.sleep(0.3)  # a Stop taken past the allowance would be inside the control API by now
+            observed = peak[0]
+            gate.set()
+        self.assertEqual(observed, allowance)
+
+    def test_a_stop_cut_short_by_the_eviction_names_no_run(self):
+        whole = b'confirm=explicit&run_id=run-1234567890'
+        sent = whole[:-8]  # ends inside the run id: "...run_id=run-12" is a well-formed Stop of another run
+        fake, transport = control_over(FakeOperatorHost({}))
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            self.evict_a_held_stop(gui, self.stop_bytes(gui.address[1], sent, length=len(whole)))
+        self.assertEqual(fake.call.stops, [], 'a Stop whose body had not all arrived was carried out')
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
 class Adv2DoorTests(GuiCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='rc-adv2-door-'))

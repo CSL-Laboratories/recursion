@@ -220,6 +220,17 @@ class StopTests(GuiHarness):
         self.assertIn("run_id_invalid", body)
         self.assertEqual([c for c in self.api.calls if c[1] == "/v1/runs/stop"], [])
 
+    def test_a_stop_whose_body_ends_before_its_content_length_is_refused(self) -> None:
+        # The part that arrived can be a well-formed Stop of another run: "...run_id=run-12" here.
+        whole = b"confirm=explicit&run_id=run-1234567890"
+        status, _, _ = self.request("POST", "/stop", raw=whole[:-8], headers={"CONTENT_LENGTH": str(len(whole))})
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual([c for c in self.api.calls if c[1] == "/v1/runs/stop"], [])
+        # The whole body, for contrast: the same request is a Stop of the run it names.
+        status, _, _ = self.request("POST", "/stop", raw=whole)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.api.calls[-1], ("POST", "/v1/runs/stop", {"run_id": "run-1234567890"}))
+
 
 class ParityTests(GuiHarness):
     _SEMANTIC = ("api_version", "profile", "enforcement_route", "authority_effect", "order_path", "status_code",

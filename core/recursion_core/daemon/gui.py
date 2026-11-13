@@ -16,6 +16,11 @@ Stop has capacity of its own (ADV2-3): when every request thread is busy answeri
 operator plugin, say), up to ``STOP_RESERVED_THREADS`` more connections are still read, and
 only ``POST /stop`` is answered on them; any other request there gets 503. So busy read
 threads never refuse a Stop (PRODUCT.md d84cdd26, 3.4 S6: Stop on every surface).
+
+A Stop that had already arrived when its connection was closed to make room is carried out
+all the same, under that same allowance; only its answer is lost. Any other request on such a
+connection is dropped. A request body that ends before its ``Content-Length`` is refused by
+the page (``gui.surface``), so a Stop cut short this way names no run at all.
 """
 from collections.abc import Mapping
 import io
@@ -148,15 +153,21 @@ class _Server(ThreadingMixIn, WSGIServer):
             self._forget(request)
 
     def headers_read(self, request, method, path):
-        """Move a connection from reading to answering. False: no thread may answer it now."""
+        """Move a connection from reading to answering. False: no thread may answer it now.
+
+        A connection that was evicted while its request was already here is not answered, with one
+        exception: a Stop. A Stop the daemon has received is carried out, counted under Stop's own
+        allowance like any other Stop and tracked until it is done. Its connection was shut when it
+        was evicted, so its client sees a closed connection and no answer.
+        """
         stop = (method, path.split("?", 1)[0]) == ("POST", "/stop")
         with self._gate:
-            if request not in self._reading:
+            if request not in self._reading and not stop:
                 return False  # evicted: never dispatch a buffered GET/POST past the thread cap
             limit = MAX_REQUEST_THREADS + STOP_RESERVED_THREADS if stop else MAX_REQUEST_THREADS
             if len(self._working) >= limit:
                 return False
-            del self._reading[request]
+            self._reading.pop(request, None)  # an evicted Stop is no longer there
             self._working[request] = stop
             return True
 

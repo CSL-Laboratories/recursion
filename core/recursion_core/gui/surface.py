@@ -262,7 +262,12 @@ class Application:
         if (env.get("CONTENT_TYPE") or "").split(";")[0].strip() != "application/x-www-form-urlencoded":
             raise _BadRequest("content type")
         try:
-            raw = env["wsgi.input"].read(length).decode("utf-8")
+            data = env["wsgi.input"].read(length)
+            if len(data) != length:
+                # The body ended before its Content-Length: never parse the part that arrived.
+                # "run_id=run-1234567890" cut after "run-12" would name another run.
+                raise ValueError("short body")
+            raw = data.decode("utf-8")
             form = parse_qs(raw, strict_parsing=True)
         except (KeyError, UnicodeError, ValueError):
             raise _BadRequest("form") from None

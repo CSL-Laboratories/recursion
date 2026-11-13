@@ -85,7 +85,9 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   by `lstat`. The own store may not be a link or sit under one (`own_store_is_link`), and no link
   inside it may resolve outside the route home (`own_store_links_outside_route_home`), so it cannot
   reach the operator's store. Every other engine's store, `.codex/auth.json` and every Claude Code store still
-  refuse. Recursion never stores, copies or ships these tokens and cannot see what else a store
+  refuse. On every route, a parent directory of any store entry (`.config`, `.local`, `.local/share`,
+  `.codex`) may not be a link, even when the store itself is absent (`own_store_is_link`, detail: the
+  linked directory); a present Claude Code store is reported first (`claude_store_in_route_home`). Recursion never stores, copies or ships these tokens and cannot see what else a store
   holds without reading it, which it does not do. So a present own store is flagged in
   `RouteDecision.flags` as `own_login_store_not_inspected:<entry>`: it could hold a login
   `hermes auth` adopted or an OpenCode Claude provider plugin. Reading those stores (provider
@@ -199,6 +201,10 @@ Pin shape (owner call 2):
 - Other causes: `wrapper_install_missing`, `wrapper_launcher_missing`,
   `wrapper_package_not_a_file`, `wrapper_file_too_large`, `wrapper_tree_too_large`,
   `wrapper_tree_too_deep`, `wrapper_tree_unreadable`, `wrapper_pin_malformed`.
+- At route verification (not offline measurement) every directory the walk visits, every
+  file and followed link, and the launcher must pass child_env's owner/mode rule (root's or
+  ours, nobody else can write it or its parents): `wrapper_path_unsafe`, with the
+  package-relative name and child_env's cause as the detail.
 
 ## Launch binding
 
@@ -213,7 +219,9 @@ Pin shape (owner call 2):
 | `guard_antigravity_then_spawn` | `binary_path` or `launcher_path` (both are in the Antigravity pin) |
 
 A PATH name such as `cursor`, a relative path, or another binary refuses. A link to the
-pinned file passes, and argv reaches the launcher unchanged. OpenCode has no pin here, so
+pinned file passes when the spelling given as `argv[0]` itself passes child_env's file rule
+(a link in a directory someone else can write refuses `argv0_not_pinned` too), and argv
+reaches the launcher unchanged. OpenCode has no pin here, so
 `guard_then_spawn` does not bind its `argv[0]`. Full access does not relax this. The check
 compares paths at guard time; it does not hold the file open across the launch.
 

@@ -112,7 +112,9 @@ def _os_thread_published(thread):
     """True when ``thread``'s OS thread exists, so a failed ``start`` must not clear ``_busy``.
 
     See ``control_adapter._os_thread_published``: ``Thread.start`` can raise after the OS
-    thread is running, and ``ident`` is unset until that thread is scheduled.
+    thread is running, and ``ident`` is unset until that thread is scheduled. A missing
+    ``_limbo`` or ``_active_limbo_lock`` is treated as published, the same as an inspection
+    error: a second read overlapping a live one is worse than leaving this one busy.
     """
     if getattr(thread, 'ident', None) is not None:
         return True
@@ -124,7 +126,7 @@ def _os_thread_published(thread):
     lock = getattr(threading, '_active_limbo_lock', None)
     limbo = getattr(threading, '_limbo', None)
     if lock is None or limbo is None:
-        return False
+        return True
     try:
         with lock:
             return thread in limbo
@@ -249,6 +251,7 @@ class PluginHost:
         # One operator() call at a time: the plugin is in-process code of unknown thread safety.
         self._turn = threading.Condition()
         self._busy = False
+        self._busy_token = None  # identity of the call that set _busy; a newer read replaces it
         self._stuck = None  # plugin id whose call passed its deadline and has not returned
         self._operator_deadline_s, self._operator_turn_wait_s = operator_deadline_s, operator_turn_wait_s
         self.degraded = {}  # plugin id -> operator() calls that passed their deadline
@@ -514,6 +517,8 @@ class PluginHost:
             if self._busy:
                 return 503, {'error': 'unavailable: operator plugin busy with an earlier read; nothing was read'}
             self._busy = True
+            token = object()
+            self._busy_token = token
         outcome, done = {}, threading.Event()
         entered = {'ok': False}
 
@@ -528,7 +533,9 @@ class PluginHost:
             finally:
                 with self._turn:
                     done.set()
-                    self._busy = False
+                    if self._busy_token is token:
+                        self._busy = False
+                        self._busy_token = None
                     if self._stuck == plugin_id:
                         self._stuck = None
                         log.warning('operator plugin %s returned after its deadline; reads go to it again '
@@ -539,11 +546,14 @@ class PluginHost:
         try:
             thread.start()
         except BaseException:
-            # run() clears _busy. Clear it here only when that thread provably never started.
-            # KeyboardInterrupt from Thread.start's wait means the call is in flight.
+            # run() clears _busy for this token. Clear it here only when that thread provably
+            # never started and this call still owns the reservation. KeyboardInterrupt from
+            # Thread.start's wait means the call is in flight.
             with self._turn:
-                if not entered['ok'] and not _os_thread_published(thread):
+                if (not entered['ok'] and not _os_thread_published(thread)
+                        and self._busy_token is token):
                     self._busy = False
+                    self._busy_token = None
                     self._turn.notify_all()
             raise
         if done.wait(self._operator_deadline_s):

@@ -204,8 +204,8 @@ def _os_thread_published(thread):
     CPython creates the OS thread and only then waits on ``_started``. ``ident`` and
     ``is_alive`` stay unset until that thread is scheduled. ``_limbo`` is filled just
     before creation and removed when creation fails, so a thread still there has been
-    handed off. An inspection error is treated as published: overlapping a live run is
-    worse than leaving one start busy.
+    handed off. A missing ``_limbo`` or ``_active_limbo_lock``, or any inspection error,
+    is treated as published: overlapping a live run is worse than leaving one start busy.
     """
     if getattr(thread, 'ident', None) is not None:
         return True
@@ -217,7 +217,7 @@ def _os_thread_published(thread):
     lock = getattr(threading, '_active_limbo_lock', None)
     limbo = getattr(threading, '_limbo', None)
     if lock is None or limbo is None:
-        return False
+        return True
     try:
         with lock:
             return thread in limbo
@@ -285,10 +285,12 @@ class RouteStarter:
             thread.start()
         except BaseException:
             # Roll the run back only when the target never entered and the OS thread was never
-            # created. An exception from Thread.start's wait means the thread is running; its
-            # finally drops _active. Clearing it here lets a second start of this run_id overlap.
+            # created, and only if this start still holds the slot. An exception from
+            # Thread.start's wait means the thread is running; its finally drops _active only
+            # for that same context. Clearing a newer reservation lets a second start overlap.
             with self._lock:
-                if not getattr(ctx, 'target_entered', False) and not _os_thread_published(thread):
+                if (not getattr(ctx, 'target_entered', False) and not _os_thread_published(thread)
+                        and self._active.get(run_id) is ctx):
                     self._active.pop(run_id, None)
             raise
         if ctx.wait_started(self._start_timeout_s):
@@ -329,7 +331,8 @@ class RouteStarter:
                     self._settle(ctx)
         finally:
             with self._lock:
-                self._active.pop(ctx.run_id, None)
+                if self._active.get(ctx.run_id) is ctx:
+                    self._active.pop(ctx.run_id, None)
 
     def _record_result(self, run_id, result):
         try:

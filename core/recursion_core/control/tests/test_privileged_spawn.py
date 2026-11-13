@@ -10,7 +10,9 @@ Code or Codex.
 from __future__ import annotations
 
 import ast
+import ctypes
 import errno
+import fcntl
 import os
 import signal
 import stat
@@ -1837,7 +1839,12 @@ class ProbeCleanupTests(unittest.TestCase):
                 def refuse_spawn(*args, **kwargs):
                     raise RuntimeError("stop-before-spawn")
 
+                # utime refreshes ctime. Warp the sweeper's clock so the name,
+                # mtime and ctime are all past the probe timeout together.
+                real_now = time.time
                 with mock.patch.object(
+                    privileged_spawn.time, "time", side_effect=lambda: real_now() + 48 * 3600
+                ), mock.patch.object(
                     privileged_spawn, "_popen_checked", side_effect=refuse_spawn
                 ), mock.patch.object(
                     privileged_spawn, "probe_ptrace", side_effect=AssertionError("ptrace")
@@ -1888,15 +1895,15 @@ class ParentDeathSignalTests(unittest.TestCase):
     """Parent-death signal must fire even when SIGTERM is ignored or blocked.
 
     The race check compares getppid() to the spawner recorded before fork.
-    getppid()==1 kills a child whose spawner is pid 1, and misses a child
-    adopted by a subreaper.
+    A match, including spawner pid 1, execs. A mismatch (a subreaper adopted
+    the child) exits 127 before exec. prctl is retried on EINTR and EAGAIN.
+    sigprocmask failure still arms SIGKILL and execs when that prctl succeeds.
     """
 
-    def _call_arm(self, spawner: int, ppid: int) -> list[tuple[int, int]]:
-        import ctypes
-
+    def _call_arm(self, spawner: int, ppid: int) -> tuple[list[tuple[int, int]], list[int]]:
         privileged_spawn._SPAWNER_PID = spawner
         killed: list[tuple[int, int]] = []
+        exited: list[int] = []
         handler = signal.getsignal(signal.SIGTERM)
         previous = signal.pthread_sigmask(signal.SIG_BLOCK, [])
 
@@ -1905,22 +1912,112 @@ class ParentDeathSignalTests(unittest.TestCase):
 
         try:
             with mock.patch.object(privileged_spawn.os, "getppid", return_value=ppid), \
-                 mock.patch.object(privileged_spawn.os, "kill", side_effect=record):
+                 mock.patch.object(privileged_spawn.os, "kill", side_effect=record), \
+                 mock.patch.object(privileged_spawn.os, "_exit", side_effect=exited.append):
                 privileged_spawn._arm_parent_death_signal()
         finally:
             signal.signal(signal.SIGTERM, handler)
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)
             ctypes.CDLL(None, use_errno=True).prctl(1, 0, 0, 0, 0)
             privileged_spawn._SPAWNER_PID = 0
-        return killed
+        return killed, exited
 
     def test_spawner_pid_1_does_not_kill_the_child(self) -> None:
-        self.assertEqual(self._call_arm(1, 1), [])
+        killed, exited = self._call_arm(1, 1)
+        self.assertEqual(killed, [])
+        self.assertEqual(exited, [])
 
-    def test_subreaper_adoption_kills_the_child(self) -> None:
+    def test_subreaper_adoption_exits_before_exec(self) -> None:
         spawner = os.getpid()
-        killed = self._call_arm(spawner, spawner + 10)
-        self.assertEqual(killed, [(os.getpid(), signal.SIGTERM)])
+        killed, exited = self._call_arm(spawner, spawner + 10)
+        self.assertEqual(killed, [])
+        self.assertEqual(exited, [127])
+
+    def test_prctl_retries_eintr_and_eagain_then_arms(self) -> None:
+        libc = privileged_spawn._linux_libc()
+        calls = {"n": 0}
+
+        def prctl(_op: int, sig: int, _a: int, _b: int, _c: int) -> int:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                ctypes.set_errno(errno.EINTR)
+                return -1
+            if calls["n"] == 2:
+                ctypes.set_errno(errno.EAGAIN)
+                return -1
+            self.assertEqual(int(sig), signal.SIGTERM)
+            return 0
+
+        exited: list[int] = []
+        spawner = os.getpid()
+        privileged_spawn._SPAWNER_PID = spawner
+        handler = signal.getsignal(signal.SIGTERM)
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        try:
+            with mock.patch.object(libc, "prctl", side_effect=prctl), \
+                 mock.patch.object(privileged_spawn.os, "getppid", return_value=spawner), \
+                 mock.patch.object(privileged_spawn.os, "_exit", side_effect=exited.append):
+                privileged_spawn._arm_parent_death_signal()
+        finally:
+            signal.signal(signal.SIGTERM, handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            privileged_spawn._SPAWNER_PID = 0
+        self.assertEqual(exited, [])
+        self.assertGreaterEqual(calls["n"], 3)
+
+    def test_prctl_eintr_budget_refuses(self) -> None:
+        libc = privileged_spawn._linux_libc()
+        calls = {"n": 0}
+
+        def prctl(_op: int, _sig: int, _a: int, _b: int, _c: int) -> int:
+            calls["n"] += 1
+            ctypes.set_errno(errno.EINTR)
+            return -1
+
+        exited: list[int] = []
+        privileged_spawn._SPAWNER_PID = os.getpid()
+        handler = signal.getsignal(signal.SIGTERM)
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        try:
+            with mock.patch.object(libc, "prctl", side_effect=prctl), \
+                 mock.patch.object(privileged_spawn.os, "_exit", side_effect=exited.append):
+                privileged_spawn._arm_parent_death_signal()
+        finally:
+            signal.signal(signal.SIGTERM, handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            privileged_spawn._SPAWNER_PID = 0
+        self.assertEqual(exited, [127])
+        self.assertGreater(calls["n"], 1)
+
+    def test_sigprocmask_failure_arms_sigkill_without_refusing(self) -> None:
+        libc = privileged_spawn._linux_libc()
+        armed: list[int] = []
+
+        def prctl(_op: int, sig: int, _a: int, _b: int, _c: int) -> int:
+            armed.append(int(sig))
+            return 0
+
+        def blocked(*_args: object) -> int:
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+
+        exited: list[int] = []
+        spawner = os.getpid()
+        privileged_spawn._SPAWNER_PID = spawner
+        handler = signal.getsignal(signal.SIGTERM)
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        try:
+            with mock.patch.object(libc, "sigprocmask", side_effect=blocked), \
+                 mock.patch.object(libc, "prctl", side_effect=prctl), \
+                 mock.patch.object(privileged_spawn.os, "getppid", return_value=spawner), \
+                 mock.patch.object(privileged_spawn.os, "_exit", side_effect=exited.append):
+                privileged_spawn._arm_parent_death_signal()
+        finally:
+            signal.signal(signal.SIGTERM, handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            privileged_spawn._SPAWNER_PID = 0
+        self.assertEqual(exited, [])
+        self.assertEqual(armed, [signal.SIGKILL])
 
     def test_ignored_and_blocked_sigterm_still_dies_with_the_parent(self) -> None:
         core_dir = os.path.dirname(os.path.dirname(os.path.dirname(privileged_spawn.__file__)))
@@ -1971,12 +2068,14 @@ class ParentDeathSignalTests(unittest.TestCase):
 
 
 class StoreSweepTests(unittest.TestCase):
-    """Stale store reaping must not follow an attacker-controlled mtime.
+    """Stale store reaping keeps a live or freshly touched directory.
 
     ``csl734-store-same-*`` is the control probe and is never removed.
-    Age comes from the timestamp in the directory name. A directory with no
-    timestamp is removed only when it is mode 0700. Another euid, a young
-    directory, a non-prefix name, a symlink and the symlink target stay.
+    A named directory is removed only when the name, mtime and ctime are all
+    past the probe timeout and the directory is not locked. A directory with
+    no timestamp is removed only when it is mode 0700 and its mtime is old.
+    Another euid, a young directory, a non-prefix name, a symlink and the
+    symlink target stay.
     """
 
     def _token(self) -> str:
@@ -2001,17 +2100,109 @@ class StoreSweepTests(unittest.TestCase):
         finally:
             self._drop(path)
 
-    def test_refreshed_mtime_does_not_save_an_old_named_store(self) -> None:
+    def test_fresh_mtime_keeps_an_old_named_store(self) -> None:
         old_s = int(time.time()) - 24 * 3600
         path = os.path.join(tempfile.gettempdir(), f"csl734-store-{old_s}-{self._token()}")
         os.mkdir(path)
         try:
             os.chmod(path, 0o1777)
-            os.utime(path, None)  # attacker created a file; mtime is now
+            os.utime(path, None)  # mtime and ctime are now
             privileged_spawn._reap_stale_store_dirs()
-            self.assertFalse(os.path.exists(path))
+            self.assertTrue(os.path.isdir(path))
         finally:
             self._drop(path)
+
+    def test_fresh_ctime_keeps_an_old_named_store(self) -> None:
+        old_s = int(time.time()) - 24 * 3600
+        path = os.path.join(tempfile.gettempdir(), f"csl734-store-{old_s}-{self._token()}")
+        os.mkdir(path)
+        try:
+            os.chmod(path, 0o1777)
+            os.utime(path, (old_s, old_s))  # mtime is old; utime refreshes ctime
+            privileged_spawn._reap_stale_store_dirs()
+            self.assertTrue(os.path.isdir(path))
+        finally:
+            self._drop(path)
+
+    def _warp_sweep(self) -> None:
+        real_now = time.time
+        with mock.patch.object(
+            privileged_spawn.time, "time", side_effect=lambda: real_now() + 48 * 3600
+        ):
+            privileged_spawn._reap_stale_store_dirs()
+
+    def test_unlocked_store_old_by_name_and_timestamps_is_removed(self) -> None:
+        old_s = int(time.time()) - 24 * 3600
+        path = os.path.join(tempfile.gettempdir(), f"csl734-store-{old_s}-{self._token()}")
+        os.mkdir(path)
+        nested = os.path.join(path, "nested")
+        os.mkdir(nested)
+        with open(os.path.join(nested, "bytes"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        try:
+            os.chmod(path, 0o1777)
+            os.utime(path, (old_s, old_s))
+            self._warp_sweep()
+            self.assertFalse(os.path.exists(path))
+        finally:
+            if os.path.isdir(path) and not os.path.islink(path):
+                os.chmod(path, 0o700)
+                subprocess.run(["rm", "-rf", path], check=False)
+
+    def test_locked_store_survives_sweep_when_ages_are_past(self) -> None:
+        old_s = int(time.time()) - 24 * 3600
+        path = os.path.join(tempfile.gettempdir(), f"csl734-store-{old_s}-{self._token()}")
+        marker = None
+        os.mkdir(path)
+        fd = -1
+        try:
+            os.chmod(path, 0o1777)
+            marker = os.path.join(path, "live")
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write("held")
+            os.utime(path, (old_s, old_s))
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._warp_sweep()
+            self.assertTrue(os.path.isdir(path))
+            self.assertTrue(os.path.isfile(marker))
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        try:
+            if os.path.isdir(path):
+                self._warp_sweep()
+                self.assertFalse(os.path.exists(path))
+        finally:
+            if os.path.isdir(path) and not os.path.islink(path):
+                os.chmod(path, 0o700)
+                subprocess.run(["rm", "-rf", path], check=False)
+
+    def test_run_same_uid_probes_holds_an_exclusive_store_lock(self) -> None:
+        seen: dict[str, bool] = {}
+
+        def probe(*args: object, **kwargs: object) -> tuple[bool, str]:
+            tmp = kwargs.get("tmp", args[1] if len(args) > 1 else "")
+            fd = os.open(str(tmp), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    seen["busy"] = exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+                else:
+                    seen["busy"] = False
+            finally:
+                os.close(fd)
+            raise RuntimeError("stop-after-lock-check")
+
+        with mock.patch.object(privileged_spawn, "probe_abs_store_read", side_effect=probe):
+            with self.assertRaises(RuntimeError):
+                run_same_uid_probes(
+                    Backend("sudo", True, True, "ok", target_user="engine", target_uid=990),
+                    n=10,
+                    run_fn=lambda cmd, timeout: ProcResult(1, "", "denied"),
+                )
+        self.assertIs(seen.get("busy"), True)
 
     def test_young_name_is_kept_when_mtime_was_set_old(self) -> None:
         path = os.path.join(
@@ -2094,6 +2285,168 @@ class StoreSweepTests(unittest.TestCase):
                     self._drop(path)
                 except OSError:
                     pass
+
+
+def _comm_pids(comm: str) -> set[int]:
+    found: set[int] = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/comm", encoding="utf-8") as fh:
+                text = fh.read().strip()
+        except OSError:
+            continue
+        if text == comm:
+            found.add(int(name))
+    return found
+
+
+def _wait_exe(pid: int, suffix: str, timeout: float = 2.0) -> str:
+    deadline = time.time() + timeout
+    seen = ""
+    while time.time() < deadline:
+        try:
+            seen = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return ""
+        if seen.endswith(suffix):
+            return seen
+        time.sleep(0.01)
+    return seen
+
+
+def _child_fd_numbers(pid: int) -> list[str]:
+    return sorted(os.listdir(f"/proc/{pid}/fd"), key=int)
+
+
+class SpawnRefusalTests(unittest.TestCase):
+    """A preexec failure must not exec, and the caller must reap the child.
+
+    The executable fd passed for ``/proc/self/fd/N`` is cleared before exec,
+    so a live child has only fds 0, 1 and 2. sigprocmask failure still execs
+    when ``prctl(SIGKILL)`` succeeds.
+    """
+
+    def _assert_refused(self, patch) -> None:
+        before = _comm_pids("sleep")
+        proc = None
+        try:
+            with patch:
+                with self.assertRaises(OSError) as caught:
+                    proc = privileged_spawn._popen_checked(
+                        ("sleep", "60"),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+            self.assertEqual(caught.exception.errno, errno.ECANCELED)
+            self.assertIsNone(proc)
+            self.assertEqual(_comm_pids("sleep") - before, set())
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+            for pid in _comm_pids("sleep") - before:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def test_prctl_failure_refuses_spawn_and_leaves_no_child(self) -> None:
+        libc = privileged_spawn._linux_libc()
+
+        def fail(*_args: object) -> int:
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+
+        self._assert_refused(mock.patch.object(libc, "prctl", side_effect=fail))
+
+    def test_memory_error_in_preexec_refuses_spawn_and_leaves_no_child(self) -> None:
+        def boom(_libc: object) -> bool:
+            raise MemoryError("injected")
+
+        self._assert_refused(
+            mock.patch.object(privileged_spawn, "_reset_and_unblock_sigterm", side_effect=boom)
+        )
+
+    def test_getppid_eintr_refuses_spawn_and_leaves_no_child(self) -> None:
+        real_getppid = os.getppid
+        parent = os.getpid()
+
+        def interrupted() -> int:
+            if os.getpid() == parent:
+                return real_getppid()
+            raise OSError(errno.EINTR, "interrupted")
+
+        self._assert_refused(
+            mock.patch.object(privileged_spawn.os, "getppid", side_effect=interrupted)
+        )
+
+    def test_default_run_treats_refused_spawn_as_exit_127(self) -> None:
+        libc = privileged_spawn._linux_libc()
+        before = _comm_pids("sleep")
+
+        def fail(*_args: object) -> int:
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+
+        try:
+            with mock.patch.object(libc, "prctl", side_effect=fail):
+                result = privileged_spawn._default_run(("sleep", "60"), 1.0)
+            self.assertEqual(result.returncode, 127)
+            self.assertIn("refused", result.stderr)
+            self.assertEqual(_comm_pids("sleep") - before, set())
+        finally:
+            for pid in _comm_pids("sleep") - before:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def _assert_sleep_stdio(self, proc: subprocess.Popen[bytes]) -> None:
+        exe = _wait_exe(proc.pid, "/sleep")
+        self.assertTrue(exe.endswith("/sleep"), exe)
+        self.assertTrue(_pid_alive(proc.pid))
+        numbers = _child_fd_numbers(proc.pid)
+        targets = [os.readlink(f"/proc/{proc.pid}/fd/{number}") for number in numbers]
+        self.assertEqual(numbers, ["0", "1", "2"], targets)
+
+    def test_child_fds_are_only_stdio(self) -> None:
+        proc = privileged_spawn._popen_checked(
+            ("sleep", "30"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self._assert_sleep_stdio(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def test_sigprocmask_failure_still_execs(self) -> None:
+        libc = privileged_spawn._linux_libc()
+
+        def blocked(*_args: object) -> int:
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+
+        proc = None
+        try:
+            with mock.patch.object(libc, "sigprocmask", side_effect=blocked):
+                proc = privileged_spawn._popen_checked(
+                    ("sleep", "30"),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self.assertIsNone(proc.poll())
+            exe = _wait_exe(proc.pid, "/sleep")
+            self.assertTrue(exe.endswith("/sleep"), exe)
+            self.assertTrue(_pid_alive(proc.pid))
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
 
 
 def _pid_alive(pid: int) -> bool:

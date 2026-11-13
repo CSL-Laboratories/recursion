@@ -63,10 +63,10 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import errno
+import fcntl
 import math
 import os
 import pwd
-import shutil
 import signal
 import stat
 import subprocess
@@ -118,6 +118,9 @@ _STORE_DIR_PREFIX = "csl734-store-"
 _STORE_SAME_PREFIX = "csl734-store-same-"
 # Set in the parent before fork. The child compares getppid() to this value.
 _SPAWNER_PID = 0
+# PR_SET_PDEATHSIG retries. EINTR and EAGAIN are tried again; anything else,
+# or this many failures, refuses the spawn. A bounded few, not an open loop.
+_PDEATH_ATTEMPTS = 4
 _LIBC: ctypes.CDLL | None = None
 OVERHEAD_ARGV: tuple[str, ...] = ("true",)
 SUDO_REQUIRED_COMMANDS: tuple[tuple[str, ...], ...] = (
@@ -570,33 +573,117 @@ def _reset_and_unblock_sigterm(libc: ctypes.CDLL) -> bool:
     return True
 
 
-def _arm_parent_death_signal() -> None:
-    """Linux child ``preexec_fn``: die if the spawning process is already gone.
+def _prctl_parent_death(libc: ctypes.CDLL, signo: int) -> bool:
+    """Arm ``PR_SET_PDEATHSIG`` to ``signo``.
 
-    ``PR_SET_PDEATHSIG`` is the kernel's parent-death signal. It covers
-    SIGTERM and SIGKILL of the parent. Nothing is installed in the parent:
-    SIGTERM stays the default action, and there is no process-global handler.
-    The child resets SIGTERM to ``SIG_DFL`` and unblocks it before arming
-    SIGTERM; if that fails, the death signal is SIGKILL, which cannot be
-    ignored or blocked. The spawner pid is the one recorded before fork.
-    ``getppid() == 1`` is the wrong race check: it kills the child when the
-    spawner is pid 1, and it leaves the child alive when a subreaper has
-    adopted it. A failure of ``prctl`` leaves the child unchanged. The probe
-    store directory is separate: a SIGKILL of the parent can leave a
-    ``csl734-store-<timestamp>-*`` directory until the next probe start reaps
-    one whose recorded creation time is older than the probe timeout.
+    ``EINTR`` and ``EAGAIN`` are retried a bounded number of times. Any other
+    errno, or a retry budget that runs out, is a failure: the child must not
+    exec. When ``sigprocmask`` could not unblock SIGTERM, the caller passes
+    SIGKILL here. A successful ``prctl(SIGKILL)`` is the documented fallback
+    and returns true.
+    """
+
+    for _ in range(_PDEATH_ATTEMPTS):
+        ctypes.set_errno(0)
+        if libc.prctl(1, signo, 0, 0, 0) == 0:  # PR_SET_PDEATHSIG
+            return True
+        if ctypes.get_errno() not in (errno.EINTR, errno.EAGAIN):
+            return False
+    return False
+
+
+def _refuse_spawn(marker_fd: int | None) -> None:
+    """Stop the child before exec. The parent treats the marker byte as refusal.
+
+    ``os._exit`` does not return. The write is best-effort: the parent also
+    reaps a child that has already exited. A patched ``_exit`` that returns
+    (tests) falls through, and the caller returns immediately.
+    """
+
+    if marker_fd is not None:
+        try:
+            os.write(marker_fd, b"!")
+        except BaseException:
+            pass
+    os._exit(127)
+
+
+def _arm_parent_death_signal(bin_fd: int | None = None, marker_fd: int | None = None) -> None:
+    """Child ``preexec_fn``: arm parent death, then drop the exec fd.
+
+    ``PR_SET_PDEATHSIG`` covers SIGTERM and SIGKILL of the parent. Nothing is
+    installed in the parent: SIGTERM stays the default action, and there is
+    no process-global handler. The child resets SIGTERM to ``SIG_DFL`` and
+    unblocks it before arming SIGTERM. If that reset fails, the death signal
+    is SIGKILL, which cannot be ignored or blocked, and a successful
+    ``prctl(SIGKILL)`` still execs. The spawner pid is the one recorded
+    before fork. ``getppid() == 1`` is the wrong race check: it would refuse
+    a child whose spawner is pid 1, and a subreaper adoption must refuse
+    exec instead of leaving the child alive.
+
+    Fail closed. A non-zero ``prctl`` after the bounded retry, a getppid that
+    is not the spawner, or any exception (``MemoryError`` from ``signal`` or
+    ``create_string_buffer``, ``getppid`` ``EINTR``, and the rest) calls
+    ``os._exit(127)`` after a one-byte marker write. The child never execs.
+    The last step on the success path makes ``bin_fd`` non-inheritable so
+    ``pass_fds`` does not leave ``/proc/self/fd`` open in the new image.
     """
 
     try:
-        libc = _LIBC if _LIBC is not None else _linux_libc()
-        death = signal.SIGTERM if _reset_and_unblock_sigterm(libc) else signal.SIGKILL
-        if libc.prctl(1, death, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
-            return
-        spawner = _SPAWNER_PID
-        if spawner > 0 and os.getppid() != spawner:
-            os.kill(os.getpid(), death)
-    except Exception:
-        return
+        if os.uname().sysname == "Linux":
+            libc = _LIBC if _LIBC is not None else _linux_libc()
+            death = signal.SIGTERM if _reset_and_unblock_sigterm(libc) else signal.SIGKILL
+            if not _prctl_parent_death(libc, death):
+                _refuse_spawn(marker_fd)
+                return
+            spawner = _SPAWNER_PID
+            if spawner > 0 and os.getppid() != spawner:
+                _refuse_spawn(marker_fd)
+                return
+        if marker_fd is not None:
+            os.set_inheritable(marker_fd, False)
+        if bin_fd is not None:
+            os.set_inheritable(bin_fd, False)
+    except BaseException:
+        _refuse_spawn(marker_fd)
+
+
+def _spawn_preexec(bin_fd: int, marker_fd: int) -> Callable[[], None]:
+    def _preexec() -> None:
+        _arm_parent_death_signal(bin_fd, marker_fd)
+
+    return _preexec
+
+
+def _read_spawn_refusal(read_fd: int) -> bool:
+    """True when the child wrote the refusal marker before exec.
+
+    ``Popen`` returns once the child's error pipe closes, which is after
+    preexec and before the new image has to have exited. A refusal byte is
+    already in the pipe. An empty read or ``EAGAIN`` means preexec returned
+    and the marker fd was only closed by exec.
+    """
+
+    os.set_blocking(read_fd, False)
+    try:
+        chunk = os.read(read_fd, 16)
+    except BlockingIOError:
+        return False
+    return b"!" in chunk
+
+
+def _reap_refused(proc: subprocess.Popen[bytes]) -> None:
+    """Reap a child that exited in preexec. Kill it if it is somehow still alive."""
+
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _popen_checked(
@@ -608,9 +695,12 @@ def _popen_checked(
     """Spawn ``argv`` from a pinned trusted inode.
 
     stdin is ``DEVNULL``, the child is in a new session (it does not keep the
-    caller's terminal), and only the executable fd is passed across the fork.
-    On Linux the child arms ``PR_SET_PDEATHSIG`` so it dies with this process.
-    No SIGTERM handler is installed here.
+    caller's terminal), and the executable fd is passed across the fork only
+    so the child can exec it. The preexec hook clears that fd's inherit bit
+    before exec, so the new image has standard fds 0, 1 and 2. On Linux the
+    child arms ``PR_SET_PDEATHSIG`` so it dies with this process. If the hook
+    cannot arm it, the child ``_exit(127)`` and this raises ``OSError`` after
+    reaping. No SIGTERM handler is installed here.
     """
 
     if not argv:
@@ -620,21 +710,37 @@ def _popen_checked(
     if os.uname().sysname == "Linux":
         _linux_libc()
     bin_fd = _open_trusted_executable(argv[0])
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    proc: subprocess.Popen[bytes] | None = None
+    refused = False
     try:
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             list(argv),
             executable=f"/proc/self/fd/{bin_fd}",
-            pass_fds=(bin_fd,),
+            pass_fds=(bin_fd, write_fd),
             close_fds=True,
             stdin=subprocess.DEVNULL,
             stdout=stdout,
             stderr=stderr,
             env=_scrubbed_env(),
             start_new_session=True,
-            preexec_fn=_arm_parent_death_signal if os.uname().sysname == "Linux" else None,
+            preexec_fn=_spawn_preexec(bin_fd, write_fd),
         )
+        os.close(write_fd)
+        write_fd = -1
+        refused = _read_spawn_refusal(read_fd)
     finally:
         os.close(bin_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+        if refused and proc is not None:
+            _reap_refused(proc)
+    if refused:
+        raise OSError(errno.ECANCELED, "spawn refused before exec")
+    if proc is None:
+        raise OSError(errno.ECANCELED, "spawn refused before exec")
+    return proc
 
 
 def _default_run(cmd: Sequence[str], timeout: float) -> ProcResult:
@@ -1438,9 +1544,11 @@ def _probe_store_reap_age_s() -> float:
 def _store_name_created_at(name: str) -> float | None:
     """Creation time recorded in ``csl734-store-<seconds-or-ns>-*``, or ``None``.
 
-    The temp directory is often mode ``01777``, so another user can create a
-    file inside it and refresh ``st_mtime``. The timestamp in the name is not
-    writable that way: sticky ``/tmp`` refuses a rename by anyone but the owner.
+    Sticky ``/tmp`` refuses a rename by anyone but the owner, so another user
+    cannot rewrite the timestamp in the name. They can create a file inside a
+    mode ``01777`` directory and refresh ``st_mtime`` and ``st_ctime``. A
+    named store is therefore removed only when the name and both timestamps
+    are old, and only when the live holder is not locking it.
     """
 
     if not name.startswith(_STORE_DIR_PREFIX) or name.startswith(_STORE_SAME_PREFIX):
@@ -1454,18 +1562,202 @@ def _store_name_created_at(name: str) -> float | None:
     return float(value)
 
 
+def _age_past(when: float, now: float, min_age: float) -> bool:
+    return now - when > min_age
+
+
+def _store_dir_is_stale(name: str, st: os.stat_result, now: float, min_age: float) -> bool:
+    """True when this directory is old enough to remove.
+
+    A name that parses as a timestamp must be old, and so must ``st_mtime``
+    and ``st_ctime``. A fresh timestamp means the directory is still in use
+    or was just created, even when the other clock looks old. A name with no
+    timestamp is removed only when the mode is exactly ``0700`` and
+    ``st_mtime`` is old: another user cannot write inside it.
+    """
+
+    created = _store_name_created_at(name)
+    if created is None:
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            return False
+        return _age_past(st.st_mtime, now, min_age)
+    if not _age_past(created, now, min_age):
+        return False
+    return _age_past(st.st_mtime, now, min_age) and _age_past(st.st_ctime, now, min_age)
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _lock_store_dir(path: str) -> int:
+    """Exclusive flock on an ``O_DIRECTORY`` fd. The caller closes it.
+
+    The live probe holds this for the store's whole lifetime. ``O_CLOEXEC``
+    keeps the fd out of children. Closing the fd releases the lock.
+    """
+
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _lock_store_nowait(fd: int) -> bool:
+    """``LOCK_EX|LOCK_NB``. False when another holder has the directory.
+
+    ``EINTR`` is retried a bounded number of times. Any other error skips
+    the directory: a sweeper that cannot lock must not delete.
+    """
+
+    for _ in range(_PDEATH_ATTEMPTS):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno != errno.EINTR:
+                return False
+    return False
+
+
+def _path_is_inode(path: str, identity: os.stat_result) -> bool:
+    try:
+        named = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        _same_inode(named, identity)
+        and stat.S_ISDIR(named.st_mode)
+        and not stat.S_ISLNK(named.st_mode)
+    )
+
+
+def _remove_dir_entries(dirfd: int) -> None:
+    """Unlink the entries of the directory open on ``dirfd``. The directory stays.
+
+    Subdirectories are opened ``O_NOFOLLOW`` and removed only when the opened
+    inode is the one ``lstat`` just saw. Symlinks are unlinked, not followed.
+    """
+
+    try:
+        names = os.listdir(dirfd)
+    except OSError:
+        return
+    for name in names:
+        try:
+            st = os.lstat(name, dir_fd=dirfd)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+            try:
+                sub = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=dirfd,
+                )
+            except OSError:
+                continue
+            try:
+                try:
+                    opened = os.fstat(sub)
+                except OSError:
+                    continue
+                if not _same_inode(opened, st):
+                    continue
+                _remove_dir_entries(sub)
+            finally:
+                os.close(sub)
+            try:
+                os.rmdir(name, dir_fd=dirfd)
+            except OSError:
+                pass
+        else:
+            try:
+                os.unlink(name, dir_fd=dirfd)
+            except OSError:
+                pass
+
+
+def _rmdir_if_inode(path: str, identity: os.stat_result) -> None:
+    """``rmdir`` ``path`` only when that directory entry is still ``identity``."""
+
+    parent_path = os.path.dirname(path) or "/"
+    name = os.path.basename(path)
+    if not name or name in {".", ".."}:
+        return
+    try:
+        parent = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        try:
+            named = os.lstat(name, dir_fd=parent)
+        except OSError:
+            return
+        if not _same_inode(named, identity) or not stat.S_ISDIR(named.st_mode):
+            return
+        if stat.S_ISLNK(named.st_mode):
+            return
+        try:
+            os.rmdir(name, dir_fd=parent)
+        except OSError:
+            pass
+    finally:
+        os.close(parent)
+
+
+def _reap_one_store_dir(
+    path: str,
+    name: str,
+    listed: os.stat_result,
+    min_age: float,
+    euid: int,
+) -> None:
+    """Remove one stale store if we can lock it and it is still that inode."""
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        if not _lock_store_nowait(fd):
+            return
+        try:
+            held = os.fstat(fd)
+        except OSError:
+            return
+        if not _same_inode(held, listed) or held.st_uid != euid:
+            return
+        if not stat.S_ISDIR(held.st_mode):
+            return
+        if not _store_dir_is_stale(name, held, time.time(), min_age):
+            return
+        if not _path_is_inode(path, held):
+            return
+        _remove_dir_entries(fd)
+        _rmdir_if_inode(path, held)
+    finally:
+        os.close(fd)
+
+
 def _reap_stale_store_dirs() -> None:
     """Remove stale same-uid probe store directories left by a killed parent.
 
     Only real directories in the temp dir whose names start with
     ``csl734-store-`` and not ``csl734-store-same-`` (the control probe),
-    are not symlinks, and are owned by this euid. Age comes from the
-    creation time in the directory name. A name with no timestamp is reaped
-    only when the mode is exactly ``0700`` (another user cannot write inside
-    it and refresh ``st_mtime``); any other mode is left alone. A directory
-    owned by another euid is left alone. SIGTERM installs no process-global
-    handler, so a SIGTERM of the parent does not remove the directory either.
-    A SIGKILL of the parent leaving the directory until this next probe start
+    are not symlinks, and are owned by this euid. A named directory is
+    removed only when the name timestamp, ``st_mtime`` and ``st_ctime`` are
+    all older than the probe timeout. A name with no timestamp is reaped
+    only when the mode is exactly ``0700`` and ``st_mtime`` is old. The
+    sweeper takes ``LOCK_EX|LOCK_NB`` on an ``O_DIRECTORY`` fd and skips a
+    busy directory. Removal walks that fd and ``rmdir``s the name only when
+    ``lstat`` still names the locked inode. A directory owned by another
+    euid is left alone. SIGTERM installs no process-global handler, so a
+    SIGTERM of the parent does not remove the directory either. A SIGKILL
+    of the parent leaving an unlocked directory until this next probe start
     is a residual.
     """
 
@@ -1489,14 +1781,9 @@ def _reap_stale_store_dirs() -> None:
             continue
         if st.st_uid != euid:
             continue
-        created = _store_name_created_at(name)
-        if created is None:
-            if stat.S_IMODE(st.st_mode) != 0o700:
-                continue
-            created = st.st_mtime
-        if now - created <= min_age:
+        if not _store_dir_is_stale(name, st, now, min_age):
             continue
-        shutil.rmtree(path, ignore_errors=True)
+        _reap_one_store_dir(path, name, st, min_age, euid)
 
 
 def run_same_uid_probes(
@@ -1512,12 +1799,14 @@ def run_same_uid_probes(
     found, the attempt counts as an error, not as blocked.
 
     The sleep child is in its own session and arms ``PR_SET_PDEATHSIG``, so it
-    dies when this process dies. No SIGTERM handler is installed. SIGKILL of
-    this process can leave the ``csl734-store-<timestamp>-*`` directory (mode
-    01777) until the next call reaps a directory with that prefix, owned by
-    this euid, whose name timestamp is older than the probe timeout. The
-    ``csl734-store-same-`` control directories are not reaped. That leftover
-    directory is a residual.
+    dies when this process dies. No SIGTERM handler is installed. This call
+    holds an exclusive flock on the store directory fd for the directory's
+    whole lifetime, so a concurrent sweep skips it. SIGKILL of this process
+    drops that lock and can leave the ``csl734-store-<timestamp>-*`` directory
+    (mode 01777) until the next call reaps a directory with that prefix,
+    owned by this euid, whose name timestamp, mtime and ctime are all older
+    than the probe timeout. The ``csl734-store-same-`` control directories
+    are not reaped. That leftover directory is a residual.
     """
 
     if n < 10:
@@ -1529,32 +1818,36 @@ def run_same_uid_probes(
     tally = _Tally()
     write_prefix = spawn_command(backend, ())
     with tempfile.TemporaryDirectory(prefix=f"{_STORE_DIR_PREFIX}{time.time_ns()}-") as tmp:
-        os.chmod(tmp, 0o1777)
-        for _ in range(n):
-            tally.add(
-                "abs_store_read",
-                probe_abs_store_read(
-                    write_prefix, tmp, expected_owner=target_uid, run_fn=run_fn
-                ),
-                f"0600 store owner uid={target_uid}",
-            )
-            unit = None
-            if backend.name == "systemd_run":
-                unit = f"csl734-probe-{uuid.uuid4().hex[:12]}"
-            cmd = spawn_command(backend, SLEEP_PROBE_ARGV, unit=unit)
-            proc = _popen_checked(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                if unit is not None:
-                    pid = systemd_unit_main_pid(unit, target_uid, run_fn=run_fn)
-                    missing = f"no MainPID with uid {target_uid} for unit {unit}"
-                else:
-                    pid = find_target_uid_pid(proc.pid, target_uid)
-                    missing = f"no process with uid {target_uid} under launcher pid {proc.pid}"
-                _probe_pid(tally, pid, missing)
-            finally:
-                _terminate(proc)
-                if unit is not None:
-                    run_fn(("systemctl", "stop", unit), 5.0)
+        store_fd = _lock_store_dir(tmp)
+        try:
+            os.chmod(tmp, 0o1777)
+            for _ in range(n):
+                tally.add(
+                    "abs_store_read",
+                    probe_abs_store_read(
+                        write_prefix, tmp, expected_owner=target_uid, run_fn=run_fn
+                    ),
+                    f"0600 store owner uid={target_uid}",
+                )
+                unit = None
+                if backend.name == "systemd_run":
+                    unit = f"csl734-probe-{uuid.uuid4().hex[:12]}"
+                cmd = spawn_command(backend, SLEEP_PROBE_ARGV, unit=unit)
+                proc = _popen_checked(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    if unit is not None:
+                        pid = systemd_unit_main_pid(unit, target_uid, run_fn=run_fn)
+                        missing = f"no MainPID with uid {target_uid} for unit {unit}"
+                    else:
+                        pid = find_target_uid_pid(proc.pid, target_uid)
+                        missing = f"no process with uid {target_uid} under launcher pid {proc.pid}"
+                    _probe_pid(tally, pid, missing)
+                finally:
+                    _terminate(proc)
+                    if unit is not None:
+                        run_fn(("systemctl", "stop", unit), 5.0)
+        finally:
+            os.close(store_fd)
     return tally.summaries(n)
 
 

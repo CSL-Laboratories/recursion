@@ -76,6 +76,10 @@ class _ObjectMissing(Exception):
         self.message = message
 
 
+class _LooseUnusable(_ObjectMissing):
+    """A loose file is present, but it is not a usable copy of its object name."""
+
+
 class _NotPresent(Exception):
     """A lookup path is absent. Distinct from a symlink or an unreadable file."""
 
@@ -217,6 +221,9 @@ def _objects_snapshot(objects: Path) -> tuple[tuple, ...]:
 
 _HASH_BYTES = {1: 20, 2: 32}
 _OBJ_TYPE = {1: b"commit", 2: b"tree", 3: b"blob", 4: b"tag"}
+# git pack.depth cannot exceed 4095. Chains deeper than that are refused.
+_MAX_DELTA_DEPTH = 4095
+_LOOSE_TYPES = {b"commit", b"tree", b"blob", b"tag"}
 _TREE_MODES = {b"40000", b"040000"}
 _BLOB_MODES = {b"100644", b"100755", b"120000", b"100664"}
 _PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
@@ -285,14 +292,20 @@ def _regular_basename(directory: Path, name: str) -> bool:
 
 
 def _midx_pack_names(data: bytes) -> list[str]:
-    """Pack names from a version-1 multi-pack-index. Unknown layouts are refused."""
+    """Pack names from a version 1 or 2 multi-pack-index. Unknown layouts are refused.
+
+    Version 2 is the documented default (``midx.version``). Its header, chunk
+    table, PNAM chunk and trailer match version 1; version 2 may list packs in
+    any order, which this reader already allows. A non-zero base-midx count is
+    still refused.
+    """
     if len(data) < 12 or data[:4] != b"MIDX":
         raise _StoreRefusal("not a multi-pack-index")
     version = data[4]
     hash_version = data[5]
     num_chunks = data[6]
     num_base = data[7]
-    if version != 1 or hash_version not in _HASH_BYTES or num_base != 0 or num_chunks < 1:
+    if version not in (1, 2) or hash_version not in _HASH_BYTES or num_base != 0 or num_chunks < 1:
         raise _StoreRefusal(f"unsupported multi-pack-index version {version}")
     hash_len = _HASH_BYTES[hash_version]
     toc_bytes = (num_chunks + 1) * 12
@@ -458,15 +471,34 @@ def _outside_reference_problem_raised(objects: Path) -> None:
     return None
 
 
-def _inflate(buf: bytes, offset: int) -> bytes:
+def _inflate(buf: bytes, offset: int, size: int) -> bytes:
+    """Inflate one pack zlib stream, refusing output past the declared size.
+
+    ``max_length`` is ``size + 1`` so a stream that expands further is detected
+    from the extra byte or from ``unconsumed_tail`` before that output is kept.
+    Bytes after a finished stream (the next pack object) stay in ``unused_data``.
+    """
+    if size < 0 or size >= sys.maxsize:
+        raise _ObjectMissing("pack object size does not match its header")
     decompressor = zlib.decompressobj()
     try:
-        data = decompressor.decompress(buf[offset:])
-        data += decompressor.flush()
-    except zlib.error as exc:
+        data = decompressor.decompress(buf[offset:], max_length=size + 1)
+    except (zlib.error, OverflowError) as exc:
         raise _ObjectMissing(f"pack zlib stream is unreadable ({exc})") from exc
+    if len(data) > size or decompressor.unconsumed_tail:
+        raise _ObjectMissing("pack object size does not match its header")
     if not decompressor.eof:
-        raise _ObjectMissing("pack zlib stream is truncated")
+        try:
+            rest = decompressor.flush()
+        except zlib.error as exc:
+            raise _ObjectMissing(f"pack zlib stream is unreadable ({exc})") from exc
+        if len(data) + len(rest) > size:
+            raise _ObjectMissing("pack object size does not match its header")
+        data += rest
+        if not decompressor.eof:
+            raise _ObjectMissing("pack zlib stream is truncated")
+    if len(data) != size:
+        raise _ObjectMissing("pack object size does not match its header")
     return data
 
 
@@ -489,6 +521,8 @@ def _apply_delta(base: bytes, delta: bytes) -> bytes:
     result_size, pos = _delta_size(delta, pos)
     if base_size != len(base):
         raise _ObjectMissing("delta base size does not match")
+    if result_size < 0 or result_size >= sys.maxsize:
+        raise _ObjectMissing("delta result size does not match")
     out = bytearray()
     while pos < len(delta):
         cmd = delta[pos]
@@ -510,10 +544,14 @@ def _apply_delta(base: bytes, delta: bytes) -> bytes:
                     pos += 1
             if size == 0:
                 size = 0x10000
-            if offset + size > len(base):
+            if size > len(base) or offset > len(base) - size:
                 raise _ObjectMissing("delta copy extends past the base")
+            if size > result_size - len(out):
+                raise _ObjectMissing("delta result size does not match")
             out += base[offset : offset + size]
         elif cmd:
+            if cmd > result_size - len(out):
+                raise _ObjectMissing("delta result size does not match")
             if pos + cmd > len(delta):
                 raise _ObjectMissing("delta insert is truncated")
             out += delta[pos : pos + cmd]
@@ -538,7 +576,7 @@ def _pack_object_at(pack: bytes, offset: int) -> tuple[int, bytes, int | bytes]:
     size = byte & 15
     shift = 4
     while byte & 0x80:
-        if pos >= len(pack):
+        if pos >= len(pack) or shift > 63:
             raise _ObjectMissing("pack object header is truncated")
         byte = pack[pos]
         pos += 1
@@ -565,7 +603,7 @@ def _pack_object_at(pack: bytes, offset: int) -> tuple[int, bytes, int | bytes]:
         pos += 20
     elif obj_type not in _OBJ_TYPE:
         raise _ObjectMissing(f"unsupported pack object type {obj_type}")
-    payload = _inflate(pack, pos)
+    payload = _inflate(pack, pos, size)
     if len(payload) != size:
         raise _ObjectMissing("pack object size does not match its header")
     return obj_type, payload, extra
@@ -650,6 +688,58 @@ def _idx_v2_tables(data: bytes, fanout_at: int) -> tuple[list[bytes], list[int],
     return names, offsets, count
 
 
+def _parse_loose(raw: bytes, hex_oid: str) -> tuple[bytes, bytes]:
+    """Inflate a loose object, capping output at the size declared in its header.
+
+    The header is read first (it is only a few dozen bytes). The remaining
+    content is then limited to that size plus one byte, so a stream that
+    expands further is refused before it is retained.
+    """
+    decompressor = zlib.decompressobj()
+    try:
+        window = decompressor.decompress(raw, max_length=64)
+    except (zlib.error, OverflowError) as exc:
+        raise _LooseUnusable(f"loose object {hex_oid} is unreadable ({exc})") from exc
+    nul = window.find(b"\0")
+    if nul < 0 or b" " not in window[:nul]:
+        raise _LooseUnusable(f"loose object {hex_oid} has no header")
+    header = window[:nul]
+    content = window[nul + 1 :]
+    typ, size_text = header.split(b" ", 1)
+    try:
+        size = int(size_text.decode("ascii"))
+    except ValueError as exc:
+        raise _LooseUnusable(f"loose object {hex_oid} has a bad size") from exc
+    canonical = str(size).encode("ascii")
+    if size < 0 or size >= sys.maxsize or size_text != canonical or typ not in _LOOSE_TYPES:
+        raise _LooseUnusable(f"loose object {hex_oid} header does not match")
+    if len(content) > size:
+        raise _LooseUnusable(f"loose object {hex_oid} header does not match")
+    if len(content) < size:
+        if decompressor.eof or not decompressor.unconsumed_tail:
+            raise _LooseUnusable(f"loose object {hex_oid} header does not match")
+        try:
+            more = decompressor.decompress(decompressor.unconsumed_tail, max_length=size - len(content) + 1)
+        except (zlib.error, OverflowError) as exc:
+            raise _LooseUnusable(f"loose object {hex_oid} is unreadable ({exc})") from exc
+        if len(more) > size - len(content) or decompressor.unconsumed_tail:
+            raise _LooseUnusable(f"loose object {hex_oid} header does not match")
+        content += more
+    if not decompressor.eof:
+        try:
+            extra = decompressor.flush()
+        except zlib.error as exc:
+            raise _LooseUnusable(f"loose object {hex_oid} is unreadable ({exc})") from exc
+        if len(content) + len(extra) > size:
+            raise _LooseUnusable(f"loose object {hex_oid} header does not match")
+        content += extra
+        if not decompressor.eof:
+            raise _LooseUnusable(f"loose object {hex_oid} is unreadable (truncated)")
+    if len(content) != size:
+        raise _LooseUnusable(f"loose object {hex_oid} header does not match")
+    return typ, content
+
+
 class _ObjectStore:
     """Objects read from loose files and pack files inside one objects directory."""
 
@@ -658,64 +748,124 @@ class _ObjectStore:
         self.packs = _load_packs(objects / "pack", objects)
         self.cache: dict[bytes, tuple[bytes, bytes]] = {}
 
-    def get(self, oid: bytes, depth: int = 0) -> tuple[bytes, bytes]:
-        if depth > 64:
-            raise _ObjectMissing("delta chain is too deep")
+    def get(self, oid: bytes) -> tuple[bytes, bytes]:
         cached = self.cache.get(oid)
         if cached is not None:
             return cached
-        found = self._loose(oid)
+        loose_error: _LooseUnusable | None = None
+        try:
+            loose = self._loose(oid)
+        except _LooseUnusable as exc:
+            loose = None
+            loose_error = exc
+        if loose is not None:
+            self._verify(oid, loose[0], loose[1])
+            self.cache[oid] = loose
+            return loose
+        found = self._find_pack(oid)
         if found is None:
-            for pack in self.packs:
-                offset = pack.offset(oid)
-                if offset is not None:
-                    found = self._at(pack, offset, depth)
-                    break
-        if found is None:
+            if loose_error is not None:
+                raise loose_error
             raise _ObjectMissing(oid.hex())
-        typ, content = found
-        header = typ + b" " + str(len(content)).encode("ascii") + b"\0"
-        if hashlib.sha1(header + content).digest() != oid:
-            raise _ObjectMissing(f"object {oid.hex()} does not match its bytes")
+        typ, content = self._resolve(found[0], found[1])
+        self._verify(oid, typ, content)
         self.cache[oid] = (typ, content)
         return typ, content
 
+    def _verify(self, oid: bytes, typ: bytes, content: bytes) -> None:
+        header = typ + b" " + str(len(content)).encode("ascii") + b"\0"
+        if hashlib.sha1(header + content).digest() != oid:
+            raise _ObjectMissing(f"object {oid.hex()} does not match its bytes")
+
+    def _find_pack(self, oid: bytes) -> tuple[_PackIndex, int] | None:
+        for pack in self.packs:
+            offset = pack.offset(oid)
+            if offset is not None:
+                return pack, offset
+        return None
+
     def _loose(self, oid: bytes) -> tuple[bytes, bytes] | None:
+        """Return a valid loose object.
+
+        A missing file is ``None``. A file that will not inflate, or whose
+        bytes are not the object named by its path, raises ``_LooseUnusable``
+        so the caller can use a packed copy. Symlinks still raise
+        ``_StoreRefusal`` from ``_read_nofollow``.
+        """
         hex_oid = oid.hex()
         try:
             raw = _read_nofollow(self.objects, f"{hex_oid[:2]}/{hex_oid[2:]}")
         except _NotPresent:
             return None
-        try:
-            data = zlib.decompress(raw)
-        except zlib.error as exc:
-            raise _ObjectMissing(f"loose object {hex_oid} is unreadable ({exc})") from exc
-        if hashlib.sha1(data).digest() != oid:
-            raise _ObjectMissing(f"loose object {hex_oid} does not match its name")
-        nul = data.find(b"\0")
-        if nul < 0 or b" " not in data[:nul]:
-            raise _ObjectMissing(f"loose object {hex_oid} has no header")
-        typ, size_text = data[:nul].split(b" ", 1)
-        try:
-            size = int(size_text.decode("ascii"))
-        except ValueError as exc:
-            raise _ObjectMissing(f"loose object {hex_oid} has a bad size") from exc
-        content = data[nul + 1 :]
-        if size != len(content) or typ not in {b"commit", b"tree", b"blob", b"tag"}:
-            raise _ObjectMissing(f"loose object {hex_oid} header does not match")
+        typ, content = _parse_loose(raw, hex_oid)
+        if hashlib.sha1(typ + b" " + str(len(content)).encode("ascii") + b"\0" + content).digest() != oid:
+            raise _LooseUnusable(f"loose object {hex_oid} does not match its name")
         return typ, content
 
-    def _at(self, pack: _PackIndex, offset: int, depth: int) -> tuple[bytes, bytes]:
-        if depth > 64:
-            raise _ObjectMissing("delta chain is too deep")
-        obj_type, payload, extra = _pack_object_at(pack.pack, offset)
-        if obj_type in _OBJ_TYPE:
-            return _OBJ_TYPE[obj_type], payload
-        if obj_type == 6:
-            base_type, base = self._at(pack, extra, depth + 1)  # type: ignore[arg-type]
-            return base_type, _apply_delta(base, payload)
-        base_type, base = self.get(extra, depth + 1)  # type: ignore[arg-type]
-        return base_type, _apply_delta(base, payload)
+    def _resolve(self, pack: _PackIndex, offset: int) -> tuple[bytes, bytes]:
+        """Resolve one pack object, following deltas iteratively.
+
+        Visited pack offsets stop a self-delta or a loop without walking the
+        depth cap. The cap is git's ``pack.depth`` maximum.
+        """
+        deltas: list[bytes] = []
+        seen: set[tuple[int, int]] = set()
+        depth = 0
+        current_pack = pack
+        current_offset = offset
+        typ = b""
+        content = b""
+        while True:
+            if depth > _MAX_DELTA_DEPTH:
+                raise _ObjectMissing("delta chain is too deep")
+            marker = (id(current_pack), current_offset)
+            if marker in seen:
+                raise _ObjectMissing("delta chain is too deep")
+            seen.add(marker)
+            obj_type, payload, extra = _pack_object_at(current_pack.pack, current_offset)
+            if obj_type in _OBJ_TYPE:
+                typ = _OBJ_TYPE[obj_type]
+                content = payload
+                break
+            deltas.append(payload)
+            depth += 1
+            if obj_type == 6:
+                if not isinstance(extra, int):
+                    raise _ObjectMissing("ofs-delta base is invalid")
+                base_marker = (id(current_pack), extra)
+                if base_marker in seen:
+                    raise _ObjectMissing("delta chain is too deep")
+                if extra < 12 or extra >= current_offset or extra >= len(current_pack.pack) - 20:
+                    raise _ObjectMissing("ofs-delta base is invalid")
+                current_offset = extra
+                continue
+            if not isinstance(extra, bytes) or len(extra) != 20:
+                raise _ObjectMissing("ref-delta oid is truncated")
+            base = self._cached_or_loose(extra)
+            if base is not None:
+                typ, content = base
+                break
+            found = self._find_pack(extra)
+            if found is None:
+                raise _ObjectMissing(extra.hex())
+            current_pack, current_offset = found
+        for delta in reversed(deltas):
+            content = _apply_delta(content, delta)
+        return typ, content
+
+    def _cached_or_loose(self, oid: bytes) -> tuple[bytes, bytes] | None:
+        cached = self.cache.get(oid)
+        if cached is not None:
+            return cached
+        try:
+            loose = self._loose(oid)
+        except _LooseUnusable:
+            return None
+        if loose is None:
+            return None
+        self._verify(oid, loose[0], loose[1])
+        self.cache[oid] = loose
+        return loose
 
 
 def _load_packs(pack_dir: Path, objects: Path) -> list[_PackIndex]:

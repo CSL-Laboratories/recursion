@@ -13,7 +13,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -737,12 +739,15 @@ class VaultTests(unittest.TestCase):
             self.assertIn(parent, ceiling.split(os.pathsep))
             self.assertNotIn("/", ceiling.split(os.pathsep))
 
-    def _craft_midx(self, names: list[str]) -> bytes:
-        """A version-1 multi-pack-index whose PNAM chunk lists names, NUL-padded to 4 bytes."""
+    def _craft_midx(self, names: list[str], version: int = 1) -> bytes:
+        """A multi-pack-index whose PNAM chunk lists names, NUL-padded to 4 bytes.
+
+        Version 2 uses the same header and chunk framing as version 1.
+        """
         raw = b"".join(name.encode("utf-8") + b"\0" for name in names)
         raw += b"\0" * ((4 - (len(raw) % 4)) % 4)
         num_chunks = 1
-        header = b"MIDX" + bytes([1, 1, num_chunks, 0]) + len(names).to_bytes(4, "big")
+        header = b"MIDX" + bytes([version, 1, num_chunks, 0]) + len(names).to_bytes(4, "big")
         pnam_off = 12 + (num_chunks + 1) * 12
         end = pnam_off + len(raw)
         toc = b"PNAM" + pnam_off.to_bytes(8, "big") + (0).to_bytes(4, "big") + end.to_bytes(8, "big")
@@ -959,6 +964,227 @@ class VaultTests(unittest.TestCase):
                 self.assertNotIn("\r", text)
                 self.assertNotIn("\nPASS:", text)
                 text.encode("utf-8")
+
+
+def _encode_size(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        piece = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(piece | 0x80)
+        else:
+            out.append(piece)
+            return bytes(out)
+
+
+def _encode_obj_header(obj_type: int, size: int) -> bytes:
+    byte = (obj_type << 4) | (size & 0x0F)
+    size >>= 4
+    out = bytearray()
+    while size:
+        out.append(byte | 0x80)
+        byte = size & 0x7F
+        size >>= 7
+    out.append(byte)
+    return bytes(out)
+
+
+def _encode_ofs(relative: int) -> bytes:
+    out = [relative & 0x7F]
+    relative >>= 7
+    while relative:
+        relative -= 1
+        out.append(0x80 | (relative & 0x7F))
+        relative >>= 7
+    return bytes(reversed(out))
+
+
+def _insert_delta(base: bytes, result: bytes) -> bytes:
+    if len(result) > 127:
+        raise AssertionError("test insert delta is limited to 127 bytes")
+    body = _encode_size(len(base)) + _encode_size(len(result))
+    if result:
+        body += bytes([len(result)]) + result
+    return body
+
+
+def _ofs_chain_pack(tip: bytes, depth: int) -> tuple[bytes, int]:
+    """Undeltified base plus `depth` OFS deltas. The last object resolves to `tip`."""
+    contents = [index.to_bytes(2, "big") for index in range(depth)]
+    contents.append(tip)
+    buf = bytearray(b"PACK" + (2).to_bytes(4, "big") + len(contents).to_bytes(4, "big"))
+    offsets = []
+    for index, content in enumerate(contents):
+        offsets.append(len(buf))
+        if index == 0:
+            payload = zlib.compress(content)
+            buf += _encode_obj_header(3, len(content)) + payload
+            continue
+        delta = _insert_delta(contents[index - 1], content)
+        payload = zlib.compress(delta)
+        relative = len(buf) - offsets[index - 1]
+        buf += _encode_obj_header(6, len(delta)) + _encode_ofs(relative) + payload
+    pack = bytes(buf)
+    return pack + hashlib.sha1(pack).digest(), offsets[-1]
+
+
+def _peak(call) -> tuple[BaseException | None, int]:
+    tracemalloc.start()
+    caught = None
+    try:
+        call()
+    except BaseException as exc:  # noqa: BLE001 - the caller asserts the type
+        caught = exc
+    finally:
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    return caught, peak
+
+
+class ObjectReaderBoundsTests(unittest.TestCase):
+    def test_delta_copy_overflow_stays_under_a_megabyte(self) -> None:
+        """A short declared result must not materialise every copy command."""
+        base = b"x" * (64 * 1024)
+        delta = _encode_size(len(base)) + _encode_size(1) + bytes([0x80]) * 80
+
+        def call() -> None:
+            pin_check._apply_delta(base, delta)
+
+        caught, peak = _peak(call)
+        self.assertIsInstance(caught, pin_check._ObjectMissing)
+        self.assertIn("delta result size", caught.message)
+        self.assertLess(peak, 1 << 20, f"peak {peak}")
+
+    def test_pack_inflate_stays_under_a_megabyte(self) -> None:
+        """A zlib stream larger than its pack header must not be fully inflated."""
+        comp = zlib.compress(b"\0" * (8 * 1024 * 1024))
+        header = _encode_obj_header(3, 1)
+        body = b"PACK" + (2).to_bytes(4, "big") + (1).to_bytes(4, "big") + header + comp
+        pack = body + hashlib.sha1(body).digest()
+
+        def call() -> None:
+            pin_check._pack_object_at(pack, 12)
+
+        caught, peak = _peak(call)
+        self.assertIsInstance(caught, pin_check._ObjectMissing)
+        self.assertLess(peak, 1 << 20, f"peak {peak}")
+
+    def test_delta_copy_past_the_base_is_refused(self) -> None:
+        delta = _encode_size(3) + _encode_size(1) + bytes([0x91, 5, 1])
+        with self.assertRaises(pin_check._ObjectMissing) as caught:
+            pin_check._apply_delta(b"abc", delta)
+        self.assertIn("extends past the base", caught.exception.message)
+
+    def _resolve(self, pack: bytes, offset: int) -> tuple[bytes, bytes]:
+        store = pin_check._ObjectStore.__new__(pin_check._ObjectStore)
+        store.cache = {}
+        store.packs = []
+        store.objects = Path(".")
+        index = pin_check._PackIndex.__new__(pin_check._PackIndex)
+        index.pack = pack
+        return store._resolve(index, offset)
+
+    def test_delta_depth_matches_git_maximum_and_cycles_stop(self) -> None:
+        """4095 OFS deltas resolve; 4096 and a self-delta stop without recursing."""
+        pack, tip = _ofs_chain_pack(b"tip-bytes", 4095)
+        _typ, content = self._resolve(pack, tip)
+        self.assertEqual(content, b"tip-bytes")
+        pack, tip = _ofs_chain_pack(b"tip-bytes", 4096)
+        with self.assertRaises(pin_check._ObjectMissing) as caught:
+            self._resolve(pack, tip)
+        self.assertEqual(caught.exception.message, "delta chain is too deep")
+        delta = _insert_delta(b"\x00", b"\x01")
+        body = (
+            b"PACK"
+            + (2).to_bytes(4, "big")
+            + (1).to_bytes(4, "big")
+            + _encode_obj_header(6, len(delta))
+            + b"\x00"
+            + zlib.compress(delta)
+        )
+        self_pack = body + hashlib.sha1(body).digest()
+        with self.assertRaises(pin_check._ObjectMissing) as caught:
+            self._resolve(self_pack, 12)
+        self.assertEqual(caught.exception.message, "delta chain is too deep")
+
+
+class DeepObjectStoreTests(VaultTests):
+    def _install_pack(self, repo: Path, pack: bytes) -> None:
+        packdir = repo / ".git" / "objects" / "pack"
+        packdir.mkdir(parents=True, exist_ok=True)
+        path = packdir / "deep.pack"
+        path.write_bytes(pack)
+        done = subprocess.run(["git", "-C", str(repo), "index-pack", str(path)], capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_ofs_delta_chain_of_65_matches_git(self) -> None:
+        """git reads 65 OFS deltas (pack.depth allows 4095); the checker must too."""
+        repo = Path(self.tmp.name) / "delta-65"
+        commit = self._commit_repo(repo)
+        oid = self._blob_oid(repo, commit)
+        pack, _tip = _ofs_chain_pack(self.body, 65)
+        self._install_pack(repo, pack)
+        loose = repo / ".git" / "objects" / oid[:2] / oid[2:]
+        self.assertTrue(loose.is_file(), loose)
+        loose.unlink()
+        got = subprocess.check_output(["git", "-C", str(repo), "cat-file", "blob", oid])
+        self.assertEqual(got, self.body)
+        fsck = subprocess.run(["git", "-C", str(repo), "fsck"], capture_output=True)
+        self.assertEqual(fsck.returncode, 0, fsck.stderr)
+        shown = subprocess.check_output(
+            ["git", "-C", str(repo), "show", f"{commit}:contracts/recursion/PRODUCT.md"]
+        )
+        self.assertEqual(shown, self.body)
+        self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+
+    def test_corrupt_loose_object_falls_back_to_pack(self) -> None:
+        """A loose file whose bytes are not the object must not hide the packed copy."""
+        cases = {
+            "hash": zlib.compress(b"blob 4\0nope"),
+            "inflate": b"this is not a zlib stream",
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                repo = Path(self.tmp.name) / f"loose-fallback-{name}"
+                commit = self._commit_repo(repo)
+                oid = self._blob_oid(repo, commit)
+                subprocess.run(["git", "-C", str(repo), "repack", "-ad"], check=True)
+                loose = repo / ".git" / "objects" / oid[:2] / oid[2:]
+                self.assertFalse(loose.exists(), loose)
+                loose.parent.mkdir(parents=True, exist_ok=True)
+                loose.write_bytes(raw)
+                got = subprocess.check_output(["git", "-C", str(repo), "cat-file", "blob", oid])
+                self.assertEqual(got, self.body)
+                shown = subprocess.check_output(
+                    ["git", "-C", str(repo), "show", f"{commit}:contracts/recursion/PRODUCT.md"]
+                )
+                self.assertEqual(shown, self.body)
+                self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+
+    def test_corrupt_loose_without_a_pack_is_refused(self) -> None:
+        repo = Path(self.tmp.name) / "loose-only-bad"
+        commit = self._commit_repo(repo)
+        oid = self._blob_oid(repo, commit)
+        loose = repo / ".git" / "objects" / oid[:2] / oid[2:]
+        os.chmod(loose, 0o644)
+        loose.write_bytes(zlib.compress(b"blob 4\0nope"))
+        problems = self._assert_refused(repo, self._pin_for(commit))
+        self.assertIn("does not match its name", problems[0])
+
+    def test_midx_version_2_local_packs_pass_and_escape_is_refused(self) -> None:
+        """Version 2 is the current default and uses the same chunk framing as version 1."""
+        repo = Path(self.tmp.name) / "midx-v2"
+        commit = self._commit_repo(repo)
+        subprocess.run(["git", "-C", str(repo), "repack", "-ad"], check=True)
+        packdir = repo / ".git" / "objects" / "pack"
+        idx_name = next(path.name for path in packdir.iterdir() if path.suffix == ".idx")
+        midx = packdir / "multi-pack-index"
+        midx.write_bytes(self._craft_midx([idx_name], version=2))
+        self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+        midx.write_bytes(self._craft_midx(["../" + idx_name], version=2))
+        problems = self._assert_refused(repo, self._pin_for(commit))
+        self.assertIn("multi-pack-index", problems[0])
 
 
 if __name__ == "__main__":

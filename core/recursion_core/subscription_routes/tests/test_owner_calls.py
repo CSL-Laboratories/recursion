@@ -1792,6 +1792,17 @@ class HermesHomeReuseTests(_Calls):
         if swapped.exists():
             swapped.unlink()
         self.launcher.reset_mock()
+        if self.home.exists() and not self.home.is_symlink():
+            os.chmod(self.home, 0o700)
+        for extra in ("config.yaml.alias", "swapped-config.yaml"):
+            leftover = self.root / extra
+            if leftover.exists() or leftover.is_symlink():
+                leftover.unlink()
+        other = self.root / "other-home"
+        if other.is_symlink():
+            other.unlink()
+        elif other.exists():
+            shutil.rmtree(other)
 
     @contextmanager
     def _hook_recheck_syscalls(self, index: int | None, mutate):
@@ -1907,6 +1918,18 @@ class HermesHomeReuseTests(_Calls):
         elif kind == "home":
             self.assertTrue(self.home.is_symlink())
             self.assertEqual(ADOPT_YAML, (self.root / "route-home.real" / ".hermes" / "config.yaml").read_bytes())
+            other = self.root / "other-home" / ".hermes"
+            self.assertEqual(b"auth:\n  adopt_external_logins: true \n", (other / "config.yaml").read_bytes())
+            self.assertEqual(b"HERMES_HOME=/not-the-route\n", (other / ".env").read_bytes())
+        elif kind == "mode":
+            self.assertEqual(0o777, stat.S_IMODE(os.lstat(self.home).st_mode))
+            self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        elif kind == "alias":
+            alias = self.root / "config.yaml.alias"
+            self.assertEqual(b"auth:\n  adopt_external_logins: true \n", self.config().read_bytes())
+            self.assertEqual(ADOPT_YAML, alias.read_bytes())
+            self.assertNotEqual(os.lstat(alias).st_ino, os.lstat(self.config()).st_ino)
+            self.assertEqual(1, os.lstat(alias).st_nlink)
 
     def test_new_config_inode_after_final_name_stat_refuses(self) -> None:
         # Index 32 on 0f1fa676 is the last stat of config.yaml. The fstat after it
@@ -2099,20 +2122,63 @@ class HermesHomeReuseTests(_Calls):
         elif kind == "hermes":
             # HOME is the first lstat. The .hermes name is the second.
             found = self._nth_after(events, final_pread, "lstat", 2)
-        elif kind == "home":
+        elif kind in ("home", "mode"):
             found = self._nth_after(events, final_pread, "lstat", 1)
-        elif kind == "inode":
-            found = self._last_after(events, final_pread, "lstat")
+        elif kind in ("inode", "alias"):
+            found = self._nth_after(events, final_pread, "lstat", 1)
         else:
             found = None
         return len(events) if found is None else found
 
     def _symlink_home(self, _freeze: dict[str, object]) -> None:
-        real = self.root / "route-home.real"
+        # Another directory, not the renamed route home. Following the symlink opens
+        # that directory's .hermes (adopt true, plus .env). The held home fd does not.
+        other = self.root / "other-home"
+        if not other.exists():
+            self._private(other)
+            self._private(other / ".hermes")
+            cfg = os.open(
+                other / ".hermes" / "config.yaml", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            )
+            try:
+                os.write(cfg, b"auth:\n  adopt_external_logins: true \n")
+            finally:
+                os.close(cfg)
+            env = os.open(
+                other / ".hermes" / ".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            )
+            try:
+                os.write(env, b"HERMES_HOME=/not-the-route\n")
+            finally:
+                os.close(env)
         if self.home.is_symlink():
             return
-        os.rename(self.home, real)
-        os.symlink(real, self.home)
+        os.rename(self.home, self.root / "route-home.real")
+        os.symlink(other, self.home)
+
+    def _chmod_home_open(self, _freeze: dict[str, object]) -> None:
+        os.chmod(self.home, 0o777)
+
+    def _link_aside_then_replace_config(self, freeze: dict[str, object]) -> None:
+        # Link the pinned inode outside .hermes, then rename a new file onto the name.
+        # The descriptor's nlink returns to 1. A frozen fstat keeps ctime from being
+        # the signal, so only a later name lstat against that fd sees the new inode.
+        live = os.lstat(self.config())
+        freeze["id"] = (live.st_dev, live.st_ino)
+        freeze["st"] = _clone_stat(live)
+        alias = self.root / "config.yaml.alias"
+        if not alias.exists():
+            os.link(self.config(), alias)
+        fd = os.open(
+            self.root / "swapped-config.yaml", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+        )
+        try:
+            os.write(fd, b"auth:\n  adopt_external_logins: true \n")
+        finally:
+            os.close(fd)
+        os.rename(self.root / "swapped-config.yaml", self.config())
+        self.assertEqual(1, os.lstat(alias).st_nlink)
+        self.assertNotEqual(live.st_ino, os.lstat(self.config()).st_ino)
 
     def _lie_about_pread(self, freeze: dict[str, object]) -> None:
         # Same inode, same size, mtime restored. A patched os.pread returns the pin.
@@ -2137,21 +2203,19 @@ class HermesHomeReuseTests(_Calls):
         self.launcher.assert_not_called()
 
     def test_attacks_at_every_extended_index_including_after_pread_refuse(self) -> None:
-        # (a) plant .env / .op.env / state.db after the captured listdir.
-        # (b) replace .hermes after the last directory fstat.
-        # (c) replace config.yaml between the final fstat and pread, and after pread.
-        # (d) a patched os.pread returns the pin while the inode bytes changed.
-        # (e) HOME becomes a symlink as the recheck runs.
-        # The seal is the last look, so each of these refuses at every index before
-        # the seal call that sees it, including the final pread and the calls after it.
+        # Plant after the call that observed the name. range(observer) stops before
+        # that call, so a change landing after it and before the seal returns was
+        # never planted. Every hooked call is in range, including the seal's last
+        # hooked call: the re-take after it still has to refuse. The residual is a
+        # change after the seal function returns, covered separately, and a
+        # same-inode rewrite that keeps size, mtime, ctime and nlink.
+        # (a) .env / .op.env / API-key state.db after listdir.
+        # (b) .hermes renamed aside and a new directory created after lstat(".hermes").
+        # (c) HOME renamed and symlinked at another directory after the HOME lstat.
+        # (d) config.yaml linked aside and replaced between the name lstat and fstat.
+        # (e) HOME chmod 0777. The seal used to compare only dev/ino and not-symlink.
         events = self._trace_extended()
         final_pread = self._final_pread(events)
-        if len(events) == final_pread + 1:
-            # Nothing runs after pread. A name planted as that read returns must still refuse.
-            self._reset_hermes_tree()
-            self._refuse_at(
-                final_pread, self._plant_named(".env", b"HERMES_HOME=/not-the-route\n"), when="after",
-            )
         self.assertGreater(len(events), final_pread + 1)
         self.assertIn("lstat", events[final_pread + 1:])
         self.assertIn("listdir", events[final_pread + 1:])
@@ -2160,18 +2224,40 @@ class HermesHomeReuseTests(_Calls):
             (".op.env", self._plant_named(".op.env", b"HERMES_HOME=/not-the-route\n"), "after"),
             ("state.db", self._plant_named("state.db", b"x"), "after"),
             ("hermes", self._replace_hermes_dir, "after"),
-            ("inode", self._plant_new_config_inode, "after"),
             ("home", self._symlink_home, "after"),
+            ("alias", self._link_aside_then_replace_config, "after"),
+            ("mode", self._chmod_home_open, "after"),
             ("pread", self._lie_about_pread, "before"),
         )
         for kind, mutate, when in attacks:
             observer = self._seal_observer(events, final_pread, kind)
             self.assertGreater(observer, final_pread)
-            for index in range(observer):
+            # after: plant once the observing call has returned, and after every
+            # later call. before: the pread lie is planted before that read.
+            # Mode is visible to the HOME lstat itself, so a chmod before it is
+            # included. range(observer) is not the bound.
+            start = 0 if kind in ("mode", "pread") else observer
+            stop = observer if kind == "pread" else len(events)
+            for index in range(start, stop):
                 with self.subTest(kind=kind, index=index, when=when):
                     self._reset_hermes_tree()
                     self._refuse_at(index, mutate, when=when)
                     self._assert_mutation_left_in_place(kind)
+
+    def test_post_seal_plant_is_the_residual_window(self) -> None:
+        # After the seal's last call returns, the child opens by path. A name planted
+        # there is outside the process. Same for a chmod of HOME.
+        real = policy._seal_pinned_hermes_names
+
+        def plant_env(*args: object, **kwargs: object) -> None:
+            real(*args, **kwargs)
+            self._plant_named(".env", b"HERMES_HOME=/not-the-route\n")({})
+
+        with mock.patch.object(policy, "_seal_pinned_hermes_names", side_effect=plant_env):
+            self.launch("hermes")
+        self.assertEqual(1, self.launcher.call_count)
+        self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / ".env").read_bytes())
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
 
     def test_editor_rename_of_identical_bytes_then_a_new_launch_succeeds(self) -> None:
         self.launch("hermes")

@@ -63,6 +63,58 @@ class StopTest(unittest.TestCase):
         self.assertEqual(api.call("run.stop", {"run_id": run})["code"], a.STOPPED)
         self.assertEqual(len(kill.requests), 1)
 
+    def test_partial_stop_missing_requested_does_not_answer_stopped_without_a_kill(self) -> None:
+        # A missing ``requested`` key is not "already sent". EMPTY confirm must
+        # not answer stopped until request_stop has run for this cgroup.
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        rec = registry.get(run)
+        cgroup = rec["cgroup"]
+        rec["stop"] = {"checks": 0, "reason": None}
+        registry.put(rec)
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(kill.requests, [cgroup])
+        self.assertEqual((res["code"], res["state"]), (a.STOPPED, "stopped"))
+        self.assertIs(registry.get(run)["stop"]["requested"], True)
+
+    def test_partial_stop_populated_requests_the_kill(self) -> None:
+        # POPULATED confirm with a partial stop object must still request the
+        # kill. Otherwise every later stop re-checks and the run stays pending.
+        api, registry, kill, _ = make_api(FakeKillTree([POPULATED, EMPTY]))
+        run = started(api)
+        rec = registry.get(run)
+        cgroup = rec["cgroup"]
+        rec["stop"] = {"checks": 0, "reason": None, "requested_at": 1.0}
+        registry.put(rec)
+        first = api.call("run.stop", {"run_id": run})
+        self.assertEqual(kill.requests, [cgroup])
+        self.assertEqual((first["code"], first["reason"]), (a.PENDING, "cgroup_populated"))
+        self.assertIs(registry.get(run)["stop"]["requested"], True)
+        second = api.call("run.stop", {"run_id": run})
+        self.assertEqual(second["code"], a.STOPPED)
+        self.assertEqual(len(kill.requests), 1)
+
+    def test_malformed_stop_object_requests_the_kill(self) -> None:
+        cases = (
+            {"requested_at": 1.0},
+            {"requested": "yes", "checks": 0, "reason": None},
+            "sent",
+            ["requested"],
+            1,
+        )
+        for stop in cases:
+            with self.subTest(stop=stop):
+                api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+                run = started(api)
+                rec = registry.get(run)
+                cgroup = rec["cgroup"]
+                rec["stop"] = stop
+                registry.put(rec)
+                res = api.call("run.stop", {"run_id": run})
+                self.assertEqual(kill.requests, [cgroup])
+                self.assertEqual(res["code"], a.STOPPED)
+                self.assertIs(registry.get(run)["stop"]["requested"], True)
+
     def test_repeat_stop_on_stopped_run_sends_nothing(self) -> None:
         api, _, kill, _ = make_api(FakeKillTree([EMPTY]))
         run = started(api)

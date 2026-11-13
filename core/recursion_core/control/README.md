@@ -13,10 +13,11 @@ recorded on F60, CSL-762).
   later) goes through it; none has its own Stop path.
 - Stop: the first `run.stop` asks the injected cleanup layer (`KillTree`, a cgroup v2 + pidfd
   abstraction running the #916 procedure) to stop the run's tree, then to confirm. Only a confirmed
-  empty cgroup answers `stopped`. A populated cgroup, a confirm timeout, an unknown answer or a cleanup
+  empty cgroup answers `stopped`, and only after that cleanup request was sent for the run's cgroup.
+  A populated cgroup, a confirm timeout, an unknown answer or a cleanup
   error answers `pending` with that reason, never `stopped` or `terminated`. A repeat stop on a stopped
-  run sends nothing; on a pending run it only re-checks, unless the earlier cleanup request itself
-  raised, in which case the next stop sends it again. An unknown run is `run_unknown`. A start's
+  run sends nothing; on a pending run it only re-checks, unless the earlier cleanup request was never
+  sent (it raised, or the stop object does not record `requested: true`), in which case the next stop sends it again. An unknown run is `run_unknown`. A start's
   `client_key` dedupes retries per tenant and is bound to that start's engine and prompt digest; reusing
   it for a different request is `request_invalid` / `client_key_reused`. The key and digest are stored in
   the run record (`start_key`) and found through `RunRegistry.find_start`, so a durable registry keeps

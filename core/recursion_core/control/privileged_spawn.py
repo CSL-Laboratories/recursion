@@ -66,13 +66,14 @@ import errno
 import math
 import os
 import pwd
+import shutil
 import signal
 import stat
 import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -510,6 +511,36 @@ def _scrubbed_env() -> dict[str, str]:
     return {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
 
 
+def _arm_parent_death_signal() -> None:
+    """Linux child ``preexec_fn``: SIGTERM this process if its parent dies.
+
+    ``PR_SET_PDEATHSIG`` is the kernel's parent-death signal. It covers
+    SIGTERM and SIGKILL of the parent. Nothing is installed in the parent:
+    SIGTERM stays the default action, and there is no process-global handler.
+    A failure leaves the child unchanged. The probe store directory is
+    separate: a SIGKILL of the parent can leave a ``csl734-store-*`` directory
+    until the next probe start reaps one that is older than the probe timeout.
+    """
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = (
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        )
+        prctl.restype = ctypes.c_int
+        if prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            return
+        if os.getppid() == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+    except Exception:
+        return
+
+
 def _popen_checked(
     argv: Sequence[str],
     *,
@@ -520,6 +551,8 @@ def _popen_checked(
 
     stdin is ``DEVNULL``, the child is in a new session (it does not keep the
     caller's terminal), and only the executable fd is passed across the fork.
+    On Linux the child arms ``PR_SET_PDEATHSIG`` so it dies with this process.
+    No SIGTERM handler is installed here.
     """
 
     if not argv:
@@ -536,6 +569,7 @@ def _popen_checked(
             stderr=stderr,
             env=_scrubbed_env(),
             start_new_session=True,
+            preexec_fn=_arm_parent_death_signal if os.uname().sysname == "Linux" else None,
         )
     finally:
         os.close(bin_fd)
@@ -654,30 +688,51 @@ def _rejected_target_uid(uid: int | None, our_uid: int) -> bool:
     return uid is None or uid == our_uid or _unusable_host_id(uid)
 
 
+def _caller_group_set(caller_groups: Collection[int] | None = None) -> frozenset[int]:
+    """The caller's primary, effective and supplementary gids.
+
+    ``caller_groups`` replaces that set in tests. ``None`` reads this process.
+    """
+
+    if caller_groups is not None:
+        return frozenset(caller_groups)
+    found = {os.getgid(), os.getegid()}
+    try:
+        found.update(os.getgroups())
+    except OSError:
+        pass
+    return frozenset(found)
+
+
 def _gid_set_rejected(
     primary: int | None,
     groups: tuple[int, ...] | None,
     *,
-    caller_gid: int | None,
+    caller_groups: Collection[int] | None = None,
 ) -> str | None:
     """Return a rejection when these gids must not own the engine.
 
-    ``caller_gid`` is the caller's primary gid. The engine's primary gid must
-    not be that gid (group-readable engine files would be the caller's).
-    Supplementary group 0 is root's group. Pass ``caller_gid=None`` when the
-    process under test is the caller's own control process.
+    The engine's primary gid, and every gid in its group list, must be
+    disjoint from the caller's full group set (``getgid``, ``getegid`` and
+    ``getgroups``). A shared gid would make group-readable engine files the
+    caller's. Supplementary group 0 is root's group. Pass ``caller_groups``
+    to inject that set; ``None`` reads this process.
     """
 
     if _unusable_host_id(primary):
         return f"rejected: primary gid {primary} is root or not a host gid"
-    if caller_gid is not None and primary == caller_gid:
-        return f"rejected: primary gid {primary} is the caller's gid"
+    caller = _caller_group_set(caller_groups)
+    if primary in caller:
+        return f"rejected: primary gid {primary} is in the caller's groups"
     if groups is None:
         return "rejected: group list missing"
     if primary not in groups:
         return f"rejected: primary gid {primary} is not in the group list"
     if any(_unusable_host_id(gid) for gid in groups):
         return "rejected: a group id is root or not a host gid"
+    shared = next((gid for gid in groups if gid in caller), None)
+    if shared is not None:
+        return f"rejected: group id {shared} is in the caller's groups"
     return None
 
 
@@ -686,7 +741,7 @@ def _target_gids_rejected(
     prefix: Sequence[str],
     id_bin: str,
     *,
-    caller_gid: int | None,
+    caller_groups: Collection[int] | None = None,
 ) -> str | None:
     """``id -g`` and ``id -G`` under ``prefix``. A reason, or ``None`` when usable."""
 
@@ -702,7 +757,7 @@ def _target_gids_rejected(
             f"id -g/-G failed rc={gid_result.returncode}/{groups_result.returncode} "
             f"err={err[:160]}"
         )
-    return _gid_set_rejected(gid, groups, caller_gid=caller_gid)
+    return _gid_set_rejected(gid, groups, caller_groups=caller_groups)
 
 
 def _helper_paths(env: Mapping[str, str] | None) -> tuple[str, ...]:
@@ -795,6 +850,8 @@ def _probe_sudo_target(
     run_fn: RunFn,
     our_uid: int,
     candidates: Sequence[str] = SUDO_TARGET_CANDIDATES,
+    *,
+    caller_groups: Collection[int] | None = None,
 ) -> tuple[str | None, int | None, str]:
     """First candidate sudo reaches as a non-root other uid for every launch
     the measured path actually runs. Independent of ``sudo -n true`` (root)."""
@@ -813,7 +870,7 @@ def _probe_sudo_target(
             run_fn,
             ("sudo", "-n", "-u", user, "--"),
             "id",
-            caller_gid=os.getgid(),
+            caller_groups=caller_groups,
         )
         if gid_reason is not None:
             notes.append(f"sudo -n -u {user} {gid_reason}")
@@ -863,7 +920,13 @@ def _probe_sudo_target(
     return None, None, "; ".join(notes) if notes else "no sudo target candidates"
 
 
-def _probe_systemd_run(run_fn: RunFn, user: str, our_uid: int) -> tuple[bool, int | None, str]:
+def _probe_systemd_run(
+    run_fn: RunFn,
+    user: str,
+    our_uid: int,
+    *,
+    caller_groups: Collection[int] | None = None,
+) -> tuple[bool, int | None, str]:
     prefix = (
         "systemd-run",
         f"--uid={user}",
@@ -889,7 +952,7 @@ def _probe_systemd_run(run_fn: RunFn, user: str, our_uid: int) -> tuple[bool, in
     if not ok:
         return False, None, reason
     gid_reason = _target_gids_rejected(
-        run_fn, prefix, "/usr/bin/id", caller_gid=os.getgid()
+        run_fn, prefix, "/usr/bin/id", caller_groups=caller_groups
     )
     if gid_reason is not None:
         return False, None, f"{reason}; {gid_reason}"
@@ -1291,6 +1354,52 @@ def _probe_pid(tally: _Tally, pid: int | None, missing: str) -> None:
     tally.add("ptrace", probe_ptrace(pid), target)
 
 
+def _probe_store_reap_age_s() -> float:
+    """Age past which a ``csl734-store-*`` directory is stale.
+
+    This is the runner timeout of the sleep probe command. A directory
+    younger than that may belong to a probe that has just started.
+    """
+
+    return _launch_timeout(SLEEP_PROBE_ARGV)
+
+
+def _reap_stale_store_dirs() -> None:
+    """Remove stale same-uid probe store directories left by a killed parent.
+
+    Only directories in the temp dir whose names start with the exact prefix
+    ``csl734-store-``, are not symlinks, are owned by this euid, and are older
+    than the probe timeout. SIGTERM installs no process-global handler, so a
+    SIGTERM of the parent does not remove the directory either. A SIGKILL of
+    the parent leaving the directory until this next probe start is a residual.
+    """
+
+    tmp = tempfile.gettempdir()
+    prefix = "csl734-store-"
+    min_age = _probe_store_reap_age_s()
+    now = time.time()
+    euid = os.geteuid()
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(tmp, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            continue
+        if st.st_uid != euid:
+            continue
+        if now - st.st_mtime <= min_age:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def run_same_uid_probes(
     backend: Backend,
     n: int = DEFAULT_N,
@@ -1302,6 +1411,13 @@ def run_same_uid_probes(
     The probed process is the one whose uids all equal ``target_uid`` (for
     systemd-run, the unit's MainPID), never the launcher. When it cannot be
     found, the attempt counts as an error, not as blocked.
+
+    The sleep child is in its own session and arms ``PR_SET_PDEATHSIG``, so it
+    dies when this process dies. No SIGTERM handler is installed. SIGKILL of
+    this process can leave the ``csl734-store-*`` directory (mode 01777) until
+    the next call reaps a directory with that exact prefix, owned by this
+    euid, and older than the probe timeout. That leftover directory is a
+    residual.
     """
 
     if n < 10:
@@ -1309,6 +1425,7 @@ def run_same_uid_probes(
     target_uid = backend.target_uid
     if target_uid is None:
         raise ValueError(f"{backend.name} backend has no target_uid to probe")
+    _reap_stale_store_dirs()
     tally = _Tally()
     write_prefix = spawn_command(backend, ())
     with tempfile.TemporaryDirectory(prefix="csl734-store-") as tmp:
@@ -1434,6 +1551,7 @@ def detect_backends(
     env: Mapping[str, str] | None = None,
     helper_paths: Sequence[str] | None = None,
     engine_user: str | None = None,
+    caller_groups: Collection[int] | None = None,
 ) -> tuple[Backend, ...]:
     """Detect spawn backends. ``engine_user`` (else ``RECURSION_ENGINE_USER``)
     is tried before the ``nobody``/``daemon`` measurement stand-ins."""
@@ -1462,7 +1580,9 @@ def detect_backends(
     # Sudoers can grant a target user without granting root, so the target
     # probe runs whatever ``sudo -n true`` (root target) returned.
     root_note = "sudo -n true ok" if facts.sudo_n_true else "sudo -n true failed"
-    user, target_uid, sudo_note = _probe_sudo_target(run, our_uid, candidates)
+    user, target_uid, sudo_note = _probe_sudo_target(
+        run, our_uid, candidates, caller_groups=caller_groups
+    )
     if user is not None and target_uid is not None:
         sudo_backend = Backend(
             "sudo",
@@ -1483,12 +1603,16 @@ def detect_backends(
 
     stand_in = sudo_backend.target_user or "nobody"
     systemd_user = engine or stand_in
-    sys_ok, sys_uid, sys_reason = _probe_systemd_run(run, systemd_user, our_uid)
+    sys_ok, sys_uid, sys_reason = _probe_systemd_run(
+        run, systemd_user, our_uid, caller_groups=caller_groups
+    )
     if not sys_ok and engine is not None and stand_in != engine:
         # The configured engine user cannot be reached, but systemd-run may still reach the stand-in.
         # Probe it so that working path is still measured and reported (bot review 4512091152); a shared
         # stand-in is never selected (select_path), so this changes evidence, not selection.
-        alt_ok, alt_uid, alt_reason = _probe_systemd_run(run, stand_in, our_uid)
+        alt_ok, alt_uid, alt_reason = _probe_systemd_run(
+            run, stand_in, our_uid, caller_groups=caller_groups
+        )
         sys_reason = f"engine user {engine}: {sys_reason}; stand-in {stand_in}: {alt_reason}"
         if alt_ok:
             sys_ok, sys_uid, systemd_user = True, alt_uid, stand_in

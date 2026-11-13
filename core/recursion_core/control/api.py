@@ -33,10 +33,12 @@ known cgroup (the handle had none, or a restart lost it) answers ``start_unconfi
 record against the host after a restart is the CSL-738 startup sweep.
 
 Stop: the first call asks the cleanup layer to stop the run's tree, then asks it to confirm. Only a
-confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown answer or a
+confirmed empty cgroup yields ``stopped``, and only after the cleanup request for that cgroup has been
+sent. A populated cgroup, a confirm timeout, an unknown answer or a
 cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
 pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested`` is
-false: it raised, or it is a stop intent from before the launch was recorded), in which case it sends it
+not exactly true: the key is missing, the stop object is malformed, it raised, or it is a stop intent
+from before the launch was recorded), in which case it sends it
 (``cgroup.kill`` and pidfd signals are safe to repeat).
 Reads never change state and never call the cleanup layer.
 
@@ -291,33 +293,57 @@ class ControlAPI:
                 return self._recorded({"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}, rec)
         self._stop_wanted.discard(run_id)
         first = rec["state"] != "stop_pending"
-        if rec.get("stop") is None:
-            rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
-        if not rec["stop"].get("requested", True):
-            # First stop, a stop intent left during launch, or an earlier request raised before it was known
-            # to be sent: (re)send it.
+        stop = self._coerce_stop(rec)
+        if stop.get("requested") is not True:
+            # First stop, a partial or malformed stop object, a stop intent left during launch, or an
+            # earlier request that raised before it was known to be sent: (re)send it. A missing
+            # ``requested`` key is not "already sent".
             try:
                 self._kill.request_stop(rec["cgroup"])
             except Exception as err:
                 return self._pending(rec, f"cleanup_error:{type(err).__name__}")
-            rec["stop"]["requested"] = True
+            stop["requested"] = True
         try:
             answer = self._kill.confirm(rec["cgroup"], self._confirm_timeout_s)
         except Exception as err:
             return self._pending(rec, f"cleanup_error:{type(err).__name__}")
-        if answer != EMPTY:
-            return self._pending(rec, _PENDING_REASON.get(answer, "confirm_unknown"))
+        if answer != EMPTY or stop.get("requested") is not True:
+            # Never answer stopped without a cleanup request for this cgroup.
+            if answer != EMPTY:
+                reason = _PENDING_REASON.get(answer, "confirm_unknown")
+            else:
+                reason = "stop_not_requested"
+            return self._pending(rec, reason)
         rec["state"] = "stopped"
         rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason=None)
         res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first}
         return self._recorded(res, rec)
 
+    def _coerce_stop(self, rec: dict) -> dict:
+        """A stop object records a sent kill only when ``requested`` is exactly true.
+
+        Anything else (missing key, a non-dict, a non-bool) has not requested
+        the kill and must send it.
+        """
+
+        stop = rec.get("stop")
+        if not isinstance(stop, dict):
+            stop = {}
+        if not isinstance(stop.get("checks"), int) or isinstance(stop.get("checks"), bool):
+            stop["checks"] = 0
+        stop.setdefault("requested_at", self._clock())
+        if "reason" not in stop:
+            stop["reason"] = None
+        if stop.get("requested") is not True:
+            stop["requested"] = False
+        rec["stop"] = stop
+        return stop
+
     def _stop_intent(self, rec: dict) -> dict:
         # Red-team r3 finding 2: the Stop is kept (in the record and in memory), and the start that is
         # still launching acts on it once the launch is recorded. The record keeps its launch state.
         self._stop_wanted.add(rec["run_id"])
-        if rec.get("stop") is None:
-            rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
+        self._coerce_stop(rec)
         rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason="cgroup_unknown")
         res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": "cgroup_unknown"}
         if not self._try_put(rec):

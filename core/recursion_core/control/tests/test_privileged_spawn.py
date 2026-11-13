@@ -12,9 +12,12 @@ from __future__ import annotations
 import ast
 import errno
 import os
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -117,12 +120,13 @@ def _sudo_policy(allowed: dict[tuple[str, ...], str]):
 
 
 def _stand_in_gid() -> int:
-    """A primary gid that is neither root nor this process's gid."""
+    """A primary gid outside root and this process's full group set."""
 
-    for gid in (65534, 65533, 65532, 65531):
-        if gid not in {0, os.getgid()}:
+    caller = {0, os.getgid(), os.getegid(), *os.getgroups()}
+    for gid in (65534, 65533, 65532, 65531, 65530, 65529):
+        if gid not in caller:
             return gid
-    return 65531
+    return 65529
 
 
 def _nobody_allows(*argvs: tuple[str, ...]) -> dict[tuple[str, ...], str]:
@@ -1415,11 +1419,127 @@ class SpawnBoundaryTests(unittest.TestCase):
             with self.subTest(name=name):
                 self._assert_sudo_rejected(self._sudo("990\n", gid=gid, groups=groups))
 
-    def test_supplementary_caller_gid_with_its_own_primary_gid_is_accepted(self) -> None:
+    def test_engine_group_overlapping_caller_gid_is_rejected(self) -> None:
+        # The engine's own primary gid is fine; sharing the caller's gid anywhere
+        # in the engine group list is not (group-readable engine files).
         gid = _stand_in_gid()
         backend = self._sudo("990\n", gid=f"{gid}\n", groups=f"{gid} {os.getgid()}\n")
+        self.assertFalse(backend.available, backend.reason)
+        self.assertIsNone(backend.target_uid)
+        self.assertIsNone(backend.target_user)
+
+    def test_engine_group_disjoint_from_the_caller_stays_available(self) -> None:
+        primary = _stand_in_gid()
+        caller = {0, os.getgid(), os.getegid(), *os.getgroups()}
+        extra = next(gid for gid in range(primary - 1, 1, -1) if gid not in caller)
+        backend = self._sudo("990\n", gid=f"{primary}\n", groups=f"{primary} {extra}\n")
         self.assertTrue(backend.available, backend.reason)
         self.assertEqual(backend.target_uid, 990)
+
+    def _engine_gid_run(self, gid: str, *, systemd: bool):
+        def run(cmd, timeout: float) -> ProcResult:
+            key = tuple(cmd)
+            if systemd:
+                if key[:2] != ("systemd-run", f"--uid={ENGINE_USER}"):
+                    return ProcResult(1, "", "denied")
+                tail = key[-2:]
+                if tail == ("/usr/bin/id", "-u"):
+                    return ProcResult(0, f"{ENGINE_UID}\n", "")
+                if tail == ("/usr/bin/id", "-g"):
+                    return ProcResult(0, gid, "")
+                if tail == ("/usr/bin/id", "-G"):
+                    return ProcResult(0, gid, "")
+                return ProcResult(1, "", "denied")
+            if key[:4] != ("sudo", "-n", "-u", "engine"):
+                return ProcResult(1, "", "denied")
+            if key == ("sudo", "-n", "-u", "engine", "--", "id", "-u"):
+                return ProcResult(0, "990\n", "")
+            if key == ("sudo", "-n", "-u", "engine", "--", "id", "-g"):
+                return ProcResult(0, gid, "")
+            if key == ("sudo", "-n", "-u", "engine", "--", "id", "-G"):
+                return ProcResult(0, gid, "")
+            return ProcResult(0, "", "")
+
+        return run
+
+    def test_engine_primary_gid_in_caller_supplementary_groups_is_not_selectable(self) -> None:
+        # gid 4 is not the caller's primary gid. It is only a supplementary group
+        # (adm on this host). select_path must not choose that sudo backend.
+        with mock.patch.object(privileged_spawn.os, "getgid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getegid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getgroups", return_value=[4, 1000]):
+            backends = detect_backends(
+                facts=self._facts(),
+                run_fn=self._engine_gid_run("4\n", systemd=False),
+                helper_paths=("/tmp/csl734-no-such-helper",),
+                env={},
+                engine_user="engine",
+            )
+        sudo = next(b for b in backends if b.name == "sudo")
+        selected = select_path(backends, f21_open=())
+        self.assertFalse(sudo.available, sudo.reason)
+        self.assertIsNone(sudo.target_uid)
+        self.assertNotEqual(selected.name, "sudo")
+        self.assertEqual(selected.name, "managed_login_folder")
+        self.assertIsNone(selected.backend)
+
+    def test_systemd_run_gid_in_caller_supplementary_groups_is_not_selectable(self) -> None:
+        with mock.patch.object(privileged_spawn.os, "getgid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getegid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getgroups", return_value=[4, 1000]):
+            backends = detect_backends(
+                facts=self._facts(),
+                run_fn=self._engine_gid_run("4\n", systemd=True),
+                helper_paths=("/tmp/csl734-no-such-helper",),
+                env={},
+                engine_user=ENGINE_USER,
+            )
+        systemd = next(b for b in backends if b.name == "systemd_run")
+        selected = select_path(backends, f21_open=())
+        self.assertFalse(systemd.available, systemd.reason)
+        self.assertIsNone(systemd.target_uid)
+        self.assertNotEqual(selected.name, "systemd_run")
+        self.assertEqual(selected.name, "managed_login_folder")
+
+    def test_injected_caller_groups_reject_an_overlapping_engine_gid(self) -> None:
+        # The OS groups do not include 4. The injected set does, so rejection
+        # comes from the argument, not from this process's real groups.
+        self.assertIsNotNone(
+            privileged_spawn._gid_set_rejected(4, (4,), caller_groups=frozenset({1000, 4}))
+        )
+        self.assertIsNotNone(
+            privileged_spawn._gid_set_rejected(
+                65531, (65531, 2000), caller_groups=frozenset({2000})
+            )
+        )
+        self.assertIsNone(
+            privileged_spawn._gid_set_rejected(65531, (65531,), caller_groups=frozenset({1000, 4}))
+        )
+        with mock.patch.object(privileged_spawn.os, "getgid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getegid", return_value=1000), \
+             mock.patch.object(privileged_spawn.os, "getgroups", return_value=[1000]):
+            sudo_backends = detect_backends(
+                facts=self._facts(),
+                run_fn=self._engine_gid_run("4\n", systemd=False),
+                helper_paths=("/tmp/csl734-no-such-helper",),
+                env={},
+                engine_user="engine",
+                caller_groups=frozenset({1000, 4}),
+            )
+            sys_backends = detect_backends(
+                facts=self._facts(),
+                run_fn=self._engine_gid_run("4\n", systemd=True),
+                helper_paths=("/tmp/csl734-no-such-helper",),
+                env={},
+                engine_user=ENGINE_USER,
+                caller_groups=frozenset({50, 4}),
+            )
+        sudo = next(b for b in sudo_backends if b.name == "sudo")
+        systemd = next(b for b in sys_backends if b.name == "systemd_run")
+        self.assertFalse(sudo.available, sudo.reason)
+        self.assertNotEqual(select_path(sudo_backends, f21_open=()).name, "sudo")
+        self.assertFalse(systemd.available, systemd.reason)
+        self.assertNotEqual(select_path(sys_backends, f21_open=()).name, "systemd_run")
 
     def test_process_with_root_gid_is_not_the_engine(self) -> None:
         def field(pid: int, key: str) -> str | None:
@@ -1594,6 +1714,149 @@ class LiveHostTests(unittest.TestCase):
                     f"{backend.name} {name} should drop to 0/n open; detail={probe.detail}",
                 )
                 self.assertTrue(probe.blocked)
+
+
+class ProbeCleanupTests(unittest.TestCase):
+    """A killed probe parent must not leave a sleep child or a stale 1777 store.
+
+    SIGTERM installs no process-global handler. SIGKILL of the parent can
+    leave the store directory until the next probe start; that leftover is a
+    residual once the directory is older than the probe timeout.
+    """
+
+    def test_sigkill_of_probe_parent_reaps_sleep_and_the_next_probe_reaps_the_dir(self) -> None:
+        core_dir = os.path.dirname(os.path.dirname(os.path.dirname(privileged_spawn.__file__)))
+        handler = signal.getsignal(signal.SIGTERM)
+        child_pid = None
+        store = None
+        helper = None
+        decoys: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="csl734-test-") as td:
+                status = os.path.join(td, "status")
+                script = os.path.join(td, "helper.py")
+                with open(script, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        "import os, subprocess, sys, tempfile, time\n"
+                        "from recursion_core.control.privileged_spawn import _popen_checked\n"
+                        "directory = tempfile.mkdtemp(prefix='csl734-store-')\n"
+                        "os.chmod(directory, 0o1777)\n"
+                        "proc = _popen_checked(('sleep', '60'), "
+                        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                        "with open(sys.argv[1], 'w', encoding='utf-8') as out:\n"
+                        "    out.write(directory + '\\n' + str(proc.pid) + '\\n')\n"
+                        "time.sleep(180)\n"
+                    )
+                env = os.environ.copy()
+                env["PYTHONPATH"] = core_dir + os.pathsep + env.get("PYTHONPATH", "")
+                env.pop("RECURSION_LIVE_HOST_PROBES", None)
+                env.pop("RECURSION_CGROUP_ROOT", None)
+                helper = subprocess.Popen(
+                    [sys.executable, script, status],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    cwd=core_dir,
+                )
+                deadline = time.time() + 5
+                while time.time() < deadline and not os.path.exists(status):
+                    if helper.poll() is not None:
+                        err = helper.stderr.read().decode("utf-8", "replace") if helper.stderr else ""
+                        self.fail(f"helper exited {helper.returncode}: {err}")
+                    time.sleep(0.05)
+                self.assertTrue(os.path.exists(status), "helper did not report the sleep pid")
+                with open(status, encoding="utf-8") as fh:
+                    store, child_text = fh.read().splitlines()[:2]
+                child_pid = int(child_text)
+                os.kill(helper.pid, signal.SIGKILL)
+                helper.wait(timeout=5)
+                gone = time.time() + 2
+                while time.time() < gone and _pid_alive(child_pid):
+                    time.sleep(0.05)
+                child_alive = _pid_alive(child_pid)
+                tmp = tempfile.gettempdir()
+                token = f"{os.getpid()}-{time.time_ns()}"
+                young = os.path.join(tmp, f"csl734-store-young-{token}")
+                other = os.path.join(tmp, f"csl734-sudo-probe-{token}")
+                leftover_file = os.path.join(tmp, f"csl734-store-file-{token}")
+                link_target = os.path.join(td, "link-target")
+                os.mkdir(young)
+                os.mkdir(other)
+                os.mkdir(link_target)
+                with open(leftover_file, "w", encoding="utf-8") as fh:
+                    fh.write("keep")
+                link = os.path.join(tmp, f"csl734-store-link-{token}")
+                os.symlink(link_target, link)
+                decoys.extend((young, other, leftover_file, link))
+                old = time.time() - (24 * 3600)
+                os.utime(store, (old, old))
+                os.utime(other, (old, old))
+                os.utime(leftover_file, (old, old))
+                os.utime(link, (old, old), follow_symlinks=False)
+
+                def refuse_spawn(*args, **kwargs):
+                    raise RuntimeError("stop-before-spawn")
+
+                with mock.patch.object(
+                    privileged_spawn, "_popen_checked", side_effect=refuse_spawn
+                ), mock.patch.object(
+                    privileged_spawn, "probe_ptrace", side_effect=AssertionError("ptrace")
+                ), mock.patch.object(
+                    privileged_spawn, "probe_proc_pid_root", side_effect=AssertionError("proc")
+                ):
+                    with self.assertRaises(RuntimeError):
+                        run_same_uid_probes(
+                            Backend(
+                                "sudo", True, True, "ok", target_user="engine", target_uid=990
+                            ),
+                            n=10,
+                            run_fn=lambda cmd, timeout: ProcResult(1, "", "denied"),
+                        )
+                problems = []
+                if child_alive:
+                    problems.append("sleep child still alive after parent SIGKILL")
+                if os.path.exists(store):
+                    problems.append("next probe left the stale csl734-store directory")
+                if not os.path.isdir(young):
+                    problems.append("reaped a store directory younger than the probe timeout")
+                if not os.path.isdir(other):
+                    problems.append("reaped a directory whose prefix is not csl734-store-")
+                if not os.path.isfile(leftover_file):
+                    problems.append("removed a non-directory with the store prefix")
+                if not os.path.islink(link) or not os.path.isdir(link_target):
+                    problems.append("followed a csl734-store-* symlink")
+                self.assertEqual(problems, [])
+                self.assertEqual(signal.getsignal(signal.SIGTERM), handler)
+        finally:
+            if helper is not None and helper.poll() is None:
+                helper.kill()
+                helper.wait(timeout=2)
+            if child_pid is not None and _pid_alive(child_pid):
+                os.kill(child_pid, signal.SIGKILL)
+            if store and os.path.isdir(store) and not os.path.islink(store):
+                os.chmod(store, 0o700)
+                subprocess.run(["rm", "-rf", store], check=False)
+            for path in decoys:
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.unlink(path)
+                elif os.path.isdir(path):
+                    os.chmod(path, 0o700)
+                    os.rmdir(path)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            state = fh.read().rpartition(")")[2].split()[0]
+    except OSError:
+        return False
+    return state != "Z"
 
 
 def live_newuidmap_ready(facts: HostFacts) -> bool:

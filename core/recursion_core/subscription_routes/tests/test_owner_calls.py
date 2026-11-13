@@ -1803,6 +1803,11 @@ class HermesHomeReuseTests(_Calls):
             other.unlink()
         elif other.exists():
             shutil.rmtree(other)
+        linked = self.root / "linked-hermes"
+        if linked.is_symlink():
+            linked.unlink()
+        elif linked.exists():
+            shutil.rmtree(linked)
 
     @contextmanager
     def _hook_recheck_syscalls(self, index: int | None, mutate):
@@ -2356,6 +2361,197 @@ class HermesHomeReuseTests(_Calls):
                 self.assertEqual(30, self.launcher.call_count)
                 self.assertEqual(ADOPT_YAML, self.config().read_bytes())
                 self.assertEqual(["config.yaml"], sorted(os.listdir(self.home / ".hermes")))
+
+    def _write_exact(self, path: Path, payload: bytes) -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            self.assertEqual(len(payload), os.write(fd, payload))
+        finally:
+            os.close(fd)
+
+    def _arm_hardlinked_directory(self) -> None:
+        # The extra link exists before the launch that is attacked, so the pin records
+        # nlink 2. Renaming that directory onto .hermes during the seal does not change
+        # the config inode or the link count.
+        self.launch("hermes")
+        self.launcher.reset_mock()
+        other = self.root / "linked-hermes"
+        self._private(other)
+        os.link(self.config(), other / "config.yaml")
+        self._write_exact(other / ".env", b"HERMES_HOME=/not-the-route\n")
+        self.assertGreaterEqual(os.lstat(self.config()).st_nlink, 2)
+
+    def _arm_hardlinked_home(self) -> None:
+        self.launch("hermes")
+        self.launcher.reset_mock()
+        other = self.root / "other-home"
+        self._private(other)
+        self._private(other / ".hermes")
+        os.link(self.config(), other / ".hermes" / "config.yaml")
+        self._write_exact(other / ".hermes" / ".env", b"HERMES_HOME=/not-the-route\n")
+        self.assertGreaterEqual(os.lstat(self.config()).st_nlink, 2)
+
+    def _plant_hardlinked_directory(self, _freeze: dict[str, object]) -> None:
+        aside = self.home / ".hermes.aside"
+        if aside.exists() or self.home.is_symlink():
+            return
+        os.rename(self.home / ".hermes", aside)
+        os.rename(self.root / "linked-hermes", self.home / ".hermes")
+
+    def _plant_hardlinked_home_symlink(self, _freeze: dict[str, object]) -> None:
+        if self.home.is_symlink():
+            return
+        os.rename(self.home, self.root / "route-home.real")
+        os.symlink(self.root / "other-home", self.home)
+
+    def _chmod_hermes_open(self, _freeze: dict[str, object]) -> None:
+        os.chmod(self.home / ".hermes", 0o777)
+
+    def _assert_eighth_snapshot_left(self, kind: str) -> None:
+        secret = b"HERMES_HOME=/not-the-route\n"
+        if kind == "hardlink":
+            swapped = self.home / ".hermes"
+            aside = self.home / ".hermes.aside" / "config.yaml"
+            self.assertEqual(secret, (swapped / ".env").read_bytes())
+            self.assertEqual(ADOPT_YAML, aside.read_bytes())
+            self.assertEqual(os.lstat(aside).st_ino, os.lstat(swapped / "config.yaml").st_ino)
+            self.assertGreaterEqual(os.lstat(aside).st_nlink, 2)
+        elif kind == "home":
+            self.assertTrue(self.home.is_symlink())
+            other = self.root / "other-home" / ".hermes"
+            real = self.root / "route-home.real" / ".hermes" / "config.yaml"
+            self.assertEqual(secret, (other / ".env").read_bytes())
+            self.assertEqual(ADOPT_YAML, real.read_bytes())
+            self.assertEqual(os.lstat(real).st_ino, os.lstat(other / "config.yaml").st_ino)
+            self.assertGreaterEqual(os.lstat(real).st_nlink, 2)
+        elif kind == "chmod":
+            self.assertEqual(0o777, stat.S_IMODE(os.lstat(self.home / ".hermes").st_mode))
+            self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+
+    @contextmanager
+    def _hook_seal_calls(self, index: int | None, mutate):
+        """Count ``_seal_*`` calls. After call ``index`` returns, run ``mutate`` once.
+
+        The seal's four snapshots are 80 calls on 3872bd82. Call 71 is the open of the
+        8th directory snapshot. Calls 73-79 are that snapshot's path lstat and every
+        seal call after it. ``mutate`` uses ``os`` directly, so it is not counted.
+        """
+
+        counter = {"n": 0}
+        events: list[tuple[str, object]] = []
+        guard = {"on": False}
+        names = (
+            ("open", "_seal_open"),
+            ("fstat", "_seal_fstat"),
+            ("lstat", "_seal_lstat"),
+            ("listdir", "_seal_listdir"),
+            ("close", "_seal_close"),
+        )
+        reals = {attr: getattr(policy, attr) for _label, attr in names}
+
+        def make(label: str, attr: str):
+            real = reals[attr]
+
+            def wrapped(*args: object, **kwargs: object):
+                if guard["on"]:
+                    return real(*args, **kwargs)
+                seen = counter["n"]
+                counter["n"] += 1
+                events.append((label, args[0] if args else None))
+                result = real(*args, **kwargs)
+                if index is not None and seen == index:
+                    guard["on"] = True
+                    try:
+                        mutate({})
+                    finally:
+                        guard["on"] = False
+                return result
+
+            return wrapped
+
+        patchers = [
+            mock.patch.object(policy, attr, side_effect=make(label, attr))
+            for label, attr in names
+        ]
+        for patcher in patchers:
+            patcher.start()
+        try:
+            yield events
+        finally:
+            for patcher in patchers:
+                patcher.stop()
+
+    def _trace_seal_calls(self) -> list[tuple[str, object]]:
+        with self._hook_seal_calls(None, lambda _freeze: None) as events:
+            self.launch("hermes")
+        self._reset_hermes_tree()
+        return events
+
+    def test_hardlink_swap_home_symlink_and_hermes_mode_at_calls_73_through_79_refuse(self) -> None:
+        # On 3872bd82 the 8th directory snapshot is seal calls 71-74 (open, fstat,
+        # lstat, listdir). Calls 73-79 are that lstat and the calls after it. The
+        # config path lstat compares only dev/ino, and .hermes is not read again, so
+        # a hard link of config.yaml (nlink 2, already pinned) renamed onto .hermes
+        # still launches. So does the HOME symlink to that same inode, and chmod 0777
+        # of .hermes, because mode and owner are not in the snapshot.
+        self._arm_hardlinked_directory()
+        events = self._trace_seal_calls()
+        hermes_opens = [
+            index for index, (name, arg) in enumerate(events[:80])
+            if name == "open" and str(arg).endswith(f"{os.sep}.hermes")
+        ]
+        self.assertEqual([2, 11, 22, 31, 42, 51, 62, 71], hermes_opens)
+        self.assertEqual("lstat", events[73][0])
+        self.assertTrue(str(events[73][1]).endswith(f"{os.sep}.hermes"))
+        self.assertEqual("listdir", events[74][0])
+        self.assertEqual("fstat", events[75][0])
+        self.assertEqual(("lstat", "config.yaml"), (events[76][0], events[76][1]))
+        self.assertEqual("lstat", events[77][0])
+        self.assertTrue(str(events[77][1]).endswith(f"{os.sep}config.yaml"))
+        self.assertEqual(["close", "close"], [events[78][0], events[79][0]])
+        attacks = (
+            ("hardlink", self._arm_hardlinked_directory, self._plant_hardlinked_directory),
+            ("home", self._arm_hardlinked_home, self._plant_hardlinked_home_symlink),
+            ("chmod", self._arm_hardlinked_directory, self._chmod_hermes_open),
+        )
+        for kind, arm, mutate in attacks:
+            for index in range(73, 80):
+                with self.subTest(kind=kind, index=index):
+                    self._reset_hermes_tree()
+                    arm()
+                    with self._hook_seal_calls(index, mutate):
+                        with self.assertRaises(SubscriptionRouteRefused) as caught:
+                            self.launch("hermes")
+                    self.assertNotIn("HERMES_HOME=/not-the-route", str(caught.exception))
+                    self.launcher.assert_not_called()
+                    self._assert_eighth_snapshot_left(kind)
+
+    def test_post_seal_hardlink_swap_is_the_residual_window(self) -> None:
+        # After the seal returns, the child opens by path. A directory swapped there
+        # is the owner-decision residual, same as a name planted after the seal.
+        self._arm_hardlinked_directory()
+        real = policy._seal_pinned_hermes_names
+
+        def plant(*args: object, **kwargs: object) -> None:
+            real(*args, **kwargs)
+            self._plant_hardlinked_directory({})
+
+        with mock.patch.object(policy, "_seal_pinned_hermes_names", side_effect=plant):
+            self.launch("hermes")
+        self.assertEqual(1, self.launcher.call_count)
+        self._assert_eighth_snapshot_left("hardlink")
+
+    def test_subscription_readme_and_notes_still_launch(self) -> None:
+        self._private(self.home / ".hermes")
+        for name in ("README", "notes.txt"):
+            self._write_exact(self.home / ".hermes" / name, b"benign\n")
+        self.launch_sub()
+        self.assertEqual(1, self.launcher.call_count)
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(
+            {"README", "notes.txt", "config.yaml"},
+            set(os.listdir(self.home / ".hermes")),
+        )
 
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")

@@ -55,14 +55,17 @@ must show link count at least 1 and the full stamp unchanged; ``.hermes`` is sta
 home fd again and must be the pinned directory. That name verification runs once more, immediately
 before the final ``fstat`` and ``pread`` of the config fd. ``pread`` is the function captured at
 import, so a later patch of ``os.pread`` cannot change what that read returns. After that ``pread``
-returns, the last operations are a seal, all through the functions captured at import: ``HOME`` is
-``lstat``'d by path and must still be a real directory (not a symlink) with the pinned device and
-inode; ``.hermes`` is opened again by name from the home fd (``O_NOFOLLOW|O_DIRECTORY``) and must be
-the pinned directory; ``listdir`` on that fd must match the pinned names; ``config.yaml`` is
-``lstat``'d by name and must be the pinned inode with link count at least 1; ``fstat`` of the config
-fd must show the full stamp. Any difference refuses and is left in place: this recheck does not
-unlink. A same-size ``O_TRUNC`` that keeps ``mtime_ns`` and ``ctime_ns`` still changes the bytes the
-captured ``pread`` sees, so it refuses.
+returns, the seal takes one by-name snapshot and takes it again from the start, then takes that
+pair once more through the functions captured at import. HOME's mode and owner are in the snapshot.
+``.hermes`` mode and owner are too: a directory that is group- or other-writable, or owned by
+someone other than the effective uid, refuses. The last reads are path ``lstat`` checks of every
+ancestor the child will resolve, deepest first: ``config.yaml``, then ``.hermes`` (device, inode,
+mode and owner against ``fstat`` of the directory fd just opened on that path), then HOME against
+``fstat`` of the held home fd. Before those reads, that directory fd is the pinned inode:
+``config.yaml`` opened ``O_NOFOLLOW`` from it must be the pinned config, and ``.env`` must be
+absent on it, so the listing and the config both come from the inode the pin named. Any mismatch
+refuses and is left in place: this recheck does not unlink. A same-size ``O_TRUNC`` that keeps
+``mtime_ns`` and ``ctime_ns`` still changes the bytes the captured ``pread`` sees, so it refuses.
 ``.env`` and ``.op.env`` are not read, and refuse as a file, a symlink
 or a directory: Hermes ``load_hermes_dotenv`` loads ``~/.hermes/.env`` over the process environment,
 and ``.op.env`` beside it, before ``config.yaml``, so ``HERMES_HOME`` there selects a different config
@@ -1925,7 +1928,9 @@ def _config_seal_identity(
     link count to 1. ``ctime_ns`` may stay put. The name's device and inode must
     be the descriptor's, and both must be the pin. The descriptor's size, mtime,
     ctime and link count must be the recorded stamp. The path ``lstat`` must be
-    that same inode, so a directory swapped after ``hermes_fd`` was opened disagrees.
+    that same inode. A hard link of the pinned inode in another directory still
+    matches this check. The ancestor walk after the snapshots compares ``.hermes``
+    and HOME by path with the pinned descriptors.
     """
 
     try:
@@ -1951,18 +1956,35 @@ def _config_seal_identity(
     return named_stamp, opened_stamp
 
 
+def _hermes_directory_stamp(st: os.stat_result) -> tuple[int, int, int, int]:
+    """Device, inode, owner and full mode. Mode includes the file type."""
+
+    return (st.st_dev, st.st_ino, st.st_uid, st.st_mode)
+
+
+def _hermes_directory_is_private(st: os.stat_result, hermes_dev: int, hermes_ino: int) -> bool:
+    """The pinned directory, owned by the effective uid, and not group- or other-writable."""
+
+    return (stat.S_ISDIR(st.st_mode)
+            and (st.st_dev, st.st_ino) == (hermes_dev, hermes_ino)
+            and st.st_uid == os.geteuid()
+            and (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) == 0)
+
+
 def _directory_seal_identity(
     engine: str,
     hermes_path: str,
     hermes_dev: int,
     hermes_ino: int,
-) -> tuple[int, tuple[int, int], tuple[int, int], tuple[str, ...]]:
+) -> tuple[int, tuple[int, int, int, int], tuple[int, int, int, int], tuple[str, ...]]:
     """Open ``.hermes`` by path, then ``fstat`` the new fd and ``lstat`` the path.
 
     ``O_NOFOLLOW`` applies to the final component. A symlink planted at HOME is
     followed, so this open is the directory the child path would reach, not the
-    directory an older home fd still holds. The three identities must be the pin.
-    The caller closes ``fd``.
+    directory an older home fd still holds. Device, inode, owner and mode of the
+    path and the fd must be the same, and that inode must be the pin. Group or
+    other write, or an owner other than the effective uid, refuses. The caller
+    closes ``fd``.
     """
 
     try:
@@ -1976,13 +1998,136 @@ def _directory_seal_identity(
     except OSError:
         _seal_close(fd)
         raise _refuse_hermes_config(engine, ".hermes") from None
-    opened_id = (opened.st_dev, opened.st_ino)
-    named_id = (named.st_dev, named.st_ino)
-    if (not stat.S_ISDIR(opened.st_mode) or not stat.S_ISDIR(named.st_mode)
-            or opened_id != (hermes_dev, hermes_ino) or named_id != opened_id):
+    opened_id = _hermes_directory_stamp(opened)
+    named_id = _hermes_directory_stamp(named)
+    if (not _hermes_directory_is_private(opened, hermes_dev, hermes_ino)
+            or not _hermes_directory_is_private(named, hermes_dev, hermes_ino)
+            or named_id != opened_id):
         _seal_close(fd)
         raise _refuse_hermes_config(engine, ".hermes")
     return fd, named_id, opened_id, names
+
+
+def _seal_child_ancestors(
+    engine: str,
+    route_home: str,
+    home_fd: int,
+    home_dev: int,
+    home_ino: int,
+    home_uid: int,
+    home_mode: int,
+    config_fd: int,
+    pin_id: tuple[int, int],
+    hermes_dev: int,
+    hermes_ino: int,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    nlink: int,
+) -> None:
+    """Last reads: the path the child resolves, deepest first, then each ancestor.
+
+    ``.hermes`` is opened by path. ``fstat`` must be the pinned directory, owned by
+    the effective uid and not group- or other-writable. Through that fd,
+    ``config.yaml`` opened ``O_NOFOLLOW`` must be the pinned config, and ``.env``
+    (and ``.op.env``) must be absent, so the config and the directory listing both
+    come from the pinned inode. A hard link of ``config.yaml`` in some other
+    directory has the same device and inode; the path ``lstat`` of ``.hermes`` is
+    what disagrees when that directory is renamed onto the name.
+
+    The last three reads are path ``lstat`` of ``config.yaml``, then of ``.hermes``
+    (device, inode, mode and owner against a fresh ``fstat`` of this fd), then of
+    HOME against a fresh ``fstat`` of the held home fd. Any mismatch refuses.
+    This function does not unlink.
+    """
+
+    hermes_path = os.path.join(route_home, ".hermes")
+    config_path = os.path.join(hermes_path, "config.yaml")
+    hermes_fd = -1
+    cfg = -1
+    try:
+        try:
+            hermes_fd = _seal_open(hermes_path, _DIR_OPEN_FLAGS)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        try:
+            opened_dir = _seal_fstat(hermes_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        if not _hermes_directory_is_private(opened_dir, hermes_dev, hermes_ino):
+            raise _refuse_hermes_config(engine, ".hermes")
+        try:
+            cfg = _seal_open("config.yaml", _HERMES_OPEN_FLAGS, dir_fd=hermes_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        try:
+            cfg_st = _seal_fstat(cfg)
+            held = _seal_fstat(config_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        if (not _pinned_config_stamp(cfg_st, pin_id, size, mtime_ns, ctime_ns, nlink)
+                or (cfg_st.st_dev, cfg_st.st_ino) != (held.st_dev, held.st_ino)):
+            raise _refuse_hermes_config(engine, "config.yaml")
+        _seal_close(cfg)
+        cfg = -1
+        for name in sorted(_HERMES_DOTENV_NAMES):
+            try:
+                _seal_lstat(name, dir_fd=hermes_fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    continue
+                raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name) from None
+            raise SubscriptionRouteRefused(engine, "hermes_dotenv_in_home", name)
+        # Fresh descriptor samples, then the path walks with nothing between them.
+        # Deepest first: config.yaml, .hermes, HOME. A swap after a path's own
+        # lstat is outside that path's check; a swap after this function returns
+        # is the owner-decision window.
+        try:
+            dir_now = _seal_fstat(hermes_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        try:
+            home_now = _seal_fstat(home_fd)
+        except OSError:
+            raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+        # The fd's sample is taken. Close it before the path walks so those
+        # lstats are the last reads.
+        held_dir, hermes_fd = hermes_fd, -1
+        _seal_close(held_dir)
+        try:
+            config_named = _seal_lstat(config_path)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        try:
+            dir_named = _seal_lstat(hermes_path)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        try:
+            home_named = _seal_lstat(route_home)
+        except OSError:
+            raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+        if (not stat.S_ISREG(config_named.st_mode)
+                or (config_named.st_dev, config_named.st_ino) != pin_id):
+            raise _refuse_hermes_config(engine, "config.yaml")
+        if (not _hermes_directory_is_private(dir_now, hermes_dev, hermes_ino)
+                or not _hermes_directory_is_private(dir_named, hermes_dev, hermes_ino)
+                or _hermes_directory_stamp(dir_named) != _hermes_directory_stamp(dir_now)):
+            raise _refuse_hermes_config(engine, ".hermes")
+        home_path = (home_named.st_dev, home_named.st_ino, home_named.st_uid, home_named.st_mode)
+        home_held = (home_now.st_dev, home_now.st_ino, home_now.st_uid, home_now.st_mode)
+        if (stat.S_ISLNK(home_named.st_mode) or not stat.S_ISDIR(home_named.st_mode)
+                or not stat.S_ISDIR(home_now.st_mode)
+                or (home_now.st_dev, home_now.st_ino) != (home_dev, home_ino)
+                or home_path != (home_dev, home_ino, home_uid, home_mode)
+                or home_held != home_path
+                or home_named.st_uid != os.geteuid()
+                or home_named.st_mode & 0o077):
+            raise SubscriptionRouteRefused(engine, "route_home_not_private")
+    finally:
+        if cfg >= 0:
+            _seal_close(cfg)
+        if hermes_fd >= 0:
+            _seal_close(hermes_fd)
 
 
 def _capture_hermes_seal(
@@ -2006,9 +2151,10 @@ def _capture_hermes_seal(
 ) -> tuple:
     """One by-name snapshot. Every libc call is a function captured at import.
 
-    HOME (mode and owner included), ``.hermes`` opened and ``lstat``'d by path,
-    the directory fd, the listing, the config name and the config fd. The name
-    identity must equal the fd identity for HOME, ``.hermes`` and ``config.yaml``.
+    HOME (mode and owner included), ``.hermes`` opened and ``lstat``'d by path
+    (device, inode, mode and owner), the directory fd, the listing, the config
+    name and the config fd. The name identity must equal the fd identity for
+    HOME, ``.hermes`` and ``config.yaml``.
     """
 
     hermes_path = os.path.join(route_home, ".hermes")
@@ -2082,20 +2228,24 @@ def _seal_pinned_hermes_names(
     """Last look, after ``pread`` returns. Two full snapshots must match. Does not unlink.
 
     Each snapshot is HOME (``lstat`` mode and owner, and ``fstat`` of the held fd),
-    ``.hermes`` opened and ``lstat``'d by path, that directory fd, the listing, the
-    config name and the config fd (link count, ctime, size, mtime). The snapshot is
-    taken twice through the ``_LIBC_*`` names and the two results must match. Each
-    of those passes re-takes itself before it is returned. By-name device and inode
-    must equal the pinned fd for HOME, ``.hermes`` and ``config.yaml``.
+    ``.hermes`` opened and ``lstat``'d by path (device, inode, mode and owner), that
+    directory fd, the listing, the config name and the config fd (link count, ctime,
+    size, mtime). The snapshot is taken twice through the ``_LIBC_*`` names and the
+    two results must match. Each of those passes re-takes itself before it is
+    returned. By-name device and inode must equal the pinned fd for HOME, ``.hermes``
+    and ``config.yaml``. ``.hermes`` must be owned by the effective uid and must not
+    be group- or other-writable.
 
     After that last ``_LIBC_*`` call returns, the same snapshot is taken twice more
     through ``_SEAL_LIBC``, the functions captured at import. A patch of ``os.*`` or
     of the ``_LIBC_*`` names does not retarget that re-take, and it must match the
-    snapshot just taken. A mismatch refuses.
+    snapshot just taken. A mismatch refuses. The last reads of that re-take are the
+    path walks in ``_seal_child_ancestors``: ``config.yaml``, then ``.hermes`` against
+    the pinned directory fd, then HOME against the held home fd.
 
     A change after this function returns is outside the seal. So is a change during
-    the last ``_SEAL_LIBC`` pass, after that pass has already read the field, and a
-    rewrite of the same inode that keeps size, mtime, ctime and link count.
+    the last path walk, after that walk has already read the path, and a rewrite of
+    the same inode that keeps size, mtime, ctime and link count.
     """
 
     args = (
@@ -2112,10 +2262,16 @@ def _seal_pinned_hermes_names(
     try:
         third = _capture_hermes_seal(*args)
         fourth = _capture_hermes_seal(*args)
+        if third != second or third != fourth:
+            _refuse_changed_hermes_snapshot(
+                engine, second, third if third != second else fourth, auth)
+        # After the 8th directory snapshot. The path walks are the last reads.
+        _seal_child_ancestors(
+            engine, route_home, home_fd, home_dev, home_ino, home_uid, home_mode,
+            config_fd, pin_id, hermes_dev, hermes_ino, size, mtime_ns, ctime_ns, nlink,
+        )
     finally:
         _SEAL_CALLS.reset(token)
-    if third != second or third != fourth:
-        _refuse_changed_hermes_snapshot(engine, second, third if third != second else fourth, auth)
 
 
 def _recheck_pinned_hermes_config(
@@ -2139,9 +2295,10 @@ def _recheck_pinned_hermes_config(
     verification runs once more immediately before the final ``fstat`` and ``pread``.
     ``pread`` is the function captured at import. After it returns, the seal takes
     a full snapshot and then takes that same snapshot again by name from the start.
-    HOME includes mode and owner. ``.hermes`` is opened and ``lstat``'d by path.
-    The config name's device and inode must equal the config fd. The two snapshots
-    must match. This function does not unlink.
+    HOME includes mode and owner. ``.hermes`` is opened and ``lstat``'d by path,
+    and its mode and owner are part of that snapshot. The config name's device and
+    inode must equal the config fd. The two snapshots must match. The last reads
+    are the ancestor path walks. This function does not unlink.
 
     A change after that seal's last call returns, before the child execs or opens
     by path, remains an owner-decision residual. So does a same-inode rewrite that
@@ -2294,10 +2451,12 @@ def _launch_checked(
             # name, fstat of the config fd including link count, .hermes by name again)
             # and repeat that verification immediately before the final fstat and pread.
             # pread is captured at import. After it returns, the seal takes one full
-            # snapshot (HOME mode and owner, .hermes by path, the listing, config name
-            # against the config fd) and takes that snapshot again from the start.
-            # The two must match. A change after that seal's last call, before the
-            # child opens by path, remains an owner-decision residual. So does a
+            # snapshot (HOME mode and owner, .hermes by path including mode and owner,
+            # the listing, config name against the config fd) and takes that snapshot
+            # again from the start. The two must match. The last reads are path lstat
+            # of config.yaml, then .hermes against the pinned directory fd, then HOME
+            # against the held home fd. A change after that seal's last call, before
+            # the child opens by path, remains an owner-decision residual. So does a
             # same-inode rewrite that keeps size, mtime, ctime and link count.
             # Subscription extra names stay an owner decision (Lucas) when both
             # snapshots see them. XDG_* and HERMES_HOME are unchanged.

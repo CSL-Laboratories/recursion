@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -787,6 +788,35 @@ class HermesHomeReuseTests(_Calls):
 
         return mock.patch.object(policy, "_bind_hermes_launch_path", side_effect=wrapped)
 
+    @contextmanager
+    def _during_post_listing_walk(self, mutate):
+        """Run ``mutate`` once, when the root walk after the ``.hermes`` listing starts.
+
+        The listing has already pinned ``config.yaml``. The recheck runs after this walk returns.
+        """
+
+        real_list = policy._refuse_hermes_dir_entries
+        real_walk = policy._bind_route_home_from_root
+        listed = False
+        done = False
+
+        def listing(*args: object, **kwargs: object):
+            nonlocal listed
+            result = real_list(*args, **kwargs)
+            listed = True
+            return result
+
+        def walk(engine: str, route_home: str) -> None:
+            nonlocal done
+            if listed and not done:
+                done = True
+                mutate()
+            real_walk(engine, route_home)
+
+        with mock.patch.object(policy, "_refuse_hermes_dir_entries", side_effect=listing), \
+                mock.patch.object(policy, "_bind_route_home_from_root", side_effect=walk):
+            yield
+
     def _hermes_at(self, home: Path, *, subscription: bool = False):
         env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
         if subscription:
@@ -986,6 +1016,142 @@ class HermesHomeReuseTests(_Calls):
         self.assertEqual("config.yaml", exc.detail)
         self.assertTrue(swapped)
         self.launcher.assert_not_called()
+
+    def test_swapped_in_user_config_survives_the_post_listing_refusal(self) -> None:
+        # A Hermes atomic-save rename lands a different inode after the pin.
+        # The refusal must not unlink a file this launch did not read.
+        user = (
+            b"# hermes config\n"
+            b"model:\n"
+            b"  default: anthropic/claude-sonnet\n"
+            b"  provider: anthropic\n"
+            b"terminal:\n"
+            b"  backend: local\n"
+            b"auth:\n"
+            b"  adopt_external_logins: false\n"
+        )
+        self.assertEqual(144, len(user))
+
+        def swap() -> None:
+            dest = self.config()
+            tmp = dest.parent / "config.yaml.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                self.assertEqual(len(user), os.write(fd, user))
+            finally:
+                os.close(fd)
+            os.rename(tmp, dest)
+
+        with self._during_post_listing_walk(swap):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self.assertTrue(self.config().is_file())
+        self.assertEqual(user, self.config().read_bytes())
+        self.assertFalse((self.home / ".hermes" / "config.yaml.tmp").exists())
+        self.launcher.assert_not_called()
+
+    def test_same_inode_rewrite_after_listing_refuses(self) -> None:
+        # O_TRUNC keeps the inode. Both live stats then share dev, ino, size and
+        # mtime_ns, including when the write stays inside one timestamp tick.
+        same = b"auth:\n  adopt_external_logins: true \n"
+        grown = b"auth:\n  adopt_external_logins: true\nmodel: xyz\n"
+        appended = ADOPT_YAML + b"# comment\n"
+        self.assertEqual((37, 47, 47), (len(same), len(grown), len(appended)))
+        for label, payload in (("same-length", same), ("size-change", grown), ("appended", appended)):
+            with self.subTest(label=label):
+                shutil.rmtree(self.home / ".hermes", ignore_errors=True)
+
+                def rewrite(payload: bytes = payload) -> None:
+                    cfg = self.config()
+                    before = os.lstat(cfg)
+                    fd = os.open(cfg, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+                    try:
+                        self.assertEqual(len(payload), os.write(fd, payload))
+                    finally:
+                        os.close(fd)
+                    os.utime(cfg, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    after = os.lstat(cfg)
+                    self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+                    self.assertEqual(before.st_mtime_ns, after.st_mtime_ns)
+                    self.assertEqual(len(payload), after.st_size)
+
+                with self._during_post_listing_walk(rewrite):
+                    exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+                self.assertEqual("config.yaml", exc.detail)
+                self.assertEqual(payload, self.config().read_bytes())
+                self.launcher.assert_not_called()
+                self.launcher.reset_mock()
+
+    def test_replaced_hermes_dir_keeping_the_config_inode_refuses(self) -> None:
+        # Rename .hermes aside, mkdir a new one, hardlink config.yaml, add .env.
+        # The config inode matches. The directory the child opens does not.
+        aside = self.home / ".hermes.aside"
+
+        def swap() -> None:
+            os.rename(self.home / ".hermes", aside)
+            self._private(self.home / ".hermes")
+            os.link(aside / "config.yaml", self.config())
+            fd = os.open(self.home / ".hermes" / ".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, b"HERMES_HOME=/not-the-route\n")
+            finally:
+                os.close(fd)
+
+        with self._during_post_listing_walk(swap):
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual(".hermes", exc.detail)
+        self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
+        self.assertEqual(ADOPT_YAML, (aside / "config.yaml").read_bytes())
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(os.lstat(aside / "config.yaml").st_ino, os.lstat(self.config()).st_ino)
+        self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / ".env").read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_names_added_to_the_listed_hermes_dir_after_listing_refuse(self) -> None:
+        cases = (
+            (".env", "hermes_dotenv_in_home", False),
+            (".op.env", "hermes_dotenv_in_home", False),
+            ("state.db", "engine_store_in_route_home", False),
+            (".env", "hermes_dotenv_in_home", True),
+        )
+        for name, cause, subscription in cases:
+            with self.subTest(name=name, subscription=subscription):
+                shutil.rmtree(self.home / ".hermes", ignore_errors=True)
+
+                def plant(name: str = name) -> None:
+                    fd = os.open(
+                        self.home / ".hermes" / name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    try:
+                        os.write(fd, b"HERMES_HOME=/not-the-route\n")
+                    finally:
+                        os.close(fd)
+
+                launch = self.launch_sub if subscription else lambda: self.launch("hermes")
+                with self._during_post_listing_walk(plant):
+                    exc = self.refused(cause, launch)
+                self.assertEqual(name, exc.detail)
+                self.assertNotIn("HERMES_HOME=/not-the-route", str(exc))
+                self.assertTrue((self.home / ".hermes" / name).is_file())
+                self.launcher.assert_not_called()
+                self.launcher.reset_mock()
+
+    def test_subscription_extra_name_added_after_listing_still_launches(self) -> None:
+        def plant() -> None:
+            fd = os.open(
+                self.home / ".hermes" / "state.db",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            os.close(fd)
+
+        with self._during_post_listing_walk(plant):
+            self.launch_sub()
+        self.assertEqual(b"", (self.home / ".hermes" / "state.db").read_bytes())
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(1, self.launcher.call_count)
 
     def test_launcher_gets_the_held_route_home_fd_and_not_a_proc_self_home(self) -> None:
         # The fake launcher does not spawn. HOME=/proc/self/fd/N would name this

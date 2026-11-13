@@ -25,6 +25,7 @@
     "start_unconfirmed",
     "request_invalid",
     "registry_unavailable",
+    "unavailable",
     "scope_refused",
     "workspace_invalid",
     "workspace_busy",

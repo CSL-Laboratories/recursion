@@ -11,7 +11,7 @@
     "start_key": {
       "client_key": "k-1",
       "engine": "claude_code",
-      "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
     },
     "generation": 2,
     "cgroup_marker": null,
@@ -65,7 +65,7 @@
             "start_key": {
               "client_key": "k-1",
               "engine": "claude_code",
-              "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
             },
             "generation": 1,
             "cgroup_marker": null,
@@ -89,7 +89,7 @@
             }
           }
         },
-        "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "post_image_sha256": "45188083c94f8489455d91b854931294e567a663a33039b430b3ec933686d03a",
         "reason": "snapshot",
         "coalesced": null
       }
@@ -119,7 +119,7 @@
             "start_key": {
               "client_key": "k-1",
               "engine": "claude_code",
-              "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
             },
             "generation": 2,
             "cgroup_marker": null,
@@ -147,7 +147,7 @@
             }
           }
         },
-        "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "post_image_sha256": "fe721228e8150eb4de9745552d89e03b5546ba25456983079ca6ccab75e56230",
         "reason": "commit",
         "coalesced": null
       }

@@ -3,6 +3,6 @@
   "cwd": null,
   "input_text": "{\"a\": 1e999}",
   "expect": {
-    "refused": "number_out_of_range"
+    "refused": "integer_out_of_range"
   }
 }

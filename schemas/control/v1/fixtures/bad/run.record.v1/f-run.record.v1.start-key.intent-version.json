@@ -7,11 +7,11 @@
   "started_at": 1794555600.25,
   "stop": null,
   "start_key": {
-    "client_key": "k-1",
-    "engine": "claude_code",
-    "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "client_key": "k-2",
+    "engine": null,
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3",
     "intent_version": "x-nobody-defined-this",
-    "intent_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    "intent_sha256": "3cbc320c6e53906602e8cb19a6df90679d6c2a1ef90edc5505d3efa4893179e3"
   },
   "generation": 2,
   "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",

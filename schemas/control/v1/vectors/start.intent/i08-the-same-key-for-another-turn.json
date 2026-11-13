@@ -1,0 +1,35 @@
+{
+  "declared": [
+    "hand_pick",
+    "workspace",
+    "containment_level",
+    "session_id",
+    "turn_id"
+  ],
+  "request": {
+    "tenant": "t1",
+    "engine": "codex",
+    "prompt": "Fix the failing test in tests/test_io.py.",
+    "client_key": "k-1",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "turn_id": "turn-000c"
+  },
+  "expect": {
+    "preimage": "{\"engine\":\"codex\",\"prompt_sha256\":\"aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3\",\"session_id\":\"ses-7f3a9c2e51d04b6a\",\"turn_id\":\"turn-000c\"}",
+    "start_key": {
+      "client_key": "k-1",
+      "engine": "codex",
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3",
+      "intent_version": 1,
+      "intent_sha256": "2894809cee9218caeabcb7569eddf20314f56b228eca906c884fa4542955dd41"
+    },
+    "retry": "client_key_reused"
+  },
+  "stored": {
+    "client_key": "k-1",
+    "engine": "codex",
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3",
+    "intent_version": 1,
+    "intent_sha256": "4623dabd718a70e1a007c73bc171049906fd63bde736ac39a71704ef43696593"
+  }
+}

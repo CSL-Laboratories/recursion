@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "driver.v2.json",
   "title": "driver.v2: what an engine driver declares, takes and gives back",
-  "x-version": "1.0-draft.3",
+  "x-version": "1.0-draft.4",
   "description": "The engine driver contract, version 2. A driver is the core's own code for one engine; this file freezes the data that crosses between a driver and the rest of the core, so that every engine lane builds the same thing. It freezes shapes only: who owns a live handle between turns, how Stop and shutdown see it, and when it is released are for the driver lane to define with the lane that owns Stop. The record at the root is the driver's DECLARATION: the engine's name and one true-or-false flag for each thing the engine can do. The calls are: start(session, workspace, env) -> handle; send(input); interrupt(turn_id); resume(engine_session_id) -> handle; fork(engine_session_id, at) -> engine_session_id; parse(line) -> event drafts. A call whose flag is false is refused 'unsupported' BEFORE any side effect: no process is started, no byte is written to the engine, no record is made. Which flag each call needs: a second send of a user_message to the same worker needs multi_turn; a send of a user_message while a turn is in progress needs mid_turn_input; a send of an approval_answer needs permission_bridge; interrupt needs interrupt; resume needs resume; fork needs fork. typed_limits says the driver reads limits from typed fields of the engine's stream (never from text); usage says it reads token counts. start, the first send, close and parse need no flag. The one-turn path that exists today (one prompt, standard input closed, read until the result) is a driver whose flags are all false.",
   "type": "object",
   "additionalProperties": false,
@@ -128,7 +128,7 @@
       }
     },
     "event_draft": {
-      "description": "What parse gives back for one line of the engine's output: zero or more of these. A draft is an event before the core has numbered and timed it; its payload is exactly the payload of that type in event.v1. A driver may draft only these types. An input.accepted draft is made only from the engine's own typed signal that it took an input (its protocol's acknowledgement, or its replay of the user message), and names the delivery_id the input was sent with; it is never read out of free text. It never drafts an approval request: it asks the approval queue, and the core writes the event.",
+      "description": "What parse gives back for one line of the engine's output: zero or more of these. A draft is an event before the core has numbered and timed it; its payload is exactly the payload of that type in event.v1. A driver may draft only these types. An input.accepted draft is made only from the engine's own typed signal that it took an input (its protocol's acknowledgement, or its replay of the user message), and names the delivery_id the input was sent with; it is never read out of free text. The driver correlates acceptance with its own pending request/protocol token and worker incarnation, not an arbitrary ID read from engine output. It never drafts an approval request: it asks the approval queue, and the core writes the event.",
       "type": "object",
       "additionalProperties": false,
       "required": ["type", "payload"],

@@ -1,10 +1,8 @@
 {
-  "answer": {
-    "code": "run_unknown",
-    "detail": "limit"
-  },
   "method": "run.list",
-  "params": {
-    "limit": 0
+  "params": {},
+  "answer": {
+    "code": "method_unknown",
+    "detail": "daemon_closing"
   }
 }

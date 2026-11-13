@@ -14,7 +14,7 @@
     "projection": "x-nobody-defined-this",
     "lines": [
       {
-        "seq": 3,
+        "seq": 42,
         "time_rel_ms": 2074,
         "event_type": "engine.output",
         "source": "engine",

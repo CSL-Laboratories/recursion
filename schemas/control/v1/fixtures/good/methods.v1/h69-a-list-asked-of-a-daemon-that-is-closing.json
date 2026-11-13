@@ -1,0 +1,8 @@
+{
+  "method": "run.list",
+  "params": {},
+  "answer": {
+    "code": "unavailable",
+    "detail": "daemon_closing"
+  }
+}

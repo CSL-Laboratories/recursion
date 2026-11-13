@@ -9,7 +9,7 @@
   "start_key": {
     "client_key": "k-1",
     "engine": "claude_code",
-    "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
   },
   "generation": 2,
   "cgroup_marker": null,

@@ -79,17 +79,34 @@ the bad fixtures show both.
   started with no session, and says which (`source`). Its times are the times the core logged. A run
   with no session is not given one to make its Task. `conformance/rules.py` states the derivation and
   `vectors/task.derivation/` holds a case for every state of each source.
-- **A queued message is delivered when the engine says so, and only then.** The daemon commits the
-  item as `delivering`, under a delivery id, BEFORE it writes anything toward the engine. `steer.sent`
-  records a write into a turn in progress; it is not acceptance. The item becomes `delivered` only
-  when the engine's own typed acceptance, an `input.accepted` event from a driver's parse, names that
-  delivery id. An item with no acceptance at a restart, or at the end of the turn it was written
-  into, is `outcome_unknown`: shown as sent and not confirmed, and never sent again by itself. A
-  crash before the write and a crash after it leave the same record and end the same way. One commit
-  cannot make a delivery to an engine happen exactly once; what these records do is never claim a
-  delivery nobody confirmed, and never send twice. `vectors/queue.delivery/` walks each case.
+- **A queued message is delivered when the engine says so, and only then.** In one commit, BEFORE it
+  writes anything toward the engine, the daemon stores the item as `delivering`, a delivery id that
+  is never used again, and the full target BINDING: the item, the log, the run, the worker's
+  incarnation, the turn the input is aimed at (a new turn's id is allocated before the dispatch) and
+  how. Only that transition owns the write, and there is at most one write for one binding.
+  `steer.sent` records a write into a turn in progress; it is not acceptance. The item becomes
+  `delivered` only when the engine's own typed acceptance, an `input.accepted` event from a driver's
+  parse, agrees with the binding in its delivery, log, run, turn and how; a difference in any of them
+  changes nothing. With no acceptance at a restart, or by the end of the turn it was written into,
+  the item is `outcome_unknown`, which a surface shows as: Delivery outcome unknown; the message may
+  not have been sent. It will not be resent automatically. An acceptance that arrives after that is
+  kept as evidence and promotes nothing by itself. One commit cannot make a delivery to an engine
+  happen exactly once: this design gives up a possible delivery to avoid an automatic duplicate.
+  `vectors/queue.delivery/` walks each crash point.
 - **A log is read from a cursor.** `events.read` and `events.follow` take the cursor a read returned
-  (the log, the place in it, the daemon's epoch), and every page says whether the epoch advanced.
+  (the log, the place in it, the daemon's epoch). A page holds only positions strictly after the
+  cursor, in order, and skips none: a position that can no longer be given lies inside a
+  `replay.gap`, which starts at the next missing position and carries the seq of the last. The
+  answer's cursor is the last position represented, or the same cursor for an empty page. A first
+  read uses epoch 1 and seq 0; an older epoch reads on and the answer says the epoch advanced; a
+  cursor from a future epoch, or past the end of its log, is refused. A client keeps one cursor for
+  each log: the cursor is the only thing a read names.
+- **A timestamp is a moment that exists.** The pattern of a timestamp cannot say that February has
+  no 31st, so the schemas mark every such field with the keyword `x-instant`, which the conformance
+  client checks. A validator that does not know the keyword ignores it and must make that check itself.
+- **A digest in a record is the digest of something.** `post_image_sha256` and `input_digest` are
+  SHA-256 over the UTF-8 bytes of the value as RFC 8785 writes it, and a start's `intent_sha256` is
+  over the exact preimage that `vectors/start.intent/` gives byte for byte.
 - A session is `idle`, `live`, `stop_pending` or `ended`. `idle` with a worker that is alive is a
   persistent worker waiting for input: `idle` does not mean "no unit".
 - **Stop.** `stopped` means the run's removal was attested. `ended` means the run had already ended
@@ -166,20 +183,22 @@ tool's input as an object. The three are read strictly and bound as they are:
 | What is read | The input is JSON text and an object. The tool's name and the directory are text under the same rules as the input: any alphabet, in every field |
 | A key named twice in one object, at any depth | Refused. The core never picks the first or the last |
 | `NaN`, `Infinity` | Refused |
-| A whole number written without a fraction or an exponent | Kept exactly if it lies within -(2^53 - 1) .. 2^53 - 1, checked on its digits before any conversion that could lose it; refused outside it. A larger one is sent as a string, or not at all |
-| A number with a fraction or an exponent | Read as a binary64; refused if it is not finite |
+| Numbers | Admission does not depend on how a number is spelled, nor on whether a language would call it an integer or a float. An integral value outside -(2^53 - 1) .. 2^53 - 1 is refused (`integer_out_of_range`) whether it is written as digits, with a fraction or with an exponent, and the check is made before any conversion that could lose it; so is a number whose nearest binary64 is such a value. Every other number is a finite binary64. An exact quantity or an identifier that needs more is sent as a string |
+| Written and read again | An admitted call, written as RFC 8785 writes it and read again, is admitted with the same bytes |
+| The value that is dispatched | The normalised one that was bound: `1.0` is `1`, minus zero is `0`. A bridge that can only say yes or no to the engine's own pending request must first establish that the request means these same numbers; that it is the same pending request is not enough |
 | Half of a surrogate pair on its own, in a string or a key | Refused |
 | Unicode normalisation | None. A string is kept as it was written |
 | Depth | 64 at most |
-| What is hashed | The UTF-8 bytes of the WHOLE effect as RFC 8785 writes it: the core's own fields and the engine's call under one form. Keys in the order of their UTF-16 code units (U+10000 sorts before U+E000); numbers as ECMAScript writes them (`1.0` is `1`, `1e-7` is `1e-7`, minus zero is `0`, `1e21` is `1e+21`); strings as themselves |
+| What is hashed | The UTF-8 bytes of the WHOLE effect as RFC 8785 writes it: the core's own fields and the engine's call under one form. Keys in the order of their UTF-16 code units (U+10000 sorts before U+E000); numbers as ECMAScript writes them (`1.0` is `1`, `1e-7` is `1e-7`, minus zero is `0`); strings as themselves |
 | Size (PROVISIONAL) | `tool`, `cwd` and `input` together are at most 262,144 bytes as RFC 8785 writes them, and the approval's lines at most 200. A call that does not fit is refused with a typed code and is never truncated: no request is drawn |
+| Which lines | Every variable member of the effect is on a line, the session the call is bound to included (the word `none` for a run with no session). Every line that carries an engine's or a plugin's text goes through one encoder: at most 4,000 characters of text on a line, its label counted, and the rest continues on lines that start with two spaces. An effect that needs more than 200 lines is refused and no approval is made; nothing is cut. The record's own session and run are its effect's |
 | What the lines show | The same text, except that a character a surface must never be handed raw is written as a `\u` escape: controls, the marks that reorder or hide text, private use, tags (the list is in `rules.py`, `NOT_SHOWN_RAW`, and is explicit so that it does not move with a Unicode version). Text an engine supplied is always drawn as JSON text, quotes included, so two different values never draw the same line |
 | What is carried out | The call that was bound. Where an engine's permission protocol lets the answer carry the input, the driver sends back the bound input; otherwise the private binding to the engine's own pending request is the link |
 
 `vectors/call.profile/` holds each row as a case: what an engine wrote, and the text that is bound for
 it or the code it is refused with. The cases where two everyday serialisers disagree are among them
-(`1.0` against `1`, `1e-07` against `1e-7`, keys above U+FFFF, whole numbers above 2^53, a key named
-twice). Three things were checked against implementations that are not this one, on the lane's
+(`1.0` against `1`, `1e-07` against `1e-7`, keys above U+FFFF, whole numbers above 2^53 in every
+spelling, a key named twice). Three things were checked against implementations that are not this one, on the lane's
 machine: every plugin effect's bytes against the product's own `canonical`; every engine effect's
 digest and every call text against what Node gives with its own `JSON.parse`, a recursive key sort and
 `JSON.stringify`; and nine thousand numbers against Node's own writing of them.
@@ -197,6 +216,17 @@ look again before an answer is taken. `vectors/approval.lifecycle/` walks one re
 answer before any showing, two surfaces, a wrong digest, a stale revision, the answer, a retry of the
 same command, the same command id with another answer, a second answer, and an engine trying to
 answer.
+
+**Content, deadline, consumption.** Content may change only while the request is pending, and every
+change raises the revision; once it is resolved its effect, its lines and its deadline are immutable.
+Before a fresh answer is taken the server's time is compared with `expires_at`: at or after the
+deadline a pending request becomes `expired`, with no answer, and the answer is refused
+(`already_resolved`); a scheduler that has not run yet keeps nothing answerable. An approved effect is
+carried out against exactly the approved `(approval_id, revision, digest)` and the private binding the
+daemon keeps, once: then the request is `consumed`. A retry that returns a stored answer is history
+and carries nothing out. Eight more vectors in `vectors/approval.lifecycle/` walk a change of content,
+a change that cannot be drawn, openings and answers in another order, an answer at the deadline and
+one millisecond before it, and consumption across a restart.
 
 ## The method table
 

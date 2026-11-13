@@ -27,7 +27,7 @@
         "stop_attestation": null
       }
     },
-    "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "post_image_sha256": "41215a3d231328f1d8b1326d9a8f5dd378e648ea5e2c87c865c581f4ee195d23",
     "reason": "snapshot",
     "coalesced": null
   }

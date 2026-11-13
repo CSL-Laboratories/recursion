@@ -13,19 +13,84 @@ Nothing is frozen yet.
 
 | Schema | Version |
 |---|---|
-| `common.v1.json` | 1.0-draft.2 |
-| `run.record.v1.json` | 1.0-draft.3 |
-| `run.view.v1.json` | 1.0-draft.3 |
+| `common.v1.json` | 1.0-draft.3 |
+| `run.record.v1.json` | 1.0-draft.4 |
+| `run.view.v1.json` | 1.0-draft.4 |
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
-| `queue.item.v1.json` | 1.0-draft.4 |
-| `event.v1.json` | 1.0-draft.5 |
-| `approval.v1.json` | 1.0-draft.4 |
-| `driver.v2.json` | 1.0-draft.3 |
-| `mcp.task.v1.json` | 1.0-draft.3 |
+| `queue.item.v1.json` | 1.0-draft.5 |
+| `event.v1.json` | 1.0-draft.6 |
+| `approval.v1.json` | 1.0-draft.5 |
+| `driver.v2.json` | 1.0-draft.4 |
+| `mcp.task.v1.json` | 1.0-draft.4 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.6 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.7 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## After another model family read the whole set a second time (Nov 13, 2026)
+
+That read (of commit `d79c7a2c`) judged the drafts not yet ready to build against and wrote eight
+corrections, each with its replacement wording. The wording is in the schemas as it was written; the
+rules, the fixtures and the vectors follow it. Nothing here reopens the owner's two decisions.
+
+| Correction | What changed | What it breaks |
+|---|---|---|
+| R1. Numbers | Admission no longer depends on how a number is spelled. An integral value outside -(2^53 - 1) .. 2^53 - 1 is refused with a fraction or an exponent as well as in digits (`9007199254740993.0`, `1e20`, `1e21`, `1.5e300`), and so is a number whose nearest binary64 is such a value. What is bound is normalised (`1.0` is `1`, minus zero is `0`) and that value is what is dispatched. An admitted call read again from its own canonical text is admitted with the same bytes: every taken vector is checked for it. `approval.v1` draft 5 | A producer that took those numbers; the earlier vector that showed `1e21` and `1.5e300` as taken is changed |
+| R2. An approval's deadline, content and consumption | Before a fresh answer the server's time is compared with `expires_at`: at or after it the request is `expired` with no answer and the answer is `conflict`, `already_resolved`. Content changes only while pending and each change raises the revision. An approved effect is consumed once, against exactly its approval, revision, digest and private binding. A replayed answer is history. The rule (`ApprovalModel`) has all of it; eight vectors are new | An implementation that lets a scheduler decide expiry, or carries an effect out from a cached answer |
+| R3. The lines of an approval | The session a call is bound to is on a line. Every line of an engine's or a plugin's text, the directory included, goes through one encoder, with the label counted toward the line. A record whose own session or run is not its effect's is refused (`envelope`). `rendered_form` keeps its name: nothing was published under it | Every rendered engine approval gains a line; a directory longer than 3,987 characters is two lines, not one line the schema refuses |
+| R4. Delivery of a queued message | `queue.item.v1` draft 5: a private, normative `delivery_binding` (delivery, item, log, run, worker incarnation, target turn, how) is committed with `delivering` before the write. At most one write for one binding. An acceptance delivers only when its delivery, log, run, turn and how are the binding's; a mismatch changes nothing. `outcome_unknown` is worded as it is: the message may not have been sent. A late acceptance is kept as evidence. The rule is `DeliveryModel` (it replaces `queue_step`) | A producer that matches an acceptance by its delivery id alone, or allocates a new turn's id after the dispatch |
+| R5. The Task's edges | `run.view.v1` draft 4: a result's `code` is a code word, so a view can no longer carry one a Task would refuse. A view that says `stop_pending` sets `cancel_requested` whether or not it carries a stop record | A view whose result code ends with a line break |
+| R6. The identity of a start | `run.record.v1` draft 4: the intent is the engine as supplied (or null), the prompt's digest and only the DECLARED extensions that are present and not null, `session_id` and `turn_id` among them; it is taken before any registrant runs. The earlier fixed list of six members is gone. `start_key.engine` may be null, and only with an intent. `principal` and `launch` come together or not at all, on the record and on the view. A retry reuses a selected route entry, and a null one keeps the configured lookup. Fourteen vectors give preimages byte for byte | A producer of the fixed-list intent; a record with a principal and no launch |
+| R7. Pages and cursors | A page continues its cursor: only positions after it, in order, none skipped except inside a gap; the answer's cursor is the last position represented. A cursor from a future epoch is `request_invalid`, `cursor_epoch_ahead`; one past the end is `cursor_ahead`; an unknown log is `session_unknown`. Three good exchanges that broke this are repaired, and every good page is now checked against its cursor. `common.v1` draft 3 | A reader that expects a projection to drop positions |
+| R8. The method table | `methods` draft 7. Every row can answer `unavailable`: `run.start`, `run.status`, `run.list`, `run.stop`, `route.list` and `methods.list` gain it, for a daemon that is closing (`daemon_closing`), and `run.start` also for a start registrant that refused before a run existed (`start_registrant_failed`). The six legacy methods and `methods.list` are mandatory built-ins and are exactly the rows that cannot answer `unsupported`. An interrupt that fell back to Stop must carry the Stop's answer. Steering without `mid_turn_input` is queued for the next turn and does not interrupt. A receipt's tenant is derived from the authorized target. Each row's `falls_back` and `service` are pinned by a check | A reader with a fixed list of codes for the six legacy rows |
+
+The read also took ten rules away at random and two stayed green. Each now has a fixture that
+refuses: a session token grant that names a method twice, and a Task that waits for an approval and
+carries a result.
+
+Two of its follow-ups are done here because they are small. Every `post_image_sha256` and
+`input_digest` in a positive example is the computed digest, over the UTF-8 bytes of the value as RFC
+8785 writes it (`event.v1` draft 6), and a check holds every one to it. Every field typed as a
+timestamp is a real UTC calendar instant: the keyword `x-instant` says so, the conformance client
+checks it, and a validator that does not know the keyword must make the check itself. A Task's
+`created_at` is null when the log it is derived from is a retained tail or has a gap before the first
+event of the run or the turn (`mcp.task.v1` draft 4).
+
+### The seven choices of the commit before, each kept with a qualification
+
+| Choice | Kept as |
+|---|---|
+| A first read uses seq 0 and epoch 1 | Epoch 1 is the minimum/bootstrap token, not a claim that the client previously observed the log |
+| The name `epoch_advanced` | It is true exactly when a successful continuation replaces an older requested epoch with the current one. It is not a reset-to-zero instruction |
+| A late acceptance changes nothing | PROVISIONAL, the conservative rule. Never resend or silently promote a quarantined item merely because an unbound late packet arrived. Preserve late evidence; a later explicit reconciliation protocol may promote only after proving the durable binding and absence of a conflicting dispatch |
+| The code `result_invalid` | It truthfully says the retained result cannot be projected; it must not invent an engine failure reason |
+| `unknown` is working, `lost_reboot` is failed | working for unknown means no terminal outcome is known, not observed progress. failed/lost_reboot reports loss of the run's continuity, not proof that an external effect failed or did not happen |
+| `input.accepted` and `steer.sent` are filed under a turn | A concrete write/acceptance must name its target, and it must be the target of the durable binding |
+| `turn.started` and `steer.queued` keep more fields | These are copies of the committed turn/queue state at that event, not separately editable state |
+
+### Open, in the reading family's words
+
+Not done in these drafts. A lane must not read a schema-valid object as proof of any of them.
+
+- **Shape validation is not cross-record integrity.** Explicitly require session.active_turn_id
+  membership, coherent worker/run/turn links, unique/ordered turn indices, and equality between event
+  envelope IDs and their typed payload/post-image identities. The shapes in session.v1/event.v1/
+  approval.v1 contain both copies but cannot alone establish the joins. Add semantic vectors or
+  document the validated producer preconditions for each projection.
+- **Keep declared deferrals honest.** Stored Stop proof=removed and launch_manifest remain reserved;
+  driver live-handle ownership remains a runtime concern; session-token transport/admission is not
+  proven by grant shape; plugin API version/revocation policy remains provisional. Signature
+  verification, whole-package file-map/digest coverage and cross-reader byte ordering still need
+  executable artifact vectors before a plugin lane claims end-to-end interoperability. State the
+  conversion from session.workspace.path to launch.workspace.source_path explicitly; they currently
+  have different field names. None of these draft files is an implementation of the deferred runtime.
+- **The origin of a transcript's time.** Task/transcript origin comes from retained creation metadata
+  or the actual creation event. A retained tail or replay.gap is not a creation time. The Task rule
+  follows this; the transcript rule still counts from the first event it is given, so a transcript
+  made from a retained tail has no stated origin yet.
+- The owner's two questions stay his: whether steering is offered on an engine that gives no typed
+  acceptance mid-turn, and the final limit of an effect's size and what a prompt does with one that is
+  too long to show.
 
 ## The rest of the build plan's third revision (Nov 13, 2026)
 
@@ -59,7 +124,7 @@ typed event, and nothing else counts.
 | `state.changed.coalesced` is the number of marks an image stands for, given only when it was measured (1 or more), and null when it was not. Draft 4 used 0 for "exactly one". Today's producer keeps a set and no count, and always gives null | Every producer and reader of the number |
 
 The commits, in order, are in the description of `queue.item.v1.json`. `conformance/rules.py`
-(`queue_step`) states what each happening does to an item, and nine vectors walk it: a crash before
+(`queue_step`, since replaced by `DeliveryModel`) states what each happening does to an item, and nine vectors walk it: a crash before
 the write and a crash after it end the same way (`outcome_unknown`, never sent again by itself), and a
 step that is an acceptance must carry its `input.accepted` event. PROVISIONAL, for the lane that owns
 the queue: an acceptance that arrives after an item became `outcome_unknown` changes nothing by itself.
@@ -107,7 +172,7 @@ field. A Task of a run does not expire: PROVISIONAL until a retention rule exist
 | In the plan | Here | Why |
 |---|---|---|
 | `turn.started {delivery_id}`, `steer.queued {item_id}` | More fields, as above | The emitting lanes reshape them with a fixture |
-| A turn with outcome `done` or `candidate_done` cannot carry an error code | Neither can one with `waiting` or `paused` | Stricter, from the second read; the lane that owns sessions may relax it with a fixture |
+| A turn with outcome `done` or `candidate_done` cannot carry an error code | Neither can one with `waiting` or `paused` | Stricter, kept because it agrees with the projection of an ended turn to a completed Task. SESSIONS and MCP must change the source turn constraint, Task projection and producer/consumer vectors together before allowing error codes on waiting/paused |
 | A session's `workspace` and the launch object's `workspace` | The session's says `path`, the launch object's `source_path` | The session record was not in this revision's list; one name for both is a breaking change to `session.v1` and waits for the lane that owns it |
 
 ## Brought in line with the build plan's third revision (Nov 13, 2026)

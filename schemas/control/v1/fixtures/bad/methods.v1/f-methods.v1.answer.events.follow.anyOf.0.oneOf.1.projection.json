@@ -14,7 +14,18 @@
     "projection": "x-nobody-defined-this",
     "lines": [
       {
-        "seq": 3,
+        "seq": 1,
+        "time_rel_ms": 0,
+        "event_type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "state": null,
+        "text": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reading the tests.\"}]}}\n",
+        "speech": null,
+        "focus": null
+      },
+      {
+        "seq": 2,
         "time_rel_ms": 2074,
         "event_type": "engine.output",
         "source": "engine",
@@ -28,7 +39,7 @@
     "cursor": {
       "epoch": 3,
       "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-      "seq": 3
+      "seq": 2
     },
     "more": false,
     "epoch_advanced": true

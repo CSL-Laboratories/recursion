@@ -31,6 +31,10 @@
         "trust": "trusted"
       },
       {
+        "text": "session: ses-7f3a9c2e51d04b6a",
+        "trust": "trusted"
+      },
+      {
         "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
         "trust": "trusted"
       },
@@ -119,6 +123,10 @@
             "trust": "trusted"
           },
           {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
             "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
             "trust": "trusted"
           },
@@ -202,6 +210,10 @@
               "trust": "trusted"
             },
             {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
               "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
               "trust": "trusted"
             },
@@ -275,6 +287,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {
@@ -371,6 +387,10 @@
               "trust": "trusted"
             },
             {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
               "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
               "trust": "trusted"
             },
@@ -444,6 +464,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {
@@ -540,6 +564,10 @@
               "trust": "trusted"
             },
             {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
               "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
               "trust": "trusted"
             },
@@ -622,6 +650,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {
@@ -730,6 +762,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {
@@ -842,6 +878,10 @@
             "trust": "trusted"
           },
           {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
             "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
             "trust": "trusted"
           },
@@ -947,6 +987,10 @@
               "trust": "trusted"
             },
             {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
               "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
               "trust": "trusted"
             },
@@ -1032,6 +1076,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {
@@ -1143,6 +1191,10 @@
               "trust": "trusted"
             },
             {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
               "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
               "trust": "trusted"
             },
@@ -1228,6 +1280,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {
@@ -1338,6 +1394,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {
@@ -1452,6 +1512,10 @@
             "trust": "trusted"
           },
           {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
             "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
             "trust": "trusted"
           },
@@ -1562,6 +1626,10 @@
             "trust": "trusted"
           },
           {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
             "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
             "trust": "trusted"
           },
@@ -1667,6 +1735,10 @@
               "trust": "trusted"
             },
             {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
               "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
               "trust": "trusted"
             },
@@ -1752,6 +1824,10 @@
           },
           {
             "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
             "trust": "trusted"
           },
           {

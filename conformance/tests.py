@@ -20,6 +20,14 @@ if str(HERE) not in sys.path:
 import wire_client as client  # noqa: E402
 
 VERSION = re.compile(r"1\.0(-draft\.[1-9][0-9]*)?")
+# What the method table says beyond its codes, pinned here so that a row cannot lose it unnoticed.
+MANDATORY = ("run.start", "run.status", "run.list", "run.stop", "route.list", "plugin.list", "methods.list")
+CLOSING_ONLY = {"run.start": ["daemon_closing", "start_registrant_failed"], "run.status": ["daemon_closing"],
+                "run.list": ["daemon_closing"], "run.stop": ["daemon_closing"], "route.list": ["daemon_closing"],
+                "methods.list": ["daemon_closing"]}
+FALLS_BACK = {"session.steer": [{"flag": "mid_turn_input", "then": "next_turn"}],
+              "session.interrupt": [{"flag": "interrupt", "then": "stop_then_resume"}]}
+SERVICES = (None,)      # the services a row may name. None yet: a lane that registers one asks for its name here
 
 
 class PublishedFilesTest(unittest.TestCase):
@@ -279,6 +287,18 @@ class PublishedFilesTest(unittest.TestCase):
                                          ["not_implemented"] + needs_receipt + row["requires"])
                     else:
                         self.assertEqual(row["requires"], [], "a row requires a flag and cannot answer 'unsupported'")
+                    # The seven mandatory built-ins are exactly the rows that cannot answer 'unsupported'.
+                    self.assertEqual("unsupported" not in refusals, name in MANDATORY)
+                    # Every method can be refused by a daemon that is closing. One that waits on no service of
+                    # its own says 'unavailable' for that and for nothing a service would say.
+                    self.assertIn("unavailable", row["codes"])
+                    if name in CLOSING_ONLY:
+                        self.assertEqual([pin["then"]["properties"]["detail"]["enum"] for pin in limits["allOf"]], [CLOSING_ONLY[name]])
+                    else:
+                        self.assertNotIn("allOf", limits)
+                    # What a row says of fallbacks and of its service is data nothing else checks: pinned here.
+                    self.assertEqual(row["falls_back"], FALLS_BACK.get(name, []))
+                    self.assertIn(row["service"], SERVICES)
                     # What the row says about keys and revisions is what the params schema requires.
                     required = set(params.get("required", ()))
                     self.assertEqual("command_id" in required, row["idempotency"] == "command_id")
@@ -335,22 +355,28 @@ class PublishedFilesTest(unittest.TestCase):
                 expect = vector.get("expect")
                 if entry["rule"] == "call.profile":
                     kinds = {"caught" if "refused" in expect else "agrees"}
-                elif entry["rule"] in ("approval.binding", "transcript.projection", "task.derivation"):
+                elif entry["rule"] in ("approval.binding", "transcript.projection", "task.derivation", "event.page"):
                     kinds = {"caught" if expect else "agrees"}
+                elif entry["rule"] == "start.intent":
+                    kinds = {"caught" if expect.get("retry") == "client_key_reused" else "agrees"}
+                elif entry["rule"] == "event.cursor":
+                    kinds = {"agrees" if expect["code"] == "ok" else "caught"}
                 elif entry["rule"] == "queue.delivery":
                     kinds = ({"agrees"} if any("item" in step for step in vector["steps"]) else set()) \
                         | ({"caught"} if any("refused" in step for step in vector["steps"]) else set())
                 else:
-                    codes = {step["answer"]["code"] for step in vector["steps"]}
+                    codes = {step["answer"]["code"] if "answer" in step else step["result"] for step in vector["steps"]}
                     kinds = ({"agrees"} if "ok" in codes else set()) | ({"caught"} if codes - {"ok"} else set())
                 seen.setdefault(entry["rule"], set()).update(kinds)
         self.assertEqual({rule: sorted(kinds) for rule, kinds in seen.items()},
                          {rule: ["agrees", "caught"] for rule in client.VECTOR_RULES})
 
-    def test_a_queue_item_is_delivered_only_by_the_engines_own_acceptance(self):
-        """In a queue.delivery vector, a step that is an acceptance carries an input.accepted event that names
-        the same delivery and the same turn. Take the event away, make it the core's write, or let it name
-        another delivery or turn, and the vector is refused, whatever the item after the step says."""
+    def test_a_queue_item_is_delivered_only_by_an_acceptance_that_agrees_with_its_binding(self):
+        """In a queue.delivery vector, take each step where an acceptance delivers the item, and change the
+        acceptance: no event at all, the core's own write in its place, another turn, an envelope filed
+        under another turn, another log, another run, the other 'how', another delivery. Then write the
+        delivery a second time just before it. Each time the vector is refused: what the step claims is no
+        longer what the rule gives from the binding that was committed before the write."""
         changed = 0
         for folder, schemas in self.sets.items():
             for entry in client.load_vectors(folder):
@@ -359,23 +385,84 @@ class PublishedFilesTest(unittest.TestCase):
                 vector = client.read_json(folder / "vectors" / entry["file"])
                 self.assertIsNone(client.judge_vector(schemas, "queue.delivery", vector), entry["file"])
                 for number, step in enumerate(vector["steps"]):
-                    if step["happening"] != "accepted":
+                    if step["happening"] != "accepted" or "item" not in step:
                         continue
-                    sent = dict(step["event"], type="steer.sent", source="core", trust="trusted",
-                                payload={"item_id": vector["item"]["item_id"], "delivery_id": step["facts"]["delivery_id"]})
-                    for what, event in (("no event", None), ("the core's write", sent),
-                                        ("another delivery", dict(step["event"], payload=dict(step["event"]["payload"], delivery_id="dlv-ffff"))),
-                                        ("another turn", dict(step["event"], payload=dict(step["event"]["payload"], turn_id="turn-ffff"))),
-                                        ("an envelope of another turn", dict(step["event"], turn_id="turn-ffff"))):
+                    event = step["event"]
+                    payload = event["payload"]
+                    other_how = "new_turn" if payload["how"] == "mid_turn" else "mid_turn"
+                    variants = {
+                        "no event": None,
+                        "the core's write": dict(event, type="steer.sent", source="core", trust="trusted",
+                                                 payload={"item_id": vector["item"]["item_id"], "delivery_id": payload["delivery_id"]}),
+                        "another turn": dict(event, turn_id="turn-ffff", payload=dict(payload, turn_id="turn-ffff")),
+                        "an envelope of another turn": dict(event, turn_id="turn-ffff"),
+                        "another log": dict(event, session_id="ses-ffffffffffffffff"),
+                        "another run": dict(event, run_id="run-" + "f" * 32),
+                        "the other how": dict(event, payload=dict(payload, how=other_how)),
+                        "another delivery": dict(event, payload=dict(payload, delivery_id="dlv-ffff")),
+                    }
+                    for what, replaced in variants.items():
                         doctored = copy.deepcopy(vector)
-                        if event is None:
+                        if replaced is None:
                             del doctored["steps"][number]["event"]
                         else:
-                            doctored["steps"][number]["event"] = event
+                            doctored["steps"][number]["event"] = replaced
                         with self.subTest(vector=entry["file"], step=number + 1, change=what):
                             self.assertIsNotNone(client.judge_vector(schemas, "queue.delivery", doctored))
                         changed += 1
-        self.assertGreater(changed, 15, "too few acceptance steps to mean anything")
+                    writes = [index for index, earlier in enumerate(vector["steps"][:number])
+                              if earlier["happening"] == "written" and "item" in earlier]
+                    if writes:
+                        doctored = copy.deepcopy(vector)
+                        doctored["steps"].insert(number, copy.deepcopy(vector["steps"][writes[-1]]))
+                        with self.subTest(vector=entry["file"], step=number + 1, change="a second write"):
+                            self.assertIsNotNone(client.judge_vector(schemas, "queue.delivery", doctored))
+                        changed += 1
+        self.assertGreater(changed, 20, "too few acceptance steps to mean anything")
+
+    def test_every_page_in_a_good_exchange_continues_its_cursor(self):
+        """A good exchange of events.read or events.follow that answers a page: the page is the continuation
+        of the cursor it was asked with. (Each side validates alone; this is the join.)"""
+        found = 0
+        for folder, schemas in self.sets.items():
+            for entry in client.load_index(folder):
+                if not entry["file"].startswith("good/"):
+                    continue
+                value = client.read_json(folder / "fixtures" / entry["file"])
+                if not (isinstance(value, dict) and value.get("method") in ("events.read", "events.follow")):
+                    continue
+                answer = value.get("answer")
+                if isinstance(answer, dict) and answer.get("code") == "ok":
+                    found += 1
+                    with self.subTest(fixture=entry["file"]):
+                        self.assertEqual(client.rules.page_problems(value["params"]["cursor"], answer), [])
+        self.assertGreaterEqual(found, 4, "too few pages to mean anything")
+
+    def test_every_event_in_a_good_file_carries_real_digests_and_real_spans(self):
+        """Wherever a good fixture or a vector holds an event: a state.changed carries the digest of its
+        post-image, a tool.call the digest of its input. And in the good fixtures a replay.gap is a span
+        (from at most to, filed under to); the vectors hold broken spans on purpose, each caught by name."""
+        found = {"state.changed": 0, "tool.call": 0, "replay.gap": 0}
+        for folder, schemas in self.sets.items():
+            good = [(folder / "fixtures" / entry["file"], True) for entry in client.load_index(folder)
+                    if entry["file"].startswith("good/")]
+            vectors = [(folder / "vectors" / entry["file"], False) for entry in client.load_vectors(folder)]
+            for path, fixture in good + vectors:
+                for event in client.events_in(client.read_json(path)):
+                    kind, payload = event["type"], event["payload"]
+                    with self.subTest(file=path.name, seq=event["seq"], type=kind):
+                        if kind == "state.changed" and "post_image" in payload:
+                            found[kind] += 1
+                            self.assertEqual(payload.get("post_image_sha256"), client.rules.post_image_digest(payload["post_image"]))
+                        elif kind == "tool.call" and payload.get("input") is not None:
+                            found[kind] += 1
+                            self.assertEqual(payload.get("input_digest"), client.rules.input_digest(payload["input"]))
+                        elif kind == "replay.gap" and fixture:
+                            found[kind] += 1
+                            self.assertFalse(client.rules.gap_problem(event))
+        self.assertGreater(found["state.changed"], 20)
+        self.assertGreater(found["tool.call"], 0)
+        self.assertGreater(found["replay.gap"], 0)
 
     def test_a_task_is_derived_for_every_state_of_each_source(self):
         """A Task comes from a run or from a turn. For every state a run's view can show, and for every state

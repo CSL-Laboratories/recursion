@@ -1,10 +1,8 @@
 {
+  "method": "run.list",
+  "params": {},
   "answer": {
     "code": "x-nobody-defined-this",
-    "detail": "limit"
-  },
-  "method": "run.list",
-  "params": {
-    "limit": 0
+    "detail": "daemon_closing"
   }
 }

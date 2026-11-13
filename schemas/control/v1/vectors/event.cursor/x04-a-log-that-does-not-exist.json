@@ -1,0 +1,13 @@
+{
+  "cursor": {
+    "epoch": 1,
+    "session_id": "ses-00000000deadbeef",
+    "seq": 0
+  },
+  "log": null,
+  "epoch": 3,
+  "expect": {
+    "code": "session_unknown",
+    "session_id": "ses-00000000deadbeef"
+  }
+}

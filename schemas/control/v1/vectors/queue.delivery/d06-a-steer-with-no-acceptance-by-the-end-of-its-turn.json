@@ -13,10 +13,16 @@
   },
   "steps": [
     {
-      "what": "The intent is committed.",
+      "what": "Delivering and the binding are committed.",
       "happening": "begin",
       "facts": {
-        "delivery_id": "dlv-0008"
+        "delivery_id": "dlv-0008",
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "worker_incarnation": "wrk-5b1f0c2d.1",
+        "target_turn_id": "turn-000c",
+        "how": "mid_turn"
       },
       "item": {
         "item_id": "qi-0002",
@@ -34,9 +40,6 @@
     {
       "what": "The write returns, and the core logs steer.sent.",
       "happening": "written",
-      "facts": {
-        "delivery_id": "dlv-0008"
-      },
       "event": {
         "seq": 51,
         "session_id": "ses-7f3a9c2e51d04b6a",
@@ -65,8 +68,30 @@
       }
     },
     {
+      "what": "Another turn ends: not the one this input is aimed at. Nothing changes.",
+      "happening": "turn_ended",
+      "facts": {
+        "turn_id": "turn-000b"
+      },
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "delivering",
+        "delivery_id": "dlv-0008",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
       "what": "The turn it was written into ends.",
       "happening": "turn_ended",
+      "facts": {
+        "turn_id": "turn-000c"
+      },
       "event": {
         "seq": 53,
         "session_id": "ses-7f3a9c2e51d04b6a",
@@ -98,12 +123,8 @@
       }
     },
     {
-      "what": "PROVISIONAL, for the lane that owns the queue to confirm: an acceptance that arrives after that changes nothing by itself.",
+      "what": "PROVISIONAL, the conservative rule: an acceptance that arrives after that changes nothing by itself. It is kept.",
       "happening": "accepted",
-      "facts": {
-        "delivery_id": "dlv-0008",
-        "turn_id": "turn-000c"
-      },
       "event": {
         "seq": 54,
         "session_id": "ses-7f3a9c2e51d04b6a",
@@ -119,7 +140,41 @@
           "how": "mid_turn"
         }
       },
-      "refused": "not_delivering"
+      "refused": "not_delivering",
+      "evidence": [
+        {
+          "delivery_id": "dlv-0008",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "how": "mid_turn"
+        }
+      ]
+    },
+    {
+      "what": "A restart leaves it as it is, and the evidence with it.",
+      "happening": "restart",
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "outcome_unknown",
+        "delivery_id": "dlv-0008",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      },
+      "evidence": [
+        {
+          "delivery_id": "dlv-0008",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "how": "mid_turn"
+        }
+      ]
     }
   ]
 }

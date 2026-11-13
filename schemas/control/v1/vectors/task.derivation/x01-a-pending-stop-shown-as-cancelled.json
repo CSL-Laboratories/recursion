@@ -18,7 +18,7 @@
     "start_key": {
       "client_key": "k-1",
       "engine": "claude_code",
-      "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
     },
     "generation": 3,
     "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
@@ -73,7 +73,7 @@
             "start_key": {
               "client_key": "k-1",
               "engine": "claude_code",
-              "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
             },
             "generation": 1,
             "cgroup_marker": null,
@@ -97,7 +97,7 @@
             }
           }
         },
-        "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "post_image_sha256": "45188083c94f8489455d91b854931294e567a663a33039b430b3ec933686d03a",
         "reason": "snapshot",
         "coalesced": null
       }
@@ -127,7 +127,7 @@
             "start_key": {
               "client_key": "k-1",
               "engine": "claude_code",
-              "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
             },
             "generation": 2,
             "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
@@ -151,7 +151,7 @@
             }
           }
         },
-        "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "post_image_sha256": "cf69f7353188d72273b4c81200fee1f27bdadba7c206b8687d4f08441324efd3",
         "reason": "commit",
         "coalesced": null
       }
@@ -222,7 +222,7 @@
             "start_key": {
               "client_key": "k-1",
               "engine": "claude_code",
-              "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
             },
             "generation": 3,
             "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
@@ -246,7 +246,7 @@
             }
           }
         },
-        "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "post_image_sha256": "7438f1c14a610e6720eba78f9d27d6715d3c1a92e2a750731e47d5a14f5a83c1",
         "reason": "commit",
         "coalesced": null
       }

@@ -1,0 +1,145 @@
+{
+  "item": {
+    "item_id": "qi-0001",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "order": 1,
+    "text": "When the tests pass, also update the changelog.",
+    "revision": 1,
+    "delivery": "next_turn",
+    "state": "queued",
+    "delivery_id": null,
+    "turn_id": null,
+    "created_at": "2026-11-13T07:34:20.000Z"
+  },
+  "steps": [
+    {
+      "what": "Delivering and the binding are committed.",
+      "happening": "begin",
+      "facts": {
+        "delivery_id": "dlv-0007",
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "worker_incarnation": "wrk-5b1f0c2d.1",
+        "target_turn_id": "turn-000d",
+        "how": "new_turn"
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, also update the changelog.",
+        "revision": 1,
+        "delivery": "next_turn",
+        "state": "delivering",
+        "delivery_id": "dlv-0007",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The write returns.",
+      "happening": "written",
+      "facts": {
+        "delivery_id": "dlv-0007"
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, also update the changelog.",
+        "revision": 1,
+        "delivery": "next_turn",
+        "state": "delivering",
+        "delivery_id": "dlv-0007",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The acceptance was seen and not committed; the daemon starts again.",
+      "happening": "restart",
+      "event": {
+        "seq": 51,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:35:40.000Z",
+        "type": "effect.outcome_unknown",
+        "source": "core",
+        "trust": "trusted",
+        "payload": {
+          "effect": {
+            "kind": "queue_delivery",
+            "id": "dlv-0007"
+          },
+          "why": "daemon_restart"
+        }
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, also update the changelog.",
+        "revision": 1,
+        "delivery": "next_turn",
+        "state": "outcome_unknown",
+        "delivery_id": "dlv-0007",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The acceptance is read again after the restart: refused, the item stays quarantined, the evidence is kept.",
+      "happening": "accepted",
+      "event": {
+        "seq": 52,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000d",
+        "time": "2026-11-13T07:35:41.000Z",
+        "type": "input.accepted",
+        "source": "engine",
+        "trust": "untrusted",
+        "payload": {
+          "delivery_id": "dlv-0007",
+          "turn_id": "turn-000d",
+          "how": "new_turn"
+        }
+      },
+      "refused": "not_delivering",
+      "evidence": [
+        {
+          "delivery_id": "dlv-0007",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000d",
+          "how": "new_turn"
+        }
+      ]
+    },
+    {
+      "what": "Nothing resends it.",
+      "happening": "begin",
+      "facts": {
+        "delivery_id": "dlv-0009",
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "worker_incarnation": "wrk-5b1f0c2d.1",
+        "target_turn_id": "turn-000d",
+        "how": "new_turn"
+      },
+      "refused": "not_queued",
+      "evidence": [
+        {
+          "delivery_id": "dlv-0007",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000d",
+          "how": "new_turn"
+        }
+      ]
+    }
+  ]
+}

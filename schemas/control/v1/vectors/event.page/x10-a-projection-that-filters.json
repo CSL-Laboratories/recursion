@@ -1,0 +1,49 @@
+{
+  "method": "events.read",
+  "params": {
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 41
+    },
+    "projection": "transcript"
+  },
+  "page": {
+    "code": "ok",
+    "projection": "transcript",
+    "lines": [
+      {
+        "seq": 42,
+        "time_rel_ms": 2074,
+        "event_type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "state": null,
+        "text": "line 42\n",
+        "speech": null,
+        "focus": null
+      },
+      {
+        "seq": 44,
+        "time_rel_ms": 2090,
+        "event_type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "state": null,
+        "text": "line 44\n",
+        "speech": null,
+        "focus": null
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 44
+    },
+    "more": false,
+    "epoch_advanced": false
+  },
+  "expect": [
+    "order"
+  ]
+}

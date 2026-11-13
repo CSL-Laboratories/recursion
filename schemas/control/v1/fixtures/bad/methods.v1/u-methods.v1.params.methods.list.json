@@ -5,7 +5,7 @@
   },
   "answer": {
     "code": "ok",
-    "table_version": "1.0-draft.6",
+    "table_version": "1.0-draft.7",
     "methods": [
       {
         "name": "run.stop",

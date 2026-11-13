@@ -1,0 +1,827 @@
+{
+  "record": {
+    "approval_id": "apr-00c4",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "turn_id": "turn-000c",
+    "source": "engine_tool",
+    "effect": {
+      "kind": "engine_tool",
+      "engine": "claude_code",
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "tool": "Bash",
+      "cwd": "/home/dev/projects/atlas",
+      "input": {
+        "command": "rm -rf build && make",
+        "description": "clean build"
+      }
+    },
+    "digest_form": "rfc8785/v1",
+    "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+    "display": [],
+    "rendered_form": "csl-approval-lines/v0",
+    "rendered": [
+      {
+        "text": "Tool call waiting for an answer",
+        "trust": "trusted"
+      },
+      {
+        "text": "engine: claude_code",
+        "trust": "trusted"
+      },
+      {
+        "text": "session: ses-7f3a9c2e51d04b6a",
+        "trust": "trusted"
+      },
+      {
+        "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "trust": "trusted"
+      },
+      {
+        "text": "tool: \"Bash\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "directory: \"/home/dev/projects/atlas\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "input fields: 2",
+        "trust": "trusted"
+      },
+      {
+        "text": "\"command\": \"rm -rf build && make\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "\"description\": \"clean build\"",
+        "trust": "untrusted"
+      }
+    ],
+    "requested_at": "2026-11-13T07:34:30.000Z",
+    "expires_at": "2026-11-13T07:49:30.000Z",
+    "state": "pending",
+    "opened_by": [],
+    "answered_by": null,
+    "answer": null,
+    "answered_at": null,
+    "revision": 1
+  },
+  "steps": [
+    {
+      "what": "The phone shows it.",
+      "principal": {
+        "kind": "device",
+        "id": "phone-2f9c"
+      },
+      "at": "2026-11-13T07:34:40.000Z",
+      "request": {
+        "method": "approval.open",
+        "params": {
+          "command_id": "phone-2f9c.0010",
+          "approval_id": "apr-00c4",
+          "surface": "phone"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Bash",
+            "cwd": "/home/dev/projects/atlas",
+            "input": {
+              "command": "rm -rf build && make",
+              "description": "clean build"
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Bash\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projects/atlas\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 2",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"command\": \"rm -rf build && make\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"description\": \"clean build\"",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "pending",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "device",
+                "id": "phone-2f9c"
+              },
+              "surface": "phone",
+              "revision": 1,
+              "at": "2026-11-13T07:34:40.000Z"
+            }
+          ],
+          "answered_by": null,
+          "answer": null,
+          "answered_at": null,
+          "revision": 1
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "device",
+              "id": "phone-2f9c"
+            },
+            "surface": "phone",
+            "revision": 1,
+            "at": "2026-11-13T07:34:40.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "The owner answers on the terminal, which has not shown it: refused, although the phone has.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:41.000Z",
+      "request": {
+        "method": "approval.answer",
+        "params": {
+          "command_id": "tui-7c1e.0020",
+          "approval_id": "apr-00c4",
+          "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+          "answer": "deny",
+          "expected_revision": 1,
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "prompt_not_shown",
+        "approval_id": "apr-00c4"
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "device",
+              "id": "phone-2f9c"
+            },
+            "surface": "phone",
+            "revision": 1,
+            "at": "2026-11-13T07:34:40.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "The phone, which showed it, approves.",
+      "principal": {
+        "kind": "device",
+        "id": "phone-2f9c"
+      },
+      "at": "2026-11-13T07:34:45.000Z",
+      "request": {
+        "method": "approval.answer",
+        "params": {
+          "command_id": "phone-2f9c.0011",
+          "approval_id": "apr-00c4",
+          "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+          "answer": "approve",
+          "expected_revision": 1,
+          "surface": "phone"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Bash",
+            "cwd": "/home/dev/projects/atlas",
+            "input": {
+              "command": "rm -rf build && make",
+              "description": "clean build"
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Bash\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projects/atlas\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 2",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"command\": \"rm -rf build && make\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"description\": \"clean build\"",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "approved",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "device",
+                "id": "phone-2f9c"
+              },
+              "surface": "phone",
+              "revision": 1,
+              "at": "2026-11-13T07:34:40.000Z"
+            }
+          ],
+          "answered_by": {
+            "kind": "device",
+            "id": "phone-2f9c"
+          },
+          "answer": "approve",
+          "answered_at": "2026-11-13T07:34:45.000Z",
+          "revision": 1
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "approved",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "device",
+              "id": "phone-2f9c"
+            },
+            "surface": "phone",
+            "revision": 1,
+            "at": "2026-11-13T07:34:40.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "device",
+          "id": "phone-2f9c"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:45.000Z",
+        "revision": 1
+      }
+    },
+    {
+      "what": "The terminal shows it only now: the record is returned and no opening is added.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:50.000Z",
+      "request": {
+        "method": "approval.open",
+        "params": {
+          "command_id": "tui-7c1e.0021",
+          "approval_id": "apr-00c4",
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Bash",
+            "cwd": "/home/dev/projects/atlas",
+            "input": {
+              "command": "rm -rf build && make",
+              "description": "clean build"
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Bash\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projects/atlas\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 2",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"command\": \"rm -rf build && make\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"description\": \"clean build\"",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "approved",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "device",
+                "id": "phone-2f9c"
+              },
+              "surface": "phone",
+              "revision": 1,
+              "at": "2026-11-13T07:34:40.000Z"
+            }
+          ],
+          "answered_by": {
+            "kind": "device",
+            "id": "phone-2f9c"
+          },
+          "answer": "approve",
+          "answered_at": "2026-11-13T07:34:45.000Z",
+          "revision": 1
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "approved",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "device",
+              "id": "phone-2f9c"
+            },
+            "surface": "phone",
+            "revision": 1,
+            "at": "2026-11-13T07:34:40.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "device",
+          "id": "phone-2f9c"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:45.000Z",
+        "revision": 1
+      }
+    },
+    {
+      "what": "The owner denies it on the terminal: someone answered first.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:51.000Z",
+      "request": {
+        "method": "approval.answer",
+        "params": {
+          "command_id": "tui-7c1e.0022",
+          "approval_id": "apr-00c4",
+          "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+          "answer": "deny",
+          "expected_revision": 1,
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "conflict",
+        "detail": "already_resolved",
+        "approval_id": "apr-00c4"
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "approved",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "device",
+              "id": "phone-2f9c"
+            },
+            "surface": "phone",
+            "revision": 1,
+            "at": "2026-11-13T07:34:40.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "device",
+          "id": "phone-2f9c"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:45.000Z",
+        "revision": 1
+      }
+    }
+  ]
+}

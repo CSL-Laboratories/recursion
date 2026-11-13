@@ -246,6 +246,15 @@
       }
     },
     {
+      "file": "bad/approval.v1/b60-requested-on-a-day-that-does-not-exist.json",
+      "schema": "approval.v1.json",
+      "rule": "Every field typed timestamp is a real UTC calendar instant, on an approval as anywhere.",
+      "expect": {
+        "keyword": "x-instant",
+        "at": "/requested_at"
+      }
+    },
+    {
       "file": "bad/approval.v1/f-approval.v1.allOf.3.then.answer.json",
       "schema": "approval.v1.json",
       "rule": "The value at /answer is fixed by approval.v1.json#/allOf/3/then/properties/answer.",
@@ -1125,6 +1134,15 @@
       "rule": "An owner is 'host' or a plugin's id.",
       "expect": {
         "keyword": "pattern",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/b60-a-day-that-does-not-exist.json",
+      "schema": "common.v1.json#/$defs/timestamp",
+      "rule": "A timestamp is a real moment: February has no 31st. The pattern cannot say so; the keyword x-instant does.",
+      "expect": {
+        "keyword": "x-instant",
         "at": ""
       }
     },
@@ -2264,6 +2282,11 @@
       "shows": "A producer that counts its marks measured that this image stands for three of them. Today's producer keeps a set of marked runs and no count, and always gives null."
     },
     {
+      "file": "good/event.v1/h41-state-changed-with-text-outside-ascii.json",
+      "schema": "event.v1.json",
+      "shows": "A session whose folder has an accented letter in its name. The digest is over the UTF-8 bytes of the post-image as RFC 8785 writes it: the letter itself, not an escape. A digest taken over an everyday serialiser's escaped text would be another one."
+    },
+    {
       "file": "bad/event.v1/b01-seq-zero.json",
       "schema": "event.v1.json",
       "rule": "The first event of a log is 1.",
@@ -2630,6 +2653,15 @@
       "expect": {
         "keyword": "type",
         "at": "/turn_id"
+      }
+    },
+    {
+      "file": "bad/event.v1/b60-an-event-on-a-day-that-does-not-exist.json",
+      "schema": "event.v1.json",
+      "rule": "So is the time of an event: no transcript is made from a log that holds this.",
+      "expect": {
+        "keyword": "x-instant",
+        "at": "/time"
       }
     },
     {
@@ -4400,6 +4432,26 @@
       "shows": "The other way to break it: the result says error and names no code. The Task is failed, with the code result_invalid, and invents no reason."
     },
     {
+      "file": "good/mcp.task.v1/h25-run-that-says-stop-pending-and-carries-no-stop-record.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A view whose state is stop_pending and whose stop record is null: the schema takes it, so the rule answers it. The state alone says a Stop was asked and is not confirmed."
+    },
+    {
+      "file": "good/mcp.task.v1/h26-turn-whose-log-is-a-retained-tail.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The log as it is retained begins at position 4: the events before it were dropped. The first event that is left is not the turn's creation, so created_at is null. A tail is not a creation time."
+    },
+    {
+      "file": "good/mcp.task.v1/h27-turn-whose-first-events-are-behind-a-gap.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The log begins at its first position, and a replay.gap stands before the first event of this turn: the turn's creation may be in the gap, so created_at is null."
+    },
+    {
+      "file": "good/mcp.task.v1/h28-run-with-a-gap-after-its-first-event.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A gap later in the log does not hide the origin: the first event is the creation, and created_at is its time."
+    },
+    {
       "file": "bad/mcp.task.v1/b01-completed-without-a-result.json",
       "schema": "mcp.task.v1.json",
       "rule": "A 'completed' Task carries its result.",
@@ -4550,6 +4602,15 @@
       "expect": {
         "keyword": "anyOf",
         "at": "/created_at"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b18-waiting-for-an-approval-with-a-result.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task that waits for an approval has no result yet.",
+      "expect": {
+        "keyword": "type",
+        "at": "/result"
       }
     },
     {
@@ -5129,6 +5190,51 @@
       "file": "good/methods.v1/h62-a-method-whose-service-is-still-starting.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "The service a method's row names is not ready yet: 'unavailable', service_starting. The caller may ask again."
+    },
+    {
+      "file": "good/methods.v1/h63-a-read-from-past-the-end-of-the-log.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A cursor beyond the last position of its log cannot be continued from."
+    },
+    {
+      "file": "good/methods.v1/h64-a-read-with-an-epoch-from-the-future.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A cursor that names an epoch the daemon has not reached."
+    },
+    {
+      "file": "good/methods.v1/h65-a-read-of-a-log-nobody-knows.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A cursor names its log; an unknown one is session_unknown."
+    },
+    {
+      "file": "good/methods.v1/h66-a-stop-asked-of-a-daemon-that-is-closing.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Once closing begins no new client call is admitted, a Stop included: 'unavailable', daemon_closing. The daemon's own recovery Stop is not a client's call and goes on."
+    },
+    {
+      "file": "good/methods.v1/h67-methods-list-asked-of-a-daemon-that-is-closing.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The same for methods.list, which waits on no service."
+    },
+    {
+      "file": "good/methods.v1/h68-a-start-a-registrant-refused-before-any-run-existed.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A start registrant failed before a run was accepted: 'unavailable', start_registrant_failed, and no run id, because there is no run. Once a run is accepted a launch failure is start_failed."
+    },
+    {
+      "file": "good/methods.v1/h69-a-list-asked-of-a-daemon-that-is-closing.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The same for run.list."
+    },
+    {
+      "file": "good/methods.v1/h70-the-routes-asked-of-a-daemon-that-is-closing.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "And for route.list."
+    },
+    {
+      "file": "good/methods.v1/h71-a-status-asked-of-a-daemon-that-is-closing.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "And for run.status."
     },
     {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",
@@ -5755,6 +5861,42 @@
       }
     },
     {
+      "file": "bad/methods.v1/b32-a-fallback-to-stop-that-hides-the-stop.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "When an interrupt fell back to Stop, the answer carries the Stop's own answer: a pending Stop must reach the caller.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b33-a-built-in-waiting-on-a-service.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "run.status waits on no service: its 'unavailable' is the closing daemon and nothing else.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b34-unavailable-with-no-reason.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "'unavailable' says why.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b35-a-start-refused-as-closing-for-a-reason-nobody-defined.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "run.start's 'unavailable' is the closing daemon or a start registrant that refused.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/f-methods.v1.answer.approval.answer.anyOf.0.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/answer.approval.answer/anyOf/0/properties/code.",
@@ -5945,7 +6087,7 @@
     },
     {
       "file": "bad/methods.v1/f-methods.v1.answer.run.list.anyOf.0.code.json",
-      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/answer.run.list/anyOf/0/properties/code.",
       "expect": {
         "keyword": "const",
@@ -9706,6 +9848,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.methods.list.anyOf.1.allOf.1.allOf.0.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.methods.list/anyOf/1/allOf/1/allOf/0/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.methods.list.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.methods.list/anyOf/1/allOf/1/properties/code.",
@@ -9832,6 +9983,15 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.route.list.anyOf.1.allOf.1.allOf.0.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.route.list/anyOf/1/allOf/1/allOf/0/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.route.list.anyOf.1.allOf.1.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.route.list/anyOf/1/allOf/1/properties/code.",
@@ -9841,8 +10001,17 @@
       }
     },
     {
+      "file": "bad/methods.v1/v-methods.v1.answer.run.list.anyOf.1.allOf.1.allOf.0.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.run.list/anyOf/1/allOf/1/allOf/0/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/v-methods.v1.answer.run.list.anyOf.1.allOf.1.code.json",
-      "schema": "methods.v1.json#/$defs/refused_exchange",
+      "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.run.list/anyOf/1/allOf/1/properties/code.",
       "expect": {
         "keyword": "enum",
@@ -9856,6 +10025,15 @@
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.run.stop.anyOf.1.allOf.1.allOf.0.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.run.stop/anyOf/1/allOf/1/allOf/0/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {
@@ -10336,9 +10514,9 @@
       }
     },
     {
-      "file": "bad/methods.v1/v-methods.v1.refusal.allOf.1.then.detail.json",
+      "file": "bad/methods.v1/v-methods.v1.refusal.allOf.2.then.detail.json",
       "schema": "methods.v1.json#/$defs/refusal",
-      "rule": "The value at /detail must be one of the values listed at methods.v1.json#/$defs/refusal/allOf/1/then/properties/detail.",
+      "rule": "The value at /detail must be one of the values listed at methods.v1.json#/$defs/refusal/allOf/2/then/properties/detail.",
       "expect": {
         "keyword": "enum",
         "at": "/detail"
@@ -10470,7 +10648,7 @@
     {
       "file": "good/queue.item.v1/h04-delivered-into-a-turn.json",
       "schema": "queue.item.v1.json",
-      "shows": "The engine's own typed acceptance (an input.accepted event) named the delivery: delivered, with the turn that took it."
+      "shows": "The engine's own typed acceptance (an input.accepted event) agreed with the binding committed before the write: delivered, with the turn that took it."
     },
     {
       "file": "good/queue.item.v1/h05-cancelled.json",
@@ -10480,7 +10658,17 @@
     {
       "file": "good/queue.item.v1/h06-outcome-unknown-after-a-restart.json",
       "schema": "queue.item.v1.json",
-      "shows": "The daemon restarted while the item was being delivered, or the turn it was written into ended, and no acceptance from the engine names the delivery: nobody can say whether the engine took it. It is shown to the user as sent and not confirmed, and is never sent again by itself."
+      "shows": "The daemon restarted while the item was being delivered, or the turn it was written into ended, and no acceptance from the engine names the delivery: nobody can say whether the engine took it. Delivery outcome unknown; the message may not have been sent. It will not be resent automatically."
+    },
+    {
+      "file": "good/queue.item.v1/h07-the-binding-of-a-next-turn-delivery.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "shows": "PRIVATE. What the daemon commits with 'delivering', before it writes anything: the delivery, the item, the log, the run, the worker's incarnation, the id of the new turn (allocated before the dispatch) and how."
+    },
+    {
+      "file": "good/queue.item.v1/h08-the-binding-of-a-steer.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "shows": "The binding of a message written into the turn in progress."
     },
     {
       "file": "bad/queue.item.v1/b01-delivered-into-no-turn.json",
@@ -10573,9 +10761,90 @@
       }
     },
     {
+      "file": "bad/queue.item.v1/b60-a-binding-with-no-worker.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "A binding names the incarnation of the worker the input is written to: the driver matches the engine's signal to it.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/b61-a-binding-aimed-at-no-turn.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "A binding names its target turn; a new turn's id is allocated before the dispatch.",
+      "expect": {
+        "keyword": "type",
+        "at": "/target_turn_id"
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/b62-a-binding-that-says-how-with-the-delivery-word.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "'how' is what the engine is asked to do, new_turn or mid_turn, not the item's delivery word.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/how"
+      }
+    },
+    {
       "file": "bad/queue.item.v1/m-queue.item.v1.created-at.json",
       "schema": "queue.item.v1.json",
       "rule": "The object described at queue.item.v1.json#/ always carries 'created_at'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/m-queue.item.v1.delivery-binding.delivery-id.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "The object described at queue.item.v1.json#/$defs/delivery_binding always carries 'delivery_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/m-queue.item.v1.delivery-binding.how.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "The object described at queue.item.v1.json#/$defs/delivery_binding always carries 'how'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/m-queue.item.v1.delivery-binding.item-id.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "The object described at queue.item.v1.json#/$defs/delivery_binding always carries 'item_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/m-queue.item.v1.delivery-binding.run-id.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "The object described at queue.item.v1.json#/$defs/delivery_binding always carries 'run_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/m-queue.item.v1.delivery-binding.session-id.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "The object described at queue.item.v1.json#/$defs/delivery_binding always carries 'session_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/m-queue.item.v1.delivery-binding.target-turn-id.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "The object described at queue.item.v1.json#/$defs/delivery_binding always carries 'target_turn_id'.",
       "expect": {
         "keyword": "required",
         "at": ""
@@ -10641,6 +10910,15 @@
       "rule": "The object described at queue.item.v1.json#/ always carries 'turn_id'.",
       "expect": {
         "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/queue.item.v1/u-queue.item.v1.delivery-binding.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "rule": "The object described at queue.item.v1.json#/$defs/delivery_binding is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
         "at": ""
       }
     },
@@ -10713,6 +10991,11 @@
       "file": "good/run.record.v1/h09-launch-in-a-worktree-not-made-yet.json",
       "schema": "run.record.v1.json",
       "shows": "The launch intent of a run that will work in a worktree: the worktree is not made yet, so worktree_path is null."
+    },
+    {
+      "file": "good/run.record.v1/h10-a-start-that-named-no-engine.json",
+      "schema": "run.record.v1.json",
+      "shows": "The record of a start whose request named no engine: routing chose it. The key stores a null engine and the intent that says so; the record says which engine was launched."
     },
     {
       "file": "bad/run.record.v1/b01-stopped-without-an-attestation.json",
@@ -10883,6 +11166,33 @@
       "expect": {
         "keyword": "type",
         "at": "/launch/workspace/worktree_path"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b60-a-principal-with-no-launch.json",
+      "schema": "run.record.v1.json",
+      "rule": "'principal' and 'launch' are written together: a record that carries one carries the other.",
+      "expect": {
+        "keyword": "dependentRequired",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b61-a-launch-with-no-principal.json",
+      "schema": "run.record.v1.json",
+      "rule": "The same from the other side: a launch snapshot with nobody who asked for it.",
+      "expect": {
+        "keyword": "dependentRequired",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b62-a-legacy-key-that-names-no-engine.json",
+      "schema": "run.record.v1.json",
+      "rule": "A start that names no engine exists only on the versioned path: a key with no intent always names its engine.",
+      "expect": {
+        "keyword": "required",
+        "at": "/start_key"
       }
     },
     {
@@ -11600,6 +11910,33 @@
       }
     },
     {
+      "file": "bad/run.view.v1/b60-a-principal-with-no-launch.json",
+      "schema": "run.view.v1.json",
+      "rule": "The view holds the same rule as the record.",
+      "expect": {
+        "keyword": "dependentRequired",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.view.v1/b61-a-launch-with-no-principal.json",
+      "schema": "run.view.v1.json",
+      "rule": "From the other side.",
+      "expect": {
+        "keyword": "dependentRequired",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.view.v1/b62-a-result-code-that-ends-with-a-line-break.json",
+      "schema": "run.view.v1.json",
+      "rule": "A result's code is a code word, the same one a Task derived from it must carry: no line break rides along at its end.",
+      "expect": {
+        "keyword": "not",
+        "at": "/result/code"
+      }
+    },
+    {
       "file": "bad/run.view.v1/f-run.view.v1.result.oneOf.1.contract.json",
       "schema": "run.view.v1.json",
       "rule": "The value at /result/contract is fixed by run.view.v1.json#/$defs/result/oneOf/1/properties/contract.",
@@ -12112,6 +12449,15 @@
       "expect": {
         "keyword": "pattern",
         "at": ""
+      }
+    },
+    {
+      "file": "bad/session.token.v1/b07-a-method-named-twice.json",
+      "schema": "session.token.v1.json",
+      "rule": "A grant names each method once.",
+      "expect": {
+        "keyword": "uniqueItems",
+        "at": "/verbs"
       }
     },
     {

@@ -23,8 +23,10 @@ Three files:
 - `rules.py`: the rules a JSON Schema cannot state, as plain functions over plain values, importing the
   standard library alone: the strict reading of a tool's input, the text of a value as RFC 8785 writes
   it, the digest of an effect, the lines of an approval, `approval.open` and `approval.answer` one
-  call at a time, what a transcript line must carry because its event says so, what each thing that
-  happens to a queued message does to it, and the Task of a run and of a turn. A client in another
+  call at a time with its deadline, a change of content and the single consumption, what a transcript
+  line must carry because its event says so, what each thing that happens to a queued message does to
+  it against the binding committed before the write, the Task of a run and of a turn, the identity of
+  a start request, reading a log from a cursor, and the digests an event carries. A client in another
   language implements these and checks the same vectors.
 - `tests.py`: all of it as tests.
 
@@ -59,9 +61,21 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   being refused with exactly its code; a Task differs from what its source says in exactly the fields
   its vector lists (none, for a Task that is right). Every rule has vectors that agree and vectors it
   must catch;
-- in a queue vector, a step that is an acceptance carries an `input.accepted` event that names the
-  same delivery and the same turn: without it, with the core's own write in its place, or with
-  another delivery or turn in it, the vector is refused;
+- in a queue vector, what the core is told by an event is read from the event: an acceptance that
+  delivers an item is tried without its event, with the core's own write in its place, with another
+  turn, log, run, `how` or delivery, and after a second write, and each time the vector is refused;
+- a start request stores exactly the `start_key` its vector gives, from exactly the preimage its
+  vector gives; a cursor is answered as its vector says; a page has exactly the faults its vector
+  lists against the cursor it was asked with, and so has no fault in any good exchange;
+- wherever a good fixture or a vector holds an event, a `state.changed` carries the digest of its
+  post-image and a `tool.call` the digest of its input, and in the good fixtures a `replay.gap` is a
+  span filed under its last position;
+- every field typed as a timestamp holds a moment that exists (the keyword `x-instant`, which this
+  client adds to its validator);
+- in the method table, the seven mandatory built-ins are exactly the rows that cannot answer
+  `unsupported`; every row can answer `unavailable`; a built-in that waits on no service answers it
+  only for a closing daemon (and `run.start` for a start registrant that refused); and each row's
+  `falls_back` and `service` are the ones pinned in `tests.py`;
 - a Task vector agrees with the rule for every state a run's view can show and every state a turn can
   be in, and every status a Task can have is reached from each source;
 - every approval inside a good fixture, wherever it sits, has the digest of its effect and the lines

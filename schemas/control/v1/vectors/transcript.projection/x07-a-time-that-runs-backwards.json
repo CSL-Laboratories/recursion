@@ -89,6 +89,10 @@
             "trust": "trusted"
           },
           {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
             "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
             "trust": "trusted"
           },
@@ -165,7 +169,7 @@
       "source": "core",
       "trust": "trusted",
       "state": null,
-      "text": "Tool call waiting for an answer\nengine: claude_code\nrun: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7\ntool: \"Bash\"\ndirectory: \"/home/dev/projects/atlas\"\ninput fields: 2\n\"command\": \"rm -rf build && make\"\n\"description\": \"clean build\"",
+      "text": "Tool call waiting for an answer\nengine: claude_code\nsession: ses-7f3a9c2e51d04b6a\nrun: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7\ntool: \"Bash\"\ndirectory: \"/home/dev/projects/atlas\"\ninput fields: 2\n\"command\": \"rm -rf build && make\"\n\"description\": \"clean build\"",
       "speech": "Approval needed",
       "focus": "approval"
     }

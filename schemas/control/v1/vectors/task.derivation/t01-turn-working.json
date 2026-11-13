@@ -82,7 +82,7 @@
   "turn_id": "turn-000c",
   "events": [
     {
-      "seq": 39,
+      "seq": 1,
       "session_id": "ses-7f3a9c2e51d04b6a",
       "run_id": null,
       "turn_id": "turn-000c",
@@ -104,13 +104,13 @@
           "result": null,
           "expires_at": null
         },
-        "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "post_image_sha256": "8853fd4f2ba1898ed285de611b1cfb2b23c33542aa0c8818672913def07f4078",
         "reason": "commit",
         "coalesced": null
       }
     },
     {
-      "seq": 40,
+      "seq": 2,
       "session_id": "ses-7f3a9c2e51d04b6a",
       "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
       "turn_id": "turn-000c",
@@ -125,7 +125,7 @@
       }
     },
     {
-      "seq": 41,
+      "seq": 3,
       "session_id": "ses-7f3a9c2e51d04b6a",
       "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
       "turn_id": "turn-000c",
@@ -140,7 +140,7 @@
       }
     },
     {
-      "seq": 42,
+      "seq": 4,
       "session_id": "ses-7f3a9c2e51d04b6a",
       "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
       "turn_id": "turn-000c",
@@ -162,13 +162,13 @@
           "result": null,
           "expires_at": null
         },
-        "post_image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "post_image_sha256": "9ecac8b6e566ae094f94e3eaa28c09f2ee189f9fe8a80fa22a222f4c14accd27",
         "reason": "commit",
         "coalesced": null
       }
     },
     {
-      "seq": 43,
+      "seq": 5,
       "session_id": "ses-7f3a9c2e51d04b6a",
       "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
       "turn_id": "turn-000c",

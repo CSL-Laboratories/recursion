@@ -1,0 +1,14 @@
+{
+  "method": "events.read",
+  "params": {
+    "cursor": {
+      "epoch": 1,
+      "session_id": "ses-00000000deadbeef",
+      "seq": 0
+    }
+  },
+  "answer": {
+    "code": "session_unknown",
+    "session_id": "ses-00000000deadbeef"
+  }
+}

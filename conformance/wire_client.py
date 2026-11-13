@@ -30,8 +30,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError
+from jsonschema import Draft202012Validator, validators
+from jsonschema.exceptions import SchemaError, ValidationError
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
@@ -49,6 +49,22 @@ MIN_GOOD = MIN_BAD = 3
 
 class ConformanceError(Exception):
     """The published files themselves are inconsistent (not a fixture verdict)."""
+
+
+def _instant(validator, flag, instance, schema):
+    """``"x-instant": true`` on a string schema: the text is a moment that exists. A pattern can say that a
+    month has two digits; it cannot say that February has no 31st. A validator that does not know this
+    keyword ignores it, as the dialect says of any keyword it does not know, and must make the check itself."""
+    if flag and isinstance(instance, str):
+        try:
+            rules.milliseconds(instance)
+        except rules.Refused:
+            yield ValidationError(f"{instance!r} is not a real UTC calendar instant")
+
+
+# Registered for the dialect, so that it is also the class used below a "$ref" into another schema file (a
+# validator is chosen again from each document's own "$schema"). The registration is this process's own.
+Validator = validators.validates("draft2020-12+x-instant")(validators.extend(Draft202012Validator, {"x-instant": _instant}))
 
 
 def read_json(path: Path) -> Any:
@@ -101,7 +117,7 @@ class SchemaSet:
 
     def validator(self, ref: str) -> Draft202012Validator:
         self.resolve(ref)
-        return Draft202012Validator({"$schema": DIALECT, "$ref": ref}, registry=self.registry)
+        return Validator({"$schema": DIALECT, "$ref": ref}, registry=self.registry)
 
     def refs(self) -> Iterator[tuple[str, str]]:
         """Every ``(file, $ref)`` written anywhere in the folder's schemas."""
@@ -351,7 +367,7 @@ def check_instance(schemas: SchemaSet, entry: dict, instance: Any) -> str | None
 
 
 VECTOR_RULES = ("call.profile", "approval.binding", "approval.lifecycle", "transcript.projection", "queue.delivery",
-                "task.derivation")
+                "task.derivation", "start.intent", "event.cursor", "event.page")
 
 
 def load_vectors(folder: Path) -> list[dict]:
@@ -403,6 +419,29 @@ def _misfit(schemas: SchemaSet, ref: str, instance: Any) -> str | None:
     return f"{keyword} at {location or '/'}: {message[:160]}"
 
 
+def _unnormalised(value) -> bool:
+    """True when a value read for a call still holds a float whose value is integral."""
+    if type(value) is float:
+        return value.is_integer()
+    if isinstance(value, dict):
+        return any(_unnormalised(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_unnormalised(item) for item in value)
+    return False
+
+
+def events_in(value: Any) -> Iterator[dict]:
+    """Every event inside a value, wherever it sits: an object with the envelope of event.v1."""
+    if isinstance(value, dict):
+        if {"seq", "session_id", "type", "source", "trust", "payload"} <= set(value) and isinstance(value["payload"], dict):
+            yield value
+        for inner in value.values():
+            yield from events_in(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from events_in(inner)
+
+
 def check_vector(schemas: SchemaSet, entry: dict) -> str | None:
     """None when the vector agrees with its rule, else what does not."""
     return judge_vector(schemas, entry["rule"], read_json(schemas.folder / "vectors" / entry["file"]))
@@ -422,6 +461,18 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
             return f"taken as {text[:80]}, expected the refusal '{expect['refused']}'"
         if text != expect["call_text"]:
             return f"the call's text is {text[:200]!r}, expected {expect['call_text'][:200]!r}"
+        # The value that is bound is the value that is dispatched: every integral number is the whole number.
+        if _unnormalised(call["input"]):
+            return "the bound input holds a number that is not normalised (an integral float, or minus zero)"
+        if "input" in expect and (call["input"] != expect["input"] or rules.text_of(call["input"]) != rules.text_of(expect["input"])):
+            return "the bound input is not the vector's"
+        # Closed under its own text: written as RFC 8785 writes it and read again, it is admitted with the same bytes.
+        try:
+            again = rules.call_of(vector["tool"], rules.text_of(call["input"]), vector["cwd"])
+        except rules.Refused as refusal:
+            return f"the call's own canonical text is refused on reading it again ({refusal.code})"
+        if rules.text_of(again) != text:
+            return "the call's canonical text reads back as another call"
         effect = {"kind": "engine_tool", "engine": "claude_code", "session_id": None, "run_id": "run-vector", **call}
         misfit = _misfit(schemas, "approval.v1.json#/$defs/engine_tool_effect", effect)
         return f"the call does not fit an engine-tool effect: {misfit}" if misfit else None
@@ -443,19 +494,44 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
                 return "the effect's canonical text differs from the vector's"
         return None
     if rule == "approval.lifecycle":
-        # One request, and calls on it one after another: each answer and each record after it.
-        model = rules.ApprovalModel(vector["record"])
+        # One request, and what happens to it one step at a time: a client's call (approval.open,
+        # approval.answer) with its answer, or something the core does (it changes the content, it carries
+        # the effect out, it starts again from what is durable) with its result; and the record after each.
+        binding = vector.get("binding")
+        if binding is not None:
+            misfit = _misfit(schemas, "approval.v1.json#/$defs/binding", binding)
+            if misfit:
+                return f"the private binding does not fit approval.v1's: {misfit}"
+        model = rules.ApprovalModel(vector["record"], binding)
         records = [("the starting record", vector["record"])]
         for number, step in enumerate(vector["steps"], 1):
-            request = step["request"]
-            answer = model.call(step["principal"], request["method"], request["params"], step["at"])
-            if answer != step["answer"]:
-                return f"step {number}: the rule answers {answer}, the vector says {step['answer']}"
+            if "core" in step:
+                core = dict(step["core"])
+                happening = core.pop("happening")
+                try:
+                    if happening == "change":
+                        model.change(**core)
+                    elif happening == "consume":
+                        model.consume(core["revision"], core["digest"], core.get("binding"))
+                    elif happening == "restart":
+                        model = rules.ApprovalModel(model.record, model.binding, model.receipts)
+                    else:
+                        return f"step {number}: nothing the core does is called {happening!r}"
+                    result = "ok"
+                except rules.Refused as refusal:
+                    result = refusal.code
+                if result != step["result"]:
+                    return f"step {number}: the rule gives '{result}', the vector says '{step['result']}'"
+            else:
+                request = step["request"]
+                answer = model.call(step["principal"], request["method"], request["params"], step["at"])
+                if answer != step["answer"]:
+                    return f"step {number}: the rule answers {answer}, the vector says {step['answer']}"
+                misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", dict(request, answer=answer))
+                if misfit:
+                    return f"step {number}: the call and its answer do not fit the method table: {misfit}"
             if model.record != step["record"]:
-                return f"step {number}: the record after the call is not the vector's"
-            misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", dict(request, answer=answer))
-            if misfit:
-                return f"step {number}: the call and its answer do not fit the method table: {misfit}"
+                return f"step {number}: the record after the step is not the vector's"
             records.append((f"step {number}", step["record"]))
         for where, record in records:
             misfit = _misfit(schemas, "approval.v1.json", record)
@@ -479,33 +555,47 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
         return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
     if rule == "queue.delivery":
         # One queued message, and what happens to it step by step: the item after each, or the refusal.
-        # A step may carry the event of the log that belongs to it. An acceptance always does: the only
-        # thing that makes an item 'delivered' is an input.accepted event that names its delivery.
-        item = vector["item"]
-        records = [("the starting item", item)]
+        # What the core is told by an EVENT is read from the event and from nothing else: an acceptance is
+        # an input.accepted event, and its delivery, log, run, turn and 'how' are checked by the rule
+        # against the binding that was committed before the write. A write into a turn is a steer.sent event.
+        model = rules.DeliveryModel(vector["item"])
+        records = [("the starting item", vector["item"])]
         for number, step in enumerate(vector["steps"], 1):
-            event = step.get("event")
+            happening, facts, event = step["happening"], step.get("facts"), step.get("event")
             if event is not None:
                 misfit = _misfit(schemas, "event.v1.json", event)
                 if misfit:
                     return f"step {number}: the event does not fit event.v1: {misfit}"
-            if step["happening"] == "accepted":
-                facts = step.get("facts") or {}
-                if event is None or event["type"] != "input.accepted" or event["turn_id"] != facts.get("turn_id") or any(
-                        event["payload"][key] != facts.get(key) for key in ("delivery_id", "turn_id")):
-                    return f"step {number}: an acceptance is an input.accepted event that names the same delivery and turn"
+            if happening == "begin" and step.get("refused") != "binding":
+                misfit = _misfit(schemas, "queue.item.v1.json#/$defs/delivery_binding", facts)
+                if misfit:
+                    return f"step {number}: the binding does not fit queue.item.v1's: {misfit}"
+            if happening == "accepted":
+                if event is None or event["type"] != "input.accepted" or event["turn_id"] != event["payload"]["turn_id"]:
+                    return f"step {number}: an acceptance is an input.accepted event, filed under the turn it names"
+                facts = {"delivery_id": event["payload"]["delivery_id"], "session_id": event["session_id"],
+                         "run_id": event["run_id"], "turn_id": event["payload"]["turn_id"], "how": event["payload"]["how"]}
+            elif happening == "written" and event is not None:
+                if event["type"] != "steer.sent":
+                    return f"step {number}: a write into a turn is a steer.sent event"
+                facts = {"delivery_id": event["payload"]["delivery_id"], "item_id": event["payload"]["item_id"],
+                         "turn_id": event["turn_id"]}
+            before = json.dumps(model.item, sort_keys=True)
             try:
-                after = rules.queue_step(item, step["happening"], step.get("facts"))
+                model.step(happening, facts)
             except rules.Refused as refusal:
                 if step.get("refused") != refusal.code:
                     return f"step {number}: refused as '{refusal.code}', the vector says {step.get('refused') or step.get('item')}"
-                continue
-            if "refused" in step:
-                return f"step {number}: taken, the vector says refused '{step['refused']}'"
-            if after != step["item"]:
-                return f"step {number}: the item after is {after}, the vector says {step['item']}"
-            item = after
-            records.append((f"step {number}", after))
+                if json.dumps(model.item, sort_keys=True) != before:
+                    return f"step {number}: a refused step changed the item"
+            else:
+                if "refused" in step:
+                    return f"step {number}: taken, the vector says refused '{step['refused']}'"
+                if model.item != step["item"]:
+                    return f"step {number}: the item after is {model.item}, the vector says {step['item']}"
+                records.append((f"step {number}", step["item"]))
+            if model.evidence != step.get("evidence", []):
+                return f"step {number}: the acceptances kept for reconciliation are {model.evidence}, the vector says {step.get('evidence', [])}"
         for where, record in records:
             misfit = _misfit(schemas, "queue.item.v1.json", record)
             if misfit:
@@ -530,6 +620,46 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
         if misfit:
             return f"the source record does not fit its schema: {misfit}"
         found = rules.task_problems(wanted, vector["task"])
+        return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
+    if rule == "start.intent":
+        # A start request, the extensions the start path declared (null when no lane is on it), and the
+        # start_key it stores: the exact preimage of its intent, byte for byte, and how a later request
+        # under the same key compares with a key already stored.
+        declared, request, expect = vector["declared"], vector["request"], vector["expect"]
+        key = rules.start_key_of(request, declared)
+        preimage = rules.start_intent_text(request, declared) if key is not None and declared is not None else None
+        if preimage != expect["preimage"]:
+            return f"the preimage is {preimage!r}, the vector says {expect['preimage']!r}"
+        if key != expect["start_key"]:
+            return f"the start_key is {key}, the vector says {expect['start_key']}"
+        if key is not None:
+            misfit = _misfit(schemas, "run.record.v1.json#/$defs/start_key", key)
+            if misfit:
+                return f"the start_key does not fit run.record.v1's: {misfit}"
+        if "stored" in vector:
+            misfit = _misfit(schemas, "run.record.v1.json#/$defs/start_key", vector["stored"])
+            if misfit:
+                return f"the stored start_key does not fit run.record.v1's: {misfit}"
+            retry = rules.start_retry(vector["stored"], request, declared)
+            if retry != expect["retry"]:
+                return f"against the stored key the rule says '{retry}', the vector says '{expect['retry']}'"
+        return None
+    if rule == "event.cursor":
+        # A cursor, the log it names (or none) and the daemon's epoch: what the read is answered before any
+        # event is looked at.
+        misfit = _misfit(schemas, "common.v1.json#/$defs/cursor", vector["cursor"])
+        if misfit:
+            return f"the cursor does not fit common.v1's: {misfit}"
+        answer = rules.cursor_answer(vector["cursor"], vector["log"], vector["epoch"])
+        return None if answer == vector["expect"] else f"the rule answers {answer}, the vector says {vector['expect']}"
+    if rule == "event.page":
+        # The cursor a read was asked with and the page it was answered: where the page is not the
+        # continuation of that cursor.
+        exchange = {"method": vector["method"], "params": vector["params"], "answer": vector["page"]}
+        misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", exchange)
+        if misfit:
+            return f"the request and its page do not fit the method table: {misfit}"
+        found = rules.page_problems(vector["params"]["cursor"], vector["page"])
         return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
     return f"no rule named {rule!r}"
 

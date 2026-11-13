@@ -13,10 +13,16 @@
   },
   "steps": [
     {
-      "what": "The turn before it ended. The daemon commits the item as delivering, under a delivery id, before it writes anything.",
+      "what": "The turn before it ended. The daemon commits delivering and the binding before it writes anything.",
       "happening": "begin",
       "facts": {
-        "delivery_id": "dlv-0007"
+        "delivery_id": "dlv-0007",
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "worker_incarnation": "wrk-5b1f0c2d.1",
+        "target_turn_id": "turn-000d",
+        "how": "new_turn"
       },
       "item": {
         "item_id": "qi-0001",
@@ -51,12 +57,8 @@
       }
     },
     {
-      "what": "The engine's acceptance arrives and names the delivery: a new turn began.",
+      "what": "The engine's acceptance arrives: the same delivery, log, run and turn, and it began a new turn.",
       "happening": "accepted",
-      "facts": {
-        "delivery_id": "dlv-0007",
-        "turn_id": "turn-000d"
-      },
       "event": {
         "seq": 51,
         "session_id": "ses-7f3a9c2e51d04b6a",

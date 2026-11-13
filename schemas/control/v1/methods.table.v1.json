@@ -1,5 +1,5 @@
 {
-  "table_version": "1.0-draft.6",
+  "table_version": "1.0-draft.7",
   "methods": [
     {
       "name": "run.start",
@@ -28,6 +28,7 @@
         "start_unconfirmed",
         "request_invalid",
         "registry_unavailable",
+        "unavailable",
         "scope_refused",
         "workspace_invalid",
         "workspace_busy",
@@ -64,6 +65,7 @@
         "run_unknown",
         "request_invalid",
         "registry_unavailable",
+        "unavailable",
         "scope_refused"
       ],
       "lane": "CONTROL",
@@ -95,6 +97,7 @@
         "ok",
         "request_invalid",
         "registry_unavailable",
+        "unavailable",
         "scope_refused"
       ],
       "lane": "CONTROL",
@@ -129,6 +132,7 @@
         "run_unknown",
         "request_invalid",
         "registry_unavailable",
+        "unavailable",
         "scope_refused"
       ],
       "lane": "STOP",
@@ -158,6 +162,7 @@
       "beta": false,
       "codes": [
         "ok",
+        "unavailable",
         "scope_refused"
       ],
       "lane": "CONTROL",
@@ -1254,6 +1259,7 @@
       "beta": true,
       "codes": [
         "ok",
+        "unavailable",
         "scope_refused"
       ],
       "lane": "CONTROL",

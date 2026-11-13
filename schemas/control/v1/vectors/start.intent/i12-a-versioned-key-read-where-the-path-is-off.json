@@ -1,0 +1,25 @@
+{
+  "declared": null,
+  "request": {
+    "tenant": "t1",
+    "engine": "codex",
+    "prompt": "Fix the failing test in tests/test_io.py.",
+    "client_key": "k-1"
+  },
+  "expect": {
+    "preimage": null,
+    "start_key": {
+      "client_key": "k-1",
+      "engine": "codex",
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+    },
+    "retry": "client_key_reused"
+  },
+  "stored": {
+    "client_key": "k-1",
+    "engine": "codex",
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3",
+    "intent_version": 1,
+    "intent_sha256": "d7be9e781019574e2f44b5d306b68c16ad9474e41e7ef6b6c1d18a6bfdb191b3"
+  }
+}

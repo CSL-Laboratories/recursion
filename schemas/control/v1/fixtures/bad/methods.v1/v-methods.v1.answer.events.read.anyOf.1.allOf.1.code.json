@@ -4,13 +4,11 @@
     "cursor": {
       "epoch": 3,
       "session_id": "ses-7f3a9c2e51d04b6a",
-      "seq": 41
-    },
-    "limit": 200,
-    "projection": "raw"
+      "seq": 99
+    }
   },
   "answer": {
     "code": "method_unknown",
-    "detail": "not_implemented"
+    "detail": "cursor_ahead"
   }
 }

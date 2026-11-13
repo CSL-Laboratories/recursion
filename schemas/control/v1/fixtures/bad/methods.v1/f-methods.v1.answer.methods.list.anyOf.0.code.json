@@ -3,18 +3,6 @@
   "params": {},
   "answer": {
     "code": "x-nobody-defined-this",
-    "table_version": "1.0-draft.6",
-    "methods": [
-      {
-        "name": "run.stop",
-        "implemented": true,
-        "beta": false
-      },
-      {
-        "name": "session.turn",
-        "implemented": false,
-        "beta": true
-      }
-    ]
+    "detail": "daemon_closing"
   }
 }

@@ -24,6 +24,7 @@
     "run_unknown",
     "request_invalid",
     "registry_unavailable",
+    "unavailable",
     "scope_refused"
   ],
   "params": "#/$defs/params.run.status",

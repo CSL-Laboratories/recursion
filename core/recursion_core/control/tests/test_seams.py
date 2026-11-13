@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import importlib
 import io
@@ -23,8 +24,11 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
-from recursion_core.control import commands, hooks as H, methods
+from recursion_core.control import api as A, cli, commands, hooks as H, methods
+from recursion_core.control.registry import InMemoryRunRegistry
+from recursion_core.control.tests.fakes import FakeKillTree, run_ids
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, engines
 
 REPO = pathlib.Path(__file__).resolve().parents[4]
@@ -1326,3 +1330,489 @@ class StartRegistrantTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ======================================================================================================
+# The calls that control/api.py and control/cli.py make into the seams (S1, S2, S6). With nothing
+# registered both files answer as they did before; that is shown here against the control API built
+# the old way, and for every existing test by the suite itself.
+
+def control_api(registry=None, starter=None, *, table=None, start_hooks=None, ids=None):
+    registry = InMemoryRunRegistry() if registry is None else registry
+    starter = Recorder() if starter is None else starter
+    made = A.ControlAPI(registry, FakeKillTree(), starter, clock=lambda: 1000.0, new_run_id=ids or run_ids(),
+                        methods=table, start_hooks=start_hooks)
+    return made, registry, starter
+
+
+class Recorder:
+    """A starter that keeps what it was called with: ``(params,)`` on the base's path, ``(params, record)`` on
+    the versioned one. The first ``fail`` launches raise; with ``cgroup`` False a launch hands back no cgroup."""
+
+    def __init__(self, fail: int = 0, cgroup: bool = True) -> None:
+        self.calls, self.fail, self.cgroup = [], fail, cgroup
+
+    def __call__(self, *args) -> dict:
+        self.calls.append(copy.deepcopy(args))
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError('refused')
+        return {'cgroup': f"/sys/fs/cgroup/fake/{args[0]['run_id']}"} if self.cgroup else {}
+
+
+class ApiMethodSeamTest(unittest.TestCase):
+    """Seam S1 at the control API: a method that is not ``run.*`` is answered by the table's dispatcher."""
+
+    def test_a_method_that_is_not_a_run_method_goes_to_the_table_with_its_params_and_the_principal(self) -> None:
+        seen = []
+
+        def table(method, params, principal):
+            seen.append((method, params, principal))
+            return {'code': 'ok', 'from': 'the table'}
+        api, _, _ = control_api(table=table)
+        self.assertEqual(api.call('session.create', {'title': 'x'}, H.DEVICE), {'code': 'ok', 'from': 'the table'})
+        self.assertEqual(api.call('methods.list'), {'code': 'ok', 'from': 'the table'})
+        self.assertEqual(seen, [('session.create', {'title': 'x'}, H.DEVICE), ('methods.list', {}, None)])
+
+    def test_no_run_method_reaches_the_table(self) -> None:
+        seen = []
+        api, _, starter = control_api(table=lambda *call: seen.append(call) or {'code': 'ok'})
+        for method in ('run.kill', 'run.', 'run.events', 'run.interrupt'):
+            self.assertEqual(api.call(method, {}, H.DEVICE), {'code': 'method_unknown', 'detail': method})
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p'}, H.DEVICE)['code'], 'started')
+        self.assertEqual(api.call('run.status', {'run_id': 'run-1'}, H.DEVICE)['code'], 'ok')
+        self.assertEqual(api.call('run.list', {}, H.DEVICE)['code'], 'ok')
+        self.assertEqual(api.call('run.stop', {'run_id': 'run-9'}, H.DEVICE)['code'], 'run_unknown')
+        self.assertEqual(seen, [])
+        self.assertEqual(len(starter.calls[0]), 1, 'with the versioned path off the starter is called as before')
+
+    def test_without_a_table_every_other_method_is_unknown_as_before(self) -> None:
+        api, _, _ = control_api()
+        for method in ('session.create', 'methods.list', 'route.list', None, 7):
+            self.assertEqual(api.call(method), {'code': 'method_unknown', 'detail': str(method)})
+
+    def test_through_the_real_table_with_nothing_registered(self) -> None:
+        made = H.compose(())
+        api, _, _ = control_api(table=lambda method, params, principal: made.methods.dispatch(
+            method, params, principal, lambda inner, inner_params=None: api.call(inner, inner_params, principal)))
+        listed = api.call('methods.list', {}, H.OWNER)
+        self.assertEqual((listed['code'], listed['table_version']), ('ok', methods.TABLE_VERSION))
+        unbuilt = next(name for name in methods.METHODS if name not in methods.MANDATORY)
+        self.assertEqual(api.call(unbuilt, {}, H.OWNER), {'code': 'unsupported', 'detail': 'not_implemented'})
+        # A name the published table does not have stays unknown, and so do the two the control object answers.
+        for method in ('nope.method', 'route.list', 'plugin.list'):
+            self.assertEqual(api.call(method, {}, H.OWNER), {'code': 'method_unknown', 'detail': method})
+
+
+class Client:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def call(self, method, params=None) -> dict:
+        self.calls.append((method, params))
+        return {'code': 'ok', 'runs': []}
+
+
+class CliSeamTest(unittest.TestCase):
+    """Seam S2 at the CLI: a registered command is dispatched; everything else is what it was."""
+
+    def table(self, seen, status=3):
+        def add(sub):
+            sub.add_parser('session').add_argument('session_id')
+
+        def dispatch(args, client):
+            seen.append((args.command, args.session_id, client, args.out, args.err))
+            print('{"code": "ok"}', file=args.out)
+            return status
+        made = commands.CommandTable()
+        made.register(('session',), add, dispatch)
+        made.freeze()
+        return made
+
+    def run_main(self, argv, table):
+        client, out, err = Client(), io.StringIO(), io.StringIO()
+        return cli.main(argv, client, out, err, commands=table), out.getvalue(), err.getvalue(), client.calls
+
+    def test_a_registered_command_is_dispatched_with_its_arguments_the_client_and_the_streams(self) -> None:
+        seen, client, out, err = [], Client(), io.StringIO(), io.StringIO()
+        self.assertEqual(cli.main(['session', 'ses-1'], client, out, err, commands=self.table(seen)), 3)
+        self.assertEqual(seen, [('session', 'ses-1', client, out, err)])
+        self.assertEqual((client.calls, out.getvalue(), err.getvalue()), ([], '{"code": "ok"}\n', ''))
+
+    def test_a_name_nobody_registered_is_a_usage_error_and_never_a_start(self) -> None:
+        for table in (None, commands.CommandTable(), self.table([])):
+            with self.subTest(table=table):
+                status, out, err, calls = self.run_main(['sesion', 'ses-1'], table)
+                self.assertEqual((status, out, calls), (cli.EXIT_USAGE, '', []))
+                self.assertTrue(err.startswith('usage error: '), err)
+
+    def test_the_five_commands_answer_the_same_with_a_table_and_without(self) -> None:
+        for argv in (['list'], ['status', 'run-1'], ['stop', 'run-1'], ['conditions'], ['start'], ['list', 'extra'], [],
+                     ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p', '--client-key', 'k'],
+                     ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p', '--workspace', '/a']):
+            with self.subTest(argv=argv):
+                base = self.run_main(argv, None)
+                self.assertEqual(self.run_main(argv, commands.CommandTable()), base)
+                self.assertEqual(self.run_main(argv, self.table([])), base)
+        # With no family registered, a wrong name is refused in the base's own words.
+        self.assertEqual(self.run_main(['bogus'], commands.CommandTable()), self.run_main(['bogus'], None))
+
+    def test_a_family_that_breaks_the_tables_rules_stops_the_cli_before_any_command_runs(self) -> None:
+        def add(sub):
+            sub.add_parser('workspace')
+            sub.choices['start'].add_argument('--workspace')
+        made = commands.CommandTable()
+        made.register(('workspace',), add, lambda args, client: 0)
+        made.freeze()
+        for argv in (['list'], ['workspace'], ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p', '--workspace', '/a']):
+            with self.subTest(argv=argv):
+                status, out, err, calls = self.run_main(argv, made)
+                self.assertEqual((status, calls, err), (cli.EXIT_ERROR, [], ''))
+                answer = json.loads(out)
+                self.assertEqual(answer['code'], 'control_api_unavailable')
+                self.assertTrue(answer['detail'].startswith('commands:'), answer)
+        status, out, _, calls = self.run_main(['session', 'ses-1'], self.table([], status='done'))
+        self.assertEqual((status, calls), (cli.EXIT_ERROR, []))
+        self.assertEqual(json.loads(out.splitlines()[-1])['code'], 'control_api_unavailable')
+
+    def test_run_composes_the_hooks_and_dispatches_what_a_lane_registered(self) -> None:
+        seen = []
+        made = H.Hooks()
+        made.commands.register(('session',), lambda sub: sub.add_parser('session').add_argument('session_id'),
+                               lambda args, client: seen.append((args.command, args.session_id, client)) or 0)
+        made.freeze()
+        client = Client()
+        with mock.patch.object(H, 'compose', lambda: made):
+            self.assertEqual(cli.run(['session', 'ses-1'], lambda: client), 0)
+        self.assertEqual(seen, [('session', 'ses-1', client)])
+
+    def test_run_with_nothing_installed_is_the_base_and_a_broken_registrant_stops_it(self) -> None:
+        client = Client()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.run(['list'], lambda: client), cli.EXIT_OK)
+        status, base_out, _, base_calls = self.run_main(['list'], None)
+        self.assertEqual((cli.EXIT_OK, out.getvalue(), client.calls), (status, base_out, base_calls))
+        client = Client()
+        with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.run(['list'], lambda: client), cli.EXIT_ERROR)
+        self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
+        self.assertEqual(client.calls, [])
+
+
+KEYED = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'client_key': 'k1'}
+P_SHA = hashlib.sha256(b'p').hexdigest()
+# What a client might add to a start. Today's start ignores every one of them.
+EXTRA = {'workspace': {'path': '/home/dev/projects/atlas'}, 'hand_pick': {'engine': 'codex'}, 'containment_level': 'contained',
+         'principal': {'kind': 'plugin', 'id': 'notes.search'}, 'owner': 'notes.search', 'budget': {'cap_usd': 99},
+         'session_id': 'ses-forged', 'turn_id': 'turn-forged', 'labels': {'team': 'x'}}
+
+
+def stored(registry) -> str:
+    return json.dumps(registry.list(), sort_keys=True)
+
+
+class StartPathOffTest(unittest.TestCase):
+    """Seam S6 with no start registrant: start, _start and _retry are the base's."""
+
+    def variants(self):
+        """The control API built as before the seams; with hooks nobody registered into; and with hooks that carry
+        other lanes' registrations but no start registrant."""
+        other = H.Hooks()
+        other.set('authorize', lambda principal, method, params: None)
+        other.set('launch_check', lambda ctx, executable: None)
+        other.freeze()
+        return {'no hooks': None, 'nothing registered': H.compose(()), 'no start registrant': other}
+
+    def test_the_stored_record_its_start_key_and_what_the_starter_gets_are_the_bases(self) -> None:
+        seen = {}
+        for name, made in self.variants().items():
+            api, registry, starter = control_api(start_hooks=made)
+            unkeyed = api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', **EXTRA}, H.DEVICE)
+            keyed = api.call('run.start', {**KEYED, **EXTRA}, H.DEVICE)
+            seen[name] = (unkeyed, keyed, stored(registry), starter.calls)
+            one, two = registry.get('run-1'), registry.get('run-2')
+            self.assertIn('start_key', one, 'an unkeyed record has the member, and it is null')
+            self.assertIsNone(one['start_key'])
+            self.assertEqual(two['start_key'], {'client_key': 'k1', 'engine': 'codex', 'prompt_sha256': P_SHA})
+            for record in (one, two):
+                self.assertEqual(set(record) & {'principal', 'launch', *EXTRA}, set(), name)
+            # The starter is called with one argument: the request as it came, and the run id.
+            self.assertEqual(starter.calls, [({'tenant': 't1', 'engine': 'codex', 'prompt': 'p', **EXTRA, 'run_id': 'run-1'},),
+                                             ({**KEYED, **EXTRA, 'run_id': 'run-2'},)])
+        self.assertEqual(seen['nothing registered'], seen['no hooks'])
+        self.assertEqual(seen['no start registrant'], seen['no hooks'])
+
+    def scenario(self, made) -> list:
+        """Every branch of a retry, as a list of answers and of what is stored after each."""
+        out = []
+
+        def step(api, registry, params, principal=None):
+            out.append(api.call('run.start', params, principal))
+            out.append(stored(registry))
+            return out[-2]
+        # A started run: the same key is a duplicate, with or without fields today's start ignores; another
+        # prompt, another engine and a missing engine are not this start.
+        api, registry, starter = control_api(start_hooks=made)
+        step(api, registry, KEYED)
+        self.assertEqual((step(api, registry, KEYED)['code'], out[-2]['duplicate']), ('started', True))
+        self.assertEqual((step(api, registry, {**KEYED, **EXTRA}, H.DEVICE)['code'], out[-2]['duplicate']), ('started', True))
+        self.assertEqual(step(api, registry, {**KEYED, 'prompt': 'q'}), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual(step(api, registry, {**KEYED, 'engine': 'claude_code'}), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual(step(api, registry, {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}), {'code': 'request_invalid', 'detail': 'engine'})
+        out.append(starter.calls)
+        self.assertEqual(len(starter.calls), 1)
+        # A start the starter refused is relaunched under its run id, unless a Stop was asked for it.
+        api, registry, starter = control_api(starter=Recorder(fail=1), start_hooks=made)
+        self.assertEqual(step(api, registry, KEYED), {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'RuntimeError', 'recorded': True})
+        again = step(api, registry, {**KEYED, **EXTRA})
+        self.assertEqual((again['code'], again['run']['run_id'], again['duplicate']), ('started', 'run-1', False))
+        out.append(starter.calls)
+        api, registry, starter = control_api(starter=Recorder(fail=2), start_hooks=made)
+        step(api, registry, KEYED)
+        out.append(api.call('run.stop', {'run_id': 'run-1'}))
+        self.assertEqual(step(api, registry, KEYED), {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'stop_requested', 'duplicate': True})
+        self.assertEqual(len(starter.calls), 1)
+        # A launch that handed back no cgroup is unconfirmed, and so is its retry: nothing is launched again.
+        api, registry, starter = control_api(starter=Recorder(cgroup=False), start_hooks=made)
+        self.assertEqual((step(api, registry, KEYED)['code'], out[-2]['detail']), ('start_unconfirmed', 'starter_handle_invalid'))
+        retry = step(api, registry, KEYED)
+        self.assertEqual((retry['code'], retry['detail'], retry['duplicate']), ('start_unconfirmed', 'launch_unconfirmed', True))
+        self.assertEqual(len(starter.calls), 1)
+        return out
+
+    def test_every_branch_of_a_retry_answers_as_the_base(self) -> None:
+        variants = self.variants()
+        base = self.scenario(variants.pop('no hooks'))
+        for name, made in variants.items():
+            with self.subTest(hooks=name):
+                self.assertEqual(self.scenario(made), base)
+
+
+def entry(engine: str) -> dict:
+    """A route entry as load_routes gives it to the starter for one engine."""
+    return {'route': {'engine': engine, 'model': 'm-1', 'connection': {'kind': 'subscription', 'id': 'plus'}},
+            'deadline_s': 600.0, 'binary': None}
+
+
+class StartPathOnTest(unittest.TestCase):
+    """Seam S6 with fake registrants: the versioned start path."""
+
+    def setUp(self) -> None:
+        self.log, self.default, self.registry = [], ['codex'], InMemoryRunRegistry()
+
+    def routing(self, principal, request):
+        self.log.append(('routing', principal, request, self.registry.list()))
+        engine = (request.get('hand_pick') or {}).get('engine') or request.get('engine') or self.default[0]
+        if engine == 'none':
+            return {}
+        return {'route_entry': entry(engine) if engine != 'malformed' else {'route': {}},
+                'route_decision': {'chosen': engine, 'reason': 'default', 'candidates': [engine], 'hand_pick': request.get('hand_pick')}}
+
+    def workspace(self, principal, request):
+        self.log.append(('workspace', principal, request, self.registry.list()))
+        asked = request.get('workspace')
+        if asked is None:
+            return {}
+        if not isinstance(asked, dict) or not isinstance(asked.get('path'), str):
+            return H.Refusal('request_invalid', 'workspace')
+        if asked['path'] == '/breaks':
+            raise OSError('cannot stat')
+        return {'workspace': {'mode': 'worktree', 'source_path': asked['path'], 'base_ref': 'refs/heads/main', 'worktree_path': None}}
+
+    def hooks(self, routing=True):
+        made = H.Hooks()
+        if routing:
+            made.start_registrant('routing', ('hand_pick',), ('route_entry', 'route_decision'), self.routing, chooses_engine=True)
+        made.start_registrant('workspace', ('workspace',), ('workspace',), self.workspace)
+        made.freeze()
+        return made
+
+    def api(self, starter=None, routing=True, ids=None):
+        return control_api(self.registry, starter, start_hooks=self.hooks(routing), ids=ids)
+
+    def ran(self) -> list:
+        return [name for name, *_ in self.log]
+
+    def test_a_new_start_stores_the_servers_principal_the_launch_object_and_the_intent(self) -> None:
+        api, registry, starter = self.api()
+        request = {**KEYED, 'workspace': {'path': '/home/dev/projects/atlas'}}
+        answer = api.call('run.start', request, H.DEVICE)
+        self.assertEqual((answer['code'], answer['duplicate']), ('started', False))
+        record = registry.get('run-1')
+        self.assertEqual(record['principal'], {'kind': 'device', 'id': 'page'})
+        self.assertEqual(set(record['launch']), set(H.LAUNCH_KEYS))
+        self.assertEqual(record['launch']['route_entry'], entry('codex'))
+        self.assertEqual(record['launch']['workspace'], {'mode': 'worktree', 'source_path': '/home/dev/projects/atlas',
+                                                         'base_ref': 'refs/heads/main', 'worktree_path': None})
+        text = '{"engine":"codex","prompt_sha256":"%s","workspace":{"path":"/home/dev/projects/atlas"}}' % P_SHA
+        self.assertEqual(record['start_key'], {'client_key': 'k1', 'engine': 'codex', 'prompt_sha256': P_SHA, 'intent_version': 1,
+                                               'intent_sha256': hashlib.sha256(text.encode()).hexdigest()})
+        self.assertEqual((record['engine'], record['state'], record['tenant']), ('codex', 'running', 't1'))
+        # The registrants ran once, in order, with the principal and the request, before anything was recorded.
+        self.assertEqual([(name, principal, asked, before) for name, principal, asked, before in self.log],
+                         [('routing', H.DEVICE, request, []), ('workspace', H.DEVICE, request, [])])
+        # The starter gets the four members it reads, and the stored record: the launch context is built from it.
+        (params, handed), = starter.calls
+        self.assertEqual(params, {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'run_id': 'run-1'})
+        self.assertEqual((handed['launch'], handed['principal'], handed['state']), (record['launch'], record['principal'], 'starting'))
+        context = H.LaunchContext.from_record(handed)
+        self.assertEqual((context.principal, context.workspace['source_path'], context.owner), (H.DEVICE, '/home/dev/projects/atlas', 'host'))
+        # An unkeyed start stores no identity, as today, and the same two objects. A call with no principal is the owner's.
+        api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p'})
+        second = registry.get('run-2')
+        self.assertIn('start_key', second)
+        self.assertIsNone(second['start_key'])
+        self.assertEqual((second['principal'], set(second['launch'])), ({'kind': 'owner', 'id': 'local'}, set(H.LAUNCH_KEYS)))
+
+    def test_params_that_carry_a_principal_an_owner_a_budget_a_session_or_a_turn_store_none_of_them(self) -> None:
+        api, registry, starter = self.api()
+        self.assertEqual(api.call('run.start', {**KEYED, **EXTRA}, H.Principal('session', 'ses-1'))['code'], 'started')
+        record = registry.get('run-1')
+        self.assertEqual(record['principal'], {'kind': 'session', 'id': 'ses-1'})
+        launch = record['launch']
+        self.assertEqual((launch['owner'], launch['budget'], launch['session_id'], launch['turn_id'], launch['containment_level']),
+                         ('host', {'cap_usd': 0}, None, None, None))
+        self.assertEqual(set(record) & {'owner', 'budget', 'session_id', 'turn_id', 'containment_level', 'workspace', 'hand_pick', 'labels'}, set())
+        self.assertEqual(set(starter.calls[0][0]), {'tenant', 'engine', 'prompt', 'run_id'})
+        # Only what was DECLARED and present is in the identity: session_id, turn_id and the rest are not.
+        text = '{"engine":"codex","hand_pick":{"engine":"codex"},"prompt_sha256":"%s","workspace":{"path":"/home/dev/projects/atlas"}}' % P_SHA
+        self.assertEqual(record['start_key']['intent_sha256'], hashlib.sha256(text.encode()).hexdigest())
+        # A plugin's own start is owned by that plugin, and only then.
+        api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'owner': 'host'}, H.Principal('plugin', 'notes.search'))
+        self.assertEqual(registry.get('run-2')['launch']['owner'], 'notes.search')
+
+    def test_the_same_key_with_another_declared_field_is_a_reused_key(self) -> None:
+        api, registry, starter = self.api()
+        first = {**KEYED, 'workspace': {'path': '/a'}}
+        self.assertEqual(api.call('run.start', first)['code'], 'started')
+        before = stored(registry)
+        for other in ({**KEYED, 'workspace': {'path': '/b'}}, dict(KEYED), {**first, 'hand_pick': {'engine': 'codex'}},
+                      {**first, 'prompt': 'q'}, {**first, 'engine': 'claude_code'}, {k: v for k, v in first.items() if k != 'engine'}):
+            with self.subTest(request=other):
+                self.assertEqual(api.call('run.start', other), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        # A field nobody declared, a null one and a missing one are the same request: a duplicate.
+        for same in (first, {**first, 'labels': {'team': 'x'}, 'containment_level': 'contained'}, {**first, 'hand_pick': None}):
+            with self.subTest(request=same):
+                answer = api.call('run.start', same)
+                self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', True, 'run-1'))
+        self.assertEqual((len(starter.calls), self.ran(), stored(registry)), (1, ['routing', 'workspace'], before))
+
+    def test_the_same_raw_request_after_the_routing_default_changed_is_a_retry(self) -> None:
+        api, registry, starter = self.api()
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}     # names no engine: the router chooses
+        self.assertEqual(api.call('run.start', request)['run']['engine'], 'codex')
+        self.default[0] = 'claude_code'
+        answer = api.call('run.start', request)
+        self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id'], answer['run']['engine']),
+                         ('started', True, 'run-1', 'codex'))
+        self.assertEqual((len(starter.calls), self.ran()), (1, ['routing', 'workspace']), 'a duplicate launches nothing and runs no registrant')
+
+    def test_a_request_that_names_no_engine_is_started_on_the_engine_the_router_chose(self) -> None:
+        api, registry, starter = self.api()
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'})['code'], 'started')
+        record = registry.get('run-1')
+        self.assertEqual((record['engine'], record['start_key']['engine'], starter.calls[0][0]['engine']), ('codex', None, 'codex'))
+        self.assertEqual(record['start_key']['intent_sha256'],
+                         hashlib.sha256(('{"engine":null,"prompt_sha256":"%s"}' % P_SHA).encode()).hexdigest())
+        # Nobody chose: there is nothing to launch, and nothing is stored.
+        for request, answer in (({'tenant': 't1', 'prompt': 'p', 'hand_pick': {'engine': 'none'}}, {'code': 'request_invalid', 'detail': 'engine'}),
+                                ({'tenant': 't1', 'prompt': 'p', 'hand_pick': {'engine': 'malformed'}}, {'code': 'unavailable', 'detail': 'start_registrant_failed'}),
+                                # A request that names an engine gets that engine or nothing.
+                                ({'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'hand_pick': {'engine': 'claude_code'}},
+                                 {'code': 'unavailable', 'detail': 'start_registrant_failed'}),
+                                ({'tenant': 't1', 'engine': '', 'prompt': 'p'}, {'code': 'request_invalid', 'detail': 'engine'}),
+                                ({'tenant': 't1', 'engine': 7, 'prompt': 'p'}, {'code': 'request_invalid', 'detail': 'engine'})):
+            with self.subTest(request=request):
+                self.assertEqual(api.call('run.start', request), answer)
+        self.assertEqual((len(registry.list()), len(starter.calls)), (1, 1))
+
+    def test_with_no_registrant_that_chooses_a_start_names_its_engine_as_today(self) -> None:
+        api, registry, starter = self.api(routing=False)
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p'}), {'code': 'request_invalid', 'detail': 'engine'})
+        self.assertEqual(api.call('run.start', KEYED)['code'], 'started')
+        record = registry.get('run-1')
+        self.assertIsNone(record['launch']['route_entry'], 'no registrant chose an entry: the starter looks it up, as today')
+        self.assertEqual((record['engine'], record['start_key']['intent_version']), ('codex', 1))
+
+    @quiet
+    def test_a_registrants_refusal_comes_before_any_record(self) -> None:
+        api, registry, starter = self.api()
+        for request, answer in (({**KEYED, 'workspace': 'here'}, {'code': 'request_invalid', 'detail': 'workspace'}),
+                                ({**KEYED, 'workspace': {'path': '/breaks'}}, {'code': 'unavailable', 'detail': 'start_registrant_failed'})):
+            self.assertEqual(api.call('run.start', request), answer)
+        self.assertEqual((registry.list(), starter.calls), ([], []))
+        # The key is still free: the refused request left nothing behind.
+        self.assertEqual(api.call('run.start', KEYED)['code'], 'started')
+
+    def test_a_declared_field_with_no_canonical_text_is_refused_by_name(self) -> None:
+        api, registry, starter = self.api()
+        self.assertEqual(api.call('run.start', {**KEYED, 'workspace': {'path': '/a', 'depth': 2**60}}),
+                         {'code': 'request_invalid', 'detail': 'workspace'})
+        self.assertEqual((registry.list(), starter.calls, self.log), ([], [], []))
+
+    def test_a_failed_start_relaunches_under_its_run_id_from_the_stored_record(self) -> None:
+        api, registry, starter = self.api(Recorder(fail=1))
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1', 'workspace': {'path': '/a'}}
+        self.assertEqual(api.call('run.start', request, H.DEVICE),
+                         {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'RuntimeError', 'recorded': True})
+        kept = registry.get('run-1')
+        self.default[0] = 'claude_code'      # the router would choose otherwise now; a relaunch does not ask it
+        answer = api.call('run.start', request, H.OWNER)
+        self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', False, 'run-1'))
+        self.assertEqual(self.ran(), ['routing', 'workspace'], 'no registrant runs for a relaunch')
+        first, second = starter.calls
+        self.assertEqual(first[0], second[0])
+        self.assertEqual((second[1]['launch'], second[1]['principal'], second[1]['start_key'], second[1]['engine']),
+                         (kept['launch'], {'kind': 'device', 'id': 'page'}, kept['start_key'], 'codex'))
+        after = registry.get('run-1')
+        self.assertEqual((after['launch'], after['principal'], after['start_key']), (kept['launch'], kept['principal'], kept['start_key']))
+        self.assertEqual(len(registry.list()), 1)
+
+    def test_a_failed_start_that_was_stopped_and_an_unconfirmed_one_are_answered_as_the_base_answers_them(self) -> None:
+        api, registry, starter = self.api(Recorder(fail=2))
+        api.call('run.start', KEYED)
+        api.call('run.stop', {'run_id': 'run-1'})
+        self.assertEqual(api.call('run.start', KEYED), {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'stop_requested', 'duplicate': True})
+        self.assertEqual(len(starter.calls), 1)
+        self.registry = InMemoryRunRegistry()
+        api, registry, starter = self.api(Recorder(cgroup=False))
+        self.assertEqual(api.call('run.start', KEYED)['detail'], 'starter_handle_invalid')
+        retry = api.call('run.start', KEYED)
+        self.assertEqual((retry['code'], retry['detail'], retry['duplicate']), ('start_unconfirmed', 'launch_unconfirmed', True))
+        self.assertEqual(len(starter.calls), 1)
+
+    def test_a_legacy_key_dedupes_as_before_and_is_refused_with_a_declared_field(self) -> None:
+        legacy, registry, old = control_api(self.registry)
+        self.assertEqual(legacy.call('run.start', KEYED)['code'], 'started')
+        before = stored(registry)
+        api, _, starter = self.api(ids=iter(['run-new-1', 'run-new-2']).__next__)
+        for same in (KEYED, {**KEYED, 'labels': {'team': 'x'}, 'session_id': 'ses-1'}, {**KEYED, 'workspace': None}):
+            with self.subTest(request=same):
+                answer = api.call('run.start', same)
+                self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', True, 'run-1'))
+        for other in ({**KEYED, 'workspace': {'path': '/a'}}, {**KEYED, 'hand_pick': {'engine': 'codex'}},
+                      {k: v for k, v in KEYED.items() if k != 'engine'}, {**KEYED, 'prompt': 'q'}):
+            with self.subTest(request=other):
+                self.assertEqual(api.call('run.start', other), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual((starter.calls, self.log, stored(registry)), ([], [], before))
+
+    def test_a_failed_legacy_start_is_relaunched_as_a_legacy_one(self) -> None:
+        legacy, registry, old = control_api(self.registry, Recorder(fail=1))
+        self.assertEqual(legacy.call('run.start', KEYED)['code'], 'start_failed')
+        api, _, starter = self.api()
+        answer = api.call('run.start', KEYED)
+        self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', False, 'run-1'))
+        record = registry.get('run-1')
+        self.assertEqual(record['start_key'], {'client_key': 'k1', 'engine': 'codex', 'prompt_sha256': P_SHA})
+        self.assertEqual(set(record) & {'principal', 'launch'}, set())
+        self.assertIsNone(H.LaunchContext.from_record(starter.calls[0][1]), 'a legacy record gives the run no launch context')
+        self.assertEqual(self.log, [])
+
+    def test_a_record_of_the_versioned_path_is_never_a_retry_where_the_path_is_off(self) -> None:
+        api, registry, _ = self.api()
+        self.assertEqual(api.call('run.start', KEYED)['code'], 'started')
+        before = stored(registry)
+        off, _, starter = control_api(registry)
+        self.assertEqual(off.call('run.start', KEYED), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual((starter.calls, stored(registry)), ([], before))

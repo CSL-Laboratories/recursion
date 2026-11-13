@@ -51,6 +51,7 @@ import time
 from recursion_core.child_env import ENGINE_PROFILES, ChildRoute, EnvRefused, build_child_env
 from recursion_core.child_env import policy as _env_policy
 from recursion_core.child_env.launch import _resolve_executable
+from recursion_core.control.hooks import HookRefused
 from recursion_core.control.registry import EMPTY, POPULATED, TIMEOUT, UNKNOWN
 from recursion_core.routes import contract as c
 from recursion_core.routes.launch import ReadTimeout
@@ -93,9 +94,12 @@ def require_launcher_platform():
 class RunContext:
     """One control-API run while its route request is in flight. Set by the starter, read by the launcher."""
 
-    def __init__(self, run_id, *, breaker=None):
+    def __init__(self, run_id, *, breaker=None, launch=None):
         self.run_id = run_id
         self.breaker = breaker
+        # Seam S4: the run's LaunchContext (control.hooks), built by the starter from the stored record. None while
+        # no lane is on the start path. The working-directory provider, the drive owner and the launch check read it.
+        self.launch = launch
         self.admitted = None
         self.bound = False
         self.cgroup = None
@@ -367,11 +371,12 @@ class UnitEngineProcess:
 class ProductionLauncher:
     """``launcher(argv, *, env, shell=False) -> EngineProcess`` for one engine's route adapter."""
 
-    def __init__(self, engine, daemon, manager, state_dir, *, python=None, start_timeout_s=10.0):
+    def __init__(self, engine, daemon, manager, state_dir, *, python=None, start_timeout_s=10.0, hooks=None):
         require_launcher_platform()
         if engine not in ENGINE_PROFILES:
             raise ValueError(engine)
         self.engine, self._daemon, self._manager = engine, daemon, manager
+        self._hooks = hooks  # the composed hooks (control.hooks), or None: then no hook is asked, as before
         self._state = Path(state_dir)
         self._python = python or sys.executable
         self._start_timeout_s = start_timeout_s
@@ -437,7 +442,11 @@ class ProductionLauncher:
             # without one, the launch is refused: an engine is never started unbound beside a breaker.
             raise refused('breaker_admission_missing')
         if ctx.breaker is not None and ctx.admitted is not None and not ctx.bound:
-            error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1])
+            owner = ctx.launch.owner if ctx.launch is not None else 'host'
+            if owner != 'host':  # a run a plugin owns (seam S6 e); the keyword exists once the plugin host adds it
+                error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1], owner=owner)
+            else:
+                error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1])
             if error is not None:
                 raise refused('breaker_bind_failed:' + error)
             ctx.bound = True
@@ -453,10 +462,24 @@ class ProductionLauncher:
         payload = json.dumps(validated.to_dict()).encode('utf-8')
         if len(payload) > MAX_ENV_BYTES:
             raise refused('child_env:-:environment_too_large')
+        working_directory = None
+        if self._hooks is not None:
+            # Seams S10 and S4, parent side: the executable is resolved, and nothing of the unit exists yet (no run
+            # directory, no FIFO, no output file), so a refusal leaves nothing in the way of a relaunch. A hook
+            # that fails refuses the launch; it never lets it through.
+            try:
+                self._hooks.launch_check(ctx, executable)
+                working_directory = self._hooks.working_directory(ctx)
+            except HookRefused as exc:
+                raise refused(exc.code + (':' + exc.detail if exc.detail else '')) from None
         run_dir = private_dir(self._state / 'runs' / ctx.run_id)
         home = self._state / 'homes' / self.engine
         if not _unit_path_ok(run_dir) or not _unit_path_ok(home):
             raise refused('state_path_not_unit_safe')
+        if working_directory is None:
+            working_directory = home  # today's folder
+        elif not _unit_path_ok(working_directory):
+            raise refused('working_directory_not_unit_safe')  # the check that guards today's folder guards this one
         unit = f'recursion-run-{ctx.run_id}.service'
         if not UNIT.fullmatch(unit):
             raise refused('run_id')
@@ -471,7 +494,7 @@ class ProductionLauncher:
             flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
             stdin_fd = os.open(run_dir / 'stdin.fifo', flags)
             env_fd = os.open(run_dir / 'env.fifo', flags)
-            self._manager.prepare(unit, properties=self.unit_properties(run_dir), working_directory=home)
+            self._manager.prepare(unit, properties=self.unit_properties(run_dir), working_directory=working_directory)
             ctx.launches += 1
             try:
                 self._daemon.start(ctx.run_id, self.unit_argv(executable, argv, run_dir / 'env.fifo'))

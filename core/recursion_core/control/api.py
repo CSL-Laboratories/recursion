@@ -75,12 +75,14 @@ it, have returned, so distinct keys do not keep locks for the life of the proces
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
+from recursion_core.control.hooks import INTENT_VERSION, OWNER
 from recursion_core.control.registry import (
     EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
 )
@@ -111,10 +113,28 @@ def _new_run_id() -> str:
     return f"run-{uuid.uuid4().hex}"
 
 
+def _no_text(hooks, present: Mapping, digest: str) -> str:
+    """The first declared extension of a start request that has no canonical text, else ``engine``."""
+    for name, value in present.items():
+        try:
+            hooks.start_intent({name: value}, digest)
+        except ValueError:
+            return name
+    return "engine"
+
+
 class ControlAPI:
     def __init__(self, registry: RunRegistry, kill_tree: KillTree, starter: Starter, clock: Callable[[], float],
-                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id) -> None:
+                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id,
+                 methods: Callable[[str, dict, object], dict] | None = None, start_hooks: object = None) -> None:
         self._registry, self._kill, self._starter, self._clock = registry, kill_tree, starter, clock
+        # Seam S1: ``methods(method, params, principal) -> answer`` answers a method that is not one of the four
+        # below (the method table's dispatcher, control/methods). None, the default: such a method is unknown, as today.
+        self._methods = methods
+        # Seam S6: the composed hooks (control/hooks.py) when a lane registered on the start path, which turns the
+        # versioned path ON. Otherwise None: start, _start and _retry are then the base's, a keyed record's
+        # start_key has its three members, and no principal, launch or intent is stored.
+        self._start_hooks = start_hooks if start_hooks is not None and start_hooks.start_on else None
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
         self._locks_lock = threading.Lock()
@@ -136,9 +156,9 @@ class ControlAPI:
         self._stop_wanted: set[str] = set()  # Stops that arrived before the launch was recorded
         self._failed: set[str] = set()  # starts that raised but whose start_failed write failed
 
-    def call(self, method: str, params: Mapping | None = None) -> dict:
+    def call(self, method: str, params: Mapping | None = None, principal: object = None) -> dict:
         try:
-            return self._call(method, dict(params or {}))
+            return self._call(method, dict(params or {}), principal)
         except _RegistryError as err:  # every method answers with a typed code (red-team r2 finding 1)
             return {"code": REGISTRY_UNAVAILABLE, "detail": str(err)}
 
@@ -148,13 +168,15 @@ class ControlAPI:
         except Exception as err:
             raise _RegistryError(f"{op}:{type(err).__name__}") from err
 
-    def _call(self, method: str, params: dict) -> dict:
+    def _call(self, method: str, params: dict, principal: object = None) -> dict:
         if method == "run.list":
             return self.list_runs(params)
         if method == "run.start":
-            return self.start(params)
+            return self.start(params, principal)
         handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
         if handler is None:
+            if self._methods is not None and not (isinstance(method, str) and method.startswith("run.")):
+                return self._methods(method, params, principal)
             return {"code": METHOD_UNKNOWN, "detail": str(method)}
         run_id = params.get("run_id")
         if not isinstance(run_id, str) or not run_id:
@@ -187,8 +209,11 @@ class ControlAPI:
         return {"code": OK, "runs": runs}
 
     # -- start --------------------------------------------------------------------------------
-    def start(self, params: Mapping) -> dict:
+    def start(self, params: Mapping, principal: object = None) -> dict:
         for name in ("tenant", "engine", "prompt"):
+            if (name == "engine" and params.get(name) is None and self._start_hooks is not None
+                    and self._start_hooks.engine_may_be_chosen):
+                continue  # seam S6, ON: a request that names no engine asks the routing registrant to choose one
             if not isinstance(params.get(name), str) or not params[name]:
                 return {"code": REQUEST_INVALID, "detail": name}
         try:
@@ -199,7 +224,7 @@ class ControlAPI:
         self._enter_owner()
         try:
             if not isinstance(key, str):
-                return self._start(params)  # no key: a fresh run id, nothing to dedupe
+                return self._start(params, principal)  # no key: a fresh run id, nothing to dedupe
             slot_key = (params["tenant"], key)
             with self._locks_lock:
                 slot = self._start_locks.get(slot_key)
@@ -210,7 +235,7 @@ class ControlAPI:
             lock_key = _start_lock_key(slot_key)
             self._locks.acquire(self._local.owner, [lock_key])
             try:
-                return self._start(params)
+                return self._start(params, principal)
             finally:
                 self._locks.release(self._local.owner, [lock_key])
                 with self._locks_lock:
@@ -220,7 +245,9 @@ class ControlAPI:
         finally:
             self._exit_owner()
 
-    def _start(self, params: Mapping) -> dict:
+    def _start(self, params: Mapping, principal: object = None) -> dict:
+        if self._start_hooks is not None:
+            return self._start_versioned(params, principal)
         key = params.get("client_key")
         start_key = None
         if isinstance(key, str):
@@ -249,8 +276,88 @@ class ControlAPI:
             if self._commit(rec) != "ok":
                 raise _RegistryError("put:StaleGeneration")
             self._failed.discard(run_id)
+        return self._launch(params, run_id, rec)
+
+    def _start_versioned(self, params: Mapping, principal: object) -> dict:
+        """Seam S6, the path a start takes once a lane has registered on it (control/hooks.py). The caller holds
+        the start key's single-flight slot, as for ``_start``.
+
+        A keyed request's identity is its INTENT, computed here from what the client sent, before any registrant
+        runs. The stored key is looked up first. A record with an equal intent is a retry and is answered by
+        ``_retry``. A legacy record (no intent) is a retry only when its three members are the request's and the
+        request carries no declared extension. Anything else answers ``client_key_reused``, as a reused key does
+        today. Only a NEW start runs the registrants, outside every registry, daemon and run lock. What they
+        return is the ``launch`` object, written with the server's ``principal`` in the launch-intent write and
+        nowhere else; nothing of either is copied from the params. A relaunch of a failed start uses the stored
+        record as it is: no registrant runs again.
+        """
+        hooks = self._start_hooks
+        principal = OWNER if principal is None else principal
+        key, engine = params.get("client_key"), params.get("engine")
+        digest = hashlib.sha256(params["prompt"].encode("utf-8")).hexdigest()
+        start_key = prior = None
+        if isinstance(key, str):
+            present = hooks.declared_present(params)
+            try:
+                intent = hooks.start_intent(params, digest)
+            except ValueError:  # a member with no canonical text: it cannot be part of an identity
+                return {"code": REQUEST_INVALID, "detail": _no_text(hooks, present, digest)}
+            start_key = {"client_key": key, "engine": engine, "prompt_sha256": digest,
+                         "intent_version": INTENT_VERSION, "intent_sha256": intent}
+            prior = self._reg("find_start", params["tenant"], key)
+            if prior is not None:
+                stored = prior.get("start_key")
+                if isinstance(stored, dict) and "intent_version" in stored:
+                    same = stored.get("intent_version") == INTENT_VERSION and stored.get("intent_sha256") == intent
+                else:  # a legacy key: what its request launched beyond the three members cannot be established
+                    same = not present and stored == {"client_key": key, "engine": engine, "prompt_sha256": digest}
+                if not same:
+                    return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+        if prior is None:
+            launch, refusal = hooks.launch_snapshot(principal, params)
+            if refusal is not None:
+                return refusal  # before any record exists
+            launched_engine, entry = engine, launch.get("route_entry")
+            if entry is not None:
+                # A chosen entry is what load_routes gives the starter for an engine. It names its engine, and a
+                # request that named one gets that engine or nothing.
+                route = entry.get("route") if isinstance(entry, dict) else None
+                launched_engine = route.get("engine") if isinstance(route, dict) else None
+                if not isinstance(launched_engine, str) or not launched_engine or engine not in (None, launched_engine):
+                    return {"code": "unavailable", "detail": "start_registrant_failed"}
+            if launched_engine is None:
+                return {"code": REQUEST_INVALID, "detail": "engine"}  # none named, and no registrant chose one
+            run_id = self._new_run_id()
+            rec = {"run_id": run_id, "tenant": params["tenant"], "engine": launched_engine, "state": "starting",
+                   "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key,
+                   "principal": principal.public(), "launch": launch}
+        else:
+            run_id, rec = prior["run_id"], None
+        with self._run_lock(run_id):
+            if prior is not None:
+                answer = self._retry(self._current(prior))
+                if answer is not None:
+                    return answer
+                # A relaunch under the same run id, from the stored record: its engine, key, principal and launch
+                # object stay as they were written, and the write is a CAS on its generation.
+                rec = self._current(prior)
+                rec.update(state="starting", cgroup=None, started_at=self._clock())
+            if self._commit(rec) != "ok":
+                raise _RegistryError("put:StaleGeneration")
+            self._failed.discard(run_id)
+        return self._launch(params, run_id, rec)
+
+    def _launch(self, params: Mapping, run_id: str, rec: dict) -> dict:
+        """Launch a recorded intent and record what came of it: the second half of the base's ``_start``, line for
+        line when the versioned path is off."""
         try:
-            handle = self._starter({**params, "run_id": run_id})
+            if self._start_hooks is None:
+                handle = self._starter({**params, "run_id": run_id})
+            else:
+                # Seam S6 e: the starter gets the four members it reads and a copy of the stored record, from
+                # which it builds the run's launch context. Nothing else of the client's params reaches it.
+                handle = self._starter({"tenant": rec["tenant"], "engine": rec["engine"], "prompt": params["prompt"],
+                                        "run_id": run_id}, copy.deepcopy(rec))
         except Exception as err:  # the launch path refused or failed; the API answers with a code
             with self._run_lock(run_id):
                 # Re-read first: a Stop may have written its intent while the starter ran. If the read fails,

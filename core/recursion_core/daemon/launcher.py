@@ -103,9 +103,26 @@ class RunContext:
         self.changed = threading.Condition()
 
     def launched(self, cgroup, process):
+        """Publish the launch. False when the start was abandoned first: nothing is published then.
+
+        Publishing and abandoning are decided under one lock, so exactly one of them wins. A launch
+        is never both answered as timed out and left running where no Stop can find it.
+        """
         with self.changed:
+            if self.cancelled:
+                return False
             self.cgroup, self.process = cgroup, process
             self.changed.notify_all()
+            return True
+
+    def abandon(self):
+        """Give the launch up, as a start that ran out of time does. False when the launch was
+        published first: the run started and is not abandoned."""
+        with self.changed:
+            if self.cgroup is not None:
+                return False
+            self.cancelled = True
+            return True
 
     def finished(self, result):
         with self.changed:
@@ -472,7 +489,12 @@ class ProductionLauncher:
                 os.unlink(run_dir / 'env.fifo')
             except OSError:
                 pass
-        ctx.launched(group, process)
+        if not ctx.launched(group, process):
+            # The start was abandoned after the check above and has been answered as timed out. The
+            # launch is not published, and its tree is ended like any other launch that failed.
+            process.fence('launch_failed')
+            process.close()
+            raise OSError(errno.ECANCELED, 'start was abandoned as the unit launched')
         return process
 
     def _wait_env_read(self, fd):

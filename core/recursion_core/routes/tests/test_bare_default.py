@@ -75,6 +75,59 @@ class ClassifyHelpTest(unittest.TestCase):
                 text = (FIXTURE.parent / f"claude-{version}-help.txt").read_text()
                 self.assertEqual(bd.classify_help(text), "unknown")
 
+    def test_earlier_clause_negation_does_not_make_a_future_default_present(self) -> None:
+        # "not" / "n't" in an earlier clause does not negate a later "will be".
+        # Parent d25fab88 classified these absent. A 24-character window treated
+        # the future verb as negated, and the present fallback then returned present.
+        earlier_clause = (
+            "Do not wait, it will be the default for -p.",
+            "Do not worry, --bare will be the default for -p.",
+            "Don't worry, it will be the default for -p.",
+            "It is not slated, so --bare will be the default for -p.",
+        )
+        for desc in earlier_clause:
+            with self.subTest(desc=desc):
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "absent")
+
+    def test_future_markers_and_line_qualifiers_are_not_present(self) -> None:
+        # Adverbs between will/shall/'ll/going-to and be, and a future qualifier
+        # anywhere on the help line, must not classify as the default now.
+        future_only = (
+            "--bare will soon be the default for -p.",
+            "--bare will later be the default for -p.",
+            "--bare will eventually be the default for -p.",
+            "--bare will now be the default for -p.",
+            "--bare will also be the default for -p.",
+            "--bare shall be the default for -p.",
+            "--bare shall soon be the default for -p.",
+            "it'll be the default for -p.",
+            "--bare is going to be the default for -p.",
+            "--bare is going to soon be the default for -p.",
+        )
+        for desc in future_only:
+            with self.subTest(desc=desc):
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "absent")
+        not_present = (
+            "--bare is the default for -p in the next version.",
+            "--bare is the default for -p in the next release.",
+            "planned; --bare is the default for -p.",
+            "--bare is the default for -p soon.",
+        )
+        for desc in not_present:
+            with self.subTest(desc=desc):
+                self.assertNotEqual(bd.classify_help(help_with_bare(desc)), "present")
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "unknown")
+        # Negation that governs the future verb does not block a present claim.
+        governed = (
+            "--bare is the default for -p, not a future release.",
+            "This is the default for -p, and it will not be optional.",
+            "This is the default for -p, and it won't be optional.",
+            "This is the default for -p, and it will never be optional.",
+        )
+        for desc in governed:
+            with self.subTest(desc=desc):
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "present")
+
     def test_present_and_future_default_claims_are_unknown(self) -> None:
         text = help_with_bare(
             "Minimal mode. --bare is the default for -p, or it will become the default in a future release.")

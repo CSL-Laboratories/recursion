@@ -40,7 +40,9 @@ _FLAG_GAP = re.compile(r" {2,}|\t")
 # and a shorter oversized token would be copied into the refusal.
 _BUILD_PART_MAX = 9
 # Present-tense "default for -p" wording in the --bare block. An unnegated future or
-# planned qualifier anywhere in the same sentence blocks a present classification.
+# planned qualifier anywhere on the same help line blocks a present classification.
+# Negation counts only when it governs that marker ("will not be", "not a future"),
+# not when it belongs to an earlier clause.
 _DEFAULT_NOW = re.compile(
     r"(?:\bis\s+(?:now\s+)?(?:the\s+)?default\b[^.]*(?:-p\b|--print\b|print\s+mode|headless)"
     r"|\b(?:on|enabled)\s+by\s+default\b[^.]*(?:-p\b|--print\b|print\s+mode|headless)"
@@ -59,13 +61,30 @@ _PRINT_BARE_DEFAULT = re.compile(
     r"|\bbare\b[^.;]*?\b(?:by\s+default|default\s+mode)\b"
     r"|\bdefaults?\s+(?:to|is)\s+(?:the\s+)?(?:--)?bare\b",
     re.IGNORECASE)
-# Future or planned wording anywhere in the sentence. Negation is checked per match.
-_FUTURE_QUALIFIER = re.compile(
-    r"\bfuture\b|\bplanned\b|\bupcoming\b|\bwill\s+(?:become|be)\b",
+# will/shall/'ll/going to, then up to three adverbs, then be/become.
+# "won't" and "shan't" are included so the negation stays inside the match.
+_FUTURE_AUX = r"(?:\b(?:will|shall)\b|\b(?:wo|sha)n't\b|'(?:ll)\b|\bgoing\s+to\b)"
+_FUTURE_VERB = re.compile(
+    _FUTURE_AUX + r"(?:\s+(?!be\b|become\b)[\w']+){0,3}\s+\b(?:be|become)\b",
     re.IGNORECASE)
-# "will become/be <a few words> <the match>" is one future claim, not a present one.
+# A future qualifier that is not itself a verb. "planned" stays here so a planned
+# note on the same line still blocks a present claim.
+_FUTURE_WORD = re.compile(
+    r"\b(?:soon|upcoming|future|planned)\b|\bnext\s+(?:version|release)\b",
+    re.IGNORECASE)
+# Negation directly before a future verb ("not going to be", "never will be").
+_DIRECT_NEG_VERB = re.compile(
+    r"(?:n't|\b(?:not|never|no\s+longer)\b)\s*$",
+    re.IGNORECASE)
+# Negation directly before a future word ("not a future", "not the next version").
+_DIRECT_NEG_WORD = re.compile(
+    r"(?:n't|\b(?:not|never|no\s+longer)\b)"
+    r"(?:\s+(?:a|an|the|really|actually|yet)\b){0,2}\s*$",
+    re.IGNORECASE)
+# "will/shall/'ll/going to <adverbs> be <a few words>" immediately before a match
+# is one future claim, not a present one.
 _FUTURE_GOVERNS_MATCH = re.compile(
-    r"\bwill\s+(?:become|be)\b(?:\s+\S+){0,3}\s*$",
+    _FUTURE_AUX + r"(?:\s+\S+){0,3}\s+\b(?:be|become)\b(?:\s+\S+){0,3}\s*$",
     re.IGNORECASE)
 # Negated or conditional wording never proves the default either way.
 _NEGATED = re.compile(r"\bnot\b|\bno\s+longer\b|\bnever\b|\bunless\b|\bexcept\b|\bwithout\b|n't\b",
@@ -105,6 +124,24 @@ def _sentences(block: str) -> list[str]:
     return [s for s in re.split(r"(?<=[.;])\s+", block) if s]
 
 
+def _negation_governs_future(sentence: str, start: int, end: int, *, word: bool) -> bool:
+    """True when negation directly governs the future marker at ``[start:end]``.
+
+    Inside the marker counts (``will not be``, ``won't be``, ``will never be``).
+    So does a negation at the end of the same clause, immediately before the
+    marker (``not going to``, ``not a future``). A comma or semicolon ends the
+    clause, so ``Do not wait, it will be`` does not negate ``will be``.
+    """
+
+    if _NEGATED.search(sentence[start:end]):
+        return True
+    prior = sentence[:start]
+    boundary = max(prior.rfind(","), prior.rfind(";"))
+    clause = prior[boundary + 1:]
+    pattern = _DIRECT_NEG_WORD if word else _DIRECT_NEG_VERB
+    return pattern.search(clause) is not None
+
+
 def _affirmed(pattern: re.Pattern[str], sentence: str) -> bool:
     """True if ``pattern`` matches with no negation in the match or the few words before it."""
 
@@ -119,16 +156,23 @@ def _negated_at(sentence: str, start: int, end: int) -> bool:
 
 
 def _unnegated_future(sentence: str) -> bool:
-    """True when a future or planned qualifier in the sentence is not explicitly negated."""
+    """True when a future marker in the text is not directly negated.
 
-    for match in _FUTURE_QUALIFIER.finditer(sentence):
-        if not _negated_at(sentence, match.start(), match.end()):
+    A future verb or qualifier blocks ``present`` unless negation governs that
+    marker. ``not`` or ``n't`` in an earlier clause does not.
+    """
+
+    for match in _FUTURE_VERB.finditer(sentence):
+        if not _negation_governs_future(sentence, match.start(), match.end(), word=False):
+            return True
+    for match in _FUTURE_WORD.finditer(sentence):
+        if not _negation_governs_future(sentence, match.start(), match.end(), word=True):
             return True
     return False
 
 
 def _present_claim(sentence: str, patterns: tuple) -> bool:
-    """True for a present-tense default that is not itself a ``will become/be`` claim."""
+    """True for a present-tense default that is not itself a future ``be`` claim."""
 
     for pattern in patterns:
         for match in pattern.finditer(sentence):
@@ -144,11 +188,13 @@ def _present_claim(sentence: str, patterns: tuple) -> bool:
 def _sentence_default(sentence: str, patterns: tuple) -> str | None:
     """How one help sentence speaks about the bare default.
 
-    ``present`` is a present-tense default with no unnegated future qualifier.
-    ``unknown`` is a present claim plus a future or planned qualifier anywhere in the
+    ``present`` is a present-tense default with no unnegated future marker.
+    ``unknown`` is a present claim plus a future or planned marker anywhere in the
     sentence, whether the join is a comma or ``and``. ``absent`` is only a future
     claim that bare will be the default. ``governed`` must not be promoted to present.
-    When a sentence is not clearly present, it is not classified present.
+    A negation governs a future marker only inside it or immediately before it in
+    the same clause. When a sentence is not clearly present, it is not classified
+    present.
     """
 
     future = _unnegated_future(sentence)
@@ -180,15 +226,22 @@ def classify_help(text: object) -> str:
         # Either block saying --bare is the default now is enough: print's own help may announce
         # it even when the --bare line does not.
         patterns = (_PRINT_BARE_DEFAULT,) if option == "--print" else (_DEFAULT_NOW, _BARE_SELF_DEFAULT)
+        # A future or planned qualifier anywhere on this option's help line blocks
+        # present, including across a semicolon ("planned; --bare is the default").
+        # An uncertain line is unknown, never present.
+        line_future = _unnegated_future(blocks[option])
         for sentence in _sentences(blocks[option]):
             decision = _sentence_default(sentence, patterns)
             if decision == "present":
-                return "present"
-            if decision == "unknown":
+                if line_future:
+                    ambiguous = True
+                else:
+                    return "present"
+            elif decision == "unknown":
                 ambiguous = True
             elif decision == "absent":
                 absent = True
-            elif (decision != "governed" and not _unnegated_future(sentence)
+            elif (not line_future and decision != "governed" and not _unnegated_future(sentence)
                   and any(_affirmed(p, sentence) for p in patterns)):
                 return "present"
             if option == "--bare" and re.search(r"default\s*[:=]?\s*(?:false|off|disabled)\b",

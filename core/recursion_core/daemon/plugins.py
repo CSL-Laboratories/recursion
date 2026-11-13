@@ -53,6 +53,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
 import sys
 import threading
@@ -170,7 +171,7 @@ def read_install(directory):
         return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None}
     try:
         data = json.loads(raw.decode('utf-8'))
-    except ValueError:
+    except (ValueError, RecursionError):
         raise PluginRefused('plugin_install_config_invalid', 'not JSON') from None
     if not isinstance(data, dict) or set(data) - _INSTALL_KEYS:
         raise PluginRefused('plugin_install_config_invalid', 'unknown field')
@@ -253,6 +254,10 @@ class PluginHost:
         except (PluginRefused, Refused) as exc:
             log.error('no plugin can load: %s', exc)
             self._refuse_all(sources, exc.code, exc.detail)
+            return
+        except (OSError, sqlite3.Error) as exc:
+            log.error('no plugin can load: revocation_store_invalid: %s', type(exc).__name__)
+            self._refuse_all(sources, 'revocation_store_invalid', type(exc).__name__)
             return
         self.loader = PluginLoader(self._trust, install['grants'], install['reserved'], self.health, self._gil)
         self._compose_core(install, breaker)

@@ -116,19 +116,25 @@ class Authority:
         self._clock = clock
         if not os.path.isfile(ledger_path):
             raise Refused("ledger_missing")
-        self._db = sqlite3.connect(ledger_path, isolation_level=None, check_same_thread=False,
-                                   timeout=30)
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute("PRAGMA busy_timeout=30000")
+        self._db = None
         try:
+            self._db = sqlite3.connect(ledger_path, isolation_level=None, check_same_thread=False,
+                                       timeout=30)
+            self._db.execute("PRAGMA synchronous=FULL")
+            self._db.execute("PRAGMA busy_timeout=30000")
             meta = dict(self._db.execute("SELECT k, v FROM meta").fetchall())
-        except sqlite3.DatabaseError:
-            self._db.close()
+        except sqlite3.Error:
+            if self._db is not None:
+                self._db.close()
             raise Refused("ledger_invalid") from None
         if meta.get("magic") != _LEDGER_MAGIC or meta.get("anchor") != self._anchor_id:
             self._db.close()
             raise Refused("ledger_anchor_mismatch")
-        self._db.execute(_CHARGES_INDEX)  # ledgers created before the index gain it here
+        try:
+            self._db.execute(_CHARGES_INDEX)  # ledgers created before the index gain it here
+        except sqlite3.Error:
+            self._db.close()
+            raise Refused("ledger_invalid") from None
         self._lock = threading.Lock()
         # Positive Ed25519 verdicts for this instance's fixed anchor, keyed by the exact
         # (signature hex, canonical bytes) pair; LRU, bounded, own lock (free-threaded safe).

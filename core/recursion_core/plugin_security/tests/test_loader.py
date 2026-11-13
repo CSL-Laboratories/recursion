@@ -266,6 +266,18 @@ class DoctorAndGilTests(unittest.TestCase):
             loader.load(self.raw, self.dev.sign(self.raw), PLUGIN_SOURCE)
         self.assertEqual(ctx.exception.code, "plugin_already_active")
 
+    def test_compile_parser_overflow_runs_gil_gate_and_refuses_typed(self) -> None:
+        deep = b"~" * 10_000 + b"1"
+        raw = manifest_bytes(self.dev.public, source=deep)
+        for gil_on, expected in ((False, "plugin_compile_failed"), (True, "core_poisoned_gil_enabled")):
+            with self.subTest(gil_on=gil_on):
+                probe, health = FakeGilProbe([gil_on]), CoreHealth()
+                with self.assertRaises(Refused) as ctx:
+                    _loader(self.dev, None, probe, health=health).load(raw, self.dev.sign(raw), deep)
+                self.assertEqual(ctx.exception.code, expected)
+                self.assertEqual(probe.calls, 1)
+                self.assertEqual(bool(health.poisoned), gil_on)
+
 
 if __name__ == "__main__":
     unittest.main()

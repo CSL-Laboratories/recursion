@@ -70,14 +70,16 @@ class ConnectionBreaker:
                  probe_lease_seconds: float = 300.0) -> None:
         if not os.path.isfile(store_path):
             raise Refused("breaker_store_missing")
-        self._db = sqlite3.connect(store_path, isolation_level=None, check_same_thread=False,
-                                   timeout=30)
+        self._db = None
         try:
+            self._db = sqlite3.connect(store_path, isolation_level=None, check_same_thread=False,
+                                       timeout=30)
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute("PRAGMA busy_timeout=30000")
             meta = dict(self._db.execute("SELECT k, v FROM meta").fetchall())
-        except sqlite3.DatabaseError:
-            self._db.close()
+        except sqlite3.Error:
+            if self._db is not None:
+                self._db.close()
             raise Refused("breaker_store_invalid") from None
         if meta.get("magic") != _STORE_MAGIC:
             self._db.close()

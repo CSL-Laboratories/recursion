@@ -150,7 +150,8 @@ class SubscriptionProviderTests(_Base):
         self.assertRefusedBeforeSpawn("opencode", profile, self.env(), "claude_subscription_provider")
 
     def test_pi_and_hermes_anthropic_oauth_selection(self) -> None:
-        for engine in ("pi", "hermes"):
+        # Name kept for history; OpenCode is covered too (R3 fix-14, after the Codex read of #365).
+        for engine in ("pi", "hermes", "opencode"):
             for auth in ("oauth", "subscription", "claude_login", "setup_token", "stored", "OAuth"):
                 with self.subTest(engine=engine, auth=auth):
                     self.assertRefusedBeforeSpawn(engine, self.profile(auth=auth), self.env(), "claude_subscription_auth")

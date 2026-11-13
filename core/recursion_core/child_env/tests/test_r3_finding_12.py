@@ -29,6 +29,25 @@ class MalformedEnvironmentTest(PrivateHome):
                 with self.subTest(name=name,proxy=bool(proxy)), self.assertRaises(EnvRefused):
                     build_child_env("claude_code",home=str(self.home),auth_mode="subscription",parent={name:"FAKE\0value",**proxy})
 
+    def test_non_string_carried_values_are_typed_refusals_before_any_launch(self):
+        # Added after the Codex read of #365: without the non-string branch these raise an untyped TypeError.
+        from recursion_core.child_env import spawn
+        values = (424242, None, ["FAKE-marker"], {"FAKE-marker": 424242})
+        for name in ("LANG", "NO_PROXY", "no_proxy", "CLAUDE_CODE_OAUTH_TOKEN"):
+            for value in values:
+                for proxy in ({}, {"HTTPS_PROXY": "http://127.0.0.1:3128"}):
+                    calls = []
+                    with self.subTest(name=name, value=type(value).__name__, proxy=bool(proxy)):
+                        with self.assertRaises(EnvRefused) as caught:
+                            env = build_child_env("claude_code", home=str(self.home), auth_mode="subscription",
+                                                  parent={name: value, **proxy})
+                            spawn(["/bin/true"], env, popen=lambda *a, **k: calls.append(a))
+                        self.assertEqual((caught.exception.name, caught.exception.cause), (name, "value_malformed"))
+                        shown = " ".join((str(caught.exception), repr(caught.exception), str(caught.exception.detail)))
+                        self.assertNotIn("FAKE-marker", shown)
+                        self.assertNotIn("424242", shown)
+                        self.assertEqual(calls, [])
+
     def test_nul_home_is_a_typed_refusal(self):
         with self.assertRaises(EnvRefused):
             build_child_env("codex",home=str(self.home)+"\0",auth_mode="subscription",parent={})

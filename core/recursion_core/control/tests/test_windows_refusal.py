@@ -47,7 +47,8 @@ class WindowsRefusalTests(unittest.TestCase):
 
     def test_explicit_path_gets_the_transport_refusal_as_unavailable(self) -> None:
         # The real client refuses in its constructor (PlatformNotSupported); a Stop is never reported stopped.
-        api = SocketAPI(os.path.abspath("r3-missing-control.sock"), connect=UnixControlClient)
+        # Short and absolute on every platform, independent of cwd, so the path-length check never fires first.
+        api = SocketAPI(os.path.join(os.path.abspath(os.sep), "r3.sock"), connect=UnixControlClient)
         self.assertEqual(REFUSAL, api.call("run.stop", {"run_id": "r1"}))
 
     def test_cli_prints_the_refusal_and_exits_1_for_every_command(self) -> None:

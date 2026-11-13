@@ -148,7 +148,10 @@ class LoopbackTests(TestCase):
         self.assertIn("Withheld: data not labelled <code>kalshi</code>", page)
 
     def test_cli_passes_plugin_directories_to_the_loader_and_imports_nothing(self):
-        plugin_dirs = tuple(str(Path(p).absolute()) for p in ("one", "two"))
+        # Absolute on every platform, under two distinct parents that are not cwd, so a CLI that kept only
+        # each basename (or resolved it against cwd) fails the exact-tuple assertion.
+        root = os.path.abspath(os.sep)
+        plugin_dirs = (os.path.join(root, "r3-plugin-a", "one"), os.path.join(root, "r3-plugin-b", "two"))
         before = set(sys.modules)
         with mock.patch.object(entry, "require_free_threaded") as check, \
              mock.patch.object(entry, "main") as main, \

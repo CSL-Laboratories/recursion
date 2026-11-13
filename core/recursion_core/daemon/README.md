@@ -257,6 +257,34 @@ route result is not produced), bar evidence for any route, the O7 interventions,
 that can approve or veto an effect, and an installer for the plugin files, the authority
 ledger and the breaker store.
 
+Also not done: three defects found in review on Nov 12, 2026, left as they are on this branch
+for the Stop lane on master.
+
+- **One lock for every run's unit calls.** `Daemon.start`, `Daemon.stop`, `Daemon.reconcile`,
+  `Daemon.cgroup_clear` and the whole of `Daemon.sweep` hold the daemon's one lock while they
+  call the unit manager, and each `systemd-run` or `systemctl` call may wait up to 15 seconds
+  (`SystemdUserManager._call`). A Stop or a reconcile of one run can make three of them in a row
+  (the stop, a `show`, and a second `show` before an end is recorded), and wait up to 2 seconds
+  per cgroup path for a kill in between. A start makes two (`systemd-run`, then `show`). A sweep
+  keeps the lock for its whole pass: that work for every run not yet ended, then one
+  `list-units`, then a stop for each leftover unit. While one of these waits on a slow manager,
+  a Stop of any other run waits for the lock. It is answered late, and `pending` if its confirm
+  window has run out by then. The wait changes when Stop answers, not what it reads: `stopped`
+  still needs the row ended and the cgroup walked empty in that same call. The control API's
+  per-run locks and the socket's reserved Stop connections do not shorten the wait.
+- **A failed launch cannot be retried under the same run id.** The launcher creates
+  `stdin.fifo`, `stdout.jsonl` and `stderr.log` in the run's directory without looking for an
+  earlier attempt, and `Daemon.start` inserts the run's row the same way. When a launch fails,
+  only `env.fifo` is removed. The control API relaunches a `start_failed` run under its old id
+  when the same `client_key` is sent again, so a relaunch of an attempt that got that far fails
+  on the files or the row it left.
+- **A short write of the environment is not noticed.** The engine's environment goes to
+  `env.fifo` as one frame in one nonblocking `os.write`, and the count that call returns is not
+  checked. The frame may be up to 60,000 bytes, on the assumption that a FIFO buffers 64 KiB.
+  Where a FIFO holds less, part of the frame is written, the launcher takes the drained FIFO
+  for an environment that was read, and `engine_exec` rejects the truncated frame: the engine
+  never runs, and the start may already have been answered as launched.
+
 Evidence: `evidence_ns.sh` runs `evidence_e2e.py`, which drives the real daemon and CLI
 against a real `systemd --user` manager with a stand-in engine
 (`evidence_standin_engine.py`): start, stream, inspect, Stop, cleanup, restart, a signed

@@ -119,6 +119,42 @@ def _discard_new_leaf(leaf):
 
 
 _DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+_PROCS_WRITE = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+class _HeldDirectory(tuple):
+    """``(st_dev, st_ino)`` pinned by an open ``O_DIRECTORY|O_NOFOLLOW`` fd.
+
+    Tuple equality stays ``(st_dev, st_ino)``. The fd keeps the inode from
+    being reused. ``LeafRun`` adopts the fd; otherwise ``close`` or ``__del__``
+    releases it. A second close is a no-op.
+    """
+
+    def __new__(cls, dev, ino, fd):
+        self = super().__new__(cls, (dev, ino))
+        self.fd = fd
+        return self
+
+    def close(self):
+        fd = getattr(self, 'fd', None)
+        self.fd = None
+        if isinstance(fd, int):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _release_held_directory(identity):
+    close = getattr(identity, 'close', None)
+    if close is not None:
+        close()
 
 
 def _unlink_held_files(held):
@@ -170,49 +206,32 @@ def _discard_held_leaf(parent_fd, held, identity):
     _rmdir_matching_name(parent_fd, identity)
 
 
-def _discard_matching_inode(parent_fd, identity):
-    """Discard ``identity`` if it is still linked in ``parent_fd``.
+def _discard_matching_inode(parent_fd, held):
+    """Remove the parent entry that is the directory ``held`` pins.
 
-    Opens that entry and checks ``fstat`` before removing anything. The name
-    that currently sits at the caller's path is removed only when it is this
-    inode.
+    ``held`` is an open directory fd. A name is removed only when its
+    ``lstat`` matches ``fstat(held)``. The inode cannot be reused while that
+    fd is open, so a sibling that later receives the same inode number is
+    left in place. A name that does not match is not removed.
     """
-    identity = tuple(identity)
     try:
-        names = os.listdir(parent_fd)
+        info = os.fstat(held)
     except OSError:
         return
-    for name in names:
-        if _directory_entry_inode(parent_fd, name) != identity:
-            continue
-        held = None
-        try:
-            held = os.open(name, _DIR_OPEN, dir_fd=parent_fd)
-            _discard_held_leaf(parent_fd, held, identity)
-        except OSError:
-            pass
-        finally:
-            if held is not None:
-                try:
-                    os.close(held)
-                except OSError:
-                    pass
-        return
+    _discard_held_leaf(parent_fd, held, (info.st_dev, info.st_ino))
 
 
 def _mark_created_leaf(leaf):
-    """Mark the directory inode just created at ``leaf``. Return its identity.
+    """Mark the directory inode just created at ``leaf``.
 
-    The directory is opened ``O_DIRECTORY|O_NOFOLLOW`` relative to the parent
-    directory fd. ``fstat`` must match the inode ``lstat`` saw. The marker is
-    ``fsetxattr`` on that fd. A name that fails the check is not marked and
-    not removed. If the marker write fails, only the created inode is
+    The directory is opened ``O_DIRECTORY|O_NOFOLLOW`` from the parent fd and
+    that fd stays open on the returned ``(st_dev, st_ino)``. The marker is
+    written only when ``lstat`` of the leaf name matches ``fstat`` of this fd.
+    A name that does not match is not marked and not removed. If the marker
+    write fails, only an entry whose ``lstat`` matches the held fd is
     discarded.
     """
     leaf = Path(leaf)
-    created = cgroup_identity(leaf)
-    if created is None:
-        raise OSError(errno.EBUSY, 'cgroup identity changed')
     try:
         parent_fd = os.open(leaf.parent, _DIR_OPEN)
     except OSError as exc:
@@ -222,26 +241,29 @@ def _mark_created_leaf(leaf):
         try:
             fd = os.open(leaf.name, _DIR_OPEN, dir_fd=parent_fd)
         except OSError as exc:
-            _discard_matching_inode(parent_fd, created)
+            # Nothing is pinned. Do not remove whatever name now has an inode
+            # number sampled before this open.
             raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
         try:
             info = os.fstat(fd)
         except OSError as exc:
             raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
-        if (info.st_dev, info.st_ino) != created or not stat.S_ISDIR(info.st_mode):
-            # This fd is a directory swapped onto the name. Do not mark it
-            # and do not rmdir it. Drop only the inode mkdir created, if it
-            # is still linked under some other name.
-            os.close(fd)
-            fd = None
-            _discard_matching_inode(parent_fd, created)
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError(errno.EBUSY, 'cgroup identity changed')
+        if _directory_entry_inode(parent_fd, leaf.name) != (info.st_dev, info.st_ino):
+            # The name is no longer the inode this fd pins. Do not mark it
+            # and do not remove it. Drop the pinned inode only if a parent
+            # entry still lstats as this fd.
+            _discard_matching_inode(parent_fd, fd)
             raise OSError(errno.EBUSY, 'cgroup identity changed')
         try:
             mark_owned(fd)
         except OSError:
-            _discard_held_leaf(parent_fd, fd, created)
+            _discard_matching_inode(parent_fd, fd)
             raise
-        return created
+        held = _HeldDirectory(info.st_dev, info.st_ino, fd)
+        fd = None
+        return held
     finally:
         if fd is not None:
             try:
@@ -498,16 +520,21 @@ class Cgroup2:
     def make_leaf(self, leaf: Path):
         """Create ``leaf`` and mark that inode. Return ``(st_dev, st_ino)``.
 
-        ``mkdir`` is exclusive: an existing leaf is never reused. The marker
-        is written only after an ``O_DIRECTORY|O_NOFOLLOW`` open from the
-        parent fd ``fstat``s as the inode just created. A swapped-in directory
-        is not marked. A failed marker write discards only that created inode.
+        ``mkdir`` is exclusive: an existing leaf is never reused. The returned
+        tuple holds the ``O_DIRECTORY|O_NOFOLLOW`` fd opened on that inode
+        (``close`` or ``__del__`` releases it; ``LeafRun`` adopts it). The
+        marker is written only when ``lstat`` of the name matches ``fstat`` of
+        that fd. A swapped-in directory is not marked. A failed marker write
+        discards only an entry that still matches the held fd.
         """
         os.mkdir(leaf, 0o755)  # exclusive: an existing leaf is never reused
         return _mark_created_leaf(leaf)
 
-    def open_procs(self, leaf: Path) -> int:
-        return os.open(leaf / 'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    def open_procs(self, leaf: Path, dirfd=None) -> int:
+        """Open ``cgroup.procs`` for writing. ``dirfd`` pins the directory."""
+        if dirfd is None:
+            return os.open(Path(leaf) / 'cgroup.procs', _PROCS_WRITE)
+        return os.open('cgroup.procs', _PROCS_WRITE, dir_fd=dirfd)
 
     def kill(self, leaf: Path, deadline=None, dirfd=None):
         # O_NONBLOCK: a fifo or a stuck node must not hold the cleanup window open.
@@ -806,22 +833,37 @@ class DelegatedRoot:
             raise ValueError('Empty launch')
         leaf = self.leaf(name)
         created = self.fs.make_leaf(leaf)
-        run = LeafRun(self.fs, leaf, kill_timeout, expect=created)
+        run = None
         try:
-            # make_leaf's inode, not whatever was renamed onto this path
-            # between the marker write and this open.
-            if not isinstance(created, tuple) or run.identity != created or run.dirfd is None:
-                raise PermissionError('Leaf identity changed before launch')
+            run = LeafRun(self.fs, leaf, kill_timeout, expect=created)
+            # The held directory fd, not a previously sampled inode number.
+            # lstat of the path must still be that fd; a recycled directory
+            # can reuse (st_dev, st_ino) only after the fd is closed.
             try:
-                info = os.fstat(run.dirfd)
-            except OSError as exc:
-                raise PermissionError('Leaf is not an operator-owned directory') from exc
-            if info.st_uid != os.getuid() or not stat.S_ISDIR(info.st_mode):
+                info = os.fstat(run.dirfd) if run.dirfd is not None else None
+            except OSError:
+                info = None
+            if (not isinstance(created, tuple) or run.dirfd is None or info is None
+                    or run.identity != tuple(created)
+                    or (info.st_dev, info.st_ino) != tuple(created)
+                    or not stat.S_ISDIR(info.st_mode)
+                    or not run._path_matches_held()):
+                raise PermissionError('Leaf identity changed before launch')
+            if info.st_uid != os.getuid():
                 raise PermissionError('Leaf is not an operator-owned directory')
             run._spawn(list(argv), env, cwd, stdin, stdout, stderr, start_timeout)
         except BaseException as exc:
-            run._cleanup_after(exc)
+            if run is not None:
+                run._cleanup_after(exc)
+                # The handle is not returned. Drop its fds here; a caller that
+                # keeps this exception must not pin the inode or leak the fd.
+                run._release_held_fds()
             raise
+        finally:
+            # LeafRun owns the pin once it has stored the fd. If it did not,
+            # close the fd make_leaf is still holding.
+            if run is None or run.dirfd is None:
+                _release_held_directory(created)
         return run
 
     def adopt(self, name, kill_timeout=5.0):
@@ -837,21 +879,44 @@ class DelegatedRoot:
         """
         leaf = self.leaf(name)
         parent_fd = os.open(self.path, _DIR_OPEN)
+        fd = None
         try:
             try:
                 info = os.lstat(name, dir_fd=parent_fd)
             except OSError as exc:
                 raise PermissionError('Leaf is not an operator-owned directory') from exc
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.getuid()):
+                raise PermissionError('Leaf is not an operator-owned directory')
+            try:
+                fd = os.open(name, _DIR_OPEN, dir_fd=parent_fd)
+            except OSError as exc:
+                raise PermissionError('Leaf identity changed') from exc
+            try:
+                opened = os.fstat(fd)
+            except OSError as exc:
+                raise PermissionError('Leaf identity changed') from exc
+            if ((opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+                    or not stat.S_ISDIR(opened.st_mode)):
+                raise PermissionError('Leaf identity changed')
+            classified = _HeldDirectory(opened.st_dev, opened.st_ino, fd)
+            fd = None
         finally:
-            os.close(parent_fd)
-        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != os.getuid()):
-            raise PermissionError('Leaf is not an operator-owned directory')
-        classified = (info.st_dev, info.st_ino)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
         run = LeafRun(self.fs, leaf, kill_timeout, expect=classified)
         run.adopted = True
-        if run.dirfd is None or run.identity != classified:
+        if (run.dirfd is None or run.identity != tuple(classified)
+                or not run._path_matches_held()):
             run._close_dirfd()
+            _release_held_directory(classified)
             raise PermissionError('Leaf identity changed')
         try:
             owned = _marked_owned(run.dirfd)
@@ -963,13 +1028,19 @@ class LeafRun:
         self._open_identity(expect)
 
     def _open_identity(self, expect=None):
-        """Open the leaf from its parent dirfd and remember that inode.
+        """Pin the leaf directory and remember that inode.
 
-        ``expect`` is the ``(st_dev, st_ino)`` from ``mkdir`` or from the
-        ``lstat`` that decided this name was ours. The fd is kept only when
-        ``fstat`` matches. A directory swapped onto the name is closed and
-        not recorded, so a later kill or ``rmdir`` cannot target it.
+        A held fd on ``expect`` (the one ``make_leaf`` or ``adopt`` kept open)
+        is adopted and not reopened. Otherwise the leaf is opened from its
+        parent dirfd. The fd is kept only when ``fstat`` matches ``expect``.
+        A directory swapped onto the name is closed and not recorded, so a
+        later kill or ``rmdir`` cannot target it.
         """
+        pinned = getattr(expect, 'fd', None) if expect is not None else None
+        if isinstance(pinned, int):
+            expect.fd = None
+            self._adopt_pinned_fd(pinned, expect)
+            return
         try:
             parent_fd = os.open(self.leaf.parent, _DIR_OPEN)
         except OSError:
@@ -1009,9 +1080,82 @@ class LeafRun:
             except OSError:
                 pass
 
+    def _adopt_pinned_fd(self, fd, expect):
+        """Record ``fd`` when it is the directory ``expect`` names."""
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            return
+        if not stat.S_ISDIR(info.st_mode):
+            os.close(fd)
+            return
+        opened = (info.st_dev, info.st_ino)
+        if expect is not None and opened != tuple(expect):
+            os.close(fd)
+            return
+        self.dirfd = fd
+        self.identity = opened
+
+    def _path_matches_held(self):
+        """``lstat`` of the leaf path is the inode ``dirfd`` still pins."""
+        if self.dirfd is None:
+            return False
+        try:
+            held = os.fstat(self.dirfd)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(held.st_mode):
+            return False
+        if self.identity is not None and (held.st_dev, held.st_ino) != tuple(self.identity):
+            return False
+        return cgroup_identity(self.leaf) == (held.st_dev, held.st_ino)
+
     def _same_cgroup(self):
-        """The path still names the directory this handle opened."""
-        return self.identity is not None and cgroup_identity(self.leaf) == self.identity
+        """The path still names the directory this handle's fd pins."""
+        return self._path_matches_held()
+
+    def _procs_fd_is_held(self, procs):
+        """``procs`` is ``cgroup.procs`` of the pinned directory."""
+        if self.dirfd is None:
+            return False
+        try:
+            got = os.fstat(procs)
+        except OSError:
+            return False
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            again = os.open('cgroup.procs', flags, dir_fd=self.dirfd)
+        except OSError:
+            return False
+        try:
+            expect = os.fstat(again)
+        finally:
+            os.close(again)
+        return (got.st_dev, got.st_ino) == (expect.st_dev, expect.st_ino)
+
+    def _proc_in_held_inode(self, pid):
+        """``pid``'s cgroup is the pinned directory, not merely the same path."""
+        if self.dirfd is None or pid is None:
+            return False
+        where = self.fs.member(pid)
+        if where is None:
+            return False
+        try:
+            held = os.fstat(self.dirfd)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(held.st_mode):
+            return False
+        try:
+            fd = os.open(os.fspath(where), _DIR_OPEN)
+        except OSError:
+            return False
+        try:
+            info = os.fstat(fd)
+        finally:
+            os.close(fd)
+        return (info.st_dev, info.st_ino) == (held.st_dev, held.st_ino)
 
     def _close_dirfd(self):
         fd = self.dirfd
@@ -1147,9 +1291,16 @@ class LeafRun:
         return self.proc.pid if self.proc else None
 
     def _spawn(self, argv, env, cwd, stdin, stdout, stderr, start_timeout):
-        procs = self.fs.open_procs(self.leaf)
+        if self.dirfd is None:
+            raise LaunchError('leaf directory is not pinned')
+        procs = self.fs.open_procs(self.leaf, dirfd=self.dirfd)
         read_end = write_end = -1
         try:
+            # The procs fd must be this directory's cgroup.procs before any
+            # child can write its pid into it. A path open can name a scope
+            # swapped onto the leaf after dirfd was pinned.
+            if not self._procs_fd_is_held(procs):
+                raise LaunchError('cgroup.procs is not the pinned leaf')
             read_end, write_end = os.pipe2(os.O_CLOEXEC)
             self.proc = subprocess.Popen(
                 [sys.executable, '-I', '-S', '-c', TRAMPOLINE, str(procs), str(write_end), *argv],
@@ -1162,12 +1313,15 @@ class LeafRun:
             message = self._read_status(read_end, start_timeout)
         finally:
             for fd in (procs, read_end, write_end):
-                if fd >= 0:
-                    os.close(fd)
+                if isinstance(fd, int) and fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
         if message:
             raise LaunchError(f'trampoline failed before exec: {message}')
-        where = self.fs.member(self.proc.pid)
-        if where != self.leaf:
+        if not self._proc_in_held_inode(self.proc.pid):
+            where = self.fs.member(self.proc.pid)
             raise LaunchError(f'process is not in the leaf (seen in {where})')
 
     @staticmethod

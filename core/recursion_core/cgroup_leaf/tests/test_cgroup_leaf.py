@@ -89,10 +89,10 @@ class FakeCgroup(Cgroup2):
             raise
         return cgroup_identity(leaf)
 
-    def open_procs(self, leaf):
+    def open_procs(self, leaf, dirfd=None):
         if self.procs_override:
             return os.open(self.procs_override, os.O_WRONLY | os.O_CLOEXEC)
-        return super().open_procs(leaf)
+        return super().open_procs(leaf, dirfd=dirfd)
 
     def main(self, leaf):
         text = (leaf / 'cgroup.procs').read_text().strip()
@@ -244,7 +244,7 @@ class LeafTests(unittest.TestCase):
 
     def test_join_failure_never_execs_target(self):
         self.fs.procs_override = '/dev/full'
-        with self.assertRaisesRegex(LaunchError, 'before exec'):
+        with self.assertRaisesRegex(LaunchError, 'pinned leaf'):
             self.root.launch('run-a', self.sh('touch ran'), cwd=self.work)
         time.sleep(0.1)
         self.assertFalse((self.work / 'ran').exists())
@@ -747,6 +747,120 @@ class LeafTests(unittest.TestCase):
         self.assertEqual((leaf / 'payload').read_text(), 'systemd')
         self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
         self.assertEqual((leaf / 'cgroup.procs').read_text().strip(), '')
+
+    def test_spawn_does_not_join_scope_swapped_before_procs_open(self):
+        # LeafRun has already pinned the directory. Before cgroup.procs is
+        # opened, that directory is renamed aside and a scope takes its name.
+        # The child must join the pinned inode, not the scope. close() must
+        # not remove the scope.
+        gc.collect()
+        before = len(os.listdir('/proc/self/fd'))
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-a-aside'
+        leaf = self.root_path / 'run-a'
+        write_cgroup(scope, procs='')
+        (scope / 'payload').write_text('systemd')
+        swapped = {'done': False}
+        real_open = os.open
+
+        def swap_open(path, flags, *args, **kwargs):
+            if (not swapped['done'] and not isinstance(path, int)
+                    and (flags & os.O_WRONLY) and not (flags & os.O_CREAT)
+                    and not (flags & os.O_DIRECTORY)):
+                text = os.fsdecode(path)
+                if text == 'cgroup.procs' or text.endswith('/cgroup.procs'):
+                    swapped['done'] = True
+                    if leaf.exists() and scope.exists() and not aside.exists():
+                        leaf.rename(aside)
+                        scope.rename(leaf)
+            return real_open(path, flags, *args, **kwargs)
+
+        run = None
+        try:
+            with patch.object(cgroup_leaf.os, 'open', swap_open):
+                run = self.root.launch('run-a', ['sleep', '30'])
+            self.assertTrue(swapped['done'])
+            self.assertIsNotNone(run)
+            self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+            self.assertEqual((leaf / 'cgroup.procs').read_text().strip(), '')
+            self.assertEqual((aside / 'cgroup.procs').read_text().strip(), str(run.pid))
+            with self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+                outcome = run.close()
+            self.assertNotIn(outcome.state, ('empty', 'leaf_empty'))
+            self.assertFalse(alive(run.pid))
+            self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+            self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+            self.assertTrue(leaf.is_dir())
+            self.assertTrue(aside.is_dir())
+        finally:
+            if run is not None:
+                if run.pid and alive(run.pid):
+                    _stop_pid(run.pid)
+                run._release_held_fds()
+            gc.collect()
+        gc.collect()
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
+    def test_launch_does_not_accept_recycled_inode(self):
+        # make_leaf's directory fd must still be open when launch compares the
+        # path. Replacing the directory after that fd is closed reuses the
+        # inode number; launch must not start the child there.
+        gc.collect()
+        before = len(os.listdir('/proc/self/fd'))
+        leaf = self.root_path / 'run-a'
+        real_make = cgroup_leaf.Cgroup2.make_leaf
+
+        def make(target):
+            created = real_make(self.fs, target)
+            for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
+                path = Path(target) / name
+                if not path.exists():
+                    path.touch()
+            return created
+
+        self.fs.make_leaf = make
+        real_open_identity = cgroup_leaf.LeafRun._open_identity
+        state = {'reused': None}
+
+        def recycle(run, expect=None):
+            path = Path(run.leaf)
+            if path.is_dir():
+                original = path.stat().st_ino
+                for child in list(path.iterdir()):
+                    if child.is_symlink() or child.is_file():
+                        child.unlink()
+                    else:
+                        raise AssertionError(f'unexpected child {child}')
+                os.rmdir(path)
+                write_cgroup(path, procs='')
+                (path / 'recycled').write_text('yes')
+                state['reused'] = path.stat().st_ino == original
+            return real_open_identity(run, expect)
+
+        run = None
+        caught = None
+        try:
+            with patch.object(cgroup_leaf.LeafRun, '_open_identity', recycle):
+                try:
+                    run = self.root.launch('run-a', ['sleep', '30'])
+                except (PermissionError, LaunchError) as exc:
+                    caught = exc
+            self.assertIsNotNone(caught, f'reused={state["reused"]} run={run!r}')
+            self.assertEqual((leaf / 'cgroup.procs').read_text().strip(), '')
+            self.assertEqual((leaf / 'recycled').read_text(), 'yes')
+            self.assertTrue(leaf.is_dir())
+            caught = None
+        finally:
+            if run is not None:
+                try:
+                    run.close()
+                except Exception:
+                    pass
+                if run.pid and alive(run.pid):
+                    _stop_pid(run.pid)
+                run._release_held_fds()
+            gc.collect()
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
 
 
 def write_cgroup(path, procs=''):
@@ -1457,14 +1571,19 @@ class RemovalContractTests(unittest.TestCase):
 
         with patch.object(cgroup_leaf.os, 'setxattr', swap_setxattr):
             got = self.fs.make_leaf(leaf)
-        self.assertTrue(swapped['done'])
-        self.assertEqual(got, cgroup_identity(aside))
-        self.assertEqual(os.getxattr(aside, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False),
-                         cgroup_leaf.OWNERSHIP_VALUE)
-        with self.assertRaises(OSError) as caught:
-            os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
-        self.assertEqual(caught.exception.errno, errno.ENODATA)
-        self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+        try:
+            self.assertTrue(swapped['done'])
+            self.assertEqual(got, cgroup_identity(aside))
+            self.assertEqual(os.getxattr(aside, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False),
+                             cgroup_leaf.OWNERSHIP_VALUE)
+            with self.assertRaises(OSError) as caught:
+                os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+            self.assertEqual(caught.exception.errno, errno.ENODATA)
+            self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+        finally:
+            close = getattr(got, 'close', None)
+            if close is not None:
+                close()
 
     def test_make_leaf_enospc_discards_only_created_inode(self):
         leaf = self.root_path / 'run-a'
@@ -1494,6 +1613,136 @@ class RemovalContractTests(unittest.TestCase):
         self.assertEqual((leaf / 'payload').read_text(), 'systemd')
         self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
         self.assertFalse(aside.exists())
+
+    def test_make_leaf_does_not_mark_recycled_inode(self):
+        # The first lstat of the new directory replaces it. ext4 reuses the
+        # inode number once nothing holds the old directory open. make_leaf
+        # must not mark that replacement.
+        leaf = self.root_path / 'run-a'
+        state = {'done': False, 'reused': False}
+        real = os.lstat
+
+        def recycle_lstat(path, *args, **kwargs):
+            if state['done'] or isinstance(path, int):
+                return real(path, *args, **kwargs)
+            text = os.fsdecode(path)
+            if text != leaf.name and Path(text) != leaf:
+                return real(path, *args, **kwargs)
+            state['done'] = True
+            info = real(path, *args, **kwargs)
+            original = info.st_ino
+            for _ in range(8):
+                os.rmdir(leaf)
+                os.mkdir(leaf, 0o755)
+                info = real(path, *args, **kwargs)
+                if info.st_ino == original:
+                    state['reused'] = True
+                    break
+            return info
+
+        gc.collect()
+        before = len(os.listdir('/proc/self/fd'))
+        got = None
+        try:
+            with patch.object(cgroup_leaf.os, 'lstat', recycle_lstat):
+                try:
+                    got = self.fs.make_leaf(leaf)
+                except OSError as exc:
+                    self.assertEqual(exc.errno, errno.EBUSY)
+                else:
+                    self.fail(f'make_leaf marked a recycled directory {got!r} '
+                              f'reused={state["reused"]}')
+        finally:
+            close = getattr(got, 'close', None)
+            if close is not None:
+                close()
+            gc.collect()
+        self.assertTrue(state['done'])
+        self.assertTrue(leaf.is_dir())
+        with self.assertRaises(OSError) as caught:
+            os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+        self.assertEqual(caught.exception.errno, errno.ENODATA)
+        caught = None
+        gc.collect()
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
+    def test_discard_does_not_remove_sibling_that_reused_inode(self):
+        # Opening the new leaf fails after its inode number has been reused by
+        # run-b. Discard must not rmdir run-b.
+        leaf = self.root_path / 'run-a'
+        sibling = self.root_path / 'run-b'
+        state = {'done': False, 'reused': False}
+        real_open = os.open
+
+        def fail_open(path, flags, *args, **kwargs):
+            if (not state['done'] and _is_leaf_directory_open(path, flags, leaf)
+                    and leaf.exists()):
+                state['done'] = True
+                original = os.lstat(leaf).st_ino
+                os.rmdir(leaf)
+                os.mkdir(sibling)
+                (sibling / 'payload').write_text('keep')
+                state['reused'] = os.lstat(sibling).st_ino == original
+                raise OSError(errno.ENOENT, 'leaf name swapped away')
+            return real_open(path, flags, *args, **kwargs)
+
+        gc.collect()
+        before = len(os.listdir('/proc/self/fd'))
+        with patch.object(cgroup_leaf.os, 'open', fail_open):
+            with self.assertRaises(OSError):
+                self.fs.make_leaf(leaf)
+        gc.collect()
+        self.assertTrue(state['done'])
+        self.assertTrue(state['reused'])
+        self.assertFalse(leaf.exists())
+        self.assertTrue(sibling.is_dir())
+        self.assertEqual((sibling / 'payload').read_text(), 'keep')
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
+    def test_adopt_does_not_accept_recycled_inode(self):
+        gc.collect()
+        before = len(os.listdir('/proc/self/fd'))
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        cgroup_leaf.mark_owned(leaf)
+        real_open_identity = cgroup_leaf.LeafRun._open_identity
+        state = {'reused': None}
+
+        def recycle(run, expect=None):
+            path = Path(run.leaf)
+            original = path.stat().st_ino
+            for child in list(path.iterdir()):
+                if child.is_symlink() or child.is_file():
+                    child.unlink()
+                else:
+                    raise AssertionError(f'unexpected child {child}')
+            os.rmdir(path)
+            write_cgroup(path, procs='')
+            cgroup_leaf.mark_owned(path)
+            (path / 'recycled').write_text('yes')
+            state['reused'] = path.stat().st_ino == original
+            return real_open_identity(run, expect)
+
+        root = DelegatedRoot(self.root_path, self.fs)
+        run = None
+        caught = None
+        try:
+            with patch.object(cgroup_leaf.LeafRun, '_open_identity', recycle):
+                try:
+                    run = root.adopt('run-a')
+                except PermissionError as exc:
+                    caught = exc
+            self.assertIsNotNone(caught, f'reused={state["reused"]} run={run!r}')
+            self.assertEqual((leaf / 'recycled').read_text(), 'yes')
+            self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+            self.assertEqual(self.fs.killed, [])
+            self.assertEqual(self.fs.rmdir_calls, [])
+            caught = None
+        finally:
+            if run is not None:
+                run._release_held_fds()
+            gc.collect()
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
 
 
 class RealCgroupTests(unittest.TestCase):

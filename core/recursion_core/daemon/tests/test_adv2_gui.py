@@ -253,6 +253,21 @@ class Adv2HungPluginTests(GuiCase):
                 t.join(5)
         self.assertLessEqual(observed_peak, daemon_gui.MAX_REQUEST_THREADS)
 
+    def test_a_read_thread_that_cannot_be_started_does_not_leave_the_plugin_host_busy(self):
+        """The host is marked busy before the thread that makes the read is started. When that thread
+        cannot be started the call raises, and the mark has to be cleared: the next read is served,
+        not refused as busy for good."""
+        from unittest import mock
+        self.module.GATE.set()  # the plugin answers at once; nothing here waits on it
+        self.host._operator_turn_wait_s = 0.05  # how long a read waits for its turn before it answers busy
+        with mock.patch.object(threading.Thread, 'start', side_effect=RuntimeError('cannot start new thread')):
+            with self.assertRaises(RuntimeError):
+                self.host.operator({'command': READ})
+        self.assertEqual(self.module.CALLS, [], 'the read whose thread never started reached the plugin')
+        status, body = self.host.operator({'command': READ})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.module.CALLS, [READ])
+
     def _read_quietly(self, gui):
         try:
             self.get(gui, '/read?command=' + READ, timeout=40)

@@ -287,24 +287,35 @@ link count as the pin. A same-tick replacement leaves the open inode at link cou
 `ctime_ns`, device and inode of `config.yaml` and of `.hermes`, and the sorted listing —
 and those stamps and bytes equal the pin.
 
-After the two observations agree, the last operations re-verify every name-based fact, and
-each name lookup is followed by a descriptor check. `.hermes` is opened by name from the
-held home fd (`O_NOFOLLOW|O_DIRECTORY`) and `fstat` must be the pinned directory. `listdir`
-on that fd must match the pinned set, so an API-key `state.db` or a new `.env` / `.op.env`
-refuses. `config.yaml` is stat'd by name without following a symlink and must be the pinned
-inode. `fstat` of the config fd must show link count at least 1 and the full stamp
-unchanged. `.hermes` is stat'd by name from the home fd again and must be the pinned
-directory. That verification runs once more, immediately before the final `fstat` and
-`pread` of the config descriptor, which are the last step. Any difference refuses and
-nothing is unlinked. A same-size rewrite that keeps `mtime_ns` and `ctime_ns` still fails
-the next read of the bytes.
+After the two observations agree, the operations before the byte read re-verify every
+name-based fact, and each name lookup is followed by a descriptor check. `.hermes` is opened
+by name from the held home fd (`O_NOFOLLOW|O_DIRECTORY`) and `fstat` must be the pinned
+directory. `listdir` on that fd must match the pinned set, so an API-key `state.db` or a new
+`.env` / `.op.env` refuses. `config.yaml` is stat'd by name without following a symlink and
+must be the pinned inode. `fstat` of the config fd must show link count at least 1 and the
+full stamp unchanged. `.hermes` is stat'd by name from the home fd again and must be the
+pinned directory. That verification runs once more, immediately before the final `fstat` and
+`pread` of the config descriptor. `pread` is the function captured at import
+(`_LIBC_PREAD`), so a patch of `os.pread` at call time cannot change the bytes that read
+returns. Any difference refuses and nothing is unlinked. A same-size rewrite that keeps
+`mtime_ns` and `ctime_ns` still fails that read of the bytes.
 
-A same-uid change after the final pread returns remains (pre-existing residual): the child
-opens `config.yaml` and HOME by path. Also residual, and not changed here: `XDG_*` and
-`HERMES_HOME`; subscription extra names other than `.env` and `.op.env` (a subscription
-`state.db`); other `.hermes` names and the subscription store; `HOME=/proc/self/fd/N` (that
-path is not set); and `PROJECT_ROOT/.env` in the Hermes install tree. Allowing subscription
-extra names is an owner decision (Lucas, PRODUCT.md `055cc7a5` section 2).
+After that `pread` returns, the last operations are a seal, and every call in it is a
+function captured at import. HOME is `lstat`'d by path and must still be a real directory
+with the pinned device and inode, not a symlink. `.hermes` is opened again by name from the
+home fd (`O_NOFOLLOW|O_DIRECTORY`); `fstat` of that fd and an `lstat` of the name must both
+be the pinned directory. `listdir` on that fd must match the pinned names, so a `.env`, an
+`.op.env`, or an API-key `state.db` planted after the earlier listing refuses.
+`config.yaml` is `lstat`'d by name and must be the pinned inode with link count at least 1.
+`fstat` of the config fd must show the full stamp. A mismatch refuses. Nothing is unlinked.
+
+A same-uid change after this final seal and before the child execs or opens by path remains
+an owner-decision residual. The child opens `config.yaml` and HOME by path, and that window
+is not fixed in-process. Also residual, and not changed here: `XDG_*` and `HERMES_HOME`;
+subscription extra names other than `.env` and `.op.env` (a subscription `state.db`); other
+`.hermes` names and the subscription store; `HOME=/proc/self/fd/N` (that path is not set);
+and `PROJECT_ROOT/.env` in the Hermes install tree. Allowing subscription extra names is an
+owner decision (Lucas, PRODUCT.md `055cc7a5` section 2).
 
 Earlier in the same launch, a path bind still refuses a swapped route home or a
 `config.yaml` inode that is no longer the one the switch read accepted. A 0700 directory

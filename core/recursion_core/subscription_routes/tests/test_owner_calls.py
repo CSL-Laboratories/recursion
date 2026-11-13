@@ -1758,8 +1758,30 @@ class HermesHomeReuseTests(_Calls):
     # 23 (.env) and 24 (.op.env), the final .hermes name stat is 30, and the final
     # config.yaml name stat is 32.
     _RECHECK_HOOKS = ("open", "stat", "fstat", "listdir", "pread", "close")
+    # os.* name, and the import-captured function the seal calls for that name.
+    _EXTENDED_HOOKS = (
+        ("open", "_LIBC_OPEN"),
+        ("stat", "_LIBC_STAT"),
+        ("fstat", "_LIBC_FSTAT"),
+        ("listdir", "_LIBC_LISTDIR"),
+        ("pread", "_LIBC_PREAD"),
+        ("close", "_LIBC_CLOSE"),
+        ("lstat", "_LIBC_LSTAT"),
+    )
+
+    def _restore_route_home_path(self) -> None:
+        # A symlink planted in HOME's place must not be followed. Put the real directory back.
+        if self.home.is_symlink():
+            self.home.unlink()
+        real = self.root / "route-home.real"
+        if not self.home.exists() and real.exists():
+            os.rename(real, self.home)
+        elif real.exists():
+            shutil.rmtree(real)
 
     def _reset_hermes_tree(self) -> None:
+        self._pread_lie = False
+        self._restore_route_home_path()
         for name in (".hermes", ".hermes.aside"):
             path = self.home / name
             if path.is_symlink():
@@ -1880,6 +1902,11 @@ class HermesHomeReuseTests(_Calls):
             self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / kind).read_bytes())
         elif kind == "state.db":
             self.assertEqual(b"x", (self.home / ".hermes" / "state.db").read_bytes())
+        elif kind == "pread":
+            self.assertEqual(b"auth:\n  adopt_external_logins: true \n", self.config().read_bytes())
+        elif kind == "home":
+            self.assertTrue(self.home.is_symlink())
+            self.assertEqual(ADOPT_YAML, (self.root / "route-home.real" / ".hermes" / "config.yaml").read_bytes())
 
     def test_new_config_inode_after_final_name_stat_refuses(self) -> None:
         # Index 32 on 0f1fa676 is the last stat of config.yaml. The fstat after it
@@ -1934,7 +1961,10 @@ class HermesHomeReuseTests(_Calls):
         events = self._trace_recheck()
         self.assertEqual(("listdir", "stat", "stat"), (events[22], events[23], events[24]))
         self.assertGreater(len(events), 32)
-        self.assertEqual("pread", events[-1])
+        # os.* lookups end at the first re-verify's close. The final pread and the
+        # seal call the functions captured at import, so they are not in this trace.
+        self.assertEqual("close", events[-1])
+        self.assertIn("pread", events)
         mutations = (
             ("inode", self._plant_new_config_inode, "hermes"),
             ("hermes", self._replace_hermes_dir, "hermes"),
@@ -1952,6 +1982,284 @@ class HermesHomeReuseTests(_Calls):
                     self.assertNotIn("HERMES_HOME=/not-the-route", str(caught.exception))
                     self._assert_mutation_left_in_place(kind)
                     self.launcher.assert_not_called()
+
+    @contextmanager
+    def _hook_extended(self, index: int | None, mutate, *, when: str = "after"):
+        """Count every recheck syscall, including the functions captured at import.
+
+        ``when="after"`` runs ``mutate`` once the indexed call has returned.
+        ``when="before"`` runs it before that call. A patched ``os.pread`` lies only
+        on the ``os.pread`` binding; ``_LIBC_PREAD`` stays the real read. Hooked
+        ``fstat`` keeps a stamp ``mutate`` stored on the freeze dict, so a same-tick
+        rewrite cannot refuse through ``ctime_ns`` alone.
+        """
+
+        counter = {"n": 0}
+        events: list[str] = []
+        guard = {"on": False}
+        freeze: dict[str, object] = {"id": None, "st": None}
+        reals = {name: getattr(os, name) for name, _attr in self._EXTENDED_HOOKS}
+
+        def make(name: str, *, captured: bool):
+            real = reals[name]
+
+            def wrapped(*args: object, **kwargs: object):
+                if guard["on"]:
+                    return real(*args, **kwargs)
+                seen: int | None = None
+                if _stack_has("_recheck_pinned_hermes_config"):
+                    seen = counter["n"]
+                    counter["n"] += 1
+                    events.append(name)
+                    if index is not None and seen == index and when == "before":
+                        guard["on"] = True
+                        try:
+                            mutate(freeze)
+                        finally:
+                            guard["on"] = False
+                if name == "pread" and not captured and getattr(self, "_pread_lie", False):
+                    result, err = ADOPT_YAML, None
+                else:
+                    try:
+                        result = real(*args, **kwargs)
+                        err = None
+                    except BaseException as exc:
+                        result, err = None, exc
+                frozen = freeze["st"]
+                frozen_id = freeze["id"]
+                if (err is None and name == "fstat" and frozen is not None
+                        and frozen_id == (result.st_dev, result.st_ino)):
+                    result = frozen
+                if (seen is not None and index is not None and seen == index and when == "after"):
+                    guard["on"] = True
+                    try:
+                        mutate(freeze)
+                    finally:
+                        guard["on"] = False
+                if err is not None:
+                    raise err
+                return result
+
+            return wrapped
+
+        patchers = []
+        for name, attr in self._EXTENDED_HOOKS:
+            patchers.append(mock.patch.object(policy.os, name, side_effect=make(name, captured=False)))
+            if hasattr(policy, attr):
+                patchers.append(mock.patch.object(
+                    policy, attr, side_effect=make(name, captured=True),
+                ))
+        for patcher in patchers:
+            patcher.start()
+        try:
+            yield counter, events
+        finally:
+            for patcher in patchers:
+                patcher.stop()
+
+    def _trace_extended(self, launch=None) -> list[str]:
+        if launch is None:
+            launch = lambda: self.launch("hermes")
+        with self._hook_extended(None, lambda _freeze: None) as (_counter, events):
+            launch()
+        self._reset_hermes_tree()
+        return events
+
+    def _final_pread(self, events: list[str]) -> int:
+        return max(index for index, name in enumerate(events) if name == "pread")
+
+    def _nth_after(self, events: list[str], start: int, name: str, nth: int) -> int | None:
+        seen = 0
+        for index in range(start + 1, len(events)):
+            if events[index] == name:
+                seen += 1
+                if seen == nth:
+                    return index
+        return None
+
+    def _last_after(self, events: list[str], start: int, name: str) -> int | None:
+        found: int | None = None
+        for index in range(start + 1, len(events)):
+            if events[index] == name:
+                found = index
+        return found
+
+    def _seal_observer(self, events: list[str], final_pread: int, kind: str) -> int:
+        """Index the seal uses to see ``kind``. Absent on a build with no post-pread seal.
+
+        The range is every index strictly before that call, which includes the final
+        pread and the seal steps that run before the check. A missing check means every
+        index, including the final pread, is still a hole.
+        """
+
+        if kind == "pread":
+            return final_pread + 1
+        if kind in (".env", ".op.env", "state.db"):
+            found = self._nth_after(events, final_pread, "listdir", 1)
+        elif kind == "hermes":
+            # HOME is the first lstat. The .hermes name is the second.
+            found = self._nth_after(events, final_pread, "lstat", 2)
+        elif kind == "home":
+            found = self._nth_after(events, final_pread, "lstat", 1)
+        elif kind == "inode":
+            found = self._last_after(events, final_pread, "lstat")
+        else:
+            found = None
+        return len(events) if found is None else found
+
+    def _symlink_home(self, _freeze: dict[str, object]) -> None:
+        real = self.root / "route-home.real"
+        if self.home.is_symlink():
+            return
+        os.rename(self.home, real)
+        os.symlink(real, self.home)
+
+    def _lie_about_pread(self, freeze: dict[str, object]) -> None:
+        # Same inode, same size, mtime restored. A patched os.pread returns the pin.
+        # The captured pread reads these bytes.
+        live = os.lstat(self.config())
+        freeze["id"] = (live.st_dev, live.st_ino)
+        freeze["st"] = _clone_stat(live)
+        evil = b"auth:\n  adopt_external_logins: true \n"
+        fd = os.open(self.config(), os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        try:
+            self.assertEqual(len(evil), os.write(fd, evil))
+        finally:
+            os.close(fd)
+        os.utime(self.config(), ns=(live.st_atime_ns, live.st_mtime_ns))
+        self._pread_lie = True
+
+    def _refuse_at(self, index: int, mutate, *, when: str) -> None:
+        with self._hook_extended(index, mutate, when=when):
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                self.launch("hermes")
+        self.assertNotIn("HERMES_HOME=/not-the-route", str(caught.exception))
+        self.launcher.assert_not_called()
+
+    def test_attacks_at_every_extended_index_including_after_pread_refuse(self) -> None:
+        # (a) plant .env / .op.env / state.db after the captured listdir.
+        # (b) replace .hermes after the last directory fstat.
+        # (c) replace config.yaml between the final fstat and pread, and after pread.
+        # (d) a patched os.pread returns the pin while the inode bytes changed.
+        # (e) HOME becomes a symlink as the recheck runs.
+        # The seal is the last look, so each of these refuses at every index before
+        # the seal call that sees it, including the final pread and the calls after it.
+        events = self._trace_extended()
+        final_pread = self._final_pread(events)
+        if len(events) == final_pread + 1:
+            # Nothing runs after pread. A name planted as that read returns must still refuse.
+            self._reset_hermes_tree()
+            self._refuse_at(
+                final_pread, self._plant_named(".env", b"HERMES_HOME=/not-the-route\n"), when="after",
+            )
+        self.assertGreater(len(events), final_pread + 1)
+        self.assertIn("lstat", events[final_pread + 1:])
+        self.assertIn("listdir", events[final_pread + 1:])
+        attacks = (
+            (".env", self._plant_named(".env", b"HERMES_HOME=/not-the-route\n"), "after"),
+            (".op.env", self._plant_named(".op.env", b"HERMES_HOME=/not-the-route\n"), "after"),
+            ("state.db", self._plant_named("state.db", b"x"), "after"),
+            ("hermes", self._replace_hermes_dir, "after"),
+            ("inode", self._plant_new_config_inode, "after"),
+            ("home", self._symlink_home, "after"),
+            ("pread", self._lie_about_pread, "before"),
+        )
+        for kind, mutate, when in attacks:
+            observer = self._seal_observer(events, final_pread, kind)
+            self.assertGreater(observer, final_pread)
+            for index in range(observer):
+                with self.subTest(kind=kind, index=index, when=when):
+                    self._reset_hermes_tree()
+                    self._refuse_at(index, mutate, when=when)
+                    self._assert_mutation_left_in_place(kind)
+
+    def test_editor_rename_of_identical_bytes_then_a_new_launch_succeeds(self) -> None:
+        self.launch("hermes")
+        self.launcher.reset_mock()
+        tmp = self.home / ".hermes" / "config.yaml.editor"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            self.assertEqual(len(ADOPT_YAML), os.write(fd, ADOPT_YAML))
+        finally:
+            os.close(fd)
+        os.rename(tmp, self.config())
+        self.launch("hermes")
+        self.assertEqual(1, self.launcher.call_count)
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertFalse(tmp.exists())
+
+    def test_steady_extra_hard_link_still_launches(self) -> None:
+        self.launch("hermes")
+        self.launcher.reset_mock()
+        alias = self.home / "config.yaml.alias"
+        os.link(self.config(), alias)
+        self.assertGreaterEqual(os.lstat(self.config()).st_nlink, 2)
+        self.launch("hermes")
+        self.assertEqual(1, self.launcher.call_count)
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(os.lstat(alias).st_ino, os.lstat(self.config()).st_ino)
+
+    def test_different_st_dev_on_the_sealed_names_refuses(self) -> None:
+        # A bind mount of another filesystem over the path changes st_dev. The seal's
+        # lstat must refuse that. Patching os.lstat does not reach the captured lstat.
+        real = os.lstat
+
+        def bump(path: object, *args: object, **kwargs: object):
+            st = real(path, *args, **kwargs)
+            if path == str(self.home) or path == "config.yaml":
+                return os.stat_result((*st[:2], st.st_dev + 1, *st[3:]))
+            return st
+
+        captured = getattr(policy, "_LIBC_LSTAT", None)
+        if captured is None:
+            patcher = mock.patch.object(policy.os, "lstat", side_effect=bump)
+        else:
+            patcher = mock.patch.object(policy, "_LIBC_LSTAT", side_effect=bump)
+        with patcher:
+            self.refused("route_home_not_private", self.launch, "hermes")
+        self.launcher.assert_not_called()
+
+        def bump_config(path: object, *args: object, **kwargs: object):
+            st = real(path, *args, **kwargs)
+            if path == "config.yaml":
+                return os.stat_result((*st[:2], st.st_dev + 1, *st[3:]))
+            return st
+
+        self._reset_hermes_tree()
+        if captured is None:
+            patcher = mock.patch.object(policy.os, "lstat", side_effect=bump_config)
+        else:
+            patcher = mock.patch.object(policy, "_LIBC_LSTAT", side_effect=bump_config)
+        with patcher:
+            exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual("config.yaml", exc.detail)
+        self.launcher.assert_not_called()
+
+    def test_seal_does_not_leak_a_directory_fd(self) -> None:
+        def fds() -> set[str]:
+            return set(os.listdir("/proc/self/fd"))
+
+        before = fds()
+        self.launch("hermes")
+        self.assertEqual(before, fds())
+        self.launcher.reset_mock()
+        events = self._trace_extended()
+        final_pread = self._final_pread(events)
+        before = fds()
+        with self._hook_extended(final_pread, self._plant_named(".env", b"HERMES_HOME=/not-the-route\n")):
+            self.refused("hermes_dotenv_in_home", self.launch, "hermes")
+        self.assertEqual(before, fds())
+        self.assertEqual(b"HERMES_HOME=/not-the-route\n", (self.home / ".hermes" / ".env").read_bytes())
+        self.launcher.assert_not_called()
+
+    def test_subscription_state_db_after_final_pread_still_launches(self) -> None:
+        events = self._trace_extended(self.launch_sub)
+        final_pread = self._final_pread(events)
+        with self._hook_extended(final_pread, self._plant_named("state.db", b"x")):
+            self.launch_sub()
+        self.assertEqual(b"x", (self.home / ".hermes" / "state.db").read_bytes())
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(1, self.launcher.call_count)
 
     def test_thirty_honest_api_key_and_subscription_launches(self) -> None:
         for kind, launch in (("api_key", lambda: self.launch("hermes")), ("subscription", self.launch_sub)):

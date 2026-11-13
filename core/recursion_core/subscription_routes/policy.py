@@ -46,16 +46,23 @@ the pinned size, ``mtime_ns``, ``ctime_ns`` and link count: a same-tick replacem
 inode with link count 0 while ``ctime_ns`` does not move. The two observations must be identical:
 bytes, size, ``mtime_ns``, ``ctime_ns``, device and inode of ``config.yaml`` and of ``.hermes``, and
 the sorted listing. The config bytes, size, ``mtime_ns``, ``ctime_ns``, link count and both inodes
-equal the pin. The last operations before the return then re-verify every name-based fact, each name
+equal the pin. The last operations before the byte read re-verify every name-based fact, each name
 lookup followed by a descriptor check: ``.hermes`` is opened by name from the held home fd
 (``O_NOFOLLOW|O_DIRECTORY``) and ``fstat`` must be the pinned directory; ``listdir`` on that fd must
 match the pinned set (an API-key ``state.db``, or ``.env`` / ``.op.env``, refuses); ``config.yaml``
 is stat'd by name (``AT_SYMLINK_NOFOLLOW``) and must be the pinned inode; ``fstat`` of the config fd
 must show link count at least 1 and the full stamp unchanged; ``.hermes`` is stat'd by name from the
 home fd again and must be the pinned directory. That name verification runs once more, immediately
-before the final ``fstat`` and ``pread`` of the config fd, which are the last step. Any difference
-refuses and is left in place: this recheck does not unlink. A same-size ``O_TRUNC`` that
-keeps ``mtime_ns`` and ``ctime_ns`` still changes the bytes the next read sees, so it refuses.
+before the final ``fstat`` and ``pread`` of the config fd. ``pread`` is the function captured at
+import, so a later patch of ``os.pread`` cannot change what that read returns. After that ``pread``
+returns, the last operations are a seal, all through the functions captured at import: ``HOME`` is
+``lstat``'d by path and must still be a real directory (not a symlink) with the pinned device and
+inode; ``.hermes`` is opened again by name from the home fd (``O_NOFOLLOW|O_DIRECTORY``) and must be
+the pinned directory; ``listdir`` on that fd must match the pinned names; ``config.yaml`` is
+``lstat``'d by name and must be the pinned inode with link count at least 1; ``fstat`` of the config
+fd must show the full stamp. Any difference refuses and is left in place: this recheck does not
+unlink. A same-size ``O_TRUNC`` that keeps ``mtime_ns`` and ``ctime_ns`` still changes the bytes the
+captured ``pread`` sees, so it refuses.
 ``.env`` and ``.op.env`` are not read, and refuse as a file, a symlink
 or a directory: Hermes ``load_hermes_dotenv`` loads ``~/.hermes/.env`` over the process environment,
 and ``.op.env`` beside it, before ``config.yaml``, so ``HERMES_HOME`` there selects a different config
@@ -65,14 +72,14 @@ owner decision (Lucas, PRODUCT.md 055cc7a5 section 2); they stay ``own_login_sto
 and whether to read them is still open for him. The launcher receives ``route_home_fd``, a dup of
 the held directory, valid only during that call. ``env["HOME"]`` stays the path the profile named.
 ``HOME=/proc/self/fd/N`` is not set: that path would name this process, not a child. A same-uid
-change after the final pread returns remains (pre-existing residual): a child that re-opens
-``env["HOME"]`` or ``config.yaml`` by path is outside this bind, and a rewrite or a new name that
-lands after that return is still unbound. Also residual, and not changed here: ``XDG_*`` and
-``HERMES_HOME`` selectors; subscription extra names other than ``.env`` and ``.op.env`` (a
-subscription ``state.db``); other ``.hermes`` names and the subscription store; and
-``PROJECT_ROOT/.env`` in the Hermes install tree, which ``load_hermes_dotenv`` can load and which
-is not checked here. Closing ``route_home_fd`` when this call returns can close a reused descriptor
-number if the launcher already closed it. On a platform without ``O_PATH`` the ancestor open falls
+change after this final seal and before the child execs or opens by path remains an owner-decision
+residual: the child opens ``config.yaml`` and ``HOME`` by path, and that window is not fixed
+in-process. Also residual, and not changed here: ``XDG_*`` and ``HERMES_HOME`` selectors;
+subscription extra names other than ``.env`` and ``.op.env`` (a subscription ``state.db``); other
+``.hermes`` names and the subscription store; and ``PROJECT_ROOT/.env`` in the Hermes install tree,
+which ``load_hermes_dotenv`` can load and which is not checked here. Closing ``route_home_fd``
+when this call returns can close a reused descriptor number if the launcher already closed it.
+On a platform without ``O_PATH`` the ancestor open falls
 back to ``O_RDONLY`` and a search-only ancestor still refuses.
 
 ``guard_then_spawn`` takes the launcher and argv as trusted, core-owned inputs: it does not parse
@@ -784,13 +791,15 @@ _ANCESTOR_OPEN_FLAGS = (
 )
 _HERMES_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
                       | getattr(os, "O_NOCTTY", 0))
-# Captured at import. The last name verification calls these, so it still runs after every
-# preceding os.* lookup in the recheck has returned, immediately before the final pread.
+# Captured at import. The seal after pread calls these, so a patch of os.* at call time does not
+# redirect the last look. pread is one of them: os.pread looked up at the call would be free to lie.
 _LIBC_OPEN = os.open
 _LIBC_STAT = os.stat
 _LIBC_FSTAT = os.fstat
 _LIBC_LISTDIR = os.listdir
 _LIBC_CLOSE = os.close
+_LIBC_PREAD = os.pread
+_LIBC_LSTAT = os.lstat
 
 
 class _RouteHome:
@@ -1830,6 +1839,85 @@ def _reverify_pinned_names(
             closer(fd)
 
 
+def _seal_pinned_hermes_names(
+    engine: str,
+    route_home: str,
+    home_fd: int,
+    home_dev: int,
+    home_ino: int,
+    config_fd: int,
+    pin_id: tuple[int, int],
+    hermes_dev: int,
+    hermes_ino: int,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    nlink: int,
+    pinned_names: tuple[str, ...],
+    auth: str,
+) -> None:
+    """Last look, after ``pread`` returns. Any mismatch refuses. Does not unlink.
+
+    HOME is ``lstat``'d by path and must still be a real directory with the pinned
+    device and inode, not a symlink. ``.hermes`` is opened by name from the home fd
+    (``O_NOFOLLOW|O_DIRECTORY``) and ``fstat`` must be the pinned directory; the name
+    is ``lstat``'d again so a replacement after that open refuses. ``listdir`` must
+    match the pinned names. ``config.yaml`` is ``lstat``'d by name and must be the
+    pinned inode with link count at least 1. ``fstat`` of the config fd must show
+    the full stamp. Every call is a function captured at import.
+    """
+
+    try:
+        home_st = _LIBC_LSTAT(route_home)
+    except OSError:
+        raise SubscriptionRouteRefused(engine, "route_home_not_private") from None
+    if (stat.S_ISLNK(home_st.st_mode) or not stat.S_ISDIR(home_st.st_mode)
+            or (home_st.st_dev, home_st.st_ino) != (home_dev, home_ino)):
+        raise SubscriptionRouteRefused(engine, "route_home_not_private")
+    fd = -1
+    try:
+        try:
+            fd = _LIBC_OPEN(".hermes", _DIR_OPEN_FLAGS, dir_fd=home_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        try:
+            opened_dir = _LIBC_FSTAT(fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        if (not stat.S_ISDIR(opened_dir.st_mode)
+                or (opened_dir.st_dev, opened_dir.st_ino) != (hermes_dev, hermes_ino)):
+            raise _refuse_hermes_config(engine, ".hermes")
+        # The fd above does not see a directory swapped in after open returned.
+        try:
+            named_dir = _LIBC_LSTAT(".hermes", dir_fd=home_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        if (not stat.S_ISDIR(named_dir.st_mode)
+                or (named_dir.st_dev, named_dir.st_ino) != (hermes_dev, hermes_ino)):
+            raise _refuse_hermes_config(engine, ".hermes")
+        try:
+            names = tuple(sorted(_LIBC_LISTDIR(fd)))
+        except OSError:
+            raise _refuse_hermes_config(engine, ".hermes") from None
+        _require_pinned_listing(engine, names, pinned_names, auth)
+        try:
+            named = _LIBC_LSTAT("config.yaml", dir_fd=fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        if (not stat.S_ISREG(named.st_mode) or named.st_nlink < 1
+                or (named.st_dev, named.st_ino) != pin_id):
+            raise _refuse_hermes_config(engine, "config.yaml")
+        try:
+            opened = _LIBC_FSTAT(config_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        if not _pinned_config_stamp(opened, pin_id, size, mtime_ns, ctime_ns, nlink):
+            raise _refuse_hermes_config(engine, "config.yaml")
+    finally:
+        if fd >= 0:
+            _LIBC_CLOSE(fd)
+
+
 def _recheck_pinned_hermes_config(
     engine: str,
     route_home: str,
@@ -1846,15 +1934,18 @@ def _recheck_pinned_hermes_config(
     ``O_TRUNC`` that keeps ``mtime_ns`` and ``ctime_ns`` still changes the bytes, so the
     second read refuses it. Link count is part of that stamp.
 
-    The last operations re-verify every name-based fact, each lookup followed by the
-    descriptor check that would catch a swap, and that verification runs once more
-    immediately before the final ``fstat`` and ``pread``. Any difference refuses. This
-    function does not unlink.
+    The last operations before the byte read re-verify every name-based fact, each
+    lookup followed by the descriptor check that would catch a swap, and that
+    verification runs once more immediately before the final ``fstat`` and ``pread``.
+    ``pread`` is the function captured at import. After it returns, the seal
+    ``lstat``s HOME by path, re-opens and re-lists ``.hermes``, ``lstat``s
+    ``config.yaml`` by name, and ``fstat``s the config fd. Any difference refuses.
+    This function does not unlink.
 
-    A same-uid change after that final pread returns remains. It is the pre-existing
-    residual: the child opens ``config.yaml`` and ``HOME`` by path, and a rewrite or a
-    new name that lands after that return is not seen. Subscription extra names other
-    than ``.env`` and ``.op.env`` stay allowed.
+    A same-uid change after that seal, before the child execs or opens by path, remains
+    an owner-decision residual. The child opens ``config.yaml`` and ``HOME`` by path,
+    and that window is not fixed in-process. Subscription extra names other than
+    ``.env`` and ``.op.env`` stay allowed.
     """
 
     hold = _route_home_for(engine, route_home)
@@ -1889,8 +1980,9 @@ def _recheck_pinned_hermes_config(
     _reverify_pinned_names(*verify_args, os.open, os.stat, os.fstat, os.listdir, os.close)
     _reverify_pinned_names(
         *verify_args, _LIBC_OPEN, _LIBC_STAT, _LIBC_FSTAT, _LIBC_LISTDIR, _LIBC_CLOSE)
-    # Last step. The fstat is the descriptor check for the config name; pread is the
-    # last byte read. Nothing in this function stats or lists after this pread returns.
+    # The fstat is the descriptor check for the config name. pread is the last byte
+    # read, and it is the function captured at import. The seal below is the last
+    # look at the names, after this pread returns.
     try:
         last = _LIBC_FSTAT(config_fd)
     except OSError:
@@ -1899,11 +1991,16 @@ def _recheck_pinned_hermes_config(
             last, pin_id, recorded_size, recorded_mtime, recorded_ctime, recorded_nlink):
         raise _refuse_hermes_config(engine, "config.yaml")
     try:
-        last_bytes = os.pread(config_fd, len(recorded) + 1, 0)
+        last_bytes = _LIBC_PREAD(config_fd, len(recorded) + 1, 0)
     except OSError:
         raise _refuse_hermes_config(engine, "config.yaml") from None
     if last_bytes != recorded:
         raise _refuse_hermes_config(engine, "config.yaml")
+    _seal_pinned_hermes_names(
+        engine, route_home, hold.fd, hold.dev, hold.ino, config_fd, pin_id, hermes_dev,
+        hermes_ino, recorded_size, recorded_mtime, recorded_ctime, recorded_nlink,
+        pinned_names, auth,
+    )
 
 
 def _refuse_hermes_dir_entries(engine: str, route_home: str, auth: str, hermes_dev: int, hermes_ino: int) -> int:
@@ -1995,9 +2092,12 @@ def _launch_checked(
             # operations re-verify every name (open .hermes, fstat, listdir, the config
             # name, fstat of the config fd including link count, .hermes by name again)
             # and repeat that verification immediately before the final fstat and pread.
-            # A same-uid change after that final pread returns remains (pre-existing
-            # residual): the child opens config.yaml and HOME by path. Subscription extra
-            # names stay an owner decision (Lucas). XDG_* and HERMES_HOME are unchanged.
+            # pread is captured at import. After it returns, the seal lstats HOME by path,
+            # re-opens and re-lists .hermes, lstats config.yaml by name, and fstats the
+            # config fd. A same-uid change after that seal, before the child execs or
+            # opens by path, remains an owner-decision residual (the child opens by path),
+            # not fixed in-process. Subscription extra names stay an owner decision
+            # (Lucas). XDG_* and HERMES_HOME are unchanged.
             # Also residual: a route_home_fd number reused after the launcher closed it.
             hermes_dev, hermes_ino = _reverify_hermes_switch(decision.engine, route_home)
             _bind_hermes_launch_path(decision.engine, route_home, hermes_dev, hermes_ino)

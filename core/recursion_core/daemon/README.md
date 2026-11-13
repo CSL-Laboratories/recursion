@@ -258,8 +258,8 @@ route result is not produced), bar evidence for any route, the O7 interventions,
 that can approve or veto an effect, and an installer for the plugin files, the authority
 ledger and the breaker store.
 
-Also not done: three defects found in review on Nov 12, 2026, left as they are on this branch
-for the Stop lane on master.
+Also not done: defects found in review on Nov 12, 2026, left as they are on this branch for
+the Stop lane on master.
 
 - **One lock for every run's unit calls.** `Daemon.start`, `Daemon.stop`, `Daemon.reconcile`,
   `Daemon.cgroup_clear` and the whole of `Daemon.sweep` hold the daemon's one lock while they
@@ -285,6 +285,18 @@ for the Stop lane on master.
   Where a FIFO holds less, part of the frame is written, the launcher takes the drained FIFO
   for an environment that was read, and `engine_exec` rejects the truncated frame: the engine
   never runs, and the start may already have been answered as launched.
+- **A live unit whose control record says `start_failed`.** A start that runs out of time gives
+  its launch up under the lock the launcher publishes under (`RunContext.abandon`,
+  `RunContext.launched`), so a launch that finishes after that is ended and never published.
+  What is not done is recovery when such a unit is alive all the same, for example because the
+  daemon died after the start answered `launch_timeout` and before the launcher ended the unit.
+  The control record then says `start_failed` with no cgroup, `DaemonControl.reconcile` adopts a
+  missing cgroup only for a record still `starting`, and `run.stop` answers `pending` /
+  `cgroup_unknown` without reaching the unit.
+- **A `start_error` can belong to a later attempt.** `DaemonControl` reads the starter's failure
+  for the run after the control API has answered and let go of the run's start lock. A same-key
+  retry that fails in between replaces it: the reply's `start_failed` and run id are right, and
+  its `start_error` may be the later attempt's.
 
 Evidence: `evidence_ns.sh` runs `evidence_e2e.py`, which drives the real daemon and CLI
 against a real `systemd --user` manager with a stand-in engine

@@ -93,6 +93,10 @@ run's environment changes:
   is refused. Bedrock also passes the AWS SDK web-identity role variables (`AWS_ROLE_ARN`,
   `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_SESSION_NAME`). `--bare` is the user's choice there too. `--bare` is refused only on the
   subscription route. No route drops `CLAUDE_CODE_OAUTH_TOKEN`, and the parent env is never changed.
+- Under the daemon, none of that runs for an `api_key` route with `key_source: "api_key_helper"`, for a
+  `passthrough` route, or for a route whose `limits` would switch to one (`on_limit: "fallback"`): the
+  daemon refuses the start (`start_failed` / `launch_refused`, `no credential custody`) before this
+  adapter is called (`daemon/control_adapter.py` `route_unsupported`; `daemon/README.md`, "Not done").
 - The adapter never edits settings or credential files, never sets `DISABLE_LOGIN_COMMAND`, and never
   sets, stores or reads `CLAUDE_CODE_OAUTH_TOKEN`. The binary is `claude` itself; its hash and version are
   the R2a launch check's (CSL-732). The Commercial Terms review of this env scrub is still open in

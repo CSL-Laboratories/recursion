@@ -193,8 +193,9 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
   broken pipe; stdin is a FIFO.
 - **Stop.** Units carry `KillSignal=SIGINT`, `TimeoutStopSec=2s`, `KillMode=control-group`,
   so `systemctl --user stop` is the #916 procedure. `run.stop` records the Stop intent,
-  stops the unit and answers `stopped` only when the sweep attested the tree gone; anything
-  else is `pending` with a reason. A deadline or protocol error fences the run the same way.
+  stops the unit and answers `stopped` only after the cgroup path it names read absent or
+  empty in the same call (see "Behaviour"); anything else is `pending` with a reason. A
+  deadline or protocol error fences the run the same way.
 - **Restart.** After the startup sweep, `DaemonControl.reconcile` finishes any Stop the
   registry recorded but the control record did not, records the cgroup of a launch the
   previous daemon did not finish recording, and marks a start that never reached a unit
@@ -344,10 +345,11 @@ when the bind succeeds. A bad plugin registry still stops the service, and it is
 cherry-pick so its real HTTP test is self-contained; merge order is not assumed.
 
 The control-API device door and `ControlClient` can be injected into `main`.
-Without the #327 adapter the production default refuses authentication on every
-request (401); it does not silently trust loopback, invent data, or manufacture a
+With neither injected, `main` composes its own (`control_adapter.compose_control`; the
+`DeviceDoor` under "Composition"). A `LoopbackGUI` built with no door refuses authentication
+on every request (401); it does not silently trust loopback, invent data, or manufacture a
 token. Tests inject a fake API/device door and prove a real GET returns the page.
-Control-API credential/pairing integration remains with #327, not claimed here.
+A browser pairing step for the device token is not done (see "Not done").
 
 An installed operator plugin is a directory (`manifest.json`, `manifest.sig`, `plugin.py`)
 under `$XDG_CONFIG_HOME/recursion/plugins/`, or named with `--plugin <DIR>` (absolute). The
@@ -361,6 +363,7 @@ it is unset. `/panel?id=...` renders only the named O7 reads, through the one sh
 venue-data filter (`gui/panels.py` `filter_venue_rows`; the daemon has no copy of it), with
 no panel order verb and no panel Stop. Run Stop stays in the core page.
 
-Contract: `contracts/PRODUCT.md` at
+Contract: this section was written against `contracts/PRODUCT.md` at
 `055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
-`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`.
+`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`. That version is
+superseded; the pinned one is `d84cdd26` (`contract/PRODUCT.pin.json`).

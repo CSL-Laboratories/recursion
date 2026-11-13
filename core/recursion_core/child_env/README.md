@@ -1,7 +1,8 @@
 # core/recursion_core/child_env (CSL-785, candidate)
 
-New-core child environment for engine children. Candidate code: not yet called by a
-running core, and not reviewed or accepted.
+New-core child environment for engine children. Candidate code: called by the daemon's
+launcher (`daemon/launcher.py`, `ProductionLauncher.child_environment`), and not reviewed or
+accepted.
 
 Spec: CSLR-D-012, PRODUCT.md `d84cdd26a4de2366f3c5d34c4aec5215f822a494` (SHA-256
 `e1d5fb8c02594b2ca88281113ffc14e6f3125daded2a00d45739cfb9d2ed04dd`), section 3.3.

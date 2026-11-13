@@ -9,7 +9,8 @@ The executable is resolved on the validated PATH (or the absolute argv[0]) and m
 the same file rule as any other value, so a bare name never resolves through the parent's
 PATH. Refusals raise before Popen is called.
 
-Not wired into a running core: no daemon, run store or engine adapter calls this yet.
+Called by the subscription-route launch helpers; the daemon's systemd launcher
+uses build_child_env and its own exec boundary.
 """
 
 from __future__ import annotations

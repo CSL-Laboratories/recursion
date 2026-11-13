@@ -108,13 +108,13 @@ S13 ``hooks.service(service)``, ``hooks.start_services(context)``, ``hooks.stop_
 The after-commit subscription to events is not a hook: it is the event store's own interface, which
 other lanes call from their services.
 
-BUILDING AGAINST THIS FILE before the calls from the daemon's files have landed. A lane needs no daemon
-to test what it registers: make ``Hooks()``, call the lane's own ``register(hooks)`` on it, ``freeze()``
+BUILDING AGAINST THIS FILE. A lane needs no daemon to test what it registers: make ``Hooks()``, call the lane's own ``register(hooks)`` on it, ``freeze()``
 it, and call the hook, or ``hooks.methods.dispatch(method, params, principal, call)`` for a handler.
 That object IS the shared fake: every lane's tests go through these same defaults and these same checks,
 not through a guess of them. The one fake of the event store's transaction helper is ``FakeStore`` in
-``control/tests/test_seams.py``. Until the daemon's files call a hook, registering into it changes
-nothing in a running daemon.
+``control/tests/test_seams.py``. The calls themselves are in ``control/api.py``, ``control/cli.py``,
+``daemon/control_adapter.py``, ``daemon/launcher.py`` and ``daemon/__init__.py``, each marked with its
+seam's number, and are tested in the two ``test_seams.py`` files.
 """
 from __future__ import annotations
 

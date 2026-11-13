@@ -93,7 +93,7 @@ def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = N
         return _EXIT.get(result.get("code"), EXIT_ERROR)
     if ns.command in ("status", "stop"):
         method, params = f"run.{ns.command}", {"run_id": ns.run_id}
-    else:  # reached by the parsed ``start`` only: every other name was dispatched above or refused by the parser
+    else:
         method = "run.start"
         params = {"tenant": ns.tenant, "engine": ns.engine, "prompt": ns.prompt}
         if ns.client_key:

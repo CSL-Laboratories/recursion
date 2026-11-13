@@ -752,10 +752,42 @@ class DaemonControl:
                 payload = None
             if not isinstance(payload, dict):
                 return 400, b'{"error": "request_invalid"}'
+            answer = self.call('run.stop', {'run_id': payload.get('run_id')})
+            return 200, json.dumps(answer, sort_keys=True).encode()
+        if (method, path) == ('GET', '/v1/routes'):
+            return 200, json.dumps({'routes': self.route_records()}, sort_keys=True).encode()
+        if (method, path) == ('POST', '/v1/operator'):
+            try:
+                payload = json.loads(body or b'')
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                return 400, b'{"error": "request_invalid"}'
+            if self.plugins is None:
+                return 503, b'{"error": "unavailable: no plugin host is composed"}'
+            status, answer = self.plugins.operator(payload)
+            return status, json.dumps(answer, sort_keys=True).encode()
+        return 404, b'{"error": "not_found"}'
+
+    def page_transport(self, method, path, body):
+        """What the composition hands the page: the three paths of ``gui_transport`` with the seams in front, and a
+        fourth. S5: the page's Stop and its two reads are calls of ``run.stop``, ``route.list`` and ``operator.read``
+        made by the device principal, authorized like any call, and answered in the shapes the page has always had.
+        S11: ``POST /v1/control`` reaches the methods a lane listed. S13: each is admitted by the gate, or told the
+        daemon is closing. ``gui_transport`` above is left as it was, for whoever holds this object and calls it."""
+        if (method, path) == ('POST', '/v1/runs/stop'):
+            try:
+                payload = json.loads(body or b'')
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                return 400, b'{"error": "request_invalid"}'
             answer = self.call('run.stop', {'run_id': payload.get('run_id')}, control_hooks.DEVICE)
             return 200, json.dumps(answer, sort_keys=True).encode()
         if (method, path) == ('GET', '/v1/routes'):
             answer = self.call('route.list', {}, control_hooks.DEVICE)  # authorized like any call (seam S5)
+            if answer.get('code') == 'unavailable':  # a closing daemon, as the read below answers it
+                return 503, b'{"error": "unavailable: daemon_closing"}'
             if answer.get('code') != 'ok':
                 return 403, json.dumps({'error': answer.get('code')}, sort_keys=True).encode()
             return 200, json.dumps({'routes': answer['routes']}, sort_keys=True).encode()
@@ -903,7 +935,7 @@ class Composition:
         self.control, self.server, self.door = control, server, door
         self.plugins, self.breaker = plugins, breaker
         self.hooks, self.context = hooks, context
-        self.client = ControlClient(control.gui_transport)
+        self.client = ControlClient(control.page_transport)  # the page goes through the seams (S5, S11, S13)
 
     def close(self):
         """Seam S13. First no new client call is admitted, on any entry, and whoever waits is told. Then the

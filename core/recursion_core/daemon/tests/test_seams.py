@@ -129,7 +129,8 @@ class Composed(unittest.TestCase):
         return answer['run']['run_id']
 
     def page(self, composed, method, path, payload=None):
-        status, body = composed.control.gui_transport(method, path, b'' if payload is None else json.dumps(payload).encode())
+        # Through the transport the composition gave the page, as the page's own client calls it.
+        status, body = composed.client._transport(method, path, b'' if payload is None else json.dumps(payload).encode())
         return status, json.loads(body)
 
 
@@ -160,6 +161,17 @@ class NothingRegisteredTest(Composed):
                          (200, {'code': 'run_unknown', 'run_id': 'run-none'}))
         self.assertEqual(self.page(composed, 'POST', '/v1/operator', {'command': 'operator.health.inspect'})[0], 503)
         self.assertEqual(self.page(composed, 'POST', '/v1/control', {'method': 'run.list', 'params': {}}), (404, {'error': 'not_found'}))
+        # What the page is handed is the transport with the seams; the method it was handed before is still there,
+        # reads only what it read (a stand-in with ``call``, ``route_records`` and ``plugins`` is enough) and has no fourth path.
+        self.assertEqual(composed.client._transport, control.page_transport)
+        stand_in = mock.Mock(spec=['call', 'route_records', 'plugins'], plugins=None)
+        stand_in.call.return_value, stand_in.route_records.return_value = {'code': 'stopped'}, [{'id': 'surface:cli'}]
+        old = adapter.DaemonControl.gui_transport
+        self.assertEqual(old(stand_in, 'POST', '/v1/runs/stop', b'{"run_id": "run-1"}'), (200, b'{"code": "stopped"}'))
+        stand_in.call.assert_called_once_with('run.stop', {'run_id': 'run-1'})
+        self.assertEqual(old(stand_in, 'GET', '/v1/routes', b''), (200, b'{"routes": [{"id": "surface:cli"}]}'))
+        self.assertEqual(old(stand_in, 'POST', '/v1/operator', b'{"command": "operator.health.inspect"}')[0], 503)
+        self.assertEqual(old(stand_in, 'POST', '/v1/control', b'{"method": "run.list", "params": {}}'), (404, b'{"error": "not_found"}'))
         # A peer inside a run unit, or one whose cgroup cannot be read, gets the reply it always got.
         self.assertEqual(control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, peer(0)),
                          {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}})
@@ -294,7 +306,7 @@ class MethodSeamTest(Composed):
         for payload in ({'method': 'run.list', 'params': {}}, {'method': 'session.list', 'params': {}}, {'method': 'run.stop', 'params': {'run_id': 'x'}}):
             self.assertEqual(self.page(composed, 'POST', '/v1/control', payload), (404, {'error': 'not_found'}))
         for body in (b'', b'not json', b'[]', b'{"method": 7}', b'{"method": "session.status", "params": []}'):
-            self.assertEqual(composed.control.gui_transport('POST', '/v1/control', body), (400, b'{"error": "request_invalid"}'))
+            self.assertEqual(composed.control.page_transport('POST', '/v1/control', body), (400, b'{"error": "request_invalid"}'))
         self.assertEqual(len(seen), 3)
         self.assertEqual(self.api(composed).call('methods.list')['methods'][list(methods.METHODS).index('session.status')],
                          {'name': 'session.status', 'implemented': True, 'beta': True})
@@ -1261,8 +1273,9 @@ class ServicesSeamTest(Composed):
             self.assertEqual(composed.control.call('run.list'), closing)
             self.assertEqual(composed.control.call('run.stop', {'run_id': 'run-none'}, H.DEVICE), closing)
             self.assertEqual(self.page(composed, 'POST', '/v1/runs/stop', {'run_id': 'run-none'}), (200, closing))
-            self.assertEqual(self.page(composed, 'GET', '/v1/routes'), (403, {'error': 'unavailable'}))
-            self.assertEqual(self.page(composed, 'POST', '/v1/operator', {'command': 'operator.health.inspect'})[0], 503)
+            self.assertEqual(self.page(composed, 'GET', '/v1/routes'), (503, {'error': 'unavailable: daemon_closing'}))
+            self.assertEqual(self.page(composed, 'POST', '/v1/operator', {'command': 'operator.health.inspect'}),
+                             (503, {'error': 'unavailable: daemon_closing'}))
             self.assertEqual(composed.control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, peer()),
                              {'ok': True, 'result': closing})
             self.assertTrue(made.closing.is_set())

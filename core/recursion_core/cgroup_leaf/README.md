@@ -12,8 +12,11 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   The launching process must itself be inside that subtree, because cgroup v2
   only lets an unprivileged writer migrate a process when it can write the
   common ancestor's `cgroup.procs`. Leaf names match `run-[A-Za-z0-9_-]{1,64}`;
-  an existing leaf is never reused. Creation sets the `user.recursion.leaf`
-  attribute to `recursion-cgroup-leaf/1` on that directory. Sweep and adopt
+  an existing leaf is never reused. Creation opens that directory
+  `O_DIRECTORY|O_NOFOLLOW` from the parent directory fd, and `fsetxattr`s
+  `user.recursion.leaf` = `recursion-cgroup-leaf/1` only when `fstat` matches
+  the inode `mkdir` created. A directory swapped onto the name is not marked.
+  If the marker write fails, only that created inode is removed. Sweep and adopt
   trust a directory only when the name matches and that attribute is present.
   The `run-` prefix alone is not ownership.
 - No launch race: the parent opens the leaf's `cgroup.procs` and starts a small
@@ -22,7 +25,14 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   running the target. The parent then checks `/proc/<pid>/cgroup` names the leaf.
   No `preexec_fn`, no parent-death signal, no moving a running child.
 - Identity: the parent opens a pidfd for the unreaped child right after spawn and
-  signals through it, so a reused pid is never signalled.
+  signals through it, so a reused pid is never signalled. `close()` sends that
+  `SIGKILL` even when `lstat` of the leaf fails or the path no longer names the
+  held inode. `cgroup.kill` and `rmdir` still run only when the path names that
+  same inode. The directory fd and the recorded identity stay, so a later
+  `close()` can kill and remove the held inode if the path names it again. The
+  pidfd is closed once the exit has been seen. `__del__` polls the child and
+  closes a pidfd `close()` did not. `empty` and `leaf_empty` are not booked
+  while that child may still be alive.
 - Kill: write `1` to `cgroup.kill`, SIGKILL the main process through its pidfd,
   and repeat until the deadline. Reads and writes of `cgroup.kill` and
   `cgroup.events` stop at that deadline, so a stuck cgroup file or a process
@@ -83,7 +93,11 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   `marker-unreadable:<errno>` and is not killed: an unreadable marker is not
   proof the leaf is unmarked.
   `adopt(name)` returns a handle for a kept, marked leaf so the restarted
-  daemon can kill it later; its best outcome is `empty`. As a context manager that `empty` outcome is success.
+  daemon can kill it later; its best outcome is `empty`. The open is
+  `O_DIRECTORY|O_NOFOLLOW` from the root directory fd and is kept only when
+  `fstat` matches the inode `lstat` saw. A scope renamed onto the name in
+  that gap is refused, not killed. `launch` does the same with the inode
+  `make_leaf` returned, before spawn. As a context manager that `empty` outcome is success.
   `CleanupIncomplete` is still raised when the adopted cleanup does not finish
   (PRODUCT.md 055cc7a5 §3.1, Q38/O53).
 - Errors: a cleanup problem never replaces the original exception; it is added

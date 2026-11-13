@@ -58,7 +58,14 @@ def mark_owned(path):
     delegated root can hold a systemd ``run-*.scope`` or another tool's
     ``run-<id>``; the ``run-`` prefix alone is not ownership, and sweep does
     not kill from the name.
+
+    An integer ``path`` is a directory fd. The mark is ``fsetxattr`` on that
+    inode, so a name swapped onto the path after the fd was opened is not
+    marked.
     """
+    if isinstance(path, int):
+        os.setxattr(path, OWNERSHIP_XATTR, OWNERSHIP_VALUE)
+        return
     os.setxattr(os.fspath(path), OWNERSHIP_XATTR, OWNERSHIP_VALUE, follow_symlinks=False)
 
 
@@ -88,7 +95,12 @@ def _marked_owned(target):
 
 
 def _discard_new_leaf(leaf):
-    """Best-effort undo of a leaf whose ownership marker could not be written."""
+    """Best-effort undo of a leaf whose ownership marker could not be written.
+
+    Path-based. ``make_leaf`` does not use this: a name swapped in after
+    ``mkdir`` must not be unlinked. Callers that still hold the created inode
+    use ``_discard_held_leaf``.
+    """
     leaf = Path(leaf)
     try:
         for entry in leaf.iterdir():
@@ -104,6 +116,142 @@ def _discard_new_leaf(leaf):
         os.rmdir(leaf)
     except OSError:
         pass
+
+
+_DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def _unlink_held_files(held):
+    """Unlink regular files inside the directory fd. Leave other inodes alone."""
+    try:
+        names = os.listdir(held)
+    except OSError:
+        return
+    for name in names:
+        try:
+            info = os.lstat(name, dir_fd=held)
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            continue
+        try:
+            os.unlink(name, dir_fd=held)
+        except OSError:
+            pass
+
+
+def _rmdir_matching_name(parent_fd, identity):
+    """``rmdir`` the parent entry that is ``identity``. Never a different inode."""
+    identity = tuple(identity)
+    try:
+        names = os.listdir(parent_fd)
+    except OSError:
+        return False
+    for name in names:
+        if _directory_entry_inode(parent_fd, name) != identity:
+            continue
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+        except OSError:
+            return False
+        return True
+    return False
+
+
+def _discard_held_leaf(parent_fd, held, identity):
+    """Remove the created directory inode. A swapped-in name is not removed."""
+    try:
+        info = os.fstat(held)
+    except OSError:
+        return
+    if (info.st_dev, info.st_ino) != tuple(identity) or not stat.S_ISDIR(info.st_mode):
+        return
+    _unlink_held_files(held)
+    _rmdir_matching_name(parent_fd, identity)
+
+
+def _discard_matching_inode(parent_fd, identity):
+    """Discard ``identity`` if it is still linked in ``parent_fd``.
+
+    Opens that entry and checks ``fstat`` before removing anything. The name
+    that currently sits at the caller's path is removed only when it is this
+    inode.
+    """
+    identity = tuple(identity)
+    try:
+        names = os.listdir(parent_fd)
+    except OSError:
+        return
+    for name in names:
+        if _directory_entry_inode(parent_fd, name) != identity:
+            continue
+        held = None
+        try:
+            held = os.open(name, _DIR_OPEN, dir_fd=parent_fd)
+            _discard_held_leaf(parent_fd, held, identity)
+        except OSError:
+            pass
+        finally:
+            if held is not None:
+                try:
+                    os.close(held)
+                except OSError:
+                    pass
+        return
+
+
+def _mark_created_leaf(leaf):
+    """Mark the directory inode just created at ``leaf``. Return its identity.
+
+    The directory is opened ``O_DIRECTORY|O_NOFOLLOW`` relative to the parent
+    directory fd. ``fstat`` must match the inode ``lstat`` saw. The marker is
+    ``fsetxattr`` on that fd. A name that fails the check is not marked and
+    not removed. If the marker write fails, only the created inode is
+    discarded.
+    """
+    leaf = Path(leaf)
+    created = cgroup_identity(leaf)
+    if created is None:
+        raise OSError(errno.EBUSY, 'cgroup identity changed')
+    try:
+        parent_fd = os.open(leaf.parent, _DIR_OPEN)
+    except OSError as exc:
+        raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+    fd = None
+    try:
+        try:
+            fd = os.open(leaf.name, _DIR_OPEN, dir_fd=parent_fd)
+        except OSError as exc:
+            _discard_matching_inode(parent_fd, created)
+            raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            raise OSError(errno.EBUSY, 'cgroup identity changed') from exc
+        if (info.st_dev, info.st_ino) != created or not stat.S_ISDIR(info.st_mode):
+            # This fd is a directory swapped onto the name. Do not mark it
+            # and do not rmdir it. Drop only the inode mkdir created, if it
+            # is still linked under some other name.
+            os.close(fd)
+            fd = None
+            _discard_matching_inode(parent_fd, created)
+            raise OSError(errno.EBUSY, 'cgroup identity changed')
+        try:
+            mark_owned(fd)
+        except OSError:
+            _discard_held_leaf(parent_fd, fd, created)
+            raise
+        return created
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
 
 
 def cgroup_identity(path):
@@ -348,12 +496,15 @@ class Cgroup2:
         self.mount = Path(os.path.realpath(mount))
 
     def make_leaf(self, leaf: Path):
+        """Create ``leaf`` and mark that inode. Return ``(st_dev, st_ino)``.
+
+        ``mkdir`` is exclusive: an existing leaf is never reused. The marker
+        is written only after an ``O_DIRECTORY|O_NOFOLLOW`` open from the
+        parent fd ``fstat``s as the inode just created. A swapped-in directory
+        is not marked. A failed marker write discards only that created inode.
+        """
         os.mkdir(leaf, 0o755)  # exclusive: an existing leaf is never reused
-        try:
-            mark_owned(leaf)
-        except OSError:
-            _discard_new_leaf(leaf)
-            raise
+        return _mark_created_leaf(leaf)
 
     def open_procs(self, leaf: Path) -> int:
         return os.open(leaf / 'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -654,10 +805,18 @@ class DelegatedRoot:
         if not argv:
             raise ValueError('Empty launch')
         leaf = self.leaf(name)
-        self.fs.make_leaf(leaf)
-        run = LeafRun(self.fs, leaf, kill_timeout)
+        created = self.fs.make_leaf(leaf)
+        run = LeafRun(self.fs, leaf, kill_timeout, expect=created)
         try:
-            if leaf.is_symlink() or os.lstat(leaf).st_uid != os.getuid():
+            # make_leaf's inode, not whatever was renamed onto this path
+            # between the marker write and this open.
+            if not isinstance(created, tuple) or run.identity != created or run.dirfd is None:
+                raise PermissionError('Leaf identity changed before launch')
+            try:
+                info = os.fstat(run.dirfd)
+            except OSError as exc:
+                raise PermissionError('Leaf is not an operator-owned directory') from exc
+            if info.st_uid != os.getuid() or not stat.S_ISDIR(info.st_mode):
                 raise PermissionError('Leaf is not an operator-owned directory')
             run._spawn(list(argv), env, cwd, stdin, stdout, stderr, start_timeout)
         except BaseException as exc:
@@ -672,18 +831,34 @@ class DelegatedRoot:
         best close() can book is ``empty`` (S5: never terminated without a seen exit).
         As a context manager, that ``empty`` outcome is a finished cleanup. A leaf
         without the ownership marker written at creation is not ours and is refused.
+        The directory is opened ``O_DIRECTORY|O_NOFOLLOW`` from the root dirfd and
+        kept only when ``fstat`` matches the inode ``lstat`` saw. A scope renamed
+        onto the leaf name in that gap is not killed or removed.
         """
         leaf = self.leaf(name)
-        if leaf.is_symlink() or not leaf.is_dir() or os.lstat(leaf).st_uid != os.getuid():
-            raise PermissionError('Leaf is not an operator-owned directory')
-        run = LeafRun(self.fs, leaf, kill_timeout)
-        run.adopted = True
+        parent_fd = os.open(self.path, _DIR_OPEN)
         try:
-            owned = run.dirfd is not None and _marked_owned(run.dirfd)
+            try:
+                info = os.lstat(name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise PermissionError('Leaf is not an operator-owned directory') from exc
+        finally:
+            os.close(parent_fd)
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.getuid()):
+            raise PermissionError('Leaf is not an operator-owned directory')
+        classified = (info.st_dev, info.st_ino)
+        run = LeafRun(self.fs, leaf, kill_timeout, expect=classified)
+        run.adopted = True
+        if run.dirfd is None or run.identity != classified:
+            run._close_dirfd()
+            raise PermissionError('Leaf identity changed')
+        try:
+            owned = _marked_owned(run.dirfd)
         except OSError as exc:
             run._close_dirfd()
             raise PermissionError(f'Leaf ownership marker unreadable: {exc.errno}') from exc
-        if run.dirfd is None or not owned:
+        if not owned:
             run._close_dirfd()
             raise PermissionError('Leaf has no recursion ownership marker')
         return run
@@ -775,7 +950,7 @@ class DelegatedRoot:
 
 
 class LeafRun:
-    def __init__(self, fs: Cgroup2, leaf: Path, kill_timeout: float):
+    def __init__(self, fs: Cgroup2, leaf: Path, kill_timeout: float, *, expect=None):
         self.fs, self.leaf, self.kill_timeout = fs, leaf, kill_timeout
         self.proc = None
         self.pidfd = None
@@ -785,23 +960,54 @@ class LeafRun:
         self.dirfd = None
         self.identity = None
         self.adopted = False  # adopt() books empty; a launch must reach leaf_empty
-        self._open_identity()
+        self._open_identity(expect)
 
-    def _open_identity(self):
+    def _open_identity(self, expect=None):
+        """Open the leaf from its parent dirfd and remember that inode.
+
+        ``expect`` is the ``(st_dev, st_ino)`` from ``mkdir`` or from the
+        ``lstat`` that decided this name was ours. The fd is kept only when
+        ``fstat`` matches. A directory swapped onto the name is closed and
+        not recorded, so a later kill or ``rmdir`` cannot target it.
+        """
         try:
-            fd = os.open(self.leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            parent_fd = os.open(self.leaf.parent, _DIR_OPEN)
         except OSError:
             return
+        fd = None
         try:
-            info = os.fstat(fd)
-        except OSError:
-            os.close(fd)
-            return
-        if not stat.S_ISDIR(info.st_mode):
-            os.close(fd)
-            return
-        self.dirfd = fd
-        self.identity = (info.st_dev, info.st_ino)
+            try:
+                fd = os.open(self.leaf.name, _DIR_OPEN, dir_fd=parent_fd)
+            except OSError:
+                return
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                os.close(fd)
+                fd = None
+                return
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(fd)
+                fd = None
+                return
+            opened = (info.st_dev, info.st_ino)
+            if expect is not None and opened != tuple(expect):
+                os.close(fd)
+                fd = None
+                return
+            self.dirfd = fd
+            self.identity = opened
+            fd = None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
 
     def _same_cgroup(self):
         """The path still names the directory this handle opened."""
@@ -816,23 +1022,123 @@ class LeafRun:
             except OSError:
                 pass
 
-    def _foreign(self, populated=None):
-        """A path whose cgroup is not the one this handle opened. Leave it in place."""
-        self._close_dirfd()
-        self.identity = None
+    def _signal_held_child(self, errors):
+        """SIGKILL the child this handle spawned.
+
+        The pidfd names that child and does not depend on the cgroup path.
+        Returns True when a signal was sent or the child was already gone, so
+        the caller can reap. A failed signal leaves the pidfd open for a retry
+        and records the error. ``poll`` does not block behind another thread's
+        ``wait``.
+        """
+        proc = self.proc
+        if proc is None or proc.returncode is not None:
+            return False
+        sent = False
+        if self.pidfd is not None:
+            try:
+                signal.pidfd_send_signal(self.pidfd, signal.SIGKILL)
+                sent = True
+            except ProcessLookupError:
+                sent = True
+            except OSError as exc:
+                errors.setdefault(f'pidfd_send_signal: {exc!r}')
+        try:
+            proc.poll()
+        except OSError:
+            pass
+        return sent
+
+    def _reap_held_child(self):
+        """Poll until the child is reaped, or a short bound passes.
+
+        ``pidfd_send_signal`` returns once the signal is queued. One ``poll``
+        can still run before the zombie exists. This does not call ``wait``:
+        a blocking wait deadlocks behind another thread already in ``wait``.
+        """
+        proc = self.proc
+        if proc is None or proc.returncode is not None:
+            return
+        deadline = time.monotonic() + 0.25
+        while proc.returncode is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+            try:
+                proc.poll()
+            except OSError:
+                return
+
+    def _close_pidfd_if_reaped(self):
+        """Close the pidfd once the child has been reaped. Keep it otherwise."""
+        proc = self.proc
+        if proc is not None:
+            try:
+                proc.poll()
+            except OSError:
+                pass
+            if proc.returncode is None:
+                return
+        fd = self.pidfd
+        if fd is None:
+            return
+        self.pidfd = None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def _release_held_fds(self):
+        """Poll the child and close the pidfd and the directory fd."""
+        proc = getattr(self, 'proc', None)
+        if proc is not None:
+            try:
+                proc.poll()
+            except Exception:
+                pass
+        pidfd = getattr(self, 'pidfd', None)
+        self.pidfd = None
+        if isinstance(pidfd, int):
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+        closer = getattr(self, '_close_dirfd', None)
+        if closer is not None:
+            closer()
+
+    def _foreign(self, populated=None, errors=None):
+        """The path is not the inode this handle opened. Leave that path in place.
+
+        The held child is still SIGKILL'd: that pidfd does not depend on the
+        path. The directory fd and the recorded identity stay, so a later
+        ``close()`` can still ``cgroup.kill`` and ``rmdir`` the held inode if
+        the path names it again. The pidfd is closed once the child has been
+        reaped. The outcome stays ``unknown``. ``empty`` and ``leaf_empty``
+        would say the child is gone, and it may still be alive.
+        """
+        box = errors if errors is not None else {}
+        if self._signal_held_child(box):
+            self._reap_held_child()
+        self._close_pidfd_if_reaped()
         seen = self.proc is not None and self.proc.returncode is not None
+        messages = ['cgroup identity unknown or changed; left in place']
+        for item in box:
+            if item not in messages:
+                messages.append(item)
         outcome = Outcome('unknown', self.proc.returncode if self.proc else None, populated,
-                          seen, ('cgroup identity unknown or changed; left in place',))
+                          seen, tuple(messages))
         log.error('leaf %s: %s', self.leaf, outcome)
         return outcome
 
     def __del__(self):
-        fd = getattr(self, 'dirfd', None)
-        self.dirfd = None
-        if fd is None:
-            return
         try:
-            os.close(fd)
+            lock = getattr(self, 'lock', None)
+            if lock is not None:
+                lock.acquire()
+            try:
+                self._release_held_fds()
+            finally:
+                if lock is not None:
+                    lock.release()
         except Exception:
             pass
 
@@ -886,7 +1192,9 @@ class LeafRun:
 
         A final outcome (the leaf was removed) is cached and returned again. Any other
         outcome keeps the leaf and, while the main exit is unseen, the pidfd, so a
-        later close() (or the startup sweep) retries the kill.
+        later close() (or the startup sweep) retries the kill. The pidfd SIGKILL of
+        this handle's own child runs even when the path no longer names the held
+        inode. ``cgroup.kill`` and ``rmdir`` stay gated on that inode.
         """
         with self.lock:
             if self.outcome is None or not self.removed:
@@ -913,28 +1221,50 @@ class LeafRun:
             if parent_fd is not None:
                 os.close(parent_fd)
 
+    def _child_may_be_alive(self):
+        return self.proc is not None and self.proc.returncode is None
+
     def _terminate(self):
+        # The pidfd kill does not wait for the path to still name this inode.
+        # A rename, chmod 0, EIO, or a kill that fails and then loses the name
+        # must not skip it. cgroup.kill and rmdir stay inside the same-inode checks.
+        errors = {}  # distinct messages, first-seen order; the loop retries
+        if self._signal_held_child(errors):
+            self._reap_held_child()
         if self.removing and not self.removed:
             if self._held_inode_removed():
                 self.removed = True  # interrupted after the inode was removed
             elif not self._same_cgroup():
                 # The path is missing or names another directory. That does
                 # not prove the held inode is gone, and it must not be dropped.
+                # The swap-before-rmdir window is unchanged: a name swapped in
+                # before rmdir can still be deleted, and this retry must not
+                # book the held inode removed while it is linked elsewhere.
+                self._close_pidfd_if_reaped()
                 seen = self.proc is not None and self.proc.returncode is not None
                 outcome = Outcome('unknown', self.proc.returncode if self.proc else None,
                                   None, seen, ('cgroup identity still present after rmdir',))
                 log.error('leaf %s: %s', self.leaf, outcome)
                 return outcome
         if self.removed:  # the leaf was empty and is gone: rebuild the outcome
-            self._close_dirfd()
+            self._close_pidfd_if_reaped()
             seen = self.proc is not None and self.proc.returncode is not None
+            if self._child_may_be_alive():
+                # removed was set, but this child has no exit. Do not cache a
+                # state that says it is gone, and keep the fd for a retry.
+                self.removed = False
+                outcome = Outcome('unknown', None, False, False,
+                                  ('child exit unseen; not booked empty',))
+                log.error('leaf %s: %s', self.leaf, outcome)
+                return outcome
+            self._close_dirfd()
             return Outcome('leaf_empty' if seen else 'empty',
                            self.proc.returncode if self.proc else None, False, seen)
         # A retry may run after the path was reused. Kill and rmdir only the inode
         # this handle opened; an unknown or replaced identity is left in place.
+        # Identity and the directory fd stay so that retry can still kill.
         if not self._same_cgroup():
-            return self._foreign()
-        errors = {}  # distinct messages, first-seen order; the loop retries
+            return self._foreign(errors=errors)
         try:
             budget = max(0.0, float(self.kill_timeout))
         except (TypeError, ValueError):
@@ -942,28 +1272,26 @@ class LeafRun:
         deadline = time.monotonic() + budget
         populated = None
         attempted = False
+        # The check just above authorized the first cgroup.kill. A swap inside
+        # that check must still be killed through the held dirfd, not skipped
+        # and not written through the replaced path. Later attempts re-check.
+        authorized = True
         while True:
             # One attempt even when the budget is already spent; further attempts
             # stop at the deadline so a slow exit cannot hold the window open.
             if attempted and time.monotonic() >= deadline:
                 break
             attempted = True
+            if not authorized and not self._same_cgroup():
+                break
+            authorized = False
             try:
                 self.fs.kill(self.leaf, deadline=deadline, dirfd=self.dirfd)
             except OSError as exc:
                 errors.setdefault(f'cgroup.kill: {exc!r}')
             if not self._same_cgroup():
-                return self._foreign(populated)
-            if self.pidfd is not None and self.proc is not None and self.proc.returncode is None:
-                try:
-                    signal.pidfd_send_signal(self.pidfd, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except OSError as exc:
-                    errors.setdefault(f'pidfd_send_signal: {exc!r}')
-            # poll() is WNOHANG and does not wait on another thread's blocking wait.
-            if self.proc is not None:
-                self.proc.poll()
+                break
+            self._signal_held_child(errors)
             try:
                 populated = self.fs.populated(self.leaf, deadline=deadline, dirfd=self.dirfd)
             except OSError:
@@ -975,14 +1303,12 @@ class LeafRun:
             if remaining <= 0:
                 break
             time.sleep(min(0.01, remaining))
+        if self._signal_held_child(errors):
+            self._reap_held_child()
+        self._close_pidfd_if_reaped()
         seen = self.proc is not None and self.proc.returncode is not None
-        if seen and self.pidfd is not None:
-            # Close only once the exit is seen: until then the pidfd is the kill handle.
-            # Detach first, so an interrupt leaks the fd rather than closing it twice.
-            fd, self.pidfd = self.pidfd, None
-            os.close(fd)
         if not self._same_cgroup():
-            return self._foreign(populated)
+            return self._foreign(populated, errors)
         if populated is False and seen:
             state = 'leaf_empty'  # not 'terminated': a same-uid escapee would be unseen
         elif populated is False and self.proc is None:
@@ -991,6 +1317,8 @@ class LeafRun:
             state = 'running'
         else:
             state = 'unknown'  # includes populated 0 with the main exit unseen
+        if self._child_may_be_alive() and state in ('leaf_empty', 'empty'):
+            state = 'unknown'
         if state in ('leaf_empty', 'empty'):
             self.removing = True
             try:

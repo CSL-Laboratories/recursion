@@ -6,6 +6,7 @@ not prove kernel cgroup behaviour. Set RECURSION_CGROUP_ROOT to a writable deleg
 cgroup v2 directory containing this process to run the live cell.
 """
 import errno
+import gc
 import inspect
 import os
 from pathlib import Path
@@ -28,6 +29,34 @@ def alive(pid):
     except OSError:
         return False
     return state != 'Z'
+
+
+def _is_leaf_directory_open(path, flags, leaf):
+    """True when ``os.open`` is opening ``leaf`` itself as a directory.
+
+    Matches a full path and a parent-dirfd open of the leaf's name. Does not
+    match ``cgroup.kill`` or other files opened relative to a leaf fd.
+    """
+    if isinstance(path, int) or not (flags & os.O_DIRECTORY):
+        return False
+    text = os.fsdecode(path)
+    return text == leaf.name or Path(text) == leaf
+
+
+def _stop_pid(pid):
+    if not isinstance(pid, int):
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
 
 
 def wait_file(path, timeout=5):
@@ -58,6 +87,7 @@ class FakeCgroup(Cgroup2):
         except OSError:
             cgroup_leaf._discard_new_leaf(leaf)
             raise
+        return cgroup_identity(leaf)
 
     def open_procs(self, leaf):
         if self.procs_override:
@@ -551,6 +581,173 @@ class LeafTests(unittest.TestCase):
         self.assertEqual(outcome.state, 'unknown')
         self.assertEqual((leaf / 'marker').read_text(), 'foreign')
 
+    def test_rename_before_close_still_kills_child(self):
+        # The child renames the leaf aside before close(). The pidfd kill must
+        # not wait for the path to still name the held inode.
+        run = self.root.launch('run-a', ['sleep', '60'])
+        self.cleanup_pids.append(run.pid)
+        leaf = self.root_path / 'run-a'
+        escaped = self.root_path / 'escaped.scope'
+        held = run.identity
+        leaf.rename(escaped)
+        with self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+            outcome = run.close()
+        self.assertFalse(alive(run.pid))
+        self.assertIsNotNone(run.proc.returncode)
+        self.assertNotIn(outcome.state, ('empty', 'leaf_empty'))
+        self.assertIsNone(run.pidfd)
+        self.assertEqual(run.identity, held)
+        self.assertEqual(cgroup_identity(escaped), held)
+        self.assertIsNotNone(run.dirfd)
+        self.assertEqual(os.fstat(run.dirfd).st_ino, held[1])
+        self.assertTrue(escaped.is_dir())
+
+    def test_chmod_zero_then_restore_retries_kill(self):
+        # lstat fails while the root is mode 0. close() must still kill the
+        # child and keep the inode so a later close, after access returns, can
+        # cgroup.kill and remove that same directory.
+        run = self.root.launch('run-a', ['sleep', '60'], kill_timeout=0.3)
+        self.cleanup_pids.append(run.pid)
+        held = run.identity
+        self.root_path.chmod(0)
+        try:
+            with self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+                outcome = run.close()
+        finally:
+            self.root_path.chmod(0o755)
+        self.assertFalse(alive(run.pid))
+        self.assertNotIn(outcome.state, ('empty', 'leaf_empty'))
+        self.assertEqual(run.identity, held)
+        self.assertIsNotNone(run.dirfd)
+        self.assertIsNone(run.pidfd)
+        retried = run.close()
+        self.assertEqual(retried.state, 'leaf_empty')
+        self.assertFalse(alive(run.pid))
+        self.assertEqual(self.leaves(), [])
+
+    def test_eio_lstat_still_kills_child(self):
+        run = self.root.launch('run-a', ['sleep', '60'], kill_timeout=0.3)
+        self.cleanup_pids.append(run.pid)
+        leaf = self.root_path / 'run-a'
+        held = run.identity
+        real = os.lstat
+
+        def eio(path, *args, **kwargs):
+            if not isinstance(path, int) and Path(os.fsdecode(path)) == leaf:
+                raise OSError(errno.EIO, 'eio')
+            return real(path, *args, **kwargs)
+
+        with patch.object(cgroup_leaf.os, 'lstat', eio), \
+             self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+            outcome = run.close()
+        self.assertFalse(alive(run.pid))
+        self.assertNotIn(outcome.state, ('empty', 'leaf_empty'))
+        self.assertEqual(run.identity, held)
+        self.assertEqual(cgroup_identity(leaf), held)
+        self.assertIsNotNone(run.dirfd)
+        self.assertIsNone(run.pidfd)
+
+    def test_kill_eacces_and_rename_still_kills_child(self):
+        # cgroup.kill fails and the name is swapped before the pidfd signal
+        # used to run. The child must still die, and the renamed inode stays.
+        run = self.root.launch('run-a', ['sleep', '60'], kill_timeout=0.3)
+        self.cleanup_pids.append(run.pid)
+        leaf = self.root_path / 'run-a'
+        escaped = self.root_path / 'escaped.scope'
+        held = run.identity
+
+        def kill(target, deadline=None, dirfd=None):
+            if leaf.exists():
+                leaf.rename(escaped)
+            raise OSError(errno.EACCES, 'cgroup.kill')
+
+        self.fs.kill = kill
+        with self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+            outcome = run.close()
+        self.assertFalse(alive(run.pid))
+        self.assertNotIn(outcome.state, ('empty', 'leaf_empty'))
+        self.assertEqual(run.identity, held)
+        self.assertEqual(cgroup_identity(escaped), held)
+        self.assertIsNotNone(run.dirfd)
+        self.assertEqual((escaped / 'cgroup.procs').read_text().strip(), str(run.pid))
+
+    def test_abandoned_close_does_not_leak_pidfd(self):
+        before = len(os.listdir('/proc/self/fd'))
+        pids = []
+        for n in range(4):
+            run = self.root.launch(f'run-{n}', ['sleep', '60'])
+            pids.append(run.pid)
+            self.cleanup_pids.append(run.pid)
+            (self.root_path / f'run-{n}').rename(self.root_path / f'escaped-{n}.scope')
+            with self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+                outcome = run.close()
+            self.assertFalse(alive(run.pid))
+            self.assertNotIn(outcome.state, ('empty', 'leaf_empty'))
+            self.assertIsNone(run.pidfd)
+            del run
+        gc.collect()
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+        for pid in pids:
+            self.assertFalse(alive(pid))
+
+    def test_sweep_of_empty_leaf_does_not_spare_launch_child(self):
+        # Sweep removes a leaf that reads empty. The launch handle still holds
+        # the child's pidfd and must kill that child after the path is gone.
+        run = self.root.launch('run-a', ['sleep', '60'])
+        self.cleanup_pids.append(run.pid)
+        leaf = self.root_path / 'run-a'
+        (leaf / 'cgroup.procs').write_text('')
+        result = self.root.sweep(keep=())
+        self.assertEqual(result.outcomes['run-a'].state, 'empty')
+        self.assertFalse(leaf.exists())
+        self.assertTrue(alive(run.pid))
+        with self.assertLogs(cgroup_leaf.log.name, level='ERROR'):
+            outcome = run.close()
+        self.assertFalse(alive(run.pid))
+        self.assertNotIn(outcome.state, ('empty', 'leaf_empty'))
+        self.assertIsNone(run.pidfd)
+        self.assertTrue(outcome.main_exit_seen)
+
+    def test_launch_does_not_spawn_into_scope_swapped_after_make_leaf(self):
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-a-aside'
+        leaf = self.root_path / 'run-a'
+        write_cgroup(scope, procs='')
+        (scope / 'payload').write_text('systemd')
+        swapped = {'done': False}
+        real_open = os.open
+
+        def swap_open(path, flags, *args, **kwargs):
+            if not swapped['done'] and _is_leaf_directory_open(path, flags, leaf):
+                try:
+                    marked = os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR,
+                                         follow_symlinks=False)
+                except OSError:
+                    marked = b''
+                if marked == cgroup_leaf.OWNERSHIP_VALUE and scope.exists():
+                    swapped['done'] = True
+                    leaf.rename(aside)
+                    scope.rename(leaf)
+            return real_open(path, flags, *args, **kwargs)
+
+        caught = None
+        try:
+            with patch.object(cgroup_leaf.os, 'open', swap_open):
+                try:
+                    self.root.launch('run-a', ['sleep', '60'])
+                except PermissionError as exc:
+                    caught = exc
+        finally:
+            if (leaf / 'cgroup.procs').is_file():
+                text = (leaf / 'cgroup.procs').read_text().strip()
+                if text.isdigit():
+                    _stop_pid(int(text))
+        self.assertIsNotNone(caught)
+        self.assertTrue(swapped['done'])
+        self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        self.assertEqual((leaf / 'cgroup.procs').read_text().strip(), '')
+
 
 def write_cgroup(path, procs=''):
     """A tmpdir stand-in for one cgroup directory. Never a host cgroupfs path."""
@@ -929,8 +1126,8 @@ class RemovalContractTests(unittest.TestCase):
         real_open = os.open
 
         def swap_open(path, flags, *args, **kwargs):
-            if (not swapped['done'] and not isinstance(path, int)
-                    and Path(path) == leaf):
+            # Full path (older open) or the leaf name relative to the root dirfd.
+            if (not swapped['done'] and _is_leaf_directory_open(path, flags, leaf)):
                 swapped['done'] = True
                 leaf.rename(aside)
                 scope.rename(leaf)
@@ -1198,6 +1395,105 @@ class RemovalContractTests(unittest.TestCase):
             except ProcessLookupError:
                 pass
             waiter.join(2)
+
+    def test_adopt_does_not_kill_scope_swapped_after_lstat(self):
+        # lstat saw run-a. Before the directory fd is opened, that inode is
+        # moved aside and a marked scope takes the name. adopt must not kill,
+        # rmdir, or book that scope empty.
+        leaf = self.root_path / 'run-a'
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-a-aside'
+        write_cgroup(leaf, procs='')
+        write_cgroup(scope, procs='')
+        (leaf / 'payload').write_text('ours')
+        (scope / 'payload').write_text('systemd')
+        cgroup_leaf.mark_owned(leaf)
+        cgroup_leaf.mark_owned(scope)
+        classified = cgroup_identity(leaf)
+        swapped = {'done': False}
+        real_open = os.open
+
+        def swap_open(path, flags, *args, **kwargs):
+            if not swapped['done'] and _is_leaf_directory_open(path, flags, leaf):
+                swapped['done'] = True
+                leaf.rename(aside)
+                scope.rename(leaf)
+            return real_open(path, flags, *args, **kwargs)
+
+        root = DelegatedRoot(self.root_path, self.fs)
+        run = None
+        with patch.object(cgroup_leaf.os, 'open', swap_open):
+            try:
+                run = root.adopt('run-a')
+            except PermissionError:
+                run = None
+        self.assertTrue(swapped['done'])
+        if run is not None:
+            outcome = run.close()
+            self.fail(f'adopted swapped scope and booked {outcome.state}')
+        self.assertNotEqual(cgroup_identity(leaf), classified)
+        self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        self.assertEqual((aside / 'payload').read_text(), 'ours')
+        self.assertEqual(self.fs.killed, [])
+        self.assertEqual(self.fs.rmdir_calls, [])
+
+    def test_make_leaf_does_not_mark_swapped_scope(self):
+        leaf = self.root_path / 'run-a'
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-a-aside'
+        scope.mkdir()
+        (scope / 'payload').write_text('systemd')
+        real = os.setxattr
+        swapped = {'done': False}
+
+        def swap_setxattr(path, attr, value, *args, **kwargs):
+            if attr == cgroup_leaf.OWNERSHIP_XATTR and not swapped['done']:
+                swapped['done'] = True
+                if leaf.exists() and not aside.exists():
+                    leaf.rename(aside)
+                    scope.rename(leaf)
+            return real(path, attr, value, *args, **kwargs)
+
+        with patch.object(cgroup_leaf.os, 'setxattr', swap_setxattr):
+            got = self.fs.make_leaf(leaf)
+        self.assertTrue(swapped['done'])
+        self.assertEqual(got, cgroup_identity(aside))
+        self.assertEqual(os.getxattr(aside, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False),
+                         cgroup_leaf.OWNERSHIP_VALUE)
+        with self.assertRaises(OSError) as caught:
+            os.getxattr(leaf, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+        self.assertEqual(caught.exception.errno, errno.ENODATA)
+        self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+
+    def test_make_leaf_enospc_discards_only_created_inode(self):
+        leaf = self.root_path / 'run-a'
+        scope = self.root_path / 'run-1.scope'
+        aside = self.root_path / 'run-a-aside'
+        scope.mkdir()
+        (scope / 'payload').write_text('systemd')
+        (scope / 'cgroup.kill').write_text('')
+        real = os.setxattr
+        swapped = {'done': False}
+
+        def swap_and_enospc(path, attr, value, *args, **kwargs):
+            if attr == cgroup_leaf.OWNERSHIP_XATTR and not swapped['done']:
+                swapped['done'] = True
+                if leaf.exists() and not aside.exists():
+                    leaf.rename(aside)
+                    scope.rename(leaf)
+                raise OSError(errno.ENOSPC, 'no space')
+            return real(path, attr, value, *args, **kwargs)
+
+        with patch.object(cgroup_leaf.os, 'setxattr', swap_and_enospc):
+            with self.assertRaises(OSError) as caught:
+                self.fs.make_leaf(leaf)
+        self.assertEqual(caught.exception.errno, errno.ENOSPC)
+        self.assertTrue(swapped['done'])
+        self.assertTrue((leaf / 'payload').is_file())
+        self.assertEqual((leaf / 'payload').read_text(), 'systemd')
+        self.assertEqual((leaf / 'cgroup.kill').read_text(), '')
+        self.assertFalse(aside.exists())
 
 
 class RealCgroupTests(unittest.TestCase):

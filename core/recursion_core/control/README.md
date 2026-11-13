@@ -123,6 +123,45 @@ recorded on F60, CSL-762).
 
   Stop carries `destructiveHint: true` per 055cc7a5 O41; the older CSL-762/F60 handoff wording
   (`destructiveHint: false` on start and stop) is superseded.
+- `mcp_dual_era.py` (CSL-766, B5 / F56): an offline reading of Claude Code
+  ``2.1.312`` and MCP spec ``38353251fab3bdeead03dd8283b9e66076ce1a7f``. Default
+  (unset or ``auto``) negotiates ``2026-07-28`` via ``server/discover`` when the
+  server supports it; ``MCP_PROTOCOL_NEGOTIATION=legacy`` initializes on
+  ``2025-06-18``. A dual-era mock server speaks both over one ``ControlAPI`` so
+  the same run id and Stop are visible from either era (n=5). Native Tasks
+  ``CreateTaskResult`` is returned from ``tools/call`` only when the request
+  lists ``io.modelcontextprotocol/tasks``. ``tasks/list`` and
+  ``notifications/cancelled`` are not served. ``tools/list`` returns the four
+  control tool descriptors in both eras. With ``auth_token`` set, ``tools/list``,
+  ``tools/call`` and ``tasks/*`` need the token in ``_meta.authorization`` or in
+  top-level ``params.authorization`` before anything reaches ``ControlAPI``
+  (only the handshakes are open). This mock compares those fields; it does not
+  read an HTTP ``Authorization`` header. An unknown ``taskId`` is
+  a JSON-RPC ``-32602`` ``run_unknown`` error, and ``tasks/cancel`` sends nothing
+  to the Stop path for it. A registry outage is a JSON-RPC ``-32603``
+  ``registry_unavailable`` error, not an unknown task; if the registry stops
+  answering after ``tasks/cancel`` sent the Stop, the reply still carries the
+  Stop's own answer (``working`` + ``"pending"`` while unconfirmed). Task ``createdAt`` comes from the run's
+  ``started_at``; the default clock is wall time. Live binary wire-capture is
+  unmeasured (no Claude Code is spawned). A Stop the core has not confirmed
+  reads ``working`` with ``statusMessage: "pending"`` through ``tasks/cancel``,
+  ``tasks/get`` and the ``CreateTaskResult`` of a start whose launch a Stop
+  landed during, never ``cancelled`` (S6); a ``starting`` launch reads
+  ``working``, not ``failed``. "Not confirmed" is the TUI and CLI rule: any state
+  but ``stopped`` that carries a stop record, so a Stop kept as intent on a
+  ``start_failed`` run also reads ``working`` + ``"pending"``. When ``run.stop``
+  answered but its write-back failed (``"recorded": false``), ``tasks/cancel``
+  answers from that answer, so a confirmed Stop reads ``cancelled`` rather than a
+  stale ``pending``. The fallback keeps a stop time the record already has. It
+  does not invent one when the write never stored a stop, so ``lastUpdatedAt``
+  stays the start time the next ``tasks/get`` still reads.
+
+  Deferred (PRODUCT.md O60 / A45): the ``2026-07-28`` side is not yet tested
+  against a pinned pre-release conformance tool. The shapes (``server/discover``,
+  ``_meta``, ``resultType``, ``CreateTaskResult``, ``ttlMs``) are checked only
+  against this module's reading of ``schema.ts``. ``DualEraServer`` is an
+  in-process mock with no transport: no stdio or HTTP entry point serves it yet.
+  Choosing and pinning the conformance tool and wiring the transport are open.
 - `codex_config.py`: `codex_operator_snippet(server_id, command, args)` writes the operator's Codex TOML,
   setting `approval_mode = "approve"` under `mcp_servers.<id>.tools.recursion_run_stop`, so stop does not
   prompt where that setting is in place. `strict_auto_review` or a managed approval requirement can still

@@ -978,6 +978,29 @@ def _encode_size(value: int) -> bytes:
             return bytes(out)
 
 
+def _single_blob_pack(content: bytes) -> bytes:
+    payload = zlib.compress(content)
+    body = b"PACK" + (2).to_bytes(4, "big") + (1).to_bytes(4, "big")
+    body += _encode_obj_header(3, len(content)) + payload
+    return body + hashlib.sha1(body).digest()
+
+
+def _idx_v2_one(oid: bytes, offset: int, pack: bytes) -> bytes:
+    fanout = bytearray(256 * 4)
+    for index in range(oid[0], 256):
+        fanout[index * 4 : index * 4 + 4] = (1).to_bytes(4, "big")
+    body = (
+        b"\xfftOc"
+        + (2).to_bytes(4, "big")
+        + bytes(fanout)
+        + oid
+        + (0).to_bytes(4, "big")
+        + offset.to_bytes(4, "big")
+        + pack[-20:]
+    )
+    return body + hashlib.sha1(body).digest()
+
+
 def _encode_obj_header(obj_type: int, size: int) -> bytes:
     byte = (obj_type << 4) | (size & 0x0F)
     size >>= 4
@@ -1161,6 +1184,57 @@ class DeepObjectStoreTests(VaultTests):
                 )
                 self.assertEqual(shown, self.body)
                 self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
+
+    def test_loose_trailing_bytes_match_git(self) -> None:
+        """Bytes after a finished loose zlib stream are not a size error.
+
+        Git reads them. Bodies of 60, 200 and 65536 bytes all spill past the
+        first 64-byte inflate window, which is the path that used to treat
+        Python's unconsumed tail as a header mismatch.
+        """
+        for size in (60, 200, 65536):
+            with self.subTest(size=size):
+                repo = Path(self.tmp.name) / f"loose-tail-{size}"
+                repo.mkdir()
+                git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+                subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+                body = b"P" * size
+                target = repo / "contracts" / "recursion" / "PRODUCT.md"
+                target.parent.mkdir(parents=True)
+                target.write_bytes(body)
+                subprocess.run([*git, "add", "-A"], check=True)
+                subprocess.run([*git, "commit", "-q", "-m", "contract"], check=True)
+                commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+                oid = subprocess.check_output(
+                    ["git", "-C", str(repo), "rev-parse", f"{commit}:contracts/recursion/PRODUCT.md"],
+                    text=True,
+                ).strip()
+                loose = repo / ".git" / "objects" / oid[:2] / oid[2:]
+                os.chmod(loose, 0o644)
+                loose.write_bytes(loose.read_bytes() + b"GARBAGE")
+                got = subprocess.check_output(["git", "-C", str(repo), "cat-file", "blob", oid])
+                self.assertEqual(got, body)
+                pin = {**PINNED, "commit": commit, "sha256": hashlib.sha256(body).hexdigest()}
+                self.assertEqual(pin_check.vault_errors(pin, repo), [])
+
+    def test_second_pack_copy_is_used_when_the_first_fails_verify(self) -> None:
+        """An oid whose first packed copy does not hash is read from a later pack."""
+        repo = Path(self.tmp.name) / "second-pack"
+        commit = self._commit_repo(repo)
+        oid = self._blob_oid(repo, commit)
+        subprocess.run(["git", "-C", str(repo), "repack", "-ad"], check=True)
+        packdir = repo / ".git" / "objects" / "pack"
+        bad = _single_blob_pack(b"not-the-product-bytes")
+        (packdir / "aaa.pack").write_bytes(bad)
+        (packdir / "aaa.idx").write_bytes(_idx_v2_one(bytes.fromhex(oid), 12, bad))
+        store = pin_check._ObjectStore(repo / ".git" / "objects")
+        oid_b = bytes.fromhex(oid)
+        offsets = [pack.offset(oid_b) for pack in store.packs]
+        self.assertEqual(offsets[0], 12, "the corrupt copy must be the first pack searched")
+        self.assertGreaterEqual(sum(offset is not None for offset in offsets), 2)
+        typ, content = store.get(oid_b)
+        self.assertEqual((typ, content), (b"blob", self.body))
+        self.assertEqual(pin_check.vault_errors(self._pin_for(commit), repo), [])
 
     def test_corrupt_loose_without_a_pack_is_refused(self) -> None:
         repo = Path(self.tmp.name) / "loose-only-bad"

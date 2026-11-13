@@ -693,7 +693,10 @@ def _parse_loose(raw: bytes, hex_oid: str) -> tuple[bytes, bytes]:
 
     The header is read first (it is only a few dozen bytes). The remaining
     content is then limited to that size plus one byte, so a stream that
-    expands further is refused before it is retained.
+    expands further is refused before it is retained. Bytes after a finished
+    zlib member are ignored, matching git. Output past the declared size, a
+    stream that has not ended with more input still waiting, and a short read
+    are refused. The caller still checks the object hash.
     """
     decompressor = zlib.decompressobj()
     try:
@@ -722,7 +725,10 @@ def _parse_loose(raw: bytes, hex_oid: str) -> tuple[bytes, bytes]:
             more = decompressor.decompress(decompressor.unconsumed_tail, max_length=size - len(content) + 1)
         except (zlib.error, OverflowError) as exc:
             raise _LooseUnusable(f"loose object {hex_oid} is unreadable ({exc})") from exc
-        if len(more) > size - len(content) or decompressor.unconsumed_tail:
+        # A finished member leaves the following bytes in unused_data. Python 3.12
+        # also copies that tail into unconsumed_tail once eof is set. That is not
+        # more object data. More input before eof, or output past the declared size, is.
+        if len(more) > size - len(content) or (not decompressor.eof and decompressor.unconsumed_tail):
             raise _LooseUnusable(f"loose object {hex_oid} header does not match")
         content += more
     if not decompressor.eof:
@@ -762,15 +768,27 @@ class _ObjectStore:
             self._verify(oid, loose[0], loose[1])
             self.cache[oid] = loose
             return loose
-        found = self._find_pack(oid)
-        if found is None:
-            if loose_error is not None:
-                raise loose_error
-            raise _ObjectMissing(oid.hex())
-        typ, content = self._resolve(found[0], found[1])
-        self._verify(oid, typ, content)
-        self.cache[oid] = (typ, content)
-        return typ, content
+        # The first pack that names this oid may not hash to it. Try each later
+        # copy and keep only bytes that verify. Unreadable copies are skipped the
+        # same way; nothing is cached until the hash matches.
+        pack_error: _ObjectMissing | None = None
+        for pack in self.packs:
+            offset = pack.offset(oid)
+            if offset is None:
+                continue
+            try:
+                typ, content = self._resolve(pack, offset)
+                self._verify(oid, typ, content)
+            except _ObjectMissing as exc:
+                pack_error = exc
+                continue
+            self.cache[oid] = (typ, content)
+            return typ, content
+        if pack_error is not None:
+            raise pack_error
+        if loose_error is not None:
+            raise loose_error
+        raise _ObjectMissing(oid.hex())
 
     def _verify(self, oid: bytes, typ: bytes, content: bytes) -> None:
         header = typ + b" " + str(len(content)).encode("ascii") + b"\0"

@@ -911,6 +911,8 @@ class FakeConsumer:
             self._free()
             if not ids:
                 return
+            if after is not None and not all(run_id > after for run_id in ids):
+                raise AssertionError(f'a page after {after!r} began with {ids[0]!r}: it must start strictly after its cursor')
             for run_id in ids:
                 self.log(run_id)
             after = ids[-1]

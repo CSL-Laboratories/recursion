@@ -21,20 +21,24 @@ holds against hostile in-process code (fleet F35, P1, measures that; B17 tracks 
 same-uid authority anchor). Nothing here spawns a process, so there is no cleanup path;
 any later spawn must use cgroup plus pidfd, never ``preexec_fn`` or ``PR_SET_PDEATHSIG``.
 
-A failed load puts the import tables back. A module stays only when this attempt's
-import machinery loaded it through a finder that was already installed, from a
-path that was already searchable, and that origin is still the one recorded before
-the module body ran. A rewritten spec is not evidence. Every other name added
-during the attempt is dropped, and a parent-package attribute that still points
-at a dropped module is removed.
+A failed load puts the import tables back. Every ``sys.modules`` name added
+during the attempt is dropped, and a name that was already loaded is put back
+to the module the snapshot recorded. For each package that was already loaded,
+the bindings of those dotted names are put back too: set to the pre-load value,
+or deleted if the attribute was absent. The snapshot decides, not whether the
+attribute object is the module being dropped. A stdlib import made by the
+failed attempt is dropped with the rest; importing it again yields one module.
 
-A load that starts while another activation is inside exec is refused. The import
-lock is not re-entered and it is not waited on.
+A second ``load`` on the same loader is refused, including a nested call on
+this thread and a call from another thread. The loader lock is not waited on.
+A load that starts while another loader's activation is inside exec is refused
+the same way. That import lock is not re-entered and it is not waited on.
 
 Three residuals stay, and this process cannot close them. The plugin can change
-attributes of modules the snapshot kept. A thread it started can put a module back
-after the restore. It can replace the per-load import recorder and its finder
-while the attempt runs. Closing those means running the plugin in a subprocess.
+attributes of modules the snapshot kept. A thread it started can put a module
+back after the restore. It can patch importlib classes (``PathFinder``,
+``FileFinder``, ``SourceFileLoader``) so a later import in this process runs
+attacker code. Closing those means running the plugin in a subprocess.
 Whether to do that is an owner decision. This loader does not spawn one.
 """
 
@@ -42,7 +46,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.machinery
-import os
 import sys
 import threading
 import types
@@ -267,9 +270,7 @@ class _ImportSnapshot:
         cache = sys.path_importer_cache
         self.cache = cache
         self.cache_items = dict(cache)
-        self.search_roots: list[str] = []
-        for entry in self.path_items:
-            self._add_root(entry)
+        self.parent_bindings: dict[str, dict[str, object]] = {}
         paths: dict[str, tuple] = {}
         for name, module in self.modules.items():
             try:
@@ -278,13 +279,12 @@ class _ImportSnapshot:
                 continue
             if pkg_path is None:
                 continue
+            self._remember_bindings(name, module)
             if isinstance(pkg_path, list):
                 try:
                     items = list(pkg_path)
                 except Exception:
                     continue
-                for entry in items:
-                    self._add_root(entry)
                 paths[name] = (pkg_path, items, None)
                 continue
             inner = getattr(pkg_path, "_path", None)
@@ -294,20 +294,15 @@ class _ImportSnapshot:
                 items = list(inner)
             except Exception:
                 continue
-            for entry in items:
-                self._add_root(entry)
             paths[name] = (pkg_path, items, inner)
         self.package_paths = paths
 
-    def _add_root(self, entry: object) -> None:
-        if type(entry) is not str or not entry:
-            return
+    def _remember_bindings(self, name: str, module: object) -> None:
+        """Copy one pre-loaded package's attributes. The values are the pre-load bindings."""
         try:
-            root = os.path.realpath(entry)
-        except (OSError, ValueError):
+            self.parent_bindings[name] = dict(vars(module))
+        except Exception:
             return
-        if root and root not in self.search_roots:
-            self.search_roots.append(root)
 
 
 def _restore_list(owner: object, attr: str, original: list, items: list) -> None:
@@ -328,56 +323,35 @@ def _restore_list(owner: object, attr: str, original: list, items: list) -> None
 _MISSING = object()
 
 
-def _path_within(root: str, origin: str) -> bool:
-    try:
-        origin_real = os.path.realpath(origin)
-    except (OSError, ValueError):
-        return False
-    if not root or not origin_real:
-        return False
-    try:
-        return os.path.commonpath([root, origin_real]) == root
-    except ValueError:
-        return False
+def _restore_parent_binding(snap: _ImportSnapshot, modules: dict, name: str) -> None:
+    """Put one parent attribute back to the pre-load binding.
 
-
-def _trusted_added(name: str, module: object, recorded: dict, snap: _ImportSnapshot) -> bool:
-    """A module loaded by a pre-existing finder from a path that was already there.
-
-    The origin is the one recorded before the module body ran. A later rewrite
-    of ``__spec__.origin`` does not make an attacker file look installed.
+    The snapshot decides. An attribute that was there is set to that value,
+    including when that value is the module just dropped from ``sys.modules``.
+    An attribute that was not there is deleted.
     """
-    info = recorded.get(name)
-    if type(info) is not tuple or len(info) != 3 or module is None:
-        return False
-    rec_module, origin, finder = info
-    if module is not rec_module or finder is None or finder not in snap.meta_items:
-        return False
-    spec = getattr(module, "__spec__", None)
-    live = getattr(spec, "origin", None) if spec is not None else None
-    if type(live) is not str:
-        live = None
-    if live != origin:
-        return False
-    if origin in ("built-in", "frozen"):
-        return True
-    if type(origin) is not str or not origin:
-        return False
-    return any(_path_within(root, origin) for root in snap.search_roots)
-
-
-def _unbind_parent(modules: dict, name: str, module: object) -> None:
     parent_name, dot, attr = name.rpartition(".")
-    if not dot or module is None:
+    if not dot:
         return
     parent = modules.get(parent_name)
-    if parent is None:
+    if not isinstance(parent, types.ModuleType):
+        return
+    bindings = snap.parent_bindings.get(parent_name)
+    if bindings is None:
         return
     try:
-        current = getattr(parent, attr, _MISSING)
+        current = vars(parent)
     except Exception:
         return
-    if current is not module:
+    if attr in bindings:
+        if current.get(attr, _MISSING) is bindings[attr]:
+            return
+        try:
+            setattr(parent, attr, bindings[attr])
+        except Exception:
+            return
+        return
+    if attr not in current:
         return
     try:
         delattr(parent, attr)
@@ -385,32 +359,68 @@ def _unbind_parent(modules: dict, name: str, module: object) -> None:
         return
 
 
-def _restore_import_state(snap: _ImportSnapshot, recorded: dict | None = None) -> None:
+def _module_bindings_to_restore(snap: _ImportSnapshot, modules: dict,
+                                added: list[str]) -> list[str]:
+    """Dotted names whose parent attribute must return to the pre-load value.
+
+    That is every dotted name added to ``sys.modules``, every pre-loaded dotted
+    name whose entry was replaced or removed, and a module attribute that
+    appeared on a pre-loaded package for a name the snapshot did not have
+    (an import whose ``sys.modules`` entry was popped before the attempt ended).
+    """
+    names: set[str] = set()
+    for name in added:
+        if "." in name:
+            names.add(name)
+    for name, module in snap.modules.items():
+        if "." in name and modules.get(name) is not module:
+            names.add(name)
+    for parent_name, bindings in snap.parent_bindings.items():
+        candidates: list[types.ModuleType] = []
+        live = modules.get(parent_name)
+        if isinstance(live, types.ModuleType):
+            candidates.append(live)
+        original = snap.modules.get(parent_name)
+        if isinstance(original, types.ModuleType) and original is not live:
+            candidates.append(original)
+        for parent in candidates:
+            try:
+                current = vars(parent)
+            except Exception:
+                continue
+            for attr, value in current.items():
+                if not isinstance(value, types.ModuleType):
+                    continue
+                dotted = parent_name + "." + attr
+                if dotted in snap.modules:
+                    continue
+                previous = bindings.get(attr, _MISSING)
+                if previous is value:
+                    continue
+                if previous is _MISSING or getattr(value, "__name__", None) == dotted:
+                    names.add(dotted)
+    return list(names)
+
+
+def _restore_import_state(snap: _ImportSnapshot) -> None:
     """Put every snapshotted import table back.
 
-    A name added during the attempt stays only when ``_trusted_added`` says the
-    import machinery loaded it from a path that was already searchable. Anything
-    else is dropped, and so is a parent attribute that still points at it.
+    Every name added during the attempt is dropped. A name that was already
+    loaded is put back to the module the snapshot recorded. Parent attributes
+    of those dotted names are put back from the package snapshot.
     """
-    recorded = {} if recorded is None else recorded
     modules = snap.modules_dict
     if sys.modules is not modules:
         sys.modules = modules
-    dropped: list[tuple[str, object]] = []
-    for name in list(modules):
-        if name in snap.modules:
-            continue
-        module = modules.get(name)
-        if _trusted_added(name, module, recorded, snap):
-            continue
-        dropped.append((name, module))
-    for name, module in dropped:
-        _unbind_parent(modules, name, module)
-    for name, _module in dropped:
+    added = [name for name in list(modules) if name not in snap.modules]
+    dotted = _module_bindings_to_restore(snap, modules, added)
+    for name in added:
         modules.pop(name, None)
     for name, module in snap.modules.items():
         if modules.get(name) is not module:
             modules[name] = module
+    for name in dotted:
+        _restore_parent_binding(snap, modules, name)
     _restore_list(sys, "path", snap.path, snap.path_items)
     _restore_list(sys, "meta_path", snap.meta, snap.meta_items)
     _restore_list(sys, "path_hooks", snap.hooks, snap.hooks_items)
@@ -457,6 +467,9 @@ class PluginLoader:
         self._health = health
         self._gil = gil_probe if gil_probe is not None else GilProbe()
         self._lock = threading.Lock()
+        # Set for the thread inside ``load``. A nested call on that thread is
+        # refused before it tries to take ``_lock`` again.
+        self._load_depth = threading.local()
         self._active: dict[str, LoadedPlugin] = {}
         self.last_findings: tuple = ()
 
@@ -565,69 +578,83 @@ class PluginLoader:
 
     def load(self, manifest_bytes: bytes, signature: object, artifact: bytes,
              registry_label: str | None = None, *, root: str | None = None) -> LoadedPlugin:
-        with self._lock:
-            self._health.require_healthy()
-            findings: list[dict] = []
-            active: LoadedPlugin | None = None
-            try:
-                if type(artifact) is bytes:
-                    try:
-                        preview = parse_manifest(manifest_bytes)
-                    except Refused:
-                        preview = None
-                    if preview is not None:
-                        active = self._active.get(preview.plugin_id)
-                        # Trust is for the bytes that were compiled. Different bytes with
-                        # the same manifest are not that digest, so the recorded signature
-                        # and its permissions no longer apply.
-                        if active is not None and hashlib.sha256(artifact).hexdigest() != active.code_sha256:
-                            findings.append(_finding("verify", "artifact_digest_mismatch", "refuse"))
-                            cleared = replace(
-                                active, trust="unsigned", signer_key_id=None, permissions=(),
-                                findings=tuple(findings), manifest_raw=b"")
-                            self._active[preview.plugin_id] = cleared
-                            self.last_findings = cleared.findings
-                            raise Refused("artifact_digest_mismatch", preview.plugin_id)
-                manifest, trust, kid, label, perms = self._verify_admit(
-                    manifest_bytes, signature, artifact, registry_label, findings, root)
-                active = self._active.get(manifest.plugin_id)
-                if active is not None and active.manifest_raw == manifest.raw and (
-                        active.artifact_sha256 == manifest.artifact_sha256):
-                    raise Refused("plugin_already_active", manifest.plugin_id)
-                if active is None:
-                    code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
-                    findings.append(_finding("stage", "compiled", "info"))
-            except (Refused, SyntaxError, ValueError) as exc:
-                # No plugin code ran, but the rule is a GIL read after every load attempt.
-                if self._gil_gate("refused_load", findings):
-                    raise Refused("core_poisoned_gil_enabled", "refused_load") from exc
-                self.last_findings = tuple(findings)
-                if isinstance(exc, Refused):
-                    raise
-                raise Refused("plugin_compile_failed", type(exc).__name__) from None
-            if active is not None:
-                # The running module is the old artifact. A changed manifest is classified
-                # again and replaces the recorded trust. A changed artifact is not executed;
-                # the recorded trust is dropped because it no longer describes the bytes running.
-                if self._gil_gate(manifest.plugin_id, findings):
-                    raise Refused("core_poisoned_gil_enabled", manifest.plugin_id)
-                if manifest.artifact_sha256 != active.artifact_sha256:
-                    cleared = replace(
-                        active, trust="unsigned", signer_key_id=None, permissions=(),
-                        findings=tuple(findings) + (_finding("verify", "plugin_artifact_changed", "refuse"),),
-                        manifest_raw=manifest.raw)
-                    self._active[manifest.plugin_id] = cleared
-                    self.last_findings = cleared.findings
-                    raise Refused("plugin_artifact_changed", manifest.plugin_id)
-                updated = replace(
-                    active, trust=trust, signer_key_id=kid, registry_label=label, permissions=perms,
-                    findings=tuple(findings), developer_key_id=key_id(manifest.developer_key),
+        # Non-blocking, and per thread. Waiting here deadlocks a nested call on
+        # this thread and queues another thread behind the plugin still running.
+        if getattr(self._load_depth, "depth", 0):
+            raise Refused("plugin_load_busy")
+        if not self._lock.acquire(blocking=False):
+            raise Refused("plugin_load_busy")
+        self._load_depth.depth = 1
+        try:
+            return self._load_holding_lock(manifest_bytes, signature, artifact, registry_label, root=root)
+        finally:
+            self._load_depth.depth = 0
+            self._lock.release()
+
+    def _load_holding_lock(self, manifest_bytes: bytes, signature: object, artifact: bytes,
+                           registry_label: str | None, *, root: str | None) -> LoadedPlugin:
+        self._health.require_healthy()
+        findings: list[dict] = []
+        active: LoadedPlugin | None = None
+        try:
+            if type(artifact) is bytes:
+                try:
+                    preview = parse_manifest(manifest_bytes)
+                except Refused:
+                    preview = None
+                if preview is not None:
+                    active = self._active.get(preview.plugin_id)
+                    # Trust is for the bytes that were compiled. Different bytes with
+                    # the same manifest are not that digest, so the recorded signature
+                    # and its permissions no longer apply.
+                    if active is not None and hashlib.sha256(artifact).hexdigest() != active.code_sha256:
+                        findings.append(_finding("verify", "artifact_digest_mismatch", "refuse"))
+                        cleared = replace(
+                            active, trust="unsigned", signer_key_id=None, permissions=(),
+                            findings=tuple(findings), manifest_raw=b"")
+                        self._active[preview.plugin_id] = cleared
+                        self.last_findings = cleared.findings
+                        raise Refused("artifact_digest_mismatch", preview.plugin_id)
+            manifest, trust, kid, label, perms = self._verify_admit(
+                manifest_bytes, signature, artifact, registry_label, findings, root)
+            active = self._active.get(manifest.plugin_id)
+            if active is not None and active.manifest_raw == manifest.raw and (
+                    active.artifact_sha256 == manifest.artifact_sha256):
+                raise Refused("plugin_already_active", manifest.plugin_id)
+            if active is None:
+                code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
+                findings.append(_finding("stage", "compiled", "info"))
+        except (Refused, SyntaxError, ValueError) as exc:
+            # No plugin code ran, but the rule is a GIL read after every load attempt.
+            if self._gil_gate("refused_load", findings):
+                raise Refused("core_poisoned_gil_enabled", "refused_load") from exc
+            self.last_findings = tuple(findings)
+            if isinstance(exc, Refused):
+                raise
+            raise Refused("plugin_compile_failed", type(exc).__name__) from None
+        if active is not None:
+            # The running module is the old artifact. A changed manifest is classified
+            # again and replaces the recorded trust. A changed artifact is not executed;
+            # the recorded trust is dropped because it no longer describes the bytes running.
+            if self._gil_gate(manifest.plugin_id, findings):
+                raise Refused("core_poisoned_gil_enabled", manifest.plugin_id)
+            if manifest.artifact_sha256 != active.artifact_sha256:
+                cleared = replace(
+                    active, trust="unsigned", signer_key_id=None, permissions=(),
+                    findings=tuple(findings) + (_finding("verify", "plugin_artifact_changed", "refuse"),),
                     manifest_raw=manifest.raw)
-                self._active[manifest.plugin_id] = updated
-                self.last_findings = updated.findings
-                return updated
-            return self._activate(manifest, trust, kid, label, perms, code, findings,
-                                  hashlib.sha256(artifact).hexdigest())
+                self._active[manifest.plugin_id] = cleared
+                self.last_findings = cleared.findings
+                raise Refused("plugin_artifact_changed", manifest.plugin_id)
+            updated = replace(
+                active, trust=trust, signer_key_id=kid, registry_label=label, permissions=perms,
+                findings=tuple(findings), developer_key_id=key_id(manifest.developer_key),
+                manifest_raw=manifest.raw)
+            self._active[manifest.plugin_id] = updated
+            self.last_findings = updated.findings
+            return updated
+        return self._activate(manifest, trust, kid, label, perms, code, findings,
+                              hashlib.sha256(artifact).hexdigest())
 
     def _gil_gate(self, name: str, findings: list) -> bool:
         """Read the GIL; if it is on, poison the core and drop every active plugin."""
@@ -666,9 +693,9 @@ class PluginLoader:
                     gil_on = self._gil_gate(manifest.plugin_id, findings)
                     self.last_findings = tuple(findings)
             finally:
-                created = _end_import_record(record)
+                _end_import_record(record)
                 if gil_on or failure is not None:
-                    _restore_import_state(snap, created)
+                    _restore_import_state(snap)
         finally:
             _import_depth.depth = 0
             _import_isolation.release()

@@ -236,14 +236,29 @@ def _stripped_script_component(part: str) -> bool:
     return part.rstrip(" .") == ".."
 
 
-# Win32 device basenames, with or without an extension (``NUL.txt``). COM0 and LPT0
-# are not in this set. The check is a string test so every host refuses them.
-_DEVICE_BASENAME = re.compile(
-    r"(?i)^(con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(\..*)?$")
+# Win32 device basenames. The host cuts the component at the first "." or ":",
+# strips trailing spaces from that stem, then compares case-insensitively.
+# ``NUL.txt`` and ``nul .txt`` are both ``nul``. COM0 and LPT0 are not devices.
+# The check is a string test so every host refuses them.
+_DEVICE_NAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "conin$", "conout$",
+})
+
+
+def _device_stem(part: str) -> str:
+    cut = len(part)
+    for sep in (".", ":"):
+        index = part.find(sep)
+        if index != -1 and index < cut:
+            cut = index
+    return part[:cut].rstrip(" ").casefold()
 
 
 def _reserved_device_component(part: str) -> bool:
-    return _DEVICE_BASENAME.fullmatch(part) is not None
+    return _device_stem(part) in _DEVICE_NAMES
 
 
 def _script_escapes(value: str) -> bool:

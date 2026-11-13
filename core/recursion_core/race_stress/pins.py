@@ -45,12 +45,25 @@ it. Those untracked files are refused. Package-shadow names are exactly ``__init
 one suffix from ``importlib.machinery.all_suffixes()``; ``__init__extra.py`` is not a
 package init.
 
-When the import resolves to a sourceless ``.pyc`` or an extension file, those worktree
-bytes are hashed with ``git hash-object --no-filters`` and the file is not executed. That
-is the fail-closed choice: a clean match stays pinned, and a changed, missing, or untracked
-file is refused. Imports inside a sourceless or extension file are not walked. A tracked
-``.pyc`` beside a same-stem ``.py`` is not the loaded module (source is tried first) and
-stays allowed.
+When the import resolves to a sourceless ``.pyc``, those worktree bytes are hashed with
+``git hash-object --no-filters`` and the file is not executed. A clean match stays pinned,
+and a changed, missing, or untracked file is refused. The code object (marshal after the
+16-byte header) is read and its ``IMPORT_NAME`` targets are walked like source imports,
+including nested code objects in ``co_consts``. A dynamic import in that code refuses the
+pin. An extension file in the closure is hashed the same way; imports inside it are not
+walked. A tracked ``.pyc`` beside a same-stem ``.py`` is not the loaded module (source is
+tried first) and stays allowed, under a file pin and under a directory pin.
+
+Every hashed source module is scanned for calls that load code the import statements do
+not name. ``importlib.import_module``, ``importlib.__import__``, ``__import__`` and
+``importlib.util.spec_from_file_location`` add their target when the module name is a
+string literal, and a package-relative name only when the package or level is a literal
+too; any other argument refuses the pin. ``exec`` and ``compile`` of a string literal are
+scanned the same way; a non-literal argument refuses the pin. ``from X import *`` reads
+``X``'s ``__all__`` when that list or tuple is made of string literals and adds each
+``X.name`` submodule that resolves; a non-literal ``__all__`` refuses the pin. An
+assignment, augmented assignment or method call that mutates ``__path__``, ``sys.path``,
+``sys.meta_path`` or ``sys.path_hooks`` refuses the pin.
 
 ``os.walk`` records listing errors and fails closed. A directory mode such as ``0111``
 hides names from ``readdir``, ``os.walk``, and ``git ls-files --others`` while Python still
@@ -70,7 +83,9 @@ directory. An empty directory does not beat a tracked module or a later regular 
 Not checked here: ``sitecustomize`` reached through ``PYTHONPATH`` when the process is not
 isolated (``-B`` does not skip it); the ``PATH`` fallback when ``/usr/bin/git`` is absent;
 a ``__spec__`` whose paths still name the pinned file, which ``verify_loaded`` accepts;
-launching a driver as a plain script instead of the isolated runner.
+launching a driver as a plain script instead of the isolated runner; imports reached
+through ``getattr`` or another alias of the import functions; imports inside an extension
+module; a string-literal ``spec_from_file_location`` path that is not the hashed file.
 
 Anything else skips with a message naming both heads, instead of measuring code nobody pinned.
 Set ``RACE_STRESS_UNPINNED=1`` to run against an unpinned tree anyway (the run then reports
@@ -83,12 +98,15 @@ Re-pin by updating ``head`` and ``objects`` after re-running the suite on the ne
 from __future__ import annotations
 
 import ast
+import dis
 import importlib.machinery
 import importlib.util
+import marshal
 import os
 import shutil
 import stat
 import subprocess
+import types
 import unittest
 from pathlib import Path
 
@@ -245,11 +263,25 @@ def _allowed_untracked(root: Path, pin: str, rel: str) -> bool:
 
 
 def _directory_pin_shadows(root: Path, path: str, blobs: list[tuple[str, str]]) -> list[str]:
+    """Same shadow rules as a file pin for a tracked ``.pyc`` beside its ``.py``.
+
+    FileFinder tries source before sourceless bytecode, so ``registry.pyc`` next to
+    ``registry.py`` is not the loaded module. A sourceless ``.pyc`` (no same-stem
+    source) is still a non-source import, and a ``__pycache__`` entry still is.
+    """
+    source_stems: set[tuple[str, str]] = set()
+    for name, _blob in blobs:
+        base = Path(name).name
+        if base.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES)):
+            source_stems.add((Path(name).parent.as_posix(), _module_stem(base)))
     found: list[str] = []
     for name, _blob in blobs:
         base = Path(name).name
+        parent = Path(name).parent.as_posix()
         if "__pycache__" in Path(name).parts:
             found.append(f"bytecode cache {name}")
+        elif _is_bytecode(base) and (parent, _module_stem(base)) in source_stems:
+            continue
         elif _has_import_suffix(base) and not base.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES)):
             found.append(f"non-source import {name}")
     untracked = _untracked(root, path)
@@ -661,37 +693,692 @@ def _package_of(rel: str) -> str:
     return name.rpartition(".")[0]
 
 
-def _imported_modules(rel: str, text: str) -> list[str]:
-    """``recursion_core`` modules named by import statements in ``text``."""
-    package = _package_of(rel)
+def _from_parent(package: str, node: ast.ImportFrom) -> str:
+    """Absolute module an ``ImportFrom`` loads, or ``""`` when the relative import is nonsense."""
+    if node.level:
+        parts = package.split(".") if package else []
+        drop = node.level - 1
+        if drop > len(parts):
+            return ""
+        base = parts[:len(parts) - drop] if drop else list(parts)
+        if node.module:
+            return ".".join([*base, *node.module.split(".")])
+        return ".".join(base)
+    return node.module or ""
+
+
+def _static_import_names(package: str, node: ast.AST) -> tuple[list[str], str | None]:
+    """Import targets in ``node``, and the package of ``import *`` when there is one.
+
+    ``from . import name`` does not name the enclosing package again. ``*`` is not a
+    module; the caller reads ``__all__`` for that package.
+    """
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names], None
+    if not isinstance(node, ast.ImportFrom):
+        return [], None
+    parent = _from_parent(package, node)
+    found: list[str] = []
+    star: str | None = None
+    if node.level:
+        if node.module and parent:
+            found.append(parent)
+    elif node.module:
+        found.append(node.module)
+    for alias in node.names:
+        if alias.name == "*":
+            if parent:
+                star = parent
+            continue
+        if parent:
+            found.append(f"{parent}.{alias.name}")
+    return found, star
+
+
+def _resolve_level_name(name: str, level: int, package: str) -> str | None:
+    """Absolute name for ``__import__(name, level=level)`` inside ``package``.
+
+    Same rule as ``importlib._bootstrap._resolve_name``: ``level`` leading dots
+    climb ``package``, then ``name`` is appended.
+    """
+    if level <= 0:
+        return name or None
+    if not package or level > package.count(".") + 1:
+        return None
+    bits = package.rsplit(".", level - 1)
+    if len(bits) < level:
+        return None
+    base = bits[0]
+    if name:
+        return f"{base}.{name}"
+    return base or None
+
+
+def _resolve_import_module_name(name: str, package: str | None) -> str | None:
+    """Absolute name ``importlib.import_module(name, package)`` loads."""
+    if not name.startswith("."):
+        return name or None
+    if not package:
+        return None
+    level = 0
+    for character in name:
+        if character != ".":
+            break
+        level += 1
+    return _resolve_level_name(name[level:], level, package)
+
+
+_UNKNOWN = object()
+_NULL = object()
+_EXEC_DEPTH = 8
+_CALL_TAGS = {
+    ("importlib", "import_module"): "import_module",
+    ("importlib", "__import__"): "__import__",
+    ("__import__",): "__import__",
+    ("builtins", "__import__"): "__import__",
+    ("builtins", "exec"): "exec",
+    ("builtins", "compile"): "compile",
+    ("exec",): "exec",
+    ("compile",): "compile",
+    ("importlib", "util", "spec_from_file_location"): "spec",
+}
+_PATH_ATTRS = ("path", "meta_path", "path_hooks")
+_BYTECODE_DANGER = frozenset({
+    "__import__", "exec", "compile", "import_module", "spec_from_file_location"})
+
+
+def _keep_module(mod: str) -> bool:
+    parts = mod.split(".")
+    return mod.startswith("recursion_core") and all(part.isidentifier() for part in parts)
+
+
+def _kw_get(positional: list, keywords: dict, index: int, name: str):
+    if name in keywords:
+        return keywords[name]
+    if index < len(positional):
+        return positional[index]
+    return None
+
+
+def _call_effects(tag: str, positional: list, keywords: dict, package: str):
+    """``(modules, stars, dynamic, sources)`` for one import-shaped call.
+
+    ``dynamic`` refuses the pin. ``sources`` are string literals passed to ``exec``
+    or ``compile``, scanned as further source. A missing value is ``_UNKNOWN``.
+    """
+    if tag == "import_module":
+        name = _kw_get(positional, keywords, 0, "name")
+        if not isinstance(name, str):
+            return [], [], True, []
+        if name.startswith("."):
+            package_arg = _kw_get(positional, keywords, 1, "package")
+            if not isinstance(package_arg, str):
+                return [], [], True, []
+            resolved = _resolve_import_module_name(name, package_arg)
+        else:
+            resolved = name
+        if not resolved:
+            return [], [], True, []
+        return [resolved], [], False, []
+    if tag == "__import__":
+        name = _kw_get(positional, keywords, 0, "name")
+        fromlist = _kw_get(positional, keywords, 3, "fromlist")
+        level = _kw_get(positional, keywords, 4, "level")
+        if level is None:
+            level = 0
+        if (not isinstance(name, str) or isinstance(level, bool)
+                or not isinstance(level, int)):
+            return [], [], True, []
+        resolved = _resolve_level_name(name, level, package) if level else (name or None)
+        if not resolved:
+            return [], [], True, []
+        if fromlist is None:
+            return [resolved], [], False, []
+        if fromlist is _UNKNOWN or not isinstance(fromlist, (list, tuple)):
+            return [], [], True, []
+        if not all(isinstance(item, str) for item in fromlist):
+            return [], [], True, []
+        modules = [resolved]
+        stars: list[str] = []
+        if "*" in fromlist:
+            stars.append(resolved)
+        for item in fromlist:
+            if item and item != "*":
+                modules.append(f"{resolved}.{item}")
+        return modules, stars, False, []
+    if tag == "spec":
+        name = _kw_get(positional, keywords, 0, "name")
+        location = _kw_get(positional, keywords, 1, "location")
+        if not isinstance(name, str):
+            return [], [], True, []
+        if location is not None and (location is _UNKNOWN or not isinstance(location, str)):
+            return [], [], True, []
+        return [name], [], False, []
+    if tag in ("exec", "compile"):
+        source = _kw_get(positional, keywords, 0, "source")
+        if not isinstance(source, str):
+            return [], [], True, []
+        return [], [], False, [source]
+    return [], [], False, []
+
+
+def _string_seq(node: ast.AST | None) -> list[str] | None:
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return None
+    names: list[str] = []
+    for elt in node.elts:
+        if not isinstance(elt, ast.Constant) or not isinstance(elt.value, str):
+            return None
+        names.append(elt.value)
+    return names
+
+
+def _is_all_target(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "__all__"
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return any(_is_all_target(elt) for elt in node.elts)
+    if isinstance(node, ast.Starred):
+        return _is_all_target(node.value)
+    return False
+
+
+def _literal_all(text: str) -> tuple[list[str] | None, bool]:
+    """``(names, dynamic)`` from assignments to ``__all__``.
+
+    No assignment is ``([], False)``. A non-literal assignment is ``(None, True)``.
+    Several literal assignments are united, which is the fail-closed set.
+    """
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return []
-    found: list[str] = []
+        return None, True
+    names: list[str] = []
+    saw = False
+    dynamic = False
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            found.extend(alias.name for alias in node.names)
-            continue
-        if not isinstance(node, ast.ImportFrom):
-            continue
-        if node.level:
-            parts = package.split(".") if package else []
-            drop = node.level - 1
-            if drop > len(parts):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.AST] = list(node.targets)
+            value: ast.AST | None = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is None:
                 continue
-            base = parts[:len(parts) - drop] if drop else list(parts)
-            if node.module:
-                parent = ".".join([*base, *node.module.split(".")])
-                found.append(parent)
-            else:
-                parent = ".".join(base)
-            # ``from pkg import name`` loads ``pkg.name`` when that submodule exists.
-            found.extend(f"{parent}.{alias.name}" for alias in node.names if parent)
-        elif node.module:
-            found.append(node.module)
-            found.extend(f"{node.module}.{alias.name}" for alias in node.names)
-    return [mod for mod in found if mod.startswith("recursion_core")]
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.AugAssign):
+            if _is_all_target(node.target):
+                saw = True
+                dynamic = True
+            continue
+        else:
+            continue
+        if not any(_is_all_target(target) for target in targets):
+            continue
+        saw = True
+        seq = _string_seq(value) if len(targets) == 1 and isinstance(targets[0], ast.Name) else None
+        if seq is None:
+            dynamic = True
+        else:
+            names.extend(seq)
+    if not saw:
+        return [], False
+    if dynamic:
+        return None, True
+    return names, False
+
+
+class _SourceScan(ast.NodeVisitor):
+    """Import closure and fail-closed reasons for one hashed source module."""
+
+    def __init__(self, rel: str, depth: int, aliases: dict | None,
+                 sys_names: set | None, path_aliases: dict | None) -> None:
+        self.rel = rel
+        self.package = _package_of(rel)
+        self.depth = depth
+        self.modules: list[str] = []
+        self.stars: list[str] = []
+        self.problems: list[str] = []
+        self.aliases: dict[str, tuple[str, ...]] = {
+            "__import__": ("__import__",),
+            "exec": ("exec",),
+            "compile": ("compile",),
+        }
+        if aliases:
+            self.aliases.update(aliases)
+        self.sys_names = set(sys_names) if sys_names is not None else {"sys"}
+        self.sys_names.add("sys")
+        self.path_aliases = dict(path_aliases or {})
+
+    def finish(self) -> tuple[list[str], list[str], list[str]]:
+        modules = [mod for mod in self.modules if _keep_module(mod)]
+        stars = [mod for mod in self.stars if _keep_module(mod)]
+        return modules, stars, self.problems
+
+    def _dyn(self) -> None:
+        self.problems.append(f"{self.rel} dynamic import")
+
+    def _mut(self, label: str) -> None:
+        self.problems.append(f"{self.rel} mutates {label}")
+
+    def collect_aliases(self, tree: ast.AST) -> None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    parts = tuple(alias.name.split("."))
+                    if not parts or any(part in ("", ".", "..") for part in parts):
+                        continue
+                    if alias.asname:
+                        self.aliases[alias.asname] = parts
+                    else:
+                        self.aliases[parts[0]] = (parts[0],)
+                    if parts == ("sys",):
+                        self.sys_names.add(alias.asname or "sys")
+                continue
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            base_name = _from_parent(self.package, node) if node.level else (node.module or "")
+            if not base_name:
+                continue
+            base = tuple(base_name.split("."))
+            for alias in node.names:
+                if alias.name == "*":
+                    self._star_aliases(base)
+                    continue
+                local = alias.asname or alias.name
+                self.aliases[local] = base + (alias.name,)
+                if base == ("sys",) and alias.name in _PATH_ATTRS:
+                    self.path_aliases[local] = f"sys.{alias.name}"
+
+    def _star_aliases(self, base: tuple[str, ...]) -> None:
+        if base == ("importlib",):
+            self.aliases.setdefault("import_module", ("importlib", "import_module"))
+            self.aliases.setdefault("__import__", ("importlib", "__import__"))
+        elif base == ("importlib", "util"):
+            self.aliases.setdefault(
+                "spec_from_file_location",
+                ("importlib", "util", "spec_from_file_location"))
+        elif base == ("sys",):
+            for attr in _PATH_ATTRS:
+                self.path_aliases.setdefault(attr, f"sys.{attr}")
+
+    def _add_static(self, node: ast.AST) -> None:
+        names, star = _static_import_names(self.package, node)
+        self.modules.extend(names)
+        if star:
+            self.stars.append(star)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._add_static(node)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._add_static(node)
+        self.generic_visit(node)
+
+    def _dotted(self, node: ast.AST) -> tuple[str, ...] | None:
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id)
+        if isinstance(node, ast.Attribute):
+            base = self._dotted(node.value)
+            if base is None:
+                return None
+            return base + (node.attr,)
+        return None
+
+    def _const(self, node: ast.AST):
+        if isinstance(node, ast.Constant):
+            return node.value
+        return _UNKNOWN
+
+    def _exec_source(self, source: str) -> None:
+        if self.depth >= _EXEC_DEPTH:
+            self._dyn()
+            return
+        modules, stars, problems = _scan_source(
+            self.rel, source, depth=self.depth + 1, aliases=dict(self.aliases),
+            sys_names=set(self.sys_names), path_aliases=dict(self.path_aliases))
+        self.modules.extend(modules)
+        self.stars.extend(stars)
+        self.problems.extend(problems)
+
+    def _on_call(self, tag: str, node: ast.Call) -> None:
+        if any(kw.arg is None for kw in node.keywords):
+            self._dyn()
+            return
+        positional = [self._const(arg) for arg in node.args]
+        keywords = {kw.arg: self._const(kw.value) for kw in node.keywords if kw.arg}
+        modules, stars, dynamic, sources = _call_effects(tag, positional, keywords, self.package)
+        if dynamic:
+            self._dyn()
+        self.modules.extend(modules)
+        self.stars.extend(stars)
+        for source in sources:
+            self._exec_source(source)
+
+    def _is_sys(self, node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id in self.sys_names
+
+    def _path_expr(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            if node.id == "__path__":
+                return "__path__"
+            return self.path_aliases.get(node.id)
+        if isinstance(node, ast.Attribute):
+            if node.attr == "__path__":
+                return "__path__"
+            if node.attr in _PATH_ATTRS and self._is_sys(node.value):
+                return f"sys.{node.attr}"
+        return None
+
+    def _mutate_target(self, target: ast.AST) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._mutate_target(elt)
+            return
+        if isinstance(target, ast.Starred):
+            self._mutate_target(target.value)
+            return
+        label = self._path_expr(target)
+        if label:
+            self._mut(label)
+            return
+        if isinstance(target, ast.Subscript):
+            label = self._path_expr(target.value)
+            if label:
+                self._mut(label)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        tag = _CALL_TAGS.get(self._dotted(node.func) or ())
+        if tag:
+            self._on_call(tag, node)
+        if isinstance(node.func, ast.Attribute):
+            label = self._path_expr(node.func.value)
+            if label:
+                self._mut(label)
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self._mutate_target(target)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self._mutate_target(node.target)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._mutate_target(node.target)
+        self.generic_visit(node)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for target in node.targets:
+            self._mutate_target(target)
+        self.generic_visit(node)
+
+
+def _scan_source(rel: str, text: str, *, depth: int = 0, aliases: dict | None = None,
+                 sys_names: set | None = None, path_aliases: dict | None = None):
+    """``(modules, star packages, problems)`` for source ``text`` of ``rel``."""
+    if depth > _EXEC_DEPTH:
+        return [], [], [f"{rel} dynamic import"]
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return [], [], [f"{rel} could not parse imports"]
+    scan = _SourceScan(rel, depth, aliases, sys_names, path_aliases)
+    scan.collect_aliases(tree)
+    scan.visit(tree)
+    return scan.finish()
+
+
+def _pushes_null(ins: dis.Instruction) -> bool:
+    return ins.opname in ("LOAD_GLOBAL", "LOAD_ATTR") and isinstance(ins.arg, int) and ins.arg & 1 == 1
+
+
+def _path_label(item) -> str | None:
+    """``__path__`` or ``sys.path`` / ``sys.meta_path`` / ``sys.path_hooks``, else None."""
+    if isinstance(item, tuple) and item[0] == "n" and item[1] == "__path__":
+        return "__path__"
+    if (isinstance(item, tuple) and item[0] == "a" and item[2] in _PATH_ATTRS
+            and isinstance(item[1], tuple) and item[1][0] == "n" and item[1][1] == "sys"):
+        return f"sys.{item[2]}"
+    return None
+
+
+def _func_tag(item) -> str | None:
+    if isinstance(item, tuple) and item[0] == "n" and item[1] in (
+            "__import__", "exec", "compile", "import_module", "spec_from_file_location"):
+        return "spec" if item[1] == "spec_from_file_location" else item[1]
+    if isinstance(item, tuple) and item[0] == "a":
+        owner, attr = item[1], item[2]
+        if attr in ("import_module", "__import__", "spec_from_file_location"):
+            return "spec" if attr == "spec_from_file_location" else attr
+        if (attr in ("exec", "compile", "__import__") and isinstance(owner, tuple)
+                and owner[0] == "n" and owner[1] == "builtins"):
+            return attr
+    return None
+
+
+def _scan_code(code: types.CodeType, rel: str, package: str):
+    """``(modules, stars, sources, problems, lost)`` from one code object, not its nested ones."""
+    modules: list[str] = []
+    stars: list[str] = []
+    sources: list[str] = []
+    problems: list[str] = []
+    stack: list = []
+    kw_names: tuple = ()
+    lost = False
+
+    def push(item) -> None:
+        stack.append(item)
+
+    def pop():
+        if not stack:
+            return _UNKNOWN
+        return stack.pop()
+
+    instrs = list(dis.get_instructions(code))
+    for index, ins in enumerate(instrs):
+        op = ins.opname
+        if op in ("CACHE", "RESUME", "NOP", "PRECALL"):
+            continue
+        if op == "PUSH_NULL":
+            push(_NULL)
+        elif op == "LOAD_CONST":
+            push(("c", ins.argval))
+        elif op in ("LOAD_NAME", "LOAD_FAST", "LOAD_DEREF", "LOAD_GLOBAL"):
+            if _pushes_null(ins):
+                push(_NULL)
+            push(("n", ins.argval))
+        elif op == "LOAD_ATTR":
+            owner = pop()
+            if _pushes_null(ins):
+                push(_NULL)
+            push(("a", owner, ins.argval))
+        elif op in ("STORE_NAME", "STORE_GLOBAL"):
+            pop()
+            if ins.argval == "__path__":
+                problems.append(f"{rel} mutates __path__")
+        elif op in ("STORE_FAST", "STORE_DEREF", "POP_TOP", "RETURN_VALUE"):
+            pop()
+        elif op == "STORE_ATTR":
+            owner = pop()
+            pop()
+            if ins.argval == "__path__":
+                problems.append(f"{rel} mutates __path__")
+            elif ins.argval in _PATH_ATTRS and isinstance(owner, tuple) and owner[0] == "n" and owner[1] == "sys":
+                problems.append(f"{rel} mutates sys.{ins.argval}")
+        elif op in ("STORE_SUBSCR",):
+            _key = pop()
+            container = pop()
+            pop()
+            label = _path_label(container)
+            if label:
+                problems.append(f"{rel} mutates {label}")
+        elif op == "DELETE_SUBSCR":
+            pop()
+            label = _path_label(pop())
+            if label:
+                problems.append(f"{rel} mutates {label}")
+        elif op in ("BUILD_LIST", "BUILD_TUPLE", "BUILD_SET"):
+            for _ in range(ins.arg or 0):
+                pop()
+            push(_UNKNOWN)
+        elif op in ("BINARY_OP", "COMPARE_OP"):
+            pop()
+            pop()
+            push(_UNKNOWN)
+        elif op in ("RETURN_CONST",):
+            pass
+        elif op == "KW_NAMES":
+            kw_names = tuple(ins.argval or ())
+        elif op == "IMPORT_NAME":
+            name = ins.argval if isinstance(ins.argval, str) else None
+            ok = (index >= 2 and instrs[index - 2].opname == "LOAD_CONST"
+                  and instrs[index - 1].opname == "LOAD_CONST")
+            level = instrs[index - 2].argval if ok else None
+            fromlist = instrs[index - 1].argval if ok else None
+            pop()
+            pop()
+            push(_UNKNOWN)
+            good = (ok and name is not None and isinstance(level, int)
+                    and not isinstance(level, bool)
+                    and (fromlist is None or (
+                        isinstance(fromlist, tuple) and all(isinstance(item, str) for item in fromlist))))
+            if not good:
+                problems.append(f"{rel} dynamic import")
+                continue
+            resolved = _resolve_level_name(name, level, package) if level else (name or None)
+            if not resolved:
+                problems.append(f"{rel} dynamic import")
+                continue
+            modules.append(resolved)
+            if fromlist:
+                if "*" in fromlist:
+                    stars.append(resolved)
+                for item in fromlist:
+                    if item and item != "*":
+                        modules.append(f"{resolved}.{item}")
+        elif op == "IMPORT_FROM":
+            push(_UNKNOWN)
+        elif op == "CALL_INTRINSIC_1":
+            pop()
+            push(_UNKNOWN)
+        elif op == "CALL":
+            argc = ins.arg or 0
+            args = [pop() for _ in range(argc)]
+            args.reverse()
+            func = pop()
+            if stack and stack[-1] is _NULL:
+                pop()
+            names = kw_names
+            kw_names = ()
+            if len(names) > len(args):
+                lost = True
+                problems.append(f"{rel} dynamic import")
+                continue
+            positional = args[:-len(names)] if names else args
+            keywords = {}
+            for key, item in zip(names, args[len(args) - len(names):]):
+                keywords[key] = item[1] if isinstance(item, tuple) and item[0] == "c" else _UNKNOWN
+            pos_values = [item[1] if isinstance(item, tuple) and item[0] == "c" else _UNKNOWN
+                          for item in positional]
+            tag = _func_tag(func)
+            if isinstance(func, tuple) and func[0] == "a":
+                label = _path_label(func[1])
+                if label:
+                    problems.append(f"{rel} mutates {label}")
+            if tag is None:
+                continue
+            got, got_stars, dynamic, got_sources = _call_effects(tag, pos_values, keywords, package)
+            if dynamic:
+                problems.append(f"{rel} dynamic import")
+            modules.extend(got)
+            stars.extend(got_stars)
+            sources.extend(got_sources)
+        else:
+            lost = True
+    if lost and _BYTECODE_DANGER.intersection(code.co_names):
+        problems.append(f"{rel} dynamic import")
+    return modules, stars, sources, problems, lost
+
+
+def _scan_bytecode(path: Path, rel: str):
+    """``(modules, star packages, problems)`` for a sourceless ``.pyc``.
+
+    The code object is marshalled after the 16-byte header and is not executed.
+    Nested code objects in ``co_consts`` are walked the same way. A header or
+    marshal failure refuses the pin.
+    """
+    package = _package_of(rel)
+    try:
+        st = path.lstat()
+    except OSError:
+        return [], [], [f"{rel} could not read bytecode imports"]
+    if not stat.S_ISREG(st.st_mode):
+        return [], [], [f"{rel} could not read bytecode imports"]
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return [], [], [f"{rel} could not read bytecode imports"]
+    if len(data) < 16:
+        return [], [], [f"{rel} could not read bytecode imports"]
+    try:
+        code = marshal.loads(data[16:])
+    except (EOFError, ValueError, TypeError):
+        return [], [], [f"{rel} could not read bytecode imports"]
+    if not isinstance(code, types.CodeType):
+        return [], [], [f"{rel} could not read bytecode imports"]
+    modules: list[str] = []
+    stars: list[str] = []
+    problems: list[str] = []
+
+    def walk(block: types.CodeType) -> None:
+        got, got_stars, sources, probs, _lost = _scan_code(block, rel, package)
+        modules.extend(got)
+        stars.extend(got_stars)
+        problems.extend(probs)
+        for source in sources:
+            nested_m, nested_s, nested_p = _scan_source(rel, source)
+            modules.extend(nested_m)
+            stars.extend(nested_s)
+            problems.extend(nested_p)
+        for const in block.co_consts:
+            if isinstance(const, types.CodeType):
+                walk(const)
+            elif isinstance(const, tuple):
+                for item in const:
+                    if isinstance(item, types.CodeType):
+                        walk(item)
+
+    walk(code)
+    return ([mod for mod in modules if _keep_module(mod)],
+            [mod for mod in stars if _keep_module(mod)],
+            problems)
+
+
+def _star_submodules(root: Path, files: dict[str, tuple[str, str]], mod: str):
+    """Submodules named by a literal ``__all__``, or a reason ``__all__`` is not literal."""
+    if not _keep_module(mod):
+        return [], None
+    chosen = _select_import(root, files, mod)
+    if chosen is None:
+        return [], None
+    text = _read_module_text(root / chosen)
+    if text is None:
+        return [], "star import __all__ is not literal"
+    names, dynamic = _literal_all(text)
+    if dynamic or names is None:
+        return [], "star import __all__ is not literal"
+    found: list[str] = []
+    for name in names:
+        if not name.isidentifier():
+            continue
+        sub = f"{mod}.{name}"
+        if _select_import(root, files, sub) is not None:
+            found.append(sub)
+    return found, None
 
 
 def _tracked_regular(files: dict[str, tuple[str, str]], rel: str) -> bool:
@@ -785,10 +1472,10 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
     A directory pin also walks every tracked source file in the directory, so an import
     in the package body is part of the closure. FileFinder order applies: a namespace
     portion loses to a sibling module or extension and to ``__init__`` plus any loader
-    suffix, and a sourceless or extension file the import resolves to is hashed rather
-    than executed. Only ``recursion_core`` names are followed. The second list is every
-    tracked module path in that closure, so a shadow check can cover parents that are
-    not import-search directories.
+    suffix. A sourceless ``.pyc`` the import resolves to is hashed and its imports are
+    walked; an extension file is hashed and its imports are not. Only ``recursion_core``
+    names are followed. The second list is every tracked module path in that closure,
+    so a shadow check can cover parents that are not import-search directories.
     """
     indexed = _head_index(root)
     if indexed is None:
@@ -817,10 +1504,21 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
         if own:
             queue.extend(p for p in _resolved_paths(root, files, own) if p not in seen)
         text = _read_module_text(root / rel)
-        if text is None:
-            continue
-        for mod in _imported_modules(rel, text):
+        if text is not None:
+            modules, stars, probs = _scan_source(rel, text)
+        elif _is_bytecode(Path(rel).name):
+            modules, stars, probs = _scan_bytecode(root / rel, rel)
+        else:
+            modules, stars, probs = [], [], []
+        problems.extend(probs)
+        for mod in modules:
             queue.extend(p for p in _resolved_paths(root, files, mod) if p not in seen)
+        for mod in stars:
+            subs, problem = _star_submodules(root, files, mod)
+            if problem:
+                problems.append(f"{rel} {problem}")
+            for sub in subs:
+                queue.extend(p for p in _resolved_paths(root, files, sub) if p not in seen)
     closure: list[str] = []
     if path in files and files[path][0] in ("100644", "100755"):
         closure.append(path)

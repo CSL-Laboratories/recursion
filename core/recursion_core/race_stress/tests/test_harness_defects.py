@@ -65,6 +65,17 @@ def _write(root: Path, files: dict[str, str]) -> None:
         dest.write_text(text)
 
 
+def _isolated(repo: Path, code: str) -> str:
+    """Run ``code`` as ``python -I -B`` with ``repo/core`` inserted on ``sys.path``.
+
+    ``-I`` drops ``PYTHONPATH``. The snippet receives that core directory as ``sys.argv[1]``,
+    which is how the harness launches a pinned tree.
+    """
+    return subprocess.check_output(
+        [sys.executable, "-I", "-B", "-c", code, str(repo / "core")],
+        env=_git_env(), text=True, cwd=repo).strip()
+
+
 class SeedTests(unittest.TestCase):
     def test_interleave_module_keeps_seed_zero(self) -> None:
         env = os.environ.copy()
@@ -1163,6 +1174,284 @@ class PinTests(unittest.TestCase):
             self.assertIn(rel, cached)
             ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
             self.assertTrue(ok, message)
+
+    def _routes(self, tmp: str, breaker: str, extra: dict[str, str] | None = None):
+        rel = "core/recursion_core/routes/breaker.py"
+        repo = Path(tmp) / "repo"
+        files = {
+            "core/recursion_core/__init__.py": '"""pkg"""\n',
+            "core/recursion_core/routes/__init__.py": "",
+            rel: breaker,
+        }
+        if extra:
+            files.update(extra)
+        head = _repo(repo, files)
+        self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+        return repo, rel
+
+    def test_import_module_literal_pulls_an_untracked_module_into_the_closure(self) -> None:
+        # importlib.import_module('recursion_core.routes.secret') loads secret.py.
+        # The import statement walker never saw that name, so a dirty file stayed pinned.
+        rel_secret = "core/recursion_core/routes/secret.py"
+        body = (
+            "import importlib\n"
+            "importlib.import_module('recursion_core.routes.secret')\n"
+            "VALUE = 1\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(tmp, body)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (repo / rel_secret).write_text("VALUE = 'secret'\n")
+            loaded = _isolated(
+                repo,
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import importlib\n"
+                "print(importlib.import_module('recursion_core.routes.secret').VALUE)\n")
+            self.assertEqual(loaded, "secret")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("secret.py", message)
+
+    def test_dunder_import_literal_pulls_a_dirty_module_into_the_closure(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        secret = "core/recursion_core/routes/secret.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "__import__('recursion_core.routes.secret')\nVALUE = 1\n",
+                {secret: "VALUE = 1\n"})
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            loaded = _isolated(
+                repo,
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "print(__import__('recursion_core.routes.secret', fromlist=['VALUE']).VALUE)\n")
+            self.assertEqual(loaded, "secret")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(secret, message)
+            (repo / secret).write_text("VALUE = 1\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            # A package-relative literal is the same module, not a free pass.
+            (repo / rel).write_text(
+                "import importlib\n"
+                "importlib.import_module('.secret', 'recursion_core.routes')\n")
+            # The breaker edit itself is dirty, so restore it through a new commit's pin
+            # only after proving the relative form still names secret. Re-commit both.
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            head = self._commit(repo, rel, secret)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (repo / secret).write_text("VALUE = 'else'\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(secret, message)
+
+    def test_nonliteral_dynamic_import_is_refused(self) -> None:
+        forms = {
+            "import_module":
+                "import importlib\n"
+                "def load(name):\n"
+                "    return importlib.import_module(name)\n",
+            "__import__":
+                "def load(name):\n"
+                "    return __import__(name)\n",
+            "importlib.__import__":
+                "import importlib\n"
+                "def load(name):\n"
+                "    return importlib.__import__(name)\n",
+            "spec_from_file_location":
+                "import importlib.util\n"
+                "def load(name, path):\n"
+                "    return importlib.util.spec_from_file_location(name, path)\n",
+            "exec":
+                "def load(code):\n"
+                "    exec(code)\n",
+            "compile":
+                "def load(code):\n"
+                "    return compile(code, '<s>', 'exec')\n",
+        }
+        for label, body in forms.items():
+            with self.subTest(form=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo, _rel = self._routes(tmp, body)
+                    ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+                    self.assertFalse(ok, message)
+                    self.assertIn("dynamic import", message)
+
+    def test_exec_of_a_literal_import_pulls_that_module_into_the_closure(self) -> None:
+        secret = "core/recursion_core/routes/secret.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "exec('import recursion_core.routes.secret')\nVALUE = 1\n",
+                {secret: "VALUE = 1\n"})
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            loaded = _isolated(
+                repo,
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "exec('import recursion_core.routes.secret')\n"
+                "print(sys.modules['recursion_core.routes.secret'].VALUE)\n")
+            self.assertEqual(loaded, "secret")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(secret, message)
+
+    def test_star_import_follows_a_literal_all_and_refuses_a_dynamic_one(self) -> None:
+        secret = "core/recursion_core/pkg/secret.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "from recursion_core.pkg import *\nVALUE = 1\n",
+                {
+                    "core/recursion_core/pkg/__init__.py": "__all__ = ['secret']\n",
+                    secret: "VALUE = 1\n",
+                })
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            loaded = _isolated(
+                repo,
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from recursion_core.pkg import *\n"
+                "print(secret.VALUE)\n")
+            self.assertEqual(loaded, "secret")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("secret.py", message)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "from recursion_core.pkg import *\nVALUE = 1\n",
+                {"core/recursion_core/pkg/__init__.py": "names = ['secret']\n__all__ = names\n"})
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("star import", message)
+            self.assertIn("__all__", message)
+
+    def test_path_mutation_in_a_hashed_module_is_refused(self) -> None:
+        # pkg/__init__.py inserts an overlay outside core/. Python then loads
+        # overlay/sub.py instead of the hashed pkg/sub.py. The bytes of sub.py match HEAD.
+        init = (
+            "from pathlib import Path\n"
+            "__path__.insert(0, str(Path(__file__).resolve().parents[3] / 'overlay'))\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "from recursion_core.pkg.sub import VALUE\n",
+                {
+                    "core/recursion_core/pkg/__init__.py": init,
+                    "core/recursion_core/pkg/sub.py": "VALUE = 'tree'\n",
+                })
+            overlay = repo / "overlay"
+            overlay.mkdir()
+            (overlay / "sub.py").write_text("VALUE = 'overlay'\n")
+            loaded = _isolated(
+                repo,
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from recursion_core.pkg.sub import VALUE\n"
+                "print(VALUE)\n")
+            self.assertEqual(loaded, "overlay")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("mutates __path__", message)
+            self.assertNotIn("worktree bytes differ", message)
+        mutations = {
+            "__path__ assign": "__path__ = ['/tmp/overlay']\n",
+            "__path__ aug": "__path__ += ['/tmp/overlay']\n",
+            "sys.path": "import sys\nsys.path.insert(0, '/tmp/overlay')\n",
+            "sys.meta_path": "import sys\nsys.meta_path.append(object())\n",
+            "sys.path_hooks": "import sys\nsys.path_hooks.append(object())\n",
+        }
+        for label, body in mutations.items():
+            with self.subTest(form=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo, _rel = self._routes(tmp, body)
+                    ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+                    self.assertFalse(ok, message)
+                    self.assertIn("mutates ", message)
+
+    def test_sourceless_pyc_imports_join_the_closure(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        victim = "core/recursion_core/victim.py"
+        pyc = "core/recursion_core/onlypyc.pyc"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                "core/recursion_core/routes/__init__.py": "import recursion_core.onlypyc\n",
+                rel: "VALUE = 1\n",
+                victim: "VALUE = 1\n",
+            }
+            _repo(repo, files)
+            self._sourceless(repo / pyc, "import recursion_core.victim\n")
+            head = self._commit(repo, pyc)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            (repo / victim).write_text("VALUE = 'victim'\n")
+            loaded = _isolated(
+                repo,
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import recursion_core.onlypyc\n"
+                "import recursion_core.victim\n"
+                "print(recursion_core.victim.VALUE)\n")
+            self.assertEqual(loaded, "victim")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(victim, message)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                "core/recursion_core/routes/__init__.py": "import recursion_core.onlypyc\n",
+                rel: "VALUE = 1\n",
+            }
+            _repo(repo, files)
+            self._sourceless(
+                repo / pyc,
+                "def load(name):\n"
+                "    import importlib\n"
+                "    return importlib.import_module(name)\n"
+                "VALUE = 1\n")
+            head = self._commit(repo, pyc)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("dynamic import", message)
+
+    def test_directory_pin_allows_tracked_pyc_beside_same_stem_source(self) -> None:
+        # FileFinder loads registry.py, not registry.pyc. A file pin already allowed
+        # the tracked sibling; a directory pin called it a non-source import.
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+            }
+            _repo(repo, files)
+            pyc = repo / rel / "registry.pyc"
+            pyc.write_bytes(b"not-the-loaded-module")
+            head = self._commit(repo, f"{rel}/registry.pyc")
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            self.assertNotIn("non-source import", message)
 
 
 class DaemonResourceTests(unittest.TestCase):

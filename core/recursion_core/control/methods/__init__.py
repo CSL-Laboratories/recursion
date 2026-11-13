@@ -1,7 +1,9 @@
 """The method table (seam S1): the control methods other lanes answer, and the one dispatcher that runs them.
 
 Six methods are answered by the code that answers them today and are never in this table: ``run.start``,
-``run.status``, ``run.list``, ``run.stop``, ``route.list`` and ``plugin.list`` (``BUILT_IN``). A handler
+``run.status``, ``run.list``, ``run.stop``, ``route.list`` and ``plugin.list`` (``BUILT_IN``). A seventh,
+``methods.list``, is answered by this table itself: what this daemon implements now. Those seven are the
+MANDATORY built-ins: every daemon answers them, none of them can answer ``unsupported``, and a handler
 cannot replace one.
 
 ``METHODS`` lists every method of the published table (``schemas/control/v1/methods.table.v1.json``) with
@@ -12,9 +14,10 @@ name that is in ``METHODS`` and has no handler in this daemon is answered ``unsu
 
 A lane registers a handler from its registrant module's ``register(hooks)``::
 
-    hooks.methods.register("session.turn", handler, service="sessions")
+    hooks.methods.register("session.turn", handler, service="sessions", tenant=tenant_of)
 
     handler(ctx, params) -> answer          a dict with a "code"
+    tenant_of(principal, params) -> tenant  for a method keyed by command_id only; see "the tenant" below
 
 ``ctx`` (``Context``) carries:
 
@@ -56,11 +59,20 @@ command: ``busy``, ``unavailable``) raises ``NotAccepted(answer)``: the transact
 nothing is stored, no callback runs, and the caller gets ``answer``; the same id may be sent again. A
 handler that raises anything else is rolled back the same way and the caller gets ``unavailable``.
 
-The payload digest is the SHA-256 of the UTF-8 bytes of the params without ``command_id``, written as RFC
-8785 writes JSON (keys in UTF-16 order, no spaces, numbers as ECMAScript writes them). Params that have
-no such text (a whole number outside the exact range, a number that is not finite, half a surrogate
-pair) are ``request_invalid``. The tenant of the identity is the ``tenant`` the params name, or the
-empty string for a method whose params name none.
+The payload digest is the SHA-256 of the UTF-8 bytes of the params AS SUPPLIED without ``command_id``,
+written as RFC 8785 writes JSON (keys in UTF-16 order, no spaces, numbers as ECMAScript writes them).
+Absence is preserved: no default is inserted before the digest is taken. Params that have no such text
+(a whole number outside the exact range, a number that is not finite, half a surrogate pair) are
+``request_invalid``.
+
+THE TENANT of the identity ``(tenant, method, command_id)`` is derived from the AUTHORIZED TARGET, never
+taken from params and never inferred. The caller is authorized for the target before the dispatcher is
+reached, so before any receipt is returned; the principal is not a further part of the key. A method
+keyed by ``command_id`` is therefore registered with one of two things as ``tenant``: a function
+``tenant_of(principal, params) -> tenant`` that names the tenant the target belongs to (the session's
+tenant, say), or the constant ``INSTALL_TENANT``, the explicitly named fixed namespace of a method whose
+target is the whole install. ``tenant_of`` runs before the transaction is opened; it raises
+``NotAccepted(answer)`` when there is no such target (``session_unknown``, say).
 
 AFTER THE COMMIT. ``ctx.after_commit(fn)`` is a callback of THIS PROCESS and nothing more. After a
 confirmed commit the dispatcher calls each ``fn`` once, in the order they were scheduled, outside every
@@ -110,6 +122,9 @@ from typing import NamedTuple
 log = logging.getLogger(__name__)
 
 BUILT_IN = ('run.start', 'run.status', 'run.list', 'run.stop', 'route.list', 'plugin.list')
+MANDATORY = (*BUILT_IN, 'methods.list')    # every daemon answers these; none can answer 'unsupported'
+TABLE_VERSION = '1.0-draft.7'              # of the published table these rows are
+INSTALL_TENANT = 'install'                 # the receipt namespace of a method whose target is the whole install
 MAX_INT = 2**53 - 1   # the largest whole number every reader of JSON numbers keeps exact
 MAX_DEPTH = 64        # of params, for the payload digest
 
@@ -118,14 +133,16 @@ class Row(NamedTuple):
     scope: str          # read | run | approve | manage
     mutating: bool
     idempotency: str    # none | client_key | command_id
+    beta: bool = True   # every method is beta except the six the daemon answers today
 
 
 def _rows() -> dict:
     read = lambda: Row('read', False, 'none')                 # noqa: E731
     keyed = lambda scope='run': Row(scope, True, 'command_id')  # noqa: E731
+    today = lambda: Row('read', False, 'none', False)         # noqa: E731
     return {
-        'run.start': Row('run', True, 'client_key'), 'run.status': read(), 'run.list': read(),
-        'run.stop': Row('run', True, 'none'), 'route.list': read(), 'plugin.list': read(),
+        'run.start': Row('run', True, 'client_key', False), 'run.status': today(), 'run.list': today(),
+        'run.stop': Row('run', True, 'none', False), 'route.list': today(), 'plugin.list': today(),
         'session.start': keyed(), 'session.turn': keyed(), 'session.steer': keyed(), 'session.queue': keyed(),
         'session.interrupt': keyed(), 'session.resume': keyed(), 'session.fork': keyed(),
         'session.export': read(), 'session.list': read(), 'session.status': read(), 'session.stop': keyed(),
@@ -263,6 +280,7 @@ class MethodTable:
     def __init__(self) -> None:
         self._handlers: dict[str, Callable] = {}
         self._needs: dict[str, str] = {}             # method -> the service it needs
+        self._tenant: dict[str, object] = {}         # command method -> its tenant_of, or INSTALL_TENANT
         self._frozen = False
         self.store = None                            # the event store's transaction helper, or None
         self.service_ready: Callable[[str], bool] = _always_ready
@@ -271,10 +289,10 @@ class MethodTable:
         self._slots: dict[tuple, list] = {}          # (tenant, method, command_id) -> [lock, waiters]
 
     # -- registration ----------------------------------------------------------------------------
-    def register(self, name: str, handler: Callable, *, service: str | None = None) -> None:
+    def register(self, name: str, handler: Callable, *, service: str | None = None, tenant=None) -> None:
         if self._frozen:
             raise MethodTableError(f'method {name!r}: the table is closed; register at composition')
-        if name in BUILT_IN or (isinstance(name, str) and name.startswith('run.')):
+        if name in MANDATORY or (isinstance(name, str) and name.startswith('run.')):
             raise MethodTableError(f'method {name!r} is answered by the daemon itself and cannot be replaced')
         if name not in METHODS:
             raise MethodTableError(f'method {name!r} is not in the method table')
@@ -284,6 +302,13 @@ class MethodTable:
             raise MethodTableError(f'method {name!r}: the handler is not callable')
         if service is not None and not (isinstance(service, str) and service):
             raise MethodTableError(f'method {name!r}: service is a name')
+        if METHODS[name].idempotency == 'command_id':
+            if tenant != INSTALL_TENANT and not callable(tenant):
+                raise MethodTableError(f'method {name!r} keeps a receipt: register it with tenant=, a function of '
+                                       '(principal, params) or INSTALL_TENANT')
+            self._tenant[name] = tenant
+        elif tenant is not None:
+            raise MethodTableError(f'method {name!r} keeps no receipt and takes no tenant')
         self._handlers[name] = handler
         if service is not None:
             self._needs[name] = service
@@ -293,7 +318,14 @@ class MethodTable:
 
     def implemented(self) -> tuple:
         """The methods this daemon answers now, in the table's order."""
-        return tuple(name for name in METHODS if name in BUILT_IN or name in self._handlers)
+        return tuple(name for name in METHODS if name in MANDATORY or name in self._handlers)
+
+    def listing(self) -> dict:
+        """The answer of ``methods.list``: every row of the table, and whether this daemon answers it now."""
+        answered = set(self.implemented())
+        return {'code': 'ok', 'table_version': TABLE_VERSION,
+                'methods': [{'name': name, 'implemented': name in answered, 'beta': row.beta}
+                            for name, row in METHODS.items()]}
 
     def registered(self) -> tuple:
         """The methods a lane registered a handler for, in the table's order."""
@@ -309,6 +341,8 @@ class MethodTable:
         row = METHODS.get(method) if isinstance(method, str) else None
         if row is None or method in BUILT_IN:
             return {'code': 'method_unknown', 'detail': str(method)}
+        if method == 'methods.list':
+            return self.listing()
         handler = self._handlers.get(method)
         if handler is None:
             return {'code': 'unsupported', 'detail': 'not_implemented'}
@@ -349,7 +383,17 @@ class MethodTable:
             digest = payload_digest(params)
         except ValueError:
             return {'code': 'request_invalid', 'detail': 'params'}
-        tenant = params.get('tenant') if isinstance(params.get('tenant'), str) else ''
+        tenant = self._tenant[method]
+        if tenant != INSTALL_TENANT:
+            try:
+                tenant = tenant(principal, params)
+                if not isinstance(tenant, str) or not tenant:
+                    raise TypeError(f'tenant_of of {method} named no tenant')
+            except NotAccepted as refusal:
+                return refusal.answer
+            except Exception as exc:  # noqa: BLE001 - no tenant, no receipt: nothing is run
+                log.exception('the tenant of %s could not be derived', method)
+                return {'code': 'unavailable', 'detail': f'tenant:{type(exc).__name__}'}
         key = (tenant, method, command_id)
         ctx, stage = None, 'store'
         with self._slot(key):

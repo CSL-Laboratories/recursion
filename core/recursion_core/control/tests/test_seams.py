@@ -462,10 +462,11 @@ class Handlers:
         return {'code': 'ok', 'turn_id': 'turn-' + params['command_id']}
 
 
-def table_with(store=None, **handlers):
+def table_with(store=None, tenant=methods.INSTALL_TENANT, **handlers):
     table = methods.MethodTable()
     for name, handler in handlers.items():
-        table.register(name.replace('_', '.', 1) if '.' not in name else name, handler)
+        keyed = methods.METHODS[name].idempotency == 'command_id'
+        table.register(name, handler, **({'tenant': tenant} if keyed else {}))
     table.store = store
     return table
 
@@ -476,9 +477,12 @@ TURN = {'command_id': 'cmd-1', 'session_id': 'ses-1', 'expected_revision': 3, 't
 class MethodTableTest(unittest.TestCase):
     def test_the_table_lists_the_six_built_in_methods_and_every_other_one_once(self) -> None:
         self.assertEqual(tuple(methods.METHODS)[:6], methods.BUILT_IN)
+        self.assertEqual(methods.MANDATORY, (*methods.BUILT_IN, 'methods.list'))
         self.assertEqual(len(methods.METHODS), 38)
         self.assertEqual(methods.METHODS['run.start'].idempotency, 'client_key')
-        self.assertEqual(methods.METHODS['run.stop'], methods.Row('run', True, 'none'))
+        self.assertEqual(methods.METHODS['run.stop'], methods.Row('run', True, 'none', False))
+        self.assertEqual([name for name, row in methods.METHODS.items() if not row.beta], list(methods.BUILT_IN),
+                         'only the six methods the daemon answers today are not beta')
         keyed = [name for name, row in methods.METHODS.items() if row.idempotency == 'command_id']
         self.assertTrue(all(methods.METHODS[name].mutating for name in keyed))
         self.assertEqual(sorted(name for name, row in methods.METHODS.items() if row.mutating and name not in keyed),
@@ -494,10 +498,14 @@ class MethodTableTest(unittest.TestCase):
         published = REPO / 'schemas' / 'control' / 'v1' / 'methods.table.v1.json'
         if not published.is_file():
             self.skipTest('schemas/control/v1/methods.table.v1.json is not in this checkout yet')
-        rows = json.loads(published.read_text(encoding='utf-8'))['methods']
-        self.assertEqual({row['name']: methods.Row(row['scope'], row['mutating'], row['idempotency']) for row in rows},
-                         methods.METHODS)
+        table = json.loads(published.read_text(encoding='utf-8'))
+        rows = table['methods']
+        self.assertEqual({row['name']: methods.Row(row['scope'], row['mutating'], row['idempotency'], row['beta'])
+                          for row in rows}, methods.METHODS)
         self.assertEqual([row['name'] for row in rows], list(methods.METHODS))
+        self.assertEqual(table['table_version'], methods.TABLE_VERSION)
+        self.assertEqual([row['name'] for row in rows if 'unsupported' not in row['codes']], list(methods.MANDATORY),
+                         'the mandatory built-ins are exactly the rows that cannot answer unsupported')
 
     def test_a_name_that_is_not_in_the_table_is_method_unknown_and_an_unbuilt_one_is_unsupported(self) -> None:
         table = methods.MethodTable()
@@ -507,11 +515,23 @@ class MethodTableTest(unittest.TestCase):
         self.assertEqual(table.dispatch(None, {}, H.OWNER, None), {'code': 'method_unknown', 'detail': 'None'})
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None),
                          {'code': 'unsupported', 'detail': 'not_implemented'})
-        self.assertEqual(table.implemented(), methods.BUILT_IN)
+        self.assertEqual(table.implemented(), methods.MANDATORY)
+
+    def test_methods_list_is_answered_by_the_table_itself_and_says_what_is_implemented_now(self) -> None:
+        table = methods.MethodTable()
+        table.register('session.list', lambda ctx, params: {'code': 'ok', 'sessions': []})
+        answer = table.dispatch('methods.list', {}, H.DEVICE, None)
+        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.7'))
+        self.assertEqual([row['name'] for row in answer['methods']], list(methods.METHODS), 'every row, in the table\'s order')
+        self.assertEqual([row['name'] for row in answer['methods'] if row['implemented']],
+                         [*methods.BUILT_IN, 'session.list', 'methods.list'])
+        self.assertEqual({row['name'] for row in answer['methods'] if not row['beta']}, set(methods.BUILT_IN))
+        self.assertTrue(all(set(row) == {'name', 'implemented', 'beta'} for row in answer['methods']))
+        self.assertNotIn('device.pair_begin', [row['name'] for row in answer['methods']], 'a reserved name is never listed')
 
     def test_a_handler_cannot_replace_a_built_in_method_or_take_a_name_outside_the_table(self) -> None:
         table = methods.MethodTable()
-        for name in (*methods.BUILT_IN, 'run.resume', 'session.kill', 'device.list'):
+        for name in (*methods.MANDATORY, 'run.resume', 'session.kill', 'device.list'):
             with self.subTest(name=name):
                 with self.assertRaises(methods.MethodTableError):
                     table.register(name, lambda ctx, params: {'code': 'ok'})
@@ -520,7 +540,7 @@ class MethodTableTest(unittest.TestCase):
             table.register('session.list', lambda ctx, params: {'code': 'ok', 'sessions': []})
         with self.assertRaises(methods.MethodTableError):
             table.register('session.status', 'not a function')
-        self.assertEqual(table.implemented(), (*methods.BUILT_IN, 'session.list'))
+        self.assertEqual(table.implemented(), (*methods.BUILT_IN, 'session.list', 'methods.list'))
 
     def test_a_read_only_handler_gets_the_principal_and_no_transaction(self) -> None:
         seen = []
@@ -547,7 +567,7 @@ class MethodTableTest(unittest.TestCase):
         self.assertEqual(handlers.calls, [(H.OWNER, True, TURN)])
         self.assertEqual((store.commits, store.rollbacks), (1, 0))
         digest = hashlib.sha256(b'{"expected_revision":3,"session_id":"ses-1","text":"go on"}').hexdigest()
-        self.assertEqual(store.receipts, {('', 'session.turn', 'cmd-1'): (digest, answer)})
+        self.assertEqual(store.receipts, {('install', 'session.turn', 'cmd-1'): (digest, answer)})
         self.assertEqual(store.rows, {('work', 'cmd-1'): {'operation_id': 'op-cmd-1', 'state': 'pending'}},
                          'the work intent is in the same commit as the receipt')
         self.assertEqual(handlers.callbacks, [('wake', 'cmd-1')])
@@ -570,15 +590,57 @@ class MethodTableTest(unittest.TestCase):
                          {'code': 'conflict', 'detail': 'command_id_reused'})
         self.assertEqual(len(handlers.calls), 1)
 
-    def test_the_identity_is_the_tenant_the_method_and_the_id(self) -> None:
-        handlers, store = Handlers(), FakeStore()
-        table = table_with(store, **{'session.turn': handlers.turn, 'session.queue': handlers.turn})
+    def test_the_identity_is_the_tenant_of_the_target_the_method_and_the_id(self) -> None:
+        handlers, store, asked = Handlers(), FakeStore(), []
+        owners = {'ses-1': 't1', 'ses-2': 't2'}
+
+        def tenant_of(principal, params):
+            asked.append((principal, params['session_id']))
+            return owners[params['session_id']]
+        table = table_with(store, tenant_of, **{'session.turn': handlers.turn, 'session.queue': handlers.turn})
         table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         table.dispatch('session.queue', dict(TURN), H.OWNER, None)
-        table.dispatch('session.turn', dict(TURN, tenant='t2'), H.OWNER, None)
-        self.assertEqual(sorted(store.receipts), [('', 'session.queue', 'cmd-1'), ('', 'session.turn', 'cmd-1'),
+        table.dispatch('session.turn', dict(TURN, session_id='ses-2'), H.DEVICE, None)
+        self.assertEqual(sorted(store.receipts), [('t1', 'session.queue', 'cmd-1'), ('t1', 'session.turn', 'cmd-1'),
                                                   ('t2', 'session.turn', 'cmd-1')])
         self.assertEqual(len(handlers.calls), 3)
+        self.assertEqual(asked[-1], (H.DEVICE, 'ses-2'))
+        # A tenant the params name is not the target's tenant: it changes the payload, never the namespace.
+        self.assertEqual(table.dispatch('session.turn', dict(TURN, tenant='t9'), H.OWNER, None),
+                         {'code': 'conflict', 'detail': 'command_id_reused'})
+        self.assertNotIn('t9', [tenant for tenant, _, _ in store.receipts])
+        # The principal is not part of the key: the same command from another caller is the same command.
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.DEVICE, None), {'code': 'ok', 'turn_id': 'turn-cmd-1'})
+        self.assertEqual(len(handlers.calls), 3)
+
+    @quiet
+    def test_a_command_whose_target_has_no_tenant_runs_nothing(self) -> None:
+        handlers, store = Handlers(), FakeStore()
+
+        def unknown(principal, params):
+            raise methods.NotAccepted({'code': 'session_unknown', 'session_id': params['session_id']})
+
+        def broken(principal, params):
+            raise OSError('session store unreadable')
+        for tenant_of, expected in ((unknown, {'code': 'session_unknown', 'session_id': 'ses-1'}),
+                                    (broken, {'code': 'unavailable', 'detail': 'tenant:OSError'}),
+                                    (lambda principal, params: None, {'code': 'unavailable', 'detail': 'tenant:TypeError'}),
+                                    (lambda principal, params: '', {'code': 'unavailable', 'detail': 'tenant:TypeError'})):
+            table = table_with(store, tenant_of, **{'session.turn': handlers.turn})
+            self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), expected)
+        self.assertEqual((handlers.calls, store.commits, store.rollbacks), ([], 0, 0))
+
+    def test_a_method_that_keeps_a_receipt_names_its_tenant_and_no_other_method_does(self) -> None:
+        table = methods.MethodTable()
+        for tenant in (None, 'install-wide', '', 7):
+            with self.subTest(tenant=tenant):
+                with self.assertRaises(methods.MethodTableError):
+                    table.register('session.turn', lambda ctx, params: {'code': 'ok'}, tenant=tenant)
+        with self.assertRaises(methods.MethodTableError):
+            table.register('session.list', lambda ctx, params: {'code': 'ok'}, tenant=methods.INSTALL_TENANT)
+        table.register('surface.prefs.set', lambda ctx, params: {'code': 'ok'}, tenant=methods.INSTALL_TENANT)
+        table.register('session.turn', lambda ctx, params: {'code': 'ok'}, tenant=lambda principal, params: 't1')
+        self.assertEqual(table.registered(), ('session.turn', 'surface.prefs.set'))
 
     def test_a_command_with_no_id_or_with_params_that_have_no_text_is_refused_before_the_handler(self) -> None:
         handlers = Handlers()
@@ -604,7 +666,7 @@ class MethodTableTest(unittest.TestCase):
         threads[0].start()
         handlers.entered.wait()
         threads[1].start()
-        key = ('', 'session.turn', 'cmd-1')
+        key = ('install', 'session.turn', 'cmd-1')
         while table._slots[key][1] < 2:   # the second command has arrived and waits for the first
             time.sleep(0.001)
         self.assertEqual(len(handlers.calls), 1, 'the second command did not enter the handler beside the first')
@@ -674,7 +736,7 @@ class MethodTableTest(unittest.TestCase):
         table = table_with(store, **{'session.turn': turn})
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'ok'})
         self.assertEqual(ran, ['first', 'third'])
-        self.assertEqual(list(store.receipts), [('', 'session.turn', 'cmd-1')])
+        self.assertEqual(list(store.receipts), [('install', 'session.turn', 'cmd-1')])
 
     def test_callbacks_run_after_the_commit_and_outside_the_commands_slot(self) -> None:
         seen, store = [], FakeStore()
@@ -704,7 +766,7 @@ class MethodTableTest(unittest.TestCase):
         self.assertEqual(woken, [], 'the callback that would have woken the worker never ran')
         self.assertEqual(store.rows, {('work', 'cmd-1'): {'operation_id': 'op-1', 'state': 'pending'}},
                          'the intent is committed: a service that scans for pending work finds it')
-        self.assertIn(('', 'session.turn', 'cmd-1'), store.receipts)
+        self.assertIn(('install', 'session.turn', 'cmd-1'), store.receipts)
         # The client retries after the restart: the receipt answers, and the work is not staged again.
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'ok', 'accepted': True})
         self.assertEqual(handlers.calls, ['cmd-1'])
@@ -735,7 +797,7 @@ class MethodTableTest(unittest.TestCase):
     def test_a_method_waits_for_its_service_before_any_transaction_is_opened(self) -> None:
         handlers, store, ready = Handlers(), FakeStore(), [False]
         table = methods.MethodTable()
-        table.register('session.turn', handlers.turn, service='sessions')
+        table.register('session.turn', handlers.turn, service='sessions', tenant=methods.INSTALL_TENANT)
         table.register('session.list', lambda ctx, params: {'code': 'ok', 'sessions': []})
         table.store, table.service_ready = store, lambda name: name == 'sessions' and ready[0]
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'unavailable', 'detail': 'service_starting'})
@@ -1222,7 +1284,12 @@ class StartRegistrantTest(unittest.TestCase):
         digest = 'a' * 64
         base = {'tenant': 't1', 'engine': 'codex', 'prompt': 'x', 'client_key': 'k-1'}
         one = made.start_intent(base, digest)
+        self.assertEqual(made.start_intent_text(base, digest), '{"engine":"codex","prompt_sha256":"%s"}' % digest)
         self.assertEqual(one, hashlib.sha256(('{"engine":"codex","prompt_sha256":"%s"}' % digest).encode()).hexdigest())
+        no_engine = {key: value for key, value in base.items() if key != 'engine'}
+        self.assertEqual(made.start_intent_text(no_engine, digest), '{"engine":null,"prompt_sha256":"%s"}' % digest,
+                         'a request that names no engine says so: the member is there, and null')
+        self.assertEqual(made.start_intent_text(dict(base, engine=None), digest), made.start_intent_text(no_engine, digest))
         # A missing field, a null one and one nobody declared are the same request.
         for same in (dict(base, workspace=None), dict(base, labels={'team': 'x'}), dict(base, containment_level='contained'),
                      dict(base, tenant='t2', client_key='k-2')):

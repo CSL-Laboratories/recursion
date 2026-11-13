@@ -725,14 +725,20 @@ class Hooks:
         return {field: params[field] for field in sorted(self.declared_fields()) if params.get(field) is not None}
 
     def start_intent(self, params: dict, prompt_sha256: str) -> str:
-        """The identity of a keyed start request, version 1: the SHA-256 of the canonical JSON (RFC 8785:
-        keys sorted, UTF-8, no insignificant space) of the engine as given, the prompt's digest, and each
-        DECLARED field that is present and not null. Computed by the daemon from what the client sent.
-        ``ValueError`` when a declared field has no such text."""
-        intent = {'prompt_sha256': prompt_sha256, **self.declared_present(params)}
-        if params.get('engine') is not None:
-            intent['engine'] = params['engine']
-        return hashlib.sha256(canonical_text(intent).encode('utf-8')).hexdigest()
+        """The identity of a keyed start request, version 1: the SHA-256 of the UTF-8 bytes of the canonical
+        JSON (RFC 8785: keys sorted, no insignificant space) of one object: ``engine`` as supplied, or
+        null when the request names none; ``prompt_sha256``; and each DECLARED extension that is present
+        and not null in the validated request. Undeclared, absent and null extensions are omitted. It is
+        computed by the daemon from what the client sent, BEFORE any registrant normalizes or routes the
+        request, and never from a registrant's output. ``ValueError`` when a declared field has no such
+        text. With no registrant (the versioned path off) there is no intent at all: the identity is the
+        legacy three members, exactly."""
+        return hashlib.sha256(self.start_intent_text(params, prompt_sha256).encode('utf-8')).hexdigest()
+
+    def start_intent_text(self, params: dict, prompt_sha256: str) -> str:
+        """The exact preimage of ``start_intent``."""
+        intent = {'engine': params.get('engine'), 'prompt_sha256': prompt_sha256, **self.declared_present(params)}
+        return canonical_text(intent)
 
     def launch_snapshot(self, principal: Principal, request: dict):
         """Run the start registrants for a NEW start: ``(launch, None)``, or ``(None, refusal answer)``.

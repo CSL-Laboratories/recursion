@@ -282,6 +282,45 @@ class Adv2FilesystemTests(Adv2HostCase):
         self.assertEqual(host3.authority_state, 'unavailable: ledger_invalid')
         self.assertIsNone(host3.authority)
 
+    def test_a_store_folder_that_cannot_be_used_refuses_typed(self):
+        """Not a store file that the store itself refuses, as above, but the folder the stores live in.
+        The failure is then the operating system's own error, raised before any store is opened. The host
+        answers it with the same typed code and loads nothing."""
+        sec = self.state / 'plugin-security'
+
+        def a_file_in_its_place():
+            sec.write_bytes(b'')
+
+        def a_folder_that_cannot_be_entered():
+            sec.mkdir(mode=0o700)
+            os.chmod(sec, 0o000)
+
+        def a_folder_that_cannot_be_written_to():
+            sec.mkdir(mode=0o700)
+            os.chmod(sec, 0o500)
+
+        shapes = [a_file_in_its_place]
+        if os.geteuid() != 0:  # root is not held back by Unix file modes
+            shapes += [a_folder_that_cannot_be_entered, a_folder_that_cannot_be_written_to]
+        for shape in shapes:
+            with self.subTest(shape=shape.__name__):
+                self.install(self.touch() + ANSWER)
+                self.state.mkdir(mode=0o700, exist_ok=True)
+                shape()
+                try:
+                    with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+                        host = self.host()
+                finally:
+                    if sec.is_dir():
+                        os.chmod(sec, 0o700)
+                        shutil.rmtree(sec)
+                    else:
+                        sec.unlink()
+                record = host.records[0]
+                self.assertEqual((record['state'], record['code'], record['detail']),
+                                 ('refused', 'revocation_store_invalid', 'PermissionError'))
+                self.assertFalse(self.marker.exists())
+
     def test_a_grant_for_another_digest_gives_no_permission(self):
         # 4.3: grants are bound to the artifact digest. Same-uid tampering of install.json is the documented
         # same-uid limit; a grant that names another digest must not apply.

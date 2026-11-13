@@ -5,6 +5,7 @@ format, so a fixed public value stands in for one and the test needs no ``crypto
 """
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -39,6 +40,47 @@ class StoreOpenErrorsTests(unittest.TestCase):
                         self.assertEqual(caught.exception.code, expected)
                     finally:
                         os.chmod(path, 0o600)
+
+    def test_a_read_only_ledger_from_before_the_index_raises_the_typed_refusal(self):
+        # The ledger can be read, and its anchor matches; it has no index yet and cannot be written, so
+        # the statement that would give it one fails after the open succeeded.
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "ledger.sqlite3")
+            create_ledger(path, ANCHOR)
+            db = sqlite3.connect(path)
+            try:
+                db.execute("DROP INDEX charges_by_profile")
+                db.execute("PRAGMA journal_mode=DELETE")  # a write-ahead log cannot be read read-only
+                db.commit()
+            finally:
+                db.close()
+            os.chmod(path, 0o400)
+            try:
+                with self.assertRaises(Refused) as caught:
+                    Authority(ANCHOR, path, lambda: 0)
+                self.assertEqual(caught.exception.code, "ledger_invalid")
+            finally:
+                os.chmod(path, 0o600)
+
+
+class LedgerIndexErrorsTests(unittest.TestCase):
+    """The ledger opens and its anchor matches; the failure comes one statement later, where a ledger
+    from before the index is given it. That is a typed refusal too, and not SQLite's own error. No file
+    mode is involved, so this runs on every platform and as root."""
+
+    def test_a_ledger_without_its_charges_table_raises_the_typed_refusal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "ledger.sqlite3")
+            create_ledger(path, ANCHOR)
+            db = sqlite3.connect(path)
+            try:
+                db.execute("DROP TABLE charges")  # its index goes with it
+                db.commit()
+            finally:
+                db.close()
+            with self.assertRaises(Refused) as caught:
+                Authority(ANCHOR, path, lambda: 0)
+            self.assertEqual(caught.exception.code, "ledger_invalid")
 
 
 if __name__ == "__main__":

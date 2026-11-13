@@ -162,19 +162,25 @@ class Adv2HungPluginTests(GuiCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             status, body = host.operator({'command': READ})
         self.assertEqual((status, body), (504, {'error': plugins.OPERATOR_TIMED_OUT}))
-        # "Answered at once" without a scheduler-sensitive bound: a read that waited for the turn
-        # (or made a new call) would take the 30 s turn wait; a stuck plugin is answered without it.
+        # A read that waited for the turn (or made a new call) would take the 30 s turn wait; a stuck
+        # plugin is answered without it. The wide bound tells that apart whatever the machine is doing.
         host._operator_turn_wait_s = 30.0
         started = time.monotonic()
         status, body = host.operator({'command': READ})
-        self.assertLess(time.monotonic() - started, 10.0, 'a read into a stuck plugin waited for the turn')
+        first = time.monotonic() - started
+        self.assertLess(first, 10.0, 'a read into a stuck plugin waited for the turn')
+        # The bound this first read had before the wide one, kept beside it: the first read into a stuck
+        # plugin is itself answered at once, so a delay that only the first such read meets is noticed. It
+        # is one read against the clock. A machine that stalls for a fifth of a second at this point fails
+        # it with nothing wrong in the host.
+        self.assertLess(first, 0.2, 'a read into a stuck plugin is answered at once')
         self.assertEqual(status, 504)
         self.assertIn('no new call was made', body['error'])
-        # The fast path itself, which the wide bound above does not hold to anything: while the plugin is
-        # stuck a read waits for nothing and calls nothing, so it answers 504 at once. One slow answer can
-        # be the machine, so the read is made five times and only the fastest is held to the bound. What
-        # this guarantees: the stuck path can answer in under half a second. A delay built into that path
-        # (a sleep, a wait) slows every one of the five and fails here; a busy machine does not.
+        # The fast path again: while the plugin is stuck a read waits for nothing and calls nothing, so it
+        # answers 504 at once. One slow answer can be the machine, so the read is made five more times and
+        # only the fastest is held to the bound. What this guarantees: the stuck path can answer in under a
+        # fifth of a second. A delay built into that path (a sleep, a wait) slows every one of the five and
+        # fails here. A busy machine fails it only by slowing all five, which is unlikely, not impossible.
         fastest = None
         for _ in range(5):
             started = time.monotonic()
@@ -183,7 +189,7 @@ class Adv2HungPluginTests(GuiCase):
             self.assertEqual(status, 504)
             self.assertIn('no new call was made', body['error'])
             fastest = took if fastest is None else min(fastest, took)
-        self.assertLess(fastest, 0.5, 'the fastest of five reads into a stuck plugin was not answered at once')
+        self.assertLess(fastest, 0.2, 'the fastest of five reads into a stuck plugin was not answered at once')
         self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')
         self.assertIn('a call has still not returned', host.inventory()['plugins'][0]['degraded'])
         self.assertIn('degraded', host.route_records()[0]['blocker'])

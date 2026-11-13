@@ -274,20 +274,26 @@ How the switch is written:
   it. This package does not remove one today; the driver can, or it goes with the route
   home.
 
-The last check before the launcher is a path bind after that descriptor read. `lstat`
-(it does not follow links) must show that `route_home` is still the held directory, that
-`route_home/.hermes` is still the directory opened under it, and that
-`route_home/.hermes/config.yaml` is still the inode the read accepted. Otherwise the
-launch refuses (`route_home_not_private` or `hermes_config_blocks_adopt_override`). A
-0700 directory with no `config.yaml` renamed onto the route path during the read would
-otherwise launch with that path as HOME, and Hermes would default
-`auth.adopt_external_logins` to true. A different file renamed onto `config.yaml` after
-the open, before `fstat`, would otherwise be what the child reads. The read checks the
-fd it opened; the path `lstat` is what runs last.
+The last check before the launcher re-reads the pinned descriptor, then the names.
+`fstat`, `pread`, `fstat`: size, `mtime_ns` and `ctime_ns` must match each other and the
+pin, and the bytes must be the recorded bytes. A same-size `O_TRUNC` that restores
+`mtime_ns` still changes `ctime_ns` once the inode clock moves, so it refuses. A rewrite
+that keeps the same `ctime_ns` is not distinguished. `.hermes` is opened from the held
+route-home fd and `fstat` of that fd must be the inode the listing recorded. `config.yaml`
+is then stat'd by name through that fd and must be the pinned inode. The directory is
+listed again (`.env`, `.op.env`, and on an API-key route any other name, refuse). `.hermes`
+is stat'd by name on the held route-home fd (`follow_symlinks=False`) and must be that fd's
+inode and the inode the listing recorded. `config.yaml` is stat'd once more, and `.env` and
+`.op.env` must be absent (`stat` returns `ENOENT`). A mismatch refuses and nothing is
+unlinked. A same-uid change after that final check remains (pre-existing residual): the
+child opens `config.yaml` and HOME by path. Subscription extra names, other than `.env`
+and `.op.env`, stay allowed. Allowing them is an owner decision (Lucas, PRODUCT.md
+`055cc7a5` section 2).
 
-A same-inode rewrite after that read cannot be bound. The child opens `config.yaml` by
-path, and `lstat` cannot see new bytes in the inode just read. The check does not try to
-close that window.
+Earlier in the same launch, a path bind still refuses a swapped route home or a
+`config.yaml` inode that is no longer the one the switch read accepted. A 0700 directory
+with no `config.yaml` renamed onto the route path during that read would otherwise launch
+with that path as HOME, and Hermes would default `auth.adopt_external_logins` to true.
 
 ## Configured requirements
 

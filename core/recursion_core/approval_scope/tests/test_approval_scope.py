@@ -1095,5 +1095,140 @@ class ExpiryLatchTests(unittest.TestCase):
         self.assertNotEqual(reopened.request_id, opened.request_id)
 
 
+class MalformedIdTests(unittest.TestCase):
+    """A non-minted id is unknown. The retirement filter must not raise on it.
+
+    Minted ids are ``secrets.token_hex(16)``: 32 lowercase hex digits. Parent
+    149e8dae answered anything else with ``unknown`` / ``request_unknown`` /
+    ``scope_unknown`` and left the live request usable.
+    """
+
+    def _world(self):
+        registry = CredentialRegistry()
+        auth = ApprovalAuthority(Clock(T0), registry)
+        plugin = cred(registry, "plugin", {"control"})
+        device = cred(registry, "paired_device", {"approve"})
+        return auth, plugin, device
+
+    def _bad_values(self, minted: str):
+        return (
+            ("non-ascii-suffix", minted[:-1] + "é"),
+            ("non-ascii-block", "é" * 16),
+            ("lone-surrogate-suffix", minted[:-1] + "\ud800"),
+            ("lone-surrogate-block", "\ud800" * 16),
+            ("bytes", b"\xff" * 16),
+            ("bytes-empty", b""),
+            ("int", 0),
+            ("none", None),
+        )
+
+    def _probe(self, auth, device, minted: str, scope_id: str, request_id: str,
+               digest: str) -> None:
+        for kind, bad in self._bad_values(minted):
+            with self.subTest(op="state", kind=kind):
+                self.assertEqual(auth.state(bad), "unknown")
+            with self.subTest(op="show", kind=kind):
+                with self.assertRaises(Refused) as ctx:
+                    auth.show(device, bad)
+                self.assertEqual(ctx.exception.code, "request_unknown")
+            with self.subTest(op="grant", kind=kind):
+                with self.assertRaises(Refused) as ctx:
+                    auth.grant(device, [bad], ttl_seconds=60)
+                self.assertEqual(ctx.exception.code, "request_unknown")
+            with self.subTest(op="approve", kind=kind):
+                with self.assertRaises(Refused) as ctx:
+                    auth.approve(device, bad, request_id, digest)
+                self.assertEqual(ctx.exception.code, "scope_unknown")
+            with self.subTest(op="deny", kind=kind):
+                with self.assertRaises(Refused) as ctx:
+                    auth.deny(device, bad, request_id, digest)
+                self.assertEqual(ctx.exception.code, "scope_unknown")
+            with self.subTest(op="approve-request", kind=kind):
+                with self.assertRaises(Refused) as ctx:
+                    auth.approve(device, scope_id, bad, digest)
+                self.assertEqual(ctx.exception.code, "scope_binding")
+            with self.subTest(op="deny-request", kind=kind):
+                with self.assertRaises(Refused) as ctx:
+                    auth.deny(device, scope_id, bad, digest)
+                self.assertEqual(ctx.exception.code, "scope_binding")
+
+    def _assert_live_usable(self, auth, device, opened, scope, other, other_scope) -> None:
+        self.assertEqual(auth.state(opened.request_id), "pending")
+        self.assertEqual(auth.state(other.request_id), "pending")
+        self.assertEqual(set(auth._grants), {scope.scope_id, other_scope.scope_id})
+        shown = auth.show(device, opened.request_id)
+        self.assertEqual(shown["request_id"], opened.request_id)
+        self.assertEqual(shown["digest"], opened.digest)
+        approved = auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+        self.assertEqual(approved["outcome"], "approved")
+        self.assertEqual(auth.state(opened.request_id), "approved")
+        with self.assertRaises(Refused) as ctx:
+            auth.approve(device, scope.scope_id, opened.request_id, opened.digest)
+        self.assertEqual(ctx.exception.code, "scope_replay")
+        denied = auth.deny(device, other_scope.scope_id, other.request_id, other.digest)
+        self.assertEqual(denied["outcome"], "denied")
+        self.assertEqual(auth.state(other.request_id), "denied")
+        with self.assertRaises(Refused) as ctx:
+            auth.deny(device, other_scope.scope_id, other.request_id, other.digest)
+        self.assertEqual(ctx.exception.code, "scope_replay")
+
+    def test_non_minted_ids_are_unknown_and_the_live_request_stays_usable(self) -> None:
+        auth, plugin, device = self._world()
+        opened = auth.open(plugin, request())
+        other = auth.open(plugin, request(effect={"n": 1}))
+        scope = grant(auth, device, [opened.request_id], ttl_seconds=60)
+        other_scope = grant(auth, device, [other.request_id], ttl_seconds=60)
+        self._probe(auth, device, opened.request_id, scope.scope_id, opened.request_id,
+                    opened.digest)
+        self._assert_live_usable(auth, device, opened, scope, other, other_scope)
+
+    def test_non_minted_ids_stay_unknown_when_every_bloom_bit_is_set(self) -> None:
+        auth, plugin, device = self._world()
+        opened = auth.open(plugin, request())
+        other = auth.open(plugin, request(effect={"n": 1}))
+        scope = grant(auth, device, [opened.request_id], ttl_seconds=60)
+        other_scope = grant(auth, device, [other.request_id], ttl_seconds=60)
+        filled = [(1 << 64) - 1] * len(auth._request_bloom._words)
+        auth._request_bloom._words[:] = filled
+        auth._grant_bloom._words[:] = list(filled)
+        unknown_request = "ab" * 16
+        unknown_scope = "ef" * 16
+        self.assertNotIn(unknown_request, auth._requests)
+        self.assertNotIn(unknown_scope, auth._grants)
+        # A minted-shape id still hits the filter. A non-minted id must not.
+        self.assertEqual(auth.state(unknown_request), "expired")
+        with self.assertRaises(Refused) as ctx:
+            auth.show(device, "cd" * 16)
+        self.assertEqual(ctx.exception.code, "request_expired")
+        with self.assertRaises(Refused) as ctx:
+            auth.approve(device, unknown_scope, opened.request_id, opened.digest)
+        self.assertEqual(ctx.exception.code, "scope_expired")
+        self._probe(auth, device, opened.request_id, scope.scope_id, opened.request_id,
+                    opened.digest)
+        self._assert_live_usable(auth, device, opened, scope, other, other_scope)
+
+    def test_bloom_encode_never_raises_and_ascii_ids_still_match(self) -> None:
+        ascii_id = "cd" * 16
+        bloom = scope_mod._IdBloom()
+        with self.subTest("ascii-roundtrip"):
+            bloom.add(ascii_id)
+            self.assertIn(ascii_id, bloom)
+            self.assertEqual(ascii_id.encode("ascii"),
+                             ascii_id.encode("utf-8", "surrogatepass"))
+        fresh = scope_mod._IdBloom()
+        for kind, key in (("non-ascii", "é" * 16), ("lone-surrogate", "\ud800" * 16)):
+            with self.subTest("contains", kind=kind):
+                self.assertNotIn(key, fresh)
+            with self.subTest("add", kind=kind):
+                fresh.add(key)
+                self.assertIn(key, fresh)
+        for kind, key in (("bytes", b"\xff" * 16), ("bytes-empty", b""), ("int", 0), ("none", None)):
+            with self.subTest("non-str", kind=kind):
+                self.assertNotIn(key, fresh)
+                fresh.add(key)
+                self.assertNotIn(key, fresh)
+        self.assertIn(ascii_id, bloom)
+
+
 if __name__ == "__main__":
     unittest.main()

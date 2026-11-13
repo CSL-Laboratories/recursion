@@ -48,8 +48,11 @@ id and digest passed along by a plugin are not enough to approve.
 The first valid answer to a request wins; any later answer, through this scope or
 another, is refused. Answered, expired and fully used rows are dropped. A bounded
 tombstone of their ids remains so a replay is refused; an id that falls out of that
-tombstone is still refused. One request holds at most ``MAX_GRANTS_PER_REQUEST``
-live grants. State lives only in memory: a restart can only ask again.
+tombstone is still refused. A value that is not a 32-digit lowercase hex string,
+the shape minted ids have, is not retired: ``state`` reports ``unknown``, and
+``show``, ``grant``, ``approve`` and ``deny`` refuse it as unknown. One request
+holds at most ``MAX_GRANTS_PER_REQUEST`` live grants. State lives only in memory:
+a restart can only ask again.
 """
 
 from __future__ import annotations
@@ -90,6 +93,13 @@ _MAX_LIVE_GRANTS = 256
 _MAX_RECENTLY_REVOKED = 1024
 _ID = re.compile(r"[0-9a-f]{32}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _minted_id(value: object) -> bool:
+    """True for the 32-digit lowercase hex shape ``secrets.token_hex(16)`` mints."""
+    return type(value) is str and _ID.fullmatch(value) is not None
+
+
 _WIRE_FIELDS = frozenset({"schema", "scope_id", "holder", "bindings", "expires_at",
                           "delegable"})
 
@@ -113,6 +123,11 @@ class _IdBloom:
     Retired request and scope ids land here once their detailed tombstone is
     dropped. A false hit refuses an id the authority never issued. A stored id
     cannot later look unknown and be minted or approved again.
+
+    65536 bits and 4 hashes, never cleared. Near 100000 retired ids the
+    false-hit rate is about 0.99, so the 8 draws in ``_mint_id`` each look
+    taken and minting refuses with ``id_exhausted``. Dropping a stored id
+    would let it be minted again, so that saturation stays a residual.
     """
 
     _BITS = 1 << 16
@@ -121,7 +136,9 @@ class _IdBloom:
     def __init__(self) -> None:
         self._words = [0] * (self._BITS // 64)
 
-    def add(self, key: str) -> None:
+    def add(self, key: object) -> None:
+        if type(key) is not str:
+            return
         for bit in self._bits(key):
             self._words[bit >> 6] |= 1 << (bit & 63)
 
@@ -130,8 +147,14 @@ class _IdBloom:
             return False
         return all(self._words[bit >> 6] & (1 << (bit & 63)) for bit in self._bits(key))
 
-    def _bits(self, key: str) -> tuple[int, int, int, int]:
-        digest = hmac.new(b"csl-approval-tomb/v0", key.encode("ascii"), "sha256").digest()
+    def _bits(self, key: object) -> tuple[int, int, int, int]:
+        # utf-8 surrogatepass keeps the ASCII digest of every minted id and
+        # does not raise on a lone surrogate. add and contains skip non-strings.
+        if type(key) is str:
+            material = key.encode("utf-8", "surrogatepass")
+        else:
+            material = b""
+        digest = hmac.new(b"csl-approval-tomb/v0", material, "sha256").digest()
         mixed = int.from_bytes(digest[:8], "big")
         mask = self._MASK
         return (mixed & mask, (mixed >> 16) & mask, (mixed >> 32) & mask, (mixed >> 48) & mask)
@@ -412,7 +435,7 @@ class ApprovalAuthority:
 
     def _request_terminal(self, request_id: object) -> str | None:
         """Latched outcome of a request that is no longer live, if this id is known."""
-        if type(request_id) is not str:
+        if not _minted_id(request_id):
             return None
         found = self._request_tombs.get(request_id)
         if found is not None:
@@ -430,7 +453,9 @@ class ApprovalAuthority:
             raise Refused("request_answered")
 
     def _grant_for(self, scope_id: object) -> _Grant:
-        if type(scope_id) is not str:
+        # Live and tombstoned rows are resolved below, before the filter.
+        # Anything not minted is unknown and never reaches that filter.
+        if not _minted_id(scope_id):
             raise Refused("scope_unknown")
         grant = self._grants.get(scope_id)
         if grant is None:
@@ -442,7 +467,11 @@ class ApprovalAuthority:
         return grant
 
     def _live_request(self, request_id: object, now: int) -> _Request:
-        entry = self._requests.get(request_id) if type(request_id) is str else None
+        # A live row's id is always minted, so this does not skip one. The
+        # retirement filter is consulted only after the live map misses.
+        if not _minted_id(request_id):
+            raise Refused("request_unknown")
+        entry = self._requests.get(request_id)
         if entry is None:
             self._refuse_if_terminal(request_id)
             raise Refused("request_unknown")
@@ -591,6 +620,10 @@ class ApprovalAuthority:
         with self._lock:
             now = self._now()
             self._sweep(now)
+            # A non-minted id is unknown and skips the filter. A minted id
+            # resolves the live row before that filter.
+            if not _minted_id(request_id):
+                return "unknown"
             entry = self._requests.get(request_id)
             if entry is not None:
                 return entry.state

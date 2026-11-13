@@ -236,12 +236,23 @@ def _stripped_script_component(part: str) -> bool:
     return part.rstrip(" .") == ".."
 
 
+# Win32 device basenames, with or without an extension (``NUL.txt``). COM0 and LPT0
+# are not in this set. The check is a string test so every host refuses them.
+_DEVICE_BASENAME = re.compile(
+    r"(?i)^(con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(\..*)?$")
+
+
+def _reserved_device_component(part: str) -> bool:
+    return _DEVICE_BASENAME.fullmatch(part) is not None
+
+
 def _script_escapes(value: str) -> bool:
-    """An install-script name that is absolute, a stream, or walks out with ``..``."""
+    """An install-script name that is absolute, a stream, a device, or walks out with ``..``."""
     if os.path.isabs(value) or "\\" in value:
         return True
     parts = value.split("/")
-    return not parts or any(_stripped_script_component(part) for part in parts)
+    return not parts or any(
+        _stripped_script_component(part) or _reserved_device_component(part) for part in parts)
 
 
 def create_revocation_store(path: str) -> None:

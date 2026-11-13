@@ -21,24 +21,28 @@ holds against hostile in-process code (fleet F35, P1, measures that; B17 tracks 
 same-uid authority anchor). Nothing here spawns a process, so there is no cleanup path;
 any later spawn must use cgroup plus pidfd, never ``preexec_fn`` or ``PR_SET_PDEATHSIG``.
 
-A failed load puts the import tables back to the snapshot taken before the attempt
-and drops every module name that snapshot did not already have. It does not keep an
-import that looks genuine: origin, loader, and spec are under the plugin's control.
-An honest stdlib or core module imported during the attempt is removed, and so is a
-module another thread imported in that window. Callers import those names again.
+A failed load puts the import tables back. A module stays only when this attempt's
+import machinery loaded it through a finder that was already installed, from a
+path that was already searchable, and that origin is still the one recorded before
+the module body ran. A rewritten spec is not evidence. Every other name added
+during the attempt is dropped, and a parent-package attribute that still points
+at a dropped module is removed.
+
+A load that starts while another activation is inside exec is refused. The import
+lock is not re-entered and it is not waited on.
 
 Three residuals stay, and this process cannot close them. The plugin can change
 attributes of modules the snapshot kept. A thread it started can put a module back
-after the restore. It can replace the per-load import recorder and its finder while
-the attempt runs; the restore does not consult them. Closing those means running
-the plugin in a subprocess. Whether to do that is an owner decision. This loader
-does not spawn one.
+after the restore. It can replace the per-load import recorder and its finder
+while the attempt runs. Closing those means running the plugin in a subprocess.
+Whether to do that is an owner decision. This loader does not spawn one.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib.machinery
+import os
 import sys
 import threading
 import types
@@ -113,31 +117,41 @@ class _ImportRecord:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.created: dict[str, object] = {}
+        self.created: dict[str, tuple] = {}
+        self._specs: dict[str, tuple] = {}
         self.recording = False
+
+    def note_spec(self, name: str, origin: str | None, finder: object) -> None:
+        """Remember the origin the finder set, before the module body can rewrite it."""
+        with self._lock:
+            if self.recording and name not in self._specs:
+                self._specs[name] = (origin, finder)
 
     def remember(self, name: str, module: object) -> None:
         with self._lock:
             if self.recording and name not in self.created:
-                self.created[name] = module
+                origin, finder = self._specs.get(name, (None, None))
+                self.created[name] = (module, origin, finder)
 
     def reset(self) -> None:
         with self._lock:
             self.created.clear()
+            self._specs.clear()
             self.recording = True
 
-    def stop(self) -> dict[str, object]:
+    def stop(self) -> dict[str, tuple]:
         with self._lock:
             self.recording = False
             found = dict(self.created)
             self.created.clear()
+            self._specs.clear()
             return found
 
 
-# One activation at a time. Loaders share the process import tables, so a second
-# snapshot taken while the first is still inside exec would freeze the first
-# load's modules in place.
+# One activation at a time. A second load while this is held is refused: waiting
+# deadlocks a nested call on this thread and a cross-thread cycle.
 _import_isolation = threading.Lock()
+_import_depth = threading.local()
 _import_finding = threading.local()
 
 
@@ -208,6 +222,10 @@ class _RecordingFinder:
                 spec = find(fullname, path, target)
                 if spec is None:
                     continue
+                origin = getattr(spec, "origin", None)
+                if type(origin) is not str:
+                    origin = None
+                self._record.note_spec(fullname, origin, finder)
                 loader = getattr(spec, "loader", None)
                 if loader is not None and not isinstance(loader, _RecordingLoader):
                     spec.loader = _RecordingLoader(loader, self._record)
@@ -223,14 +241,14 @@ def _begin_import_record(record: _ImportRecord) -> None:
     sys.meta_path.insert(0, record.finder)
 
 
-def _end_import_record(record: _ImportRecord) -> None:
+def _end_import_record(record: _ImportRecord) -> dict:
     finder = getattr(record, "finder", None)
     if finder is not None:
         try:
             sys.meta_path.remove(finder)
         except ValueError:
             pass
-    record.stop()
+    return record.stop()
 
 
 class _ImportSnapshot:
@@ -249,20 +267,47 @@ class _ImportSnapshot:
         cache = sys.path_importer_cache
         self.cache = cache
         self.cache_items = dict(cache)
+        self.search_roots: list[str] = []
+        for entry in self.path_items:
+            self._add_root(entry)
         paths: dict[str, tuple] = {}
         for name, module in self.modules.items():
             try:
                 pkg_path = getattr(module, "__path__", None)
             except Exception:
                 continue
-            if not isinstance(pkg_path, list):
+            if pkg_path is None:
+                continue
+            if isinstance(pkg_path, list):
+                try:
+                    items = list(pkg_path)
+                except Exception:
+                    continue
+                for entry in items:
+                    self._add_root(entry)
+                paths[name] = (pkg_path, items, None)
+                continue
+            inner = getattr(pkg_path, "_path", None)
+            if not isinstance(inner, list):
                 continue
             try:
-                items = list(pkg_path)
+                items = list(inner)
             except Exception:
                 continue
-            paths[name] = (pkg_path, items)
+            for entry in items:
+                self._add_root(entry)
+            paths[name] = (pkg_path, items, inner)
         self.package_paths = paths
+
+    def _add_root(self, entry: object) -> None:
+        if type(entry) is not str or not entry:
+            return
+        try:
+            root = os.path.realpath(entry)
+        except (OSError, ValueError):
+            return
+        if root and root not in self.search_roots:
+            self.search_roots.append(root)
 
 
 def _restore_list(owner: object, attr: str, original: list, items: list) -> None:
@@ -280,18 +325,89 @@ def _restore_list(owner: object, attr: str, original: list, items: list) -> None
         setattr(owner, attr, list(items))
 
 
-def _restore_import_state(snap: _ImportSnapshot) -> None:
-    """Put every snapshotted import table back and drop names added since.
+_MISSING = object()
 
-    Nothing added during the attempt is kept. A rewritten spec, a finder, or
-    the per-load recorder is not evidence that a module is genuine.
+
+def _path_within(root: str, origin: str) -> bool:
+    try:
+        origin_real = os.path.realpath(origin)
+    except (OSError, ValueError):
+        return False
+    if not root or not origin_real:
+        return False
+    try:
+        return os.path.commonpath([root, origin_real]) == root
+    except ValueError:
+        return False
+
+
+def _trusted_added(name: str, module: object, recorded: dict, snap: _ImportSnapshot) -> bool:
+    """A module loaded by a pre-existing finder from a path that was already there.
+
+    The origin is the one recorded before the module body ran. A later rewrite
+    of ``__spec__.origin`` does not make an attacker file look installed.
     """
+    info = recorded.get(name)
+    if type(info) is not tuple or len(info) != 3 or module is None:
+        return False
+    rec_module, origin, finder = info
+    if module is not rec_module or finder is None or finder not in snap.meta_items:
+        return False
+    spec = getattr(module, "__spec__", None)
+    live = getattr(spec, "origin", None) if spec is not None else None
+    if type(live) is not str:
+        live = None
+    if live != origin:
+        return False
+    if origin in ("built-in", "frozen"):
+        return True
+    if type(origin) is not str or not origin:
+        return False
+    return any(_path_within(root, origin) for root in snap.search_roots)
+
+
+def _unbind_parent(modules: dict, name: str, module: object) -> None:
+    parent_name, dot, attr = name.rpartition(".")
+    if not dot or module is None:
+        return
+    parent = modules.get(parent_name)
+    if parent is None:
+        return
+    try:
+        current = getattr(parent, attr, _MISSING)
+    except Exception:
+        return
+    if current is not module:
+        return
+    try:
+        delattr(parent, attr)
+    except Exception:
+        return
+
+
+def _restore_import_state(snap: _ImportSnapshot, recorded: dict | None = None) -> None:
+    """Put every snapshotted import table back.
+
+    A name added during the attempt stays only when ``_trusted_added`` says the
+    import machinery loaded it from a path that was already searchable. Anything
+    else is dropped, and so is a parent attribute that still points at it.
+    """
+    recorded = {} if recorded is None else recorded
     modules = snap.modules_dict
     if sys.modules is not modules:
         sys.modules = modules
+    dropped: list[tuple[str, object]] = []
     for name in list(modules):
-        if name not in snap.modules:
-            modules.pop(name, None)
+        if name in snap.modules:
+            continue
+        module = modules.get(name)
+        if _trusted_added(name, module, recorded, snap):
+            continue
+        dropped.append((name, module))
+    for name, module in dropped:
+        _unbind_parent(modules, name, module)
+    for name, _module in dropped:
+        modules.pop(name, None)
     for name, module in snap.modules.items():
         if modules.get(name) is not module:
             modules[name] = module
@@ -303,7 +419,7 @@ def _restore_import_state(snap: _ImportSnapshot) -> None:
         sys.path_importer_cache = cache
     cache.clear()
     cache.update(snap.cache_items)
-    for name, (path_obj, items) in snap.package_paths.items():
+    for name, (path_obj, items, inner) in snap.package_paths.items():
         module = modules.get(name)
         if module is None:
             continue
@@ -315,8 +431,19 @@ def _restore_import_state(snap: _ImportSnapshot) -> None:
                     current = path_obj
                 except Exception:
                     pass
-            if isinstance(current, list):
-                current[:] = list(items)
+            if inner is None:
+                if isinstance(current, list):
+                    current[:] = list(items)
+                continue
+            live_inner = getattr(current, "_path", None)
+            if live_inner is not inner:
+                try:
+                    setattr(current, "_path", inner)
+                    live_inner = inner
+                except Exception:
+                    pass
+            if isinstance(live_inner, list):
+                live_inner[:] = list(items)
         except Exception:
             continue
 
@@ -514,7 +641,12 @@ class PluginLoader:
 
     def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
                   code_sha256: str) -> LoadedPlugin:
-        with _import_isolation:
+        if getattr(_import_depth, "depth", 0):
+            raise Refused("plugin_load_busy")
+        if not _import_isolation.acquire(blocking=False):
+            raise Refused("plugin_load_busy")
+        _import_depth.depth = 1
+        try:
             snap = _ImportSnapshot()
             record = _ImportRecord()
             module = types.ModuleType(_module_name(manifest.plugin_id))
@@ -534,9 +666,12 @@ class PluginLoader:
                     gil_on = self._gil_gate(manifest.plugin_id, findings)
                     self.last_findings = tuple(findings)
             finally:
-                _end_import_record(record)
+                created = _end_import_record(record)
                 if gil_on or failure is not None:
-                    _restore_import_state(snap)
+                    _restore_import_state(snap, created)
+        finally:
+            _import_depth.depth = 0
+            _import_isolation.release()
         if gil_on:
             raise Refused("core_poisoned_gil_enabled", manifest.plugin_id) from failure
         if failure is not None:

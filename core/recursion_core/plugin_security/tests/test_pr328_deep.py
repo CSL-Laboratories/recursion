@@ -227,19 +227,41 @@ class WindowsPathTests(unittest.TestCase):
         raw = manifest_bytes(dev.public, install_scripts=("scripts/install.sh",))
         self.assertEqual(parse_manifest(raw).install_scripts, ("scripts/install.sh",))
 
+    def test_win32_device_basenames_are_refused_on_every_host(self) -> None:
+        # NUL, CON, PRN, AUX, COM1-9, LPT1-9, CONIN$, CONOUT$, any case, with or without an extension.
+        dev = Key()
+        scripts = []
+        for name in ("NUL", "CON", "PRN", "AUX", "COM1", "COM9", "LPT1", "LPT9", "CONIN$", "CONOUT$"):
+            scripts.append(name)
+            scripts.append(name.lower() + ".txt")
+            scripts.append("scripts/" + name.swapcase())
+        scripts.extend(("dir/com1.sh", "lpt2.dat", "NuL.TxT", "scripts/CONOUT$.log"))
+        for script in scripts:
+            with self.subTest(script=script):
+                raw = manifest_bytes(dev.public, install_scripts=(script,))
+                with self.assertRaises(Refused) as ctx:
+                    parse_manifest(raw)
+                self.assertEqual(ctx.exception.code, "manifest_install_scripts")
+        for script in ("scripts/install.sh", "scripts/console.sh", "scripts/COM10.txt", "scripts/commit.py"):
+            raw = manifest_bytes(dev.public, install_scripts=(script,))
+            self.assertEqual(parse_manifest(raw).install_scripts, (script,))
+
 
 @needs_crypto
 class SharedImportRollbackTests(unittest.TestCase):
-    def _run_failing(self, source: bytes, *, plugin_id: str = "bad.plugin",
-                     root: str | None = None) -> str | None:
+    def _prepared(self, source: bytes, plugin_id: str = "bad.plugin"):
         dev = Key()
         kid = key_id(dev.public)
         trust = TrustStore({"dev": dev.public})
         raw = manifest_bytes(dev.public, plugin_id=plugin_id, source=source, permissions=("read",))
         grant = Grant(plugin_id, hashlib.sha256(source).hexdigest(), kid, ("read",))
-        loader = _loader(trust, {plugin_id: grant})
+        return _loader(trust, {plugin_id: grant}), raw, dev.sign(raw), source
+
+    def _run_failing(self, source: bytes, *, plugin_id: str = "bad.plugin",
+                     root: str | None = None) -> str | None:
+        loader, raw, sig, source = self._prepared(source, plugin_id)
         try:
-            loader.load(raw, dev.sign(raw), source, root=root)
+            loader.load(raw, sig, source, root=root)
         except Refused as exc:
             return exc.code
         return None
@@ -249,13 +271,13 @@ class SharedImportRollbackTests(unittest.TestCase):
         return plugin_id
 
     def test_a_failed_load_keeps_stdlib_imported_during_the_load(self) -> None:
-        """A stdlib module first imported by the failed attempt is dropped.
+        """A stdlib module the failed attempt imports stays, as one object.
 
-        The loader used to keep that import. Origin and spec are chosen by the
-        plugin, so the attempt no longer gets to leave ``graphlib`` loaded.
-        The cost is that the process imports it again afterwards.
+        A module the plugin assigns under its own name is still dropped. A
+        rewritten or path-shadowed spec is covered by the spoof tests.
         """
-        sys.modules.pop("graphlib", None)
+        import importlib
+        saved = sys.modules.pop("graphlib", None)
         plugin_id = "bad.plugin"
         source = (
             b"import graphlib, sys, types\n"
@@ -265,29 +287,35 @@ class SharedImportRollbackTests(unittest.TestCase):
         )
         try:
             self._load_failing(source, plugin_id=plugin_id)
-            self.assertIsNone(sys.modules.get("graphlib"))
+            real = sys.modules.get("graphlib")
+            self.assertIs(real, importlib.import_module("graphlib"))
+            self.assertTrue(hasattr(real, "TopologicalSorter"))
             self.assertIsNone(sys.modules.get(_module_name(plugin_id)))
         finally:
             sys.modules.pop("graphlib", None)
+            if saved is not None:
+                sys.modules["graphlib"] = saved
             sys.modules.pop(_module_name(plugin_id), None)
 
     def test_a_failed_load_keeps_a_module_imported_by_another_thread(self) -> None:
-        """``netrc`` imported by another thread during the attempt is dropped.
-
-        The snapshot cannot tell that import from one the plugin performed.
-        """
-        sys.modules.pop("netrc", None)
+        """``graphlib`` imported by another thread during the attempt keeps one identity."""
+        import importlib
+        saved = sys.modules.pop("graphlib", None)
         gate = threading.Event()
         done = threading.Event()
         coord = types.ModuleType("csl_coord_deep")
         coord.gate = gate
         coord.done = done
+        coord.mod = None
+        coord.cls = None
         sys.modules["csl_coord_deep"] = coord
 
         def importer() -> None:
             if not gate.wait(5):
                 return
-            import netrc  # noqa: F401 - the assertion is that this name survives rollback
+            import graphlib
+            coord.mod = graphlib
+            coord.cls = graphlib.TopologicalSorter
             done.set()
 
         worker = threading.Thread(target=importer)
@@ -301,10 +329,16 @@ class SharedImportRollbackTests(unittest.TestCase):
         try:
             self._load_failing(source)
             self.assertTrue(done.is_set())
-            self.assertIsNone(sys.modules.get("netrc"))
+            self.assertIs(sys.modules.get("graphlib"), coord.mod)
+            again = importlib.import_module("graphlib")
+            self.assertIs(again, coord.mod)
+            self.assertIs(again.TopologicalSorter, coord.cls)
+            self.assertIsInstance(coord.cls(), again.TopologicalSorter)
         finally:
             worker.join(5)
-            sys.modules.pop("netrc", None)
+            sys.modules.pop("graphlib", None)
+            if saved is not None:
+                sys.modules["graphlib"] = saved
             sys.modules.pop("csl_coord_deep", None)
 
     def test_a_failed_load_drops_planted_modules_inside_and_outside_the_root(self) -> None:
@@ -356,10 +390,10 @@ class SharedImportRollbackTests(unittest.TestCase):
         ).encode()
         try:
             self._load_failing(source)
-            # A real import made by the failed attempt is dropped with the planted names.
-            self.assertIsNone(sys.modules.get("graphlib"))
+            # A real import made by the failed attempt stays. Planted names do not.
             import importlib
-            real = importlib.import_module("graphlib")
+            real = sys.modules.get("graphlib")
+            self.assertIs(real, importlib.import_module("graphlib"))
             self.assertTrue(hasattr(real, "TopologicalSorter"))
             self.assertNotEqual(getattr(real, "marker", None), "pwned")
             import importlib
@@ -411,13 +445,10 @@ class SharedImportRollbackTests(unittest.TestCase):
             sys.modules.pop("calendar", None)
 
     def test_a_failed_load_keeps_a_genuine_core_import(self) -> None:
-        """A core module imported during a failed load is dropped.
+        """A core module imported during a failed load stays one object.
 
-        Keeping it meant reading the live spec and calling ``find_spec``, both
-        of which the plugin can point at a module it just loaded. The cost is
-        that ``recursion_core.child_env.launch`` is removed and imported again.
-        An attribute already set on a package that was loaded before the attempt
-        is not part of this rollback.
+        The parent-package attribute and ``sys.modules`` name the same module.
+        A live spec is not evidence: the spoof tests still drop a rewritten one.
         """
         name = "recursion_core.child_env.launch"
         saved = sys.modules.pop(name, None)
@@ -426,9 +457,14 @@ class SharedImportRollbackTests(unittest.TestCase):
         source = b"import recursion_core.child_env.launch\nraise RuntimeError('boom')\n"
         try:
             self._load_failing(source)
-            self.assertIsNone(sys.modules.get(name))
             import importlib
+            pkg = getattr(sys.modules["recursion_core"], "child_env", None)
+            loaded = sys.modules.get(name)
+            if pkg is not None:
+                self.assertIs(getattr(pkg, "launch", None), loaded)
             module = importlib.import_module(name)
+            self.assertIs(module, sys.modules.get(name))
+            self.assertIs(getattr(importlib.import_module("recursion_core.child_env"), "launch", None), module)
             self.assertTrue(hasattr(module, "spawn"))
             self.assertNotEqual(getattr(module, "marker", None), "pwned")
         finally:
@@ -619,6 +655,7 @@ class SharedImportRollbackTests(unittest.TestCase):
         try:
             self._load_failing(source)
             self.assertIsNone(sys.modules.get("logging.pwned_sub"))
+            self.assertFalse(hasattr(logging, "pwned_sub"))
             self.assertNotIn(attacker, list(logging.__path__))
             self.assertEqual(list(logging.__path__), before_path)
             self.assertNotEqual(getattr(sys.modules.get("logging.pwned_sub"), "marker", None), "pwned")
@@ -634,11 +671,207 @@ class SharedImportRollbackTests(unittest.TestCase):
             except (AttributeError, TypeError, ValueError):
                 pass
 
-    def test_concurrent_loads_do_not_share_one_import_recorder(self) -> None:
-        """Two ``PluginLoader.load`` calls must not share one import recorder.
+    def test_a_failed_child_env_import_keeps_one_validated_env(self) -> None:
+        """``from recursion_core import child_env`` is the module ``import_module`` returns.
 
-        The recorder used to be one module global. Overlapping loads wrote the
-        same ``created`` dict, so one load's cleanup judged the other's import.
+        ``ValidatedEnv`` and the policy lock stay one object, so spawn's type check
+        still names the class ``build_child_env`` returned.
+        """
+        import importlib
+        prefix = "recursion_core.child_env"
+        saved = {}
+        for key in list(sys.modules):
+            if key == prefix or key.startswith(prefix + "."):
+                saved[key] = sys.modules.pop(key)
+        parent = sys.modules["recursion_core"]
+        missing = object()
+        saved_attr = getattr(parent, "child_env", missing)
+        if saved_attr is not missing:
+            delattr(parent, "child_env")
+        source = b"import recursion_core.child_env\nraise RuntimeError('boom')\n"
+        try:
+            self._load_failing(source)
+            from recursion_core import child_env
+            again = importlib.import_module("recursion_core.child_env")
+            self.assertIs(child_env, again)
+            self.assertIs(getattr(parent, "child_env", None), again)
+            self.assertIs(child_env.ValidatedEnv, again.policy.ValidatedEnv)
+            self.assertIs(child_env.policy.ValidatedEnv, again.launch.ValidatedEnv)
+            self.assertIs(child_env.policy._TMP_LOCK, again.policy._TMP_LOCK)
+        finally:
+            for key in list(sys.modules):
+                if key == prefix or key.startswith(prefix + "."):
+                    sys.modules.pop(key, None)
+            sys.modules.update(saved)
+            if saved_attr is missing:
+                if hasattr(parent, "child_env"):
+                    delattr(parent, "child_env")
+            else:
+                parent.child_env = saved_attr
+
+    def _namespace_fixture(self):
+        import importlib
+        base = temp_dir(self)
+        os.makedirs(os.path.join(base, "nsrepro"))
+        evil_base = temp_dir(self)
+        evil_portion = os.path.join(evil_base, "nsrepro")
+        os.makedirs(evil_portion)
+        with open(os.path.join(evil_portion, "pwned_mod.py"), "w", encoding="utf-8") as fh:
+            fh.write("marker = 'pwned'\n")
+        sys.path.insert(0, base)
+        ns = importlib.import_module("nsrepro")
+        self.assertFalse(isinstance(ns.__path__, list))
+        return ns, evil_portion, base
+
+    def _clear_namespace(self, base: str) -> None:
+        import importlib
+        sys.modules.pop("nsrepro.pwned_mod", None)
+        sys.modules.pop("nsrepro", None)
+        while base in sys.path:
+            sys.path.remove(base)
+        importlib.invalidate_caches()
+
+    def test_a_failed_load_restores_a_namespace_path_append(self) -> None:
+        import importlib
+        ns, evil_portion, base = self._namespace_fixture()
+        original = ns.__path__
+        before = list(original)
+        source = (
+            "import nsrepro\n"
+            "nsrepro.__path__.append(%r)\n"
+            "raise RuntimeError('boom')\n" % evil_portion
+        ).encode()
+        try:
+            self._load_failing(source)
+            self.assertIs(ns.__path__, original)
+            self.assertNotIn(evil_portion, list(ns.__path__))
+            self.assertEqual(list(ns.__path__), before)
+            self.assertNotIn("nsrepro.pwned_mod", sys.modules)
+            with self.assertRaises(ImportError):
+                importlib.import_module("nsrepro.pwned_mod")
+        finally:
+            self._clear_namespace(base)
+
+    def test_a_failed_load_restores_a_rebound_namespace_path(self) -> None:
+        import importlib
+        ns, evil_portion, base = self._namespace_fixture()
+        original = ns.__path__
+        before = list(original)
+        source = (
+            "import nsrepro\n"
+            "nsrepro.__path__ = [%r]\n"
+            "raise RuntimeError('boom')\n" % evil_portion
+        ).encode()
+        try:
+            self._load_failing(source)
+            self.assertIs(ns.__path__, original)
+            self.assertNotIn(evil_portion, list(ns.__path__))
+            self.assertEqual(list(ns.__path__), before)
+            with self.assertRaises(ImportError):
+                importlib.import_module("nsrepro.pwned_mod")
+        finally:
+            self._clear_namespace(base)
+
+    def test_a_nested_load_on_the_same_thread_is_refused(self) -> None:
+        inner_source = b"raise RuntimeError('inner')\n"
+        inner_loader, raw, sig, source_bytes = self._prepared(inner_source, "bad.inner")
+        holder = types.ModuleType("csl_nest_deep5")
+        holder.loader = inner_loader
+        holder.raw = raw
+        holder.sig = sig
+        holder.source = source_bytes
+        holder.code = None
+        sys.modules["csl_nest_deep5"] = holder
+        outer = (
+            "import csl_nest_deep5\n"
+            "try:\n"
+            "    csl_nest_deep5.loader.load(csl_nest_deep5.raw, csl_nest_deep5.sig, csl_nest_deep5.source)\n"
+            "except Exception as exc:\n"
+            "    csl_nest_deep5.code = getattr(exc, 'code', type(exc).__name__)\n"
+            "else:\n"
+            "    csl_nest_deep5.code = 'returned'\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                box["outer"] = self._run_failing(outer, plugin_id="bad.outer")
+            except Exception as exc:  # noqa: BLE001 - the watchdog reads this on the main thread
+                box["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(5)
+        try:
+            self.assertFalse(worker.is_alive(), "nested load hung")
+            self.assertIsNone(box.get("error"))
+            self.assertEqual(holder.code, "plugin_load_busy")
+            self.assertEqual(box.get("outer"), "plugin_import_failed")
+        finally:
+            sys.modules.pop("csl_nest_deep5", None)
+
+    def test_a_cross_thread_load_is_refused_instead_of_waiting(self) -> None:
+        holder = types.ModuleType("csl_cycle_deep5")
+        holder.started = threading.Event()
+        holder.inner_done = threading.Event()
+        holder.inner_code = None
+        holder.ran = False
+        sys.modules["csl_cycle_deep5"] = holder
+        outer = (
+            "import csl_cycle_deep5\n"
+            "csl_cycle_deep5.started.set()\n"
+            "if not csl_cycle_deep5.inner_done.wait(2):\n"
+            "    raise RuntimeError('inner did not finish')\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        inner = (
+            "import csl_cycle_deep5\n"
+            "csl_cycle_deep5.ran = True\n"
+            "raise RuntimeError('boom')\n"
+        ).encode()
+        box: dict = {}
+
+        def run_inner() -> None:
+            if not holder.started.wait(5):
+                return
+            try:
+                holder.inner_code = self._run_failing(inner, plugin_id="bad.cycle.inner")
+            except Exception as exc:  # noqa: BLE001
+                holder.inner_code = type(exc).__name__
+            finally:
+                holder.inner_done.set()
+
+        def run_outer() -> None:
+            try:
+                box["outer"] = self._run_failing(outer, plugin_id="bad.cycle.outer")
+            except Exception as exc:  # noqa: BLE001
+                box["error"] = exc
+
+        threads = [
+            threading.Thread(target=run_outer, daemon=True),
+            threading.Thread(target=run_inner, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(8)
+        try:
+            self.assertFalse(any(thread.is_alive() for thread in threads), "cross-thread load hung")
+            self.assertIsNone(box.get("error"))
+            self.assertFalse(holder.ran)
+            self.assertEqual(holder.inner_code, "plugin_load_busy")
+            self.assertEqual(box.get("outer"), "plugin_import_failed")
+        finally:
+            for thread in threads:
+                thread.join(1)
+            sys.modules.pop("csl_cycle_deep5", None)
+
+    def test_concurrent_loads_do_not_share_one_import_recorder(self) -> None:
+        """Two loads must not share one import recorder.
+
+        A load that starts while another activation is inside exec is refused
+        instead of waiting. Recorders that do run are distinct objects.
         """
         holder = types.ModuleType("csl_coord_a6")
         holder.box = []
@@ -678,9 +911,11 @@ class SharedImportRollbackTests(unittest.TestCase):
                 thread.join(10)
             self.assertFalse(any(thread.is_alive() for thread in threads))
             self.assertEqual(errors, [])
-            self.assertEqual(sorted(holder.codes), ["plugin_import_failed", "plugin_import_failed"])
-            self.assertEqual(len(holder.box), 2)
-            self.assertNotEqual(holder.box[0], holder.box[1])
+            self.assertEqual(len(holder.codes), 2)
+            self.assertTrue(set(holder.codes) <= {"plugin_import_failed", "plugin_load_busy"})
+            self.assertIn("plugin_import_failed", holder.codes)
+            self.assertEqual(len(holder.box), len(set(holder.box)))
+            self.assertGreaterEqual(len(holder.box), 1)
         finally:
             for thread in threads:
                 thread.join(5)

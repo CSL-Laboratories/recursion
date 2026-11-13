@@ -48,7 +48,10 @@ id and digest passed along by a plugin are not enough to approve.
 The first valid answer to a request wins; any later answer, through this scope or
 another, is refused. Answered, expired and fully used rows are dropped. A bounded
 tombstone of their ids remains so a replay is refused; an id that falls out of that
-tombstone is still refused. A value that is not a 32-digit lowercase hex string,
+tombstone is still refused. Bloom words, the receipt, and the replacement tomb map
+are staged before any of those maps change. A fault while staging leaves the row
+where it was. The tomb is installed before the live row is removed, so a publish
+that stops in between still refuses the id. A value that is not a 32-digit lowercase hex string,
 the shape minted ids have, is not retired: ``state`` reports ``unknown``, and
 ``show``, ``grant``, ``approve`` and ``deny`` refuse it as unknown. One request
 holds at most ``MAX_GRANTS_PER_REQUEST`` live grants. State lives only in memory:
@@ -139,8 +142,31 @@ class _IdBloom:
     def add(self, key: object) -> None:
         if type(key) is not str:
             return
-        for bit in self._bits(key):
-            self._words[bit >> 6] |= 1 << (bit & 63)
+        self.publish(tuple(self.plan(key).items()))
+
+    def plan(self, key: object, pending: dict[int, int] | None = None) -> dict[int, int]:
+        """Word values after remembering ``key``. Reads the bloom and does not write it.
+
+        ``pending`` holds word values staged for this bloom and not yet published,
+        so a later id staged in the same commit sees the earlier bits. A fault
+        here, including from ``hmac.new``, leaves ``_words`` as they were.
+        """
+        if type(key) is not str:
+            return {} if pending is None else dict(pending)
+        bits = self._bits(key)
+        staged = dict(pending) if pending else {}
+        words = self._words
+        for bit in bits:
+            index = bit >> 6
+            current = staged[index] if index in staged else words[index]
+            staged[index] = current | (1 << (bit & 63))
+        return staged
+
+    def publish(self, updates: tuple[tuple[int, int], ...]) -> None:
+        """Install precomputed word values. Item assignment only."""
+        words = self._words
+        for index, value in updates:
+            words[index] = value
 
     def __contains__(self, key: object) -> bool:
         if type(key) is not str:
@@ -386,44 +412,100 @@ class ApprovalAuthority:
             self._seen_at = now
         return self._seen_at
 
-    def _remember(self, tombs: dict, bloom: _IdBloom, key: str, value: object) -> None:
-        """Keep a bounded tombstone. An id pushed out is retired in ``bloom``."""
+    def _prepare_tomb(self, tombs: dict, bloom: _IdBloom, key: str, value: object,
+                      pending: dict[int, int]) -> tuple[dict[int, int], dict]:
+        """Stage the next tomb map. Does not write ``tombs``, the bloom, or live rows.
+
+        ``pending`` is that bloom's unpublished word map. When ``tombs`` is full,
+        the oldest id's bits join that map before the id leaves the staged copy.
+        """
         if key in tombs:
-            del tombs[key]
-        elif len(tombs) >= _MAX_TOMBSTONES:
+            rebuilt = {k: v for k, v in tombs.items() if k != key}
+            rebuilt[key] = value
+            return pending, rebuilt
+        if len(tombs) >= _MAX_TOMBSTONES:
             dropped = next(iter(tombs))
-            del tombs[dropped]
-            bloom.add(dropped)
-        tombs[key] = value
+            pending = bloom.plan(dropped, pending)
+            rebuilt = {k: v for k, v in tombs.items() if k != dropped}
+            rebuilt[key] = value
+            return pending, rebuilt
+        rebuilt = dict(tombs)
+        rebuilt[key] = value
+        return pending, rebuilt
 
     def _evict_request(self, request_id: str, terminal: str) -> None:
+        pending, tombs = self._prepare_tomb(
+            self._request_tombs, self._request_bloom, request_id, terminal, {})
+        updates = tuple(pending.items())
+        self._request_bloom.publish(updates)
+        self._request_tombs = tombs
+        entry = self._requests.get(request_id)
+        if entry is not None:
+            entry.state = terminal
         self._requests.pop(request_id, None)
-        self._remember(self._request_tombs, self._request_bloom, request_id, terminal)
 
-    def _evict_grant(self, scope_id: str) -> None:
-        grant = self._grants.pop(scope_id, None)
+    def _evict_grant(self, scope_id: str, *, expire: bool = False) -> None:
+        grant = self._grants.get(scope_id)
         if grant is None:
             grant = self._grant_tombs.get(scope_id)
             if grant is None:
                 return
-        self._remember(self._grant_tombs, self._grant_bloom, scope_id, grant)
+        pending, tombs = self._prepare_tomb(
+            self._grant_tombs, self._grant_bloom, scope_id, grant, {})
+        updates = tuple(pending.items())
+        if expire:
+            grant.expired = True
+        self._grant_bloom.publish(updates)
+        self._grant_tombs = tombs
+        self._grants.pop(scope_id, None)
 
     def _sweep(self, now: int) -> None:
         """Latch and drop every terminal row visible at ``now``.
 
         Pending rows whose ``expires_at`` has arrived become ``expired``. Expired
         and fully used grants leave the live map. Caller holds the authority lock.
+        Both maps are staged before either is published, so a fault leaves both
+        as they were. Bloom bits are published before a live row is removed.
         """
-        for request_id, entry in list(self._requests.items()):
-            if entry.state != "pending" or entry.request.expires_at <= now:
-                terminal = "expired" if entry.state == "pending" else entry.state
-                self._evict_request(request_id, terminal)
-        for scope_id, grant in list(self._grants.items()):
-            if grant.expired or now >= grant.scope.expires_at:
+        req_pending: dict[int, int] = {}
+        req_tombs = self._request_tombs
+        retiring: list[tuple[str, str]] = []
+        for request_id, entry in self._requests.items():
+            if entry.state == "pending" and entry.request.expires_at > now:
+                continue
+            terminal = "expired" if entry.state == "pending" else entry.state
+            req_pending, req_tombs = self._prepare_tomb(
+                req_tombs, self._request_bloom, request_id, terminal, req_pending)
+            retiring.append((request_id, terminal))
+
+        grant_pending: dict[int, int] = {}
+        grant_tombs = self._grant_tombs
+        finishing: list[tuple[str, _Grant, bool]] = []
+        for scope_id, grant in self._grants.items():
+            expiring = bool(grant.expired or now >= grant.scope.expires_at)
+            if not expiring and len(grant.used) < len(grant.scope.bindings):
+                continue
+            grant_pending, grant_tombs = self._prepare_tomb(
+                grant_tombs, self._grant_bloom, scope_id, grant, grant_pending)
+            finishing.append((scope_id, grant, expiring))
+
+        req_updates = tuple(req_pending.items())
+        grant_updates = tuple(grant_pending.items())
+
+        for _scope_id, grant, expiring in finishing:
+            if expiring:
                 grant.expired = True
-                self._evict_grant(scope_id)
-            elif len(grant.used) >= len(grant.scope.bindings):
-                self._evict_grant(scope_id)
+        self._request_bloom.publish(req_updates)
+        self._request_tombs = req_tombs
+        for request_id, terminal in retiring:
+            entry = self._requests.get(request_id)
+            if entry is not None:
+                entry.state = terminal
+            self._requests.pop(request_id, None)
+        self._grant_bloom.publish(grant_updates)
+        self._grant_tombs = grant_tombs
+        for scope_id, _grant, _expiring in finishing:
+            self._grants.pop(scope_id, None)
 
     def _request_id_taken(self, candidate: str) -> bool:
         return (candidate in self._requests or candidate in self._request_tombs
@@ -467,10 +549,16 @@ class ApprovalAuthority:
         return grant
 
     def _live_request(self, request_id: object, now: int) -> _Request:
-        # A live row's id is always minted, so this does not skip one. The
-        # retirement filter is consulted only after the live map misses.
+        # A live row's id is always minted, so this does not skip one. A tomb
+        # wins over a live row so a publish that stored the tomb and then stopped
+        # cannot be approved again. The bloom is consulted only when the live map
+        # and the detailed tomb both miss: a false hit must not hide an id this
+        # authority still holds.
         if not _minted_id(request_id):
             raise Refused("request_unknown")
+        if request_id in self._request_tombs:
+            self._refuse_if_terminal(request_id)
+            raise Refused("request_answered")
         entry = self._requests.get(request_id)
         if entry is None:
             self._refuse_if_terminal(request_id)
@@ -620,16 +708,20 @@ class ApprovalAuthority:
         with self._lock:
             now = self._now()
             self._sweep(now)
-            # A non-minted id is unknown and skips the filter. A minted id
-            # resolves the live row before that filter.
+            # A non-minted id is unknown and skips the bloom. A detailed tomb
+            # wins over a live row. The bloom runs only after both miss, so a
+            # false hit cannot hide an id this authority still holds.
             if not _minted_id(request_id):
                 return "unknown"
+            # The tomb is authoritative when both maps still hold the id.
+            found = self._request_tombs.get(request_id)
+            if found is not None:
+                return found
             entry = self._requests.get(request_id)
             if entry is not None:
                 return entry.state
-            terminal = self._request_terminal(request_id)
-            if terminal is not None:
-                return terminal
+            if request_id in self._request_bloom:
+                return "expired"
             return "unknown"
 
     def _decide(self, credential: object, scope_id: object, request_id: object,
@@ -648,8 +740,7 @@ class ApprovalAuthority:
                     or holder.serial != grant.holder_serial):
                 raise Refused("scope_not_delegable")
             if grant.expired or now >= scope.expires_at:
-                grant.expired = True
-                self._evict_grant(scope.scope_id)
+                self._evict_grant(scope.scope_id, expire=True)
                 raise Refused("scope_expired")
             bound = dict(scope.bindings).get(request_id) if type(request_id) is str else None
             if bound is None:
@@ -659,15 +750,49 @@ class ApprovalAuthority:
             if not hmac.compare_digest(bound, digest):
                 raise Refused("digest_mismatch")
             entry = self._live_request(request_id, now)
-            grant.used.add(request_id)
+            live = entry.request.digest
+            if (type(live) is not str or len(live) != len(bound)
+                    or not hmac.compare_digest(live, bound)):
+                raise Refused("digest_mismatch")
+            if holder.serial not in entry.shown:
+                raise Refused("prompt_not_shown")
+
+            def stage() -> tuple:
+                """Hash, allocate, and copy. A fault here publishes nothing."""
+                receipt = {"request_id": request_id, "digest": bound, "outcome": outcome,
+                           "principal": holder.principal, "requester": entry.requester,
+                           "scope_id": scope.scope_id, "decided_at": now}
+                req_pending, req_tombs = self._prepare_tomb(
+                    self._request_tombs, self._request_bloom, request_id, outcome, {})
+                new_used = set(grant.used)
+                new_used.add(request_id)
+                grant_tombs = None
+                grant_pending: dict[int, int] = {}
+                if len(new_used) >= len(scope.bindings):
+                    grant_pending, grant_tombs = self._prepare_tomb(
+                        self._grant_tombs, self._grant_bloom, scope.scope_id, grant, {})
+                return (receipt, tuple(req_pending.items()), req_tombs, new_used,
+                        tuple(grant_pending.items()), grant_tombs)
+
+            try:
+                (receipt, req_updates, req_tombs, new_used,
+                 grant_updates, grant_tombs) = stage()
+            except Refused:
+                raise
+            except Exception:
+                # Staging failed before publish. Live rows, tombs, and blooms
+                # are unchanged.
+                raise
+            self._request_bloom.publish(req_updates)
+            self._request_tombs = req_tombs
             entry.state = outcome
-            result = {"request_id": request_id, "digest": bound, "outcome": outcome,
-                      "principal": holder.principal, "requester": entry.requester,
-                      "scope_id": scope.scope_id, "decided_at": now}
-            self._evict_request(request_id, outcome)
-            if len(grant.used) >= len(scope.bindings):
-                self._evict_grant(scope.scope_id)
-            return result
+            self._requests.pop(request_id, None)
+            grant.used = new_used
+            if grant_tombs is not None:
+                self._grant_bloom.publish(grant_updates)
+                self._grant_tombs = grant_tombs
+                self._grants.pop(scope.scope_id, None)
+            return receipt
 
         with self._lock:
             return self._registry._call_if_current(credential, commit)

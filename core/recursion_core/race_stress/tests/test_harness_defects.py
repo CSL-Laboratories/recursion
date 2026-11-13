@@ -678,6 +678,276 @@ class PinTests(unittest.TestCase):
             ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
             self.assertTrue(ok, message)
 
+    def test_directory_pin_hashes_imports_of_its_own_package_body(self) -> None:
+        # The directory path is not a module. Seeding it skipped daemon/__init__.py
+        # and registry.py, so imports in the package body stayed unhashed.
+        rel = "core/recursion_core/daemon"
+        outside = "core/recursion_core/outside.py"
+        policy = "core/recursion_core/subscription_routes/policy.py"
+        other = "core/recursion_core/subscription_routes/other.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                "core/recursion_core/subscription_routes/__init__.py": "",
+                f"{rel}/__init__.py":
+                    "from recursion_core.outside import OUT\n"
+                    "from recursion_core.subscription_routes.policy import POLICY\n",
+                f"{rel}/registry.py":
+                    "from recursion_core.subscription_routes.other import OTHER\n",
+                outside: "OUT = 1\n",
+                policy: "POLICY = 1\n",
+                other: "OTHER = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            helper = repo / "core/recursion_core/subscription_routes/helper.py"
+            helper.write_text("HELPER = 1\n")
+            (repo / "core/recursion_core/subscription_routes/scratch.txt").write_text("nope\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            for dirty in (outside, policy, other):
+                with self.subTest(dirty=dirty):
+                    dest = repo / dirty
+                    original = dest.read_text()
+                    dest.write_text(original + "MUT = 1\n")
+                    ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+                    self.assertFalse(ok, message)
+                    self.assertIn(dirty, message)
+                    dest.write_text(original)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            pkg = repo / "core/recursion_core/subscription_routes/policy" / "__init__.py"
+            pkg.parent.mkdir()
+            pkg.write_text("POLICY = 'pkg'\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("policy/__init__.py", message)
+
+    def test_namespace_portion_refuses_sibling_and_init_shadows(self) -> None:
+        # A directory without __init__.py is a namespace. FileFinder then loads a
+        # sibling ns.py, or ns/__init__ plus any loader suffix, ahead of that portion.
+        rel = "core/recursion_core/daemon"
+        ns = "core/recursion_core/ns"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                f"{rel}/__init__.py": "from recursion_core.ns.mod import VALUE\n",
+                f"{rel}/registry.py": "VALUE = 1\n",
+                f"{ns}/mod.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            sibling = repo / "core/recursion_core/ns.py"
+            sibling.write_text("VALUE = 'shadow'\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("ns.py", message)
+            sibling.unlink()
+            pyc = repo / "core/recursion_core/ns.pyc"
+            pyc.write_bytes(b"not-a-real-pyc")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("ns.pyc", message)
+            pyc.unlink()
+            for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+                ext = repo / "core/recursion_core" / f"ns{suffix}"
+                ext.write_bytes(b"not a real extension")
+                ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+                self.assertFalse(ok, suffix + " " + message)
+                self.assertIn(ext.name, message)
+                ext.unlink()
+            for suffix in importlib.machinery.all_suffixes():
+                init = repo / ns / f"__init__{suffix}"
+                init.write_bytes(b"not a real init")
+                ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+                self.assertFalse(ok, suffix + " " + message)
+                self.assertIn(init.name, message)
+                init.unlink()
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+
+    def test_namespace_directory_pin_refuses_sibling_module(self) -> None:
+        rel = "core/recursion_core/ns"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                f"{rel}/mod.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            sibling = repo / "core/recursion_core/ns.py"
+            sibling.write_text("VALUE = 'shadow'\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("ns.py", message)
+            sibling.unlink()
+            suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+            init = repo / rel / f"__init__{suffix}"
+            init.write_bytes(b"not a real extension")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertFalse(ok, message)
+            self.assertIn(init.name, message)
+
+    def _commit(self, repo: Path, *rels: str) -> str:
+        subprocess.check_call(["git", "add", "--", *rels], cwd=repo, env=_git_env())
+        subprocess.check_call(["git", "commit", "-q", "-m", "pin-bytes"], cwd=repo, env=_git_env())
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, env=_git_env(), text=True).strip()
+
+    def _sourceless(self, dest: Path, source: str) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        handle, name = tempfile.mkstemp(suffix=".py")
+        os.close(handle)
+        src = Path(name)
+        try:
+            src.write_text(source)
+            py_compile.compile(str(src), cfile=str(dest), doraise=True)
+        finally:
+            src.unlink(missing_ok=True)
+
+    def test_tracked_sourceless_and_extension_modules_are_hashed(self) -> None:
+        # onlypyc.pyc and ns/__init__.pyc have no .py. An extension file is the same
+        # class. The import resolves to those bytes; hashing them is what refuses an edit.
+        rel = "core/recursion_core/routes/breaker.py"
+        routes_init = "core/recursion_core/routes/__init__.py"
+        suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+        ext_rel = f"core/recursion_core/onlyext{suffix}"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                routes_init:
+                    "import recursion_core.onlypyc\n"
+                    "import recursion_core.ns\n"
+                    "import recursion_core.onlyext\n",
+                rel: "VALUE = 1\n",
+            }
+            _repo(repo, files)
+            self._sourceless(repo / "core/recursion_core/onlypyc.pyc", "VALUE = 1\n")
+            self._sourceless(repo / "core/recursion_core/ns/__init__.pyc", "VALUE = 1\n")
+            (repo / ext_rel).write_bytes(b"not a real extension")
+            head = self._commit(
+                repo, "core/recursion_core/onlypyc.pyc",
+                "core/recursion_core/ns/__init__.pyc", ext_rel)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            for dirty in (
+                    "core/recursion_core/onlypyc.pyc",
+                    "core/recursion_core/ns/__init__.pyc",
+                    ext_rel):
+                with self.subTest(dirty=dirty):
+                    dest = repo / dirty
+                    original = dest.read_bytes()
+                    dest.write_bytes(original[:-1] + bytes([original[-1] ^ 0xFF]))
+                    ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+                    self.assertFalse(ok, message)
+                    self.assertIn(dirty, message)
+                    dest.write_bytes(original)
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+
+    def test_tracked_bytecode_beside_source_stays_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, rel = self._pinned_file(tmp)
+            pyc = repo / "core/recursion_core/routes/breaker.pyc"
+            pyc.write_bytes(b"not-the-loaded-module")
+            head = self._commit(repo, "core/recursion_core/routes/breaker.pyc")
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+
+    def test_unreadable_pycache_cannot_hide_an_unchecked_pyc(self) -> None:
+        # Mode 0111: readdir, os.walk, and git ls-files miss the .pyc. Python still
+        # opens cache_from_source by name under -B.
+        rel = "core/recursion_core/routes/breaker.py"
+        parent = "core/recursion_core/subscription_routes"
+        init = f"{parent}/__init__.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                "core/recursion_core/routes/__init__.py":
+                    "from recursion_core.subscription_routes import VALUE\n",
+                rel: "VALUE = 1\n",
+                init: "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            self.assertNotIn(parent, pins._import_search_dirs([rel]))
+            src = repo / init
+            src.write_text("VALUE = 'cache'\n")
+            py_compile.compile(
+                str(src), doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+            src.write_text("VALUE = 1\n")
+            cache = Path(importlib.util.cache_from_source(str(src)))
+            cache.parent.chmod(0o111)
+            try:
+                with self.assertRaises(PermissionError):
+                    os.listdir(cache.parent)
+                walked: list[str] = []
+                for dirpath, _dirs, names in os.walk(repo / "core", followlinks=False):
+                    walked.extend(names)
+                self.assertNotIn(cache.name, walked)
+                listed = subprocess.check_output(
+                    ["git", "ls-files", "-z", "--others", "--", "core"],
+                    cwd=repo, env=_git_env())
+                self.assertNotIn(cache.name.encode(), listed)
+                self.assertGreater(cache.stat().st_size, 0)
+                env = _git_env()
+                env["PYTHONPATH"] = str(repo / "core")
+                out = subprocess.check_output(
+                    [sys.executable, "-B", "-P", "-c",
+                     "from recursion_core.subscription_routes import VALUE; print(VALUE)"],
+                    env=env, text=True, cwd=repo)
+                self.assertEqual(out.strip(), "cache")
+                ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+                self.assertFalse(ok, message)
+                self.assertIn("bytecode cache", message)
+                self.assertIn(cache.name, message)
+                self.assertIn("cannot be listed", message)
+            finally:
+                cache.parent.chmod(0o755)
+
+    def test_init_extra_is_not_a_package_shadow(self) -> None:
+        rel = "core/recursion_core/routes/breaker.py"
+        parent = "core/recursion_core/subscription_routes"
+        policy = f"{parent}/policy.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                "core/recursion_core/routes/__init__.py":
+                    "from recursion_core.subscription_routes.policy import POLICY\n",
+                rel: "VALUE = 1\n",
+                policy: "POLICY = 1\n",
+                f"{parent}/__init__.py": "VALUE = 1\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_326", repo, head, [rel])
+            self.assertNotIn(parent, pins._import_search_dirs([rel]))
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            extra = repo / parent / "policy" / "__init__extra.py"
+            extra.parent.mkdir()
+            extra.write_text("POLICY = 'extra'\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            self.assertNotIn("package shadow", message)
+            real = extra.parent / "__init__.py"
+            real.write_text("POLICY = 'pkg'\n")
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertFalse(ok, message)
+            self.assertIn("policy/__init__.py", message)
+
     def test_file_pin_refuses_package_shadow_of_imported_module_outside_search_set(self) -> None:
         # policy.py is hashed because an ancestor imports it, but its parent directory
         # is not an import-search directory. FileFinder still prefers policy/__init__.py.

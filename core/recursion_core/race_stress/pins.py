@@ -34,16 +34,43 @@ real directories, again by ``lstat`` rather than by following links.
 
 A file pin hashes more than its own blob. Importing the pinned module runs every ancestor
 package ``__init__.py``, and those files import sibling modules, so each of those tracked
-files is hashed against ``HEAD`` as well. A directory pin hashes those same ancestor
-``__init__.py`` files and the modules they import. The directory's own ``__init__.py`` is
-already inside the pinned tree.
+files is hashed against ``HEAD`` as well. A directory pin seeds that same walk with every
+tracked ``.py`` under the directory, including its own ``__init__.py``, then hashes the
+transitive imports and applies the shadow checks. Seeding the directory path itself skipped
+the package body: its ``__init__.py`` and siblings never contributed imports.
+
+A namespace portion (a package directory with no ``__init__`` file) loses to a sibling of
+the same stem with any loader suffix, and to an ``__init__`` plus any loader suffix inside
+it. Those untracked files are refused. Package-shadow names are exactly ``__init__`` plus
+one suffix from ``importlib.machinery.all_suffixes()``; ``__init__extra.py`` is not a
+package init.
+
+When the import resolves to a sourceless ``.pyc`` or an extension file, those worktree
+bytes are hashed with ``git hash-object --no-filters`` and the file is not executed. That
+is the fail-closed choice: a clean match stays pinned, and a changed, missing, or untracked
+file is refused. Imports inside a sourceless or extension file are not walked. A tracked
+``.pyc`` beside a same-stem ``.py`` is not the loaded module (source is tried first) and
+stays allowed.
+
+``os.walk`` records listing errors and fails closed. A directory mode such as ``0111``
+hides names from ``readdir``, ``os.walk``, and ``git ls-files --others`` while Python still
+opens a known cache path. For each hashed source module the path from
+``importlib.util.cache_from_source`` is statted directly and refused when that file is
+present and untracked. An empty directory that cannot be listed is refused, because it
+cannot be shown to be empty. An empty directory that lists cleanly stays allowed.
 
 ``git`` is ``/usr/bin/git`` when that binary exists, not whatever ``PATH`` names. The bytes of
 that binary are not pinned, and ``GIT_EXEC_PATH`` can still redirect its subcommands.
 Environment variables that point ``git`` at a different repository are ignored. An extra
 ``helper.py`` next to a hashed module is a different module name; a directory pin still
-refuses it. An empty directory does not beat a tracked module or a later regular module on
+refuses it when it sits inside the pinned directory, and leaves it alone outside that
+directory. An empty directory does not beat a tracked module or a later regular module on
 ``sys.path``.
+
+Not checked here: ``sitecustomize`` reached through ``PYTHONPATH`` when the process is not
+isolated (``-B`` does not skip it); the ``PATH`` fallback when ``/usr/bin/git`` is absent;
+a ``__spec__`` whose paths still name the pinned file, which ``verify_loaded`` accepts;
+launching a driver as a plain script instead of the isolated runner.
 
 Anything else skips with a message naming both heads, instead of measuring code nobody pinned.
 Set ``RACE_STRESS_UNPINNED=1`` to run against an unpinned tree anyway (the run then reports
@@ -57,6 +84,7 @@ from __future__ import annotations
 
 import ast
 import importlib.machinery
+import importlib.util
 import os
 import shutil
 import stat
@@ -96,10 +124,13 @@ _GIT_REPO_ENV = (
     "GIT_NAMESPACE", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES",
 )
 
-_IMPORT_SUFFIXES = tuple(
+# FileFinder tries extension, then source, then sourceless bytecode.
+_LOADER_SUFFIXES = tuple(
     importlib.machinery.EXTENSION_SUFFIXES
     + importlib.machinery.SOURCE_SUFFIXES
     + importlib.machinery.BYTECODE_SUFFIXES)
+_IMPORT_SUFFIXES = _LOADER_SUFFIXES
+_INIT_NAMES = frozenset("__init__" + suffix for suffix in importlib.machinery.all_suffixes())
 
 
 def _resolve_git() -> str:
@@ -149,6 +180,18 @@ def _git_z(root: Path, *args: str) -> list[str] | None:
 
 def _has_import_suffix(name: str) -> bool:
     return any(name.endswith(suffix) for suffix in _IMPORT_SUFFIXES)
+
+
+def _is_init_filename(name: str) -> bool:
+    """True for ``__init__`` plus one loader suffix, and not ``__init__extra.py``."""
+    return name in _INIT_NAMES
+
+
+def _strip_loader_suffix(name: str) -> str | None:
+    for suffix in sorted(_LOADER_SUFFIXES, key=len, reverse=True):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)]
+    return None
 
 
 def _is_bytecode(name: str) -> bool:
@@ -219,9 +262,9 @@ def _directory_pin_shadows(root: Path, path: str, blobs: list[tuple[str, str]]) 
 
 
 def _module_stem(filename: str) -> str:
-    for suffix in importlib.machinery.SOURCE_SUFFIXES:
-        if filename.endswith(suffix):
-            return filename[:-len(suffix)]
+    stripped = _strip_loader_suffix(filename)
+    if stripped is not None:
+        return stripped
     return Path(filename).stem
 
 
@@ -239,8 +282,9 @@ def _pycache_home(rel: str) -> str | None:
 def _file_pin_shadows(root: Path, paths: list[str]) -> list[str]:
     """Shadows of every hashed module, including imports outside the search set.
 
-    FileFinder loads ``stem/__init__.*`` before ``stem.py``, and an extension suffix
-    before source. Every entry in a hashed module's ``__pycache__`` can run under
+    FileFinder loads ``stem/__init__`` plus one suffix from ``all_suffixes()`` before
+    ``stem.py``, and an extension suffix before source. ``__init__extra.py`` is not
+    that name. Every entry in a hashed module's ``__pycache__`` can run under
     ``-B`` while ``module.__file__`` still names the ``.py``. A sibling ``helper.py``
     is a different module and is left alone. An empty ``stem/`` directory is not a
     package, so it is left alone too.
@@ -253,6 +297,7 @@ def _file_pin_shadows(root: Path, paths: list[str]) -> list[str]:
         stems.setdefault(parent, set()).add(_module_stem(Path(path).name))
     if not stems:
         return []
+    hashed = set(paths)
     indexed = _head_index(root)
     if indexed is None:
         return ["could not list tracked files under core/"]
@@ -278,16 +323,17 @@ def _file_pin_shadows(root: Path, paths: list[str]) -> list[str]:
         if home in parents:
             add("bytecode cache", rel)
             return
-        if parent in parents and any(
+        # A hashed extension module is the file the import loads. It is not a
+        # shadow of itself; its bytes are checked with the rest of the closure.
+        if (parent in parents and rel not in hashed and any(
                 name == stem + suffix
                 for stem in stems[parent]
-                for suffix in importlib.machinery.EXTENSION_SUFFIXES):
+                for suffix in importlib.machinery.EXTENSION_SUFFIXES)):
             add("extension shadow", rel)
             return
         grand = path.parent.parent.as_posix()
         stem = path.parent.name
-        if (grand in parents and stem in stems[grand] and name.startswith("__init__")
-                and _has_import_suffix(name)):
+        if grand in parents and stem in stems[grand] and _is_init_filename(name):
             add("package shadow", rel)
 
     for rel in untracked:
@@ -407,16 +453,30 @@ def _dangerous_import_name(name: str) -> bool:
 
 
 def _has_any_file(path: Path) -> bool:
-    """True when ``path`` contains a non-directory entry at any depth. Symlinks are not followed."""
-    for _dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+    """True when ``path`` contains a file, or a directory that cannot be listed.
+
+    An unreadable directory is not empty: ``readdir`` cannot show what it hides.
+    Symlinks are not followed.
+    """
+    blocked = False
+
+    def onerror(_err: OSError) -> None:
+        nonlocal blocked
+        blocked = True
+
+    for _dirpath, _dirnames, filenames in os.walk(path, followlinks=False, onerror=onerror):
         if filenames:
             return True
-    return False
+    return blocked
 
 
 def _dangerous_files(root_rel: str, path: Path) -> list[str]:
     found: list[str] = []
-    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+
+    def onerror(err: OSError) -> None:
+        found.append(f"{root_rel} cannot be listed ({err.strerror})")
+
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False, onerror=onerror):
         rel_dir = Path(os.path.normpath(dirpath)).relative_to(path).as_posix()
         for name in filenames:
             if not _dangerous_import_name(name):
@@ -430,10 +490,11 @@ def _layout_problems(root: Path, pin_paths: list[str]) -> list[str]:
     """Symlinks, nested git entries, and importable directories under ``core/``.
 
     The walk does not follow symlinks and does not trust ``git ls-files`` output.
-    Every symlink is refused, including one ``HEAD`` records, except a dangling
-    Emacs ``.#*`` lock. An empty directory is allowed. A dot-directory other than
-    ``.git``, and a ``*.egg-info`` directory, are allowed when they hold no
-    importable file.
+    A directory that cannot be listed fails closed (mode ``0111`` hides names from
+    ``readdir``). Every symlink is refused, including one ``HEAD`` records, except a
+    dangling Emacs ``.#*`` lock. An empty directory that lists cleanly is allowed.
+    A dot-directory other than ``.git``, and a ``*.egg-info`` directory, are allowed
+    when they hold no importable file.
     """
     root_abs = Path(os.path.normpath(os.path.abspath(root)))
     core = root_abs / "core"
@@ -453,7 +514,16 @@ def _layout_problems(root: Path, pin_paths: list[str]) -> list[str]:
     tracked, tracked_dirs = indexed
     search = _import_search_dirs(pin_paths)
     problems: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(core, followlinks=False):
+
+    def onerror(err: OSError) -> None:
+        raw = err.filename or ""
+        try:
+            rel = Path(os.path.normpath(raw)).relative_to(root_abs).as_posix()
+        except ValueError:
+            rel = raw or "core"
+        problems.append(f"{rel} cannot be listed ({err.strerror})")
+
+    for dirpath, dirnames, filenames in os.walk(core, followlinks=False, onerror=onerror):
         rel_dir = Path(os.path.normpath(dirpath)).relative_to(root_abs).as_posix()
         parent_relevant = rel_dir in search
         prune: set[str] = set()
@@ -526,8 +596,7 @@ def _core_path_shadows(root: Path) -> list[str]:
             continue
         if len(under.parts) == 1 and _has_import_suffix(top):
             found.append(f"untracked top-level import {rel}")
-        elif (len(under.parts) >= 2 and under.parts[1].startswith("__init__")
-              and _has_import_suffix(under.parts[1])):
+        elif len(under.parts) >= 2 and _is_init_filename(under.parts[1]):
             found.append(f"untracked top-level package {rel}")
     return found
 
@@ -536,7 +605,7 @@ def _ancestor_inits(path: str) -> list[str]:
     """Package ``__init__.py`` files above ``path``, under ``core/`` and not ``core`` itself.
 
     ``path`` is a pinned file or a pinned directory. A directory's own ``__init__.py``
-    is not listed: that file is already inside the pinned tree.
+    is not listed here; the directory seed includes that file so its imports are walked.
     """
     parts = Path(path).parts
     if len(parts) < 2 or parts[0] != "core":
@@ -549,18 +618,47 @@ def _ancestor_inits(path: str) -> list[str]:
     return inits
 
 
-def _package_of(rel: str) -> str:
-    """Import package of a ``core/`` module path. ``__init__.py`` is its own package."""
+def _import_name(rel: str) -> str:
+    """Import name of a ``core/`` module path. ``__init__.*`` names its package."""
     parts = Path(rel).parts
     if len(parts) < 2 or parts[0] != "core":
         return ""
     body = list(parts[1:])
-    if body[-1] == "__init__.py":
-        return ".".join(body[:-1])
-    if body[-1].endswith(".py"):
-        body[-1] = body[-1][:-3]
-        return ".".join(body[:-1])
-    return ""
+    stem = _strip_loader_suffix(body[-1])
+    if stem is None:
+        return ""
+    if stem == "__init__":
+        body = body[:-1]
+    else:
+        body[-1] = stem
+    if not body or any(part in ("", ".", "..") for part in body):
+        return ""
+    return ".".join(body)
+
+
+def _pin_module_name(path: str) -> str:
+    """Import name of a pinned file or of a pinned directory."""
+    named = _import_name(path)
+    if named:
+        return named
+    parts = Path(path).parts
+    if len(parts) < 2 or parts[0] != "core":
+        return ""
+    if _strip_loader_suffix(parts[-1]) is not None:
+        return ""
+    if any(part in ("", ".", "..") for part in parts[1:]):
+        return ""
+    return ".".join(parts[1:])
+
+
+def _package_of(rel: str) -> str:
+    """Import package of a ``core/`` module path. ``__init__.py`` is its own package."""
+    name = _import_name(rel)
+    if not name:
+        return ""
+    if Path(rel).name in _INIT_NAMES or _strip_loader_suffix(Path(rel).name) == "__init__":
+        return name
+    return name.rpartition(".")[0]
 
 
 def _imported_modules(rel: str, text: str) -> list[str]:
@@ -596,9 +694,64 @@ def _imported_modules(rel: str, text: str) -> list[str]:
     return [mod for mod in found if mod.startswith("recursion_core")]
 
 
-def _module_candidates(mod: str) -> tuple[str, str]:
-    base = "core/" + mod.replace(".", "/")
-    return f"{base}/__init__.py", f"{base}.py"
+def _tracked_regular(files: dict[str, tuple[str, str]], rel: str) -> bool:
+    meta = files.get(rel)
+    return meta is not None and meta[0] in ("100644", "100755")
+
+
+def _select_import(root: Path, files: dict[str, tuple[str, str]], mod: str) -> str | None:
+    """Path FileFinder would load for ``mod``, or None for a namespace with no shadow file.
+
+    Order matches FileFinder: ``__init__`` plus each loader suffix, then the module file
+    plus each loader suffix. Extension beats source, and source beats sourceless bytecode.
+    A sibling ``ns.py`` or ``ns/__init__.so`` therefore wins over a namespace directory.
+    """
+    if not mod.startswith("recursion_core"):
+        return None
+    parts = mod.split(".")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    base = "core/" + "/".join(parts)
+    candidates = [f"{base}/__init__{suffix}" for suffix in _LOADER_SUFFIXES]
+    candidates += [f"{base}{suffix}" for suffix in _LOADER_SUFFIXES]
+    for cand in candidates:
+        if _exists_regular_or_link(root / cand):
+            return cand
+    for cand in candidates:
+        if _tracked_regular(files, cand):
+            return cand
+    return None
+
+
+def _resolved_paths(root: Path, files: dict[str, tuple[str, str]], mod: str) -> list[str]:
+    """The file FileFinder loads for ``mod`` and for each of its parent packages."""
+    parts = mod.split(".")
+    if not mod.startswith("recursion_core") or any(part in ("", ".", "..") for part in parts):
+        return []
+    found: list[str] = []
+    for index in range(1, len(parts) + 1):
+        chosen = _select_import(root, files, ".".join(parts[:index]))
+        if chosen is not None and chosen not in found:
+            found.append(chosen)
+    return found
+
+
+def _source_seeds(path: str, files: dict[str, tuple[str, str]]) -> list[str]:
+    """Tracked source files the import walk starts from.
+
+    A file pin starts at that file. A directory pin starts at every ``.py`` in the
+    tree, including its own ``__init__.py``. The directory path is not a module file.
+    """
+    if _tracked_regular(files, path):
+        return [path]
+    prefix = path + "/"
+    seeds: list[str] = []
+    for rel, meta in files.items():
+        if meta[0] not in ("100644", "100755") or not rel.startswith(prefix):
+            continue
+        if Path(rel).name.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES)):
+            seeds.append(rel)
+    return seeds
 
 
 def _exists_regular_or_link(path: Path) -> bool:
@@ -610,6 +763,9 @@ def _exists_regular_or_link(path: Path) -> bool:
 
 
 def _read_module_text(path: Path) -> str | None:
+    """Source text of a ``.py`` file. Sourceless and extension files are not decoded."""
+    if not path.name.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES)):
+        return None
     try:
         st = path.lstat()
     except OSError:
@@ -626,16 +782,23 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
     """Ancestor package inits, and the tracked modules they or the pin import, must match HEAD.
 
     Importing a pinned file or a pinned directory runs those ``__init__.py`` files first.
-    Their import lines name the other modules that execute. Only ``recursion_core`` names
-    are followed. The second list is every tracked module path in that closure, so a
-    shadow check can cover parents that are not import-search directories.
+    A directory pin also walks every tracked source file in the directory, so an import
+    in the package body is part of the closure. FileFinder order applies: a namespace
+    portion loses to a sibling module or extension and to ``__init__`` plus any loader
+    suffix, and a sourceless or extension file the import resolves to is hashed rather
+    than executed. Only ``recursion_core`` names are followed. The second list is every
+    tracked module path in that closure, so a shadow check can cover parents that are
+    not import-search directories.
     """
     indexed = _head_index(root)
     if indexed is None:
         return ["could not list tracked files under core/"], []
     files, _dirs = indexed
     problems: list[str] = []
-    queue = [path, *_ancestor_inits(path)]
+    queue = [*_source_seeds(path, files), *_ancestor_inits(path)]
+    pin_mod = _pin_module_name(path)
+    if pin_mod:
+        queue.extend(_resolved_paths(root, files, pin_mod))
     seen: set[str] = set()
     extra: list[tuple[str, str]] = []
     while queue:
@@ -650,24 +813,14 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
             continue
         if rel != path:
             extra.append((rel, meta[1]))
+        own = _import_name(rel)
+        if own:
+            queue.extend(p for p in _resolved_paths(root, files, own) if p not in seen)
         text = _read_module_text(root / rel)
         if text is None:
             continue
         for mod in _imported_modules(rel, text):
-            init, py = _module_candidates(mod)
-            chosen = None
-            for cand in (init, py):
-                info = files.get(cand)
-                if info is not None and info[0] in ("100644", "100755"):
-                    chosen = cand
-                    break
-            if chosen is None:
-                for cand in (init, py):
-                    if cand not in seen and _exists_regular_or_link(root / cand):
-                        chosen = cand
-                        break
-            if chosen is not None and chosen not in seen:
-                queue.append(chosen)
+            queue.extend(p for p in _resolved_paths(root, files, mod) if p not in seen)
     closure: list[str] = []
     if path in files and files[path][0] in ("100644", "100755"):
         closure.append(path)
@@ -699,6 +852,51 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
     return problems, closure
 
 
+def _untracked_bytecode_caches(root: Path, modules: list[str]) -> list[str]:
+    """Untracked ``cache_from_source`` files for hashed source modules.
+
+    Python opens that path by name under ``-B``. ``git ls-files`` and ``os.walk``
+    both miss it when the ``__pycache__`` directory cannot be listed.
+    """
+    indexed = _head_index(root)
+    if indexed is None:
+        return ["could not list tracked files under core/"]
+    tracked, _dirs = indexed
+    root_abs = Path(os.path.normpath(os.path.abspath(root)))
+    found: list[str] = []
+    seen: set[str] = set()
+    for rel in modules:
+        if not rel.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES)):
+            continue
+        src = root_abs / rel
+        try:
+            cache = importlib.util.cache_from_source(os.fspath(src))
+        except (OSError, ValueError, NotImplementedError):
+            found.append(f"bytecode cache for {rel} cannot be named")
+            continue
+        cache_path = Path(cache)
+        try:
+            st = cache_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            found.append(f"bytecode cache for {rel} cannot be statted ({exc.strerror})")
+            continue
+        try:
+            crel = Path(os.path.normpath(cache_path)).relative_to(root_abs).as_posix()
+        except ValueError:
+            found.append(f"bytecode cache for {rel} is outside the checkout")
+            continue
+        if crel in seen:
+            continue
+        seen.add(crel)
+        if stat.S_ISLNK(st.st_mode):
+            found.append(f"symlink {crel}")
+        elif not stat.S_ISREG(st.st_mode) or crel not in tracked:
+            found.append(f"bytecode cache {crel}")
+    return found
+
+
 def _path_problems(root: Path, path: str, oid: str) -> list[str]:
     """Reasons ``path`` is not the pinned object. Empty when the worktree bytes and imports match."""
     if _git_text(root, "rev-parse", f"HEAD:{path}") != oid:
@@ -726,6 +924,8 @@ def _path_problems(root: Path, path: str, oid: str) -> list[str]:
     dep, closure = _file_pin_dependency_problems(root, path)
     problems.extend(dep)
     problems.extend(_file_pin_shadows(root, closure))
+    problems.extend(_untracked_bytecode_caches(
+        root, [name for name, _blob in blobs] + list(closure)))
     if not (len(blobs) == 1 and blobs[0][0] == path):
         problems.extend(_directory_pin_shadows(root, path, blobs))
     return problems

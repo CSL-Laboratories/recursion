@@ -20,17 +20,36 @@ place of that source: a bytecode cache (a timestamp or unchecked-hash `.pyc` run
 under a directory pin, and an untracked top-level name on the `core/` path the driver inserts.
 The same shadow check covers every hashed module, including one imported from outside the
 import-search directories: a same-stem package directory, a same-stem extension, and that
-directory's `__pycache__`. Any untracked `.pyc` under `core/` is refused.
+directory's `__pycache__`. A package shadow is `__init__` plus one suffix from
+`importlib.machinery.all_suffixes()`; `__init__extra.py` is not a package init. Any
+untracked `.pyc` under `core/` is refused.
 A symlink anywhere under `core/` is refused, including one whose link text matches `HEAD`
 (the pinned heads have none). A dangling Emacs lock named `.#*` is left alone. A nested
 `.git` file or directory under `core/` is refused. An untracked directory in `core/` or in
-a measured package directory is refused when it contains a file, except an empty directory,
-a dot-directory other than `.git`, and a `*.egg-info` directory that holds no `.py`, `.pyc`,
-`.so`, or `.pth`. Each tracked file's parents must be real directories (`lstat`, not a
-followed link). A file pin hashes every ancestor package `__init__.py` and the tracked
-modules those files import. A directory pin hashes those same ancestors (its own
-`__init__.py` is already in the tree). A file such as `scratch.txt` that cannot be a module
-and does not create a directory is left alone, and so is `helper.py` beside a file pin.
+a measured package directory is refused when it contains a file, except an empty directory
+that lists cleanly, a dot-directory other than `.git`, and a `*.egg-info` directory that
+holds no `.py`, `.pyc`, `.so`, or `.pth`. A directory that cannot be listed (mode `0111`
+hides names from `readdir`, `os.walk`, and `git ls-files --others`) fails closed, and each
+hashed source module's `importlib.util.cache_from_source` path is statted directly so an
+untracked unchecked-hash `.pyc` there is refused. Python opens that path by name under
+`-B`. Each tracked file's parents must be real directories (`lstat`, not a followed link).
+A file pin hashes every ancestor package `__init__.py` and the tracked modules those files
+import. A directory pin seeds that walk with every tracked `.py` in the directory,
+including its own `__init__.py`, then hashes the transitive imports and applies the same
+shadow checks. A namespace portion (no `__init__` file) is refused when an untracked
+sibling of the same stem has any loader suffix, or when an untracked `__init__` plus any
+loader suffix sits inside it. A sourceless `.pyc` or extension file the import resolves to
+is hashed against `HEAD` and not executed; imports inside that file are not walked, and a
+changed, missing, or untracked one is refused. A tracked `.pyc` beside a same-stem `.py`
+is not the loaded module and stays allowed. A file such as `scratch.txt` that cannot be a
+module and does not create a directory is left alone, and so is `helper.py` beside a file
+pin or outside a directory pin.
+
+Not checked, on purpose: `sitecustomize` reached through `PYTHONPATH` when the process is
+not isolated (`-B` does not skip it); the bytes of `/usr/bin/git` and the `PATH` fallback
+when that binary is missing; `GIT_EXEC_PATH`; a `__spec__` whose paths still name the
+pinned file, which `verify_loaded` accepts; launching a driver as a plain script instead
+of the isolated runner.
 The driver directory is appended after the standard library, and a stdlib module loaded
 from `drivers/` is refused. `git` is `/usr/bin/git` when that binary exists, not whatever
 `PATH` names, and `git` variables that select another repository (`GIT_DIR` and the rest)

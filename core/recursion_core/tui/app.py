@@ -38,16 +38,54 @@ CONDITION_ROWS = 4
 _TRUNCATED = "⟦truncated⟧"
 
 
-def _listed_run(row: object) -> bool:
-    """A run row may be committed only with a non-empty string id and a string state.
+# The control API's run-record states (registry). A blank or unknown string is not one of them.
+_RUN_STATES = frozenset({"starting", "start_failed", "running", "stop_pending", "stopped"})
+_TERMINAL_STATE = "stopped"
 
-    A whitespace id is a real id. An empty ``run.list`` is a separate, valid snapshot.
+
+def _run_id_ok(run_id: object) -> bool:
+    """Exact ``str`` and non-empty. A whitespace id is a real id; only ``""`` is blank."""
+
+    return isinstance(run_id, str) and bool(run_id)
+
+
+def _listed_run(row: object) -> bool:
+    """A run row may be merged only with a non-empty string id and a known API state.
+
+    A whitespace id is a real id. ``""`` and ``" "`` are not states. An empty ``run.list``
+    is a separate, valid snapshot, not a row.
     """
 
     if not isinstance(row, dict):
         return False
-    run_id = row.get("run_id")
-    return isinstance(run_id, str) and bool(run_id) and isinstance(row.get("state"), str)
+    return _run_id_ok(row.get("run_id")) and row.get("state") in _RUN_STATES
+
+
+# One table of allowed answers. The value is the only transition that pair may apply.
+# Anything absent records ``unexpected <method> <code>`` and leaves the row, the Stop
+# mark and both refresh latches as they are.
+_ANSWER_TRANSITIONS: dict[tuple[str, str], str] = {
+    ("run.list", "ok"): "list_ok",
+    ("run.list", "registry_unavailable"): "list_failed",
+    ("run.list", "control_api_unavailable"): "list_failed",
+    ("run.status", "ok"): "status_ok",
+    ("run.status", "run_unknown"): "noted",
+    ("run.status", "request_invalid"): "noted",
+    ("run.status", "registry_unavailable"): "noted",
+    ("run.status", "control_api_unavailable"): "status_unavailable",
+    ("run.stop", "stopped"): "stop_stopped",
+    ("run.stop", "pending"): "stop_pending",
+    ("run.stop", "run_unknown"): "noted",
+    ("run.stop", "request_invalid"): "noted",
+    ("run.stop", "registry_unavailable"): "noted",
+    ("run.stop", "control_api_unavailable"): "noted",
+    ("run.start", "started"): "start_started",
+    ("run.start", "request_invalid"): "noted",
+    ("run.start", "start_failed"): "noted",
+    ("run.start", "start_unconfirmed"): "noted",
+    ("run.start", "registry_unavailable"): "noted",
+    ("run.start", "control_api_unavailable"): "noted",
+}
 
 
 def _fmt(params: Mapping) -> str:
@@ -118,6 +156,7 @@ class TuiApp:
         self.snapshot_at: float | None = None
         self.refresh_failed: str | None = None  # last run.list read failed
         self.status_refresh_failed: str | None = None  # last run.status read failed
+        self._status_failed_run: str | None = None  # run the status latch is about, when known
         self.list_stale = False  # last successful run.list was marked stale; only a fresh list clears it
         self.last: dict | None = None
         self.last_method: str | None = None
@@ -192,6 +231,10 @@ class TuiApp:
         if method == "run.start" and self.watch_only:
             self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
             return
+        if method == "run.start" and any(
+                isinstance(run, dict) and run.get("state") == "stop_pending" for run in self.runs):
+            self._error("refused locally: start while a listed run is stop_pending")
+            return
         self.in_flight[method] += 1
         self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
         self.dispatch(method, params, self.on_answer)
@@ -203,85 +246,12 @@ class TuiApp:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
         self.last, self.last_method = answer, method
         code = answer.get("code")
-        if method == "run.list":
-            runs = answer.get("runs")
-            # A row that is not a dict, or a dict without a non-empty string run_id and a string
-            # state, is not an empty snapshot. An empty list is a valid snapshot, and a whitespace
-            # id is a real id. Committing a bad row cleared the latch and dropped a live run, so
-            # Start ran. One bad row fails the whole list.
-            if code == "ok" and isinstance(runs, list) and all(_listed_run(r) for r in runs):
-                incoming = runs
-                merged, seen = [], set()
-                for run in incoming:
-                    chosen = self._consider(run)
-                    merged.append(chosen)
-                    seen.add(chosen.get("run_id"))
-                # A list that started before a Stop does not drop the run the Stop just named.
-                if self._answer_started is not None:
-                    for old in self.runs:
-                        rid = old.get("run_id")
-                        if rid not in seen and isinstance(rid, str) and self._answer_started < self._read_at.get(rid, -1):
-                            merged.append(old)
-                self.runs = merged
-                self.snapshot_at, self.refresh_failed = self._clock(), None
-                # A stale list stays stale until a later list is not. A status answer must not clear it
-                # (bot review 4503920848).
-                self.list_stale = answer.get("stale") is True
-                ids = [str(r.get("run_id")) for r in self.runs]
-                if self.selected not in ids:
-                    self.selected = ids[0] if ids else None
-            elif code == "ok" and isinstance(runs, list):
-                self.refresh_failed = "run.list answered ok with a malformed run"
-            else:
-                self.refresh_failed = f"run.list answered {field(code)}"
-        elif method == "run.status":
-            # An unavailable status stays failed until a later status succeeds. A refusal is an answer,
-            # not a failed read, and a successful list must not clear it (bot review 4503920903).
-            # ``code`` ok with no run was not applied: call_api drops a cyclic run and keeps ``code``.
-            # Clearing the failure before the merge would turn watch_only off when the merge raises
-            # (a non-dict ``stop``) and Loop drops the answer, which lets Start run.
-            # The same row rule as run.list. A dict with no string state used to merge over a
-            # stop_pending row, clear this latch, and let Start run.
-            run = answer.get("run")
-            if code == "ok" and _listed_run(run):
-                self._merge(run)
-                self.status_refresh_failed = None
-            elif code == "ok" and isinstance(run, dict):
-                self.status_refresh_failed = "run.status answered ok with a malformed run"
-                self._error("run.status answered ok with a malformed run")
-            elif code == "ok":
-                self.status_refresh_failed = "run.status answered ok without a run"
-                self._error("run.status answered ok without a run")
-            elif code == p.UNAVAILABLE:
-                self.status_refresh_failed = f"run.status answered {field(code)}"
-        elif code == "ok" and isinstance(answer.get("run"), dict) and (
-                method != "run.start" or _listed_run(answer.get("run"))):
-            self._merge(answer["run"])
-        elif method == "run.stop" and code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
-            rid = answer["run_id"]
-            state = "stopped" if code == "stopped" else "stop_pending"
-            reason = answer.get("reason")
-            # Build every replacement before writing. ``stop: 1`` is not a record; spreading it used to
-            # raise after state and the Stop mark were set, so the answer handler recorded only
-            # ``TypeError`` and never reached UNCERTAIN.
-            updates = []
-            for run in self.runs:
-                if run.get("run_id") == rid:
-                    prior = run.get("stop")
-                    base = prior if isinstance(prior, dict) else {}
-                    updates.append((run, {**base, "reason": reason}))
-            # Applied now, so any read that started earlier is older than this Stop.
-            self._read_at[rid] = time.monotonic()
-            self._stop_mark[rid] = (self._read_at[rid], state, reason)
-            for run, stop in updates:
-                run["state"] = state
-                run["stop"] = stop
-        elif method != "run.stop" and code in ("stopped", "pending"):
-            # stopped and pending confirm a Stop. On any other method they are an unexpected
-            # code: leave the row, the Stop mark, and the refresh latch as they are.
+        # Every answer takes the one transition its (method, code) names, or none.
+        transition = _ANSWER_TRANSITIONS.get((method, code))
+        if transition is None:
             self._error(f"unexpected {method} status={field(code)}")
-        elif code == "started" and _listed_run(answer.get("run")):
-            self._merge(answer["run"])
+        else:
+            self._apply_transition(transition, params, answer)
         self._answer_keyed = p.keyed_conditions(answer)
         self.answer_conditions = [(label, text) for label, _, text in self._answer_keyed]
         self._uncertain.update({subject: text for label, subject, text in self._answer_keyed if label == p.UNCERTAIN})
@@ -291,7 +261,7 @@ class TuiApp:
                 del self._uncertain[subject]
         # A stopped answer for a run that is not in this snapshot still confirms that Stop.
         # The cleanup above keeps it when the run is absent (bot review 4504133355).
-        if method == "run.stop" and code == "stopped" and isinstance(answer.get("run_id"), str):
+        if method == "run.stop" and code == "stopped" and _run_id_ok(answer.get("run_id")):
             self._uncertain.pop(f"run={answer['run_id']}", None)
         labels = ",".join(sorted({label for label, _ in self.answer_conditions})) or "none"
         said = " ".join(x for x in (f"answer {method} status={field(code)}", self._answer_fields(answer)) if x)
@@ -305,25 +275,187 @@ class TuiApp:
             self._notice(f"stop run={field(params.get('run_id'))}: control API answered {field(code)}", speech="")
         self.sync_conditions()
 
+    def _apply_transition(self, transition: str, params: dict, answer: dict) -> None:
+        effect = {
+            "list_ok": self._apply_list_ok,
+            "list_failed": self._apply_list_failed,
+            "status_ok": self._apply_status_ok,
+            "status_unavailable": self._apply_status_unavailable,
+            "stop_stopped": self._apply_stop_stopped,
+            "stop_pending": self._apply_stop_pending,
+            "start_started": self._apply_start_started,
+            "noted": self._apply_noted,
+        }[transition]
+        effect(params, answer)
+
+    def _apply_noted(self, params: dict, answer: dict) -> None:
+        """A real refusal or other non-painting code. The row, Stop mark and latches stay."""
+
+        return
+
+    def _apply_list_failed(self, params: dict, answer: dict) -> None:
+        self.refresh_failed = f"run.list answered {field(answer.get('code'))}"
+
+    def _apply_list_ok(self, params: dict, answer: dict) -> None:
+        runs = answer.get("runs")
+        # A row that is not a dict, or a dict without a non-empty string run_id and a known
+        # state, is not an empty snapshot. An empty list is a valid snapshot, and a whitespace
+        # id is a real id. One bad row fails the whole list.
+        if not isinstance(runs, list) or not all(_listed_run(row) for row in runs):
+            if isinstance(runs, list):
+                self.refresh_failed = "run.list answered ok with a malformed run"
+            else:
+                self.refresh_failed = f"run.list answered {field(answer.get('code'))}"
+            return
+        previous = {row.get("run_id") for row in self.runs if isinstance(row, dict)}
+        merged, seen = [], set()
+        for run in runs:
+            chosen = self._consider(run)
+            merged.append(chosen)
+            seen.add(chosen.get("run_id"))
+        # A list that started before a Stop does not drop the run the Stop just named.
+        if self._answer_started is not None:
+            for old in self.runs:
+                rid = old.get("run_id")
+                if rid not in seen and isinstance(rid, str) and self._answer_started < self._read_at.get(rid, -1):
+                    merged.append(old)
+        self.runs = merged
+        self.snapshot_at, self.refresh_failed = self._clock(), None
+        # A stale list stays stale until a later list is not. A status answer must not clear it
+        # (bot review 4503920848).
+        self.list_stale = answer.get("stale") is True
+        ids = [str(row.get("run_id")) for row in self.runs]
+        if self.selected not in ids:
+            self.selected = ids[0] if ids else None
+        self._release_status_latch(previous)
+
+    def _apply_status_ok(self, params: dict, answer: dict) -> None:
+        # An unavailable status stays failed until a later status succeeds. A refusal is an answer,
+        # not a failed read, and a list that still contains the run must not clear it
+        # (bot review 4503920903). Clearing the failure before the merge would turn watch_only off
+        # when the merge raises and Loop drops the answer, which lets Start run.
+        run = answer.get("run")
+        if _listed_run(run):
+            self._merge(run)
+            self._clear_status_latch()
+            return
+        subject = self._status_subject(params, run)
+        if isinstance(run, dict):
+            self._fail_status("run.status answered ok with a malformed run", subject)
+            self._error("run.status answered ok with a malformed run")
+            return
+        self._fail_status("run.status answered ok without a run", subject)
+        self._error("run.status answered ok without a run")
+
+    def _apply_status_unavailable(self, params: dict, answer: dict) -> None:
+        self._fail_status(f"run.status answered {field(answer.get('code'))}", params.get("run_id"))
+
+    def _apply_stop_stopped(self, params: dict, answer: dict) -> None:
+        self._apply_stop(answer, _TERMINAL_STATE)
+
+    def _apply_stop_pending(self, params: dict, answer: dict) -> None:
+        self._apply_stop(answer, "stop_pending")
+
+    def _apply_stop(self, answer: dict, state: str) -> None:
+        rid = answer.get("run_id")
+        if not _run_id_ok(rid):
+            return
+        reason = answer.get("reason")
+        # Build every replacement before writing. ``stop: 1`` is not a record; spreading it used to
+        # raise after state and the Stop mark were set, so the answer handler recorded only
+        # ``TypeError`` and never reached UNCERTAIN.
+        updates = []
+        for run in self.runs:
+            if run.get("run_id") == rid:
+                prior = run.get("stop")
+                base = prior if isinstance(prior, dict) else {}
+                updates.append((run, {**base, "reason": reason}))
+        # Applied now, so any read that started earlier is older than this Stop.
+        self._read_at[rid] = time.monotonic()
+        self._stop_mark[rid] = (self._read_at[rid], state, reason)
+        for run, stop in updates:
+            run["state"] = state
+            run["stop"] = stop
+
+    def _apply_start_started(self, params: dict, answer: dict) -> None:
+        """Merge a started run. This is not a Stop and not a list or status read.
+
+        It must not paint ``stopped``, and it must not replace a ``stop_pending`` row.
+        """
+
+        run = answer.get("run")
+        if not _listed_run(run):
+            return
+        if run.get("state") == _TERMINAL_STATE:
+            return
+        old = next((known for known in self.runs if known.get("run_id") == run.get("run_id")), None)
+        if old is not None and old.get("state") == "stop_pending":
+            return
+        self._merge(run)
+
+    def _status_subject(self, params: dict, run: object) -> object:
+        if isinstance(run, dict) and _run_id_ok(run.get("run_id")):
+            return run.get("run_id")
+        return params.get("run_id")
+
+    def _fail_status(self, text: str, run_id: object) -> None:
+        self.status_refresh_failed = text
+        if _run_id_ok(run_id):
+            self._status_failed_run = run_id
+
+    def _clear_status_latch(self) -> None:
+        self.status_refresh_failed = None
+        self._status_failed_run = None
+
+    def _release_status_latch(self, previous: set) -> None:
+        """Drop the status latch when a valid full list no longer contains its run.
+
+        A listed ``stop_pending`` run keeps the latch, so Start stays refused.
+        """
+
+        if not self.status_refresh_failed:
+            return
+        if any(isinstance(row, dict) and row.get("state") == "stop_pending" for row in self.runs):
+            return
+        ids = {row.get("run_id") for row in self.runs if isinstance(row, dict)}
+        if self._status_failed_run is not None:
+            if self._status_failed_run not in ids:
+                self._clear_status_latch()
+            return
+        if not ids or previous.isdisjoint(ids):
+            self._clear_status_latch()
+
     def _consider(self, run: dict) -> dict:
         """The run record a read may store.
 
         A read that started before a newer Stop keeps the local row, so a stale ``running`` cannot hide
         that Stop. An incoming ``stopped`` row is terminal and is kept even then (the same rule
-        ``_overlay_stop`` already applies when this client has no local row).
+        ``_overlay_stop`` already applies when this client has no local row). A non-terminal row
+        never replaces ``stop_pending``: only this terminal read, or ``run.stop`` code ``stopped``,
+        may paint ``stopped``.
         """
 
         started = self._answer_started
         rid = run.get("run_id")
+        old = next((known for known in self.runs if known.get("run_id") == rid), None)
         if started is None or not isinstance(rid, str):
-            return run
-        if started < self._read_at.get(rid, -1):
-            old = next((known for known in self.runs if known.get("run_id") == rid), None)
-            if old is not None and run.get("state") != "stopped":
-                return old
-            return self._overlay_stop(run, started)
-        self._read_at[rid] = started
-        return self._overlay_stop(run, started)
+            chosen = run
+        elif started < self._read_at.get(rid, -1):
+            if old is not None and run.get("state") != _TERMINAL_STATE:
+                chosen = old
+            else:
+                chosen = self._overlay_stop(run, started)
+        else:
+            chosen = self._overlay_stop(run, started)
+            # A read we then discard must not become the newest fact for this run.
+            if not (old is not None and old.get("state") == "stop_pending"
+                    and chosen.get("state") != _TERMINAL_STATE):
+                self._read_at[rid] = started
+        if old is not None and old.get("state") == "stop_pending" and chosen.get("state") != _TERMINAL_STATE:
+            if chosen.get("state") == "stop_pending":
+                return chosen
+            return old
+        return chosen
 
     def _overlay_stop(self, run: dict, started: float) -> dict:
         mark = self._stop_mark.get(run.get("run_id"))

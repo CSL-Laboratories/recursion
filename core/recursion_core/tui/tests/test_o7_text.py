@@ -539,6 +539,7 @@ def _plant_stop_pending(app: TuiApp) -> dict:
     app._read_at["r"] = now
     app._stop_mark["r"] = (now, "stop_pending", "cgroup_populated")
     app.status_refresh_failed = "run.status answered control_api_unavailable"
+    app._status_failed_run = "r"
     app.refresh_failed = "earlier read failed"
     return row
 
@@ -639,6 +640,183 @@ class StopPendingAnswerTest(unittest.TestCase):
                 self.assertTrue(any(err.startswith("unexpected run.start status=") for err in self.app.errors))
 
 
+class AnswerTableTest(unittest.TestCase):
+    """Each answer is one (method, code) transition. A pair that is not in the table, a blank
+    state, and a cross-method code leave the row, the Stop mark and the status latch alone."""
+
+    def setUp(self) -> None:
+        self.calls: list[str] = []
+
+        class API:
+            def __init__(self, outer: "AnswerTableTest") -> None:
+                self.outer = outer
+
+            def call(self, method: str, params: dict | None = None) -> dict:
+                self.outer.calls.append(method)
+                return {"code": "started", "run": {"run_id": "new", "state": "running"}}
+
+        self.api = API(self)
+        self.app = TuiApp(self.api, clock=Clock(), environ={"NO_COLOR": "1"})
+
+    def _ready(self) -> None:
+        _plant_stop_pending(self.app)
+        self.app.snapshot_at = self.app._clock()
+        self.calls.clear()
+
+    def _assert_held(self, method: str, code: object) -> None:
+        row = self.app.runs[0]
+        self.assertEqual(row.get("state"), "stop_pending", (method, code, row))
+        self.assertEqual((row.get("stop") or {}).get("reason"), "cgroup_populated")
+        self.assertEqual([item.get("run_id") for item in self.app.runs], ["r"])
+        self.assertEqual(self.app._stop_mark["r"][1], "stop_pending")
+        self.assertIsNotNone(self.app.status_refresh_failed)
+        self.assertIn("run=r", self.app._uncertain)
+        self.assertTrue(self.app.watch_only)
+        self.assertTrue(any(err.startswith(f"unexpected {method} status=") for err in self.app.errors),
+                        self.app.errors)
+
+    def test_stop_ok_does_not_merge_a_stateless_row_or_paint_stopped(self) -> None:
+        # run.stop code ok used to merge any dict: a state-less row replaced stop_pending,
+        # and {state: stopped} painted stopped and cleared UNCERTAIN without a stop code.
+        payloads = (
+            {"run_id": "r"},
+            {"run_id": "r", "state": "stopped"},
+            {"run_id": "r", "state": ""},
+            {"run_id": "r", "state": " "},
+            {"run_id": "r", "state": "running"},
+        )
+        for run in payloads:
+            with self.subTest(run=run):
+                self._ready()
+                before = len(self.app.errors)
+                self.app.on_answer("run.stop", {"run_id": "r"}, {"code": "ok", "run": dict(run)})
+                self._assert_held("run.stop", "ok")
+                self.assertTrue(any(err.startswith("unexpected run.stop status=") for err in self.app.errors[before:]))
+
+    def test_start_ok_stopped_does_not_paint_even_when_the_read_is_stale(self) -> None:
+        self._ready()
+        self.app._answer_started = 0.0
+        try:
+            self.app.on_answer("run.start", {"tenant": "t1", "engine": "e", "prompt": "p"},
+                               {"code": "ok", "run": {"run_id": "r", "state": "stopped"}})
+        finally:
+            self.app._answer_started = None
+        self._assert_held("run.start", "ok")
+
+    def test_stop_started_does_not_drop_stop_pending_for_any_state_shape(self) -> None:
+        # code started merged for every method. run.stop started with stopped, blank, or
+        # running dropped stop_pending.
+        for state in ("stopped", "", " ", "running"):
+            with self.subTest(state=state):
+                self._ready()
+                self.app.on_answer("run.stop", {"run_id": "r"},
+                                   {"code": "started", "run": {"run_id": "r", "state": state}})
+                self._assert_held("run.stop", "started")
+
+    def test_stale_status_clears_the_latch_but_stop_pending_still_refuses_start(self) -> None:
+        # A stale listed status cleared the latch, then Start dispatched run.start.
+        self._ready()
+        self.app._answer_started = 0.0
+        try:
+            self.app.on_answer("run.status", {"run_id": "r"},
+                               {"code": "ok", "run": {"run_id": "r", "state": "running",
+                                                      "engine": "e", "tenant": "t"}})
+        finally:
+            self.app._answer_started = None
+        self.assertEqual(self.app.runs[0]["state"], "stop_pending")
+        self.assertEqual(self.app._stop_mark["r"][1], "stop_pending")
+        self.assertIsNone(self.app.status_refresh_failed)
+        self.app.refresh_failed = None
+        self.assertFalse(self.app.watch_only)
+        self.app.command("start --tenant t1 --engine codex --prompt p")
+        self.assertNotIn("run.start", self.calls)
+        self.assertIn("stop_pending", self.app.errors[-1])
+
+    def test_status_blank_state_does_not_clear_the_latch_or_enable_start(self) -> None:
+        # _listed_run accepted any string state, so '' and ' ' cleared the latch and UNCERTAIN.
+        for state in ("", " "):
+            with self.subTest(state=state):
+                self._ready()
+                self.calls.clear()
+                self.app.on_answer("run.status", {"run_id": "r"},
+                                   {"code": "ok", "run": {"run_id": "r", "state": state}})
+                self.assertEqual(self.app.runs[0]["state"], "stop_pending")
+                self.assertEqual(self.app.runs[0]["stop"]["reason"], "cgroup_populated")
+                self.assertIsNotNone(self.app.status_refresh_failed)
+                self.assertIn("run=r", self.app._uncertain)
+                self.assertTrue(self.app.watch_only)
+                self.app.command("start --tenant t1 --engine codex --prompt p")
+                self.assertNotIn("run.start", self.calls)
+                self.assertIn("watch_only", self.app.errors[-1])
+
+    def test_list_blank_state_does_not_replace_stop_pending(self) -> None:
+        for state in ("", " "):
+            with self.subTest(state=state):
+                self._ready()
+                self.app.on_answer("run.list", {}, {"code": "ok", "runs": [{"run_id": "r", "state": state}]})
+                self.assertEqual(self.app.runs[0]["state"], "stop_pending")
+                self.assertEqual(self.app.refresh_failed, "run.list answered ok with a malformed run")
+                self.assertIsNotNone(self.app.status_refresh_failed)
+                self.assertIn("run=r", self.app._uncertain)
+
+    def test_empty_list_after_malformed_status_unwedges_start(self) -> None:
+        # A malformed ok set the latch. A later valid empty list plus run_unknown left it set,
+        # so Start stayed refused with no run left.
+        self.app.runs = [{"run_id": "r", "state": "running", "engine": "e", "tenant": "t"}]
+        self.app.selected = "r"
+        self.app.snapshot_at = self.app._clock()
+        self.app.on_answer("run.status", {"run_id": "r"},
+                           {"code": "ok", "run": {"run_id": "r", "state": None}})
+        self.assertIsNotNone(self.app.status_refresh_failed)
+        self.assertEqual(self.app.runs[0]["state"], "running")
+        self.app.command("start --tenant t1 --engine codex --prompt p")
+        self.assertNotIn("run.start", self.calls)
+        self.app.on_answer("run.list", {}, {"code": "ok", "runs": []})
+        self.assertEqual(self.app.runs, [])
+        self.assertIsNone(self.app.status_refresh_failed)
+        self.app.on_answer("run.status", {"run_id": "r"}, {"code": "run_unknown", "run_id": "r"})
+        self.assertIsNone(self.app.status_refresh_failed)
+        self.assertFalse(self.app.watch_only)
+        self.assertFalse(any(err.startswith("unexpected run.status status=") for err in self.app.errors))
+        self.calls.clear()
+        self.app.command("start --tenant t1 --engine codex --prompt p")
+        self.assertIn("run.start", self.calls)
+
+    def test_a_list_that_still_shows_stop_pending_keeps_start_refused(self) -> None:
+        self._ready()
+        self.app.on_answer("run.list", {}, {"code": "ok", "runs": [
+            {"run_id": "r", "state": "stop_pending", "engine": "e", "tenant": "t",
+             "stop": {"reason": "cgroup_populated", "requested": True}}]})
+        self.assertEqual(self.app.runs[0]["state"], "stop_pending")
+        self.assertIsNotNone(self.app.status_refresh_failed)
+        self.app.refresh_failed = None
+        self.assertTrue(self.app.watch_only)
+        self.app.command("start --tenant t1 --engine codex --prompt p")
+        self.assertNotIn("run.start", self.calls)
+
+    def test_stop_code_stopped_still_paints_and_a_fresh_status_stopped_does_too(self) -> None:
+        self._ready()
+        self.app.on_answer("run.status", {"run_id": "r"},
+                           {"code": "ok", "run": {"run_id": "r", "state": "stopped"}})
+        self.assertEqual(self.app.runs[0]["state"], "stopped")
+        self.assertNotIn("run=r", self.app._uncertain)
+        self._ready()
+        self.app.on_answer("run.stop", {"run_id": "r"},
+                           {"code": "stopped", "run_id": "r", "reason": "stopped"})
+        self.assertEqual(self.app.runs[0]["state"], "stopped")
+        self.assertEqual(self.app._stop_mark["r"][1], "stopped")
+        self.assertNotIn("run=r", self.app._uncertain)
+
+    def test_start_started_does_not_paint_stopped_over_stop_pending(self) -> None:
+        self._ready()
+        self.app.on_answer("run.start", {"tenant": "t1", "engine": "e", "prompt": "p"},
+                           {"code": "started", "run": {"run_id": "r", "state": "stopped"}})
+        self.assertEqual(self.app.runs[0]["state"], "stop_pending")
+        self.assertEqual(self.app._stop_mark["r"][1], "stop_pending")
+        self.assertIsNotNone(self.app.status_refresh_failed)
+        self.assertFalse(any(err.startswith("unexpected run.start status=") for err in self.app.errors))
+
+
 class SeededStopModelTest(unittest.TestCase):
     """Seed 20261113.
 
@@ -701,6 +879,53 @@ class SeededStopModelTest(unittest.TestCase):
                     self.assertEqual(model.runs[0]["stop"]["reason"], "cgroup_populated")
                     self.assertIsNotNone(model.status_refresh_failed)
 
+    def test_seeded_method_code_and_payload_shape(self) -> None:
+        """Draw (method, code, payload shape), including blank states and cross-method codes.
+
+        Seed 20261113. A pair outside the answer table changes nothing. A blank state is not a
+        row. Only run.stop code stopped, or a list/status row whose state is stopped, may paint
+        stopped. Only a fresh valid list that drops the run, or a valid status, clears the latch.
+        """
+
+        rng = random.Random(20261113)
+        model = TuiApp(ScriptedAPI({}), clock=Clock(), environ={"NO_COLOR": "1"})
+        combos = _model_combos()
+        for trial in range(48):
+            for step in range(8):
+                _plant_stop_pending(model)
+                stop_at = model._read_at["r"]
+                method, answer, started = combos[rng.randrange(len(combos))]
+                answer = json.loads(json.dumps(answer))
+                err_at = len(model.errors)
+                model._answer_started = started
+                try:
+                    model.on_answer(method, {"run_id": "r"}, answer)
+                finally:
+                    model._answer_started = None
+                state, latch_cleared, unexpected = _predict_answer(method, answer, started, stop_at)
+                got = next((row.get("state") for row in model.runs if row.get("run_id") == "r"), None)
+                self.assertEqual(
+                    got, state,
+                    f"trial {trial} step {step}: {method} {answer.get('code')!r} "
+                    f"shape {answer!r} started={started!r} left state {got!r}, want {state!r}",
+                )
+                if state == "stop_pending":
+                    row = next(item for item in model.runs if item.get("run_id") == "r")
+                    self.assertEqual(row["stop"]["reason"], "cgroup_populated")
+                    self.assertEqual(model._stop_mark["r"][1], "stop_pending")
+                    self.assertIn("run=r", model._uncertain)
+                if unexpected:
+                    self.assertTrue(
+                        any(err.startswith(f"unexpected {method} status=") for err in model.errors[err_at:]),
+                        f"trial {trial} step {step}: {method} {answer.get('code')!r} was silent",
+                    )
+                    self.assertIsNotNone(model.status_refresh_failed)
+                    self.assertEqual(model.refresh_failed, "earlier read failed")
+                elif latch_cleared:
+                    self.assertIsNone(model.status_refresh_failed, (method, answer, started))
+                else:
+                    self.assertIsNotNone(model.status_refresh_failed, (method, answer, started))
+
 
 def _model_op(kind: int) -> tuple[str, dict, float | None]:
     """One drawn answer. ``started`` None is a synchronous (fresh) read; 0 is older than the Stop."""
@@ -751,8 +976,121 @@ def _departure_allowed(method: str, answer: dict, started: float | None, stop_at
         return False
     if method == "run.list":
         rows = answer.get("runs")
-        rows = rows if isinstance(rows, list) else []
-    else:
+        if not isinstance(rows, list) or not all(_listed_run(row) for row in rows):
+            return False
+        if fresh and not any(row.get("run_id") == "r" for row in rows):
+            return True
+        return any(row.get("run_id") == "r" and row.get("state") in _TERMINAL for row in rows)
+    run = answer.get("run")
+    return bool(_listed_run(run) and run.get("run_id") == "r" and run.get("state") in _TERMINAL)
+
+
+# Pairs the answer table allows. Kept here so a draw can tell an unexpected code from a real one
+# without reading the table out of the implementation under test.
+_MODEL_ALLOWED = {
+    ("run.list", "ok"),
+    ("run.list", "registry_unavailable"),
+    ("run.list", "control_api_unavailable"),
+    ("run.status", "ok"),
+    ("run.status", "run_unknown"),
+    ("run.status", "request_invalid"),
+    ("run.status", "registry_unavailable"),
+    ("run.status", "control_api_unavailable"),
+    ("run.stop", "stopped"),
+    ("run.stop", "pending"),
+    ("run.stop", "run_unknown"),
+    ("run.stop", "request_invalid"),
+    ("run.stop", "registry_unavailable"),
+    ("run.stop", "control_api_unavailable"),
+    ("run.start", "started"),
+    ("run.start", "request_invalid"),
+    ("run.start", "start_failed"),
+    ("run.start", "start_unconfirmed"),
+    ("run.start", "registry_unavailable"),
+    ("run.start", "control_api_unavailable"),
+}
+_MODEL_CODES = ("ok", "started", "stopped", "pending", "run_unknown", "request_invalid", "")
+_MODEL_SHAPES = (
+    {"run_id": "r", "state": "stopped"},
+    {"run_id": "r", "state": "running"},
+    {"run_id": "r", "state": "stop_pending",
+     "stop": {"reason": "cgroup_populated", "requested": True}},
+    {"run_id": "r", "state": ""},
+    {"run_id": "r", "state": " "},
+    {"run_id": "r"},
+    {"run_id": "r", "state": None},
+    {"run_id": "", "state": "running"},
+    {"run_id": " ", "state": "running"},
+    {"state": "stopped"},
+    None,  # empty list, or no run object
+)
+
+
+def _model_row_ok(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    run_id, state = row.get("run_id"), row.get("state")
+    return isinstance(run_id, str) and bool(run_id) and state in {
+        "starting", "start_failed", "running", "stop_pending", "stopped"}
+
+
+def _model_combos() -> list[tuple[str, dict, float | None]]:
+    found = []
+    for method in ("run.list", "run.status", "run.stop", "run.start"):
+        for code in _MODEL_CODES:
+            for shape in _MODEL_SHAPES:
+                for started in (None, 0.0):
+                    found.append((method, _model_answer(method, code, shape), started))
+    return found
+
+
+def _model_answer(method: str, code: str, shape: dict | None) -> dict:
+    if method == "run.list":
+        return {"code": code, "runs": [] if shape is None else [dict(shape)]}
+    if shape is None:
+        if method == "run.stop":
+            return {"code": code, "run_id": "r", "reason": "cgroup_populated"}
+        return {"code": code}
+    body = dict(shape)
+    if method == "run.stop":
+        rid = body.get("run_id")
+        return {"code": code, "run_id": rid if isinstance(rid, str) else "r",
+                "reason": "cgroup_populated", "run": body}
+    return {"code": code, "run": body}
+
+
+def _predict_answer(method: str, answer: dict, started: float | None,
+                    stop_at: float) -> tuple[str | None, bool, bool]:
+    """``(state of run r or None if the snapshot dropped it, latch cleared, unexpected)``."""
+
+    code = answer.get("code")
+    if (method, code) not in _MODEL_ALLOWED:
+        return "stop_pending", False, True
+    fresh = started is None or started >= stop_at
+    if method == "run.stop" and code == "stopped" and answer.get("run_id") == "r":
+        return "stopped", False, False
+    if method == "run.status" and code == "ok":
         run = answer.get("run")
-        rows = [run] if isinstance(run, dict) else []
-    return any(_listed_run(row) and row.get("run_id") == "r" and row.get("state") in _TERMINAL for row in rows)
+        if not _model_row_ok(run):
+            return "stop_pending", False, False
+        if run.get("run_id") != "r":
+            return "stop_pending", True, False
+        if run.get("state") == "stopped":
+            return "stopped", True, False
+        return "stop_pending", True, False
+    if method == "run.list" and code == "ok":
+        rows = answer.get("runs")
+        if not isinstance(rows, list) or not all(_model_row_ok(row) for row in rows):
+            return "stop_pending", False, False
+        incoming = next((row for row in rows if row.get("run_id") == "r"), None)
+        if not fresh:
+            if incoming is not None and incoming.get("state") == "stopped":
+                return "stopped", False, False
+            return "stop_pending", False, False
+        if incoming is None:
+            pending = any(row.get("state") == "stop_pending" for row in rows)
+            return None, not pending, False
+        if incoming.get("state") == "stopped":
+            return "stopped", False, False
+        return "stop_pending", False, False
+    return "stop_pending", False, False

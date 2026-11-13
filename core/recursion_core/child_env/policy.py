@@ -639,6 +639,10 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
         try:
             st = os.lstat(candidate)
         except FileNotFoundError:
+            # A future component may be created by the engine. Do not let a
+            # later parent traversal escape the checked ancestor after that happens.
+            if ".." in pending:
+                return None, False, "value_chain_unsafe"
             rest = [candidate] + [p for p in reversed(pending)]
             return os.path.join(*rest), True, None
         except OSError:

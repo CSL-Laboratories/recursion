@@ -517,20 +517,31 @@ class UnitKillTree:
         return unit[len('recursion-run-'):-len('.service')]
 
     def request_stop(self, cgroup):
-        # Durable Stop intent first, then systemctl stop (SIGINT, about 2 s, SIGKILL the rest).
-        self._daemon.stop(self.run_id_of(cgroup))
+        # Durable Stop intent first, then systemctl stop (SIGINT, about 2 s, SIGKILL the rest). The
+        # path goes with it: a launch whose control record was never written has no other one to walk.
+        self._daemon.stop(self.run_id_of(cgroup), cgroup=cgroup)
 
     def confirm(self, cgroup, timeout_s):
+        """``EMPTY`` only when the run's row is ``terminated`` and ``cgroup`` itself, walked in this
+        call, is absent or empty.
+
+        The row alone is not enough. It ends on what was seen of the unit and of the cgroup on the
+        control record, and a sweep or a fence can end it for a run whose record carries no cgroup
+        without ever looking at this path. The receipt names this path, so this path is walked.
+        """
         run_id = self.run_id_of(cgroup)
         deadline = self._clock() + timeout_s
         while True:
-            run = self._daemon.reconcile(run_id)
+            run = self._daemon.reconcile(run_id, cgroup=cgroup)
+            clear = None
             if run.state == 'terminated':
-                return EMPTY  # attested by the sweep: cgroup subtree read empty, no listed pid alive
+                clear = self._daemon.cgroup_clear(run_id, cgroup)
+                if clear is True:
+                    return EMPTY  # attested: the unit ended, and this cgroup read absent or empty just now
             if run.state == 'lost_reboot':
                 return UNKNOWN  # nothing saw the tree end; the registry does not call that terminated
             if self._clock() >= deadline:
-                if run.state in ('running', 'stopping'):
+                if run.state in ('running', 'stopping') or clear is False:
                     return POPULATED
                 return TIMEOUT if run.state == 'starting' else UNKNOWN
             self._sleep(self._poll_s)

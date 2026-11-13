@@ -56,6 +56,10 @@ RECORDED_KILL_WAIT_S = 2.0
 # operator asks for is always sent.
 STOP_RESEND_BASE_S = 30.0
 STOP_RESEND_MAX_S = 600.0
+# Why a gone unit with a recorded Stop is not ended: its cgroup could not be read, or the control
+# record that should name the cgroup carries none.
+CGROUP_UNREAD = 'unit gone; the recorded cgroup could not be read'
+CGROUP_UNRECORDED = 'unit gone; the control record carries no cgroup to walk'
 
 
 def require_free_threaded():
@@ -693,8 +697,9 @@ class Registry:
                 return []
             return self.db.execute('SELECT run_id, record FROM control_runs ORDER BY run_id').fetchall()
 
-    def control_cgroup(self, run_id):
-        """The cgroup path ``run_id``'s control record carries, or None when it records none.
+    def control_identity(self, run_id):
+        """``(recorded, cgroup)`` for ``run_id``, from one read: whether a control record exists at
+        all, and the cgroup path it carries (None when it records none).
 
         A record that cannot be read as one raises ValueError: that is not "no cgroup".
         """
@@ -703,17 +708,24 @@ class Registry:
             table = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                     "AND name='control_runs'").fetchone()
             if table is None:
-                return None
+                return False, None
             row = self.db.execute('SELECT record FROM control_runs WHERE run_id=?', (run_id,)).fetchone()
         if row is None:
-            return None
+            return False, None
         record = json.loads(row[0])
         group = record.get('cgroup') if isinstance(record, dict) else False
         if group is None or group == '':
-            return None
+            return True, None
         if not isinstance(group, str):
             raise ValueError('control record carries no readable cgroup')
-        return group
+        return True, group
+
+    def control_cgroup(self, run_id):
+        """The cgroup path ``run_id``'s control record carries, or None when it records none.
+
+        A record that cannot be read as one raises ValueError: that is not "no cgroup".
+        """
+        return self.control_identity(run_id)[1]
 
     def close(self):
         with self.lock:
@@ -779,19 +791,48 @@ class Daemon:
             self._reconcile(self.registry.get(run_id))
             return self.registry.get(run_id)
 
-    def stop(self, run_id):
+    def stop(self, run_id, *, cgroup=None):
+        """Record the Stop, send it and return the run's record.
+
+        ``cgroup`` is the path the caller will name in its receipt. It is walked beside the one on
+        the control record, which a launch whose record was never written does not have.
+        """
         with self.lock:
             self._open()
             self.registry.request_stop(run_id)
-            self._reconcile(self.registry.get(run_id), send_stop=True)
+            self._reconcile(self.registry.get(run_id), send_stop=True, cgroup=cgroup)
             return self.registry.get(run_id)
 
-    def reconcile(self, run_id):
-        """Observe one run now and return its record. Raises KeyError for an unknown id."""
+    def reconcile(self, run_id, *, cgroup=None):
+        """Observe one run now and return its record. Raises KeyError for an unknown id.
+
+        ``cgroup`` is walked as in ``stop``.
+        """
         with self.lock:
             self._open()
-            self._reconcile(self.registry.get(run_id))
+            self._reconcile(self.registry.get(run_id), cgroup=cgroup)
             return self.registry.get(run_id)
+
+    def cgroup_clear(self, run_id, cgroup):
+        """Walk ``cgroup`` now, for a run with a recorded Stop. Raises KeyError for an unknown id.
+
+        True: the path is absent or empty. False: a process is still alive in it. None: that
+        cannot be told (no Stop is recorded for the run, the path does not name the run's unit,
+        the manager cannot walk, or the walk could not be finished).
+
+        The run's row says what was seen of its unit and of the cgroup on its control record. It
+        can read ``terminated`` without this path ever having been looked at: a launch whose
+        control record never got its cgroup has none recorded, and a sweep or a fence that replays
+        its Stop on a unit systemd has forgotten finds no path to walk. A Stop receipt names a
+        cgroup, so the kill tree asks here about that very path before it answers ``stopped``.
+        What is alive there is killed, as in every walk under a recorded Stop.
+        """
+        with self.lock:
+            self._open()
+            run = self.registry.get(run_id)
+            if not run.stop_requested:
+                return None  # the walk kills what it finds: never without a recorded Stop
+            return self._walk_cgroups(run, [cgroup])
 
     def _stop_send_due(self, run_id):
         held = self._stop_resend.get(run_id)
@@ -802,7 +843,7 @@ class Daemon:
         wait = STOP_RESEND_BASE_S if held is None else min(held[1] * 2, STOP_RESEND_MAX_S)
         self._stop_resend[run_id] = (self.clock() + wait, wait)
 
-    def _reconcile(self, run, detail='', send_stop=False):
+    def _reconcile(self, run, detail='', send_stop=False, cgroup=None):
         if run.state in TERMINAL:
             self._stop_resend.pop(run.run_id, None)
             return
@@ -840,8 +881,10 @@ class Daemon:
             # in the cgroup the run was recorded with (a user manager that was killed and
             # restarted forgets its units; their processes stay). So the recorded cgroup is
             # walked, and what is still alive there is killed through the cgroup (ADV1-1).
+            # A run the control API knows but has no cgroup for cannot be walked at all: its
+            # row is not ended on systemd's word either (see ``_recorded_cgroup_clear``).
             if observation == 'gone' and (stopped or not_loaded):
-                clear = self._recorded_cgroup_clear(run)
+                clear, unread = self._recorded_cgroup_clear(run, cgroup)
                 if clear is True:
                     observation = 'empty'
                     if not_loaded and not detail:
@@ -850,7 +893,7 @@ class Daemon:
                     observation = 'running'
                     detail = detail or 'unit gone; the recorded cgroup still holds a process'
                 else:
-                    detail = detail or 'unit gone; the recorded cgroup could not be read'
+                    detail = detail or unread
             state = {'running': 'stopping' if run.stop_requested else 'running',
                      'empty': 'terminated'}.get(observation, 'unknown')
         except (OSError, subprocess.SubprocessError) as exc:
@@ -865,29 +908,50 @@ class Daemon:
         if (state, detail[:500]) != (run.state, run.detail):
             self.registry.state(run.run_id, state, detail)
 
-    def _recorded_cgroup_clear(self, run):
-        """True when the cgroup recorded for ``run`` is absent or empty, False when a process
-        is still alive in it, None when that cannot be told.
+    def _recorded_cgroup_clear(self, run, cgroup=None):
+        """``(clear, why)``. ``clear`` is True when every cgroup known for ``run`` is absent or
+        empty, False when a process is still alive in one, None when that cannot be told; ``why``
+        is the row's detail for None.
 
-        The recorded path is the one on the run's control record. A run with none (it never
-        launched, or the launch was never recorded) has no path to walk: no receipt can say
-        ``stopped`` for it either, because the control API confirms only a recorded cgroup.
+        The paths are the one on the run's control record and ``cgroup``, the one a Stop brought
+        with it. With neither there is nothing to walk, and the answer turns on whether the
+        control API knows the run:
+
+        * no control record at all: the run is the daemon's alone (started through
+          ``Daemon.start``). Its row ends on systemd's word, as it always did;
+        * a control record that carries no cgroup: the API started a launch and never recorded
+          where it ran. A process may be alive under a path this daemon was never told, so that
+          cannot be told and the row is not ended. It stays that way until a Stop brings the
+          path, or the record gains it. A launch that never started a unit waits there too:
+          nothing durable tells the two apart yet.
+
+        Either way the row is not a Stop receipt: the kill tree answers only after
+        ``cgroup_clear`` walked the path the receipt names.
         """
         try:
-            group = self.registry.control_cgroup(run.run_id)
+            recorded, group = self.registry.control_identity(run.run_id)
         except ValueError:
             log.exception('control record of %s is unreadable; its cgroup was not walked', run.run_id)
-            return None
-        if group is None:
-            return True
+            return None, CGROUP_UNREAD
+        paths = [path for path in dict.fromkeys((group, cgroup)) if path is not None]
+        if not paths:
+            return (None, CGROUP_UNRECORDED) if recorded else (True, '')
+        return self._walk_cgroups(run, paths), CGROUP_UNREAD
+
+    def _walk_cgroups(self, run, paths):
+        """The manager's walk over each of ``paths``: False if any holds a live process, else
+        None if any could not be told, else True."""
         check = getattr(self.manager, 'recorded_cgroup_clear', None)
         if not callable(check):
             return None
         try:
-            return check(run.unit, group)
+            outcomes = [check(run.unit, path) for path in paths]
         except Exception:
             log.exception('walk of the recorded cgroup of %s failed', run.run_id)
             return None
+        if False in outcomes:
+            return False
+        return None if None in outcomes else True
 
     def _termination_attested(self, unit):
         attest = getattr(self.manager, 'processes_gone', None)

@@ -102,7 +102,16 @@ are unaffected:
   alone: when the run's control record carries a cgroup path, that path is walked,
   what is still alive there is killed through the cgroup (`cgroup.kill`, else
   SIGKILL by pidfd to each listed pid /proc still places there), and only an
-  absent or empty cgroup is `terminated`; otherwise the run stays `stopping`. A scripted observation that the unit ended, or a listener that is
+  absent or empty cgroup is `terminated`; otherwise the run stays `stopping`. A Stop
+  brings the cgroup path its receipt will name, and that path is walked the same way
+  when the control record carries none (a launch whose record was never written).
+  With no path at all the row ends on systemd's word only for a run that has no
+  control record; a run whose control record exists and carries no cgroup stays
+  `unknown` (`unit gone; the control record carries no cgroup to walk`) through every
+  sweep and fence, until a Stop brings the path or the record gains it. A launch
+  that never started a unit waits there too: nothing durable tells the two apart yet.
+  `run.stop` answers `stopped` only after the path it names read absent or empty in
+  the same call, whatever the row says. A scripted observation that the unit ended, or a listener that is
   still alive, is not `terminated`. A read of `cgroup.procs` or `/proc/<pid>/stat`
   that fails with anything other than ENOENT or ESRCH is unknown, not an empty
   cgroup and not a dead process, and is not `terminated`. A run with a recorded
@@ -235,7 +244,12 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
   "deadline_s": 3600, "binary": "/abs/path/claude"}}}`. Nothing is defaulted: an engine
   with no entry answers `start_failed` / `route_not_configured`.
 
-Not done: credential custody (an API-key route refuses, `no credential`), Pi, Hermes and
+Not done: credential custody (an API-key route refuses, `no credential`; a Claude Code route
+whose key comes from the user's `apiKeyHelper`, `"key_source": "api_key_helper"`, and a
+`passthrough` route (Bedrock, Vertex, Foundry or a gateway) are refused `start_failed` /
+`launch_refused`, `no credential custody`, before anything is launched, and so is a route whose
+`limits` would switch to one (`"on_limit": "fallback"` with such a route in `fallback`);
+`route.list` names that as the route's blocker; the subscription route is not affected), Pi, Hermes and
 OpenCode, the Control MCP transport, a browser pairing step for the device token, a second
 launch per run (a fallback route refuses `run_already_launched`), re-attaching the route
 driver to a run that outlived a daemon (its output file keeps growing and is readable; its

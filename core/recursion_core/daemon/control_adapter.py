@@ -32,9 +32,10 @@ those reads and the loaded operator plugin's O7 reads. A read with no source ans
 The route breaker is ``breaker.DurableRouteBreaker``: trips, run bindings and faults are kept in
 the plugin-security breaker store under the daemon's state directory and survive a restart.
 
-Not here: custody (an API-key route has no credential source and refuses), the O7
-interventions, bar evidence for any route (every route reads BETA), scopes on the socket beyond
-the uid check, and the Control MCP transport.
+Not here: custody (an API-key route has no credential source and refuses; a route that brings
+its own credential, ``key_source: api_key_helper`` or ``passthrough``, is refused before launch,
+see ``route_unsupported``), the O7 interventions, bar evidence for any route (every route reads
+BETA), scopes on the socket beyond the uid check, and the Control MCP transport.
 """
 from __future__ import annotations
 
@@ -192,6 +193,52 @@ def no_custody(connection_id, env_name):
     raise KeyError(connection_id)
 
 
+def route_unsupported(entry):
+    """Why the daemon will not launch a loaded route entry, or None when it may.
+
+    Two kinds of route bring a credential the daemon has no custody layer to hand to the engine: an
+    API-key route whose key comes from the user's own ``apiKeyHelper`` (``key_source: api_key_helper``),
+    and a ``passthrough`` route (Bedrock, Vertex, Foundry, a gateway). The launcher's child environment
+    gives the engine a home of its own and only the policy's variables, so the helper's settings and the
+    cloud variables never reach it, while the user's sign-in does: the run would be carried by the
+    subscription and recorded and metered as the other connection. Until custody exists both are
+    refused ``launch_refused`` before anything is bound or launched. The subscription route is not
+    touched, and an API-key route with ``key_source: custody`` keeps its own refusal
+    (``no credential``).
+
+    The same holds for the routes the entry would switch to. With ``limits.on_limit: fallback`` the
+    route service launches the next ``limits.fallback`` route once the primary connection is at a
+    limit, so an entry whose fallback list names such a route is refused whole, naming the fallback
+    by its place in the list. A fallback list that is only shown to the user (``ask``, ``wait``) is
+    never launched from and does not refuse the entry.
+    """
+    route = entry.get('route') if isinstance(entry, dict) else None
+    if not isinstance(route, dict):
+        return None
+    reason = _no_custody(route)
+    if reason is not None:
+        return f'no credential custody: {reason}'
+    limits = route.get('limits')
+    if isinstance(limits, dict) and limits.get('on_limit') == 'fallback' and isinstance(limits.get('fallback'), list):
+        for place, other in enumerate(limits['fallback'], 1):
+            reason = _no_custody(other)
+            if reason is not None:
+                return f'no credential custody: fallback {place}: {reason}'
+    return None
+
+
+def _no_custody(route):
+    """What kind of custody-less route ``route`` is, or None."""
+    connection = route.get('connection') if isinstance(route, dict) else None
+    if not isinstance(connection, dict):
+        return None
+    if connection.get('kind') == 'passthrough':
+        return 'a passthrough route is not launched'
+    if connection.get('key_source') == 'api_key_helper':
+        return 'a key_source api_key_helper route is not launched'
+    return None
+
+
 class StartRefused(Exception):
     def __init__(self, code, detail=''):
         super().__init__(f'{code}: {detail}' if detail else code)
@@ -231,6 +278,9 @@ class RouteStarter:
         entry = self._routes.get(engine)
         if entry is None:
             raise self._refuse(run_id, 'route_not_configured', engine)
+        unsupported = route_unsupported(entry)
+        if unsupported is not None:
+            raise self._refuse(run_id, route_contract.LAUNCH_REFUSED, unsupported)
         if self._breaker_unavailable is not None:
             raise self._refuse(run_id, 'breaker_store_unavailable', self._breaker_unavailable)
         connection = route_connection(entry)
@@ -433,6 +483,9 @@ class DaemonControl:
                                              f'starts on this connection are refused; {NO_BAR_EVIDENCE}')
                     elif tripped or state != 'closed':
                         record['blocker'] = f'breaker {state} on this connection (typed limit); {NO_BAR_EVIDENCE}'
+                unsupported = route_unsupported(entry)
+                if unsupported is not None:  # every start on this route is refused, whatever the breaker says
+                    record['blocker'] = f'{route_contract.LAUNCH_REFUSED}: {unsupported}'
             records.append(record)
         records.append({'id': 'surface:cli', 'class': 'surface', 'surface': 'cli', 'sign_in': '', 'configured': True,
                         'maturity': 'beta', 'beta': True, 'bars': {}, 'blocker': NO_BAR_EVIDENCE})
@@ -748,7 +801,9 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     ``daemon.manager`` must be an ``EngineUnitManager``. ``routes`` overrides the operator's
     route file (tests). A route file that cannot be trusted leaves every start refused
     (``route_not_configured``) and is logged; reads and Stop still work. The same holds for a
-    breaker store that exists and cannot be opened (``breaker_store_unavailable``).
+    breaker store that exists and cannot be opened (``breaker_store_unavailable``). A loaded route
+    the daemon has no credential custody for (``route_unsupported``) is logged here and refused
+    ``launch_refused`` at each start; the other routes are not affected.
 
     Operator plugins under ``$XDG_CONFIG_HOME/recursion/plugins`` and in ``plugin_dirs`` are
     loaded through ``plugins.PluginHost``; one that is refused is kept in the inventory with its
@@ -768,6 +823,10 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         except RoutesUnreadable as exc:
             log.error('no route can start: %s', exc)
             routes = {}
+    for engine, entry in sorted(routes.items()):
+        unsupported = route_unsupported(entry)
+        if unsupported is not None:
+            log.error('route %s cannot start (%s): %s', engine, route_contract.LAUNCH_REFUSED, unsupported)
     config_dir = Path(environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')) / 'recursion'
     registry = DurableRunRegistry(daemon.registry, processes=pid_alive(manager))
     stored = breaker = breaker_unavailable = None

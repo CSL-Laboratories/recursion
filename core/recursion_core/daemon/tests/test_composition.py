@@ -295,6 +295,194 @@ class ComposedDaemonTest(unittest.TestCase):
         states = {r['state'] for r in api.call('run.list')['runs']}
         self.assertEqual(states, {'start_failed'})
 
+    #: Routes the daemon has no credential custody for, each with what its method needs set in the
+    #: daemon's environment. With those set the adapter itself accepts the route, so a refusal here is
+    #: the daemon's own and not the adapter's "needs ... set".
+    NO_CUSTODY_ROUTES = {
+        'api_key_helper': ({'kind': 'api_key', 'id': 'work-helper', 'key_source': 'api_key_helper'}, {}),
+        'bedrock': ({'kind': 'passthrough', 'id': 'aws-work', 'method': 'bedrock'},
+                    {'CLAUDE_CODE_USE_BEDROCK': '1', 'AWS_REGION': 'us-east-1', 'AWS_PROFILE': 'work'}),
+        'vertex': ({'kind': 'passthrough', 'id': 'gcp-work', 'method': 'vertex'},
+                   {'CLAUDE_CODE_USE_VERTEX': '1', 'CLOUD_ML_REGION': 'us-east5',
+                    'ANTHROPIC_VERTEX_PROJECT_ID': 'synthetic-project'}),
+        'foundry': ({'kind': 'passthrough', 'id': 'azure-work', 'method': 'foundry'},
+                    {'CLAUDE_CODE_USE_FOUNDRY': '1', 'ANTHROPIC_FOUNDRY_RESOURCE': 'synthetic-resource'}),
+        'gateway': ({'kind': 'passthrough', 'id': 'gateway-work', 'method': 'gateway'},
+                    {'ANTHROPIC_BASE_URL': 'https://gateway.invalid', 'ANTHROPIC_AUTH_TOKEN': 'synthetic-gateway-value'}),
+    }
+
+    def probe_engine(self):
+        """An engine that leaves a file behind if it is ever executed, and then answers like a result."""
+        ran = self.tmp / 'engine-ran'
+        self.engine.write_text(
+            '#!/usr/bin/python3 -I\nimport json, os, sys\n'
+            f'open({str(ran)!r}, "w").write(json.dumps(sorted(os.environ)))\n'
+            'sys.stdin.read()\n'
+            'print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ran"}), flush=True)\n')
+        os.chmod(self.engine, 0o700)
+        return ran
+
+    def test_api_key_helper_route_does_not_silently_fall_back_to_personal_oauth_token(self):
+        """R1-3: a helper-key or passthrough route is refused ``launch_refused`` and nothing is launched.
+        Before, it started under the user's sign-in and was recorded as the other connection."""
+        ran = self.probe_engine()
+        self.environ['CLAUDE_CONFIG_DIR'] = str(self.tmp / 'custom-claude-cfg')
+        self.environ['CLAUDE_CODE_OAUTH_TOKEN'] = 'synthetic-oauth-test-value'
+        base = dict(self.environ)
+        for name, (connection, needs) in self.NO_CUSTODY_ROUTES.items():
+            with self.subTest(route=name):
+                self.environ = {**base, **needs}
+                self.routes = {'claude_code': {
+                    'route': {'engine': 'claude_code', 'model': 'm', 'connection': dict(connection)},
+                    'deadline_s': 60.0, 'binary': str(self.engine)}}
+                try:
+                    with mock.patch.object(adapter.log, 'error') as logged:
+                        _, composed = self.boot()
+                    api = self.api(composed)
+                    composed.breaker.bind_run = binds = mock.Mock(return_value=None)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi'})
+                    self.assertEqual(answer['code'], 'start_failed', answer)
+                    self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+                    self.assertTrue(answer['start_error']['detail'].startswith('no credential custody: '), answer)
+                    self.assertEqual(self.units.started, [], 'a unit was started')
+                    self.assertFalse(ran.exists(), 'the engine was executed')
+                    binds.assert_not_called()  # refused before the run is bound to the connection it names
+                    run = api.call('run.status', {'run_id': answer['run_id']})['run']
+                    self.assertEqual((run['state'], run['cgroup'], run['observed']), ('start_failed', None, None))
+                    row = next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+                    self.assertEqual((row['configured'], row['sign_in']), (True, connection['kind']))
+                    self.assertTrue(row['blocker'].startswith('launch_refused: no credential custody: '), row)
+                    # Said once when the routes load, too: the operator need not start a run to find out.
+                    said = [call.args[0] % call.args[1:] for call in logged.call_args_list]
+                    self.assertTrue(any(line.startswith('route claude_code cannot start (launch_refused): '
+                                                        'no credential custody: ') for line in said), said)
+                finally:
+                    self.shutdown()
+                    self.kill_units()
+                    self.units.started.clear()
+                    self.units.procs.clear()
+                    ran.unlink(missing_ok=True)
+
+    def test_a_route_file_with_a_helper_key_route_refuses_that_route_and_starts_the_other(self):
+        """R1-3 through ``routes.json``: the refused route does not take the subscription route with it."""
+        ran = self.probe_engine()
+        config = self.tmp / 'config' / 'recursion'
+        config.mkdir(parents=True, mode=0o700)
+        standin = self.tmp / 'bin' / 'codex-standin' / 'claude'
+        standin.parent.mkdir(mode=0o700)
+        shutil.copyfile(STANDIN, standin)
+        os.chmod(standin, 0o700)
+        routes = config / adapter.ROUTES_FILE
+        routes.write_text(json.dumps({'routes': {'claude_code': {
+            'model': 'm', 'connection': {'kind': 'api_key', 'id': 'work-helper', 'key_source': 'api_key_helper'},
+            'deadline_s': 60, 'binary': str(self.engine)}}}))
+        os.chmod(routes, 0o600)
+        self.environ['CLAUDE_CODE_OAUTH_TOKEN'] = 'synthetic-oauth-test-value'
+        self.routes = None  # read the operator's file
+        with mock.patch.object(adapter.log, 'error'):
+            _, composed = self.boot()
+        api = self.api(composed)
+        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi'})
+        self.assertEqual(answer['code'], 'start_failed', answer)
+        self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+        self.assertEqual((self.units.started, ran.exists()), ([], False))
+        self.shutdown()
+        # The same file with the subscription route: it starts, as before.
+        routes.write_text(json.dumps({'routes': {'claude_code': {
+            'model': 'stand-in-model', 'api_key_helper': 'absent',
+            'connection': {'kind': 'subscription', 'id': 'stand-in-login'},
+            'deadline_s': 120, 'binary': str(standin)}}}))
+        _, composed = self.boot()
+        self.start(self.api(composed))
+        self.assertEqual(len(self.units.started), 1)
+
+    def test_a_fallback_route_without_custody_is_refused_with_the_route_that_lists_it(self):
+        """R1-3 through ``limits.fallback``: once the primary connection is at a limit the route service
+        launches the next fallback, so a helper-key or passthrough fallback would start under the sign-in
+        too. The route that lists one is refused whole, before anything is bound or launched."""
+        ran = self.probe_engine()
+        self.environ['CLAUDE_CODE_OAUTH_TOKEN'] = 'synthetic-oauth-test-value'
+        base = dict(self.environ)
+        for name, (connection, needs) in self.NO_CUSTODY_ROUTES.items():
+            with self.subTest(fallback=name):
+                self.environ = {**base, **needs}
+                self.routes = {'claude_code': {
+                    'route': {'engine': 'claude_code', 'model': 'm', 'api_key_helper': 'absent',
+                              'connection': {'kind': 'subscription', 'id': 'stand-in-login'},
+                              'limits': {'on_limit': 'fallback', 'fallback': [
+                                  {'engine': 'claude_code', 'model': 'm', 'connection': dict(connection)}]}},
+                    'deadline_s': 60.0, 'binary': str(self.engine)}}
+                try:
+                    with mock.patch.object(adapter.log, 'error') as logged:
+                        _, composed = self.boot()
+                    # The primary is at its limit, which is when the service would switch to the fallback.
+                    composed.breaker._stored.report('subscription:stand-in-login', 'plan_limit')
+                    composed.breaker.bind_run = binds = mock.Mock(return_value=None)
+                    api = self.api(composed)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'hi'})
+                    self.assertEqual(answer['code'], 'start_failed', answer)
+                    self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+                    self.assertTrue(answer['start_error']['detail'].startswith('no credential custody: fallback 1: '),
+                                    answer)
+                    self.assertEqual(self.units.started, [], 'a unit was started')
+                    self.assertFalse(ran.exists(), 'the engine was executed')
+                    binds.assert_not_called()
+                    row = next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+                    self.assertTrue(row['blocker'].startswith('launch_refused: no credential custody: fallback 1: '), row)
+                    said = [call.args[0] % call.args[1:] for call in logged.call_args_list]
+                    self.assertTrue(any('no credential custody: fallback 1: ' in line for line in said), said)
+                finally:
+                    self.shutdown()
+                    self.kill_units()
+                    self.units.started.clear()
+                    self.units.procs.clear()
+                    ran.unlink(missing_ok=True)
+        # The same list when it is only shown to the user (on_limit: ask): nothing is launched from it,
+        # so the subscription route starts as it did before.
+        self.environ = dict(base)
+        self.routes = {'claude_code': {
+            'route': {'engine': 'claude_code', 'model': 'm', 'api_key_helper': 'absent',
+                      'connection': {'kind': 'subscription', 'id': 'other-login'},
+                      'limits': {'on_limit': 'ask', 'fallback': [
+                          {'engine': 'claude_code', 'model': 'm',
+                           'connection': dict(self.NO_CUSTODY_ROUTES['api_key_helper'][0])}]}},
+            'deadline_s': 60.0, 'binary': str(self.engine)}}
+        _, composed = self.boot()
+        self.start(self.api(composed), 'hi')
+        self.assertEqual(len(self.units.started), 1)
+
+    def test_route_unsupported_names_only_the_routes_without_custody(self):
+        def entry(connection):
+            return {'route': {'engine': 'claude_code', 'model': 'm', 'connection': connection}, 'deadline_s': 1.0}
+
+        for name, (connection, _) in self.NO_CUSTODY_ROUTES.items():
+            self.assertTrue(adapter.route_unsupported(entry(connection)).startswith('no credential custody: '), name)
+        for allowed in ({'kind': 'subscription', 'id': 'login'},
+                        {'kind': 'api_key', 'id': 'key-1', 'credential_env': 'ANTHROPIC_API_KEY'},
+                        {'kind': 'api_key', 'id': 'key-1', 'credential_env': 'ANTHROPIC_API_KEY', 'key_source': 'custody'}):
+            self.assertIsNone(adapter.route_unsupported(entry(allowed)), allowed)
+        for malformed in (None, {}, {'route': None}, {'route': {}}, entry(None), entry('passthrough')):
+            self.assertIsNone(adapter.route_unsupported(malformed), malformed)  # the route contract refuses these
+
+        def with_limits(limits):
+            listed = entry({'kind': 'subscription', 'id': 'login'})
+            listed['route']['limits'] = limits
+            return listed
+
+        helper = {'engine': 'claude_code', 'model': 'm', 'connection': self.NO_CUSTODY_ROUTES['api_key_helper'][0]}
+        other = {'engine': 'claude_code', 'model': 'm', 'connection': {'kind': 'subscription', 'id': 'other-login'}}
+        # A fallback the service would launch from refuses the entry, and is named by its place in the list.
+        self.assertEqual(adapter.route_unsupported(with_limits({'on_limit': 'fallback', 'fallback': [other, helper]})),
+                         'no credential custody: fallback 2: a key_source api_key_helper route is not launched')
+        self.assertIsNone(adapter.route_unsupported(with_limits({'on_limit': 'fallback', 'fallback': [other]})))
+        # A list that is only shown to the user is never launched from: the subscription route stays as it was.
+        for shown in ({'on_limit': 'ask', 'fallback': [helper]}, {'on_limit': 'wait', 'fallback': [helper]},
+                      {'fallback': [helper]}):
+            self.assertIsNone(adapter.route_unsupported(with_limits(shown)), shown)
+        for malformed in ('fallback', {'on_limit': 'fallback'}, {'on_limit': 'fallback', 'fallback': 'x'},
+                          {'on_limit': 'fallback', 'fallback': [None, 'x', {}]}):
+            self.assertIsNone(adapter.route_unsupported(with_limits(malformed)), malformed)  # the contract refuses these
+
     # -- CLI -------------------------------------------------------------------------------------
     def run_cli(self, argv, path):
         out = io.StringIO()
@@ -914,28 +1102,40 @@ class LauncherTest(unittest.TestCase):
 
     def test_kill_tree_answers_empty_only_on_an_attested_end(self):
         class FakeDaemon:
-            def __init__(self, states):
-                self.states, self.stopped, self.seen = list(states), [], []
+            def __init__(self, states, clear):
+                self.states, self.clear = list(states), clear
+                self.stopped, self.seen, self.walked = [], [], []
 
-            def stop(self, run_id):
-                self.stopped.append(run_id)
+            def stop(self, run_id, *, cgroup=None):
+                self.stopped.append((run_id, cgroup))
 
-            def reconcile(self, run_id):
-                self.seen.append(run_id)
+            def reconcile(self, run_id, *, cgroup=None):
+                self.seen.append((run_id, cgroup))
                 state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
                 return Run(run_id, f'recursion-run-{run_id}.service', True, state, BOOT, '')
 
-        def tree(*states):
+            def cgroup_clear(self, run_id, cgroup):
+                self.walked.append((run_id, cgroup))
+                return self.clear
+
+        def tree(*states, clear=True):
             clock = FakeClock(0.0)
-            daemon = FakeDaemon(states)
+            daemon = FakeDaemon(states, clear)
             return daemon, launcher.UnitKillTree(daemon, poll_s=0.5, clock=clock, sleep=clock.advance)
 
         group = '/user.slice/app.slice/recursion-run-run-7.service'
         daemon, kill = tree('terminated')
         kill.request_stop(group)
-        self.assertEqual(daemon.stopped, ['run-7'])
+        self.assertEqual(daemon.stopped, [('run-7', group)])  # the path goes to the daemon with the Stop
         self.assertEqual(kill.confirm(group, 5.0), EMPTY)
+        self.assertEqual((daemon.seen, daemon.walked), ([('run-7', group)], [('run-7', group)]))
         self.assertEqual(tree('stopping', 'stopping', 'terminated')[1].confirm(group, 5.0), EMPTY)
+        # A terminated row is not enough: the path itself has to read absent or empty in this call.
+        self.assertEqual(tree('terminated', clear=False)[1].confirm(group, 2.0), POPULATED)
+        self.assertEqual(tree('terminated', clear=None)[1].confirm(group, 2.0), UNKNOWN)
+        watched, watching = tree('stopping', clear=False)
+        self.assertEqual(watching.confirm(group, 2.0), POPULATED)
+        self.assertEqual(watched.walked, [], 'the path is walked only once the row reads terminated')
         self.assertEqual(tree('running')[1].confirm(group, 2.0), POPULATED)
         self.assertEqual(tree('stopping')[1].confirm(group, 2.0), POPULATED)
         self.assertEqual(tree('unknown')[1].confirm(group, 2.0), UNKNOWN)
@@ -946,7 +1146,7 @@ class LauncherTest(unittest.TestCase):
                 kill.request_stop(bad)
             with self.assertRaises(ValueError):
                 kill.confirm(bad, 1.0)
-        self.assertEqual(daemon.stopped, ['run-7'])
+        self.assertEqual(daemon.stopped, [('run-7', group)])
 
     def test_engine_process_reads_lines_until_the_main_process_is_gone(self):
         out = self.tmp / 'stdout.jsonl'

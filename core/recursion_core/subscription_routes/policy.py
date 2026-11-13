@@ -579,6 +579,14 @@ def _check_home(
     for entry in CLAUDE_STORE_ENTRIES:
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "claude_store_in_route_home", entry)
+    # Check the store's parent components even when the leaf is absent.
+    # Otherwise .config -> an operator directory can expose unrelated stores.
+    for entry in (*CLAUDE_STORE_ENTRIES, *ENGINE_STORE_ENTRIES):
+        path = route_home
+        for part in entry.split("/")[:-1]:
+            path = os.path.join(path, part)
+            if os.path.islink(path):
+                raise SubscriptionRouteRefused(engine, "own_store_is_link", os.path.relpath(path, route_home))
     for entry in ENGINE_STORE_ENTRIES:
         if entry in own:
             _check_own_store(engine, route_home, real, entry)
@@ -764,7 +772,15 @@ def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
     if "\x00" in first or not os.path.isabs(first):
         return False
     real = os.path.realpath(first)
-    return any(isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path) == real for path in pinned)
+    if not any(isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path) == real for path in pinned):
+        return False
+    # The caller may spell a pinned launcher through a different symlink. Its
+    # actual spelling must have the same safe ownership chain as the pin itself.
+    from recursion_core.child_env.policy import _unsafe_file
+    try:
+        return _unsafe_file(first) is None
+    except OSError:
+        return False
 
 
 def _argv_binds_model(argv: list[str], model: str) -> bool:

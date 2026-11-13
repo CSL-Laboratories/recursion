@@ -132,7 +132,12 @@ class ConnectionBreaker:
         with self._lock:
             now = self._clock()
             if code == c.PLAN_LIMIT and _is_signal(outcome.get("limit")):
-                until = self._open(connection, outcome["limit"], now, probe)
+                try:
+                    until = self._open(connection, outcome["limit"], now, probe)
+                except Exception:
+                    # Fail closed: a half-updated key must not admit the next request.
+                    self._fail_closed(connection, outcome.get("limit"), now)
+                    raise
                 limit = outcome.get("limit")
                 if isinstance(limit, dict) and limit.get("reset_at") is None:
                     outcome["retry_at"] = until  # the cooldown the notice can tell the user to wait for
@@ -146,20 +151,82 @@ class ConnectionBreaker:
             # proved nothing, so its lease is released for the next request to probe.
             return self._release(probe, now) or "none"
 
+    def _backoff(self, failures: int) -> float:
+        """Doubling cooldown capped at ``max_cooldown_s``, without overflowing int or float.
+
+        ``cooldown * 2 ** (failures - 1)`` raises OverflowError once the exponent no longer fits
+        in a float (the 1025th limit when cooldown is 300.0). Cap the shift and stop doubling
+        once the next step would pass the cap.
+        """
+
+        cap = self._max_cooldown_s
+        value = self._cooldown_s
+        steps = failures - 1
+        if steps < 0:
+            steps = 0
+        elif steps > 63:
+            steps = 63
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return cap
+        if value <= 0:
+            return value if value < cap else cap
+        if value >= cap:
+            return cap
+        for _ in range(steps):
+            if value > cap / 2:
+                return cap
+            try:
+                nxt = value * 2
+            except OverflowError:
+                return cap
+            if nxt >= cap:
+                return cap
+            value = nxt
+        return value
+
+    def _open_until(self, failures: int, signal: dict, now: float) -> float:
+        backoff = self._backoff(failures)
+        reset_at = signal.get("reset_at")
+        # reset_at is already on this clock. A raw vendor epoch that was not translated is far past
+        # now + max_open_s and is capped here; adapters translate so a real reset is not the cap.
+        if reset_at is not None and reset_at > now:
+            return min(reset_at, now + self._max_open_s)
+        return now + backoff
+
+    def _fail_closed(self, connection: str, signal: object, now: float) -> None:
+        """Leave the limit's key OPEN. Used when ``record`` fails mid-update."""
+
+        if isinstance(signal, dict) and signal.get("scope") == "model" and isinstance(signal.get("model"), str):
+            slot = self._slot(connection, signal["model"])
+        else:
+            slot = self._slot(connection, None)
+        source = "fail_closed"
+        if isinstance(signal, dict) and isinstance(signal.get("source"), str):
+            source = signal["source"]
+        prior = self._keys.get(slot) or {}
+        failures = prior.get("failures", 0)
+        if isinstance(failures, bool) or not isinstance(failures, int):
+            failures = 0
+        self._keys[slot] = {
+            "state": OPEN, "failures": failures + 1, "open_until": now + self._max_open_s,
+            "probe": None, "lease_until": None, "source": source,
+        }
+
     def _open(self, connection: str, signal: dict, now: float, probe: str | None = None) -> float:
         slot = self._slot(connection, None if signal["scope"] == "connection" else signal["model"])
+        prior = self._keys.get(slot)
+        failures = (prior["failures"] if prior else 0) + 1
+        # Arithmetic happens before any lease is cleared. The key is then replaced in one
+        # assignment, so a later exception cannot observe a cleared probe that is not OPEN.
+        until = self._open_until(failures, signal, now)
+        self._keys[slot] = {
+            "state": OPEN, "failures": failures, "open_until": until, "probe": None,
+            "lease_until": None, "source": signal["source"],
+        }
         # The limit can land on the other key than the one the probe leased (a model-scoped limit on a
         # connection probe, or the reverse). That probe is over either way: free its lease so the key
         # it held does not refuse with PROBE_IN_FLIGHT while no probe runs.
         self._release(probe, now)
-        rec = self._keys.setdefault(slot, {"state": CLOSED, "failures": 0, "probe": None, "lease_until": None})
-        rec["failures"] += 1
-        backoff = min(self._cooldown_s * 2 ** (rec["failures"] - 1), self._max_cooldown_s)
-        reset_at = signal.get("reset_at")
-        # reset_at is already on this clock. A raw vendor epoch that was not translated is far past
-        # now + max_open_s and is capped here; adapters translate so a real reset is not the cap.
-        until = min(reset_at, now + self._max_open_s) if reset_at is not None and reset_at > now else now + backoff
-        rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
         return until
 
     def _find_probe(self, probe: str | None) -> dict | None:

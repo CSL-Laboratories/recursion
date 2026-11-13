@@ -12,8 +12,9 @@ Typed limit signals:
   is translated from Unix epoch onto the breaker clock). Codex's default bucket (``limitId``
   ``codex``) is credential-wide. Any other ``limitId`` is the breaker model key itself: the requested
   route model is not used, so a notice for one bucket does not fence a different model. An
-  ``api_key`` route that is told this read needs ChatGPT auth ignores that one error and continues
-  the turn; a subscription route does not.
+  ``api_key`` route ignores only the ChatGPT-auth rejection of this read and continues the turn.
+  A typed ``codexErrorInfo`` usage limit is a plan limit on every route, including ``api_key``,
+  and does not start a turn. A subscription route does not ignore the ChatGPT-auth rejection.
 * a JSON-RPC error, or a failed turn, whose typed ``codexErrorInfo`` is ``usageLimitExceeded``
   (unverified name).
 
@@ -92,8 +93,8 @@ class CodexAdapter(RouteAdapter):
             except _RpcError as err:
                 # ChatGPT auth is required for this read. An API-key session is rejected with wording
                 # that sounds like a quota ("rate limits"), which would short-fault every such request
-                # before a turn. Ignore that one error on an api_key route and continue.
-                if kind != "api_key":
+                # before a turn. Ignore only that rejection. A typed usage limit is a plan limit.
+                if kind != "api_key" or not _chatgpt_auth_required(err.error):
                     raise
                 events.append(c.event("usage", "codex.account/rateLimits/read", {
                     "ignored": scalar(err.error.get("message"))}))
@@ -193,11 +194,32 @@ def _exhausted(snapshot: object, source: str, events: list, translate) -> dict |
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
-def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+def _error_info(error: dict) -> object:
     data = error.get("data") if isinstance(error.get("data"), dict) else {}
     info = error.get("codexErrorInfo", data.get("codexErrorInfo"))
     if isinstance(info, dict):  # a tagged variant: {"usageLimitExceeded": {...}} (shape unverified)
         info = next(iter(info), None)
+    return info
+
+
+def _chatgpt_auth_required(error: dict) -> bool:
+    """True only for the ChatGPT-login rejection of ``account/rateLimits/read``.
+
+    A typed usage-limit or auth ``codexErrorInfo`` is never this rejection.
+    """
+
+    info = _error_info(error)
+    if info in _LIMIT_ERRORS or info in _AUTH_ERRORS:
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    text = message.lower()
+    return "chatgpt" in text and "auth" in text
+
+
+def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+    info = _error_info(error)
     if info in _AUTH_ERRORS:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=str(info))
     if info in _LIMIT_ERRORS:

@@ -63,6 +63,11 @@ class RouteAdapter:
             self._run_label = None
             process.fence("io_error")
             return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+        except Exception as err:
+            # Anything else after launch fences the child. The detail names the type only.
+            self._run_label = None
+            process.fence("engine_error")
+            return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"unexpected: {type(err).__name__}")
         return self._apply_run_label(out)
 
     def _apply_run_label(self, out: dict) -> dict:

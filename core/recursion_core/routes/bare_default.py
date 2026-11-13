@@ -39,7 +39,8 @@ _FLAG_GAP = re.compile(r" {2,}|\t")
 # A component longer than this is not a build number. int() raises past 4300 digits,
 # and a shorter oversized token would be copied into the refusal.
 _BUILD_PART_MAX = 9
-# Present-tense "default for -p" wording in the --bare block. Future-tense notes are filtered first.
+# Present-tense "default for -p" wording in the --bare block. A future-release clause
+# drops that claim only when the clause itself is the bare-default statement.
 _DEFAULT_NOW = re.compile(
     r"(?:\bis\s+(?:now\s+)?(?:the\s+)?default\b[^.]*(?:-p\b|--print\b|print\s+mode|headless)"
     r"|\b(?:on|enabled)\s+by\s+default\b[^.]*(?:-p\b|--print\b|print\s+mode|headless)"
@@ -58,8 +59,16 @@ _PRINT_BARE_DEFAULT = re.compile(
     r"|\bbare\b[^.;]*?\b(?:by\s+default|default\s+mode)\b"
     r"|\bdefaults?\s+(?:to|is)\s+(?:the\s+)?(?:--)?bare\b",
     re.IGNORECASE)
-_FUTURE = re.compile(r"\bwill\s+become\b|\bfuture\s+release\b|\bin\s+a\s+future\b|\bplanned\b|\bupcoming\b",
-                     re.IGNORECASE)
+# A future clause governs the bare default only when it is the claim about that default.
+_FUTURE_GOVERNS = re.compile(
+    r"\bwill\s+(?:become|be)\b[^.]{0,80}\bdefault\b"
+    r"|\b(?:is|becomes)\s+(?:now\s+)?(?:the\s+)?default\b[^.]{0,80}"
+    r"\b(?:in\s+a\s+future|future\s+release|upcoming|planned)\b"
+    r"|\bdefault\s+(?:for|in|with|under)\s+(?:-p\b|--print\b|print\s+mode|headless)\b[^.]{0,80}"
+    r"\b(?:in\s+a\s+future|future\s+release)\b"
+    r"|\b(?:upcoming|planned)\s+(?:to\s+be\s+)?(?:the\s+)?default\b",
+    re.IGNORECASE)
+_CLAUSE = re.compile(r",")
 # Negated or conditional wording never proves the default either way.
 _NEGATED = re.compile(r"\bnot\b|\bno\s+longer\b|\bnever\b|\bunless\b|\bexcept\b|\bwithout\b|n't\b",
                       re.IGNORECASE)
@@ -107,6 +116,46 @@ def _affirmed(pattern: re.Pattern[str], sentence: str) -> bool:
     return False
 
 
+def _clauses(sentence: str) -> list[str]:
+    return [part.strip() for part in _CLAUSE.split(sentence) if part.strip()]
+
+
+def _future_governs_clause(clause: str) -> bool:
+    """True when this clause's future-release wording is the claim about the default."""
+
+    for match in _FUTURE_GOVERNS.finditer(clause):
+        if not _NEGATED.search(clause[max(0, match.start() - 24):match.end()]):
+            return True
+    return False
+
+
+def _sentence_default(sentence: str, patterns: tuple) -> str | None:
+    """How one help sentence speaks about the bare default.
+
+    ``present`` is a present-tense default the future wording does not govern.
+    ``unknown`` is a present claim and a separate future claim about that default.
+    ``absent`` is only a future claim that bare will be the default.
+    ``governed`` is future wording that must not be promoted to present.
+    """
+
+    present = False
+    governed = False
+    for clause in _clauses(sentence):
+        if _future_governs_clause(clause):
+            governed = True
+        elif any(_affirmed(pattern, clause) for pattern in patterns):
+            present = True
+    if present and governed:
+        return "unknown"
+    if present:
+        return "present"
+    if governed and "bare" in sentence.lower() and _DEFAULT_NOW.search(sentence):
+        return "absent"
+    if governed:
+        return "governed"
+    return None
+
+
 def classify_help(text: object) -> str:
     """Return ``"absent"``, ``"present"`` or ``"unknown"`` for one build's ``claude --help`` text."""
 
@@ -118,20 +167,26 @@ def classify_help(text: object) -> str:
     if any(opt in blocks for opt in _OPT_OUT):
         return "present"
     absent = False
+    ambiguous = False
     for option in ("--bare", "--print"):
+        # Either block saying --bare is the default now is enough: print's own help may announce
+        # it even when the --bare line does not.
+        patterns = (_PRINT_BARE_DEFAULT,) if option == "--print" else (_DEFAULT_NOW, _BARE_SELF_DEFAULT)
         for sentence in _sentences(blocks[option]):
-            if _FUTURE.search(sentence):
-                if "bare" in sentence.lower() and _DEFAULT_NOW.search(sentence):
-                    absent = True
-                continue
-            # Either block saying --bare is the default now is enough: print's own help may announce
-            # it even when the --bare line does not.
-            patterns = (_PRINT_BARE_DEFAULT,) if option == "--print" else (_DEFAULT_NOW, _BARE_SELF_DEFAULT)
-            if any(_affirmed(p, sentence) for p in patterns):
+            decision = _sentence_default(sentence, patterns)
+            if decision == "present":
+                return "present"
+            if decision == "unknown":
+                ambiguous = True
+            elif decision == "absent":
+                absent = True
+            elif decision != "governed" and any(_affirmed(p, sentence) for p in patterns):
                 return "present"
             if option == "--bare" and re.search(r"default\s*[:=]?\s*(?:false|off|disabled)\b",
                                                 sentence, re.I):
                 absent = True
+    if ambiguous:
+        return "unknown"
     return "absent" if absent else "unknown"
 
 

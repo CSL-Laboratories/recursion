@@ -178,6 +178,40 @@ class BreakerTest(unittest.TestCase):
         self.clock.advance(3600)
         self.assertTrue(self.b.admit("subscription:A", "m", "t1")["admitted"])
 
+    def test_plan_limit_backoff_does_not_overflow_after_a_probe(self) -> None:
+        # Default cooldown_s is a float. The 1025th plan limit is 300.0 * 2**1024, which
+        # raises OverflowError after the probe lease is cleared and before the key is open.
+        clock = FakeClock()
+        breaker = ConnectionBreaker(clock)
+        for _ in range(1024):
+            breaker.record("subscription:A", "m", "t1", LIMIT)
+        clock.advance(breaker._max_cooldown_s)
+        probe = breaker.admit("subscription:A", "m", "t1")
+        self.assertTrue(probe["admitted"])
+        breaker.record("subscription:A", "m", "t1", LIMIT, probe["probe"])
+        nxt = breaker.admit("subscription:A", "m", "t2")
+        self.assertEqual(nxt["code"], c.BREAKER_OPEN)
+        self.assertFalse(nxt["admitted"])
+
+    def test_record_exception_leaves_the_breaker_open(self) -> None:
+        class Raises:
+            def __gt__(self, other: object) -> bool:
+                raise RuntimeError("compare")
+
+            def __lt__(self, other: object) -> bool:
+                raise RuntimeError("compare")
+
+        self.b.record("subscription:A", "m", "t1", LIMIT)
+        self.clock.advance(300)
+        probe = self.b.admit("subscription:A", "m", "t1")["probe"]
+        bad = {"code": c.PLAN_LIMIT, "limit": {
+            "scope": "connection", "model": None, "reset_at": Raises(), "source": "test.typed"}}
+        with self.assertRaises(RuntimeError):
+            self.b.record("subscription:A", "m", "t1", bad, probe)
+        nxt = self.b.admit("subscription:A", "m", "t2")
+        self.assertEqual(nxt["code"], c.BREAKER_OPEN)
+        self.assertFalse(nxt["admitted"])
+
     def test_vendor_reset_time_is_used_and_capped(self) -> None:
         sig = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "t", reset_at=self.clock() + 5000)}
         self.b.record("subscription:A", "m", "t1", sig)

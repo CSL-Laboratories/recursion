@@ -30,7 +30,7 @@ import json
 
 from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
-from recursion_core.routes.base import RouteAdapter, scalar
+from recursion_core.routes.base import RouteAdapter, _Protocol, scalar
 from recursion_core.routes.launch import child_env
 
 # Lucas, Nov 7 ~6:34pm PST (correction to the Nov 8 briefing; replaces "refuse --bare, clear apiKeyHelper,
@@ -289,6 +289,11 @@ def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, mode
     if msg.get("error") in ("authentication_failed", "oauth_token_expired") or msg.get("api_error_status") == 401:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=str(msg.get("error") or "401"))
     text = msg.get("result")
-    if c.sounds_like_quota(text) or any(c.sounds_like_quota(e) for e in msg.get("errors") or [] if isinstance(e, str)):
+    errors = msg.get("errors")
+    if errors is None:
+        errors = []
+    elif not isinstance(errors, list):
+        raise _Protocol("result errors is not a list")
+    if c.sounds_like_quota(text) or any(c.sounds_like_quota(e) for e in errors if isinstance(e, str)):
         return c.result(rid, c.SHORT_FAULT, events=events, detail=f"untyped quota-like text on {model}")
     return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(scalar(msg.get("subtype")) or "error"))

@@ -43,6 +43,16 @@ class ClassifyHelpTest(unittest.TestCase):
         text = help_with_bare("Minimal mode. --bare will become the default for -p in a future release.")
         self.assertEqual(bd.classify_help(text), "absent")
 
+    def test_present_default_survives_a_negated_future_aside(self) -> None:
+        # A future-release word in the same sentence must not drop a present-tense default.
+        text = help_with_bare("Minimal mode. --bare is the default for -p, not a future release.")
+        self.assertEqual(bd.classify_help(text), "present")
+
+    def test_present_and_future_default_claims_are_unknown(self) -> None:
+        text = help_with_bare(
+            "Minimal mode. --bare is the default for -p, or it will become the default in a future release.")
+        self.assertEqual(bd.classify_help(text), "unknown")
+
     def test_present_tense_default_is_present(self) -> None:
         for desc in ("Minimal mode. This is the default for -p.",
                      "Minimal mode. Default for -p/--print; OAuth and keychain are never read.",

@@ -1328,9 +1328,6 @@ class StartRegistrantTest(unittest.TestCase):
                     H.LaunchContext.from_record(broken)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # ======================================================================================================
 # The calls that control/api.py and control/cli.py make into the seams (S1, S2, S6). With nothing
@@ -1823,3 +1820,7 @@ class StartPathOnTest(unittest.TestCase):
         off, _, starter = control_api(registry)
         self.assertEqual(off.call('run.start', KEYED), {'code': 'request_invalid', 'detail': 'client_key_reused'})
         self.assertEqual((starter.calls, stored(registry)), ([], before))
+
+
+if __name__ == "__main__":
+    unittest.main()

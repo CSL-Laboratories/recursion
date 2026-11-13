@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Callable, Mapping
 
 STATES = ("absent", "present", "unknown")
@@ -39,62 +40,63 @@ _FLAG_GAP = re.compile(r" {2,}|\t")
 # A component longer than this is not a build number. int() raises past 4300 digits,
 # and a shorter oversized token would be copied into the refusal.
 _BUILD_PART_MAX = 9
-# Present-tense "default for -p" wording in the --bare block. An unnegated future or
-# planned qualifier anywhere on the same help line blocks a present classification.
-# Negation counts only when it governs that marker ("will not be", "not a future"),
-# not when it belongs to an earlier clause.
-_DEFAULT_NOW = re.compile(
-    r"(?:\bis\s+(?:now\s+)?(?:the\s+)?default\b[^.]*(?:-p\b|--print\b|print\s+mode|headless)"
-    r"|\b(?:on|enabled)\s+by\s+default\b[^.]*(?:-p\b|--print\b|print\s+mode|headless)"
-    r"|\bdefault\s+(?:for|in|with|under)\s+(?:-p\b|--print\b|print\s+mode|headless))",
-    re.IGNORECASE)
-# Inside the --bare block the subject is bare itself, so a bare "this is the default" is enough.
-_BARE_SELF_DEFAULT = re.compile(
-    r"\b(?:is|becomes)\s+(?:now\s+)?(?:the\s+)?default\b|\(default(?:\s*[:=]\s*(?:true|on|enabled))?\)"
-    r"|\b(?:on|enabled)\s+by\s+default\b|\bdefault\s*[:=]\s*(?:true|on|enabled)\b"
-    r"|\bdefaults\s+to\s+(?:on|true|enabled)\b",
-    re.IGNORECASE)
-# Inside the -p/--print block: the sentence must name bare and say it is the default now.
-_PRINT_BARE_DEFAULT = re.compile(
-    r"\bbare\b[^.;]*?\b(?:is|becomes)\s+(?:now\s+)?(?:the\s+)?default\b"
-    r"|\bbare\b[^.;]*?\(default(?:\s*[:=]\s*(?:true|on|enabled))?\)"
-    r"|\bbare\b[^.;]*?\b(?:by\s+default|default\s+mode)\b"
-    r"|\bdefaults?\s+(?:to|is)\s+(?:the\s+)?(?:--)?bare\b",
-    re.IGNORECASE)
-# will/shall/'ll/going to, then up to three adverbs, then be/become.
-# "won't" and "shan't" are included so the negation stays inside the match.
-_FUTURE_AUX = r"(?:\b(?:will|shall)\b|\b(?:wo|sha)n't\b|'(?:ll)\b|\bgoing\s+to\b)"
-_FUTURE_VERB = re.compile(
-    _FUTURE_AUX + r"(?:\s+(?!be\b|become\b)[\w']+){0,3}\s+\b(?:be|become)\b",
-    re.IGNORECASE)
-# A future qualifier that is not itself a verb. "planned" stays here so a planned
-# note on the same line still blocks a present claim.
-_FUTURE_WORD = re.compile(
-    r"\b(?:soon|upcoming|future|planned)\b|\bnext\s+(?:version|release)\b",
-    re.IGNORECASE)
-# Negation directly before a future verb ("not going to be", "never will be").
-_DIRECT_NEG_VERB = re.compile(
-    r"(?:n't|\b(?:not|never|no\s+longer)\b)\s*$",
-    re.IGNORECASE)
-# Negation directly before a future word ("not a future", "not the next version").
-_DIRECT_NEG_WORD = re.compile(
-    r"(?:n't|\b(?:not|never|no\s+longer)\b)"
-    r"(?:\s+(?:a|an|the|really|actually|yet)\b){0,2}\s*$",
-    re.IGNORECASE)
-# "will/shall/'ll/going to <adverbs> be <a few words>" immediately before a match
-# is one future claim, not a present one.
-_FUTURE_GOVERNS_MATCH = re.compile(
-    _FUTURE_AUX + r"(?:\s+\S+){0,3}\s+\b(?:be|become)\b(?:\s+\S+){0,3}\s*$",
-    re.IGNORECASE)
-# Negated or conditional wording never proves the default either way.
-_NEGATED = re.compile(r"\bnot\b|\bno\s+longer\b|\bnever\b|\bunless\b|\bexcept\b|\bwithout\b|n't\b",
-                      re.IGNORECASE)
+# Present is the whole sentence, not a substring. Cores are the only present-tense
+# statements. A trailer is allowed only when the remainder of the sentence is that
+# exact string. Anything else that mentions default or bare is unknown.
+_PRESENT_CORES = (
+    "default: true",
+    "defaults to --bare",
+    "bare is the default",
+    "bare is now the default",
+    "bare is the default for -p",
+    "bare is now the default for -p",
+    "--bare is the default",
+    "--bare is now the default",
+    "--bare is the default for -p",
+    "--bare is now the default for -p",
+    "this is the default",
+    "this is now the default",
+    "this is the default for -p",
+    "this is now the default for -p",
+)
+_PRESENT_TRAILERS = (
+    "",
+    ", not a future release",
+    ", not planned for the future",
+    ", and it will not be a future release",
+    ", it will not be a future release",
+    ", not coming soon",
+    " as soon as possible",
+)
+_PRESENT_SENTENCES = frozenset(
+    core + trailer for core in _PRESENT_CORES for trailer in _PRESENT_TRAILERS)
+# Explicit future-default wording ("it'll be the default", "will soon be the default").
+# "not" or "never" between the auxiliary and be/become is not this form.
+_FUTURE_DEFAULT = re.compile(
+    r"(?:it'll(?![a-z])|(?:is\s+)?going\s+to\b|(?<![a-z'])(?:will|shall)\b)"
+    r"(?!\s+(?:not|never)\b)"
+    r"(?:\s+(?!be\b|become\b|not\b|never\b)[a-z]+){0,4}\s+"
+    r"(?:be|become)\s+the\s+default\b")
+# A present-tense "is the default" beside a future claim is a contradiction, not absent.
+_PRESENTISH = re.compile(
+    r"\bis\s+(?:now\s+)?the\s+default\b"
+    r"|\bdefaults\s+to\s+--bare\b"
+    r"|\bdefault:\s*true\b")
+_DEFAULT_OFF = re.compile(r"\bdefault\s*[:=]\s*(?:false|off|disabled)\b")
+_MENTIONS = re.compile(r"\bdefaults?\b|\bbare\b|--bare\b")
+# A sibling sentence with one of these keeps an exact present sentence from winning.
+_MARKERS = re.compile(
+    r"\b(?:will|won't|shall|shan't|going|slated|about|may|might|would|could|should|"
+    r"was|were|previously|if|then|later|subsequent|forthcoming|sooner|soon|"
+    r"planned|future|upcoming|must)\b"
+    r"|\bno\s+longer\b"
+    r"|'ll\b")
 # An option that turns bare mode off would only exist if bare can be on without the flag.
 _OPT_OUT = ("--no-bare",)
 
 
-def _option_raw_blocks(text: str) -> dict[str, str]:
-    """Map each long option to its raw help lines (the option line plus its wrapped description).
+def _option_raw_chunks(text: str) -> dict[str, list[str]]:
+    """Map each long option to every raw help block, in order.
 
     A later header for the same flag is kept. The first block must not hide a later one.
     """
@@ -111,7 +113,13 @@ def _option_raw_blocks(text: str) -> dict[str, str]:
         flag_area = content[:gap.start()] if gap else content
         for name in _LONG.findall(flag_area):
             parts.setdefault(name, []).append(raw)
-    return {name: "".join(chunks) for name, chunks in parts.items()}
+    return parts
+
+
+def _option_raw_blocks(text: str) -> dict[str, str]:
+    """Each long option's raw help blocks joined, for the CLI dump."""
+
+    return {name: "".join(chunks) for name, chunks in _option_raw_chunks(text).items()}
 
 
 def _option_blocks(text: str) -> dict[str, str]:
@@ -120,136 +128,130 @@ def _option_blocks(text: str) -> dict[str, str]:
     return {opt: " ".join(raw.split()) for opt, raw in _option_raw_blocks(text).items()}
 
 
-def _sentences(block: str) -> list[str]:
-    return [s for s in re.split(r"(?<=[.;])\s+", block) if s]
+def _fold_char(ch: str) -> str:
+    """Map one apostrophe or quote variant to ASCII. Other characters stay."""
+
+    if ch in "'\"":
+        return ch
+    name = unicodedata.name(ch, "")
+    if "QUOTATION MARK" in name or "APOSTROPHE" in name or "PRIME" in name:
+        return '"' if "DOUBLE" in name else "'"
+    if name in {"GRAVE ACCENT", "ACUTE ACCENT",
+                "MODIFIER LETTER GRAVE ACCENT", "MODIFIER LETTER ACUTE ACCENT"}:
+        return "'"
+    return ch
 
 
-def _negation_governs_future(sentence: str, start: int, end: int, *, word: bool) -> bool:
-    """True when negation directly governs the future marker at ``[start:end]``.
+def _normalize_text(text: str) -> str:
+    """NFKC, ASCII quotes, lower case, and one space where help wrapped a line."""
 
-    Inside the marker counts (``will not be``, ``won't be``, ``will never be``).
-    So does a negation at the end of the same clause, immediately before the
-    marker (``not going to``, ``not a future``). A comma or semicolon ends the
-    clause, so ``Do not wait, it will be`` does not negate ``will be``.
-    """
-
-    if _NEGATED.search(sentence[start:end]):
-        return True
-    prior = sentence[:start]
-    boundary = max(prior.rfind(","), prior.rfind(";"))
-    clause = prior[boundary + 1:]
-    pattern = _DIRECT_NEG_WORD if word else _DIRECT_NEG_VERB
-    return pattern.search(clause) is not None
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(_fold_char(ch) for ch in text)
+    text = text.lower()
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _affirmed(pattern: re.Pattern[str], sentence: str) -> bool:
-    """True if ``pattern`` matches with no negation in the match or the few words before it."""
+def _chunk_description(raw: str) -> str:
+    """The option's description, without the flag header, normalized."""
 
-    for m in pattern.finditer(sentence):
-        if not _NEGATED.search(sentence[max(0, m.start() - 24):m.end()]):
-            return True
-    return False
-
-
-def _negated_at(sentence: str, start: int, end: int) -> bool:
-    return _NEGATED.search(sentence[max(0, start - 24):end]) is not None
-
-
-def _unnegated_future(sentence: str) -> bool:
-    """True when a future marker in the text is not directly negated.
-
-    A future verb or qualifier blocks ``present`` unless negation governs that
-    marker. ``not`` or ``n't`` in an earlier clause does not.
-    """
-
-    for match in _FUTURE_VERB.finditer(sentence):
-        if not _negation_governs_future(sentence, match.start(), match.end(), word=False):
-            return True
-    for match in _FUTURE_WORD.finditer(sentence):
-        if not _negation_governs_future(sentence, match.start(), match.end(), word=True):
-            return True
-    return False
+    lines = raw.split("\n")
+    first = lines[0].lstrip(" \t")
+    gap = _FLAG_GAP.search(first)
+    first_desc = first[gap.end():] if gap else ""
+    rest = "\n".join(lines[1:])
+    body = first_desc + ("\n" + rest if rest else "")
+    return _normalize_text(body)
 
 
-def _present_claim(sentence: str, patterns: tuple) -> bool:
-    """True for a present-tense default that is not itself a future ``be`` claim."""
+def _sentence_key(part: str) -> str:
+    """One sentence, quotes stripped and ``default:true`` spaced like ``default: true``."""
 
-    for pattern in patterns:
-        for match in pattern.finditer(sentence):
-            if _negated_at(sentence, match.start(), match.end()):
-                continue
-            lookback = sentence[max(0, match.start() - 48):match.start()]
-            if _FUTURE_GOVERNS_MATCH.search(lookback):
-                continue
-            return True
-    return False
+    s = part.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    s = re.sub(r"\s*:\s*", ": ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.strip(".").strip()
 
 
-def _sentence_default(sentence: str, patterns: tuple) -> str | None:
-    """How one help sentence speaks about the bare default.
+def _sentences(text: str) -> list[str]:
+    return [key for part in re.split(r"[.;!?]+", text) if (key := _sentence_key(part))]
 
-    ``present`` is a present-tense default with no unnegated future marker.
-    ``unknown`` is a present claim plus a future or planned marker anywhere in the
-    sentence, whether the join is a comma or ``and``. ``absent`` is only a future
-    claim that bare will be the default. ``governed`` must not be promoted to present.
-    A negation governs a future marker only inside it or immediately before it in
-    the same clause. When a sentence is not clearly present, it is not classified
-    present.
-    """
 
-    future = _unnegated_future(sentence)
-    present = _present_claim(sentence, patterns)
-    if present and future:
-        return "unknown"
-    if present:
+def _classify_sentence(sentence: str, *, option: str) -> str | None:
+    """``present`` only for an exact allowlisted sentence. ``None`` makes no claim."""
+
+    if sentence in _PRESENT_SENTENCES:
         return "present"
-    if future and "bare" in sentence.lower() and _DEFAULT_NOW.search(sentence):
-        return "absent"
+    future = _FUTURE_DEFAULT.search(sentence) is not None
+    presentish = _PRESENTISH.search(sentence) is not None
+    off = option == "--bare" and _DEFAULT_OFF.search(sentence) is not None
+    if future and (presentish or off):
+        return "unknown"
     if future:
-        return "governed"
+        return "absent"
+    if off and presentish:
+        return "unknown"
+    if off:
+        return "absent"
+    if _MENTIONS.search(sentence) or presentish:
+        return "unknown"
+    return None
+
+
+def _classify_description(text: str, *, option: str) -> str | None:
+    """How one option description speaks about the bare default. ``None`` is silent."""
+
+    if not text:
+        return None
+    sentences = _sentences(text)
+    kinds = [_classify_sentence(sentence, option=option) for sentence in sentences]
+    if "present" in kinds:
+        for sentence, kind in zip(sentences, kinds):
+            if kind != "present" and _MARKERS.search(sentence):
+                return "unknown"
+        if "unknown" in kinds:
+            return "unknown"
+        return "present"
+    if "unknown" in kinds:
+        return "unknown"
+    if "absent" in kinds:
+        return "absent"
     return None
 
 
 def classify_help(text: object) -> str:
-    """Return ``"absent"``, ``"present"`` or ``"unknown"`` for one build's ``claude --help`` text."""
+    """Return ``"absent"``, ``"present"`` or ``"unknown"`` for one build's ``claude --help`` text.
+
+    Help is normalized first (NFKC, apostrophes and quotes folded to ASCII, wrapped
+    lines collapsed, lower case). ``present`` is only an exact present-tense sentence
+    from the allowlist, plus an exact trailing clause when one is listed. Any other
+    sentence that mentions default or bare is ``unknown``. ``absent`` is the explicit
+    future-default wording (``it'll be the default`` and ``will be the default``,
+    including after a folded apostrophe) or ``default: false`` on ``--bare``.
+    """
 
     if not isinstance(text, str) or not text.strip():
         return "unknown"
-    blocks = _option_blocks(text)
-    if "--bare" not in blocks or "--print" not in blocks:
+    chunks = _option_raw_chunks(text)
+    if "--bare" not in chunks or "--print" not in chunks:
         return "unknown"
-    if any(opt in blocks for opt in _OPT_OUT):
+    if any(opt in chunks for opt in _OPT_OUT):
         return "present"
-    absent = False
-    ambiguous = False
+    saw_present = False
+    saw_absent = False
     for option in ("--bare", "--print"):
-        # Either block saying --bare is the default now is enough: print's own help may announce
-        # it even when the --bare line does not.
-        patterns = (_PRINT_BARE_DEFAULT,) if option == "--print" else (_DEFAULT_NOW, _BARE_SELF_DEFAULT)
-        # A future or planned qualifier anywhere on this option's help line blocks
-        # present, including across a semicolon ("planned; --bare is the default").
-        # An uncertain line is unknown, never present.
-        line_future = _unnegated_future(blocks[option])
-        for sentence in _sentences(blocks[option]):
-            decision = _sentence_default(sentence, patterns)
+        for raw in chunks[option]:
+            decision = _classify_description(_chunk_description(raw), option=option)
+            if decision == "unknown":
+                return "unknown"
             if decision == "present":
-                if line_future:
-                    ambiguous = True
-                else:
-                    return "present"
-            elif decision == "unknown":
-                ambiguous = True
+                saw_present = True
             elif decision == "absent":
-                absent = True
-            elif (not line_future and decision != "governed" and not _unnegated_future(sentence)
-                  and any(_affirmed(p, sentence) for p in patterns)):
-                return "present"
-            if option == "--bare" and re.search(r"default\s*[:=]?\s*(?:false|off|disabled)\b",
-                                                sentence, re.I):
-                absent = True
-    if ambiguous:
-        return "unknown"
-    return "absent" if absent else "unknown"
+                saw_absent = True
+    if saw_present:
+        return "present"
+    return "absent" if saw_absent else "unknown"
 
 
 def auth_mode(text: object) -> dict:

@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import random
 import shutil
 import subprocess
 import textwrap
@@ -64,7 +65,8 @@ class ClassifyHelpTest(unittest.TestCase):
         kept = {
             "--bare is the default for -p, not a future release.": "present",
             "This is the default for -p.": "present",
-            "On by default in print mode.": "present",
+            # Not an exact present-tense sentence. Was present.
+            "On by default in print mode.": "unknown",
             "--bare will become the default for -p in a future release.": "absent",
         }
         for desc, state in kept.items():
@@ -117,16 +119,18 @@ class ClassifyHelpTest(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertNotEqual(bd.classify_help(help_with_bare(desc)), "present")
                 self.assertEqual(bd.classify_help(help_with_bare(desc)), "unknown")
-        # Negation that governs the future verb does not block a present claim.
-        governed = (
-            "--bare is the default for -p, not a future release.",
+        # The exact trailer stays present. A longer negated aside is not that sentence.
+        # Those three were present.
+        self.assertEqual(bd.classify_help(help_with_bare(
+            "--bare is the default for -p, not a future release.")), "present")
+        ambiguous_aside = (
             "This is the default for -p, and it will not be optional.",
             "This is the default for -p, and it won't be optional.",
             "This is the default for -p, and it will never be optional.",
         )
-        for desc in governed:
+        for desc in ambiguous_aside:
             with self.subTest(desc=desc):
-                self.assertEqual(bd.classify_help(help_with_bare(desc)), "present")
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "unknown")
 
     def test_present_and_future_default_claims_are_unknown(self) -> None:
         text = help_with_bare(
@@ -134,12 +138,17 @@ class ClassifyHelpTest(unittest.TestCase):
         self.assertEqual(bd.classify_help(text), "unknown")
 
     def test_present_tense_default_is_present(self) -> None:
-        for desc in ("Minimal mode. This is the default for -p.",
-                     "Minimal mode. Default for -p/--print; OAuth and keychain are never read.",
-                     "Minimal mode, on by default in print mode.",
-                     "Minimal mode. Now the default in headless runs."):
+        self.assertEqual(bd.classify_help(help_with_bare(
+            "Minimal mode. This is the default for -p.")), "present")
+        # Not exact present-tense sentences. Each was present.
+        ambiguous = (
+            "Minimal mode. Default for -p/--print; OAuth and keychain are never read.",
+            "Minimal mode, on by default in print mode.",
+            "Minimal mode. Now the default in headless runs.",
+        )
+        for desc in ambiguous:
             with self.subTest(desc=desc):
-                self.assertEqual(bd.classify_help(help_with_bare(desc)), "present")
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "unknown")
 
     def test_opt_out_option_means_bare_can_be_on_without_the_flag(self) -> None:
         text = help_with_bare("Minimal mode.", extra="  --no-bare                             Turn bare off\n")
@@ -246,22 +255,35 @@ class ClassifyHelpTest(unittest.TestCase):
         for flag in ("-p, --print", "--print"):
             text = help_with_bare("Minimal mode.").replace(
                 "-p, --print                           Print response and exit",
-                flag + "                           Runs in bare mode by default")
+                flag + "                           Defaults to --bare.")
             self.assertEqual(bd.classify_help(text), "present")
+            # "Runs in bare mode by default" was present. It is not an exact sentence.
+            ambiguous = help_with_bare("Minimal mode.").replace(
+                "-p, --print                           Print response and exit",
+                flag + "                           Runs in bare mode by default")
+            self.assertEqual(bd.classify_help(ambiguous), "unknown")
 
     def test_bare_help_saying_it_is_the_default_is_present(self) -> None:
-        for desc in ("Minimal mode. --bare is the default.", "Minimal mode (default).",
-                     "Minimal mode. Defaults to on.", "Minimal mode. Bare is now the default."):
+        for desc in ("Minimal mode. --bare is the default.", "Minimal mode. Bare is now the default."):
             with self.subTest(desc=desc):
                 self.assertEqual(bd.classify_help(help_with_bare(desc)), "present")
+        # Not exact present-tense sentences. Each was present.
+        for desc in ("Minimal mode (default).", "Minimal mode. Defaults to on."):
+            with self.subTest(desc=desc):
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "unknown")
 
     def test_only_print_help_saying_bare_is_default_is_present(self) -> None:
-        for note in ("--bare is the default.", "Bare mode is now the default.", "Defaults to --bare.",
-                     "Implies --bare (default).", "Default is bare mode."):
+        for note in ("--bare is the default.", "Defaults to --bare."):
             with self.subTest(note=note):
                 text = help_with_bare("Minimal mode.").replace("Print response and exit",
                                                                "Print response and exit. " + note)
                 self.assertEqual(bd.classify_help(text), "present")
+        # Not exact present-tense sentences. Each was present.
+        for note in ("Bare mode is now the default.", "Implies --bare (default).", "Default is bare mode."):
+            with self.subTest(note=note):
+                text = help_with_bare("Minimal mode.").replace("Print response and exit",
+                                                               "Print response and exit. " + note)
+                self.assertEqual(bd.classify_help(text), "unknown")
 
     def test_future_or_negated_print_wording_keeps_its_classification(self) -> None:
         cases = {"--bare will become the default for -p in a future release.": "absent",
@@ -282,6 +304,109 @@ class ClassifyHelpTest(unittest.TestCase):
                      "                                        --bare on a continuation line only\n"):
             with self.subTest(text=text):
                 self.assertEqual(bd.classify_help(text), "unknown")
+
+    def test_reviewer_rows_are_not_a_present_default(self) -> None:
+        # On 2f965a52 the apostrophe, punctuation, modal, past, and conditional rows
+        # were present, and the four exact negated-future or "as soon as possible"
+        # sentences were unknown. The state on each row is the allowlist result.
+        right = "\u2019"
+        modifier = "\u02bc"
+        rows = (
+            (f"--bare won{right}t be the default for -p.", "unknown"),
+            (f"--bare won{modifier}t be the default for -p.", "unknown"),
+            (f"it{right}ll be the default for -p.", "absent"),
+            (f"it{modifier}ll be the default for -p.", "absent"),
+            (f"--bare isn{right}t the default for -p.", "unknown"),
+            (f"--bare isn{modifier}t the default for -p.", "unknown"),
+            (f"Don{right}t worry, it{right}ll be the default for -p.", "absent"),
+            (f"Don{modifier}t worry, it{modifier}ll be the default for -p.", "absent"),
+            ("--bare will — be the default for -p.", "unknown"),
+            ("--bare will (later) be the default for -p.", "unknown"),
+            ("--bare will, as expected, be the default for -p.", "unknown"),
+            ("--bare is slated to be the default for -p.", "unknown"),
+            ("--bare is about to be the default for -p.", "unknown"),
+            ("--bare may become the default for -p.", "unknown"),
+            ("--bare would be the default for -p.", "unknown"),
+            ("--bare was the default for -p.", "unknown"),
+            ("Previously, --bare is the default for -p.", "unknown"),
+            ("If you use print mode then --bare is the default for -p.", "unknown"),
+            ("If it were released, --bare is the default for -p.", "unknown"),
+            ("--bare is the default for -p in a later release.", "unknown"),
+            ("--bare is the default for -p in a subsequent release.", "unknown"),
+            ("--bare is the default for -p in a forthcoming release.", "unknown"),
+            ("--bare is the default for -p sooner or later.", "unknown"),
+            ("It is no longer experimental or optional for anyone, and --bare is the default for -p.",
+             "unknown"),
+            ("This is the default for -p as soon as the session starts.", "unknown"),
+            ("This is the default for -p as soon as possible.", "present"),
+            ("This is the default for -p, not planned for the future.", "present"),
+            ("This is the default for -p, and it will not be a future release.", "present"),
+            ("This is the default for -p, not coming soon.", "present"),
+            ("This is the default for -p, not a future release.", "present"),
+            ("default: true", "present"),
+            ("Defaults to --bare.", "present"),
+        )
+        for desc, state in rows:
+            with self.subTest(desc=desc):
+                got = bd.classify_help(help_with_bare(desc))
+                if state != "present":
+                    self.assertNotEqual(got, "present")
+                self.assertEqual(got, state)
+
+    def test_seeded_marker_sentences_are_never_present(self) -> None:
+        # A future, modal, past, or conditional marker is never present unless the
+        # whole sentence is an exact allowlisted statement (those are not generated).
+        # Seed 1112. On 2f965a52 many of these classified present.
+        rng = random.Random(1112)
+        markers = (
+            "will", "won't", "shall", "it'll", "going to", "slated", "about to",
+            "may", "might", "would", "could", "should", "was", "were", "previously",
+            "if", "then", "later", "subsequent", "forthcoming", "sooner", "no longer",
+            "soon", "planned", "future", "upcoming", "as soon as", "must",
+        )
+        cores = (
+            "--bare is the default for -p",
+            "this is the default for -p",
+            "--bare is the default",
+            "bare is now the default",
+            "default: true",
+            "defaults to --bare",
+        )
+        shapes = (
+            "{core} {marker} zz",
+            "{marker} zz {core}",
+            "{core}, {marker} zz",
+            "zz {marker}, {core}",
+            "--bare {marker} zz the default for -p",
+            "if it were zz, {core} {marker}",
+        )
+        sentences = [
+            shapes[i % len(shapes)].format(core=cores[i % len(cores)], marker=markers[i % len(markers)])
+            for i in range(len(markers) * len(cores))
+        ]
+        sentences.extend(rng.choice(shapes).format(core=rng.choice(cores), marker=rng.choice(markers))
+                         for _ in range(80))
+        sentences.extend((
+            "--bare is slated to be the default for -p",
+            "--bare will — be the default for -p",
+            "--bare will (later) be the default for -p",
+            "--bare will, as expected, be the default for -p",
+            "--bare may become the default for -p",
+            "--bare would be the default for -p",
+            "--bare was the default for -p",
+            "Previously, --bare is the default for -p",
+            "If it were released, --bare is the default for -p",
+            "--bare is the default for -p in a later release",
+            "--bare is the default for -p sooner or later",
+            f"it\u2019ll be the default for -p",
+            f"--bare won\u2019t be the default for -p",
+            f"--bare isn\u2019t the default for -p",
+            f"Don\u2019t worry, it\u2019ll be the default for -p",
+        ))
+        self.assertGreaterEqual(len(sentences), 100)
+        for sentence in sentences:
+            with self.subTest(sentence=sentence):
+                self.assertNotEqual(bd.classify_help(help_with_bare(sentence + ".")), "present")
 
 
 class ReadHelpTest(unittest.TestCase):
@@ -489,7 +614,14 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
                 + "  --bare                                Minimal mode. default: false\n"
                 + "      --bare is now the default for -p.\n"
                 + "  -p, --print                           Print response and exit\n")
-        self.assertEqual(bd.classify_help(text), "present")
+        # Whitespace collapse joins the two lines into one sentence, so it is not the
+        # exact present statement. Unknown shows the continuation stayed in the block:
+        # dropping it would leave "default: false" and classify absent. Was present.
+        self.assertEqual(bd.classify_help(text), "unknown")
+        dropped = (HEAD
+                   + "  --bare                                Minimal mode. default: false\n"
+                   + "  -p, --print                           Print response and exit\n")
+        self.assertEqual(bd.classify_help(dropped), "absent")
 
     def test_unencodable_help_refuses_without_the_text(self) -> None:
         secret = "sk-live-SECRETVALUE"

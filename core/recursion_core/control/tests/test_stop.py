@@ -7,6 +7,8 @@ import hashlib
 import json
 import threading
 import unittest
+from array import array
+from collections import deque
 
 from recursion_core.control import api as a
 from recursion_core.control import mcp_tools
@@ -691,6 +693,177 @@ class TornRecordTest(unittest.TestCase):
         again = api.call("run.start", params)
         self.assertEqual((again["duplicate"], again["run"]["run_id"]), (True, "run-1"))
         self.assertEqual(len(starter.calls), 1)
+
+
+def _unhashable_values() -> tuple[object, ...]:
+    """Values whose membership test raises TypeError (they are not hashable)."""
+    return (
+        {"torn": True},
+        ["running"],
+        bytearray(b"running"),
+        deque(["running"]),
+        array("B", b"running"),
+    )
+
+
+class _TornGet(FailingRegistry):
+    """``get`` swaps ``state`` for the next queued value. The stored record is not mutated."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.torn: list[object] = []
+
+    def get(self, run_id: str):
+        rec = super().get(run_id)
+        if rec is not None and self.torn:
+            rec["state"] = self.torn.pop(0)
+        return rec
+
+
+class UnhashableValueTest(unittest.TestCase):
+    """A registry value or confirm answer that cannot be hashed must not escape ``call``.
+
+    On an unfixed build, ``state in _STATES`` and ``_PENDING_REASON.get(answer)`` raise TypeError.
+    That skips the failed-start mark, drops the launched cgroup, and leaves ``stop.requested`` unset,
+    so the next stop signals again.
+    """
+
+    P = {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k"}
+
+    def _stored(self, state: object, **extra: object) -> dict:
+        rec = {"run_id": "run-9", "tenant": "t1", "engine": "codex", "state": state,
+               "cgroup": "/cg/run-9", "started_at": 1.0, "stop": None,
+               "start_key": {"client_key": "k", "engine": "codex", "prompt_sha256": "ab"}}
+        rec.update(extra)
+        return rec
+
+    def test_unhashable_state_on_stop_and_status_is_a_failed_read(self) -> None:
+        for state in _unhashable_values():
+            with self.subTest(state=type(state).__name__):
+                registry = InMemoryRunRegistry()
+                kill = FakeKillTree([EMPTY])
+                api, _, _, _ = make_api(kill, registry=registry)
+                registry.put(self._stored(state))
+                before = registry.list()
+                for method in ("run.stop", "run.status"):
+                    try:
+                        res = api.call(method, {"run_id": "run-9"})
+                    except Exception as err:
+                        self.fail(f"{type(err).__name__} escaped ControlAPI.call on {method}")
+                    self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "get:malformed"})
+                self.assertEqual((kill.requests, kill.confirms), ([], []))
+                self.assertEqual(registry.list(), before)
+
+    def test_keyed_start_with_unhashable_stored_state_launches_nothing(self) -> None:
+        for state in _unhashable_values():
+            with self.subTest(state=type(state).__name__):
+                registry = InMemoryRunRegistry()
+                api, _, _, starter = make_api(registry=registry)
+                registry.put(self._stored(state, run_id="run-1"))
+                try:
+                    res = api.call("run.start", self.P)
+                except Exception as err:
+                    self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+                self.assertEqual(res, {"code": a.REGISTRY_UNAVAILABLE, "detail": "find_start:malformed"})
+                self.assertEqual(starter.calls, [])
+                self.assertEqual(registry.get("run-1")["state"], state)
+
+    def test_torn_reread_after_starter_failure_still_relaunches(self) -> None:
+        # The re-read after a refused starter is unhashable, so the start_failed write is skipped.
+        # The same key must relaunch; it must not stay start_unconfirmed forever.
+        for state in _unhashable_values():
+            with self.subTest(state=type(state).__name__):
+                registry = _TornGet()
+                calls: list[str] = []
+
+                def starter(params: dict, _calls: list[str] = calls, _registry: _TornGet = registry,
+                            _state: object = state) -> dict:
+                    _calls.append(params["run_id"])
+                    if len(_calls) == 1:
+                        _registry.torn.append(_state)
+                        raise RuntimeError("refused")
+                    return {"cgroup": f"/cg/{params['run_id']}"}
+
+                api, _, _, _ = make_api(registry=registry, starter=starter)
+                try:
+                    first = api.call("run.start", self.P)
+                except Exception as err:
+                    self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+                self.assertEqual((first["code"], first["recorded"]), (a.START_FAILED, False))
+                self.assertEqual(registry.get("run-1")["state"], "starting")
+                again = api.call("run.start", self.P)
+                self.assertEqual(again["code"], a.STARTED, again)
+                self.assertEqual((again["duplicate"], again["run"]["run_id"]), (False, "run-1"))
+                self.assertEqual(calls, ["run-1", "run-1"])
+
+    def test_torn_reread_after_launch_keeps_the_cgroup_stoppable(self) -> None:
+        # The re-read after a successful starter is unhashable. The cgroup must still be killable
+        # when the write of "running" cannot land.
+        for state in _unhashable_values():
+            with self.subTest(state=type(state).__name__):
+                registry = _TornGet()
+                kill = FakeKillTree([EMPTY])
+
+                def starter(params: dict, _registry: _TornGet = registry, _state: object = state) -> dict:
+                    _registry.torn.append(_state)
+                    _registry.fail_puts = "running"
+                    return {"cgroup": f"/cg/{params['run_id']}"}
+
+                api, _, _, _ = make_api(kill, registry=registry, starter=starter)
+                try:
+                    res = api.call("run.start", self.P)
+                except Exception as err:
+                    self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+                self.assertEqual((res["code"], res["detail"]), (a.START_UNCONFIRMED, "registry_unavailable"))
+                self.assertEqual(registry.get("run-1")["state"], "starting")
+                stop = api.call("run.stop", {"run_id": "run-1"})
+                self.assertEqual(stop["code"], a.STOPPED)
+                self.assertEqual(kill.requests, ["/cg/run-1"])
+
+    def test_torn_reread_after_launch_still_records_a_stoppable_run(self) -> None:
+        for state in _unhashable_values():
+            with self.subTest(state=type(state).__name__):
+                registry = _TornGet()
+                kill = FakeKillTree([EMPTY])
+
+                def starter(params: dict, _registry: _TornGet = registry, _state: object = state) -> dict:
+                    _registry.torn.append(_state)
+                    return {"cgroup": f"/cg/{params['run_id']}"}
+
+                api, _, _, _ = make_api(kill, registry=registry, starter=starter)
+                try:
+                    res = api.call("run.start", self.P)
+                except Exception as err:
+                    self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+                self.assertEqual(res["code"], a.STARTED)
+                stored = registry.get("run-1")
+                self.assertEqual((stored["state"], stored["cgroup"]), ("running", "/cg/run-1"))
+                stop = api.call("run.stop", {"run_id": "run-1"})
+                self.assertEqual(stop["code"], a.STOPPED)
+                self.assertEqual(kill.requests, ["/cg/run-1"])
+
+    def test_unhashable_confirm_does_not_signal_twice(self) -> None:
+        # request_stop has succeeded. The pending write of stop_pending does not land. The sent flag
+        # must already be stored, or the next stop signals the tree again.
+        for answer in _unhashable_values():
+            with self.subTest(answer=type(answer).__name__):
+                registry = FailingRegistry()
+                kill = FakeKillTree([answer, EMPTY])
+                api, _, _, _ = make_api(kill, registry=registry)
+                run = started(api)
+                registry.fail_puts = "stop_pending"
+                try:
+                    res = api.call("run.stop", {"run_id": run})
+                except Exception as err:
+                    self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+                self.assertEqual((res["code"], res["reason"]), (a.PENDING, "confirm_unknown"))
+                self.assertIs(registry.get(run)["stop"]["requested"], True)
+                self.assertEqual(len(kill.requests), 1)
+                registry.fail_puts = False
+                again = api.call("run.stop", {"run_id": run})
+                self.assertEqual(again["code"], a.STOPPED)
+                self.assertEqual(len(kill.requests), 1)
+                self.assertEqual(len(kill.confirms), 2)
 
 
 if __name__ == "__main__":

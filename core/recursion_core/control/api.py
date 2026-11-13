@@ -17,8 +17,9 @@ Methods and typed result codes::
 
 A registry error never escapes ``call``: a read or a start that cannot reach the registry answers
 ``registry_unavailable`` and launches nothing. A record read back without its required fields, or with
-the wrong types, is that same failed read and is not written back. Once the cleanup layer has answered,
-Stop returns that answer even if writing it back fails, with ``"recorded": false``.
+the wrong types, is that same failed read and is not written back. A state is compared only when it is
+a string, so an unhashable state is that failed read and not a TypeError. Once the cleanup layer has
+answered, Stop returns that answer even if writing it back fails, with ``"recorded": false``.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
@@ -34,11 +35,12 @@ known cgroup (the handle had none, or a restart lost it) answers ``start_unconfi
 record against the host after a restart is the CSL-738 startup sweep.
 
 Stop: the first call asks the cleanup layer to stop the run's tree, then asks it to confirm. Only a
-confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown answer or a
-cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
-pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested`` is
-missing or false: it raised, the stored flag was lost, or it is a stop intent from before the launch was
-recorded), in which case it sends it
+confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown or non-string
+answer, or a cleanup error yields ``pending`` with that reason. ``stop.requested`` is stored when
+``request_stop`` returns, before confirm, so an answer that cannot be classified does not signal again.
+A repeat stop on a stopped run sends nothing; on a pending run it only re-checks, unless the earlier
+cleanup request was never sent (``stop.requested`` is missing or false: it raised, the stored flag was
+lost, or it is a stop intent from before the launch was recorded), in which case it sends it
 (``cgroup.kill`` and pidfd signals are safe to repeat).
 Reads never change state and never call the cleanup layer.
 
@@ -72,6 +74,13 @@ CODES = frozenset({STARTED, OK, STOPPED, PENDING, RUN_UNKNOWN, REQUEST_INVALID, 
                    START_UNCONFIRMED, REGISTRY_UNAVAILABLE})
 SUCCESS_CODES = frozenset({STARTED, OK, STOPPED})
 _PENDING_REASON = {POPULATED: "cgroup_populated", TIMEOUT: "confirm_timeout"}
+
+
+def _confirm_reason(answer: object) -> str:
+    """Pending reason for a confirm answer other than empty. Non-strings are not used as keys."""
+    if isinstance(answer, str):
+        return _PENDING_REASON.get(answer, "confirm_unknown")
+    return "confirm_unknown"
 
 # starter(params) -> {"cgroup"}: the daemon's launch path (route service + cgroup leaf), injected. params
 # carries the API-chosen "run_id", which the starter must launch under.
@@ -124,17 +133,19 @@ def _record_ok(rec: object) -> bool:
     """True when ``rec`` still has every field a write-back is allowed to persist.
 
     A short read (a required key absent) or a mistyped value must not be written back: doing so drops
-    ``cgroup`` or ``start_key`` and the registry then forgets the live tree or the dedupe index."""
+    ``cgroup`` or ``start_key`` and the registry then forgets the live tree or the dedupe index.
+    ``state`` is tested with ``isinstance`` before membership: a dict, list, bytearray, deque or array
+    is unhashable and must be a failed read, not a TypeError."""
     if not isinstance(rec, dict) or any(name not in rec for name in _RECORD_FIELDS):
         return False
-    cgroup = rec["cgroup"]
+    cgroup, state = rec["cgroup"], rec["state"]
     if not (_nonempty_str(rec["run_id"]) and _nonempty_str(rec["tenant"]) and _nonempty_str(rec["engine"])):
         return False
-    if rec["state"] not in _STATES or not _number(rec["started_at"]):
+    if not isinstance(state, str) or state not in _STATES or not _number(rec["started_at"]):
         return False
     if cgroup is not None and not _nonempty_str(cgroup):
         return False
-    if rec["state"] in _LAUNCHED_STATES and not _nonempty_str(cgroup):
+    if state in _LAUNCHED_STATES and not _nonempty_str(cgroup):
         return False
     return _stop_ok(rec["stop"]) and _start_key_ok(rec["start_key"])
 
@@ -187,7 +198,7 @@ class ControlAPI:
 
     # -- reads --------------------------------------------------------------------------------
     def status(self, run_id: str) -> dict:
-        rec = self._reg("get", run_id)
+        rec = self._read_record(run_id)  # same shape check as Stop; a mistyped record is not "ok"
         if rec is None:
             return {"code": RUN_UNKNOWN, "run_id": run_id}
         return {"code": OK, "run": rec}
@@ -234,6 +245,9 @@ class ControlAPI:
             handle = self._starter({**params, "run_id": run_id})
         except Exception as err:  # the launch path refused or failed; the API answers with a code
             with self._run_lock(run_id):
+                # Mark the failure before the re-read. A torn read must not skip the mark: the stored
+                # record still says starting, and a same-key retry would stay start_unconfirmed forever.
+                self._failed.add(run_id)
                 # Re-read first: a Stop may have written its intent while the starter ran. If the read fails,
                 # write nothing rather than overwrite that intent with the launch-intent copy (t1430u X1c).
                 try:
@@ -244,15 +258,16 @@ class ControlAPI:
                 if current is not None:
                     current["state"] = "start_failed"
                     recorded = self._try_put(current)
-                if not recorded:  # the record still says starting; a same-key retry must still relaunch
-                    self._failed.add(run_id)
+                if recorded:  # the registry itself now says start_failed
+                    self._failed.discard(run_id)
             return {"code": START_FAILED, "run_id": run_id, "detail": type(err).__name__, "recorded": recorded}
         cgroup = handle.get("cgroup") if isinstance(handle, Mapping) else None
         if not isinstance(cgroup, str) or not cgroup:
             return {"code": START_UNCONFIRMED, "run": rec, "detail": "starter_handle_invalid"}
         with self._run_lock(run_id):
-            # Known to this process even if the write below fails, so Stop and a retry can still aim at it
-            # (red-team r3 finding 1).
+            # Known to this process before the re-read, so a torn read cannot discard the cgroup
+            # (red-team r3 finding 1). Stop and a retry can still aim at it if the write below fails.
+            self._launched[run_id] = dict(rec, state="running", cgroup=cgroup)
             current = self._current(rec)  # re-read: keeps a stop intent written while the starter ran
             current.update(state="running", cgroup=cgroup)
             self._launched[run_id] = dict(current)
@@ -377,12 +392,17 @@ class ControlAPI:
             except Exception as err:
                 return self._pending(rec, f"cleanup_error:{type(err).__name__}")
             rec["stop"]["requested"] = True
+            # The signal has been sent. Store that before confirm: an unclassifiable answer, or a
+            # pending write that does not land, must not make the next stop signal again.
+            if run_id in self._launched:
+                self._launched[run_id] = dict(rec, stop=dict(rec["stop"]))
+            self._try_put(rec)
         try:
             answer = self._kill.confirm(rec["cgroup"], self._confirm_timeout_s)
         except Exception as err:
             return self._pending(rec, f"cleanup_error:{type(err).__name__}")
         if answer != EMPTY:
-            return self._pending(rec, _PENDING_REASON.get(answer, "confirm_unknown"))
+            return self._pending(rec, _confirm_reason(answer))
         rec["state"] = "stopped"
         rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason=None)
         res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first}

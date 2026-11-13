@@ -203,6 +203,7 @@ def stale_probe(mod, Refused, rng, args, v: h.Violations, counters: dict, tmp: s
 def main() -> int:
     args = h.parse_args()
     h.prepare_tree_import(args.tree)
+    h.arm_tree_pin(args.tree)
     from recursion_core.plugin_security import breaker as mod
     from recursion_core.plugin_security import errors as errors_mod
     from recursion_core.plugin_security.errors import Refused
@@ -220,6 +221,7 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="rs328-") as tmp:
             linearizability(mod, Refused, rng, args, v, counters, tmp)
             stale_probe(mod, Refused, rng, args, v, counters, tmp)
+    h.enforce_tree_pin(args.tree, v)
     return h.finish("breaker_328", args, v, started=started,
                     extra={"measured": h.tree_info(args.tree, "core/recursion_core/plugin_security/breaker.py"),
                            "counters": counters})

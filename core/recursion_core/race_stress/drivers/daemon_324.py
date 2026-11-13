@@ -383,6 +383,7 @@ def drive(mod, rng, args, v: h.Violations, counters: dict) -> tuple[int, int]:
 def main() -> int:
     args = h.parse_args()
     h.prepare_tree_import(args.tree)
+    h.arm_tree_pin(args.tree)
     from recursion_core import daemon as mod
     h.verify_loaded(args.tree, [(mod, "core/recursion_core/daemon/__init__.py")])
 
@@ -392,6 +393,7 @@ def main() -> int:
     rng = random.Random(args.seed)
     counters = {"runs": 0, "closed_mid_run": 0, "boot_flips": 0, "terminal": 0, "stop_requested": 0}
     leaked_threads, leaked_fds = drive(mod, rng, args, v, counters)
+    h.enforce_tree_pin(args.tree, v)
     return h.finish("daemon_324", args, v, started=started,
                     extra={"measured": h.tree_info(args.tree, "core/recursion_core/daemon/__init__.py"),
                            "counters": counters, "aborted": aborted(),

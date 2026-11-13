@@ -186,6 +186,7 @@ def one_iteration(mod, c, rng, args, v: h.Violations, counters: dict) -> None:
 def main() -> int:
     args = h.parse_args()
     h.prepare_tree_import(args.tree)
+    h.arm_tree_pin(args.tree)
     from recursion_core.routes import breaker as mod
     from recursion_core.routes import contract as c
     h.verify_loaded(args.tree, [
@@ -199,6 +200,7 @@ def main() -> int:
     counters = {"ops": 0, "probes": 0, "opened": 0, "refused": 0}
     for _ in range(args.iters):
         one_iteration(mod, c, rng, args, v, counters)
+    h.enforce_tree_pin(args.tree, v)
     return h.finish("breaker_326", args, v, started=started,
                     extra={"measured": h.tree_info(args.tree, "core/recursion_core/routes/breaker.py"),
                            "counters": counters})

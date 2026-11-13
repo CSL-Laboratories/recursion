@@ -80,12 +80,31 @@ refuses it when it sits inside the pinned directory, and leaves it alone outside
 directory. An empty directory does not beat a tracked module or a later regular module on
 ``sys.path``.
 
+The static scan is only an early refusal. It covers the modules importing the pinned
+entry actually executes (the driver and the interleave loader), including function bodies
+of those entry files and of sourceless bytecode, and module-level statements of the
+packages those imports run. A dynamic call inside a function of some other module, or
+any dynamic code in a file the run never imports, does not by itself refuse the pin.
+The child that runs the stress installs ``sys.addaudithook`` before importing pinned
+code and records ``import``, ``exec``, ``compile``, code-file ``open``, and
+``os.add_dll_directory`` when that event exists. ``pin_status`` is true only when every
+code object that child executed (module files, compiled or exec'd strings, zip members,
+``.pth`` files) is in the hashed set with matching blob hashes. An exec, eval, or
+compile of a string that is not the text of a hashed file, a loader that is not a file
+loader, or a ``sys.path`` / ``sys.meta_path`` / ``sys.path_hooks`` / ``__path__`` change
+seen on an audit event or by comparing the process before and after makes it false.
+
 Not checked here: ``sitecustomize`` reached through ``PYTHONPATH`` when the process is not
 isolated (``-B`` does not skip it); the ``PATH`` fallback when ``/usr/bin/git`` is absent;
 a ``__spec__`` whose paths still name the pinned file, which ``verify_loaded`` accepts;
-launching a driver as a plain script instead of the isolated runner; imports reached
-through ``getattr`` or another alias of the import functions; imports inside an extension
-module; a string-literal ``spec_from_file_location`` path that is not the hashed file.
+launching a driver as a plain script instead of the isolated runner; imports inside an
+extension module; a string-literal ``spec_from_file_location`` path that is not the hashed
+file. The audit hook is in-process only: a subprocess the pinned code starts is not
+hooked, and ``ctypes`` (or another C call that does not go through the audited import
+and eval paths) can still load code or rewrite lists without an event. A path edit that
+is undone before the next recorded import and before ``pin_status`` reads the snapshot
+is not seen. ``compile`` of a string whose immediate caller is the standard library
+(``dataclasses``, ``collections.namedtuple``) is not attributed to the tree.
 
 Anything else skips with a message naming both heads, instead of measuring code nobody pinned.
 Set ``RACE_STRESS_UNPINNED=1`` to run against an unpinned tree anyway (the run then reports
@@ -106,6 +125,8 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
+import sysconfig
 import types
 import unittest
 from pathlib import Path
@@ -931,12 +952,19 @@ class _SourceScan(ast.NodeVisitor):
     """Import closure and fail-closed reasons for one hashed source module."""
 
     def __init__(self, rel: str, depth: int, aliases: dict | None,
-                 sys_names: set | None, path_aliases: dict | None) -> None:
+                 sys_names: set | None, path_aliases: dict | None,
+                 dynamic: str = "full") -> None:
         self.rel = rel
         self.package = _package_of(rel)
         self.depth = depth
+        # ``full`` records every dynamic call. ``module`` records only calls that run
+        # on import. ``off`` still collects import names for the hash closure.
+        self.dynamic = dynamic
+        self.func_depth = 0
         self.modules: list[str] = []
         self.stars: list[str] = []
+        self.top_modules: list[str] = []
+        self.top_stars: list[str] = []
         self.problems: list[str] = []
         self.aliases: dict[str, tuple[str, ...]] = {
             "__import__": ("__import__",),
@@ -954,11 +982,26 @@ class _SourceScan(ast.NodeVisitor):
         stars = [mod for mod in self.stars if _keep_module(mod)]
         return modules, stars, self.problems
 
+    def _records_dynamic(self) -> bool:
+        if self.dynamic == "off":
+            return False
+        if self.dynamic == "module" and self.func_depth:
+            return False
+        return True
+
     def _dyn(self) -> None:
-        self.problems.append(f"{self.rel} dynamic import")
+        if self._records_dynamic():
+            self.problems.append(f"{self.rel} dynamic import")
 
     def _mut(self, label: str) -> None:
-        self.problems.append(f"{self.rel} mutates {label}")
+        if self._records_dynamic():
+            self.problems.append(f"{self.rel} mutates {label}")
+
+    def _note_top(self, modules: list[str], stars: list[str]) -> None:
+        if self.func_depth:
+            return
+        self.top_modules.extend(modules)
+        self.top_stars.extend(stars)
 
     def collect_aliases(self, tree: ast.AST) -> None:
         for node in ast.walk(tree):
@@ -1004,8 +1047,9 @@ class _SourceScan(ast.NodeVisitor):
     def _add_static(self, node: ast.AST) -> None:
         names, star = _static_import_names(self.package, node)
         self.modules.extend(names)
-        if star:
-            self.stars.append(star)
+        stars = [star] if star else []
+        self.stars.extend(stars)
+        self._note_top(names, stars)
 
     def visit_Import(self, node: ast.Import) -> None:
         self._add_static(node)
@@ -1028,18 +1072,36 @@ class _SourceScan(ast.NodeVisitor):
     def _const(self, node: ast.AST):
         if isinstance(node, ast.Constant):
             return node.value
+        # A literal tuple or list (``fromlist=('VALUE',)``) is still a constant.
+        # A dict globals argument stays unknown; ``__import__`` does not read it.
+        if isinstance(node, (ast.Tuple, ast.List)):
+            values = []
+            for elt in node.elts:
+                if isinstance(elt, ast.Starred):
+                    return _UNKNOWN
+                value = self._const(elt)
+                if value is _UNKNOWN:
+                    return _UNKNOWN
+                values.append(value)
+            return tuple(values)
         return _UNKNOWN
 
     def _exec_source(self, source: str) -> None:
         if self.depth >= _EXEC_DEPTH:
             self._dyn()
             return
-        modules, stars, problems = _scan_source(
+        child = self.dynamic
+        if self.dynamic == "off" or (self.dynamic == "module" and self.func_depth):
+            child = "off"
+        modules, stars, problems, top_modules, top_stars = _scan_source(
             self.rel, source, depth=self.depth + 1, aliases=dict(self.aliases),
-            sys_names=set(self.sys_names), path_aliases=dict(self.path_aliases))
+            sys_names=set(self.sys_names), path_aliases=dict(self.path_aliases),
+            dynamic=child)
         self.modules.extend(modules)
         self.stars.extend(stars)
-        self.problems.extend(problems)
+        if child != "off":
+            self.problems.extend(problems)
+        self._note_top(top_modules, top_stars)
 
     def _on_call(self, tag: str, node: ast.Call) -> None:
         if any(kw.arg is None for kw in node.keywords):
@@ -1052,6 +1114,7 @@ class _SourceScan(ast.NodeVisitor):
             self._dyn()
         self.modules.extend(modules)
         self.stars.extend(stars)
+        self._note_top(modules, stars)
         for source in sources:
             self._exec_source(source)
 
@@ -1116,20 +1179,41 @@ class _SourceScan(ast.NodeVisitor):
             self._mutate_target(target)
         self.generic_visit(node)
 
+    def _visit_function(self, node: ast.AST) -> None:
+        self.func_depth += 1
+        self.generic_visit(node)
+        self.func_depth -= 1
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_function(node)
+
 
 def _scan_source(rel: str, text: str, *, depth: int = 0, aliases: dict | None = None,
-                 sys_names: set | None = None, path_aliases: dict | None = None):
-    """``(modules, star packages, problems)`` for source ``text`` of ``rel``."""
+                 sys_names: set | None = None, path_aliases: dict | None = None,
+                 dynamic: str = "full"):
+    """``(modules, star packages, problems, module-level modules, module-level stars)``.
+
+    ``dynamic`` is ``full``, ``module``, or ``off``. Import names are collected either way.
+    """
     if depth > _EXEC_DEPTH:
-        return [], [], [f"{rel} dynamic import"]
+        problem = [f"{rel} dynamic import"] if dynamic != "off" else []
+        return [], [], problem, [], []
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return [], [], [f"{rel} could not parse imports"]
-    scan = _SourceScan(rel, depth, aliases, sys_names, path_aliases)
+        problem = [f"{rel} could not parse imports"] if dynamic != "off" else []
+        return [], [], problem, [], []
+    scan = _SourceScan(rel, depth, aliases, sys_names, path_aliases, dynamic)
     scan.collect_aliases(tree)
     scan.visit(tree)
-    return scan.finish()
+    modules, stars, problems = scan.finish()
+    return modules, stars, problems, scan.top_modules, scan.top_stars
 
 
 def _pushes_null(ins: dis.Instruction) -> bool:
@@ -1304,55 +1388,79 @@ def _scan_code(code: types.CodeType, rel: str, package: str):
     return modules, stars, sources, problems, lost
 
 
-def _scan_bytecode(path: Path, rel: str):
+def _load_pyc_code(path: Path) -> types.CodeType | None:
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 16:
+        return None
+    try:
+        code = marshal.loads(data[16:])
+    except (EOFError, ValueError, TypeError):
+        return None
+    if not isinstance(code, types.CodeType):
+        return None
+    return code
+
+
+def _bytecode_top_imports(path: Path, rel: str) -> tuple[list[str], list[str]]:
+    """Module-level import names in a sourceless ``.pyc``, ignoring nested code objects."""
+    code = _load_pyc_code(path)
+    if code is None:
+        return [], []
+    modules, stars, _sources, _problems, _lost = _scan_code(code, rel, _package_of(rel))
+    return ([mod for mod in modules if _keep_module(mod)],
+            [mod for mod in stars if _keep_module(mod)])
+
+
+def _scan_bytecode(path: Path, rel: str, dynamic: str = "full"):
     """``(modules, star packages, problems)`` for a sourceless ``.pyc``.
 
     The code object is marshalled after the 16-byte header and is not executed.
     Nested code objects in ``co_consts`` are walked the same way. A header or
-    marshal failure refuses the pin.
+    marshal failure refuses the pin. ``dynamic`` selects which of those code
+    objects may refuse the pin; import names are collected either way.
     """
     package = _package_of(rel)
-    try:
-        st = path.lstat()
-    except OSError:
-        return [], [], [f"{rel} could not read bytecode imports"]
-    if not stat.S_ISREG(st.st_mode):
-        return [], [], [f"{rel} could not read bytecode imports"]
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return [], [], [f"{rel} could not read bytecode imports"]
-    if len(data) < 16:
-        return [], [], [f"{rel} could not read bytecode imports"]
-    try:
-        code = marshal.loads(data[16:])
-    except (EOFError, ValueError, TypeError):
-        return [], [], [f"{rel} could not read bytecode imports"]
-    if not isinstance(code, types.CodeType):
-        return [], [], [f"{rel} could not read bytecode imports"]
+    code = _load_pyc_code(path)
+    if code is None:
+        problem = [f"{rel} could not read bytecode imports"] if dynamic != "off" else []
+        return [], [], problem
     modules: list[str] = []
     stars: list[str] = []
     problems: list[str] = []
 
-    def walk(block: types.CodeType) -> None:
+    def walk(block: types.CodeType, level: int) -> None:
         got, got_stars, sources, probs, _lost = _scan_code(block, rel, package)
         modules.extend(got)
         stars.extend(got_stars)
-        problems.extend(probs)
+        record = dynamic == "full" or (dynamic == "module" and level == 0)
+        if record:
+            problems.extend(probs)
+        child = dynamic if record else "off"
         for source in sources:
-            nested_m, nested_s, nested_p = _scan_source(rel, source)
+            nested_m, nested_s, nested_p, _top_m, _top_s = _scan_source(
+                rel, source, dynamic=child)
             modules.extend(nested_m)
             stars.extend(nested_s)
-            problems.extend(nested_p)
+            if child != "off":
+                problems.extend(nested_p)
         for const in block.co_consts:
             if isinstance(const, types.CodeType):
-                walk(const)
+                walk(const, level + 1)
             elif isinstance(const, tuple):
                 for item in const:
                     if isinstance(item, types.CodeType):
-                        walk(item)
+                        walk(item, level + 1)
 
-    walk(code)
+    walk(code, 0)
     return ([mod for mod in modules if _keep_module(mod)],
             [mod for mod in stars if _keep_module(mod)],
             problems)
@@ -1465,6 +1573,73 @@ def _read_module_text(path: Path) -> str | None:
         return None
 
 
+def _pin_entries(path: str, files: dict[str, tuple[str, str]]) -> list[str]:
+    """Files importing this pin executes before any of its own imports.
+
+    A file pin's entry is that file. A directory pin's entry is the package
+    ``__init__.py`` the driver imports, not every module that happens to sit in the tree.
+    """
+    if _tracked_regular(files, path):
+        return [path]
+    init = path.rstrip("/") + "/__init__.py"
+    if _tracked_regular(files, init):
+        return [init]
+    return []
+
+
+def _dynamic_mode(rel: str, entries: set[str], executed: set[str]) -> str:
+    """How much dynamic code in ``rel`` may refuse the pin before the run."""
+    if rel not in executed:
+        return "off"
+    if rel in entries or _is_bytecode(Path(rel).name):
+        return "full"
+    return "module"
+
+
+def _executed_files(root: Path, path: str, files: dict[str, tuple[str, str]]) -> tuple[set[str], set[str]]:
+    """``(entry files, files importing the entry actually loads at module level)``.
+
+    Function bodies are not followed. ``daemon/__main__.py`` and a test helper the
+    package never imports stay out of the set, so dynamic code there is not an early
+    refusal. ``plugin_security/__init__.py`` does import ``loader.py``, so that module
+    is in the set, but only its module-level statements are.
+    """
+    entries = set(_pin_entries(path, files))
+    queue = [*entries, *_ancestor_inits(path)]
+    pin_mod = _pin_module_name(path)
+    if pin_mod:
+        queue.extend(_resolved_paths(root, files, pin_mod))
+    executed: set[str] = set()
+    seen: set[str] = set()
+    while queue:
+        rel = queue.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        executed.add(rel)
+        text = _read_module_text(root / rel)
+        if text is not None:
+            _modules, _stars, _probs, top_modules, top_stars = _scan_source(
+                rel, text, dynamic="off")
+            follow = [mod for mod in top_modules if _keep_module(mod)]
+            star_mods = [mod for mod in top_stars if _keep_module(mod)]
+        elif _is_bytecode(Path(rel).name):
+            follow, star_mods = _bytecode_top_imports(root / rel, rel)
+        else:
+            continue
+        for mod in follow:
+            for found in _resolved_paths(root, files, mod):
+                if found not in seen:
+                    queue.append(found)
+        for mod in star_mods:
+            subs, _problem = _star_submodules(root, files, mod)
+            for sub in subs:
+                for found in _resolved_paths(root, files, sub):
+                    if found not in seen:
+                        queue.append(found)
+    return entries, executed
+
+
 def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], list[str]]:
     """Ancestor package inits, and the tracked modules they or the pin import, must match HEAD.
 
@@ -1481,6 +1656,7 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
     if indexed is None:
         return ["could not list tracked files under core/"], []
     files, _dirs = indexed
+    entries, executed = _executed_files(root, path, files)
     problems: list[str] = []
     queue = [*_source_seeds(path, files), *_ancestor_inits(path)]
     pin_mod = _pin_module_name(path)
@@ -1503,11 +1679,12 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
         own = _import_name(rel)
         if own:
             queue.extend(p for p in _resolved_paths(root, files, own) if p not in seen)
+        mode = _dynamic_mode(rel, entries, executed)
         text = _read_module_text(root / rel)
         if text is not None:
-            modules, stars, probs = _scan_source(rel, text)
+            modules, stars, probs, _top_m, _top_s = _scan_source(rel, text, dynamic=mode)
         elif _is_bytecode(Path(rel).name):
-            modules, stars, probs = _scan_bytecode(root / rel, rel)
+            modules, stars, probs = _scan_bytecode(root / rel, rel, dynamic=mode)
         else:
             modules, stars, probs = [], [], []
         problems.extend(probs)
@@ -1515,7 +1692,7 @@ def _file_pin_dependency_problems(root: Path, path: str) -> tuple[list[str], lis
             queue.extend(p for p in _resolved_paths(root, files, mod) if p not in seen)
         for mod in stars:
             subs, problem = _star_submodules(root, files, mod)
-            if problem:
+            if problem and mode != "off":
                 problems.append(f"{rel} {problem}")
             for sub in subs:
                 queue.extend(p for p in _resolved_paths(root, files, sub) if p not in seen)
@@ -1629,8 +1806,414 @@ def _path_problems(root: Path, path: str, oid: str) -> list[str]:
     return problems
 
 
+_FILE_LOADERS = (
+    importlib.machinery.SourceFileLoader,
+    importlib.machinery.SourcelessFileLoader,
+    importlib.machinery.ExtensionFileLoader,
+)
+_BENIGN_LOADERS = frozenset({"BuiltinImporter", "FrozenImporter", "NamespaceLoader"})
+_CODE_OPEN_SUFFIXES = tuple(
+    list(importlib.machinery.SOURCE_SUFFIXES)
+    + list(importlib.machinery.BYTECODE_SUFFIXES)
+    + list(importlib.machinery.EXTENSION_SUFFIXES)
+    + [".pth", ".zip"])
+
+
+def _same_root(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == Path(right).resolve()
+    except OSError:
+        return False
+
+
+def _rel_under(root: Path, filename: str) -> str | None:
+    """Path of ``filename`` relative to ``root``, or None when it is not inside.
+
+    Lexical only: this runs from the audit hook, which must not stat or open.
+    """
+    if not filename or filename.startswith("<"):
+        return None
+    if ".zip" + os.sep in filename or filename.endswith(".zip"):
+        return None
+    try:
+        path = Path(os.path.normpath(filename))
+        if not path.is_absolute():
+            return None
+        rel = path.relative_to(os.path.normpath(root))
+    except ValueError:
+        return None
+    if not rel.parts or ".." in rel.parts:
+        return None
+    return rel.as_posix()
+
+
+def _stdlib_file(filename: str) -> bool:
+    if not filename or filename.startswith("<frozen") or filename.startswith("<builtin"):
+        return True
+    if filename.startswith("<"):
+        return False
+    try:
+        path = Path(filename).resolve()
+    except OSError:
+        return False
+    prefixes: list[Path] = []
+    for key in ("stdlib", "platstdlib"):
+        value = sysconfig.get_path(key) or ""
+        if value:
+            try:
+                prefixes.append(Path(value).resolve())
+            except OSError:
+                continue
+    try:
+        prefixes.append(Path(sys.base_prefix).resolve())
+    except OSError:
+        pass
+    for prefix in prefixes:
+        try:
+            path.relative_to(prefix)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _path_key(seq) -> tuple:
+    keyed: list[str] = []
+    for item in seq:
+        if isinstance(item, (str, bytes, os.PathLike)):
+            keyed.append(os.path.normpath(os.fspath(item)))
+        else:
+            keyed.append(f"id:{id(item)}")
+    return tuple(keyed)
+
+
+def _id_key(seq) -> tuple:
+    return tuple(id(item) for item in seq)
+
+
+class _Execution:
+    """What one armed process has imported, compiled, or opened since the snapshot."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.path = _path_key(sys.path)
+        self.meta = _id_key(sys.meta_path)
+        self.hooks = _id_key(sys.path_hooks)
+        self.modules = set(sys.modules)
+        self.files: list[str] = []
+        self.opens: list[str] = []
+        self.strings: list[str | None] = []
+        self.bound: list[tuple[str, str | None]] = []
+        self.path_changed = False
+        self.meta_changed = False
+        self.hooks_changed = False
+        self.dll = False
+        self.notes: list[str] = []
+
+
+_state: _Execution | None = None
+_hook_installed = False
+_busy = False
+
+
+def _caller_under_tree() -> bool:
+    """True when the first frame outside the hook and importlib lives in the pinned tree."""
+    if _state is None:
+        return False
+    frame = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        name = frame.f_code.co_name
+        if (name in ("_audit", "_record", "_caller_under_tree")
+                or filename.startswith("<frozen importlib")
+                or name == "_call_with_frames_removed"):
+            frame = frame.f_back
+            continue
+        return _rel_under(_state.root, filename) is not None
+    return False
+
+
+def _record(event: str, args) -> None:
+    state = _state
+    if state is None:
+        return
+    if event == "import" and len(args) >= 5:
+        # Some internal imports pass None for the path lists. That is not a mutation.
+        if args[2] is not None and _path_key(args[2]) != state.path:
+            state.path_changed = True
+        if args[3] is not None and _id_key(args[3]) != state.meta:
+            state.meta_changed = True
+        if args[4] is not None and _id_key(args[4]) != state.hooks:
+            state.hooks_changed = True
+        filename = args[1]
+        if isinstance(filename, str):
+            state.files.append(filename)
+        return
+    if event == "compile" and len(args) >= 2 and _caller_under_tree():
+        source, filename = args[0], args[1]
+        if isinstance(source, bytes):
+            text: str | None = source.decode("utf-8", "replace")
+        elif isinstance(source, str):
+            text = source
+        else:
+            text = None
+        if isinstance(filename, str) and not filename.startswith("<"):
+            state.files.append(filename)
+            state.bound.append((filename, text))
+        else:
+            state.strings.append(text)
+        return
+    if event == "exec" and args:
+        code = args[0]
+        filename = getattr(code, "co_filename", None)
+        if isinstance(filename, str) and not filename.startswith("<"):
+            state.files.append(filename)
+        elif _caller_under_tree() and isinstance(filename, str) and filename.startswith("<"):
+            # ``exec`` of a code object compiled earlier still carries ``<string>``.
+            # The compile event recorded the text when this process compiled it.
+            if not isinstance(code, types.CodeType):
+                state.strings.append(None)
+        return
+    if event == "open" and args and isinstance(args[0], str):
+        mode = args[1] if len(args) > 1 else "r"
+        if isinstance(mode, str) and mode[:1] in ("w", "a", "x"):
+            return
+        path = args[0]
+        if path.endswith(_CODE_OPEN_SUFFIXES) or ".zip" + os.sep in path:
+            state.opens.append(path)
+        return
+    if event == "os.add_dll_directory":
+        state.dll = True
+
+
+def _audit(event, args) -> None:
+    global _busy
+    if _busy or _state is None:
+        return
+    _busy = True
+    try:
+        _record(event, args)
+    except Exception as exc:
+        if _state is not None:
+            _state.notes.append(f"audit hook failed on {event} ({type(exc).__name__}: {exc})")
+    finally:
+        _busy = False
+
+
+def arm_execution_pin(root: Path | str) -> None:
+    """Start recording executed code. Call this before importing the pinned tree.
+
+    The snapshot is the process as it is now, so the harness may already have put
+    ``tree/core`` on ``sys.path``. Later edits of that list are part of the run.
+    """
+    global _state, _hook_installed
+    _state = _Execution(Path(root))
+    if not _hook_installed:
+        sys.addaudithook(_audit)
+        _hook_installed = True
+
+
+def env_for_root(root: Path | str) -> str | None:
+    """Pin env whose value is this checkout, or None when the variable is unset."""
+    try:
+        resolved = Path(root).resolve()
+    except OSError:
+        return None
+    for env in PINS:
+        value = os.environ.get(env)
+        if not value:
+            continue
+        try:
+            if Path(value).resolve() == resolved:
+                return env
+        except OSError:
+            continue
+    return None
+
+
+def _blob_problem(root: Path, rel: str) -> str | None:
+    """None when ``rel`` is a committed blob and the worktree bytes match it."""
+    head = _git_text(root, "rev-parse", f"HEAD:{rel}")
+    if not head:
+        return f"executed {rel} is not a committed blob"
+    out = _git(root, "hash-object", "--no-filters", "--", rel)
+    if out is None or out.returncode != 0 or not out.stdout.strip():
+        return f"executed {rel} could not be hashed"
+    if out.stdout.strip() != head:
+        return f"executed {rel} worktree bytes differ"
+    return None
+
+
+def _file_text(root: Path, rel: str) -> str | None:
+    file = root / rel
+    try:
+        if not file.is_file() or file.is_symlink():
+            return None
+        return file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _hashed_texts(root: Path) -> set[str]:
+    """Decoded text of tracked ``core/`` sources whose worktree bytes match HEAD."""
+    blobs = _tracked_blobs(root, "core")
+    if not blobs:
+        return set()
+    names = [rel for rel, _oid in blobs if rel.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES))]
+    oids = [oid for rel, oid in blobs if rel.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES))]
+    texts: set[str] = set()
+    for start in range(0, len(names), 64):
+        texts.update(_texts_for(root, names[start:start + 64], oids[start:start + 64]))
+    return texts
+
+
+def _texts_for(root: Path, names: list[str], oids: list[str]) -> set[str]:
+    out = _git(root, "hash-object", "--no-filters", "--", *names)
+    if out is None or out.returncode != 0:
+        return set()
+    got = out.stdout.splitlines()
+    texts: set[str] = set()
+    if len(got) != len(names):
+        return set()
+    for rel, oid, hashed in zip(names, oids, got):
+        if hashed != oid:
+            continue
+        text = _file_text(root, rel)
+        if text is not None:
+            texts.add(text)
+    return texts
+
+
+def _loader_name(loader: object) -> str:
+    """Class name of a loader instance, or the class's own name when the spec stores the class."""
+    if loader is None:
+        return ""
+    if isinstance(loader, type):
+        return loader.__name__
+    return type(loader).__name__
+
+
+def _package_path_problem(root: Path, module) -> str | None:
+    origin = getattr(module, "__file__", None)
+    pkg_path = getattr(module, "__path__", None)
+    if not isinstance(origin, str) or pkg_path is None:
+        return None
+    if _rel_under(root, origin) is None:
+        return None
+    if Path(origin).name not in _INIT_NAMES and not Path(origin).name.startswith("__init__."):
+        return None
+    expected = os.path.normpath(str(Path(origin).resolve().parent))
+    found: list[str] = []
+    try:
+        entries = list(pkg_path)
+    except TypeError:
+        return f"{getattr(module, '__name__', origin)} mutates __path__"
+    for entry in entries:
+        try:
+            found.append(os.path.normpath(str(Path(os.fspath(entry)).resolve())))
+        except (OSError, TypeError, ValueError):
+            return f"{getattr(module, '__name__', origin)} mutates __path__"
+    if found != [expected]:
+        return f"{getattr(module, '__name__', origin)} mutates __path__"
+    return None
+
+
+def execution_problems() -> list[str]:
+    """Reasons the armed run executed code that is not the hashed tree.
+
+    Empty when nothing has been armed, or when every executed source matches a blob
+    and the path lists are the ones snapshotted at ``arm_execution_pin``.
+    """
+    global _busy
+    state = _state
+    if state is None:
+        return []
+    _busy = True
+    try:
+        return _execution_problems(state)
+    finally:
+        _busy = False
+
+
+def _execution_problems(state: _Execution) -> list[str]:
+    root = state.root
+    problems: list[str] = list(state.notes)
+    if state.path_changed or _path_key(sys.path) != state.path:
+        problems.append("mutates sys.path")
+    if state.meta_changed or _id_key(sys.meta_path) != state.meta:
+        problems.append("mutates sys.meta_path")
+    if state.hooks_changed or _id_key(sys.path_hooks) != state.hooks:
+        problems.append("mutates sys.path_hooks")
+    if state.dll:
+        problems.append("mutates os.add_dll_directory")
+    texts = _hashed_texts(root) if state.strings or state.bound else set()
+    for text in state.strings:
+        if text is None or text not in texts:
+            problems.append("untraced exec of a string")
+    for filename, text in state.bound:
+        rel = _rel_under(root, filename) if isinstance(filename, str) else None
+        if rel is None or text is None:
+            problems.append("untraced exec of a string")
+            continue
+        file_text = _file_text(root, rel)
+        if file_text is None or text != file_text or file_text not in texts:
+            problems.append(f"executed {rel} does not match the hashed source")
+    seen_files: set[str] = set()
+    for filename in [*state.files, *state.opens]:
+        if not isinstance(filename, str) or filename in seen_files:
+            continue
+        seen_files.add(filename)
+        if filename.startswith("<") or _stdlib_file(filename):
+            continue
+        # ``open`` is audited before the call, including reads of a cache that is not there.
+        if filename in state.opens and not os.path.isfile(filename):
+            continue
+        suffix_code = filename.endswith(_CODE_OPEN_SUFFIXES) or ".zip" + os.sep in filename
+        rel = _rel_under(root, filename)
+        if rel is None:
+            if suffix_code or filename.endswith(".pth") or ".zip" in filename:
+                problems.append(f"executed {filename} is not a hashed file")
+            continue
+        if suffix_code or rel.endswith(tuple(importlib.machinery.SOURCE_SUFFIXES)):
+            problem = _blob_problem(root, rel)
+            if problem:
+                problems.append(problem)
+    for name, module in list(sys.modules.items()):
+        if name in state.modules:
+            continue
+        spec = getattr(module, "__spec__", None)
+        loader = getattr(spec, "loader", None) if spec is not None else None
+        origin = None
+        if spec is not None:
+            origin = getattr(spec, "origin", None)
+        if not isinstance(origin, str):
+            origin = getattr(module, "__file__", None)
+        loader_name = _loader_name(loader)
+        if loader is not None and not isinstance(loader, _FILE_LOADERS) and loader_name not in _BENIGN_LOADERS:
+            problems.append(f"non-file loader {loader_name} for {name}")
+        if isinstance(origin, str) and origin in ("built-in", "frozen"):
+            continue
+        if isinstance(origin, str) and not origin.startswith("<") and not _stdlib_file(origin):
+            rel = _rel_under(root, origin)
+            if rel is None:
+                problems.append(f"executed {name} from {origin} is not a hashed file")
+            else:
+                problem = _blob_problem(root, rel)
+                if problem:
+                    problems.append(problem)
+        path_problem = _package_path_problem(root, module)
+        if path_problem:
+            problems.append(path_problem)
+    return _dedupe(problems)
+
+
 def pin_status(env: str, root: Path) -> tuple[bool, str]:
-    """``(ok, message)`` for the checkout ``root`` named by ``env``."""
+    """``(ok, message)`` for the checkout ``root`` named by ``env``.
+
+    The static scan can refuse before anything runs. When this process armed an
+    execution pin for ``root``, the code that has actually run is part of the
+    decision too.
+    """
     pin = PINS[env]
     head = _git_text(root, "rev-parse", "HEAD")
     if head is None:
@@ -1639,6 +2222,8 @@ def pin_status(env: str, root: Path) -> tuple[bool, str]:
                 for reason in _path_problems(root, path, oid)]
     problems.extend(_core_path_shadows(root))
     problems.extend(_layout_problems(root, list(pin["objects"])))
+    if _state is not None and _same_root(_state.root, root):
+        problems.extend(execution_problems())
     problems = _dedupe(problems)
     if not problems:
         if head == pin["head"]:

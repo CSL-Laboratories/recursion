@@ -506,3 +506,40 @@ def finish(target: str, args, violations: Violations, *, started: float, extra: 
     """Print the result line and return 1 when any violation was recorded."""
     emit(target, args, violations, started=started, extra=extra)
     return 1 if violations.count else 0
+
+
+_pins_mod = None
+
+
+def _pins():
+    """The checkout's ``pins.py``, loaded by path so the measured tree cannot shadow it."""
+    global _pins_mod
+    if _pins_mod is None:
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "pins.py"
+        spec = importlib.util.spec_from_file_location("_race_stress_pins_runtime", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(str(path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _pins_mod = module
+    return _pins_mod
+
+
+def arm_tree_pin(tree: str) -> None:
+    """Record executed code from here on. Call after ``prepare_tree_import`` and before the import."""
+    _pins().arm_execution_pin(tree)
+
+
+def enforce_tree_pin(tree: str, violations: Violations) -> None:
+    """Record a violation when the code this process executed is not the hashed pin."""
+    pins = _pins()
+    root = Path(tree)
+    env = pins.env_for_root(root)
+    if env is not None:
+        ok, message = pins.pin_status(env, root)
+        if not ok:
+            violations.add(message)
+        return
+    for problem in pins.execution_problems():
+        violations.add("unpinned: " + problem)

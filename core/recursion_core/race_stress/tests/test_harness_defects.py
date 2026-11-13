@@ -1454,6 +1454,284 @@ class PinTests(unittest.TestCase):
             self.assertNotIn("non-source import", message)
 
 
+class ExecutionPinTests(PinTests):
+    """Bypasses of the static import scan. Each one runs the dirty code under python -I -B.
+
+    On 06b441e1 the static scan still reports the tree pinned, so ``PIN 0`` fails there.
+    """
+
+    def _armed(self, repo: Path, env: str, snippet: str) -> str:
+        # The child loads pins.py by path, so it does not see this process's PINS.
+        pin = pins.PINS[env]
+        payload = json.dumps({"pr": pin["pr"], "head": pin["head"], "objects": pin["objects"]})
+        script = (
+            "import importlib.util, json, sys\n"
+            "from pathlib import Path\n"
+            "spec = importlib.util.spec_from_file_location('_pins', sys.argv[1])\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "root = Path(sys.argv[2])\n"
+            "env = sys.argv[3]\n"
+            "mod.PINS[env] = json.loads(sys.argv[4])\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, str(root / 'core'))\n"
+            "mod.arm_execution_pin(root)\n"
+            f"{snippet}\n"
+            "ok, message = mod.pin_status(env, root)\n"
+            "print('PIN', int(bool(ok)))\n"
+            "print(message)\n"
+        )
+        return subprocess.check_output(
+            [sys.executable, "-I", "-B", "-c", script,
+             str(Path(pins.__file__).resolve()), str(repo), env, payload],
+            env=_git_env(), text=True, cwd=repo)
+
+    def _assert_runtime_unpinned(self, repo: Path, snippet: str, *,
+                                 env: str = "RACE_STRESS_TREE_326") -> None:
+        static_ok, static_message = pins.pin_status(env, repo)
+        self.assertTrue(static_ok, static_message)
+        out = self._armed(repo, env, snippet)
+        self.assertIn("RAN secret", out)
+        self.assertIn("PIN 0", out)
+
+    def test_eval_import_is_unpinned_when_it_runs(self) -> None:
+        secret = "core/recursion_core/routes/secret.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "RAN = eval(\"__import__('recursion_core.routes.secret', fromlist=['VALUE']).VALUE\")\n",
+                {secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_all_append_pulls_a_dirty_module_when_it_runs(self) -> None:
+        self._star_mutation("__all__ = []\n__all__.append('secret')\n")
+
+    def test_all_extend_pulls_a_dirty_module_when_it_runs(self) -> None:
+        self._star_mutation("__all__ = []\n__all__.extend(['secret'])\n")
+
+    def _star_mutation(self, init: str) -> None:
+        secret = "core/recursion_core/pkg/secret.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "from recursion_core.pkg import *\nRAN = secret.VALUE\n",
+                {"core/recursion_core/pkg/__init__.py": init, secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_sys_path_alias_is_unpinned_when_it_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay = Path(tmp) / "overlay"
+            overlay.mkdir()
+            (overlay / "secret.py").write_text("VALUE = 'secret'\n")
+            body = (
+                "import sys\n"
+                "p = sys.path\n"
+                f"p.insert(0, {str(overlay)!r})\n"
+                "import secret\n"
+                "RAN = secret.VALUE\n"
+            )
+            repo, _rel = self._routes(tmp, body)
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_meta_path_walrus_is_unpinned_when_it_runs(self) -> None:
+        # Walrus cannot target an attribute. Binding the list, then appending,
+        # changes the finder ids without an assignment the static scan sees.
+        body = (
+            "import sys\n"
+            "class _Finder:\n"
+            "    def find_spec(self, *args, **kwargs):\n"
+            "        return None\n"
+            "(mp := sys.meta_path).append(_Finder())\n"
+            "RAN = 'secret'\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(tmp, body)
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_path_via_globals_is_unpinned_when_it_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay = Path(tmp) / "overlay"
+            overlay.mkdir()
+            (overlay / "sub.py").write_text("VALUE = 'secret'\n")
+            init = f"globals()['__path__'].insert(0, {str(overlay)!r})\n"
+            repo, _rel = self._routes(
+                tmp,
+                "from recursion_core.pkg.sub import VALUE as RAN\n",
+                {
+                    "core/recursion_core/pkg/__init__.py": init,
+                    "core/recursion_core/pkg/sub.py": "VALUE = 1\n",
+                })
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_addsitedir_pth_is_unpinned_when_it_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay = Path(tmp) / "overlay"
+            overlay.mkdir()
+            (overlay / "secret.py").write_text("VALUE = 'secret'\n")
+            (overlay / "secret.pth").write_text("import secret\n")
+            body = (
+                "import site\n"
+                f"site.addsitedir({str(overlay)!r})\n"
+                "import secret\n"
+                "RAN = secret.VALUE\n"
+            )
+            repo, _rel = self._routes(tmp, body)
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_relative_import_with_custom_globals_is_unpinned_when_it_runs(self) -> None:
+        secret = "core/recursion_core/alt/secret.py"
+        body = (
+            "mod = __import__('secret', {'__package__': 'recursion_core.alt',"
+            " '__name__': 'recursion_core.alt.m'}, None, ('VALUE',), 1)\n"
+            "RAN = mod.VALUE\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp, body,
+                {"core/recursion_core/alt/__init__.py": "", secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_runpy_run_module_is_unpinned_when_it_runs(self) -> None:
+        secret = "core/recursion_core/routes/secret.py"
+        body = (
+            "import runpy\n"
+            "RAN = runpy.run_module('recursion_core.routes.secret')['VALUE']\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(tmp, body, {secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_pkgutil_load_module_is_unpinned_when_it_runs(self) -> None:
+        secret = "core/recursion_core/routes/secret.py"
+        body = (
+            "import pkgutil\n"
+            "loader = pkgutil.get_loader('recursion_core.routes.secret')\n"
+            "RAN = loader.load_module('recursion_core.routes.secret').VALUE\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(tmp, body, {secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_find_spec_exec_module_is_unpinned_when_it_runs(self) -> None:
+        secret = "core/recursion_core/routes/secret.py"
+        body = (
+            "import importlib.util\n"
+            "spec = importlib.util.find_spec('recursion_core.routes.secret')\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "RAN = mod.VALUE\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(tmp, body, {secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_source_file_loader_is_unpinned_when_it_runs(self) -> None:
+        secret = "core/recursion_core/routes/secret.py"
+        body = (
+            "from importlib.machinery import SourceFileLoader\n"
+            "from pathlib import Path\n"
+            "path = str(Path(__file__).with_name('secret.py'))\n"
+            "RAN = SourceFileLoader('recursion_core.routes.secret', path).load_module().VALUE\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(tmp, body, {secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_zipimport_is_unpinned_when_it_runs(self) -> None:
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = Path(tmp) / "mods.zip"
+            with zipfile.ZipFile(zpath, "w") as archive:
+                archive.writestr("secret.py", "VALUE = 'secret'\n")
+            body = (
+                "import zipimport\n"
+                f"RAN = zipimport.zipimporter({str(zpath)!r}).load_module('secret').VALUE\n"
+            )
+            repo, _rel = self._routes(tmp, body)
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_getattr_import_alias_is_unpinned_when_it_runs(self) -> None:
+        secret = "core/recursion_core/routes/secret.py"
+        body = (
+            "import importlib\n"
+            "RAN = getattr(importlib, 'import_module')('recursion_core.routes.secret').VALUE\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(tmp, body, {secret: "VALUE = 1\n"})
+            (repo / secret).write_text("VALUE = 'secret'\n")
+            self._assert_runtime_unpinned(
+                repo, "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+
+    def test_dynamic_code_the_driver_never_imports_stays_pinned(self) -> None:
+        # Same shape as daemon/__main__.py and tests/crash_child.py on 7c729db9:
+        # dynamic, but not on the import the driver performs.
+        rel = "core/recursion_core/daemon"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            files = {
+                "core/recursion_core/__init__.py": '"""pkg"""\n',
+                f"{rel}/__init__.py": "VALUE = 1\n",
+                f"{rel}/__main__.py":
+                    "import importlib\n"
+                    "def cli(name):\n"
+                    "    return importlib.import_module(name)\n",
+                f"{rel}/tests/crash_child.py":
+                    "import sys\n"
+                    "sys.path.insert(0, '/tmp/not-used')\n",
+            }
+            head = _repo(repo, files)
+            self._pin("RACE_STRESS_TREE_324", repo, head, [rel])
+            ok, message = pins.pin_status("RACE_STRESS_TREE_324", repo)
+            self.assertTrue(ok, message)
+            out = self._armed(
+                repo, "RACE_STRESS_TREE_324",
+                "import recursion_core.daemon as d\nprint('RAN', 'secret' if d.VALUE == 1 else d.VALUE)\n")
+            self.assertIn("RAN secret", out)
+            self.assertIn("PIN 1", out)
+
+    def test_unexecuted_helper_function_stays_pinned_until_it_runs(self) -> None:
+        # Same shape as plugin_security/loader.py load/_activate on 54a2d771.
+        helper = "core/recursion_core/routes/helper.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _rel = self._routes(
+                tmp,
+                "import recursion_core.routes.helper as helper\nRAN = 'secret'\n",
+                {helper: "def load(blob):\n    return compile(blob, '<plugin>', 'exec')\n"})
+            ok, message = pins.pin_status("RACE_STRESS_TREE_326", repo)
+            self.assertTrue(ok, message)
+            out = self._armed(
+                repo, "RACE_STRESS_TREE_326",
+                "import recursion_core.routes.breaker as b\nprint('RAN', b.RAN)\n")
+            self.assertIn("RAN secret", out)
+            self.assertIn("PIN 1", out)
+            out = self._armed(
+                repo, "RACE_STRESS_TREE_326",
+                "import recursion_core.routes.breaker as b\n"
+                "b.helper.load('x = 1')\n"
+                "print('RAN', b.RAN)\n")
+            self.assertIn("RAN secret", out)
+            self.assertIn("PIN 0", out)
+
+
 class DaemonResourceTests(unittest.TestCase):
     def _mod(self, *, block: threading.Event | None = None, held: threading.Lock | None = None):
         def hold() -> None:

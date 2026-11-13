@@ -28,6 +28,7 @@ import _harness as h
 def main() -> None:
     tree = sys.argv[sys.argv.index("--tree") + 1]
     h.prepare_tree_import(tree)
+    h.arm_tree_pin(tree)
     from recursion_core.plugin_security import breaker as mod
     from recursion_core.plugin_security import errors as errors_mod
     from recursion_core.plugin_security.errors import Refused
@@ -35,6 +36,10 @@ def main() -> None:
         (mod, "core/recursion_core/plugin_security/breaker.py"),
         (errors_mod, "core/recursion_core/plugin_security/errors.py"),
     ])
+    problems = h._pins().execution_problems()
+    if problems:
+        print(json.dumps({"pinned": False, "pin": problems[0]}))
+        sys.exit(2)
 
     if not hasattr(mod.ConnectionBreaker, "begin_probe"):
         print(json.dumps({"lease_api": False, "error": "tree predates the #328 lease API"}))

@@ -169,10 +169,10 @@ class DelegatedRoot:
             raise ValueError('Empty launch')
         leaf = self.leaf(name)
         self.fs.make_leaf(leaf)
+        if leaf.is_symlink() or os.lstat(leaf).st_uid != os.getuid():
+            raise PermissionError('Leaf is not an operator-owned directory')
         run = LeafRun(self.fs, leaf, kill_timeout)
         try:
-            if leaf.is_symlink() or os.lstat(leaf).st_uid != os.getuid():
-                raise PermissionError('Leaf is not an operator-owned directory')
             run._spawn(list(argv), env, cwd, stdin, stdout, stderr, start_timeout)
         except BaseException as exc:
             run._cleanup_after(exc)
@@ -376,6 +376,7 @@ class LeafRun:
             log.exception('leaf %s cleanup interrupted', self.leaf)
             self._cleanup_after(interrupt)  # retries; the interrupt still propagates
             raise
-        if outcome.state != 'leaf_empty' or outcome.errors:
+        expected = 'empty' if self.proc is None else 'leaf_empty'
+        if outcome.state != expected or outcome.errors:
             raise CleanupIncomplete(outcome)
         return False

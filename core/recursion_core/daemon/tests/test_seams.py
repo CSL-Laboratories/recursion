@@ -128,6 +128,17 @@ class Composed(unittest.TestCase):
         self.assertEqual(answer['code'], 'started', answer)
         return answer['run']['run_id']
 
+    def settled(self, run_id):
+        """The run's route worker has written its result: nothing of the run is still being written."""
+        self.assertTrue(until(lambda: (self.state / 'runs' / run_id / 'result.json').exists()), f'{run_id} has a result')
+
+    def stop(self, caller, run_id):
+        """Stop a run, and wait for its worker to be done with it before the test's folder can go."""
+        answer = caller.call('run.stop', {'run_id': run_id})
+        self.assertEqual(answer['code'], 'stopped', answer)
+        self.settled(run_id)
+        return answer
+
     def page(self, composed, method, path, payload=None):
         # Through the transport the composition gave the page, as the page's own client calls it.
         status, body = composed.client._transport(method, path, b'' if payload is None else json.dumps(payload).encode())
@@ -184,7 +195,7 @@ class NothingRegisteredTest(Composed):
         record = control.registry.get(run_id)
         self.assertEqual(sorted(record['start_key']), ['client_key', 'engine', 'prompt_sha256'])
         self.assertEqual(set(record) & {'principal', 'launch', 'workspace', 'owner'}, set())
-        self.assertEqual(api.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(api, run_id)
 
     def test_a_registrant_that_is_absent_changes_nothing_and_one_that_is_broken_stops_the_composition(self):
         from recursion_core.control.tests.test_seams import FakePackages
@@ -258,6 +269,7 @@ class AuthorizeSeamTest(Composed):
         self.assertEqual(control.registry.get(run_id)['state'], 'stopped')
         self.assertIsNotNone(proc.poll())
         self.assertEqual(seen, [])
+        self.settled(run_id)
         # A peer inside a run unit is still closed at accept, before any slot and before any authorizer.
         self.assertIs(composed.server._admit, adapter.admit_peer)
         self.assertFalse(adapter.admit_peer(mock.Mock(pid=0)))
@@ -382,7 +394,7 @@ class MethodSeamTest(Composed):
         self.assertEqual(api.call('run.list')['code'], 'ok')
         self.assertEqual(api.call('route.list')['code'], 'ok')
         self.assertEqual(api.call('plugin.list')['code'], 'ok')
-        self.assertEqual(api.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(api, run_id)
         events.ready = True
         self.assertEqual(api.call('events.read', {}), {'code': 'ok', 'events': []})
         # The service was started with the one context, whose fields are the declared ones.
@@ -425,7 +437,7 @@ class EngineSeamTest(Composed):
             credentials('home', 'ANTHROPIC_API_KEY')     # a source that has nothing gives no empty credential
         self.assertEqual(caught.exception.args, ('home',))
         self.assertEqual(asked, [('work', 'ANTHROPIC_API_KEY'), ('home', 'ANTHROPIC_API_KEY')])
-        self.assertEqual(self.api(composed).call('run.stop', {'run_id': self.start(self.api(composed))})['code'], 'stopped')
+        self.stop(self.api(composed), self.start(self.api(composed)))
 
     def test_by_default_the_lookup_is_todays_which_has_no_credential(self):
         _, composed = self.boot()
@@ -519,7 +531,7 @@ class LaunchSeamTest(Composed):
         self.assertEqual(str(started['cwd']), str(folder))
         # The launcher binds what the breaker admitted, once, as the host's; the starter binds nothing.
         bind.assert_called_once_with(run_id, 'subscription:stand-in-login', 'claude_code', 'stand-in-model')
-        self.assertEqual(composed.control.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(composed.control, run_id)
 
     def test_with_the_start_path_off_the_hooks_are_asked_with_no_launch_context(self):
         log = []
@@ -530,7 +542,7 @@ class LaunchSeamTest(Composed):
         run_id = self.start(composed.control, workspace={'path': '/x'})
         self.assertEqual(log, [('owner', run_id, None), ('check', run_id, None, str(self.engine)), ('folder', run_id, None)])
         self.assertEqual(str(self.units.started[-1]['cwd']), str(self.state / 'homes' / 'claude_code'), 'None is today\'s folder')
-        self.assertEqual(composed.control.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(composed.control, run_id)
 
     def test_a_run_a_plugin_owns_is_bound_as_that_plugins(self):
         def register(made):
@@ -545,7 +557,7 @@ class LaunchSeamTest(Composed):
                          [mock.call(run_id, 'subscription:stand-in-login', 'claude_code', 'stand-in-model', owner='notes.search'),
                           mock.call(host, 'subscription:stand-in-login', 'claude_code', 'stand-in-model')])
         for run in (run_id, host):
-            self.assertEqual(composed.control.call('run.stop', {'run_id': run})['code'], 'stopped')
+            self.stop(composed.control, run)
 
     @quiet
     def test_a_launch_the_check_refuses_leaves_nothing_behind_and_its_relaunch_is_checked_again(self):
@@ -572,7 +584,7 @@ class LaunchSeamTest(Composed):
         third = composed.control.call('run.start', request)
         self.assertEqual((third['code'], third['run']['run_id'], third['duplicate']), ('started', run_id, False))
         self.assertEqual(checks, [(run_id, str(self.engine))] * 3)
-        self.assertEqual(composed.control.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(composed.control, run_id)
 
     @quiet
     def test_a_folder_that_fails_or_cannot_sit_in_a_unit_refuses_the_launch(self):
@@ -623,7 +635,7 @@ class LaunchSeamTest(Composed):
         self.assertEqual(list(made_folders), [run_id], 'one folder for the run, not a second')
         self.assertEqual([entry[0] for entry in log], ['registrant'], 'the stored launch object is used: no registrant runs again')
         self.assertEqual(str(self.units.started[-1]['cwd']), str(made_folders[run_id]))
-        self.assertEqual(composed.control.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(composed.control, run_id)
 
     def binding_case(self, on):
         """Primary A is open, fallback B is admitted and bound, a later check refuses before a unit exists; on the
@@ -683,7 +695,7 @@ class LaunchSeamTest(Composed):
         self.assertEqual(self.routes['claude_code']['route']['model'], 'stand-in-model')
         self.assertEqual((answer['run']['engine'], seen[0]['route']['model'], seen[0]['deadline_s']), ('claude_code', 'chosen-model', 120.0))
         self.assertEqual(composed.control.registry.get(answer['run']['run_id'])['launch']['route_entry'], chosen)
-        self.assertEqual(composed.control.call('run.stop', {'run_id': answer['run']['run_id']})['code'], 'stopped')
+        self.stop(composed.control, answer['run']['run_id'])
 
 
 class ResultReaderSeamTest(Composed):
@@ -705,7 +717,7 @@ class ResultReaderSeamTest(Composed):
         self.assertEqual(asked, [], 'neither run.start nor run.list asks')
         self.assertEqual(api.call('run.status', {'run_id': run_id})['run']['result'], theirs)
         self.assertEqual(asked, [run_id])
-        self.assertEqual(api.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(api, run_id)
         # A run with a result of its own, in memory or in result.json, is answered from it: nobody is asked.
         ended = self.start(api, ENDS)
         self.assertTrue(until(lambda: (self.state / 'runs' / ended / 'result.json').exists()))
@@ -1114,12 +1126,13 @@ class ChangeMarkerStopTest(Composed):
         daemon, composed, marker = self.marked()
         run_id = self.start(composed.control)
         self.assertIn(run_id, marker.take()[0])
-        self.assertEqual(composed.control.call('run.stop', {'run_id': run_id})['code'], 'stopped')
+        self.stop(composed.control, run_id)
         self.shutdown()
         self.assertIsNone(daemon.registry.mark_changed, 'a closed composition leaves nothing of its own on the daemon\'s registry')
 
     def shape(self, composed, run_id, answer):
         """What a Stop answered and left, without the values that name the run."""
+        self.settled(run_id)
         after = composed.control.call('run.status', {'run_id': run_id})['run']
         return (sorted(answer), answer['code'], answer.get('state'), answer.get('recorded'), answer.get('reason'),
                 after['state'], after['observed']['state'], after['stop_attestation']['proof'])

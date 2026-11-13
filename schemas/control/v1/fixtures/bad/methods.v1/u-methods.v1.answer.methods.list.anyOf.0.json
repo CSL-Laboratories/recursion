@@ -3,7 +3,7 @@
   "params": {},
   "answer": {
     "code": "ok",
-    "table_version": "1.0-draft.5",
+    "table_version": "1.0-draft.6",
     "methods": [
       {
         "name": "run.stop",

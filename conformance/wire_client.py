@@ -350,7 +350,8 @@ def check_instance(schemas: SchemaSet, entry: dict, instance: Any) -> str | None
     return None
 
 
-VECTOR_RULES = ("call.profile", "approval.binding", "approval.lifecycle", "transcript.projection")
+VECTOR_RULES = ("call.profile", "approval.binding", "approval.lifecycle", "transcript.projection", "queue.delivery",
+                "task.derivation")
 
 
 def load_vectors(folder: Path) -> list[dict]:
@@ -404,8 +405,11 @@ def _misfit(schemas: SchemaSet, ref: str, instance: Any) -> str | None:
 
 def check_vector(schemas: SchemaSet, entry: dict) -> str | None:
     """None when the vector agrees with its rule, else what does not."""
-    vector = read_json(schemas.folder / "vectors" / entry["file"])
-    rule = entry["rule"]
+    return judge_vector(schemas, entry["rule"], read_json(schemas.folder / "vectors" / entry["file"]))
+
+
+def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
+    """The same for a vector that is already read, so that a test can hand over one it has changed."""
     if rule == "call.profile":
         # One tool call as an engine wrote it, and the text that is bound for it, or the reason it is refused.
         expect = vector["expect"]
@@ -472,6 +476,60 @@ def check_vector(schemas: SchemaSet, entry: dict) -> str | None:
             if misfit:
                 return f"line {number} does not fit transcript.line.v1: {misfit}"
         found = rules.transcript_problems(vector["events"], vector["lines"])
+        return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
+    if rule == "queue.delivery":
+        # One queued message, and what happens to it step by step: the item after each, or the refusal.
+        # A step may carry the event of the log that belongs to it. An acceptance always does: the only
+        # thing that makes an item 'delivered' is an input.accepted event that names its delivery.
+        item = vector["item"]
+        records = [("the starting item", item)]
+        for number, step in enumerate(vector["steps"], 1):
+            event = step.get("event")
+            if event is not None:
+                misfit = _misfit(schemas, "event.v1.json", event)
+                if misfit:
+                    return f"step {number}: the event does not fit event.v1: {misfit}"
+            if step["happening"] == "accepted":
+                facts = step.get("facts") or {}
+                if event is None or event["type"] != "input.accepted" or event["turn_id"] != facts.get("turn_id") or any(
+                        event["payload"][key] != facts.get(key) for key in ("delivery_id", "turn_id")):
+                    return f"step {number}: an acceptance is an input.accepted event that names the same delivery and turn"
+            try:
+                after = rules.queue_step(item, step["happening"], step.get("facts"))
+            except rules.Refused as refusal:
+                if step.get("refused") != refusal.code:
+                    return f"step {number}: refused as '{refusal.code}', the vector says {step.get('refused') or step.get('item')}"
+                continue
+            if "refused" in step:
+                return f"step {number}: taken, the vector says refused '{step['refused']}'"
+            if after != step["item"]:
+                return f"step {number}: the item after is {after}, the vector says {step['item']}"
+            item = after
+            records.append((f"step {number}", after))
+        for where, record in records:
+            misfit = _misfit(schemas, "queue.item.v1.json", record)
+            if misfit:
+                return f"{where}: the item does not fit queue.item.v1: {misfit}"
+        return None
+    if rule == "task.derivation":
+        # A run's view or a session's turn, its log, and the Task derived from them.
+        for number, event in enumerate(vector["events"], 1):
+            misfit = _misfit(schemas, "event.v1.json", event)
+            if misfit:
+                return f"event {number} does not fit event.v1: {misfit}"
+        misfit = _misfit(schemas, "mcp.task.v1.json", vector["task"])
+        if misfit:
+            return f"the task does not fit mcp.task.v1: {misfit}"
+        if vector["source"] == "run":
+            misfit = _misfit(schemas, "run.view.v1.json", vector["view"])
+            wanted = None if misfit else rules.task_of_run(vector["view"], vector["events"], vector["pending_approval_ids"])
+        else:
+            misfit = _misfit(schemas, "session.v1.json", vector["session"])
+            wanted = None if misfit else rules.task_of_turn(vector["session"], vector["turn_id"], vector["events"],
+                                                            vector["pending_approval_ids"])
+        if misfit:
+            return f"the source record does not fit its schema: {misfit}"
+        found = rules.task_problems(wanted, vector["task"])
         return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
     return f"no rule named {rule!r}"
 

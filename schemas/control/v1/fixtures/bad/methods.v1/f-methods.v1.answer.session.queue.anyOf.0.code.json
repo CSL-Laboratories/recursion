@@ -7,6 +7,6 @@
   },
   "answer": {
     "code": "x-nobody-defined-this",
-    "detail": "command_id_reused"
+    "detail": "store_absent"
   }
 }

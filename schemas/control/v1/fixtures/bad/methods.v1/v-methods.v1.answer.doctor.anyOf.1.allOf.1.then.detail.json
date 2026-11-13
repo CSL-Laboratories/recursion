@@ -3,6 +3,6 @@
   "params": {},
   "answer": {
     "code": "unsupported",
-    "detail": "multi_turn"
+    "detail": "store_absent"
   }
 }

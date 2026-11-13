@@ -14,24 +14,108 @@ Nothing is frozen yet.
 | Schema | Version |
 |---|---|
 | `common.v1.json` | 1.0-draft.2 |
-| `run.record.v1.json` | 1.0-draft.2 |
-| `run.view.v1.json` | 1.0-draft.2 |
+| `run.record.v1.json` | 1.0-draft.3 |
+| `run.view.v1.json` | 1.0-draft.3 |
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
-| `queue.item.v1.json` | 1.0-draft.3 |
-| `event.v1.json` | 1.0-draft.4 |
+| `queue.item.v1.json` | 1.0-draft.4 |
+| `event.v1.json` | 1.0-draft.5 |
 | `approval.v1.json` | 1.0-draft.4 |
-| `driver.v2.json` | 1.0-draft.2 |
-| `mcp.task.v1.json` | 1.0-draft.2 |
+| `driver.v2.json` | 1.0-draft.3 |
+| `mcp.task.v1.json` | 1.0-draft.3 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.5 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.6 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## The rest of the build plan's third revision (Nov 13, 2026)
+
+The section after this one brought three schemas in line with the build plan's third revision and
+listed what was left. This section is what was left: the launch object, the delivery of a queued
+message, the Task, and the cursor. Two rules that a schema cannot state came with it
+(`conformance/rules.py`: `queue_step`, and `task_of_run` with `task_of_turn`), each with vectors.
+What still differs from the plan is at the end of this section.
+
+### `run.record.v1.json` and `run.view.v1.json` are `1.0-draft.3`
+
+| Change from draft 2 | What it breaks |
+|---|---|
+| The record's `session_id`, `turn_id`, `workspace`, `route`, `route_decision`, `owner` and `budget` are gone from the top level. They are ONE object, `launch`, stored as the launch was asked: `route_entry` (the route as it was loaded: `route`, `deadline_s`, `binary`), `route_decision`, `workspace` (`mode`, `source_path`, `base_ref`, `worktree_path`), `containment_level`, `session_id`, `turn_id`, `owner`, `budget`. Every field of it is always present; one that does not apply is null. The record's `principal` is NOT inside it: it stays beside it, set by the host, so that a reader takes who asked from the trusted field and never from what was asked | Every producer and reader of the seven fields |
+| `start_error {code, detail}` is new and RESERVED. No producer writes it yet: the lane that owns Stop writes it, with its fix for a start error that can belong to a later attempt. A reader uses it when it is there and falls back when it is not | Nothing |
+
+A record written before this change has no `launch`; both fields are optional for that reason.
+
+### `queue.item.v1.json` is `1.0-draft.4` and `event.v1.json` is `1.0-draft.5`
+
+How the core learns that an engine took a message is settled, by the plan: the engine says so, in a
+typed event, and nothing else counts.
+
+| Change | What it breaks |
+|---|---|
+| `input.accepted {delivery_id, turn_id, how}` is new: the ENGINE's typed acceptance of an input, from a driver's parse and only from the engine's own typed signal, never read out of free text. `how` is `new_turn` or `mid_turn`. Its source is always `engine` | Nothing published; a producer that marked an item delivered without it |
+| `steer.sent {item_id, delivery_id}` replaces `steer.delivered {item_id, delivery_id, how}`. It records the WRITE into a turn in progress and is not acceptance | Every producer and reader of `steer.delivered` |
+| `turn.started` is written by the core, when `input.accepted` with `how: new_turn` arrives; draft 4 let a client's request be its source | A producer that writes `turn.started` when a turn is asked for |
+| A queue item is `delivered` only when an `input.accepted` names its delivery id; `turn_id` is then the turn that took it. An item still `delivering` at a restart, or at the end of the turn it was written into, is `outcome_unknown` | A producer that treats the write, or the engine's printed text, as delivery |
+| `effect.outcome_unknown.why` gains `turn_ended` | A reader with a fixed list of reasons |
+| `state.changed.coalesced` is the number of marks an image stands for, given only when it was measured (1 or more), and null when it was not. Draft 4 used 0 for "exactly one". Today's producer keeps a set and no count, and always gives null | Every producer and reader of the number |
+
+The commits, in order, are in the description of `queue.item.v1.json`. `conformance/rules.py`
+(`queue_step`) states what each happening does to an item, and nine vectors walk it: a crash before
+the write and a crash after it end the same way (`outcome_unknown`, never sent again by itself), and a
+step that is an acceptance must carry its `input.accepted` event. PROVISIONAL, for the lane that owns
+the queue: an acceptance that arrives after an item became `outcome_unknown` changes nothing by itself.
+
+`turn.started` still carries `index` and `text` beside `delivery_id`, and `steer.queued` still carries
+`order`, `delivery`, `revision` and `state` beside `item_id`. The plan names fewer fields for both. The
+transcript's line for a turn's input takes its text from `turn.started`, so the fields stay until the
+lane that emits the event sends a fixture that says otherwise.
+
+### `driver.v2.json` is `1.0-draft.3`
+
+| Change from draft 2 | What it breaks |
+|---|---|
+| A declaration carries `input_ack`, true or false: whether the engine gives a typed acceptance of an input sent into a turn in progress. It records a fact about the engine and nothing else. Whether steering is offered on an engine that gives none is NOT decided | Every declaration: the field is required |
+| A driver's parse may draft `input.accepted`. It still may not draft `turn.started` or an approval request | Nothing |
+
+### `mcp.task.v1.json` is `1.0-draft.3`
+
+| Change from draft 2 | What it breaks |
+|---|---|
+| The record names its `source`, `turn` or `run`, and carries `session_id`, `run_id` and `turn_id` at the top level. Draft 2's `of` object is gone | Every producer and reader of `of` |
+| A Task of a run started with no session is derived from the run's view, field by field. Starting, running, a Stop pending and a unit that cannot be observed are `working` (`input_required` while an approval is pending); a Stop asked and not confirmed sets `cancel_requested` and leaves the status; `stopped` is `cancelled`; ended with a result is `completed` or `failed` by the result's code (a result that says ok and carries a code is `failed` with it; one that says error and carries none is `failed` with `result_invalid`), and `result_ref` is the run id; ended with no result kept is `failed` with code `result_unavailable`; a start that never launched is `failed` with code `start_failed`; lost at a reboot is `failed` with code `lost_reboot` | A server that keeps a Task in a store of its own |
+| The detail of a failed start is the code of the record's `start_error` when the record has one, and null when it does not. Nothing durable says why a start failed today, so a Task never gives a reason | A Task that repeats the reason the start call was answered with |
+| `created_at` and `updated_at` are the times the core LOGGED: the first event of the run or the turn, and its latest `state.changed`. Each is null when the log holds no such event | A server that stamps its own clock |
+| A result's `detail` may be null | A reader that expects a string |
+| Cancelling a turn's Task is an interrupt of that turn, not a Stop: it is `cancelled` when the turn's outcome is `interrupted`. Cancelling a run's Task is `run.stop` | Nothing published |
+
+`conformance/rules.py` (`task_of_run`, `task_of_turn`) is the derivation as code. Every good Task
+fixture is made by it from a source record and a log, with its status, flag, times and result also
+written by hand and compared. Thirty-two vectors pair a source with a Task: twenty-four that agree,
+for every state of a run's view and every state of a turn, and eight that are caught, each for its own
+field. A Task of a run does not expire: PROVISIONAL until a retention rule exists.
+
+### `methods.v1.json` is `1.0-draft.6`
+
+| Change from draft 5 | What it breaks |
+|---|---|
+| `events.read` and `events.follow` TAKE the cursor they return (`cursor {epoch, session_id, seq}`), not a log id and a number. A first read sends seq 0 and the lowest epoch, 1 | Every caller of both |
+| Every page answers `epoch_advanced`: true when the cursor named an older epoch than the daemon's and the read went on by seq all the same | Every producer of a page |
+| A method that takes a `command_id` may answer `unsupported` with detail `store_absent`: it needs a receipt, and the daemon was composed with no event store to keep one in. No other method may | A reader with a fixed list of `unsupported` details |
+| Said in the rules: a method whose row names a service answers `unavailable`, `service_starting`, until that service is ready. A plugin holding `run` may stop only a run whose `launch.owner` is that plugin (PROVISIONAL, with the rest of who may Stop) | Nothing |
+
+### Still different from the plan
+
+| In the plan | Here | Why |
+|---|---|---|
+| `turn.started {delivery_id}`, `steer.queued {item_id}` | More fields, as above | The emitting lanes reshape them with a fixture |
+| A turn with outcome `done` or `candidate_done` cannot carry an error code | Neither can one with `waiting` or `paused` | Stricter, from the second read; the lane that owns sessions may relax it with a fixture |
+| A session's `workspace` and the launch object's `workspace` | The session's says `path`, the launch object's `source_path` | The session record was not in this revision's list; one name for both is a breaking change to `session.v1` and waits for the lane that owns it |
 
 ## Brought in line with the build plan's third revision (Nov 13, 2026)
 
 The build plan was revised again while the drafts below were being written, and it now carries the
 owner's two decisions. Where it differs from these drafts it wins. Three things changed for it here;
-the rest of its list is under "Not aligned yet" at the end of this section.
+the rest of its list was under "Not aligned yet" at the end of this section, and is now the section
+above.
 
 ### `approval.v1.json` is `1.0-draft.4`
 
@@ -61,18 +145,19 @@ listed here so that nobody uses one for something else: `device.pair_begin`, `de
 `device.revoke` (the lane that builds pairing), and `config.scan`, `config.offers`, `config.apply`,
 `prefs.export`, `prefs.import` (the lane that builds import). `methods.list` does not list them.
 
-### Not aligned yet with that revision
+### Not aligned yet with that revision (at the time; aligned since, in the section above)
 
-These are in the plan's list and not in the drafts. Each is a breaking change to a draft, so each will
-be its own entry here when it lands.
+These were in the plan's list and not in the drafts when this section was written. Each has landed
+since, as its own entry in the section above. `stop.requested` already named a scope and the driver's
+`user_message` already named its turn in draft 2.
 
-| In the plan | In the drafts today |
+| In the plan | In the drafts then |
 |---|---|
 | The run record's `route`, `route_decision`, `workspace`, `owner`, `budget`, `session_id` and `turn_id` are ONE `launch` object, with `containment_level` and the route entry as it was loaded; `start_error` is reserved on the record | Separate optional fields; no `start_error` |
-| `steer.sent` replaces `steer.delivered`; `input.accepted` is the engine's typed acceptance of an input; `turn.started` and `steer.queued` carry fewer fields; a queue item is `delivered` only on `input.accepted` | `steer.delivered`; no `input.accepted`; the driver's parse cannot draft one |
-| `events.read` and `events.follow` take the cursor they return | They take a log id and a number |
-| The Task names its source (`turn` or `run`) and the run source is given field by field (a start that never launched is `failed` with code `start_failed`; no retained result is `failed` with `result_unavailable`; times come from the run's log) | `mcp.task.v1` draft 2, unchanged |
-| `state.changed.coalesced` may be null; `stop.requested` names a scope; the driver's `user_message` names its turn | As in draft 2 |
+| `steer.sent` replaces `steer.delivered`; `input.accepted` is the engine's typed acceptance of an input; a queue item is `delivered` only on `input.accepted` | `steer.delivered`; no `input.accepted`; the driver's parse could not draft one |
+| `events.read` and `events.follow` take the cursor they return | They took a log id and a number |
+| The Task names its source (`turn` or `run`) and the run source is given field by field | `mcp.task.v1` draft 2 |
+| `state.changed.coalesced` may be null | A number, 0 for "exactly one" |
 | A plugin holding `run` may stop only a run whose `launch.owner` is that plugin (provisional) | Not stated |
 
 ## After the second cross-family read of these drafts (Nov 13, 2026)
@@ -118,8 +203,8 @@ breaks: a record of a `done`, `candidate_done`, `waiting` or `paused` turn that 
 `delivering` is the daemon's COMMITTED intent to deliver, and that commit comes before anything is
 written toward the engine, so a crash between the two can never lead to a second send. What it breaks:
 an implementation that writes first and records after. How the core learns that an engine took an
-input sent into a turn in progress is not settled: the options are with the build's coordinator, and
-this record's `delivered` keeps its draft-2 wording until they are.
+input sent into a turn in progress was not settled then: this record's `delivered` kept its draft-2
+wording. It is settled since (`input.accepted`; draft 4, at the top of this file).
 
 ### `methods.v1.json` is `1.0-draft.4`
 
@@ -152,12 +237,12 @@ The sanitizer that engine text goes through is not part of these records; the ru
 text only when it is plain, which a sanitizer leaves alone. The sentences for the other event types,
 what is announced and where input goes are the renderer's and are not checked.
 
-### Not changed yet, on purpose
+### Not changed then, on purpose (changed since: draft 3, at the top of this file)
 
-`mcp.task.v1.json` stays at draft 2. The Task of a run that has no session needs facts the run record
-does not keep (why a start failed, after a restart; when the state last changed) and a rule from a
-run's result to the Task's. Those cross lanes; the options are with the build's coordinator, and no
-lane should treat that half of the Task as agreed.
+`mcp.task.v1.json` stayed at draft 2 in that commit. The Task of a run that has no session needed
+facts the run record does not keep (why a start failed, after a restart; when the state last changed)
+and a rule from a run's result to the Task's. Those cross lanes, so the options went to the build's
+coordinator first. The plan's third revision answers them, and draft 3 is built to it.
 
 ### The checks themselves
 
@@ -272,7 +357,10 @@ Built as recommended and **not decided**. Each is the owner's decision or anothe
 
 | Choice | Built as | Alternative | Whose |
 |---|---|---|---|
-| Canonical form behind the approval digest and `tool.call.input_digest` | `csl-cj/v0`, named in the record as `digest_form`. Because that form takes ASCII text and whole numbers only, an engine tool's input is carried inside the effect as an escaped JSON string (`input_json`) | RFC 8785, for engine effects or for all | The owner's |
+| How large an approved call may be, and what happens to one that is too long to show | Refused with a typed code (`too_large` above 262,144 bytes, `too_many_lines` above 200 lines), never truncated. (The canonical form itself is decided: see "Decided by the owner", above) | Other limits; a prompt that shows a part | The owner's |
+| Steering on an engine that gives no typed acceptance mid-turn | Not built either way: `driver.v2` records `input_ack`, and a message sent mid-turn on such an engine ends `outcome_unknown` | Refuse `session.steer` there; or turn it into a next-turn message | The owner's |
+| A late acceptance of an item that is already `outcome_unknown` | Changes nothing by itself | Let it make the item `delivered` | The lane that owns the queue |
+| Expiry of a Task of a run | null: it does not expire | A retention rule | The lane that builds the MCP face, against the Tasks conformance run |
 | Who may Stop | `run.stop` needs a held `run` scope; an owner or device with it may stop any run; a session may stop only its own subtree; the daemon's recovery Stop is not a client's call | Any authenticated caller may stop any run | The owner's |
 | Approvals on the MCP face | `approval.list` is a read tool; `approval.open` and `approval.answer` are never tools | No approval tool at all; or answering through MCP with an approve-scoped token | The owner's |
 | Names of the containment levels | `host_integrated`, `engine_user`, `contained` | Any other set | The lane that owns Stop, on the owner's decision |

@@ -5,7 +5,7 @@
   "turn_id": null,
   "time": "2026-11-13T07:34:51.887Z",
   "type": "turn.started",
-  "source": "client",
+  "source": "core",
   "trust": "trusted",
   "payload": {
     "delivery_id": "dlv-0007",

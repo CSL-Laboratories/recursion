@@ -7,6 +7,7 @@ pattern; see README.md for why it is not named ``test_*.py``.
 from __future__ import annotations
 
 import ast
+import copy
 import re
 import sys
 import unittest
@@ -269,10 +270,13 @@ class PublishedFilesTest(unittest.TestCase):
                     # answer could carry the code and skip every field the typed answer requires.
                     self.assertEqual(sorted(set(typed) & set(refusals)), [], "a typed code is also a bare refusal")
                     # 'unsupported' names not_implemented or a flag the row requires, and the row requires
-                    # exactly the flags the answer can name.
+                    # exactly the flags the answer can name. store_absent (no event store to keep a receipt
+                    # in) can be named only by a method that has a receipt: one keyed by command_id.
                     limits = answer["anyOf"][1]["allOf"][1]
                     if "unsupported" in refusals:
-                        self.assertEqual(limits["then"]["properties"]["detail"]["enum"], ["not_implemented"] + row["requires"])
+                        needs_receipt = ["store_absent"] if row["idempotency"] == "command_id" else []
+                        self.assertEqual(limits["then"]["properties"]["detail"]["enum"],
+                                         ["not_implemented"] + needs_receipt + row["requires"])
                     else:
                         self.assertEqual(row["requires"], [], "a row requires a flag and cannot answer 'unsupported'")
                     # What the row says about keys and revisions is what the params schema requires.
@@ -331,14 +335,75 @@ class PublishedFilesTest(unittest.TestCase):
                 expect = vector.get("expect")
                 if entry["rule"] == "call.profile":
                     kinds = {"caught" if "refused" in expect else "agrees"}
-                elif entry["rule"] in ("approval.binding", "transcript.projection"):
+                elif entry["rule"] in ("approval.binding", "transcript.projection", "task.derivation"):
                     kinds = {"caught" if expect else "agrees"}
+                elif entry["rule"] == "queue.delivery":
+                    kinds = ({"agrees"} if any("item" in step for step in vector["steps"]) else set()) \
+                        | ({"caught"} if any("refused" in step for step in vector["steps"]) else set())
                 else:
                     codes = {step["answer"]["code"] for step in vector["steps"]}
                     kinds = ({"agrees"} if "ok" in codes else set()) | ({"caught"} if codes - {"ok"} else set())
                 seen.setdefault(entry["rule"], set()).update(kinds)
         self.assertEqual({rule: sorted(kinds) for rule, kinds in seen.items()},
                          {rule: ["agrees", "caught"] for rule in client.VECTOR_RULES})
+
+    def test_a_queue_item_is_delivered_only_by_the_engines_own_acceptance(self):
+        """In a queue.delivery vector, a step that is an acceptance carries an input.accepted event that names
+        the same delivery and the same turn. Take the event away, make it the core's write, or let it name
+        another delivery or turn, and the vector is refused, whatever the item after the step says."""
+        changed = 0
+        for folder, schemas in self.sets.items():
+            for entry in client.load_vectors(folder):
+                if entry["rule"] != "queue.delivery":
+                    continue
+                vector = client.read_json(folder / "vectors" / entry["file"])
+                self.assertIsNone(client.judge_vector(schemas, "queue.delivery", vector), entry["file"])
+                for number, step in enumerate(vector["steps"]):
+                    if step["happening"] != "accepted":
+                        continue
+                    sent = dict(step["event"], type="steer.sent", source="core", trust="trusted",
+                                payload={"item_id": vector["item"]["item_id"], "delivery_id": step["facts"]["delivery_id"]})
+                    for what, event in (("no event", None), ("the core's write", sent),
+                                        ("another delivery", dict(step["event"], payload=dict(step["event"]["payload"], delivery_id="dlv-ffff"))),
+                                        ("another turn", dict(step["event"], payload=dict(step["event"]["payload"], turn_id="turn-ffff"))),
+                                        ("an envelope of another turn", dict(step["event"], turn_id="turn-ffff"))):
+                        doctored = copy.deepcopy(vector)
+                        if event is None:
+                            del doctored["steps"][number]["event"]
+                        else:
+                            doctored["steps"][number]["event"] = event
+                        with self.subTest(vector=entry["file"], step=number + 1, change=what):
+                            self.assertIsNotNone(client.judge_vector(schemas, "queue.delivery", doctored))
+                        changed += 1
+        self.assertGreater(changed, 15, "too few acceptance steps to mean anything")
+
+    def test_a_task_is_derived_for_every_state_of_each_source(self):
+        """A Task comes from a run or from a turn. For every state a run's view can show, and for every state
+        a turn can be in, there is a vector whose Task agrees with the rule; and every status a Task can
+        have is reached from each source that can reach it."""
+        states, statuses = {"run": set(), "turn": set()}, {"run": set(), "turn": set()}
+        control = None
+        for folder, schemas in self.sets.items():
+            for entry in client.load_vectors(folder):
+                if entry["rule"] != "task.derivation":
+                    continue
+                control = schemas
+                vector = client.read_json(folder / "vectors" / entry["file"])
+                if vector["expect"]:
+                    continue
+                source = vector["source"]
+                statuses[source].add(vector["task"]["status"])
+                if source == "run":
+                    states[source].add(vector["view"]["state"])
+                else:
+                    states[source].add(next(turn["state"] for turn in vector["session"]["turns"]
+                                            if turn["turn_id"] == vector["turn_id"]))
+        self.assertIsNotNone(control, "no task.derivation vector")
+        self.assertEqual(sorted(states["run"]), sorted(control.schemas["run.view.v1.json"]["$defs"]["public_state"]["enum"]))
+        self.assertEqual(sorted(states["turn"]), sorted(control.schemas["session.v1.json"]["$defs"]["turn_state"]["enum"]))
+        every = sorted(control.schemas["mcp.task.v1.json"]["properties"]["status"]["enum"])
+        self.assertEqual(sorted(statuses["run"]), every)
+        self.assertEqual(sorted(statuses["turn"]), every)
 
     def test_every_approval_in_a_good_fixture_shows_what_it_binds(self):
         """Wherever a good fixture holds an approval (on its own, in an event, in an answer), its digest is

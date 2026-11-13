@@ -25,10 +25,10 @@ them (see "Checking the fixtures").
 | `stop.result.v1.json` | public | What a Stop answers. Today's answer, exactly, plus additions the lane that owns Stop will make | control API |
 | `session.v1.json` | public and storage | One session and its turns, each turn with its own outcome and result | SESSIONS |
 | `queue.item.v1.json` | public and storage | One queued message of a session | SESSIONS |
-| `event.v1.json` | public and storage | One event of a log, with one payload schema for each of twenty-four types | EVENTS and every lane that emits |
+| `event.v1.json` | public and storage | One event of a log, with one payload schema for each of twenty-five types | EVENTS and every lane that emits |
 | `approval.v1.json` | public | One approval request as a client reads it; the summary `approval.list` returns; and (described, never sent) the daemon's private binding | APPROVALS |
-| `driver.v2.json` | internal | What an engine driver declares (its flags), what `send` takes, what `start` gives back, and the event drafts `parse` returns | each engine lane |
-| `mcp.task.v1.json` | public | An MCP Task, derived from a turn (or, for `run.start`, from the run) at the moment it is asked for | MCP |
+| `driver.v2.json` | internal | What an engine driver declares (its flags, and whether its engine gives a typed acceptance of an input sent mid-turn), what `send` takes, what `start` gives back, and the event drafts `parse` returns | each engine lane |
+| `mcp.task.v1.json` | public | An MCP Task, derived at the moment it is asked for from a turn of a session or, for a run started with no session, from the run; the record names which | MCP |
 | `transcript.line.v1.json` | public | One line of a session's transcript: a projection of an event for a linear reader | EVENTS, TUI |
 | `methods.v1.json` | public | The method table's schema: a row for each of thirty-eight methods, and the params and every answer of each | CONTROL and each lane that owns a method |
 | `methods.table.v1.json` | data | The table itself: for each method its scope, whether it mutates, its key and precondition, the driver flags it needs, its page and MCP marks, every code it can answer | lane SPINE, on request |
@@ -47,7 +47,8 @@ so that none of them can be taken away unnoticed.
 `conformance/rules.py` states as code (that a digest is the digest of its effect, that an approval's
 lines are the lines of that effect, how a tool call becomes the text that is bound, how
 `approval.open` and `approval.answer` are answered one after another, what a transcript line must
-carry because its event says so). `vectors/index.json` lists
+carry because its event says so, what happens to a queued message step by step, what the Task of a run
+or of a turn must say). `vectors/index.json` lists
 them. A client in another language implements the same rules and checks the same vectors.
 
 ## Storage records and public records are different records
@@ -74,6 +75,21 @@ the bad fixtures show both.
 - **Stop acts on a run. Interrupt acts on a turn.**
 - **A turn's result is stored with the turn.** A run's result file is the run's, not a turn's. An MCP
   Task of a session is derived from a turn, never from the run's last result.
+- **A Task is derived, never stored.** It comes from a turn of a session, or from a run that was
+  started with no session, and says which (`source`). Its times are the times the core logged. A run
+  with no session is not given one to make its Task. `conformance/rules.py` states the derivation and
+  `vectors/task.derivation/` holds a case for every state of each source.
+- **A queued message is delivered when the engine says so, and only then.** The daemon commits the
+  item as `delivering`, under a delivery id, BEFORE it writes anything toward the engine. `steer.sent`
+  records a write into a turn in progress; it is not acceptance. The item becomes `delivered` only
+  when the engine's own typed acceptance, an `input.accepted` event from a driver's parse, names that
+  delivery id. An item with no acceptance at a restart, or at the end of the turn it was written
+  into, is `outcome_unknown`: shown as sent and not confirmed, and never sent again by itself. A
+  crash before the write and a crash after it leave the same record and end the same way. One commit
+  cannot make a delivery to an engine happen exactly once; what these records do is never claim a
+  delivery nobody confirmed, and never send twice. `vectors/queue.delivery/` walks each case.
+- **A log is read from a cursor.** `events.read` and `events.follow` take the cursor a read returned
+  (the log, the place in it, the daemon's epoch), and every page says whether the epoch advanced.
 - A session is `idle`, `live`, `stop_pending` or `ended`. `idle` with a worker that is alive is a
   persistent worker waiting for input: `idle` does not mean "no unit".
 - **Stop.** `stopped` means the run's removal was attested. `ended` means the run had already ended
@@ -216,17 +232,17 @@ Each of these has a fixture, so a change shows up as a failing fixture, not as a
 
 | Item | Where | Whose to settle |
 |---|---|---|
-| Payloads of `turn.started`, `turn.ended`, `steer.queued`, `steer.delivered` | `event.v1.json` | The lanes that emit them (the driver lanes, LOOP, SESSIONS), by sending a fixture |
+| Payloads of `turn.started`, `turn.ended`, `steer.queued`, `steer.sent`, `input.accepted` | `event.v1.json` | The lanes that emit them (the driver lanes, LOOP, SESSIONS), by sending a fixture |
 | Payloads of `diff`, `checkpoint`, `fork`, `workspace.grant`, `workspace.revoke`; the `diff` answer | `event.v1.json`, `methods.v1.json` | WORKSPACE |
 | `route_decision` (chosen, reason, candidates, hand pick) and the answer of `route.explain` | `common.v1.json`, `methods.v1.json` | ROUTING, QUOTA |
 | `effect.outcome_unknown` (which effects, which reasons) | `event.v1.json` | EVENTS |
 | `usage.bucket`, the `budget.show` row | `event.v1.json`, `methods.v1.json` | QUOTA |
 | `containment_level` names, `claim` keys, the `attestation` and `fence` shapes | `stop.result.v1.json` | The lane that owns Stop, on a decision that is still open |
-| The launch snapshot (`route` on the run record): which of the route contract's fields it keeps | `run.record.v1.json` | DRIVER-CC, ROUTING |
+| The launch object (`launch` on the run record): which of the route contract's fields its `route_entry` keeps | `run.record.v1.json` | DRIVER-CC, ROUTING |
 | The lines of an approval (`csl-approval-lines/v0`): their wording and order, the characters shown as escapes, and the rule that a call too large to show whole is denied without asking | `approval.v1.json`, `conformance/rules.py` | APPROVALS |
 | `surface` (who showed an approval) is `cli`, `tui`, `page` or `phone` | `approval.v1.json` | APPROVALS |
 | The transcript's `state`, `speech` and `focus` | `transcript.line.v1.json` | TUI |
-| The Task's `poll_interval_ms`, and the status derived for `unknown` and `lost_reboot` runs | `mcp.task.v1.json` | MCP |
+| The Task's `poll_interval_ms`, the status derived for `unknown` and `lost_reboot` runs, and that a Task of a run does not expire | `mcp.task.v1.json` | MCP |
 | `driver.v2`: the shapes of `start`, `handle` and `fork` | `driver.v2.json` | DRIVER-CC |
 | Scopes, page marks and MCP marks of the thirty-two methods that are new | `methods.table.v1.json` | CONTROL, PAGE, MCP |
 | The delegable methods of a session token | `session.token.v1.json` | CONTROL, DELEGATION |

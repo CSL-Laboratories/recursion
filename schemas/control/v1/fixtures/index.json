@@ -1487,7 +1487,7 @@
     {
       "file": "good/driver.v2/h02-a-driver-with-a-worker.json",
       "schema": "driver.v2.json",
-      "shows": "A driver that keeps a worker between turns, takes input mid-turn, and bridges permission prompts. It cannot fork."
+      "shows": "A driver that keeps a worker between turns, takes input mid-turn, and bridges permission prompts. It cannot fork. It declares that its engine gives a typed acceptance of an input sent mid-turn."
     },
     {
       "file": "good/driver.v2/h03-resume-only.json",
@@ -1543,6 +1543,16 @@
       "file": "good/driver.v2/h13-interrupt-a-turn.json",
       "schema": "driver.v2.json#/$defs/interrupt",
       "shows": "What interrupt takes: the turn to interrupt."
+    },
+    {
+      "file": "good/driver.v2/h14-mid-turn-input-on-an-engine-that-gives-no-acceptance.json",
+      "schema": "driver.v2.json",
+      "shows": "A driver that can write into a turn in progress, on an engine that gives no typed acceptance of such an input. It says so: a message sent mid-turn through it can never be shown as taken, and its queue item ends outcome_unknown. Whether steering is offered at all on such an engine is not decided by this record."
+    },
+    {
+      "file": "good/driver.v2/h15-draft-input-accepted.json",
+      "schema": "driver.v2.json#/$defs/event_draft",
+      "shows": "A draft from parse: the engine's typed acceptance of an input, naming the delivery id it was sent with. The core numbers it and writes it as an input.accepted event."
     },
     {
       "file": "bad/driver.v2/b01-a-flag-left-out.json",
@@ -1659,6 +1669,33 @@
       "expect": {
         "keyword": "type",
         "at": "/at"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b14-a-declaration-that-does-not-say.json",
+      "schema": "driver.v2.json",
+      "rule": "A driver always says whether its engine gives a typed acceptance mid-turn: leaving it out is not a no.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/driver.v2/b15-an-acceptance-declared-in-words.json",
+      "schema": "driver.v2.json",
+      "rule": "input_ack is true or false: a fact about the engine, not a description of it.",
+      "expect": {
+        "keyword": "type",
+        "at": "/input_ack"
+      }
+    },
+    {
+      "file": "bad/driver.v2/b16-a-driver-drafting-turn-started.json",
+      "schema": "driver.v2.json#/$defs/event_draft",
+      "rule": "A driver drafts the engine's acceptance. That a turn began is the core's to write, when the acceptance arrives.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/type"
       }
     },
     {
@@ -2104,7 +2141,7 @@
     {
       "file": "good/event.v1/h17-turn-started.json",
       "schema": "event.v1.json",
-      "shows": "The engine took a message: a turn began. The delivery id closes the delivery that was open."
+      "shows": "A turn began. The core writes this when the engine's acceptance of the input arrives (input.accepted, how new_turn); the delivery id is the one that input was written under."
     },
     {
       "file": "good/event.v1/h18-turn-ended-waiting-for-the-user.json",
@@ -2117,9 +2154,9 @@
       "shows": "A message was queued for the session; the text is in the queue item, not in the log."
     },
     {
-      "file": "good/event.v1/h20-steer-delivered.json",
+      "file": "good/event.v1/h20-steer-sent.json",
       "schema": "event.v1.json",
-      "shows": "The daemon wrote the queued message toward the engine, inside the turn in progress."
+      "shows": "The daemon wrote the queued message toward the engine, inside the turn in progress. That is the write, not the engine's acceptance."
     },
     {
       "file": "good/event.v1/h21-interrupt-delivered.json",
@@ -2169,12 +2206,12 @@
     {
       "file": "good/event.v1/h30-state-changed-found-by-a-later-scan.json",
       "schema": "event.v1.json",
-      "shows": "A change found by a scan, not seen as it was made: the reason says so, and 'coalesced' says it may stand for two earlier changes."
+      "shows": "A change found by a scan, not seen as it was made: the reason says so. How many marks the image stands for was not measured, so 'coalesced' is null and not a guess."
     },
     {
       "file": "good/event.v1/h31-state-changed-turn.json",
       "schema": "event.v1.json",
-      "shows": "A turn changed: the post-image is the turn as the session record keeps it."
+      "shows": "A turn changed: the post-image is the turn as the session record keeps it. This producer counts its marks, and measured that the image stands for exactly one."
     },
     {
       "file": "good/event.v1/h32-approval-expired-nobody-answered.json",
@@ -2210,6 +2247,21 @@
       "file": "good/event.v1/h38-approval-answered-with-an-approval.json",
       "schema": "event.v1.json",
       "shows": "The owner approved it: the state is approved and the answer says approve."
+    },
+    {
+      "file": "good/event.v1/h38-input-accepted-beginning-a-turn.json",
+      "schema": "event.v1.json",
+      "shows": "The engine's own typed acceptance of an input, from a driver's parse: it names the delivery id the input was written under and the turn that took it, and says it began a new turn. On this the core writes turn.started, and a queue item that carries the delivery becomes 'delivered'."
+    },
+    {
+      "file": "good/event.v1/h39-input-accepted-into-the-turn-in-progress.json",
+      "schema": "event.v1.json",
+      "shows": "The engine took a message sent mid-turn: the acceptance names the delivery of the steer.sent before it, and the turn in progress."
+    },
+    {
+      "file": "good/event.v1/h40-state-changed-standing-for-three-marks.json",
+      "schema": "event.v1.json",
+      "shows": "A producer that counts its marks measured that this image stands for three of them. Today's producer keeps a set of marked runs and no count, and always gives null."
     },
     {
       "file": "bad/event.v1/b01-seq-zero.json",
@@ -2500,12 +2552,84 @@
       }
     },
     {
+      "file": "bad/event.v1/b33-a-turn-started-written-by-a-client.json",
+      "schema": "event.v1.json",
+      "rule": "Only the core writes turn.started, and only when the engine's acceptance arrives: a client's request is not a turn that began.",
+      "expect": {
+        "keyword": "const",
+        "at": "/source"
+      }
+    },
+    {
+      "file": "bad/event.v1/b34-an-acceptance-written-by-the-core.json",
+      "schema": "event.v1.json",
+      "rule": "An acceptance is the engine's own typed signal, from a driver's parse. The core's write toward the engine is not one.",
+      "expect": {
+        "keyword": "const",
+        "at": "/source"
+      }
+    },
+    {
+      "file": "bad/event.v1/b35-an-acceptance-into-the-next-turn.json",
+      "schema": "event.v1.json",
+      "rule": "An acceptance says what the engine did, 'new_turn' or 'mid_turn', not what was asked for.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/payload/how"
+      }
+    },
+    {
+      "file": "bad/event.v1/b36-a-write-that-says-how-it-was-taken.json",
+      "schema": "event.v1.json",
+      "rule": "steer.sent is the write: it carries the item and the delivery id, and nothing about acceptance.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/b37-a-count-of-no-marks.json",
+      "schema": "event.v1.json",
+      "rule": "An image stands for at least one mark. Where the number was not measured it is null, never 0.",
+      "expect": {
+        "keyword": "minimum",
+        "at": "/payload/coalesced"
+      }
+    },
+    {
+      "file": "bad/event.v1/b38-the-write-named-as-a-delivery.json",
+      "schema": "event.v1.json",
+      "rule": "The type steer.delivered is gone: the write is steer.sent, and the acceptance is input.accepted.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/event.v1/b39-an-acceptance-that-names-no-turn.json",
+      "schema": "event.v1.json",
+      "rule": "An acceptance names the turn that took the input.",
+      "expect": {
+        "keyword": "required",
+        "at": "/payload"
+      }
+    },
+    {
       "file": "bad/event.v1/b40-a-done-turn-with-an-error-code.json",
       "schema": "event.v1.json",
       "rule": "A turn that ended without failing carries no error code: with one, its outcome is 'failed'. (The Task of a turn already required this; the event did not.)",
       "expect": {
         "keyword": "type",
         "at": "/payload/result/code"
+      }
+    },
+    {
+      "file": "bad/event.v1/b40-a-write-into-no-turn.json",
+      "schema": "event.v1.json",
+      "rule": "steer.sent is written into a turn in progress, and names it.",
+      "expect": {
+        "keyword": "type",
+        "at": "/turn_id"
       }
     },
     {
@@ -2563,15 +2687,6 @@
       }
     },
     {
-      "file": "bad/event.v1/f-event.v1.allOf.15.then.source.json",
-      "schema": "event.v1.json",
-      "rule": "The value at /source is fixed by event.v1.json#/allOf/15/then/properties/source.",
-      "expect": {
-        "keyword": "const",
-        "at": "/source"
-      }
-    },
-    {
       "file": "bad/event.v1/f-event.v1.allOf.16.then.source.json",
       "schema": "event.v1.json",
       "rule": "The value at /source is fixed by event.v1.json#/allOf/16/then/properties/source.",
@@ -2590,21 +2705,21 @@
       }
     },
     {
-      "file": "bad/event.v1/f-event.v1.allOf.17.then.trust.json",
-      "schema": "event.v1.json",
-      "rule": "The value at /trust is fixed by event.v1.json#/allOf/17/then/properties/trust.",
-      "expect": {
-        "keyword": "const",
-        "at": "/trust"
-      }
-    },
-    {
       "file": "bad/event.v1/f-event.v1.allOf.18.then.source.json",
       "schema": "event.v1.json",
       "rule": "The value at /source is fixed by event.v1.json#/allOf/18/then/properties/source.",
       "expect": {
         "keyword": "const",
         "at": "/source"
+      }
+    },
+    {
+      "file": "bad/event.v1/f-event.v1.allOf.18.then.trust.json",
+      "schema": "event.v1.json",
+      "rule": "The value at /trust is fixed by event.v1.json#/allOf/18/then/properties/trust.",
+      "expect": {
+        "keyword": "const",
+        "at": "/trust"
       }
     },
     {
@@ -2662,15 +2777,6 @@
       }
     },
     {
-      "file": "bad/event.v1/f-event.v1.allOf.23.then.trust.json",
-      "schema": "event.v1.json",
-      "rule": "The value at /trust is fixed by event.v1.json#/allOf/23/then/properties/trust.",
-      "expect": {
-        "keyword": "const",
-        "at": "/trust"
-      }
-    },
-    {
       "file": "bad/event.v1/f-event.v1.allOf.24.then.source.json",
       "schema": "event.v1.json",
       "rule": "The value at /source is fixed by event.v1.json#/allOf/24/then/properties/source.",
@@ -2683,6 +2789,24 @@
       "file": "bad/event.v1/f-event.v1.allOf.24.then.trust.json",
       "schema": "event.v1.json",
       "rule": "The value at /trust is fixed by event.v1.json#/allOf/24/then/properties/trust.",
+      "expect": {
+        "keyword": "const",
+        "at": "/trust"
+      }
+    },
+    {
+      "file": "bad/event.v1/f-event.v1.allOf.25.then.source.json",
+      "schema": "event.v1.json",
+      "rule": "The value at /source is fixed by event.v1.json#/allOf/25/then/properties/source.",
+      "expect": {
+        "keyword": "const",
+        "at": "/source"
+      }
+    },
+    {
+      "file": "bad/event.v1/f-event.v1.allOf.25.then.trust.json",
+      "schema": "event.v1.json",
+      "rule": "The value at /trust is fixed by event.v1.json#/allOf/25/then/properties/trust.",
       "expect": {
         "keyword": "const",
         "at": "/trust"
@@ -3058,6 +3182,24 @@
       }
     },
     {
+      "file": "bad/event.v1/m-event.v1.input.accepted.delivery-id.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/input.accepted always carries 'delivery_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/m-event.v1.input.accepted.how.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/input.accepted always carries 'how'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/payload"
+      }
+    },
+    {
       "file": "bad/event.v1/m-event.v1.interrupt.outcome.json",
       "schema": "event.v1.json",
       "rule": "The object described at event.v1.json#/$defs/interrupt always carries 'outcome'.",
@@ -3301,33 +3443,6 @@
       }
     },
     {
-      "file": "bad/event.v1/m-event.v1.steer.delivered.delivery-id.json",
-      "schema": "event.v1.json",
-      "rule": "The object described at event.v1.json#/$defs/steer.delivered always carries 'delivery_id'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/payload"
-      }
-    },
-    {
-      "file": "bad/event.v1/m-event.v1.steer.delivered.how.json",
-      "schema": "event.v1.json",
-      "rule": "The object described at event.v1.json#/$defs/steer.delivered always carries 'how'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/payload"
-      }
-    },
-    {
-      "file": "bad/event.v1/m-event.v1.steer.delivered.item-id.json",
-      "schema": "event.v1.json",
-      "rule": "The object described at event.v1.json#/$defs/steer.delivered always carries 'item_id'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/payload"
-      }
-    },
-    {
       "file": "bad/event.v1/m-event.v1.steer.queued.delivery.json",
       "schema": "event.v1.json",
       "rule": "The object described at event.v1.json#/$defs/steer.queued always carries 'delivery'.",
@@ -3367,6 +3482,24 @@
       "file": "bad/event.v1/m-event.v1.steer.queued.state.json",
       "schema": "event.v1.json",
       "rule": "The object described at event.v1.json#/$defs/steer.queued always carries 'state'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/m-event.v1.steer.sent.delivery-id.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/steer.sent always carries 'delivery_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/payload"
+      }
+    },
+    {
+      "file": "bad/event.v1/m-event.v1.steer.sent.item-id.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/steer.sent always carries 'item_id'.",
       "expect": {
         "keyword": "required",
         "at": "/payload"
@@ -3787,6 +3920,15 @@
       }
     },
     {
+      "file": "bad/event.v1/u-event.v1.input.accepted.json",
+      "schema": "event.v1.json",
+      "rule": "The object described at event.v1.json#/$defs/input.accepted is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/payload"
+      }
+    },
+    {
       "file": "bad/event.v1/u-event.v1.interrupt.json",
       "schema": "event.v1.json",
       "rule": "The object described at event.v1.json#/$defs/interrupt is closed: a field nobody defined is refused.",
@@ -3844,15 +3986,6 @@
       "file": "bad/event.v1/u-event.v1.state.changed.json",
       "schema": "event.v1.json",
       "rule": "The object described at event.v1.json#/$defs/state.changed is closed: a field nobody defined is refused.",
-      "expect": {
-        "keyword": "additionalProperties",
-        "at": "/payload"
-      }
-    },
-    {
-      "file": "bad/event.v1/u-event.v1.steer.delivered.json",
-      "schema": "event.v1.json",
-      "rule": "The object described at event.v1.json#/$defs/steer.delivered is closed: a field nobody defined is refused.",
       "expect": {
         "keyword": "additionalProperties",
         "at": "/payload"
@@ -4075,15 +4208,6 @@
       }
     },
     {
-      "file": "bad/event.v1/v-event.v1.steer.delivered.how.json",
-      "schema": "event.v1.json",
-      "rule": "The value at /payload/how must be one of the values listed at event.v1.json#/$defs/steer.delivered/properties/how.",
-      "expect": {
-        "keyword": "enum",
-        "at": "/payload/how"
-      }
-    },
-    {
       "file": "bad/event.v1/v-event.v1.steer.queued.delivery.json",
       "schema": "event.v1.json",
       "rule": "The value at /payload/delivery must be one of the values listed at event.v1.json#/$defs/steer.queued/properties/delivery.",
@@ -4156,49 +4280,124 @@
       }
     },
     {
-      "file": "good/mcp.task.v1/h01-working.json",
+      "file": "good/mcp.task.v1/h01-turn-working.json",
       "schema": "mcp.task.v1.json",
-      "shows": "A turn in progress."
+      "shows": "A turn in progress. The Task is created when the first event of the turn was logged, and last changed at its latest state.changed: the times the core logged."
     },
     {
-      "file": "good/mcp.task.v1/h02-input-required.json",
+      "file": "good/mcp.task.v1/h02-turn-waiting-for-an-approval.json",
       "schema": "mcp.task.v1.json",
-      "shows": "An approval is pending: a person must answer it on a surface that draws approvals."
+      "shows": "An approval is pending for the turn: a person must answer it on a surface that draws approvals. It is never answered through the Task."
     },
     {
-      "file": "good/mcp.task.v1/h03-completed-done.json",
+      "file": "good/mcp.task.v1/h03-turn-done.json",
       "schema": "mcp.task.v1.json",
       "shows": "The turn ended and its work is done. The result is the turn's own, and it expires when the turn's does."
     },
     {
-      "file": "good/mcp.task.v1/h04-failed.json",
-      "schema": "mcp.task.v1.json",
-      "shows": "The turn failed with a typed code."
-    },
-    {
-      "file": "good/mcp.task.v1/h05-cancelled-after-a-confirmed-stop.json",
-      "schema": "mcp.task.v1.json",
-      "shows": "The Stop was confirmed. 'cancelled' is never shown before that."
-    },
-    {
-      "file": "good/mcp.task.v1/h06-working-with-a-stop-pending.json",
-      "schema": "mcp.task.v1.json",
-      "shows": "A cancel was asked and the Stop is not confirmed: still working, with cancel_requested true."
-    },
-    {
-      "file": "good/mcp.task.v1/h07-run-started-with-run-start.json",
-      "schema": "mcp.task.v1.json",
-      "shows": "Work started with run.start: the Task id is the run id, there is no session and no turn."
-    },
-    {
-      "file": "good/mcp.task.v1/h08-run-that-failed-to-start.json",
-      "schema": "mcp.task.v1.json",
-      "shows": "A run whose start failed."
-    },
-    {
-      "file": "good/mcp.task.v1/h09-completed-but-waiting-for-the-user.json",
+      "file": "good/mcp.task.v1/h04-turn-over-and-waiting-for-the-user.json",
       "schema": "mcp.task.v1.json",
       "shows": "The turn is over, so the Task is completed; its outcome says the engine waits for the user, which is not 'done'."
+    },
+    {
+      "file": "good/mcp.task.v1/h05-turn-failed.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The turn failed with a typed code. The worker is gone."
+    },
+    {
+      "file": "good/mcp.task.v1/h06-turn-interrupted.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "Cancelling a turn's Task is an interrupt of that turn, not a Stop: the Task is cancelled because the turn's outcome is 'interrupted', and the worker lives on."
+    },
+    {
+      "file": "good/mcp.task.v1/h07-turn-stopped.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The run was stopped and the Stop was confirmed: the turn's Task is cancelled. 'cancelled' is never shown before that."
+    },
+    {
+      "file": "good/mcp.task.v1/h08-turn-with-a-stop-pending.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A Stop of the session was asked and is not confirmed: the turn is still working, with cancel_requested true."
+    },
+    {
+      "file": "good/mcp.task.v1/h09-turn-still-queued.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A turn that waits behind the turn in progress: it is bound to no run yet, and its only event is the one that recorded it."
+    },
+    {
+      "file": "good/mcp.task.v1/h10-turn-earlier-on-a-shared-run.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "An earlier turn of a run that a later turn shares. Its Task carries its own result and its own times; nothing of the later turn, though that one ended last on the same run."
+    },
+    {
+      "file": "good/mcp.task.v1/h11-run-running.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "Work started with run.start and no session: the Task id is the run id, there is no session and no turn, and it does not expire. Its times are those of the run's own log, 'run:<run_id>'."
+    },
+    {
+      "file": "good/mcp.task.v1/h12-run-starting.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A run that is being started: working. Its log holds one event so far, so both times are that event's."
+    },
+    {
+      "file": "good/mcp.task.v1/h13-run-waiting-for-an-approval.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "An approval is pending for the run."
+    },
+    {
+      "file": "good/mcp.task.v1/h14-run-with-a-stop-pending.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A Stop was asked and is not confirmed. The Task keeps the status it had, working, and says cancel_requested. It is not 'cancelled'."
+    },
+    {
+      "file": "good/mcp.task.v1/h15-run-stopped.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The Stop is confirmed: only now is the Task cancelled."
+    },
+    {
+      "file": "good/mcp.task.v1/h16-run-ended-with-its-result.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The run ended and its result says ok: completed. The Task carries the result's code and detail and names the run as where the whole result is read (run.status)."
+    },
+    {
+      "file": "good/mcp.task.v1/h17-run-ended-at-a-typed-limit.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The run ended and its result is an error: failed, with the result's own code."
+    },
+    {
+      "file": "good/mcp.task.v1/h18-run-ended-and-no-result-was-kept.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The run ended and there is no result to read: failed, with the code result_unavailable. It is never shown as completed."
+    },
+    {
+      "file": "good/mcp.task.v1/h19-run-that-never-launched.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A start that never launched, as the record is today: nothing durable says why, so the code is start_failed and the detail is null. The log holds nothing of it either, so both times are null. The Task invents none of this."
+    },
+    {
+      "file": "good/mcp.task.v1/h20-run-that-never-launched-with-its-reason-kept.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "RESERVED: the same, once the record carries start_error (the lane that owns Stop writes it). The Task's detail is then that code."
+    },
+    {
+      "file": "good/mcp.task.v1/h21-run-lost-at-a-reboot.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The machine restarted under the run: failed, with the code lost_reboot."
+    },
+    {
+      "file": "good/mcp.task.v1/h22-run-that-cannot-be-observed.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The unit cannot be observed: nobody can say that the run ended, so the Task is still working."
+    },
+    {
+      "file": "good/mcp.task.v1/h23-run-whose-result-says-ok-and-carries-a-code.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A result that breaks the route contract's own rule: it says ok and carries a code. The Task goes by the code: failed, never completed."
+    },
+    {
+      "file": "good/mcp.task.v1/h24-run-whose-result-says-error-and-carries-no-code.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The other way to break it: the result says error and names no code. The Task is failed, with the code result_invalid, and invents no reason."
     },
     {
       "file": "bad/mcp.task.v1/b01-completed-without-a-result.json",
@@ -4260,7 +4459,7 @@
       "rule": "A Task derived from a turn names the turn.",
       "expect": {
         "keyword": "type",
-        "at": "/of/turn_id"
+        "at": "/turn_id"
       }
     },
     {
@@ -4300,18 +4499,72 @@
       }
     },
     {
-      "file": "bad/mcp.task.v1/f-mcp.task.v1.allOf.0.then.cancel-requested.json",
+      "file": "bad/mcp.task.v1/b12-a-run-task-given-a-session.json",
       "schema": "mcp.task.v1.json",
-      "rule": "The value at /cancel_requested is fixed by mcp.task.v1.json#/allOf/0/then/properties/cancel_requested.",
+      "rule": "A run started with no session is not given one: its Task names no session.",
+      "expect": {
+        "keyword": "type",
+        "at": "/session_id"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b13-a-source-nobody-defined.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task is derived from a turn or from a run.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/source"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b14-a-task-that-does-not-name-its-source.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "Every Task says what it is derived from.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b15-a-run-task-that-expires.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task of a run does not expire: there is no retention rule yet.",
+      "expect": {
+        "keyword": "type",
+        "at": "/expires_at"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b16-a-run-task-with-no-run.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task derived from a run names the run.",
+      "expect": {
+        "keyword": "type",
+        "at": "/run_id"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/b17-a-time-as-a-number.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "created_at is a time the core logged, in the form every record uses, or null.",
+      "expect": {
+        "keyword": "anyOf",
+        "at": "/created_at"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/f-mcp.task.v1.allOf.2.then.cancel-requested.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The value at /cancel_requested is fixed by mcp.task.v1.json#/allOf/2/then/properties/cancel_requested.",
       "expect": {
         "keyword": "const",
         "at": "/cancel_requested"
       }
     },
     {
-      "file": "bad/mcp.task.v1/f-mcp.task.v1.allOf.1.then.cancel-requested.json",
+      "file": "bad/mcp.task.v1/f-mcp.task.v1.allOf.3.then.cancel-requested.json",
       "schema": "mcp.task.v1.json",
-      "rule": "The value at /cancel_requested is fixed by mcp.task.v1.json#/allOf/1/then/properties/cancel_requested.",
+      "rule": "The value at /cancel_requested is fixed by mcp.task.v1.json#/allOf/3/then/properties/cancel_requested.",
       "expect": {
         "keyword": "const",
         "at": "/cancel_requested"
@@ -4345,51 +4598,6 @@
       }
     },
     {
-      "file": "bad/mcp.task.v1/m-mcp.task.v1.of.json",
-      "schema": "mcp.task.v1.json",
-      "rule": "The object described at mcp.task.v1.json#/ always carries 'of'.",
-      "expect": {
-        "keyword": "required",
-        "at": ""
-      }
-    },
-    {
-      "file": "bad/mcp.task.v1/m-mcp.task.v1.of.kind.json",
-      "schema": "mcp.task.v1.json",
-      "rule": "The object described at mcp.task.v1.json#/properties/of always carries 'kind'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/of"
-      }
-    },
-    {
-      "file": "bad/mcp.task.v1/m-mcp.task.v1.of.run-id.json",
-      "schema": "mcp.task.v1.json",
-      "rule": "The object described at mcp.task.v1.json#/properties/of always carries 'run_id'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/of"
-      }
-    },
-    {
-      "file": "bad/mcp.task.v1/m-mcp.task.v1.of.session-id.json",
-      "schema": "mcp.task.v1.json",
-      "rule": "The object described at mcp.task.v1.json#/properties/of always carries 'session_id'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/of"
-      }
-    },
-    {
-      "file": "bad/mcp.task.v1/m-mcp.task.v1.of.turn-id.json",
-      "schema": "mcp.task.v1.json",
-      "rule": "The object described at mcp.task.v1.json#/properties/of always carries 'turn_id'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/of"
-      }
-    },
-    {
       "file": "bad/mcp.task.v1/m-mcp.task.v1.outcome.json",
       "schema": "mcp.task.v1.json",
       "rule": "The object described at mcp.task.v1.json#/ always carries 'outcome'.",
@@ -4417,9 +4625,54 @@
       }
     },
     {
+      "file": "bad/mcp.task.v1/m-mcp.task.v1.result.code.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The object described at mcp.task.v1.json#/$defs/result always carries 'code'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/result"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/m-mcp.task.v1.result.detail.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The object described at mcp.task.v1.json#/$defs/result always carries 'detail'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/result"
+      }
+    },
+    {
       "file": "bad/mcp.task.v1/m-mcp.task.v1.result.json",
       "schema": "mcp.task.v1.json",
       "rule": "The object described at mcp.task.v1.json#/ always carries 'result'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/m-mcp.task.v1.result.result-ref.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The object described at mcp.task.v1.json#/$defs/result always carries 'result_ref'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/result"
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/m-mcp.task.v1.run-id.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The object described at mcp.task.v1.json#/ always carries 'run_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/mcp.task.v1/m-mcp.task.v1.session-id.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The object described at mcp.task.v1.json#/ always carries 'session_id'.",
       "expect": {
         "keyword": "required",
         "at": ""
@@ -4453,6 +4706,15 @@
       }
     },
     {
+      "file": "bad/mcp.task.v1/m-mcp.task.v1.turn-id.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "The object described at mcp.task.v1.json#/ always carries 'turn_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
       "file": "bad/mcp.task.v1/m-mcp.task.v1.updated-at.json",
       "schema": "mcp.task.v1.json",
       "rule": "The object described at mcp.task.v1.json#/ always carries 'updated_at'.",
@@ -4462,39 +4724,30 @@
       }
     },
     {
-      "file": "bad/mcp.task.v1/u-mcp.task.v1.of.json",
+      "file": "bad/mcp.task.v1/u-mcp.task.v1.result.json",
       "schema": "mcp.task.v1.json",
-      "rule": "The object described at mcp.task.v1.json#/properties/of is closed: a field nobody defined is refused.",
+      "rule": "The object described at mcp.task.v1.json#/$defs/result is closed: a field nobody defined is refused.",
       "expect": {
         "keyword": "additionalProperties",
-        "at": "/of"
+        "at": "/result"
       }
     },
     {
-      "file": "bad/mcp.task.v1/v-mcp.task.v1.allOf.1.then.outcome.json",
+      "file": "bad/mcp.task.v1/v-mcp.task.v1.allOf.3.then.outcome.json",
       "schema": "mcp.task.v1.json",
-      "rule": "The value at /outcome must be one of the values listed at mcp.task.v1.json#/allOf/1/then/properties/outcome.",
+      "rule": "The value at /outcome must be one of the values listed at mcp.task.v1.json#/allOf/3/then/properties/outcome.",
       "expect": {
         "keyword": "enum",
         "at": "/outcome"
       }
     },
     {
-      "file": "bad/mcp.task.v1/v-mcp.task.v1.allOf.2.then.outcome.json",
+      "file": "bad/mcp.task.v1/v-mcp.task.v1.allOf.4.then.outcome.json",
       "schema": "mcp.task.v1.json",
-      "rule": "The value at /outcome must be one of the values listed at mcp.task.v1.json#/allOf/2/then/properties/outcome.",
+      "rule": "The value at /outcome must be one of the values listed at mcp.task.v1.json#/allOf/4/then/properties/outcome.",
       "expect": {
         "keyword": "enum",
         "at": "/outcome"
-      }
-    },
-    {
-      "file": "bad/mcp.task.v1/v-mcp.task.v1.of.kind.json",
-      "schema": "mcp.task.v1.json",
-      "rule": "The value at /of/kind must be one of the values listed at mcp.task.v1.json#/properties/of/properties/kind.",
-      "expect": {
-        "keyword": "enum",
-        "at": "/of/kind"
       }
     },
     {
@@ -4650,7 +4903,7 @@
     {
       "file": "good/methods.v1/h12-events-follow-that-timed-out.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "shows": "events.follow waited and nothing new arrived: an empty page, the same cursor, timed_out true."
+      "shows": "events.follow is given the cursor the last read returned, waited, and nothing new arrived: an empty page, the same cursor, timed_out true."
     },
     {
       "file": "good/methods.v1/h13-session-stop-of-a-subtree-still-pending.json",
@@ -4750,7 +5003,7 @@
     {
       "file": "good/methods.v1/h32-events-read-ok.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "shows": "events.read with projection 'raw' returns events."
+      "shows": "events.read takes a cursor and, with projection 'raw', returns events and the cursor to read on from."
     },
     {
       "file": "good/methods.v1/h33-route-explain-ok.json",
@@ -4815,7 +5068,7 @@
     {
       "file": "good/methods.v1/h50-events-follow-as-a-transcript.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "shows": "events.follow with projection 'transcript' returns lines."
+      "shows": "events.follow with projection 'transcript' returns lines. The request is a first read of a run's own log: seq 0 and the lowest epoch. The daemon is in epoch 3: it reads on by seq, and the answer says the epoch advanced."
     },
     {
       "file": "good/methods.v1/h51-plugin-list-with-a-loaded-and-a-refused-plugin.json",
@@ -4866,6 +5119,16 @@
       "file": "good/methods.v1/h60-row-of-session-interrupt.json",
       "schema": "methods.v1.json#/$defs/row",
       "shows": "The row of session.interrupt: it requires no driver flag, and says what it does without one: it falls back to Stop, then resumes."
+    },
+    {
+      "file": "good/methods.v1/h61-a-mutating-method-in-a-daemon-with-no-event-store.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A method that takes a command_id needs a receipt. This daemon was composed with no event store to keep one in: 'unsupported', store_absent, before any side effect."
+    },
+    {
+      "file": "good/methods.v1/h62-a-method-whose-service-is-still-starting.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The service a method's row names is not ready yet: 'unavailable', service_starting. The caller may ask again."
     },
     {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",
@@ -5456,6 +5719,42 @@
       }
     },
     {
+      "file": "bad/methods.v1/b28-a-read-from-a-bare-number.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "A read takes the cursor a read returned: the log, the place in it and the epoch travel together, and a bare number beside it is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b29-a-read-that-names-only-a-log.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "A read names its place with a cursor; a log id alone is not one.",
+      "expect": {
+        "keyword": "required",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b30-a-page-that-does-not-say-whether-the-epoch-advanced.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "Every page says whether the daemon restarted since the cursor was given.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b31-a-read-refused-for-want-of-a-receipt.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "Only a method that takes a command_id needs a receipt: a read is never refused store_absent.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
       "file": "bad/methods.v1/f-methods.v1.answer.approval.answer.anyOf.0.code.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/answer.approval.answer/anyOf/0/properties/code.",
@@ -5945,6 +6244,15 @@
       "file": "bad/methods.v1/m-methods.v1.answer.events.follow.anyOf.0.cursor.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The object described at methods.v1.json#/$defs/answer.events.follow/anyOf/0 always carries 'cursor'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.events.follow.anyOf.0.epoch-advanced.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.events.follow/anyOf/0 always carries 'epoch_advanced'.",
       "expect": {
         "keyword": "required",
         "at": "/answer"
@@ -7274,18 +7582,9 @@
       }
     },
     {
-      "file": "bad/methods.v1/m-methods.v1.params.events.follow.session-id.json",
+      "file": "bad/methods.v1/m-methods.v1.params.events.read.cursor.json",
       "schema": "methods.v1.json#/$defs/request",
-      "rule": "The object described at methods.v1.json#/$defs/params.events.follow always carries 'session_id'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/params"
-      }
-    },
-    {
-      "file": "bad/methods.v1/m-methods.v1.params.events.read.session-id.json",
-      "schema": "methods.v1.json#/$defs/request",
-      "rule": "The object described at methods.v1.json#/$defs/params.events.read always carries 'session_id'.",
+      "rule": "The object described at methods.v1.json#/$defs/params.events.read always carries 'cursor'.",
       "expect": {
         "keyword": "required",
         "at": "/params"
@@ -8840,15 +9139,6 @@
       }
     },
     {
-      "file": "bad/methods.v1/u-methods.v1.params.events.read.json",
-      "schema": "methods.v1.json#/$defs/exchange",
-      "rule": "The object described at methods.v1.json#/$defs/params.events.read is closed: a field nobody defined is refused.",
-      "expect": {
-        "keyword": "additionalProperties",
-        "at": "/params"
-      }
-    },
-    {
       "file": "bad/methods.v1/u-methods.v1.params.key.list.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The object described at methods.v1.json#/$defs/params.key.list is closed: a field nobody defined is refused.",
@@ -9386,15 +9676,6 @@
       "expect": {
         "keyword": "enum",
         "at": "/answer/code"
-      }
-    },
-    {
-      "file": "bad/methods.v1/v-methods.v1.answer.events.read.anyOf.1.allOf.1.then.detail.json",
-      "schema": "methods.v1.json#/$defs/exchange",
-      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.events.read/anyOf/1/allOf/1/then/properties/detail.",
-      "expect": {
-        "keyword": "enum",
-        "at": "/answer/detail"
       }
     },
     {
@@ -10184,12 +10465,12 @@
     {
       "file": "good/queue.item.v1/h03-delivering.json",
       "schema": "queue.item.v1.json",
-      "shows": "The daemon has written the item toward the engine and has not yet seen the engine take it. It can no longer be edited."
+      "shows": "The daemon has committed its intent to deliver the item, under a delivery id, BEFORE anything is written toward the engine. Nothing says yet that the engine took it, and the record is the same whether the write has happened or not. It can no longer be edited."
     },
     {
       "file": "good/queue.item.v1/h04-delivered-into-a-turn.json",
       "schema": "queue.item.v1.json",
-      "shows": "An event from the engine named the delivery: delivered, with the turn it became."
+      "shows": "The engine's own typed acceptance (an input.accepted event) named the delivery: delivered, with the turn that took it."
     },
     {
       "file": "good/queue.item.v1/h05-cancelled.json",
@@ -10199,7 +10480,7 @@
     {
       "file": "good/queue.item.v1/h06-outcome-unknown-after-a-restart.json",
       "schema": "queue.item.v1.json",
-      "shows": "The daemon restarted while the item was being delivered and no engine event names the delivery: nobody can say whether the engine took it. It is shown to the user and never sent again by itself."
+      "shows": "The daemon restarted while the item was being delivered, or the turn it was written into ended, and no acceptance from the engine names the delivery: nobody can say whether the engine took it. It is shown to the user as sent and not confirmed, and is never sent again by itself."
     },
     {
       "file": "bad/queue.item.v1/b01-delivered-into-no-turn.json",
@@ -10391,7 +10672,7 @@
     {
       "file": "good/run.record.v1/h01-every-version-1-addition.json",
       "schema": "run.record.v1.json",
-      "shows": "A stored record that carries every optional addition of version 1, and a start key with a version 1 intent."
+      "shows": "A stored record that carries the principal, the whole launch snapshot and the other additions of version 1, and a start key with a version 1 intent."
     },
     {
       "file": "good/run.record.v1/h02-starting-launch-intent.json",
@@ -10417,6 +10698,21 @@
       "file": "good/run.record.v1/h06-launch-snapshot-of-a-route-with-a-key-helper.json",
       "schema": "run.record.v1.json",
       "shows": "The launch snapshot of a route whose key comes from the engine's own key helper: the helper is present, and the route entry acknowledges that this is billed as a key."
+    },
+    {
+      "file": "good/run.record.v1/h07-launch-with-no-route-entry.json",
+      "schema": "run.record.v1.json",
+      "shows": "A launch snapshot with no route entry: no registrant chose a route, so the starter looks the configured entry up as it does today. Nothing else was asked for either: no workspace, no session, a budget of zero."
+    },
+    {
+      "file": "good/run.record.v1/h08-start-failed-with-its-reason-kept.json",
+      "schema": "run.record.v1.json",
+      "shows": "RESERVED, as the lane that owns Stop will write it: a start that never launched, with the reason kept in the record so that it outlives a restart. Nothing writes start_error today."
+    },
+    {
+      "file": "good/run.record.v1/h09-launch-in-a-worktree-not-made-yet.json",
+      "schema": "run.record.v1.json",
+      "shows": "The launch intent of a run that will work in a worktree: the worktree is not made yet, so worktree_path is null."
     },
     {
       "file": "bad/run.record.v1/b01-stopped-without-an-attestation.json",
@@ -10487,7 +10783,7 @@
       "rule": "A version 1 addition is absent or has a value; it is never null.",
       "expect": {
         "keyword": "type",
-        "at": "/workspace"
+        "at": "/launch"
       }
     },
     {
@@ -10505,7 +10801,7 @@
       "rule": "The budget is the cap. It never carries or names a key.",
       "expect": {
         "keyword": "additionalProperties",
-        "at": "/budget"
+        "at": "/launch/budget"
       }
     },
     {
@@ -10559,16 +10855,43 @@
       "rule": "The launch snapshot names the variable a key travels in. It never holds the key.",
       "expect": {
         "keyword": "additionalProperties",
-        "at": "/route/connection"
+        "at": "/launch/route_entry/route/connection"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b17-an-owner-beside-the-launch.json",
+      "schema": "run.record.v1.json",
+      "rule": "A run's owner is part of its one launch snapshot; it is not a field of its own beside it.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b18-a-principal-inside-the-launch.json",
+      "schema": "run.record.v1.json",
+      "rule": "The principal is the launch snapshot's trusted sibling in the record, never inside it.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/b19-a-direct-workspace-with-a-worktree.json",
+      "schema": "run.record.v1.json",
+      "rule": "In 'direct' mode there is no worktree.",
+      "expect": {
+        "keyword": "type",
+        "at": "/launch/workspace/worktree_path"
       }
     },
     {
       "file": "bad/run.record.v1/f-run.record.v1.launch-route.billing-ack.json",
       "schema": "run.record.v1.json",
-      "rule": "The value at /route/billing_ack is fixed by run.record.v1.json#/$defs/launch_route/properties/billing_ack.",
+      "rule": "The value at /launch/route_entry/route/billing_ack is fixed by run.record.v1.json#/$defs/launch_route/properties/billing_ack.",
       "expect": {
         "keyword": "const",
-        "at": "/route/billing_ack"
+        "at": "/launch/route_entry/route/billing_ack"
       }
     },
     {
@@ -10613,7 +10936,7 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route/properties/connection always carries 'id'.",
       "expect": {
         "keyword": "required",
-        "at": "/route/connection"
+        "at": "/launch/route_entry/route/connection"
       }
     },
     {
@@ -10622,7 +10945,7 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route always carries 'connection'.",
       "expect": {
         "keyword": "required",
-        "at": "/route"
+        "at": "/launch/route_entry/route"
       }
     },
     {
@@ -10631,7 +10954,7 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route/properties/connection always carries 'kind'.",
       "expect": {
         "keyword": "required",
-        "at": "/route/connection"
+        "at": "/launch/route_entry/route/connection"
       }
     },
     {
@@ -10640,7 +10963,7 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route always carries 'engine'.",
       "expect": {
         "keyword": "required",
-        "at": "/route"
+        "at": "/launch/route_entry/route"
       }
     },
     {
@@ -10649,7 +10972,7 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route/properties/limits always carries 'on_limit'.",
       "expect": {
         "keyword": "required",
-        "at": "/route/limits"
+        "at": "/launch/route_entry/route/limits"
       }
     },
     {
@@ -10658,7 +10981,115 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route always carries 'model'.",
       "expect": {
         "keyword": "required",
-        "at": "/route"
+        "at": "/launch/route_entry/route"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch-workspace.base-ref.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch_workspace always carries 'base_ref'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch/workspace"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch-workspace.mode.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch_workspace always carries 'mode'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch/workspace"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch-workspace.source-path.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch_workspace always carries 'source_path'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch/workspace"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch-workspace.worktree-path.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch_workspace always carries 'worktree_path'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch/workspace"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.budget.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'budget'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.containment-level.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'containment_level'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.owner.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'owner'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.route-decision.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'route_decision'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.route-entry.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'route_entry'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.session-id.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'session_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.turn-id.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'turn_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.launch.workspace.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch always carries 'workspace'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch"
       }
     },
     {
@@ -10689,12 +11120,57 @@
       }
     },
     {
+      "file": "bad/run.record.v1/m-run.record.v1.route-entry.binary.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/route_entry always carries 'binary'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch/route_entry"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.route-entry.deadline-s.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/route_entry always carries 'deadline_s'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch/route_entry"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.route-entry.route.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/route_entry always carries 'route'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/launch/route_entry"
+      }
+    },
+    {
       "file": "bad/run.record.v1/m-run.record.v1.run-id.json",
       "schema": "run.record.v1.json",
       "rule": "The object described at run.record.v1.json#/ always carries 'run_id'.",
       "expect": {
         "keyword": "required",
         "at": ""
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.start-error.code.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/start_error always carries 'code'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/start_error"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/m-run.record.v1.start-error.detail.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/start_error always carries 'detail'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/start_error"
       }
     },
     {
@@ -10865,7 +11341,7 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route is closed: a field nobody defined is refused.",
       "expect": {
         "keyword": "additionalProperties",
-        "at": "/route"
+        "at": "/launch/route_entry/route"
       }
     },
     {
@@ -10874,7 +11350,16 @@
       "rule": "The object described at run.record.v1.json#/$defs/launch_route/properties/limits is closed: a field nobody defined is refused.",
       "expect": {
         "keyword": "additionalProperties",
-        "at": "/route/limits"
+        "at": "/launch/route_entry/route/limits"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/u-run.record.v1.launch-workspace.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/launch_workspace is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/launch/workspace"
       }
     },
     {
@@ -10884,6 +11369,24 @@
       "expect": {
         "keyword": "additionalProperties",
         "at": "/members/0"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/u-run.record.v1.route-entry.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/route_entry is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/launch/route_entry"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/u-run.record.v1.start-error.json",
+      "schema": "run.record.v1.json",
+      "rule": "The object described at run.record.v1.json#/$defs/start_error is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/start_error"
       }
     },
     {
@@ -10907,37 +11410,46 @@
     {
       "file": "bad/run.record.v1/v-run.record.v1.launch-route.api-key-helper.json",
       "schema": "run.record.v1.json",
-      "rule": "The value at /route/api_key_helper must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/api_key_helper.",
+      "rule": "The value at /launch/route_entry/route/api_key_helper must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/api_key_helper.",
       "expect": {
         "keyword": "enum",
-        "at": "/route/api_key_helper"
+        "at": "/launch/route_entry/route/api_key_helper"
       }
     },
     {
       "file": "bad/run.record.v1/v-run.record.v1.launch-route.connection.key-source.json",
       "schema": "run.record.v1.json",
-      "rule": "The value at /route/connection/key_source must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/connection/properties/key_source.",
+      "rule": "The value at /launch/route_entry/route/connection/key_source must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/connection/properties/key_source.",
       "expect": {
         "keyword": "enum",
-        "at": "/route/connection/key_source"
+        "at": "/launch/route_entry/route/connection/key_source"
       }
     },
     {
       "file": "bad/run.record.v1/v-run.record.v1.launch-route.connection.kind.json",
       "schema": "run.record.v1.json",
-      "rule": "The value at /route/connection/kind must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/connection/properties/kind.",
+      "rule": "The value at /launch/route_entry/route/connection/kind must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/connection/properties/kind.",
       "expect": {
         "keyword": "enum",
-        "at": "/route/connection/kind"
+        "at": "/launch/route_entry/route/connection/kind"
       }
     },
     {
       "file": "bad/run.record.v1/v-run.record.v1.launch-route.limits.on-limit.json",
       "schema": "run.record.v1.json",
-      "rule": "The value at /route/limits/on_limit must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/limits/properties/on_limit.",
+      "rule": "The value at /launch/route_entry/route/limits/on_limit must be one of the values listed at run.record.v1.json#/$defs/launch_route/properties/limits/properties/on_limit.",
       "expect": {
         "keyword": "enum",
-        "at": "/route/limits/on_limit"
+        "at": "/launch/route_entry/route/limits/on_limit"
+      }
+    },
+    {
+      "file": "bad/run.record.v1/v-run.record.v1.launch-workspace.mode.json",
+      "schema": "run.record.v1.json",
+      "rule": "The value at /launch/workspace/mode must be one of the values listed at run.record.v1.json#/$defs/launch_workspace/properties/mode.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/launch/workspace/mode"
       }
     },
     {
@@ -11003,12 +11515,17 @@
     {
       "file": "good/run.view.v1/h03-run-with-a-session-and-a-workspace.json",
       "schema": "run.view.v1.json",
-      "shows": "A run view that carries the version 1 additions."
+      "shows": "A run view that carries the principal and the launch snapshot."
     },
     {
       "file": "good/run.view.v1/h04-ended-at-a-typed-limit.json",
       "schema": "run.view.v1.json",
       "shows": "A run that ended at a typed plan limit: the whole route result, with its limit signal and the adapter's own events. The route result is the adapter's record; typed limits for consumers are in the event log."
+    },
+    {
+      "file": "good/run.view.v1/h05-start-failed-with-its-reason.json",
+      "schema": "run.view.v1.json",
+      "shows": "RESERVED: the view of a start that never launched, carrying the reason the record will keep once the lane that owns Stop writes it."
     },
     {
       "file": "bad/run.view.v1/b01-ended-without-the-recorded-state.json",

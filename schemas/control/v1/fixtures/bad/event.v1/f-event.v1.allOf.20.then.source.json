@@ -1,14 +1,15 @@
 {
-  "seq": 27,
+  "seq": 26,
   "session_id": "ses-7f3a9c2e51d04b6a",
-  "run_id": null,
-  "turn_id": null,
-  "time": "2026-11-13T07:34:27.999Z",
-  "type": "fork",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:26.962Z",
+  "type": "checkpoint",
   "source": "x-nobody-defined-this",
   "trust": "trusted",
   "payload": {
-    "child_session_id": "ses-2c4e6a8b0d1f3a5c",
-    "at_turn_id": "turn-000b"
+    "checkpoint_id": "ckpt-0003",
+    "ref": "refs/recursion/checkpoints/ses-7f3a9c2e51d04b6a/3",
+    "label": null
   }
 }

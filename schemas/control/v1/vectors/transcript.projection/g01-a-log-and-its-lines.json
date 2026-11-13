@@ -7,7 +7,7 @@
       "turn_id": "turn-000c",
       "time": "2026-11-13T07:34:00.000Z",
       "type": "turn.started",
-      "source": "client",
+      "source": "core",
       "trust": "trusted",
       "payload": {
         "delivery_id": "dlv-0007",
@@ -185,7 +185,7 @@
       "seq": 1,
       "time_rel_ms": 0,
       "event_type": "turn.started",
-      "source": "client",
+      "source": "core",
       "trust": "trusted",
       "state": null,
       "text": "Fix the failing test in tests/test_io.py.",

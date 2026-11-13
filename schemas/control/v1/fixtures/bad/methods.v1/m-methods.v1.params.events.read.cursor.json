@@ -1,0 +1,7 @@
+{
+  "method": "events.read",
+  "params": {
+    "limit": 200,
+    "projection": "raw"
+  }
+}

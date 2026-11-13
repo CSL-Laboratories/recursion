@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "event.v1.json",
   "title": "event.v1: one event of a session's log",
-  "x-version": "1.0-draft.4",
+  "x-version": "1.0-draft.5",
   "description": "PUBLIC record, and the row lane EVENTS stores. Each log is ordered and append-only; everything a client shows comes from it. seq starts at 1 in each log, has no holes, and is never used twice. session_id names the LOG: a session's id, or 'run:<run_id>' for a run that has no session. run_id and turn_id are null for an event that belongs to no run or no turn. time is when the core wrote the event. source says where the event's content came from: 'core' (the daemon's own code), 'engine' (an engine's output or its typed stream), 'plugin', or 'client' (something a user or a calling program sent). trust says whether the content may be shown as the product's own words: content from an engine or a plugin is always 'untrusted', and a core event that carries engine text is 'untrusted' too. Every type has exactly one payload schema, below; none is a name only. The lane that emits an event owns its payload: it may reshape a draft here by sending a fixture. Only the core writes approval.requested: a surface opens its approval state on that event and on nothing an engine printed. A number that is not known is null with quality 'unknown', never 0. Engine-shaped values (a tool call's input) are open objects marked untrusted; nothing a core lane reads lives in one. A reader that meets a type it does not know keeps the envelope, shows nothing from the payload, and reads on.",
   "type": "object",
   "additionalProperties": false,
@@ -17,7 +17,7 @@
       "enum": [
         "state.changed", "engine.output", "tool.call", "tool.result",
         "approval.requested", "approval.answered", "usage", "limit", "result", "replay.gap",
-        "turn.started", "turn.ended", "steer.queued", "steer.delivered", "interrupt",
+        "turn.started", "turn.ended", "steer.queued", "steer.sent", "input.accepted", "interrupt",
         "stop.requested", "stop.result", "diff", "checkpoint", "fork",
         "workspace.grant", "workspace.revoke", "route.decision", "effect.outcome_unknown"
       ]
@@ -85,7 +85,7 @@
     },
     {
       "if": {"required": ["type"], "properties": {"type": {"const": "turn.started"}}},
-      "then": {"properties": {"payload": {"$ref": "#/$defs/turn.started"}, "turn_id": {"type": "string"}}}
+      "then": {"properties": {"payload": {"$ref": "#/$defs/turn.started"}, "source": {"const": "core"}, "turn_id": {"type": "string"}}}
     },
     {
       "if": {"required": ["type"], "properties": {"type": {"const": "turn.ended"}}},
@@ -96,8 +96,12 @@
       "then": {"properties": {"payload": {"$ref": "#/$defs/steer.queued"}}}
     },
     {
-      "if": {"required": ["type"], "properties": {"type": {"const": "steer.delivered"}}},
-      "then": {"properties": {"payload": {"$ref": "#/$defs/steer.delivered"}, "source": {"const": "core"}}}
+      "if": {"required": ["type"], "properties": {"type": {"const": "steer.sent"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/steer.sent"}, "source": {"const": "core"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "input.accepted"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/input.accepted"}, "source": {"const": "engine"}, "turn_id": {"type": "string"}}}
     },
     {
       "if": {"required": ["type"], "properties": {"type": {"const": "interrupt"}}},
@@ -165,7 +169,7 @@
       }
     },
     "state.changed": {
-      "description": "One record changed. It carries the record as it is AFTER the change (the post-image), typed by entity, so a log can rebuild state without another read. For a run the post-image is the daemon's row and the stored control record; either may be null when that half does not exist yet. For a session it is the session record; for a turn it is the turn. post_image_sha256 is the SHA-256 of the post-image written as JSON with sorted keys, UTF-8 and no insignificant space, as the core serialised it: a reader compares digests and does not recompute them. Together with the entity's id it is how a change that is logged twice is recognised. reason: 'commit' (the change was seen as it was made), 'reconcile' (it was found by a later scan, so earlier steps may be missing), 'snapshot' (the first record of an entity that already existed when logging began). coalesced counts the earlier changes this one may stand for: 0 when it is known to stand for exactly one.",
+      "description": "One record changed. It carries the record as it is AFTER the change (the post-image), typed by entity, so a log can rebuild state without another read. For a run the post-image is the daemon's row and the stored control record; either may be null when that half does not exist yet. For a session it is the session record; for a turn it is the turn. post_image_sha256 is the SHA-256 of the post-image written as JSON with sorted keys, UTF-8 and no insignificant space, as the core serialised it: a reader compares digests and does not recompute them. Together with the entity's id it is how a change that is logged twice is recognised. reason: 'commit' (the change was seen as it was made), 'reconcile' (it was found by a later scan, so earlier steps may be missing), 'snapshot' (the first record of an entity that already existed when logging began). coalesced is the number of marks this image stands for, given only when it was measured (1 when it is known to stand for exactly one), and null when it cannot be known: an image that came from a scan, or from a producer that keeps a set of marked runs and not a count.",
       "type": "object",
       "additionalProperties": false,
       "required": ["entity", "entity_id", "post_image", "post_image_sha256", "reason", "coalesced"],
@@ -175,7 +179,7 @@
         "post_image": {"type": "object"},
         "post_image_sha256": {"$ref": "common.v1.json#/$defs/sha256"},
         "reason": {"enum": ["commit", "reconcile", "snapshot"]},
-        "coalesced": {"type": "integer", "minimum": 0}
+        "coalesced": {"type": ["integer", "null"], "minimum": 1}
       },
       "allOf": [
         {
@@ -364,7 +368,7 @@
       }
     },
     "turn.started": {
-      "description": "A turn began: the engine took a message. delivery_id is the id that message was written toward the engine with, so the delivery that is still open can be closed. index is the turn's place in the session (from 0). text is the input as it was sent.",
+      "description": "A turn began. The core writes this when an input.accepted with how new_turn arrives; delivery_id is the id that input was written toward the engine with. index is the turn's place in the session (from 0). text is the input as it was sent.",
       "type": "object",
       "additionalProperties": false,
       "required": ["delivery_id", "index", "text"],
@@ -407,15 +411,25 @@
         "state": {"enum": ["queued", "cancelled"]}
       }
     },
-    "steer.delivered": {
-      "description": "The daemon wrote a queued message toward the engine, under delivery_id. how: 'mid_turn' (into the turn in progress), 'interrupt_then_send' (the turn was interrupted and the message sent after it), 'next_turn' (as a new turn after the previous one ended). That the engine TOOK it is a later event that names the same delivery_id (turn.started, or the engine's own record of a mid-turn message).",
+    "steer.sent": {
+      "description": "The daemon wrote a queued message into the turn in progress, under delivery_id. This is the WRITE and it is NOT acceptance: that the engine took the message is a later input.accepted that names the same delivery_id. An item whose write is followed by no acceptance by the end of that turn, or by a restart, is outcome_unknown.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["item_id", "delivery_id", "how"],
+      "required": ["item_id", "delivery_id"],
       "properties": {
         "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+        "delivery_id": {"$ref": "common.v1.json#/$defs/delivery_id"}
+      }
+    },
+    "input.accepted": {
+      "description": "The ENGINE's own typed acceptance of an input, produced by a driver's parse and only from the engine's typed signal (its protocol's acknowledgement, or its replay of the user message), never read out of free text. delivery_id is the id the input was written with; turn_id is the turn that took it; how says whether it began a new turn (new_turn, on which the core writes turn.started) or went into the turn in progress (mid_turn). It is what turns a queue item from delivering into delivered.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delivery_id", "turn_id", "how"],
+      "properties": {
         "delivery_id": {"$ref": "common.v1.json#/$defs/delivery_id"},
-        "how": {"enum": ["mid_turn", "interrupt_then_send", "next_turn"]}
+        "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
+        "how": {"enum": ["new_turn", "mid_turn"]}
       }
     },
     "interrupt": {
@@ -504,7 +518,7 @@
       "$ref": "common.v1.json#/$defs/route_decision"
     },
     "effect.outcome_unknown": {
-      "description": "DRAFT, lane EVENTS supplies the fields. Something with an effect outside the daemon was in flight when the daemon stopped watching it, and nobody can say whether it happened. It is shown to the user and is never retried by itself. effect names what it was and which one; why is a typed code.",
+      "description": "DRAFT, lane EVENTS supplies the fields. Something with an effect outside the daemon was in flight when the daemon stopped watching it, and nobody can say whether it happened. It is shown to the user and is never retried by itself. effect names what it was and which one; why is a typed code: 'turn_ended' is a message written into a turn that ended with no acceptance of it from the engine.",
       "type": "object",
       "additionalProperties": false,
       "required": ["effect", "why"],
@@ -518,7 +532,7 @@
             "id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[\\r\\n]"}}
           }
         },
-        "why": {"enum": ["daemon_restart", "engine_gone", "deadline"]}
+        "why": {"enum": ["daemon_restart", "engine_gone", "deadline", "turn_ended"]}
       }
     }
   }

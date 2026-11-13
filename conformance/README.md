@@ -23,7 +23,9 @@ Three files:
 - `rules.py`: the rules a JSON Schema cannot state, as plain functions over plain values, importing the
   standard library alone: the strict reading of a tool's input, the text of a value as RFC 8785 writes
   it, the digest of an effect, the lines of an approval, `approval.open` and `approval.answer` one
-  call at a time, and what a transcript line must carry because its event says so. A client in another language implements these and checks the same vectors.
+  call at a time, what a transcript line must carry because its event says so, what each thing that
+  happens to a queued message does to it, and the Task of a run and of a turn. A client in another
+  language implements these and checks the same vectors.
 - `tests.py`: all of it as tests.
 
 ## What it checks
@@ -52,8 +54,16 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   the problems its vector lists (none, or a digest that is not its effect's, lines that are not its
   effect's, a call outside its profile); a sequence of `approval.open` and `approval.answer` calls is
   answered step by step as the protocol says; the lines of a transcript carry what their events say
-  (seq, time, type, source, trust, state, and the text where it is the event's own). Every rule has
-  vectors that agree and vectors it must catch;
+  (seq, time, type, source, trust, state, and the text where it is the event's own); a queued message
+  goes through its steps as the rule says, each step leaving exactly the item its vector gives or
+  being refused with exactly its code; a Task differs from what its source says in exactly the fields
+  its vector lists (none, for a Task that is right). Every rule has vectors that agree and vectors it
+  must catch;
+- in a queue vector, a step that is an acceptance carries an `input.accepted` event that names the
+  same delivery and the same turn: without it, with the core's own write in its place, or with
+  another delivery or turn in it, the vector is refused;
+- a Task vector agrees with the rule for every state a run's view can show and every state a turn can
+  be in, and every status a Task can have is reached from each source;
 - every approval inside a good fixture, wherever it sits, has the digest of its effect and the lines
   of its effect;
 - no fixture is checked against a schema that refuses nothing (the root of a file that only holds

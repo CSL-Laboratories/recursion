@@ -22,6 +22,6 @@
       "expires_at": null
     },
     "reason": "commit",
-    "coalesced": 0
+    "coalesced": 1
   }
 }

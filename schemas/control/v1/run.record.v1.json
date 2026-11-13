@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "run.record.v1.json",
   "title": "run.record.v1: the run record as the registry stores it",
-  "x-version": "1.0-draft.2",
-  "description": "STORAGE record. This is the JSON document the daemon's registry keeps for one run (core/recursion_core/control/registry.py). The twelve required fields are exactly what is stored today and none of them changes in version 1, including 'start_key' and 'stop_attestation' in today's shapes. The other fields are optional additions: each is either absent or carries a value, and null is not used for them. NONE of the additions is ever copied from a request's params: principal comes from the way the request came in, owner from that principal, budget from the quota part of start normalisation, route, route_decision and workspace from the validated output of start normalisation, and session_id and turn_id only from the daemon's own session service. RESERVED, and refused by this schema until the lane that owns Stop defines them: a 'launch_manifest' field, and a stored attestation whose proof is 'removed'. What a client reads from run.status and run.list is a different record, run.view.v1.",
+  "x-version": "1.0-draft.3",
+  "description": "STORAGE record. This is the JSON document the daemon's registry keeps for one run (core/recursion_core/control/registry.py). The twelve required fields are exactly what is stored today and none of them changes in version 1, including 'start_key' and 'stop_attestation' in today's shapes. The other fields are optional additions: each is either absent or carries a value, and null is not used for them. 'principal' and 'launch' are written together by the start path once a lane has registered on it; 'launch' is the ONE typed launch snapshot (route entry, route decision, workspace, containment level, session and turn, owner, budget) and the principal is its trusted sibling, never inside it. NONE of this is ever copied from a request's params. 'start_error' is reserved for the lane that owns Stop and is absent until it writes it. RESERVED, and refused by this schema until the lane that owns Stop defines them: a 'launch_manifest' field, and a stored attestation whose proof is 'removed'. What a client reads from run.status and run.list is a different record, run.view.v1.",
   "type": "object",
   "additionalProperties": false,
   "required": ["run_id", "tenant", "engine", "state", "cgroup", "started_at", "stop", "start_key", "generation", "cgroup_marker", "members", "stop_attestation"],
@@ -20,16 +20,11 @@
     "cgroup_marker": {"$ref": "#/$defs/cgroup_marker"},
     "members": {"$ref": "#/$defs/members"},
     "stop_attestation": {"$ref": "#/$defs/stop_attestation"},
-    "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
-    "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
-    "workspace": {"$ref": "common.v1.json#/$defs/workspace"},
-    "route": {"$ref": "#/$defs/launch_route"},
-    "route_decision": {"$ref": "common.v1.json#/$defs/route_decision"},
+    "launch": {"$ref": "#/$defs/launch"},
+    "start_error": {"$ref": "#/$defs/start_error"},
     "engine_session_id": {"$ref": "#/$defs/engine_session_id"},
     "continues": {"$ref": "#/$defs/continues"},
     "principal": {"$ref": "common.v1.json#/$defs/principal"},
-    "owner": {"$ref": "common.v1.json#/$defs/owner"},
-    "budget": {"$ref": "common.v1.json#/$defs/budget"},
     "lease": {"$ref": "common.v1.json#/$defs/lease"},
     "cgroup_identity": {"$ref": "common.v1.json#/$defs/cgroup_identity"}
   },
@@ -110,6 +105,57 @@
         "cgroup_marker": {"type": "string", "minLength": 1},
         "member_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "generation": {"type": "integer", "minimum": 1}
+      }
+    },
+    "launch": {
+      "description": "The ONE typed launch snapshot of a run, written in the launch-intent write and nowhere else. None of it is copied from a request's params: each part comes from the entry point, from the principal, or from the validated output of a registrant of the start path. route_entry is the route entry as it was loaded for the engine (the route with its model, its connection and its limits; the deadline; the binary), or null when no registrant chose one, and then the starter looks the configured entry up as it does today. A retry reuses this snapshot; nothing is routed again. route_decision says how the route was chosen, or is null. workspace is where the run works, or null. containment_level is the level the run was launched at, or null. session_id and turn_id name the session and the turn the run belongs to, and are null for a run started without a session. owner is 'host' or the id of the plugin that started the run, derived by the server from the principal. budget is the cap; a budget of 0 lets nothing be spent, and a reservation's id and state live in the quota ledger, keyed by the run id, never here. The principal is NOT in this object: it is the record's own 'principal', beside it. At run time the starter hands one typed context to everything on the launch path, built from this whole object and that trusted sibling principal, with no field flattened or recomputed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route_entry", "route_decision", "workspace", "containment_level", "session_id", "turn_id", "owner", "budget"],
+      "properties": {
+        "route_entry": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/route_entry"}]},
+        "route_decision": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/route_decision"}]},
+        "workspace": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/launch_workspace"}]},
+        "containment_level": {"anyOf": [{"type": "null"}, {"$ref": "stop.result.v1.json#/$defs/containment_level"}]},
+        "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/session_id"}]},
+        "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
+        "owner": {"$ref": "common.v1.json#/$defs/owner"},
+        "budget": {"$ref": "common.v1.json#/$defs/budget"}
+      }
+    },
+    "route_entry": {
+      "description": "One route entry as the routes file gives it to the starter (daemon/control_adapter.py, load_routes): the route, the deadline in seconds, and the absolute path of the engine's binary, or null when the entry names none.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "deadline_s", "binary"],
+      "properties": {
+        "route": {"$ref": "#/$defs/launch_route"},
+        "deadline_s": {"type": "number", "exclusiveMinimum": 0},
+        "binary": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "launch_workspace": {
+      "description": "Where a run works, as its launch recorded it. source_path is the folder the caller named. In 'direct' mode the engine works in that folder and worktree_path is null. In 'worktree' mode it works in a git worktree cut from base_ref, and worktree_path is null until the worktree is made.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "source_path", "base_ref", "worktree_path"],
+      "properties": {
+        "mode": {"enum": ["direct", "worktree"]},
+        "source_path": {"type": "string", "minLength": 1},
+        "base_ref": {"type": ["string", "null"], "minLength": 1},
+        "worktree_path": {"type": ["string", "null"], "minLength": 1}
+      },
+      "if": {"required": ["mode"], "properties": {"mode": {"const": "direct"}}},
+      "then": {"properties": {"worktree_path": {"type": "null"}}}
+    },
+    "start_error": {
+      "description": "RESERVED. Why a start failed, kept with the record: a typed code and a detail. Nothing writes it today: the reason for a failed start lives only in the starter's memory, reaches the first run.start answer once and is gone after a restart. The lane that owns Stop will write it, in the write that records the failed start; until then it is absent. It is in the schema now so that a frozen version 1 needs no second version when that lane starts writing it. When it is present, the Task of the run gives its code as the detail of the failure (mcp.task.v1).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail"],
+      "properties": {
+        "code": {"$ref": "common.v1.json#/$defs/code_word"},
+        "detail": {"type": "string"}
       }
     },
     "launch_route": {

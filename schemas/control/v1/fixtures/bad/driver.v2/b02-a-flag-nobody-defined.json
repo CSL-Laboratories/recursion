@@ -11,5 +11,6 @@
     "typed_limits": false,
     "usage": false,
     "vision": true
-  }
+  },
+  "input_ack": false
 }

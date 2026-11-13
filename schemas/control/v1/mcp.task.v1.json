@@ -1,41 +1,29 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "mcp.task.v1.json",
-  "title": "mcp.task.v1: an MCP Task, derived from a turn or a run",
-  "x-version": "1.0-draft.2",
-  "description": "How the Control MCP server answers for a Task. A Task is not stored anywhere of its own: it is DERIVED, at the moment it is asked for, from the daemon's records, so it survives a restart of the MCP server and of the daemon. This record is that derivation; the server maps its fields onto the wire names of the protocol version it speaks (in the '2025-06-18' version the same facts are returned by the plain start, status and stop tools; in the '2026-07-28' version by the Tasks methods). A Task of a session is derived from a TURN, never from the run's last result, because several turns can share one run: task_id is the turn_id, status comes from the turn's state and outcome, result is the turn's own result, and expires_at is the turn's. The derivation for a turn: queued or running with no approval pending -> 'working'; an approval pending for it -> 'input_required'; state 'ended' (outcome candidate_done, done, waiting or paused) -> 'completed', with the outcome carried here so a caller can tell 'done' from 'waiting'; 'failed' -> 'failed'; 'interrupted' or 'stopped' -> 'cancelled'. A Task of a run started with run.start, which has no session and so no turn record, is derived from the run: task_id is the run_id; starting, running or unknown -> 'working' (an approval pending -> 'input_required'); ended with a result whose code is null -> 'completed'; ended with a code, start_failed or lost_reboot -> 'failed'; stopped -> 'cancelled'; its result is the run's result and it does not expire. A cancel is a Stop: it answers 'pending' until the Stop is confirmed, and while it is pending the status stays as it was and cancel_requested is true. 'cancelled' is shown only after the Stop is confirmed, never before. An approval is never answered through a Task: 'input_required' tells the client that a person must answer on a surface that draws approvals.",
+  "title": "mcp.task.v1: a Task of the Control MCP server, derived from a turn or from a run",
+  "x-version": "1.0-draft.3",
+  "description": "How the Control MCP server answers for a Task. A Task is not stored anywhere of its own: it is DERIVED, at the moment it is asked for, from the daemon's records and its event log, so it survives a restart of the MCP server and of the daemon. This record is that derivation, and conformance/rules.py (task_of_run, task_of_turn) states it as code that the vectors in vectors/task.derivation check; the server maps the fields onto the wire names of the protocol version it speaks. A Task has one of two sources, named in 'source'. SOURCE turn, for a turn of a session: task_id is the turn_id; the status comes from the turn's state (queued or running -> 'working', or 'input_required' while an approval is pending for it; 'ended' -> 'completed', with the turn's outcome carried here so a caller can tell 'done' from 'waiting'; 'failed' -> 'failed'; 'interrupted' or 'stopped' -> 'cancelled'); the result is the turn's own result and the expiry the turn's own. It is never derived from the latest result of a run that several turns share. Cancelling a turn's Task is an interrupt of that turn, not a Stop: the Task is cancelled when the turn's outcome is interrupted, and the worker may live on. SOURCE run, for a run started with run.start and no session: such a run has no session and no turn record, so task_id is the run_id and the status comes from the run's view. Starting, running, a Stop pending and an unobservable unit -> 'working' ('input_required' while an approval is pending); a Stop that was asked and is not confirmed sets cancel_requested and leaves the status as it was; 'stopped' -> 'cancelled', only once the Stop is confirmed; ended with a result -> 'completed' when the result carries no code and says ok, 'failed' with the result's code when it carries one, and result_ref is the run id (the whole result stays in run.status); a result that breaks the route contract's own rule (ok exactly when there is no code) is never 'completed': it is 'failed', with its code, or with the code result_invalid when it has none; ended with NO result kept -> 'failed', code result_unavailable; a start that never launched -> 'failed', code start_failed, with the code of the record's start_error as the detail when the record carries one and a null detail when it does not (the reason is not durable until the lane that owns Stop writes it; a Task never invents one); lost at a reboot -> 'failed', code lost_reboot. A Task of a run has no turn outcome, and its expiry is null until a retention rule exists (PROVISIONAL; the MCP lane checks it against the Tasks conformance run). BOTH: created_at is the time of the first event in the log for the run or the turn, and updated_at the time of its latest state.changed; they are the times the core logged, and each is null when the log holds no such event. An approval is never answered through a Task: 'input_required' tells the client that a person must answer on a surface that draws approvals.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["task_id", "of", "status", "outcome", "cancel_requested", "status_message", "pending_approval_ids", "created_at", "updated_at", "expires_at", "poll_interval_ms", "result"],
+  "required": ["task_id", "source", "session_id", "run_id", "turn_id", "status", "outcome", "cancel_requested", "status_message", "pending_approval_ids", "created_at", "updated_at", "expires_at", "poll_interval_ms", "result"],
   "properties": {
     "task_id": {
-      "description": "A turn_id or a run_id, as 'of' says.",
+      "description": "The turn_id for source 'turn', the run_id for source 'run'.",
       "type": "string",
       "pattern": "^[A-Za-z0-9_-]{1,64}$",
       "not": {"pattern": "[\\r\\n]"}
     },
-    "of": {
+    "source": {
       "description": "What the Task is derived from.",
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "session_id", "run_id", "turn_id"],
-      "properties": {
-        "kind": {"enum": ["turn", "run"]},
-        "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/session_id"}]},
-        "run_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]},
-        "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]}
-      },
-      "allOf": [
-        {
-          "if": {"required": ["kind"], "properties": {"kind": {"const": "turn"}}},
-          "then": {"properties": {"session_id": {"type": "string"}, "turn_id": {"type": "string"}}}
-        },
-        {
-          "if": {"required": ["kind"], "properties": {"kind": {"const": "run"}}},
-          "then": {"properties": {"session_id": {"type": "null"}, "run_id": {"type": "string"}, "turn_id": {"type": "null"}}}
-        }
-      ]
+      "enum": ["turn", "run"]
     },
+    "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/session_id"}]},
+    "run_id": {
+      "description": "The run. For source 'turn' it is the turn's run, null while the turn is not bound to one.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]
+    },
+    "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
     "status": {"enum": ["working", "input_required", "completed", "failed", "cancelled"]},
     "outcome": {
       "description": "The turn's outcome once it has ended; null before that, and always null for a Task of a run.",
@@ -45,29 +33,47 @@
       "description": "True while a Stop has been asked and is not confirmed.",
       "type": "boolean"
     },
-    "status_message": {"type": ["string", "null"], "maxLength": 500},
+    "status_message": {
+      "description": "A sentence for a person, written by the server. The derivation does not decide it.",
+      "type": ["string", "null"],
+      "maxLength": 500
+    },
     "pending_approval_ids": {
       "type": "array",
       "items": {"$ref": "common.v1.json#/$defs/approval_id"},
       "uniqueItems": true
     },
-    "created_at": {"$ref": "common.v1.json#/$defs/timestamp"},
-    "updated_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "created_at": {
+      "description": "The time of the first event in the log for this run or turn, as the core logged it; null when the log holds none.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]
+    },
+    "updated_at": {
+      "description": "The time of the latest state.changed in the log for this run or turn; null when the log holds none.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]
+    },
     "expires_at": {
-      "description": "The turn's expires_at: when its result can no longer be read. null means for as long as the record is kept.",
+      "description": "The turn's expires_at: when its result can no longer be read. null means for as long as the record is kept, and it is always null for a Task of a run.",
       "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]
     },
     "poll_interval_ms": {
-      "description": "How long a client should wait before asking again; null when the daemon gives no advice.",
+      "description": "How long a client should wait before asking again; null when the daemon gives no advice. The derivation does not decide it.",
       "type": ["integer", "null"],
       "minimum": 100
     },
     "result": {
-      "description": "The turn's result as the session record keeps it (or, for a Task of a run, the run's result in the same shape).",
-      "anyOf": [{"type": "null"}, {"$ref": "session.v1.json#/$defs/turn_result"}]
+      "description": "For source 'turn', the turn's result as the session record keeps it. For source 'run', the code and detail of the run's result with the run id as result_ref, or the typed failure when there is no result to read.",
+      "anyOf": [{"type": "null"}, {"$ref": "#/$defs/result"}]
     }
   },
   "allOf": [
+    {
+      "if": {"required": ["source"], "properties": {"source": {"const": "turn"}}},
+      "then": {"properties": {"session_id": {"type": "string"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["source"], "properties": {"source": {"const": "run"}}},
+      "then": {"properties": {"session_id": {"type": "null"}, "run_id": {"type": "string"}, "turn_id": {"type": "null"}, "outcome": {"type": "null"}, "expires_at": {"type": "null"}}}
+    },
     {
       "if": {"required": ["status"], "properties": {"status": {"const": "completed"}}},
       "then": {"properties": {"result": {"type": "object", "properties": {"code": {"type": "null"}}}, "outcome": {"enum": ["candidate_done", "done", "waiting", "paused", null]}, "cancel_requested": {"const": false}, "pending_approval_ids": {"maxItems": 0}}}
@@ -87,10 +93,19 @@
     {
       "if": {"required": ["status"], "properties": {"status": {"const": "input_required"}}},
       "then": {"properties": {"result": {"type": "null"}, "outcome": {"type": "null"}, "pending_approval_ids": {"minItems": 1}}}
-    },
-    {
-      "if": {"required": ["of"], "properties": {"of": {"required": ["kind"], "properties": {"kind": {"const": "run"}}}}},
-      "then": {"properties": {"outcome": {"type": "null"}, "expires_at": {"type": "null"}}}
     }
-  ]
+  ],
+  "$defs": {
+    "result": {
+      "description": "A Task's result. code is null when the work succeeded and a typed code when it did not. detail says more and may carry engine text, which is untrusted; it is null where nothing more is known (a start that never launched and left no recorded reason, a result that was not kept). result_ref names where the full result can be read, or is null when there is none.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail", "result_ref"],
+      "properties": {
+        "code": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/code_word"}]},
+        "detail": {"type": ["string", "null"]},
+        "result_ref": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/token"}]}
+      }
+    }
+  }
 }

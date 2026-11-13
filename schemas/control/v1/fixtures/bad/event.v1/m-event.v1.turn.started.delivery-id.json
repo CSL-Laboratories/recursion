@@ -5,7 +5,7 @@
   "turn_id": "turn-000c",
   "time": "2026-11-13T07:34:17.629Z",
   "type": "turn.started",
-  "source": "client",
+  "source": "core",
   "trust": "trusted",
   "payload": {
     "index": 2,

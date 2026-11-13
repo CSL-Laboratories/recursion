@@ -1,0 +1,19 @@
+{
+  "task_id": "turn-000c",
+  "source": "turn",
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "status": "input_required",
+  "outcome": null,
+  "cancel_requested": false,
+  "status_message": "waiting for an approval",
+  "pending_approval_ids": [
+    "apr-00c4"
+  ],
+  "created_at": "2026-11-13T07:33:59.950Z",
+  "updated_at": "2026-11-13T07:34:00.006Z",
+  "expires_at": null,
+  "poll_interval_ms": 1000,
+  "result": null
+}

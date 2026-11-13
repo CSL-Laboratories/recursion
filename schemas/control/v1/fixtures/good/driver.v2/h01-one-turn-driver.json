@@ -10,5 +10,6 @@
     "permission_bridge": false,
     "typed_limits": false,
     "usage": false
-  }
+  },
+  "input_ack": false
 }

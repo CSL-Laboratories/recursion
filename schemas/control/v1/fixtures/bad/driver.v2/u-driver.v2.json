@@ -11,5 +11,6 @@
     "typed_limits": false,
     "usage": false
   },
+  "input_ack": false,
   "x-nobody-defined-this": true
 }

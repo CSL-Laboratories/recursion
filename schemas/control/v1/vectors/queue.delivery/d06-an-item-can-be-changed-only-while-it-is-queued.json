@@ -1,0 +1,103 @@
+{
+  "item": {
+    "item_id": "qi-0001",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "order": 1,
+    "text": "When the tests pass, also update the changelog.",
+    "revision": 1,
+    "delivery": "next_turn",
+    "state": "queued",
+    "delivery_id": null,
+    "turn_id": null,
+    "created_at": "2026-11-13T07:34:20.000Z"
+  },
+  "steps": [
+    {
+      "what": "The user edits the text.",
+      "happening": "edit",
+      "facts": {
+        "text": "When the tests pass, update the changelog and the version."
+      },
+      "event": {
+        "seq": 51,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:25.000Z",
+        "type": "steer.queued",
+        "source": "client",
+        "trust": "trusted",
+        "payload": {
+          "item_id": "qi-0001",
+          "order": 1,
+          "delivery": "next_turn",
+          "revision": 2,
+          "state": "queued"
+        }
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, update the changelog and the version.",
+        "revision": 2,
+        "delivery": "next_turn",
+        "state": "queued",
+        "delivery_id": null,
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The user turns it into a steer.",
+      "happening": "edit",
+      "facts": {
+        "delivery": "steer"
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, update the changelog and the version.",
+        "revision": 3,
+        "delivery": "steer",
+        "state": "queued",
+        "delivery_id": null,
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The intent is committed.",
+      "happening": "begin",
+      "facts": {
+        "delivery_id": "dlv-0007"
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, update the changelog and the version.",
+        "revision": 3,
+        "delivery": "steer",
+        "state": "delivering",
+        "delivery_id": "dlv-0007",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "An edit now is refused.",
+      "happening": "edit",
+      "facts": {
+        "text": "never mind"
+      },
+      "refused": "not_queued"
+    },
+    {
+      "what": "So is a withdrawal.",
+      "happening": "cancel",
+      "refused": "not_queued"
+    }
+  ]
+}

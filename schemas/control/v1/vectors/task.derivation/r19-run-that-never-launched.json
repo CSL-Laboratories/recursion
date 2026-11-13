@@ -1,0 +1,62 @@
+{
+  "source": "run",
+  "view": {
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "tenant": "t1",
+    "engine": "claude_code",
+    "state": "start_failed",
+    "cgroup": null,
+    "started_at": 1794555600.25,
+    "stop": null,
+    "start_key": {
+      "client_key": "k-1",
+      "engine": "claude_code",
+      "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "generation": 2,
+    "cgroup_marker": null,
+    "members": [],
+    "stop_attestation": null,
+    "principal": {
+      "kind": "owner",
+      "id": "local"
+    },
+    "launch": {
+      "route_entry": null,
+      "route_decision": null,
+      "workspace": null,
+      "containment_level": null,
+      "session_id": null,
+      "turn_id": null,
+      "owner": "host",
+      "budget": {
+        "cap_usd": 0
+      }
+    },
+    "observed": null
+  },
+  "events": [],
+  "pending_approval_ids": [],
+  "task": {
+    "task_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "source": "run",
+    "session_id": null,
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "turn_id": null,
+    "status": "failed",
+    "outcome": null,
+    "cancel_requested": false,
+    "status_message": null,
+    "pending_approval_ids": [],
+    "created_at": null,
+    "updated_at": null,
+    "expires_at": null,
+    "poll_interval_ms": null,
+    "result": {
+      "code": "start_failed",
+      "detail": null,
+      "result_ref": null
+    }
+  },
+  "expect": []
+}

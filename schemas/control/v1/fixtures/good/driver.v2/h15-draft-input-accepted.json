@@ -1,0 +1,8 @@
+{
+  "type": "input.accepted",
+  "payload": {
+    "delivery_id": "dlv-0008",
+    "turn_id": "turn-000c",
+    "how": "mid_turn"
+  }
+}

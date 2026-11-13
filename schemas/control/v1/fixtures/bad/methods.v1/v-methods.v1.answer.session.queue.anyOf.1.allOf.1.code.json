@@ -7,6 +7,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "detail": "command_id_reused"
+    "detail": "store_absent"
   }
 }

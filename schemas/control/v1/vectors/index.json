@@ -1,5 +1,5 @@
 {
-  "about": "Every vector of this folder. A vector is checked against a rule that no schema can state (conformance/rules.py), named by 'rule'. call.profile: one tool call as an engine wrote it (tool, cwd, input_text) and the text that is bound for it (call_text: its cwd, input and tool, as one object, as RFC 8785 writes it), or the code it is refused with. approval.binding: one approval record of the right shape, and exactly what does not agree inside it (an empty list when everything does); effect_text, where present, is the text whose UTF-8 bytes the digest is taken over. approval.lifecycle: one request, then calls on it one after another, each with who is calling, the answer, and the record after it. The call texts, the effect texts, three whole sets of lines and the order of the answers were written by hand and then checked against the rule, not copied from it. These files are plain ASCII: a character outside it is written as a JSON escape.",
+  "about": "Every vector of this folder. A vector is checked against a rule that no schema can state (conformance/rules.py), named by 'rule'. call.profile: one tool call as an engine wrote it (tool, cwd, input_text) and the text that is bound for it (call_text: its cwd, input and tool, as one object, as RFC 8785 writes it), or the code it is refused with. approval.binding: one approval record of the right shape, and exactly what does not agree inside it (an empty list when everything does); effect_text, where present, is the text whose UTF-8 bytes the digest is taken over. approval.lifecycle: one request, then calls on it one after another, each with who is calling, the answer, and the record after it. The call texts, the effect texts, three whole sets of lines and the order of the answers were written by hand and then checked against the rule, not copied from it. queue.delivery: one queued message and what happens to it, step by step: the item after each step, or the code the step is refused with; a step may carry the event of the log that belongs to it, and an acceptance always carries its input.accepted event. task.derivation: a run's view or a session and one of its turns, the log, the approvals pending, a Task, and exactly which of the Task's fields are not what the source says (an empty list when all are). These files are plain ASCII: a character outside it is written as a JSON escape.",
   "vectors": [
     {
       "file": "call.profile/p01-a-plain-call.json",
@@ -255,6 +255,211 @@
       "file": "transcript.projection/x07-a-time-that-runs-backwards.json",
       "rule": "transcript.projection",
       "shows": "After the clock stepped back, the line shows the smaller time instead of keeping the one before."
+    },
+    {
+      "file": "queue.delivery/d01-a-message-for-the-next-turn-is-delivered.json",
+      "rule": "queue.delivery",
+      "shows": "A message waiting for the next turn. Its intent to deliver is committed first; then it is written toward the engine, which changes nothing in the record; it is 'delivered' only when the engine's own acceptance names its delivery id, and then it carries the turn it began."
+    },
+    {
+      "file": "queue.delivery/d02-a-crash-before-the-write.json",
+      "rule": "queue.delivery",
+      "shows": "The daemon stops after it committed the intent and BEFORE it wrote anything. At the restart the item is outcome_unknown: shown as sent and not confirmed, and never sent again by itself."
+    },
+    {
+      "file": "queue.delivery/d03-a-crash-after-the-write.json",
+      "rule": "queue.delivery",
+      "shows": "The daemon stops AFTER the write returned and before any acceptance arrived. The record is the same as when it stops before the write, and so is the end: outcome_unknown. One commit cannot make a delivery to an engine happen exactly once; what it can do is never claim a delivery nobody confirmed and never send twice."
+    },
+    {
+      "file": "queue.delivery/d04-a-steer-written-into-the-turn-and-taken.json",
+      "rule": "queue.delivery",
+      "shows": "A steer message is written into the turn in progress. steer.sent records the write and changes nothing in the item; the engine's acceptance, how mid_turn, makes it delivered into that same turn."
+    },
+    {
+      "file": "queue.delivery/d05-a-steer-with-no-acceptance-by-the-end-of-its-turn.json",
+      "rule": "queue.delivery",
+      "shows": "A steer message was written into a turn, and the turn ended with no acceptance of it from the engine: nobody can say whether the engine read it. It is outcome_unknown, not delivered and not queued again."
+    },
+    {
+      "file": "queue.delivery/d06-an-item-can-be-changed-only-while-it-is-queued.json",
+      "rule": "queue.delivery",
+      "shows": "An edit while the item is queued raises its revision. Once the intent to deliver is committed, it can be neither edited nor withdrawn."
+    },
+    {
+      "file": "queue.delivery/d07-a-withdrawn-item-is-never-delivered.json",
+      "rule": "queue.delivery",
+      "shows": "An item withdrawn while it was queued cannot begin delivery."
+    },
+    {
+      "file": "queue.delivery/d08-an-acceptance-that-names-another-delivery.json",
+      "rule": "queue.delivery",
+      "shows": "Only an acceptance that names THIS delivery makes the item delivered. One that names another, or one that arrives for an item nothing was committed for, changes nothing."
+    },
+    {
+      "file": "queue.delivery/d09-a-restart-leaves-a-queued-item-queued.json",
+      "rule": "queue.delivery",
+      "shows": "A restart, and the end of a turn, change only an item that was being delivered. A queued item stays queued and is delivered later, once."
+    },
+    {
+      "file": "task.derivation/t01-turn-working.json",
+      "rule": "task.derivation",
+      "shows": "A turn in progress. The Task is created when the first event of the turn was logged, and last changed at its latest state.changed: the times the core logged."
+    },
+    {
+      "file": "task.derivation/t02-turn-waiting-for-an-approval.json",
+      "rule": "task.derivation",
+      "shows": "An approval is pending for the turn: a person must answer it on a surface that draws approvals. It is never answered through the Task."
+    },
+    {
+      "file": "task.derivation/t03-turn-done.json",
+      "rule": "task.derivation",
+      "shows": "The turn ended and its work is done. The result is the turn's own, and it expires when the turn's does."
+    },
+    {
+      "file": "task.derivation/t04-turn-over-and-waiting-for-the-user.json",
+      "rule": "task.derivation",
+      "shows": "The turn is over, so the Task is completed; its outcome says the engine waits for the user, which is not 'done'."
+    },
+    {
+      "file": "task.derivation/t05-turn-failed.json",
+      "rule": "task.derivation",
+      "shows": "The turn failed with a typed code. The worker is gone."
+    },
+    {
+      "file": "task.derivation/t06-turn-interrupted.json",
+      "rule": "task.derivation",
+      "shows": "Cancelling a turn's Task is an interrupt of that turn, not a Stop: the Task is cancelled because the turn's outcome is 'interrupted', and the worker lives on."
+    },
+    {
+      "file": "task.derivation/t07-turn-stopped.json",
+      "rule": "task.derivation",
+      "shows": "The run was stopped and the Stop was confirmed: the turn's Task is cancelled. 'cancelled' is never shown before that."
+    },
+    {
+      "file": "task.derivation/t08-turn-with-a-stop-pending.json",
+      "rule": "task.derivation",
+      "shows": "A Stop of the session was asked and is not confirmed: the turn is still working, with cancel_requested true."
+    },
+    {
+      "file": "task.derivation/t09-turn-still-queued.json",
+      "rule": "task.derivation",
+      "shows": "A turn that waits behind the turn in progress: it is bound to no run yet, and its only event is the one that recorded it."
+    },
+    {
+      "file": "task.derivation/t10-turn-earlier-on-a-shared-run.json",
+      "rule": "task.derivation",
+      "shows": "An earlier turn of a run that a later turn shares. Its Task carries its own result and its own times; nothing of the later turn, though that one ended last on the same run."
+    },
+    {
+      "file": "task.derivation/r11-run-running.json",
+      "rule": "task.derivation",
+      "shows": "Work started with run.start and no session: the Task id is the run id, there is no session and no turn, and it does not expire. Its times are those of the run's own log, 'run:<run_id>'."
+    },
+    {
+      "file": "task.derivation/r12-run-starting.json",
+      "rule": "task.derivation",
+      "shows": "A run that is being started: working. Its log holds one event so far, so both times are that event's."
+    },
+    {
+      "file": "task.derivation/r13-run-waiting-for-an-approval.json",
+      "rule": "task.derivation",
+      "shows": "An approval is pending for the run."
+    },
+    {
+      "file": "task.derivation/r14-run-with-a-stop-pending.json",
+      "rule": "task.derivation",
+      "shows": "A Stop was asked and is not confirmed. The Task keeps the status it had, working, and says cancel_requested. It is not 'cancelled'."
+    },
+    {
+      "file": "task.derivation/r15-run-stopped.json",
+      "rule": "task.derivation",
+      "shows": "The Stop is confirmed: only now is the Task cancelled."
+    },
+    {
+      "file": "task.derivation/r16-run-ended-with-its-result.json",
+      "rule": "task.derivation",
+      "shows": "The run ended and its result says ok: completed. The Task carries the result's code and detail and names the run as where the whole result is read (run.status)."
+    },
+    {
+      "file": "task.derivation/r17-run-ended-at-a-typed-limit.json",
+      "rule": "task.derivation",
+      "shows": "The run ended and its result is an error: failed, with the result's own code."
+    },
+    {
+      "file": "task.derivation/r23-run-whose-result-says-ok-and-carries-a-code.json",
+      "rule": "task.derivation",
+      "shows": "A result that breaks the route contract's own rule: it says ok and carries a code. The Task goes by the code: failed, never completed."
+    },
+    {
+      "file": "task.derivation/r24-run-whose-result-says-error-and-carries-no-code.json",
+      "rule": "task.derivation",
+      "shows": "The other way to break it: the result says error and names no code. The Task is failed, with the code result_invalid, and invents no reason."
+    },
+    {
+      "file": "task.derivation/r18-run-ended-and-no-result-was-kept.json",
+      "rule": "task.derivation",
+      "shows": "The run ended and there is no result to read: failed, with the code result_unavailable. It is never shown as completed."
+    },
+    {
+      "file": "task.derivation/r19-run-that-never-launched.json",
+      "rule": "task.derivation",
+      "shows": "A start that never launched, as the record is today: nothing durable says why, so the code is start_failed and the detail is null. The log holds nothing of it either, so both times are null. The Task invents none of this."
+    },
+    {
+      "file": "task.derivation/r20-run-that-never-launched-with-its-reason-kept.json",
+      "rule": "task.derivation",
+      "shows": "RESERVED: the same, once the record carries start_error (the lane that owns Stop writes it). The Task's detail is then that code."
+    },
+    {
+      "file": "task.derivation/r21-run-lost-at-a-reboot.json",
+      "rule": "task.derivation",
+      "shows": "The machine restarted under the run: failed, with the code lost_reboot."
+    },
+    {
+      "file": "task.derivation/r22-run-that-cannot-be-observed.json",
+      "rule": "task.derivation",
+      "shows": "The unit cannot be observed: nobody can say that the run ended, so the Task is still working."
+    },
+    {
+      "file": "task.derivation/x01-a-pending-stop-shown-as-cancelled.json",
+      "rule": "task.derivation",
+      "shows": "A Stop is pending and the Task already says cancelled. 'cancelled' is shown only once the Stop is confirmed."
+    },
+    {
+      "file": "task.derivation/x02-a-reason-nobody-kept.json",
+      "rule": "task.derivation",
+      "shows": "The record of a start that never launched keeps no reason, and the Task gives one. After a restart nothing could back it."
+    },
+    {
+      "file": "task.derivation/x03-a-kept-reason-left-out.json",
+      "rule": "task.derivation",
+      "shows": "The record carries start_error and the Task's detail is null."
+    },
+    {
+      "file": "task.derivation/x04-no-result-shown-as-completed.json",
+      "rule": "task.derivation",
+      "shows": "The run ended with no result kept, and the Task says completed."
+    },
+    {
+      "file": "task.derivation/x05-the-latest-result-of-a-shared-run.json",
+      "rule": "task.derivation",
+      "shows": "The Task of an earlier turn carries the result of the turn that ended last on the same run."
+    },
+    {
+      "file": "task.derivation/x06-times-from-the-servers-own-clock.json",
+      "rule": "task.derivation",
+      "shows": "Both times are the moment the Task was asked for, not the times the core logged."
+    },
+    {
+      "file": "task.derivation/x07-an-interrupt-shown-as-a-pending-stop.json",
+      "rule": "task.derivation",
+      "shows": "Nothing is stopping the session, and the Task of its turn says cancel_requested."
+    },
+    {
+      "file": "task.derivation/x08-a-pending-approval-left-out.json",
+      "rule": "task.derivation",
+      "shows": "An approval is pending for the run and the Task says working, with no approval named."
     }
   ]
 }

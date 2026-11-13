@@ -22,6 +22,8 @@ What is here:
 * ``approval_problems``: what does not agree inside one approval record.
 * ``transcript_fields`` and ``transcript_problems``: what a transcript line must carry because its
   event says so.
+* ``queue_step``: what happens to a queued message, one happening at a time.
+* ``task_of_run``, ``task_of_turn`` and ``task_problems``: the Task of a run or of a turn, derived.
 * ``ApprovalModel``: approval.open and approval.answer, step by step, with replay.
 """
 from __future__ import annotations
@@ -508,6 +510,147 @@ def transcript_problems(events: list, lines: list) -> list:
     for number, (line, wanted) in enumerate(zip(lines, fields), 1):
         problems += [f"{number}:{key}" for key, value in wanted.items() if line.get(key) != value]
     return problems
+
+
+# ------------------------------------------------------------------------- the delivery of a queue item
+
+def queue_step(item: dict, happening: str, facts: dict | None = None) -> dict:
+    """One thing that happens to a queued message, and the item after it; or refuse.
+
+    ``begin`` (facts: delivery_id): the daemon COMMITS its intent to deliver, before anything is written
+    toward the engine: the item becomes ``delivering`` under that delivery id and can no longer be
+    edited or withdrawn. Only a ``queued`` item can begin (``not_queued``), so nothing is ever sent a
+    second time by itself. ``written`` (facts: delivery_id): the write toward the engine returned. It
+    changes NOTHING in the item: a crash before the write and a crash after it leave the same
+    ``delivering`` item, which is the point. Only a ``delivering`` item is written
+    (``not_delivering``), under its own delivery id (``delivery_mismatch``). ``accepted`` (facts:
+    delivery_id, turn_id): the engine's own typed acceptance, an ``input.accepted`` event, names the
+    delivery: the item becomes ``delivered`` and carries the turn that took it. Nothing else makes an
+    item ``delivered``. An acceptance of an item that is not ``delivering`` changes nothing
+    (``not_delivering``), and neither does one that names another delivery (``delivery_mismatch``).
+    ``restart`` (the daemon starts again) and ``turn_ended`` (the turn the item was written into
+    ended): an item still ``delivering`` has no acceptance and becomes ``outcome_unknown``, which is
+    shown as sent and not confirmed; any other item is unchanged. ``edit`` (facts: text and/or
+    delivery) and ``cancel``: only while ``queued`` (``not_queued``); an edit raises the revision.
+    """
+    facts = facts or {}
+    after = copy.deepcopy(item)
+    state = item["state"]
+    if happening == "begin":
+        if state != "queued":
+            raise Refused("not_queued")
+        after.update(state="delivering", delivery_id=facts["delivery_id"])
+    elif happening in ("written", "accepted"):
+        if state != "delivering":
+            raise Refused("not_delivering")
+        if facts["delivery_id"] != item["delivery_id"]:
+            raise Refused("delivery_mismatch")
+        if happening == "accepted":
+            after.update(state="delivered", turn_id=facts["turn_id"])
+    elif happening in ("restart", "turn_ended"):
+        if state == "delivering":
+            after.update(state="outcome_unknown")
+    elif happening in ("edit", "cancel"):
+        if state != "queued":
+            raise Refused("not_queued")
+        if happening == "cancel":
+            after.update(state="cancelled")
+        else:
+            after.update({key: facts[key] for key in ("text", "delivery") if key in facts}, revision=item["revision"] + 1)
+    else:
+        raise Refused("happening")
+    return after
+
+
+# ----------------------------------------------------------------------------------------- the Task
+
+def _log_times(events: list, of_turn: str | None = None) -> tuple:
+    """created_at and updated_at as the core logged them: the time of the first event, and of the latest
+    state.changed; null where the log holds none."""
+    mine = [event for event in events if of_turn is None or event.get("turn_id") == of_turn]
+    changed = [event["time"] for event in mine if event["type"] == "state.changed"]
+    return (mine[0]["time"] if mine else None), (changed[-1] if changed else None)
+
+
+def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) -> dict:
+    """What the Task of a run started without a session must say, from the run's view and its log.
+
+    The Task has no store of its own: these fields are derived each time, so they survive a restart.
+    Starting, running, a Stop pending and an unobservable unit are ``working`` (``input_required``
+    while an approval is pending), and a Stop that was asked and is not confirmed sets
+    ``cancel_requested``. ``stopped`` is ``cancelled``: only a confirmed Stop is. A run that ended with
+    a result is ``completed`` when the result carries no code and says ok, and ``failed`` with the
+    result's code when it carries one. (The route contract writes ok exactly when there is no code. A
+    result that breaks that is never ``completed``: one that says ok and carries a code is ``failed``
+    with that code, and one that says error and carries none is ``failed`` with the code
+    ``result_invalid``.) The Task's ``result_ref`` is the run id, and the whole result stays in run.status. A run
+    that ended with NO result kept is ``failed`` with the code ``result_unavailable``. A start that
+    never launched is ``failed`` with the code ``start_failed``; its detail is the code of the record's
+    ``start_error`` when the record carries one, and null when it does not (the reason is not durable
+    until the lane that owns Stop writes it). A run lost at a reboot is ``failed`` with the code
+    ``lost_reboot``. A Task of a run has no turn outcome and does not expire.
+    """
+    state, run_id, result = view["state"], view["run_id"], view.get("result")
+    created_at, updated_at = _log_times(list(events))
+    task = {"task_id": run_id, "source": "run", "session_id": None, "run_id": run_id, "turn_id": None,
+            "outcome": None, "cancel_requested": False, "pending_approval_ids": [], "expires_at": None,
+            "created_at": created_at, "updated_at": updated_at, "result": None}
+    if state in ("starting", "running", "stop_pending", "unknown"):
+        task["pending_approval_ids"] = list(pending_approval_ids)
+        task["status"] = "input_required" if pending_approval_ids else "working"
+        task["cancel_requested"] = view.get("stop") is not None
+    elif state == "stopped":
+        task["status"] = "cancelled"
+    elif state == "ended" and result is not None:
+        ok = result["code"] is None and result["status"] == "ok"
+        task["status"] = "completed" if ok else "failed"
+        task["result"] = {"code": None if ok else (result["code"] or "result_invalid"), "detail": result["detail"],
+                          "result_ref": run_id}
+    elif state == "ended":
+        task["status"] = "failed"
+        task["result"] = {"code": "result_unavailable", "detail": None, "result_ref": None}
+    elif state == "start_failed":
+        kept = view.get("start_error")
+        task["status"] = "failed"
+        task["result"] = {"code": "start_failed", "detail": kept["code"] if kept else None, "result_ref": None}
+    elif state == "lost_reboot":
+        task["status"] = "failed"
+        task["result"] = {"code": "lost_reboot", "detail": None, "result_ref": None}
+    else:
+        raise Refused("state")
+    return task
+
+
+def task_of_turn(session: dict, turn_id: str, events: list = (), pending_approval_ids: list = ()) -> dict:
+    """What the Task of a session's turn must say, from the session record and its log.
+
+    It is never derived from the latest result of a run that several turns share: the result is the
+    turn's own and so is the expiry. Queued and running are ``working`` (``input_required`` while an
+    approval is pending for it); ``ended`` is ``completed``, with the turn's outcome so that a caller
+    can tell done from waiting; ``failed`` is ``failed``; ``interrupted`` and ``stopped`` are
+    ``cancelled``. Cancelling a turn's Task is an interrupt of that turn, not a Stop: the worker may
+    live on. ``cancel_requested`` is true while the session's Stop is pending and the turn has not ended.
+    """
+    turn = next((item for item in session["turns"] if item["turn_id"] == turn_id), None)
+    if turn is None:
+        raise Refused("turn_unknown")
+    created_at, updated_at = _log_times(list(events), of_turn=turn_id)
+    live = turn["state"] in ("queued", "running")
+    status = {"queued": "working", "running": "working", "ended": "completed", "failed": "failed",
+              "interrupted": "cancelled", "stopped": "cancelled"}[turn["state"]]
+    if live and pending_approval_ids:
+        status = "input_required"
+    return {"task_id": turn_id, "source": "turn", "session_id": session["session_id"], "run_id": turn["run_id"],
+            "turn_id": turn_id, "status": status, "outcome": turn["outcome"],
+            "cancel_requested": live and session["state"] == "stop_pending",
+            "pending_approval_ids": list(pending_approval_ids) if live else [], "expires_at": turn["expires_at"],
+            "created_at": created_at, "updated_at": updated_at, "result": turn["result"]}
+
+
+def task_problems(wanted: dict, task: dict) -> list:
+    """The fields of a Task that are not what its source says, by name. What the rule does not decide
+    (the message for a person, the advice on when to ask again) is not compared."""
+    return [key for key, value in wanted.items() if task.get(key) != value]
 
 
 # ------------------------------------------------------------------- approval.open and approval.answer

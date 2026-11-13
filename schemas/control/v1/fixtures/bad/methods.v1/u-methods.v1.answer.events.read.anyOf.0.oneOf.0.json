@@ -1,8 +1,11 @@
 {
   "method": "events.read",
   "params": {
-    "session_id": "ses-7f3a9c2e51d04b6a",
-    "after": 41,
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 41
+    },
     "limit": 200,
     "projection": "raw"
   },
@@ -33,6 +36,7 @@
       "seq": 42
     },
     "more": true,
+    "epoch_advanced": false,
     "x-nobody-defined-this": true
   }
 }

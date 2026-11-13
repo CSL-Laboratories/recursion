@@ -9,5 +9,6 @@
     "fork": false,
     "permission_bridge": false,
     "usage": false
-  }
+  },
+  "input_ack": false
 }

@@ -309,7 +309,8 @@ class RouteStarter:
             return {'cgroup': ctx.cgroup}
         result = ctx.result
         if result is None:
-            ctx.cancelled = True
+            if not ctx.abandon():
+                return {'cgroup': ctx.cgroup}  # published as the wait ran out: the run started
             raise self._refuse(run_id, 'launch_timeout', '')
         raise self._refuse(run_id, str(result.get('code') or 'engine_exited'), str(result.get('detail') or ''))
 

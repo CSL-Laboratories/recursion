@@ -235,6 +235,103 @@ class ComposedDaemonTest(unittest.TestCase):
         self.assertEqual(api.call('run.stop', {'run_id': 'run-none'})['code'], 'run_unknown')
         self.assertEqual(api.call('run.kill', {})['code'], 'method_unknown')
 
+    # -- a launch and its start timeout that meet -----------------------------------------------
+    HELD_BOUND_S = 30.0  # only ends a wait that would otherwise never end; it never decides a pass
+
+    def hold_launch(self):
+        """Hold the launcher just before it publishes a launch, and make the start's wait run out
+        exactly there. Nothing is timed: the launcher waits for ``release``, and the start's wait is
+        entered only once the launcher has ``reached`` publication, then given no time at all."""
+        gate = mock.Mock(reached=threading.Event(), release=threading.Event(), done=threading.Event(),
+                         contexts=[], published=[])
+        publish, wait = launcher.RunContext.launched, launcher.RunContext.wait_started
+
+        def held(ctx, cgroup, process):
+            gate.contexts.append(ctx)
+            gate.reached.set()
+            gate.release.wait(self.HELD_BOUND_S)
+            gate.published.append(publish(ctx, cgroup, process))
+            gate.done.set()
+            return gate.published[-1]
+
+        def runs_out(ctx, timeout_s):
+            self.assertTrue(gate.reached.wait(self.HELD_BOUND_S), 'the launcher got as far as publishing')
+            return wait(ctx, 0)
+
+        for name, stand_in in (('launched', held), ('wait_started', runs_out)):
+            patcher = mock.patch.object(launcher.RunContext, name, stand_in)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(gate.release.set)
+        return gate
+
+    def test_a_launch_finished_after_its_start_gave_up_is_ended_and_never_published(self):
+        """The start runs out of time at the moment the launcher has a live engine and is about to
+        publish it. The start has answered ``launch_timeout`` and the control record says
+        ``start_failed`` with no cgroup, so no Stop could find that engine: the launch must not be
+        published, and its tree is ended under a Stop the daemon recorded."""
+        daemon, composed = self.boot()
+        control, gate = composed.control, self.hold_launch()
+        first = control.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1',
+                                           'client_key': 'late'})
+        self.assertEqual((first['code'], (first.get('start_error') or {}).get('code')),
+                         ('start_failed', 'launch_timeout'), first)
+        run = first['run_id']
+        proc = self.units.procs[f'recursion-run-{run}.service']
+        self.assertIsNone(proc.poll(), 'a real engine process is alive behind the failed start')
+        # A Stop sent in that window has no cgroup to act on; it is kept as intent and says so.
+        stop = control.call('run.stop', {'run_id': run})
+        self.assertEqual((stop['code'], stop.get('reason')), ('pending', 'cgroup_unknown'), stop)
+        gate.release.set()
+        self.assertTrue(gate.done.wait(self.HELD_BOUND_S), 'the launcher went on to publish')
+        try:
+            proc.wait(self.HELD_BOUND_S)
+        except subprocess.TimeoutExpired:
+            self.fail('the engine of a start that answered launch_timeout is still running')
+        self.assertEqual(gate.published, [False], 'a launch whose start gave up is not published')
+        for thread in threading.enumerate():
+            if thread.name == f'recursion-run-{run}':
+                thread.join(self.HELD_BOUND_S)
+                self.assertFalse(thread.is_alive(), 'the route worker ended')
+        ctx = gate.contexts[0]
+        self.assertEqual((ctx.cgroup, ctx.process, len(self.units.started)), (None, None, 1))
+        row = daemon.registry.get(run)
+        self.assertEqual((row.stop_requested, row.state), (True, 'terminated'))  # ended under a recorded Stop
+        status = control.call('run.status', {'run_id': run})['run']
+        self.assertEqual((status['state'], status['cgroup'], status['observed']['state']),
+                         ('start_failed', None, 'terminated'))
+        # Stop of a start that failed keeps its standing answer; what matters is that nothing is alive.
+        again = control.call('run.stop', {'run_id': run})
+        self.assertEqual((again['code'], again.get('reason')), ('pending', 'cgroup_unknown'), again)
+
+    def test_a_launch_published_as_its_start_gives_up_is_a_started_run(self):
+        """The other order: the launcher publishes in the instant before the start gives the launch
+        up. Giving up then finds a published launch and loses, so the start answers ``started`` and
+        the run is an ordinary one that Stop reaches."""
+        _, composed = self.boot()
+        control, gate = composed.control, self.hold_launch()
+        abandon = launcher.RunContext.abandon
+
+        def too_late(ctx):
+            gate.release.set()
+            self.assertTrue(gate.done.wait(self.HELD_BOUND_S), 'the launcher published first')
+            return abandon(ctx)
+
+        patcher = mock.patch.object(launcher.RunContext, 'abandon', too_late)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        answer = control.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1',
+                                            'client_key': 'tie'})
+        self.assertEqual((answer['code'], gate.published), ('started', [True]), answer)
+        run = answer['run']['run_id']
+        unit = f'recursion-run-{run}.service'
+        proc = self.units.procs[unit]
+        self.assertEqual((answer['run']['state'], answer['run']['cgroup']), ('running', f'/test.slice/{unit}'))
+        self.assertIsNone(proc.poll())
+        receipt = control.call('run.stop', {'run_id': run})
+        self.assertEqual((receipt['code'], receipt['state']), ('stopped', 'stopped'), receipt)
+        self.assertIsNotNone(proc.poll())  # the receipt came after the process was gone
+
     def test_engine_gets_only_the_policy_environment_and_no_secret_is_in_the_unit_command(self):
         _, composed = self.boot()
         run_id = self.start(self.api(composed))

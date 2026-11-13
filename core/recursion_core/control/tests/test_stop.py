@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import threading
@@ -588,6 +589,108 @@ class StartConcurrencyTest(unittest.TestCase):
         self.assertEqual(calls, ["run-1"])
         self.assertEqual(sorted(r["duplicate"] for r in out), [False, True, True, True])
         self.assertEqual({r["run"]["run_id"] for r in out}, {"run-1"})
+
+
+class ShortGet(InMemoryRunRegistry):
+    """``get`` returns a copy that omits one key. The stored record is not mutated."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.omit: str | None = None
+
+    def get(self, run_id: str):
+        with self._lock:
+            rec = self._runs.get(run_id)
+            if rec is None:
+                return None
+            view = copy.deepcopy(rec)
+            if self.omit is not None:
+                view.pop(self.omit, None)
+            return view
+
+
+class TornRecordTest(unittest.TestCase):
+    """A short registry read must not be written back, and must not escape ``call``."""
+
+    P = {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k"}
+
+    def test_torn_get_omitting_cgroup_is_not_written_back(self) -> None:
+        registry = ShortGet()
+        kill = FakeKillTree([EMPTY])
+        api, _, _, starter = make_api(kill, registry=registry)
+        started_run = api.call("run.start", self.P)
+        run, cgroup = started_run["run"]["run_id"], registry.list()[0]["cgroup"]
+        registry.omit = "cgroup"
+        restarted = a.ControlAPI(registry, kill, starter, clock=lambda: 2000.0)  # in-memory handle is gone
+        res = restarted.call("run.stop", {"run_id": run})
+        self.assertEqual(res["code"], a.REGISTRY_UNAVAILABLE)
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(registry.list()[0]["cgroup"], cgroup)
+        registry.omit = None
+        later = restarted.call("run.stop", {"run_id": run})
+        self.assertEqual(later["code"], a.STOPPED)
+        self.assertEqual(kill.requests, [cgroup])
+
+    def test_torn_get_omitting_start_key_does_not_drop_dedupe(self) -> None:
+        registry = ShortGet()
+        kill = FakeKillTree([EMPTY])
+        api, _, _, starter = make_api(kill, registry=registry)
+        first = api.call("run.start", self.P)
+        registry.omit = "start_key"
+        res = api.call("run.stop", {"run_id": first["run"]["run_id"]})
+        self.assertEqual(res["code"], a.REGISTRY_UNAVAILABLE)
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(registry.list()[0]["start_key"]["client_key"], "k")
+        registry.omit = None
+        again = api.call("run.start", self.P)
+        self.assertEqual((again["code"], again["duplicate"], again["run"]["run_id"]), (a.STARTED, True, "run-1"))
+        self.assertEqual(len(starter.calls), 1)
+        self.assertEqual([r["run_id"] for r in registry.list()], ["run-1"])
+
+    def test_stop_missing_requested_is_sent(self) -> None:
+        registry = InMemoryRunRegistry()
+        kill = FakeKillTree([POPULATED, EMPTY])
+        api, _, _, _ = make_api(kill, registry=registry)
+        registry.put({"run_id": "run-9", "tenant": "t1", "engine": "codex", "state": "stop_pending",
+                      "cgroup": "/cg/run-9", "started_at": 1.0,
+                      "stop": {"requested_at": 1.0, "checks": 1, "reason": "cgroup_populated"},
+                      "start_key": {"client_key": "k", "engine": "codex", "prompt_sha256": "ab"}})
+        first = api.call("run.stop", {"run_id": "run-9"})
+        self.assertEqual(first["code"], a.PENDING)
+        self.assertEqual(kill.requests, ["/cg/run-9"])
+        self.assertIs(registry.get("run-9")["stop"]["requested"], True)
+        second = api.call("run.stop", {"run_id": "run-9"})
+        self.assertEqual(second["code"], a.STOPPED)
+        self.assertEqual(kill.requests, ["/cg/run-9"])
+
+    def test_torn_get_omitting_state_stays_inside_call(self) -> None:
+        registry = ShortGet()
+        kill = FakeKillTree([EMPTY])
+        api, _, _, _ = make_api(kill, registry=registry)
+        run = started(api)
+        registry.omit = "state"
+        try:
+            res = api.call("run.stop", {"run_id": run})
+        except Exception as err:
+            self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+        self.assertEqual(res["code"], a.REGISTRY_UNAVAILABLE)
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(registry.list()[0]["state"], "running")
+
+    def test_lone_surrogate_prompt_stays_inside_call(self) -> None:
+        api, registry, _, starter = make_api()
+        prompt = "\ud800"
+        params = {"tenant": "t1", "engine": "codex", "prompt": prompt, "client_key": "k"}
+        try:
+            res = api.call("run.start", params)
+        except Exception as err:
+            self.fail(f"{type(err).__name__} escaped ControlAPI.call")
+        digest = hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest()
+        self.assertEqual(res["code"], a.STARTED)
+        self.assertEqual(registry.get("run-1")["start_key"]["prompt_sha256"], digest)
+        again = api.call("run.start", params)
+        self.assertEqual((again["duplicate"], again["run"]["run_id"]), (True, "run-1"))
+        self.assertEqual(len(starter.calls), 1)
 
 
 if __name__ == "__main__":

@@ -15,8 +15,9 @@ recorded on F60, CSL-762).
   abstraction running the #916 procedure) to stop the run's tree, then to confirm. Only a confirmed
   empty cgroup answers `stopped`. A populated cgroup, a confirm timeout, an unknown answer or a cleanup
   error answers `pending` with that reason, never `stopped` or `terminated`. A repeat stop on a stopped
-  run sends nothing; on a pending run it only re-checks, unless the earlier cleanup request itself
-  raised, in which case the next stop sends it again. An unknown run is `run_unknown`. A start's
+  run sends nothing; on a pending run it only re-checks, unless the earlier cleanup request was not
+  recorded as sent (`stop.requested` missing or false), in which case the next stop sends it again.
+  An unknown run is `run_unknown`. A start's
   `client_key` dedupes retries per tenant and is bound to that start's engine and prompt digest; reusing
   it for a different request is `request_invalid` / `client_key_reused`. The key and digest are stored in
   the run record (`start_key`) and found through `RunRegistry.find_start`, so a durable registry keeps
@@ -36,7 +37,8 @@ recorded on F60, CSL-762).
   a record against the host after a restart (the startup sweep) belongs to the durable-registry item,
   CSL-738.
 - Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
-  fails answers `registry_unavailable`. Once the cleanup layer has answered, Stop returns `stopped` or
+  fails answers `registry_unavailable`. A record missing a required field or carrying a wrong type is
+  that same answer and is not written back. Once the cleanup layer has answered, Stop returns `stopped` or
   `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
   record and asks the cleanup layer again, which is safe to repeat. For a launch whose own write failed,
   the API keeps the Stop decision with that launch, so a later Stop or a same-key retry continues it

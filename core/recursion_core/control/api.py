@@ -16,8 +16,9 @@ Methods and typed result codes::
                                                                 | registry_unavailable
 
 A registry error never escapes ``call``: a read or a start that cannot reach the registry answers
-``registry_unavailable`` and launches nothing. Once the cleanup layer has answered, Stop returns that
-answer even if writing it back fails, with ``"recorded": false``.
+``registry_unavailable`` and launches nothing. A record read back without its required fields, or with
+the wrong types, is that same failed read and is not written back. Once the cleanup layer has answered,
+Stop returns that answer even if writing it back fails, with ``"recorded": false``.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
@@ -36,7 +37,8 @@ Stop: the first call asks the cleanup layer to stop the run's tree, then asks it
 confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown answer or a
 cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
 pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested`` is
-false: it raised, or it is a stop intent from before the launch was recorded), in which case it sends it
+missing or false: it raised, the stored flag was lost, or it is a stop intent from before the launch was
+recorded), in which case it sends it
 (``cgroup.kill`` and pidfd signals are safe to repeat).
 Reads never change state and never call the cleanup layer.
 
@@ -78,6 +80,63 @@ Starter = Callable[[dict], Mapping[str, str]]
 
 class _RegistryError(Exception):
     pass
+
+
+_RECORD_FIELDS = ("run_id", "tenant", "engine", "state", "cgroup", "started_at", "stop", "start_key")
+_STATES = frozenset({"starting", "start_failed", "running", "stop_pending", "stopped"})
+_LAUNCHED_STATES = frozenset({"running", "stop_pending", "stopped"})
+
+
+def _nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _stop_ok(stop: object) -> bool:
+    """A stop object may omit ``requested``; absence means the kill has not been sent."""
+    if stop is None:
+        return True
+    if not isinstance(stop, dict):
+        return False
+    if "requested_at" not in stop or "checks" not in stop or "reason" not in stop:
+        return False
+    checks, reason = stop["checks"], stop["reason"]
+    if not _number(stop["requested_at"]) or isinstance(checks, bool) or not isinstance(checks, int):
+        return False
+    if reason is not None and not isinstance(reason, str):
+        return False
+    return "requested" not in stop or isinstance(stop["requested"], bool)
+
+
+def _start_key_ok(key: object) -> bool:
+    if key is None:
+        return True
+    if not isinstance(key, dict):
+        return False
+    client, engine, digest = (key.get("client_key"), key.get("engine"), key.get("prompt_sha256"))
+    return isinstance(client, str) and isinstance(engine, str) and isinstance(digest, str) and bool(digest)
+
+
+def _record_ok(rec: object) -> bool:
+    """True when ``rec`` still has every field a write-back is allowed to persist.
+
+    A short read (a required key absent) or a mistyped value must not be written back: doing so drops
+    ``cgroup`` or ``start_key`` and the registry then forgets the live tree or the dedupe index."""
+    if not isinstance(rec, dict) or any(name not in rec for name in _RECORD_FIELDS):
+        return False
+    cgroup = rec["cgroup"]
+    if not (_nonempty_str(rec["run_id"]) and _nonempty_str(rec["tenant"]) and _nonempty_str(rec["engine"])):
+        return False
+    if rec["state"] not in _STATES or not _number(rec["started_at"]):
+        return False
+    if cgroup is not None and not _nonempty_str(cgroup):
+        return False
+    if rec["state"] in _LAUNCHED_STATES and not _nonempty_str(cgroup):
+        return False
+    return _stop_ok(rec["stop"]) and _start_key_ok(rec["start_key"])
 
 
 def _new_run_id() -> str:
@@ -153,9 +212,12 @@ class ControlAPI:
         key = params.get("client_key")
         start_key = None
         if isinstance(key, str):
-            start_key = {"client_key": key, "engine": params["engine"],
-                         "prompt_sha256": hashlib.sha256(params["prompt"].encode()).hexdigest()}
+            # surrogatepass: a lone surrogate is a real prompt and must not raise out of call.
+            digest = hashlib.sha256(params["prompt"].encode("utf-8", "surrogatepass")).hexdigest()
+            start_key = {"client_key": key, "engine": params["engine"], "prompt_sha256": digest}
         prior = self._reg("find_start", params["tenant"], key) if start_key is not None else None
+        if prior is not None and not _record_ok(prior):
+            raise _RegistryError("find_start:malformed")
         if prior is not None and prior.get("start_key") != start_key:
             return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
         run_id = prior["run_id"] if prior is not None else self._new_run_id()
@@ -175,7 +237,7 @@ class ControlAPI:
                 # Re-read first: a Stop may have written its intent while the starter ran. If the read fails,
                 # write nothing rather than overwrite that intent with the launch-intent copy (t1430u X1c).
                 try:
-                    current = self._reg("get", run_id)
+                    current = self._read_record(run_id)
                 except _RegistryError:
                     current = None
                 recorded = False
@@ -231,15 +293,27 @@ class ControlAPI:
         self._launched.pop(run_id, None)
         return {"code": STARTED, "run": prior, "duplicate": True}
 
+    def _read_record(self, run_id: str) -> dict | None:
+        """The registry's copy, or a failed read when that copy lost required fields."""
+        rec = self._reg("get", run_id)
+        if rec is not None and not _record_ok(rec):
+            raise _RegistryError("get:malformed")
+        return rec
+
     def _current(self, rec: dict) -> dict:
-        """The registry's copy of ``rec``, or ``rec`` itself if the registry cannot answer."""
+        """The registry's copy of ``rec``, or ``rec`` itself if the registry cannot answer.
+
+        A short read is a failed read. The copy already held is complete; the torn view is not returned
+        and so cannot be written back over the stored record."""
         try:
-            current = self._reg("get", rec["run_id"])
+            current = self._read_record(rec["run_id"])
         except _RegistryError:
             current = None
         return current if current is not None else dict(rec)
 
     def _try_put(self, rec: dict) -> bool:
+        if not _record_ok(rec):
+            return False
         try:
             self._reg("put", rec)
         except _RegistryError:
@@ -265,7 +339,7 @@ class ControlAPI:
         launch whose write failed: that run is live and its cgroup is known, so Stop still reaches cleanup
         (S6). Any other read failure answers ``registry_unavailable``."""
         try:
-            return self._reg("get", run_id)
+            return self._read_record(run_id)
         except _RegistryError:
             launched = self._launched.get(run_id)
             if launched is None:
@@ -274,6 +348,8 @@ class ControlAPI:
 
     def _stop(self, rec: dict) -> dict:
         """One stop decision on ``rec``. Caller holds the run lock."""
+        if not _record_ok(rec):
+            raise _RegistryError("get:malformed")
         run_id = rec["run_id"]
         if rec["state"] == "stopped":
             res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
@@ -293,9 +369,9 @@ class ControlAPI:
         first = rec["state"] != "stop_pending"
         if rec.get("stop") is None:
             rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
-        if not rec["stop"].get("requested", True):
-            # First stop, a stop intent left during launch, or an earlier request raised before it was known
-            # to be sent: (re)send it.
+        if not rec["stop"].get("requested", False):
+            # First stop, a missing flag, a stop intent left during launch, or an earlier request that
+            # raised before it was known to be sent: (re)send it. A missing flag is not "already sent".
             try:
                 self._kill.request_stop(rec["cgroup"])
             except Exception as err:

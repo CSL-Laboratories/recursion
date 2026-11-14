@@ -16,7 +16,8 @@ d84cdd26, CSLR-D-012, section 3.4 S6 line 888):
   been carried out; read the run's status before retrying.
 
 On a platform without the Unix transport (Windows) every call answers ``control_api_unavailable``
-with ``delivered: false`` and ``detail: "platform_unsupported"``; nothing is connected.
+with ``delivered: false`` and ``detail: "platform_unsupported"``, an explicit path included; no path is
+checked and nothing is connected (D9).
 """
 
 from __future__ import annotations
@@ -58,7 +59,9 @@ class SocketAPI:
         self._timeout_s, self._connect = timeout_s, connect
 
     def call(self, method: str, params: dict | None = None) -> dict:
-        if self.path is None:
+        # D9 (decided Nov 12): Windows refuses uniformly here, before any path, frame or connector is looked at.
+        # An explicit POSIX path used to reach the connector and answer connect:InsecureSocketPath (finding 13).
+        if self.path is None or os.name == "nt" or not hasattr(os, "getuid"):
             return {"code": UNAVAILABLE, "delivered": False, "detail": "platform_unsupported"}
         message = {"op": "control", "method": method, "params": dict(params or {})}
         try:

@@ -7,7 +7,11 @@ The daemon's files only call this module; they hold no lane's logic.
 
 REGISTRATION. ``compose()`` makes one ``Hooks`` object for one composition (a daemon, or one run of the
 CLI). It goes through a fixed list of registrant modules, ``REGISTRANTS``: one per lane, named here and
-nowhere else. Adding a name is a request to the lane that keeps this file. For each name:
+nowhere else. Adding a name is a request to the lane that keeps this file. The imports are GUARDED STATIC
+IMPORTS: each registrant has a function of its own below, with its names written out, a literal
+``find_spec`` for each package above it that is not part of the core and for the module itself, and a
+literal ``import`` statement. Nothing in this module imports a module by a computed name, and
+``compose()`` takes no list of names: what can be loaded is what is written here. For each name:
 
 1. ``importlib.util.find_spec`` of its parent package returns None: that lane is not installed. Skipped.
    The ancestors are looked for one at a time, outermost first, so a name whose parent's own parent is
@@ -127,7 +131,6 @@ invoke them from admitted handlers.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import importlib.util
 import logging
 import threading
@@ -412,6 +415,32 @@ class ServiceContext:
     closing: threading.Event | None = None
 
 
+def own_teardown(lock, errors: list) -> None:
+    """Take the ownership of a teardown and return holding it. ``lock`` is a ``threading.RLock``, re-entrant only
+    so that its owner can be told. An interruption while it is waited for is kept in ``errors`` and the wait goes
+    on: a caller that left here would run its own clean-up while the owner is still tearing down. The thread
+    that already owns it is refused: a teardown does not wait for itself. The caller releases the lock."""
+    if lock._is_owned():
+        raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+    while True:
+        try:
+            lock.acquire()
+            return
+        except BaseException as exc:  # noqa: BLE001 - kept; ownership is still needed
+            errors.append(exc)
+            if lock._is_owned():     # taken, and interrupted on the way back from taking it
+                return
+
+
+def raise_kept(errors: list) -> None:
+    """What a teardown kept, raised once it is over: an interruption before an ordinary failure, the first of each."""
+    for exc in errors:
+        if not isinstance(exc, Exception):
+            raise exc
+    if errors:
+        raise errors[0]
+
+
 class Admission:
     """The composition-wide gate every client call passes: the socket, the page and an in-process call.
 
@@ -468,18 +497,24 @@ class Admission:
         return self._admitted
 
     def drain(self) -> None:
+        """Return when no admitted call is left, and not before. An interruption while the condition is being
+        taken, or while it is waited on, is kept and the drain goes on; the first one is raised once every call
+        has left. So an exception from this method is raised only AFTER the last call left, and a caller that
+        wants to be sure calls it until it returns."""
         if not self.enabled:
             return
         interrupted = None
-        with self._changed:
-            while self._admitted > 0:
-                try:
-                    if not self._changed.wait(self.stall_log_s):
-                        log.warning('closing waits for %d admitted call(s); services and stores stay alive', self._admitted)
-                except BaseException as exc:  # noqa: BLE001 - calls are still inside: the wait is not over
-                    interrupted = interrupted or exc
-                    log.warning('the wait for %d admitted call(s) was interrupted (%s); it goes on',
-                                self._admitted, type(exc).__name__)
+        while True:
+            try:
+                with self._changed:
+                    while self._admitted > 0:
+                        if not self._changed.wait(self.stall_log_s):
+                            log.warning('closing waits for %d admitted call(s); services and stores stay alive',
+                                        self._admitted)
+                break
+            except BaseException as exc:  # noqa: BLE001 - calls may still be inside: the wait is not over
+                interrupted = interrupted or exc
+                log.warning('the wait for admitted calls was interrupted (%s); it goes on', type(exc).__name__)
         if interrupted is not None:
             raise interrupted
 
@@ -502,7 +537,7 @@ class Hooks:
         self.gate = Admission()
         self.store = None
         # The lifecycle has one owner at a time: starting, stopping and closing are serialised by this lock.
-        self._lifecycle = threading.Lock()
+        self._lifecycle = threading.RLock()   # re-entrant only so that its owner can be told: see own_teardown
         self._closed = False
         self.stop_retry_s = 1.0      # between two tries of a service's stop that raised
 
@@ -807,6 +842,16 @@ class Hooks:
     # workers joined. Keep the service and all resources it may use alive until stop confirms quiescence. Log
     # a stalled cleanup and keep waiting. Propagate retained teardown errors only after all resource users
     # have left.
+    #
+    # Interruption while acquiring lifecycle ownership, closing admission, acquiring the drain condition, or
+    # waiting for admitted calls is retained. No close caller returns or raises until the teardown owner has
+    # finished and every resource user has left. An exception from a drain attempt is never itself evidence
+    # that admission is empty.
+    #
+    # Lifecycle methods are called only by the composition owner, never from an admitted handler or callback,
+    # a service's start/stop, or a worker that teardown must join. A shutdown request is handed to that owner;
+    # it does not recursively execute teardown. (A lifecycle method entered from inside another one, on the
+    # same thread, raises HookError.)
     def open_store(self, state_dir):
         """Call the event store's factory, once, before any service starts. None when no lane registered one."""
         with self._lifecycle:
@@ -826,29 +871,44 @@ class Hooks:
             for service in self._services:
                 if self.closing.is_set() or self._closed:
                     log.error('closing began while services were starting; stopping the ones that did')
-                    self._stop_started(context)
+                    self._stop_all(context, [])
                     raise HookError('closing has begun: no service is started')
                 self._started.append(service)
                 try:
                     service.start(context)
                 except BaseException:
                     log.exception('service %s did not start; stopping it and the ones that did', service.name)
-                    self._stop_started(context)
+                    self._stop_all(context, [])
                     raise
 
     def stop_services(self, context: ServiceContext) -> None:
         """Stop every started service, in reverse order, each until its stop has returned. The first failure
         is raised after the last service has stopped."""
-        with self._lifecycle:
-            errors = self._stop_started(context)
-        self._raise_first(errors)
+        errors: list = []
+        own_teardown(self._lifecycle, errors)
+        try:
+            self._stop_all(context, errors)
+        finally:
+            self._lifecycle.release()
+        raise_kept(errors)
 
-    def _stop_started(self, context) -> list:
+    def _stop_all(self, context, errors: list) -> None:
+        """Stop every tracked service and return only when none is left. An interruption, wherever in the
+        stopping it lands (inside a service's ``stop``, in the wait before it is tried again, or between two
+        steps), is kept and the stopping goes on at once with the services still tracked. This is the one place
+        that keeps it, so none is lost behind an ordinary failure."""
+        while self._started:
+            try:
+                self._stop_started(context, errors)
+            except BaseException as exc:  # noqa: BLE001 - services are still tracked: the teardown is not over
+                errors.append(exc)
+
+    def _stop_started(self, context, errors: list) -> None:
         """Stop the tracked services, newest first. A service leaves the list only when its ``stop`` has
-        RETURNED, which is what says its workers have joined. A ``stop`` that raises, or is interrupted, is kept
-        as an error and tried again after ``stop_retry_s``, for as long as it takes: nothing the service may
-        use is torn down on the strength of a failure. The caller holds the lifecycle lock."""
-        errors = []
+        RETURNED, which is what says its workers have joined. A ``stop`` that raises is kept as an error (the
+        first one of a service) and tried again after ``stop_retry_s``, for as long as it takes: nothing the
+        service may use is torn down on the strength of a failure. An interruption is not caught here: it goes
+        to ``_stop_all``, which keeps it and comes back. The caller holds the lifecycle lock."""
         while self._started:
             service = self._started[-1]
             failed = False
@@ -856,7 +916,7 @@ class Hooks:
                 try:
                     service.stop(context)       # a normal return confirms all of its resource users joined
                     break
-                except BaseException as exc:    # noqa: BLE001 - not proof that anything stopped
+                except Exception as exc:        # noqa: BLE001 - not proof that anything stopped
                     if not failed:
                         failed = True
                         errors.append(exc)
@@ -864,21 +924,8 @@ class Hooks:
                                       'is tried again', service.name)
                     else:
                         log.warning('service %s has still not stopped (%s); waiting', service.name, type(exc).__name__)
-                try:
-                    time.sleep(self.stop_retry_s)
-                except BaseException as exc:    # noqa: BLE001 - an interruption does not end the teardown
-                    errors.append(exc)
+                time.sleep(self.stop_retry_s)
             self._started.pop()                 # only after that confirmation
-        return errors
-
-    @staticmethod
-    def _raise_first(errors: list) -> None:
-        """An interruption that was kept is raised before an ordinary failure; either only after the teardown."""
-        for exc in errors:
-            if not isinstance(exc, Exception):
-                raise exc
-        if errors:
-            raise errors[0]
 
     def service_ready(self, name: str) -> bool:
         return any(service.name == name and bool(service.ready) for service in self._started)
@@ -895,44 +942,203 @@ class Hooks:
         store. A teardown error, or an interruption, is raised only after all of that.
 
         One caller owns the teardown. Another that calls while it runs, or after it, waits for the owner to
-        finish and then returns: it closes nothing itself."""
-        with self._lifecycle:
-            if self._closed:
-                return
-            self.begin_close()
-            errors = []
-            try:
-                self.gate.drain()
-            except BaseException as exc:  # noqa: BLE001 - raised by the drain only once every call had left
-                errors.append(exc)
-            errors.extend(self._stop_started(context))
-            store, self.store = self.store, None
-            self.methods.store = None
-            close = getattr(store, 'close', None)
-            if callable(close):
+        finish and then returns: it closes nothing itself. A caller that is interrupted while it waits for the
+        owner goes on waiting and raises its interruption only once the owner has finished."""
+        errors: list = []
+        own_teardown(self._lifecycle, errors)
+        try:
+            # The owned teardown. Whatever interrupts a step of it is kept and the teardown goes on from that
+            # step: closing admission again changes nothing, the drain is asked again until it RETURNS, the
+            # services still tracked are stopped, and the store is closed while it is still the store.
+            while not self._closed:
                 try:
-                    close()
-                except Exception as exc:  # noqa: BLE001
-                    log.exception('the event store did not close cleanly')
+                    self.begin_close()
+                    self.gate.drain()               # returns only when every admitted call has left
+                    self._stop_all(context, errors)
+                    store = self.store
+                    close = getattr(store, 'close', None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception as exc:  # noqa: BLE001
+                            log.exception('the event store did not close cleanly')
+                            errors.append(exc)
+                    self.store = None
+                    self.methods.store = None
+                    self._closed = True
+                except BaseException as exc:  # noqa: BLE001 - proves no quiescence: the owned teardown goes on
                     errors.append(exc)
-            self._closed = True
-        self._raise_first(errors)
+        finally:
+            self._lifecycle.release()
+        raise_kept(errors)
 
 
-def compose(registrants=REGISTRANTS) -> Hooks:
+# ---- the registrants, one guarded static import each -----------------------------------------------------------
+# Each function looks for its registrant with literal names and imports it with a literal statement. None when
+# the lane is not installed, or its package has no such module. An installed package that fails while it is
+# imported raises here: it is never read as absence. The order is REGISTRANTS'.
+def _load_keys_hooks():
+    if (importlib.util.find_spec('recursion_core.keys') is None
+            or importlib.util.find_spec('recursion_core.keys.hooks') is None):
+        return None
+    import recursion_core.keys.hooks as module
+    return module
+
+
+def _load_events_hooks():
+    if (importlib.util.find_spec('recursion_core.events') is None
+            or importlib.util.find_spec('recursion_core.events.hooks') is None):
+        return None
+    import recursion_core.events.hooks as module
+    return module
+
+
+def _load_workspace_hooks():
+    if (importlib.util.find_spec('recursion_core.workspace') is None
+            or importlib.util.find_spec('recursion_core.workspace.hooks') is None):
+        return None
+    import recursion_core.workspace.hooks as module
+    return module
+
+
+def _load_routing_hooks():
+    if (importlib.util.find_spec('recursion_core.routing') is None
+            or importlib.util.find_spec('recursion_core.routing.hooks') is None):
+        return None
+    import recursion_core.routing.hooks as module
+    return module
+
+
+def _load_quota_hooks():
+    if (importlib.util.find_spec('recursion_core.quota') is None
+            or importlib.util.find_spec('recursion_core.quota.hooks') is None):
+        return None
+    import recursion_core.quota.hooks as module
+    return module
+
+
+def _load_approvals_hooks():
+    if (importlib.util.find_spec('recursion_core.approvals') is None
+            or importlib.util.find_spec('recursion_core.approvals.hooks') is None):
+        return None
+    import recursion_core.approvals.hooks as module
+    return module
+
+
+def _load_sessions_hooks():
+    if (importlib.util.find_spec('recursion_core.sessions') is None
+            or importlib.util.find_spec('recursion_core.sessions.hooks') is None):
+        return None
+    import recursion_core.sessions.hooks as module
+    return module
+
+
+def _load_launch_check_hooks():
+    if (importlib.util.find_spec('recursion_core.launch_check') is None
+            or importlib.util.find_spec('recursion_core.launch_check.hooks') is None):
+        return None
+    import recursion_core.launch_check.hooks as module
+    return module
+
+
+def _load_setup_hooks():
+    if (importlib.util.find_spec('recursion_core.setup') is None
+            or importlib.util.find_spec('recursion_core.setup.hooks') is None):
+        return None
+    import recursion_core.setup.hooks as module
+    return module
+
+
+def _load_gui_hooks():
+    if (importlib.util.find_spec('recursion_core.gui') is None
+            or importlib.util.find_spec('recursion_core.gui.hooks') is None):
+        return None
+    import recursion_core.gui.hooks as module
+    return module
+
+
+def _load_remote_hooks():
+    if (importlib.util.find_spec('recursion_core.remote') is None
+            or importlib.util.find_spec('recursion_core.remote.hooks') is None):
+        return None
+    import recursion_core.remote.hooks as module
+    return module
+
+
+def _load_control_mcp_hooks():
+    if (importlib.util.find_spec('recursion_core.control.mcp') is None
+            or importlib.util.find_spec('recursion_core.control.mcp.hooks') is None):
+        return None
+    import recursion_core.control.mcp.hooks as module
+    return module
+
+
+def _load_control_scopes():
+    if importlib.util.find_spec('recursion_core.control.scopes') is None:
+        return None
+    import recursion_core.control.scopes as module
+    return module
+
+
+def _load_routes_driver_hooks():
+    if importlib.util.find_spec('recursion_core.routes.driver_hooks') is None:
+        return None
+    import recursion_core.routes.driver_hooks as module
+    return module
+
+
+def _load_plugin_security_host_hooks():
+    if importlib.util.find_spec('recursion_core.plugin_security.host_hooks') is None:
+        return None
+    import recursion_core.plugin_security.host_hooks as module
+    return module
+
+
+def _load_plugin_security_sign_hooks():
+    if importlib.util.find_spec('recursion_core.plugin_security.sign_hooks') is None:
+        return None
+    import recursion_core.plugin_security.sign_hooks as module
+    return module
+
+
+_LOADERS = (
+    ('recursion_core.keys.hooks', _load_keys_hooks),
+    ('recursion_core.events.hooks', _load_events_hooks),
+    ('recursion_core.workspace.hooks', _load_workspace_hooks),
+    ('recursion_core.routing.hooks', _load_routing_hooks),
+    ('recursion_core.quota.hooks', _load_quota_hooks),
+    ('recursion_core.approvals.hooks', _load_approvals_hooks),
+    ('recursion_core.sessions.hooks', _load_sessions_hooks),
+    ('recursion_core.launch_check.hooks', _load_launch_check_hooks),
+    ('recursion_core.setup.hooks', _load_setup_hooks),
+    ('recursion_core.gui.hooks', _load_gui_hooks),
+    ('recursion_core.remote.hooks', _load_remote_hooks),
+    ('recursion_core.control.mcp.hooks', _load_control_mcp_hooks),
+    ('recursion_core.control.scopes', _load_control_scopes),
+    ('recursion_core.routes.driver_hooks', _load_routes_driver_hooks),
+    ('recursion_core.plugin_security.host_hooks', _load_plugin_security_host_hooks),
+    ('recursion_core.plugin_security.sign_hooks', _load_plugin_security_sign_hooks),
+)
+
+
+def bare() -> Hooks:
+    """The hooks with nothing registered: every default, and the tables closed. What a composition that is
+    given no hooks uses, and what a test builds on."""
+    hooks = Hooks()
+    hooks.freeze()
+    return hooks
+
+
+def compose() -> Hooks:
     """The hooks of one composition: every registrant that is installed has registered, and the tables are frozen."""
     hooks = Hooks()
-    for name in registrants:
-        parts = name.split('.')
+    for name, load in _LOADERS:
         try:
-            # Each ancestor, outermost first: the first that is not there says the lane is not installed.
-            # find_spec of a dotted name imports its parent, so an installed ancestor that fails to import
-            # raises here and fails composition; it is never read as absence.
-            if any(importlib.util.find_spec('.'.join(parts[:depth])) is None for depth in range(1, len(parts))):
-                continue        # the lane is not installed
-            if importlib.util.find_spec(name) is None:
-                continue        # the package is there and has no hooks module
-            module = importlib.import_module(name)
+            # Absence is decided by find_spec before the import. An installed ancestor that fails to import
+            # raises inside the loader and fails composition, and so does anything the registrant raises.
+            module = load()
+            if module is None:
+                continue        # the lane is not installed, or its package has no such module
             module.register(hooks)
         except HookError:
             raise

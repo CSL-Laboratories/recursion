@@ -50,10 +50,22 @@ A lane registers a handler from its registrant module's ``register(hooks)``::
     discarded if it rolls back. A failed nested handler contributes no callbacks. Outside a command, a
     successful read's callbacks run after its handler returns.
 
+    Each callback is owned by the dispatch that registered it. It runs only if that dispatch, and every
+    dispatch between it and the one whose commit it waits for, SUCCEEDED: returned an answer. A dispatch
+    that left any other way (a refusal by ``NotAccepted``, an error, an interruption that an outer
+    handler caught) contributes none, and neither do the nested calls made inside it; the callbacks of
+    its siblings are not touched, whatever the order in which they were registered.
+
     The restriction follows the dispatch, not the caller's position in it: a command that calls a read
     that calls a built-in is still inside the command. A method keyed by ``command_id`` is refused as
     ``nested_command`` wherever the nested call is made. Once the outermost dispatch has returned,
     ``ctx.call`` answers ``request_invalid/dispatch_ended``: its admission is over.
+
+    Calls made on another thread through ``ctx.call`` must finish, and their threads must be joined,
+    before the invoking handler or callback returns. Contexts are not a detached-work admission.
+    ``after_commit`` registration belongs to an active handler frame; registering from a callback or
+    after that frame returns is rejected. (It raises ``RuntimeError``; so does a registration that
+    arrives after the dispatch whose commit it would wait for has finished.)
 ``ctx.closing``
     A ``threading.Event`` that is set when the daemon begins to close. A handler that waits (a long
     poll) waits on this and returns when it is set.
@@ -159,7 +171,7 @@ log = logging.getLogger(__name__)
 
 BUILT_IN = ('run.start', 'run.status', 'run.list', 'run.stop', 'route.list', 'plugin.list')
 MANDATORY = (*BUILT_IN, 'methods.list')    # every daemon answers these; none can answer 'unsupported'
-TABLE_VERSION = '1.0-draft.7'              # of the published table these rows are
+TABLE_VERSION = '1.0-draft.9'              # of the published table these rows are
 INSTALL_TENANT = 'install'                 # the receipt namespace of a method whose target is the whole install
 MAX_INT = 2**53 - 1   # the largest whole number every reader of JSON numbers keeps exact
 MAX_DEPTH = 64        # of params, for the payload digest
@@ -170,7 +182,7 @@ class Row(NamedTuple):
     mutating: bool
     idempotency: str    # none | client_key | command_id
     beta: bool = True   # every method is beta except the six the daemon answers today
-    service: str | None = None   # the service the published row says the method waits for; None in every row today
+    service: str | None = None   # the service the published row says the method waits for, or None
 
 
 def _rows() -> dict:
@@ -185,7 +197,8 @@ def _rows() -> dict:
         'session.export': read(), 'session.list': read(), 'session.status': read(), 'session.stop': keyed(),
         'queue.update': keyed(), 'queue.cancel': keyed(),
         'approval.list': read(), 'approval.open': keyed('approve'), 'approval.answer': keyed('approve'),
-        'events.read': read(), 'events.follow': read(),
+        # The two reads of a log wait for the event lane's service, as their published rows say (draft 9).
+        'events.read': Row('read', False, 'none', True, 'events'), 'events.follow': Row('read', False, 'none', True, 'events'),
         'route.explain': read(), 'operator.read': read(), 'budget.show': read(),
         'workspace.diff': read(), 'workspace.checkpoint': keyed(), 'workspace.restore': keyed(),
         'workspace.publish': keyed('manage'),
@@ -217,14 +230,20 @@ class _Dispatch:
     """One dispatch that is running. ``command`` is the enclosing dispatch whose command transaction was open
     when this one began, or None; ``root`` is the outermost dispatch, whose admission every nested call shares."""
 
-    __slots__ = ('command', 'root', 'callbacks', 'in_transaction', 'ended')
+    __slots__ = ('parent', 'command', 'root', 'callbacks', 'in_transaction', 'ended', 'active', 'succeeded',
+                 'sealed', 'lock')
 
     def __init__(self, parent) -> None:
+        self.parent = parent
         self.command = _command_of(parent)
         self.root = parent.root if parent is not None else self
-        self.callbacks: list = []
+        self.callbacks: list = []       # (the dispatch that registered it, fn), in the order of registration
         self.in_transaction = False
         self.ended = False
+        self.active = False             # its handler is running: only then may it register a callback
+        self.succeeded = False          # its handler returned an answer; set once, never by a failure
+        self.sealed = False             # its callback list is closed: what it holds is about to run, or never will
+        self.lock = threading.Lock()    # of ``sealed`` and of appending to ``callbacks``
 
 
 def _command_of(scope):
@@ -240,17 +259,25 @@ def _command_of(scope):
 class Context:
     """What a handler is given. Made by the dispatcher for one call and not kept after it."""
 
-    __slots__ = ('principal', 'tx', 'closing', '_callbacks', '_call')
+    __slots__ = ('principal', 'tx', 'closing', '_scope', '_owner', '_call')
 
-    def __init__(self, principal, tx, closing, call, callbacks: list) -> None:
+    def __init__(self, principal, tx, closing, call, scope, owner) -> None:
         self.principal, self.tx, self.closing = principal, tx, closing
-        self._callbacks = callbacks     # the enclosing command's list when this is a read nested in a command
-        self._call = call
+        self._scope = scope             # the dispatch this context is the handler's view of
+        self._owner = owner             # the dispatch whose commit its callbacks wait for: the enclosing
+        self._call = call               # command when this is a read nested in one, else ``scope`` itself
 
     def after_commit(self, fn: Callable[[], object]) -> None:
         if not callable(fn):
             raise TypeError('after_commit takes a function of no arguments')
-        self._callbacks.append(fn)
+        if not self._scope.active:
+            raise RuntimeError('after_commit is called by a running handler: not from a callback, and not after '
+                               'the handler has returned')
+        owner = self._owner
+        with owner.lock:
+            if owner.sealed:
+                raise RuntimeError('after_commit arrived after the dispatch its callback would wait for had finished')
+            owner.callbacks.append((self._scope, fn))
 
     def call(self, method: str, params=None) -> dict:
         return self._call(method, params)
@@ -457,26 +484,33 @@ class MethodTable:
 
     def _read(self, method, params, principal, handler, nested, scope) -> dict:
         enclosing = scope.command   # the command this read is nested in, whose transaction is open; or None
-        callbacks = enclosing.callbacks if enclosing is not None else scope.callbacks
-        mark = len(callbacks)
-        ctx = Context(principal, None, self.closing, nested, callbacks)
+        owner = enclosing if enclosing is not None else scope
+        ctx = Context(principal, None, self.closing, nested, scope, owner)
+        # A dispatch that does not reach ``succeeded`` contributes no callbacks, however it left: a refusal, an
+        # error, or an interruption that passes through here and is caught further out. Nothing is deleted from
+        # the list it shares with its siblings.
+        scope.active = True
         try:
             answer = handler(ctx, params)
             if not isinstance(answer, dict) or not isinstance(answer.get('code'), str):
                 raise TypeError(f'handler of {method} returned no answer')
+            scope.succeeded = True
         except NotAccepted as refusal:
-            del callbacks[mark:]         # a failed handler contributes no callbacks
             return copy.deepcopy(refusal.answer)
         except Exception as exc:  # noqa: BLE001 - a handler's bug is an answer, never a dropped call
-            del callbacks[mark:]
             log.exception('handler of %s failed', method)
             return {'code': 'unavailable', 'detail': f'handler:{type(exc).__name__}'}
-        if enclosing is not None:
-            return answer                # its callbacks wait for the enclosing command's commit
-        if callbacks:
+        finally:
+            scope.active = False
+            if enclosing is None:
+                with scope.lock:
+                    scope.sealed = True      # nothing joins this list from here on
+        # A read nested in a command registered its callbacks on that command's list (``owner``), where they wait
+        # for its commit; its own list is empty. A read with no command around it has no transaction of the
+        # dispatcher's to wait for: the handler returned, and its own list runs now.
+        if scope.callbacks:
             answer = copy.deepcopy(answer)   # what the caller gets is not what a callback still holds
-        # No transaction of the dispatcher's here, so nothing to wait for: the handler returned.
-        self._run_callbacks(method, callbacks)
+        self._run_callbacks(method, scope)
         return answer
 
     def _command(self, method, params, principal, handler, nested, scope) -> dict:
@@ -497,7 +531,7 @@ class MethodTable:
                 if not isinstance(tenant, str) or not tenant:
                     raise TypeError(f'tenant_of of {method} named no tenant')
             except NotAccepted as refusal:
-                return refusal.answer
+                return copy.deepcopy(refusal.answer)
             except Exception as exc:  # noqa: BLE001 - no tenant, no receipt: nothing is run
                 log.exception('the tenant of %s could not be derived', method)
                 return {'code': 'unavailable', 'detail': f'tenant:{type(exc).__name__}'}
@@ -515,8 +549,12 @@ class MethodTable:
                     # From here to the end of the transaction this dispatch is a command with its transaction
                     # open: nested calls are restricted, and nested reads' callbacks join this command's.
                     scope.in_transaction = True
-                    ctx, stage = Context(principal, tx, self.closing, nested, scope.callbacks), 'handler'
-                    answer = handler(ctx, params)
+                    ctx, stage = Context(principal, tx, self.closing, nested, scope, scope), 'handler'
+                    scope.active = True
+                    try:
+                        answer = handler(ctx, params)
+                    finally:
+                        scope.active = False
                     if not isinstance(answer, dict) or not isinstance(answer.get('code'), str):
                         raise TypeError(f'handler of {method} returned no answer')
                     # An owned snapshot: neither the handler's object nor the store's copy of it.
@@ -532,13 +570,23 @@ class MethodTable:
                 return {'code': 'unavailable', 'detail': f'{stage}:{type(exc).__name__}'}
             finally:
                 scope.in_transaction = False
+                with scope.lock:
+                    scope.sealed = True      # committed or rolled back: no callback joins this command any more
         # Committed, and the slot is released: callbacks run outside every lock of the dispatcher, the ones
         # nested reads registered among them, in the order they were registered.
-        self._run_callbacks(method, scope.callbacks)
+        scope.succeeded = True
+        self._run_callbacks(method, scope)
         return committed_answer
 
-    def _run_callbacks(self, method, callbacks) -> None:
-        for fn in list(callbacks):
+    def _run_callbacks(self, method, owner) -> None:
+        """Run the callbacks that wait for ``owner``, in the order they were registered: each one whose own
+        dispatch succeeded, and every dispatch between it and ``owner``. The list is sealed, so it is whole."""
+        for registrant, fn in list(owner.callbacks):
+            current = registrant
+            while current is not owner and current is not None and current.succeeded:
+                current = current.parent
+            if current is not owner or not owner.succeeded:
+                continue                     # its own dispatch, or one around it, did not succeed
             try:
                 fn()
             except Exception:  # noqa: BLE001 - the receipt is committed; a later callback still runs

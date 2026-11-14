@@ -25,20 +25,40 @@ models a failure before anything is published, and nothing else. Its event table
 and the order, and nothing of the ledger's own schema, which is the event lane's. The shapes the
 published protocol leaves open (what ``receipt_get`` and ``execute`` return) are this fake's reading until
 the event lane publishes them: ``(payload_digest, answer)`` or None, and a list of rows.
+
+This is a provisional SQL subset, not a second EVENTS implementation. EVENTS owns the helper's return
+shapes, supported schema/SQL features, value profiles and version behavior. Registration is
+composition-only and atomic; it cannot alter helper-owned receipt/event tables. Every accepted schema
+constraint is enforced, and unsupported features are rejected at registration. Replace this class with
+the EVENTS-owned shared fake when it is available; consumer tests must not choose whichever fake passes.
+
+This temporary fixture supports the declaration/SQL/value profile stated here. EVENTS owns migrations,
+pragma policy, receipt/event validation and helper return shapes. A consumer requiring a view, migration
+or another unsupported operation must use the EVENTS fake; passing this fixture is not ledger conformance.
+
+The profile: a declaration is ``CREATE TABLE`` and ``CREATE INDEX`` statements and nothing else (no view,
+no trigger, no change to a table that exists), once for a lane, all of it or none of it. Foreign keys a
+declaration states are enforced. ``execute`` reads and writes rows of declared tables. A value that is
+kept as JSON has text keys. The store closes only when no transaction is open: a close that finds one is
+refused, and a transaction that waited for its turn while the store closed is refused when its turn comes.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import importlib
+import importlib.util
+import inspect
 import io
 import json
 import logging
 import os
 import pathlib
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -53,10 +73,22 @@ from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, engines
 
 REPO = pathlib.Path(__file__).resolve().parents[4]
 BOUND_S = 30.0   # only ends a wait that would otherwise never end; it never decides a pass
+SIGNAL_SETTLE_S = 2.0   # see the one test that sends a real signal; it never decides a pass either
 
 
 def _wire(value) -> str:
-    """A value as the store keeps it: JSON, or it is refused. So what is read back is owned by the reader."""
+    """A value as the store keeps it: JSON, or it is refused. So what is read back is owned by the reader. An
+    object's keys are text: a key of another type is refused, where a serialiser would quietly make it text."""
+    def keys_are_text(item) -> None:
+        if isinstance(item, dict):
+            if not all(isinstance(key, str) for key in item):
+                raise TypeError('an object key is text')
+            for inner in item.values():
+                keys_are_text(inner)
+        elif isinstance(item, (list, tuple)):
+            for inner in item:
+                keys_are_text(inner)
+    keys_are_text(value)
     return json.dumps(value, allow_nan=False, sort_keys=True)
 
 
@@ -70,8 +102,7 @@ class FakeTx:
         self._owner, self._active = threading.get_ident(), True
 
     def _use(self) -> None:
-        if self._store.closed:
-            raise RuntimeError('store_closed')
+        # (A store cannot close under an open transaction, so there is no "closed" to ask about here.)
         if not self._active or threading.get_ident() != self._owner:
             raise RuntimeError('transaction_not_active_for_caller')
 
@@ -142,7 +173,9 @@ class FakeStore:
     def _connect(self):
         # A transaction that meets another's lock is refused at once where the store is not serial; where it is,
         # the write lock above means it never meets one.
-        return sqlite3.connect(self._path, isolation_level=None, timeout=0, check_same_thread=False)
+        db = sqlite3.connect(self._path, isolation_level=None, timeout=0, check_same_thread=False)
+        db.execute('PRAGMA foreign_keys=ON')    # a constraint a declaration states is enforced, on every connection
+        return db
 
     def _names(self, db) -> set:
         return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
@@ -156,66 +189,119 @@ class FakeStore:
         return sqlite3.SQLITE_DENY
 
     def register_tables(self, lane, version, ddl) -> None:
-        """Declare a lane's tables, once, at composition. Only tables declared here can be reached by ``execute``."""
-        if self.closed:
-            raise RuntimeError('store_closed')
-        if not isinstance(lane, str) or not lane or lane in self._lanes:
-            raise RuntimeError('a lane declares its tables once')
-        with contextlib.closing(self._connect()) as db:
-            before = self._names(db)
-            db.executescript(ddl)
-            added = self._names(db) - before
-        if not added:
-            raise RuntimeError('the declaration made no table')
-        self._lanes[lane] = version
-        self._tables |= added
+        """Declare a lane's tables, once, at composition. Only tables declared here can be reached by ``execute``.
+
+        A declaration can only declare: ``CREATE TABLE`` and ``CREATE INDEX`` on its own tables. Anything else
+        in it (a write to the helper's own tables, a view, a trigger, a change to an existing table) is refused,
+        and a declaration that fails leaves NOTHING behind: every statement of it is undone and the lane can
+        declare again. It is made under the same guard as closing, so none is made on a closed store."""
+        with self._guard:
+            if self.closed:
+                raise RuntimeError('store_closed')
+            if not isinstance(lane, str) or not lane or lane in self._lanes:
+                raise RuntimeError('a lane declares its tables once')
+            created: set = set()
+            indexes: set = set()
+
+            def declaration_only(action, first, second, database, source) -> int:
+                if action == sqlite3.SQLITE_CREATE_TABLE:
+                    if first in ('receipts', 'events'):
+                        return sqlite3.SQLITE_DENY
+                    created.add(first)
+                    return sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_CREATE_INDEX:
+                    indexes.add(first)      # only on a table of its own: indexing a table READs it, refused below
+                    return sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_REINDEX:        # what creating an index asks for, of that same index
+                    return sqlite3.SQLITE_OK if first in indexes else sqlite3.SQLITE_DENY
+                if first in ('sqlite_master', 'sqlite_schema'):
+                    return sqlite3.SQLITE_OK        # what creating a table writes, and nothing a statement can name
+                if action == sqlite3.SQLITE_READ and first in created:
+                    return sqlite3.SQLITE_OK
+                if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
+                    return sqlite3.SQLITE_OK
+                return sqlite3.SQLITE_DENY
+
+            with contextlib.closing(self._connect()) as db:
+                before = self._names(db)
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.set_authorizer(declaration_only)
+                    statement = ''
+                    for char in ddl:
+                        statement += char
+                        if sqlite3.complete_statement(statement):
+                            db.execute(statement)
+                            statement = ''
+                    if statement.strip():
+                        db.execute(statement)
+                    db.set_authorizer(None)
+                    added = self._names(db) - before
+                    if not added:
+                        raise RuntimeError('the declaration made no table')
+                    db.execute('COMMIT')
+                except BaseException:
+                    db.set_authorizer(None)
+                    with contextlib.suppress(sqlite3.Error):
+                        db.execute('ROLLBACK')
+                    raise
+            self._lanes[lane] = version
+            self._tables |= added
 
     @contextlib.contextmanager
     def transaction(self):
-        if self.closed:
-            raise RuntimeError('store_closed')
         if getattr(self._local, 'transaction', None) is not None:
             raise RuntimeError('nested_transaction')
         if self._serial:
             self._write.acquire()
-        db = None
+        db = tx = None
+        counted = False
         try:
+            # ONE guard decides "is it closed" and counts the open transactions. So a transaction that waited
+            # for the write lock while the store closed is refused here, when its turn comes; and close() is
+            # refused from here until this transaction's connection is gone.
+            with self._guard:
+                if self.closed:
+                    raise RuntimeError('store_closed')
+                self.open_transactions += 1
+                counted = True
             db = self._connect()
             db.execute('BEGIN IMMEDIATE' if self._serial else 'BEGIN')
             tx = FakeTx(self, db)
             self._local.transaction = tx
-            with self._guard:
-                self.open_transactions += 1
             try:
-                try:
-                    yield tx
-                    if self.closed:
-                        raise RuntimeError('store_closed')
-                    if self.fail_commit:
-                        raise OSError('the commit failed')
-                    db.execute('COMMIT')
-                except BaseException:
-                    with self._guard:
-                        self.rollbacks += 1
-                    with contextlib.suppress(sqlite3.Error):
-                        db.execute('ROLLBACK')
-                    raise
+                yield tx
+                if self.fail_commit:
+                    raise OSError('the commit failed')
+                db.execute('COMMIT')
+            except BaseException:
                 with self._guard:
-                    self.commits += 1
-            finally:
-                # Always, on exit, including rollback and failed commit.
+                    self.rollbacks += 1
+                with contextlib.suppress(sqlite3.Error):
+                    db.execute('ROLLBACK')
+                raise
+            with self._guard:
+                self.commits += 1
+        finally:
+            # Always, on exit: a commit, a rollback, a failed commit, a transaction that could not begin.
+            if tx is not None:
                 tx._active = False
                 self._local.transaction = None
-                with self._guard:
-                    self.open_transactions -= 1
-        finally:
             if db is not None:
                 db.close()
+            if counted:
+                with self._guard:
+                    self.open_transactions -= 1
             if self._serial:
                 self._write.release()
 
     def close(self) -> None:
-        self.closed = True
+        """Close the store. Refused (``transactions_active``) while a transaction is open: a close never returns
+        with a commit still to come. The caller ends its transactions first; this fake does not wait for them."""
+        with self._guard:
+            if self.open_transactions:
+                raise RuntimeError('transactions_active')
+            self.closed = True
         if self._log is not None:
             self._log.append(('close', 'store', None))
 
@@ -272,43 +358,71 @@ def quiet(test):
     return wrapped
 
 
-class FakePackages:
-    """Packages written to a temporary folder on ``sys.path``, with names no other test uses."""
-
-    count = 0
+class FakeLanes:
+    """Registrant modules under their REAL names, for one test. The composition imports its registrants with
+    literal statements, so a test cannot hand it a name: it writes the lane's package into a temporary folder
+    and puts that folder on the path of the package the lane sits in (``recursion_core`` for a lane's own
+    package), for as long as the test runs."""
 
     def __init__(self, case: unittest.TestCase) -> None:
         self._dir = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._dir.name)
-        FakePackages.count += 1
-        self.prefix = f'seamfake{FakePackages.count}'
-        sys.path.insert(0, str(self.root))
+        self._mounted: list = []
+        self._names: list = []
         case.addCleanup(self._clean)
-        importlib.invalidate_caches()
 
-    def _clean(self) -> None:
-        sys.path.remove(str(self.root))
-        for name in [name for name in sys.modules if name.split('.')[0].startswith(self.prefix)]:
-            del sys.modules[name]
-        self._dir.cleanup()
-        importlib.invalidate_caches()
+    def _folder(self, package: str) -> pathlib.Path:
+        """A folder that is searched for the submodules of ``package``, a package of the core that exists."""
+        folder = self.root / package
+        if not folder.exists():
+            module = importlib.import_module(package)
+            folder.mkdir()
+            module.__path__.append(str(folder))
+            self._mounted.append((module, str(folder)))
+        return folder
 
-    def package(self, name: str, init: str = '', **modules: str) -> str:
-        full = f'{self.prefix}_{name}'
-        folder = self.root / full
+    def lane(self, name: str, init: str = '', **modules: str) -> str:
+        """The package ``recursion_core.<name>`` with this ``__init__`` and these modules; its full name."""
+        parent, _, leaf = f'recursion_core.{name}'.rpartition('.')
+        folder = self._folder(parent) / leaf
         folder.mkdir()
         (folder / '__init__.py').write_text(init, encoding='utf-8')
         for module, text in modules.items():
             (folder / f'{module}.py').write_text(text, encoding='utf-8')
+        self._names.append(f'{parent}.{leaf}')
         importlib.invalidate_caches()
-        return full
+        return f'{parent}.{leaf}'
+
+    def module(self, name: str, text: str) -> str:
+        """The module ``recursion_core.<name>`` inside a package of the core that exists; its full name."""
+        parent, _, leaf = f'recursion_core.{name}'.rpartition('.')
+        (self._folder(parent) / f'{leaf}.py').write_text(text, encoding='utf-8')
+        self._names.append(f'{parent}.{leaf}')
+        importlib.invalidate_caches()
+        return f'{parent}.{leaf}'
+
+    def _clean(self) -> None:
+        for module, folder in self._mounted:
+            module.__path__.remove(folder)
+        for name in self._names:
+            for loaded in [key for key in sys.modules if key == name or key.startswith(name + '.')]:
+                del sys.modules[loaded]
+            parent, _, leaf = name.rpartition('.')
+            if hasattr(sys.modules.get(parent), leaf):
+                delattr(sys.modules[parent], leaf)
+        self._dir.cleanup()
+        importlib.invalidate_caches()
+
+
+CORE_PACKAGES = ('recursion_core', 'recursion_core.control', 'recursion_core.routes', 'recursion_core.plugin_security')
+REGISTERS_NOTHING = 'def register(hooks):\n    pass\n'
 
 
 class RegistrationTest(unittest.TestCase):
     """Absent is not broken, and absent is decided before the import."""
 
     def setUp(self) -> None:
-        self.fake = FakePackages(self)
+        self.fake = FakeLanes(self)
 
     def test_nothing_is_installed_today_and_the_hooks_compose_with_their_defaults(self) -> None:
         composed = H.compose()
@@ -319,46 +433,81 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(composed.commands.names(), ())
         self.assertEqual(composed.engines.names(), ('claude_code', 'codex'))
 
+    def test_the_registrants_are_guarded_static_imports_and_nothing_is_imported_by_a_computed_name(self) -> None:
+        """The brief's words. ``compose()`` takes no list of names; the module calls nothing that imports by a
+        computed name; and each registrant's own function holds, as literals, a ``find_spec`` for each package
+        above it that is not part of the core, then for the module, and one ``import`` statement of exactly
+        that module. Sixteen blocks written by hand: this is what catches a wrong name in one of them."""
+        self.assertEqual(list(inspect.signature(H.compose).parameters), [])
+        self.assertEqual(tuple(name for name, _ in H._LOADERS), H.REGISTRANTS)
+        self.assertEqual(len(set(H.REGISTRANTS)), 16)
+        tree = ast.parse(pathlib.Path(H.__file__).read_text(encoding='utf-8'))
+        called = {node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, 'id', None)
+                  for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        self.assertEqual(called & {'import_module', '__import__', 'exec', 'eval', 'reload'}, set())
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        for package in CORE_PACKAGES:
+            self.assertIsNotNone(importlib.util.find_spec(package), 'a package of the core itself is always there')
+        for name, load in H._LOADERS:
+            with self.subTest(registrant=name):
+                node = functions[load.__name__]
+                specs = sorted((call for call in ast.walk(node) if isinstance(call, ast.Call)
+                                and isinstance(call.func, ast.Attribute) and call.func.attr == 'find_spec'),
+                               key=lambda call: (call.lineno, call.col_offset))
+                self.assertTrue(all(len(call.args) == 1 and isinstance(call.args[0], ast.Constant) for call in specs),
+                                'every name that is looked for is a literal')
+                parts = name.split('.')
+                above = ['.'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+                self.assertEqual([call.args[0].value for call in specs], [item for item in above if item not in CORE_PACKAGES],
+                                 'each package above it, outermost first, then the module itself')
+                imports = [alias.name for statement in ast.walk(node) if isinstance(statement, ast.Import)
+                           for alias in statement.names]
+                self.assertEqual(imports, [name], 'one literal import statement, of exactly this module')
+                self.assertEqual([s for s in ast.walk(node) if isinstance(s, ast.ImportFrom)], [])
+
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
-        composed = H.compose((f'{self.fake.prefix}_nolane.hooks',))
+        self.assertIsNone(importlib.util.find_spec('recursion_core.keys'), 'no keys lane is installed in this tree')
+        composed = H.compose()
         self.assertEqual(composed.methods.registered(), ())
+        self.assertNotIn('recursion_core.keys', sys.modules)
 
     def test_a_package_with_no_hooks_module_is_skipped(self) -> None:
-        package = self.fake.package('bare')
-        composed = H.compose((f'{package}.hooks',))
+        package = self.fake.lane('keys')
+        composed = H.compose()
         self.assertEqual(composed.methods.registered(), ())
         self.assertIn(package, sys.modules, 'the parent package is imported to look for its hooks module')
+        self.assertNotIn(f'{package}.hooks', sys.modules)
 
     def test_a_hooks_module_with_a_missing_dependency_fails_composition(self) -> None:
-        package = self.fake.package('needs', hooks='import a_module_that_does_not_exist_anywhere\n\ndef register(hooks):\n    pass\n')
+        self.fake.lane('keys', hooks='import a_module_that_does_not_exist_anywhere\n\ndef register(hooks):\n    pass\n')
         with self.assertRaises(H.HookError) as caught:
-            H.compose((f'{package}.hooks',))
+            H.compose()
         self.assertIn('ModuleNotFoundError', str(caught.exception))
+        self.assertIn('recursion_core.keys.hooks', str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, ModuleNotFoundError)
 
     def test_a_hooks_module_that_raises_on_import_fails_composition(self) -> None:
-        package = self.fake.package('boom', hooks='raise RuntimeError("at import")\n')
+        self.fake.lane('keys', hooks='raise RuntimeError("at import")\n')
         with self.assertRaises(H.HookError):
-            H.compose((f'{package}.hooks',))
+            H.compose()
 
     def test_a_register_that_raises_fails_composition(self) -> None:
-        package = self.fake.package('late', hooks='def register(hooks):\n    raise RuntimeError("in register")\n')
+        self.fake.lane('keys', hooks='def register(hooks):\n    raise RuntimeError("in register")\n')
         with self.assertRaises(H.HookError):
-            H.compose((f'{package}.hooks',))
+            H.compose()
 
     def test_a_hooks_module_with_no_register_fails_composition(self) -> None:
-        package = self.fake.package('empty', hooks='VALUE = 1\n')
+        self.fake.lane('keys', hooks='VALUE = 1\n')
         with self.assertRaises(H.HookError):
-            H.compose((f'{package}.hooks',))
+            H.compose()
 
     def test_a_parent_package_that_raises_while_it_is_imported_fails_composition(self) -> None:
-        package = self.fake.package('badparent', init='raise RuntimeError("the package itself")\n',
-                                    hooks='def register(hooks):\n    pass\n')
+        self.fake.lane('keys', init='raise RuntimeError("the package itself")\n', hooks=REGISTERS_NOTHING)
         with self.assertRaises(H.HookError):
-            H.compose((f'{package}.hooks',))
+            H.compose()
 
     def test_register_runs_once_and_registers_everything_the_lane_adds(self) -> None:
-        package = self.fake.package('lane', hooks=(
+        package = self.fake.lane('keys', hooks=(
             'CALLS = []\n'
             'def register(hooks):\n'
             '    CALLS.append(hooks)\n'
@@ -366,7 +515,7 @@ class RegistrationTest(unittest.TestCase):
             '    hooks.methods.register("session.list", lambda ctx, params: {"code": "ok", "sessions": []})\n'
             '    hooks.commands.register(("session",), lambda sub: sub.add_parser("session"), lambda args, client: 0)\n'
             '    hooks.engines.register("pi", lambda *a, **k: None)\n'))
-        composed = H.compose((f'{package}.hooks',))
+        composed = H.compose()
         module = sys.modules[f'{package}.hooks']
         self.assertEqual(module.CALLS, [composed])
         self.assertEqual(composed.read_result('run-1'), {'status': 'ok', 'code': None, 'detail': 'run-1'})
@@ -374,21 +523,34 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(composed.commands.names(), ('session',))
         self.assertEqual(composed.engines.names(), ('claude_code', 'codex', 'pi'))
 
+    def test_the_registrants_register_in_the_fixed_order_and_one_deeper_in_the_core_is_found_too(self) -> None:
+        engine = 'def register(hooks):\n    hooks.engines.register(%r, lambda *a, **k: None)\n'
+        self.fake.lane('events', hooks=engine % 'hermes')            # written first, registered second
+        self.fake.lane('keys', hooks=engine % 'pi')
+        self.fake.lane('control.mcp', hooks=engine % 'cursor')       # a package below a package of the core
+        self.fake.module('control.scopes', engine % 'grok')          # a module inside a package of the core
+        self.fake.module('routes.driver_hooks', engine % 'opencode')
+        composed = H.compose()
+        self.assertEqual(composed.engines.names(), ('claude_code', 'codex', 'pi', 'hermes', 'cursor', 'grok', 'opencode'),
+                         "in the order of the fixed list, whatever the order they were installed in")
+
     def test_two_registrants_for_one_hook_fail_composition(self) -> None:
         text = 'def register(hooks):\n    hooks.set("authorize", lambda principal, method, params: None)\n'
-        first, second = self.fake.package('one', hooks=text), self.fake.package('two', hooks=text)
+        self.fake.lane('keys', hooks=text)
+        self.fake.lane('events', hooks=text)
         with self.assertRaises(H.HookError) as caught:
-            H.compose((f'{first}.hooks', f'{second}.hooks'))
+            H.compose()
         self.assertIn('authorize', str(caught.exception))
 
     def test_two_registrants_for_one_method_fail_composition(self) -> None:
         text = 'def register(hooks):\n    hooks.methods.register("session.list", lambda ctx, params: {"code": "ok"})\n'
-        first, second = self.fake.package('m1', hooks=text), self.fake.package('m2', hooks=text)
+        self.fake.lane('keys', hooks=text)
+        self.fake.lane('events', hooks=text)
         with self.assertRaises(H.HookError):
-            H.compose((f'{first}.hooks', f'{second}.hooks'))
+            H.compose()
 
     def test_after_composition_nothing_can_be_registered(self) -> None:
-        composed = H.compose(())
+        composed = H.bare()
         with self.assertRaises(H.HookError):
             composed.set('authorize', lambda principal, method, params: None)
         with self.assertRaises(H.HookError):
@@ -417,7 +579,7 @@ class DefaultsTest(unittest.TestCase):
     """With nothing registered each hook does what the daemon does today."""
 
     def setUp(self) -> None:
-        self.hooks = H.compose(())
+        self.hooks = H.bare()
 
     def test_the_default_authorizer_refuses_only_a_peer_inside_a_run_unit(self) -> None:
         self.assertIsNone(self.hooks.authorize(H.OWNER, 'run.stop', {'run_id': 'run-1'}))
@@ -634,8 +796,9 @@ class Handlers:
 
 
 def row_names_service(case, method, service) -> None:
-    """For one test, the published row of ``method`` names ``service``. No published row names one today, and a
-    registration cannot name what its row does not, so a test of readiness says what the row would say."""
+    """For one test, the published row of ``method`` names ``service``. Only the two reads of a log name one in
+    the published table, and a registration cannot name what its row does not, so a test of readiness on
+    another method says what its row would say."""
     patched = mock.patch.dict(methods.METHODS, {method: methods.METHODS[method]._replace(service=service)})
     patched.start()
     case.addCleanup(patched.stop)
@@ -645,7 +808,7 @@ def table_with(store=None, tenant=methods.INSTALL_TENANT, **handlers):
     table = methods.MethodTable()
     for name, handler in handlers.items():
         keyed = methods.METHODS[name].idempotency == 'command_id'
-        table.register(name, handler, **({'tenant': tenant} if keyed else {}))
+        table.register(name, handler, service=methods.METHODS[name].service, **({'tenant': tenant} if keyed else {}))
     table.store = store
     return table
 
@@ -707,7 +870,7 @@ class MethodTableTest(unittest.TestCase):
         table = methods.MethodTable()
         table.register('session.list', lambda ctx, params: {'code': 'ok', 'sessions': []})
         answer = table.dispatch('methods.list', {}, H.DEVICE, None)
-        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.7'))
+        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.9'))
         self.assertEqual([row['name'] for row in answer['methods']], list(methods.METHODS), 'every row, in the table\'s order')
         self.assertEqual([row['name'] for row in answer['methods'] if row['implemented']],
                          [*methods.BUILT_IN, 'session.list', 'methods.list'])
@@ -1141,7 +1304,7 @@ class EngineTableTest(unittest.TestCase):
             table.register('hermes', 'not a function')
 
     def test_two_compositions_do_not_share_a_table(self) -> None:
-        one, two = H.compose(()), H.compose(())
+        one, two = H.bare(), H.bare()
         self.assertIsNot(one.engines, two.engines)
         self.assertEqual(two.engines.names(), ('claude_code', 'codex'))
 
@@ -1286,7 +1449,7 @@ class ServicesTest(unittest.TestCase):
 
 class AdmissionTest(unittest.TestCase):
     def test_with_nothing_registered_the_gate_refuses_nobody_and_waits_for_nothing(self) -> None:
-        made = H.compose(())
+        made = H.bare()
         self.assertFalse(made.gate.enabled)
         self.assertTrue(made.gate.enter())
         made.begin_close()
@@ -1373,6 +1536,44 @@ class AdmissionTest(unittest.TestCase):
         self.assertTrue(drained.is_set())
 
     @quiet
+    def test_the_drain_itself_keeps_an_interruption_until_the_last_call_has_left(self) -> None:
+        """``drain()`` with no close around it, on one thread, so no schedule decides it. It is interrupted as it
+        takes the condition and again while it waits, with one call inside. It goes on both times, returns
+        control only after the call has left, and raises the FIRST interruption then."""
+        gate = H.Admission()
+        gate.enabled = True
+        gate.enter()
+        gate.close()
+        condition = gate._changed
+        first, second = KeyboardInterrupt('as it takes the condition'), KeyboardInterrupt('while it waits')
+        seen = []
+
+        class Interrupted:
+            def __enter__(self):
+                seen.append(('take', gate.admitted))
+                if len(seen) == 1:
+                    raise first
+                return condition.__enter__()
+
+            def __exit__(self, *exc):
+                return condition.__exit__(*exc)
+
+            def wait(self, timeout=None):
+                seen.append(('wait', gate.admitted))
+                if [what for what, _ in seen].count('wait') == 1:
+                    raise second
+                gate._changed = condition      # the call leaves while the drain waits, as another thread's would
+                gate.leave()
+                return True
+        gate._changed = Interrupted()
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            gate.drain()
+        self.assertEqual(seen, [('take', 1), ('take', 1), ('wait', 1), ('take', 1), ('wait', 1)],
+                         'after each interruption it asked again, with the call still inside')
+        self.assertEqual(gate.admitted, 0, 'it raised only after the last call had left')
+        self.assertIs(raised.exception, first, 'and what it raises is the first interruption')
+
+    @quiet
     def test_a_teardown_error_is_raised_only_after_everything_was_stopped_and_closed(self) -> None:
         log = []
         store = FakeStore(log)
@@ -1410,7 +1611,7 @@ class StartRegistrantTest(unittest.TestCase):
         return made
 
     def test_registering_one_turns_the_versioned_path_on(self) -> None:
-        self.assertFalse(H.compose(()).start_on)
+        self.assertFalse(H.bare().start_on)
         made = self.hooks_with(('workspace', ('workspace',), ('workspace',), lambda principal, request: {}))
         self.assertTrue(made.start_on)
         self.assertEqual(made.declared_fields(), frozenset({'workspace'}))
@@ -1652,18 +1853,23 @@ class FakeStoreTest(unittest.TestCase):
                 with store.transaction():      # and the thread can open one again afterwards
                     pass
 
-    def test_a_closed_store_refuses_access_and_a_commit_across_a_close(self) -> None:
-        store = self.filled()
-        before = (store.receipts, store.rows, store.events)
-        with self.assertRaises(RuntimeError) as caught:
-            with store.transaction() as tx:
-                tx.execute('UPDATE work SET state = ? WHERE command_id = ?', ('written before the close', 'c1'))
+    def test_a_close_is_refused_while_a_transaction_is_open_and_a_closed_store_refuses_access(self) -> None:
+        for serial in (True, False):
+            with self.subTest(serial=serial):
+                store = self.filled(serial=serial)
+                with store.transaction() as tx:
+                    tx.execute('UPDATE work SET state = ? WHERE command_id = ?', ('written before the close', 'c1'))
+                    self.assertEqual(self.refused(store.close), 'transactions_active')
+                    self.assertFalse(store.closed, 'a refused close closed nothing')
+                    tx.append({'type': 'still usable'})
+                self.assertEqual(store.rows[('work', 'c1')]['state'], 'written before the close', 'and the transaction committed')
+                self.assertEqual((store.commits, store.open_transactions), (2, 0))
                 store.close()
-                self.assertEqual(self.refused(lambda: tx.append({'type': 'x'})), 'store_closed')
-        self.assertEqual(str(caught.exception), 'store_closed', 'the commit of a transaction the store closed under is refused')
-        self.assertEqual((store.receipts, store.rows, store.events), before)
-        self.assertEqual(self.refused(lambda: store.transaction().__enter__()), 'store_closed')
-        self.assertEqual(self.refused(lambda: store.register_tables('queue', 1, 'CREATE TABLE q (a TEXT)')), 'store_closed')
+                self.assertTrue(store.closed)
+                self.assertEqual(self.refused(lambda: store.transaction().__enter__()), 'store_closed')
+                self.assertEqual(self.refused(lambda: store.register_tables('queue', 1, 'CREATE TABLE q (a TEXT)')), 'store_closed')
+                self.assertEqual(store.open_transactions, 0, 'a refused entry is not counted as open')
+                self.assertEqual(self.refused(lambda: tx.append({'type': 'x'})), 'transaction_not_active_for_caller')
 
     def test_a_receipt_is_never_replaced(self) -> None:
         store = self.filled()
@@ -1731,6 +1937,143 @@ class FakeStoreTest(unittest.TestCase):
         self.assertEqual(results, {'A': 'committed', 'B': 'conflict'})
         self.assertEqual(store.rows[('work', 'c1')]['state'], 'A', 'the committed write is still there')
         self.assertEqual((store.commits, store.rollbacks), (2, 1))
+
+
+class FakeStoreBoundaryTest(unittest.TestCase):
+    """The second reads' B3: closing and committing share one guard, a declaration can only declare, and what a
+    declaration states is enforced."""
+
+    def refused(self, use) -> str:
+        with self.assertRaises(RuntimeError) as caught:
+            use()
+        return str(caught.exception)
+
+    def test_a_commit_cannot_come_after_a_close_has_returned(self) -> None:
+        """A transaction is past its block and about to COMMIT, held there. Another thread closes the store.
+        The close is refused; it does not return and let the commit follow it."""
+        store = work_store()
+        at_commit, go, done = threading.Event(), threading.Event(), []
+        self.addCleanup(go.set)
+        connect = store._connect
+
+        class HeldAtCommit:
+            def __init__(self, db) -> None:
+                self._db = db
+
+            def execute(self, sql, *args):
+                if sql == 'COMMIT':
+                    at_commit.set()
+                    go.wait(BOUND_S)
+                return self._db.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._db, name)
+        store._connect = lambda: HeldAtCommit(connect())
+
+        def writer():
+            with store.transaction() as tx:
+                tx.execute('INSERT INTO work VALUES (?, ?, ?)', ('c1', 'op-1', 'pending'))
+            done.append('committed')
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        self.assertTrue(at_commit.wait(BOUND_S), 'the transaction is at its commit')
+        self.assertEqual(self.refused(store.close), 'transactions_active')
+        self.assertEqual((store.closed, store.open_transactions), (False, 1))
+        go.set()
+        thread.join(BOUND_S)
+        self.assertEqual((done, store.commits, store.open_transactions), (['committed'], 1, 0))
+        store._connect = connect
+        self.assertEqual(store.rows, {('work', 'c1'): {'operation_id': 'op-1', 'state': 'pending'}})
+        store.close()
+        self.assertTrue(store.closed)
+
+    def test_a_transaction_that_waited_while_the_store_closed_is_refused_when_its_turn_comes(self) -> None:
+        store = work_store()
+        asked, outcome, write = threading.Event(), [], store._write
+
+        class Announcing:
+            def acquire(self):
+                asked.set()
+                return write.acquire()
+
+            def release(self):
+                write.release()
+        write.acquire()                         # stands for a transaction in flight: the next one waits its turn
+        store._write = Announcing()
+
+        def later():
+            try:
+                with store.transaction():
+                    outcome.append('entered')
+            except RuntimeError as exc:
+                outcome.append(str(exc))
+        thread = threading.Thread(target=later, daemon=True)
+        thread.start()
+        self.assertTrue(asked.wait(BOUND_S), 'it has asked for its turn')
+        store.close()                           # nothing is open: the close succeeds
+        write.release()                         # and now its turn comes
+        thread.join(BOUND_S)
+        self.assertEqual((outcome, store.open_transactions, store.commits, store.rollbacks), (['store_closed'], 0, 0, 0))
+
+    def test_a_declaration_can_only_declare_and_leaves_nothing_behind_when_it_fails(self) -> None:
+        store = work_store()
+        with store.transaction() as tx:
+            tx.receipt_put('t1', 'session.turn', 'c1', 'digest-1', {'code': 'ok'})
+            tx.execute('INSERT INTO work VALUES (?, ?, ?)', ('c1', 'op-1', 'pending'))
+            tx.append({'type': 'turn.started'})
+        before = (store.receipts, store.rows, store.events)
+        refused = {
+            "a write to the helper's own table": "UPDATE receipts SET payload_digest = 'replaced'; CREATE TABLE own (id TEXT)",
+            'a second statement that is not SQL': 'CREATE TABLE leaked (id TEXT); THIS IS NOT SQL',
+            'a statement that fails after a table was made': 'CREATE TABLE leaked (id TEXT); CREATE TABLE leaked (id TEXT)',
+            'a view': 'CREATE TABLE seen (id TEXT); CREATE VIEW peek AS SELECT * FROM receipts',
+            'a trigger': 'CREATE TABLE t1 (id TEXT); CREATE TRIGGER sneak AFTER INSERT ON t1 BEGIN DELETE FROM receipts; END',
+            "a change to another lane's table": 'CREATE TABLE mine (id TEXT); ALTER TABLE work ADD COLUMN extra TEXT',
+            "another lane's table dropped": 'CREATE TABLE mine (id TEXT); DROP TABLE work',
+            "an index on another lane's table": 'CREATE TABLE mine (id TEXT); CREATE INDEX on_work ON work (state)',
+            'rows written by a declaration': "CREATE TABLE mine (id TEXT); INSERT INTO mine VALUES ('x')",
+            "the helper's own table read": 'CREATE TABLE mine AS SELECT * FROM receipts',
+            "the helper's own table declared again, quietly, and indexed":
+                'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS receipts (id TEXT); '
+                'CREATE INDEX on_receipts ON receipts (tenant)',
+            'no table at all': 'SELECT 1',
+        }
+        made = {'own', 'leaked', 'seen', 'peek', 't1', 'sneak', 'mine', 'on_work', 'on_receipts'}
+        for what, ddl in refused.items():
+            with self.subTest(declaration=what):
+                with self.assertRaises((sqlite3.Error, RuntimeError)):
+                    store.register_tables('queue', 1, ddl)
+                names = {row[0] for row in store._read('SELECT name FROM sqlite_master')}
+                self.assertEqual(names & made, set(), 'nothing of a refused declaration is left')
+                self.assertEqual((store.receipts, store.rows, store.events), before)
+        # The lane was never recorded as declared, so it can still declare: a table and an index of its own.
+        store.register_tables('queue', 1, 'CREATE TABLE queue_items (item_id TEXT PRIMARY KEY, state TEXT); '
+                                          'CREATE INDEX by_state ON queue_items (state)')
+        with store.transaction() as tx:
+            tx.execute('INSERT INTO queue_items VALUES (?, ?)', ('item-1', 'queued'))
+            self.assertEqual(tx.execute('SELECT item_id FROM queue_items WHERE state = ?', ('queued',)), [('item-1',)])
+
+    def test_a_foreign_key_a_declaration_states_is_enforced(self) -> None:
+        store = FakeStore()
+        store.register_tables('queue', 1, 'CREATE TABLE parents (id TEXT PRIMARY KEY); '
+                                          'CREATE TABLE children (id TEXT PRIMARY KEY, parent TEXT NOT NULL REFERENCES parents (id))')
+        with self.assertRaises(sqlite3.IntegrityError):
+            with store.transaction() as tx:
+                tx.execute('INSERT INTO children VALUES (?, ?)', ('child-1', 'no-such-parent'))
+        self.assertEqual(store.rows, {})
+        with store.transaction() as tx:
+            tx.execute('INSERT INTO parents VALUES (?)', ('parent-1',))
+            tx.execute('INSERT INTO children VALUES (?, ?)', ('child-1', 'parent-1'))
+        self.assertEqual(set(store.rows), {('parents', 'parent-1'), ('children', 'child-1')})
+
+    def test_an_object_key_that_is_not_text_is_refused_and_not_turned_into_text(self) -> None:
+        store = work_store()
+        for write in (lambda tx: tx.append({'type': 'x', 'by_id': {1: 'one'}}),
+                      lambda tx: tx.receipt_put('t1', 'session.turn', 'c9', 'd', {'code': 'ok', 'items': [{2: 'two'}]})):
+            with self.assertRaises(TypeError):
+                with store.transaction() as tx:
+                    write(tx)
+        self.assertEqual((store.receipts, store.events), ({}, []))
 
 
 def composed(table, built_in):
@@ -1935,6 +2278,158 @@ class NestedDispatchTest(unittest.TestCase):
         self.assertEqual((self.asked, ran), ([], ['the handler goes on', 1]), 'and that read\'s callback waited for the commit')
 
 
+class CallbackOwnershipTest(unittest.TestCase):
+    """The second reads' B1: a callback belongs to the dispatch that registered it, not to a place in a list."""
+
+    def setUp(self) -> None:
+        self.store = work_store()
+
+    def table(self, **handlers):
+        table = table_with(self.store, **handlers)
+        return table, composed(table, lambda method, params: {'code': 'ok'})
+
+    @quiet
+    def test_a_read_that_fails_discards_its_own_callbacks_and_leaves_its_siblings(self) -> None:
+        """Read A is made on another thread: it registers a callback and waits. Read B, made by the command
+        itself, registers its own and returns. Then A fails. The command joins A and commits. B's callback
+        runs, and the command's own on both sides of it; A's does not. (A used to cut the shared list from
+        the place it had found it at, and took B's with it.)"""
+        for failure in (ValueError('A fails after B registered'), methods.NotAccepted({'code': 'busy'})):
+            ran, a_registered, a_may_fail = [], threading.Event(), threading.Event()
+            self.addCleanup(a_may_fail.set)
+
+            def failing(ctx, params, failure=failure, ran=ran, a_registered=a_registered, a_may_fail=a_may_fail):
+                ctx.after_commit(lambda: ran.append('A'))
+                a_registered.set()
+                a_may_fail.wait(BOUND_S)
+                raise failure
+
+            def succeeding(ctx, params, ran=ran):
+                ctx.after_commit(lambda: ran.append('B'))
+                return {'code': 'ok', 'sessions': []}
+
+            def turn(ctx, params, ran=ran, a_registered=a_registered, a_may_fail=a_may_fail):
+                answers = {}
+                ctx.after_commit(lambda: ran.append('own-1'))
+                thread = threading.Thread(target=lambda: answers.update(a=ctx.call('session.status', {})), daemon=True)
+                thread.start()
+                self.assertTrue(a_registered.wait(BOUND_S))
+                answers['b'] = ctx.call('session.list', {})
+                ctx.after_commit(lambda: ran.append('own-2'))
+                a_may_fail.set()
+                thread.join(BOUND_S)
+                return {'code': 'ok', 'a': answers['a']['code'], 'b': answers['b']['code']}
+            with self.subTest(failure=type(failure).__name__):
+                self.store = work_store()
+                table, call = self.table(**{'session.turn': turn, 'session.status': failing, 'session.list': succeeding})
+                answer = table.dispatch('session.turn', dict(TURN), H.OWNER, call)
+                self.assertEqual((answer['code'], answer['b']), ('ok', 'ok'))
+                self.assertIn(answer['a'], ('unavailable', 'busy'))
+                self.assertEqual((self.store.commits, ran), (1, ['own-1', 'B', 'own-2']))
+
+    def test_a_read_that_leaves_by_an_interruption_contributes_no_callback(self) -> None:
+        ran = []
+
+        def interrupted(ctx, params):
+            ctx.after_commit(lambda: ran.append('the interrupted read'))
+            raise KeyboardInterrupt
+
+        def turn(ctx, params):
+            try:
+                ctx.call('session.status', {})
+            except KeyboardInterrupt:
+                pass                    # the command's handler catches it and goes on to commit
+            ctx.after_commit(lambda: ran.append('own'))
+            return {'code': 'ok'}
+        table, call = self.table(**{'session.turn': turn, 'session.status': interrupted})
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, call), {'code': 'ok'})
+        self.assertEqual((self.store.commits, ran), (1, ['own']))
+
+    @quiet
+    def test_what_a_failed_read_called_is_discarded_with_it(self) -> None:
+        """A calls a read that succeeds and registers; then A fails. The descendant's callback goes with A's,
+        and a sibling of A keeps its own."""
+        ran = []
+
+        def descendant(ctx, params):
+            ctx.after_commit(lambda: ran.append('descendant of A'))
+            return {'code': 'ok', 'sessions': []}
+
+        def failing(ctx, params):
+            ctx.after_commit(lambda: ran.append('A'))
+            self.assertEqual(ctx.call('session.list', {})['code'], 'ok')
+            raise ValueError('A fails after its descendant succeeded')
+
+        def sibling(ctx, params):
+            ctx.after_commit(lambda: ran.append('sibling'))
+            return {'code': 'ok'}
+
+        def turn(ctx, params):
+            self.assertEqual(ctx.call('session.status', {})['code'], 'unavailable')
+            self.assertEqual(ctx.call('session.export', {})['code'], 'ok')
+            self.assertEqual(ctx.call('session.list', {})['code'], 'ok')      # the same read, called by the command: kept
+            return {'code': 'ok'}
+        table, call = self.table(**{'session.turn': turn, 'session.status': failing, 'session.list': descendant,
+                                    'session.export': sibling})
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, call), {'code': 'ok'})
+        self.assertEqual(ran, ['sibling', 'descendant of A'], 'only the one the command itself called')
+
+    def test_after_commit_belongs_to_a_running_handler(self) -> None:
+        """Registering from a callback, or through a context kept after its handler returned, is rejected: it
+        is not accepted and then never run."""
+        for method, params in (('session.turn', dict(TURN)), ('session.status', {})):
+            kept, ran, refused = [], [], []
+
+            def handler(ctx, params, kept=kept, ran=ran, refused=refused):
+                kept.append(ctx)
+
+                def callback():
+                    ran.append('callback')
+                    try:
+                        ctx.after_commit(lambda: ran.append('registered from a callback'))
+                    except RuntimeError as exc:
+                        refused.append(str(exc))
+                ctx.after_commit(callback)
+                return {'code': 'ok'}
+            with self.subTest(method=method):
+                table, call = self.table(**{method: handler})
+                self.assertEqual(table.dispatch(method, params, H.OWNER, call), {'code': 'ok'})
+                self.assertEqual((ran, len(refused)), (['callback'], 1))
+                self.assertIn('running handler', refused[0])
+                with self.assertRaises(RuntimeError):
+                    kept[0].after_commit(lambda: ran.append('after the handler returned'))
+                self.assertEqual(ran, ['callback'])
+
+    @quiet
+    def test_a_registration_that_arrives_after_the_command_finished_is_refused_and_not_lost_in_silence(self) -> None:
+        """What the contract forbids: a handler returns without joining a thread it made a nested call on. That
+        read's registration arrives after the command has committed. It is refused, loudly."""
+        entered, go, outcome, ran, threads = threading.Event(), threading.Event(), [], [], []
+        self.addCleanup(go.set)
+
+        def slow(ctx, params):
+            entered.set()
+            go.wait(BOUND_S)
+            try:
+                ctx.after_commit(lambda: ran.append('late'))
+                outcome.append('accepted')
+            except RuntimeError:
+                outcome.append('refused')
+                raise
+            return {'code': 'ok'}
+
+        def turn(ctx, params):
+            threads.append(threading.Thread(target=lambda: ctx.call('session.status', {}), daemon=True))
+            threads[0].start()
+            self.assertTrue(entered.wait(BOUND_S))
+            return {'code': 'ok'}                # without joining it
+        table, call = self.table(**{'session.turn': turn, 'session.status': slow})
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, call), {'code': 'ok'})
+        go.set()
+        threads[0].join(BOUND_S)
+        self.assertEqual((outcome, ran, self.store.commits), (['refused'], [], 1))
+
+
 class OwnedAnswerTest(unittest.TestCase):
     """R5: the committed response is an owned snapshot."""
 
@@ -1977,6 +2472,43 @@ class OwnedAnswerTest(unittest.TestCase):
         got['why'].append('changed by the caller')
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'busy', 'why': ['turn in flight']})
         self.assertEqual(table.dispatch('session.status', {}, H.OWNER, None), {'code': 'ok', 'items': ['a']})
+
+
+class ReceiptReadTest(unittest.TestCase):
+    """A replay is the caller's own copy whatever the store hands back, the store's own object included. (The
+    fake decodes a fresh answer at every read, so it cannot show this; a store that keeps one object can.)"""
+
+    def test_a_replay_from_a_store_that_hands_out_its_own_object_cannot_be_changed_through_it(self) -> None:
+        kept = {'code': 'ok', 'items': ['first']}
+        digest = methods.payload_digest(TURN)
+
+        class Tx:
+            def receipt_get(self, tenant, method, command_id):
+                return digest, kept              # the very object, every time
+
+            def receipt_put(self, *args):
+                raise AssertionError('a replay stores nothing')
+
+        class Store:
+            @contextlib.contextmanager
+            def transaction(self):
+                yield Tx()
+        table = table_with(Store(), **{'session.turn': lambda ctx, params: self.fail('a replay calls no handler')})
+        first = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
+        first['items'].append('changed by the first caller')
+        first['code'] = 'changed'
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'ok', 'items': ['first']})
+        self.assertEqual(kept, {'code': 'ok', 'items': ['first']})
+
+    def test_a_refusal_from_the_tenant_function_is_the_callers_own_copy(self) -> None:
+        refusal = methods.NotAccepted({'code': 'session_unknown', 'session_id': 'ses-1'})
+
+        def tenant_of(principal, params):
+            raise refusal
+        table = table_with(work_store(), tenant=tenant_of, **{'session.turn': lambda ctx, params: {'code': 'ok'}})
+        first = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
+        first['code'] = 'changed by the caller'
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'session_unknown', 'session_id': 'ses-1'})
 
 
 class NumberRuleTest(unittest.TestCase):
@@ -2022,14 +2554,27 @@ class NumberRuleTest(unittest.TestCase):
 class PublishedRowTest(unittest.TestCase):
     """R9: a method's service is its published row's, and a registration cannot name another."""
 
-    def test_no_published_row_names_a_service_today_and_none_can_be_registered_with_one(self) -> None:
-        self.assertEqual({row.service for row in methods.METHODS.values()}, {None})
+    def test_only_the_two_reads_of_a_log_name_a_service_and_no_other_row_can_be_registered_with_one(self) -> None:
+        self.assertEqual({name: row.service for name, row in methods.METHODS.items() if row.service is not None},
+                         {'events.read': 'events', 'events.follow': 'events'}, 'the published table, draft 9')
         self.assertEqual(methods.Row._fields, ('scope', 'mutating', 'idempotency', 'beta', 'service'))
         table = methods.MethodTable()
         with self.assertRaises(methods.MethodTableError) as caught:
             table.register('session.list', lambda ctx, params: {'code': 'ok'}, service='not-in-published-rows')
         self.assertIn('published row', str(caught.exception))
         self.assertEqual(table.registered(), ())
+        # The real rows: a read of a log is registered with the service its row names, and with no other.
+        for service in (None, 'sessions', ''):
+            with self.subTest(service=service):
+                with self.assertRaises(methods.MethodTableError):
+                    methods.MethodTable().register('events.follow', lambda ctx, params: {'code': 'ok'}, service=service)
+        table.register('events.follow', lambda ctx, params: {'code': 'ok'}, service='events')
+        table.register('events.read', lambda ctx, params: {'code': 'ok'}, service='events')
+        self.assertEqual(table.services_needed(), {'events.follow': 'events', 'events.read': 'events'})
+        table.service_ready = lambda name: False
+        self.assertEqual(table.dispatch('events.read', {}, H.OWNER, None), {'code': 'unavailable', 'detail': 'service_starting'})
+        table.service_ready = lambda name: name == 'events'
+        self.assertEqual(table.dispatch('events.read', {}, H.OWNER, None), {'code': 'ok'})
 
     def test_a_row_that_names_a_service_is_registered_with_that_service_and_no_other(self) -> None:
         row_names_service(self, 'session.list', 'sessions')
@@ -2128,18 +2673,32 @@ class IntentMembersTest(unittest.TestCase):
 
 
 class WatchedLock:
-    """A lock that says when a thread asks for it while another holds it."""
+    """The lifecycle's lock, which says when a thread asks for it while another holds it, and can be made to
+    interrupt the next thread that asks (once), before or after that thread has taken it."""
 
     def __init__(self) -> None:
-        self._inner, self.contended = threading.Lock(), threading.Event()
+        self._inner, self.contended = threading.RLock(), threading.Event()
+        self._held = threading.Event()
+        self.interrupt_next = None        # 'before' or 'after': raise KeyboardInterrupt in the next acquire, once
 
     def acquire(self, *args, **kwargs):
-        if self._inner.locked():
+        if self._held.is_set() and not self._inner._is_owned():
             self.contended.set()
-        return self._inner.acquire(*args, **kwargs)
+        when, self.interrupt_next = self.interrupt_next, None
+        if when == 'before':
+            raise KeyboardInterrupt
+        taken = self._inner.acquire(*args, **kwargs)
+        self._held.set()
+        if when == 'after':
+            raise KeyboardInterrupt       # it is held: the interruption arrived on the way back
+        return taken
 
     def release(self) -> None:
+        self._held.clear()
         self._inner.release()
+
+    def _is_owned(self) -> bool:
+        return self._inner._is_owned()
 
     def __enter__(self):
         self.acquire()
@@ -2185,7 +2744,9 @@ class WorkerService:
             self.go_on.wait(BOUND_S)
         self._quit.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(BOUND_S)
+            if self._thread.is_alive():
+                raise AssertionError('the test worker did not stop within BOUND_S')
 
 
 class LifecycleTest(unittest.TestCase):
@@ -2250,20 +2811,49 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual((events.stop_calls, alive_at_close, store.closed), (2, [[]], True))
 
     @quiet
+    def test_stopping_the_services_keeps_an_interruption_and_stops_every_one_before_it_raises(self) -> None:
+        """``stop_services`` on its own, with no close around it that would come back. The newest service's stop
+        fails once in the ordinary way; the older one's is interrupted once. When the call ends every service
+        has stopped, and what it raises is the interruption, although the ordinary failure came first."""
+        made, store, (events, sessions), _ = self.made(
+            lambda store: WorkerService('events', store, fail_stops=1, failure=KeyboardInterrupt),
+            lambda store: WorkerService('sessions', store, fail_stops=1))
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        with self.assertRaises(KeyboardInterrupt):
+            made.stop_services(context)
+        self.assertEqual((sessions.stop_calls, events.stop_calls, sessions.alive(), events.alive(), made._started),
+                         (2, 2, False, False, []))
+        self.assertFalse(store.closed, 'stopping the services closes no store')
+        made.finish_close(context)
+
+    @quiet
     def test_an_interruption_of_the_wait_for_admitted_calls_does_not_end_the_wait(self) -> None:
         made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store))
         context = H.ServiceContext()
         made.open_store('/state')
         made.start_services(context)
         self.assertTrue(made.gate.enter())                 # a call is inside
-        waited, wait = threading.Event(), made.gate._changed.wait
+        waits, wait = [], made.gate._changed.wait
+        # No schedule decides this test. The close moves on in one of two ways after the interruption: it waits
+        # again (right), or it begins to tear down (wrong). Either sets ``moved_on``, and what the teardown saw
+        # is written down at the moment it begins, so a wrong close is caught however the threads are scheduled.
+        moved_on, admitted_at_teardown, stop = threading.Event(), [], events.stop
 
         def interrupted_once(timeout=None):
-            if not waited.is_set():
-                waited.set()
+            waits.append(timeout)
+            if len(waits) == 1:
                 raise KeyboardInterrupt
+            moved_on.set()
             return wait(timeout)
+
+        def stopping(context):
+            admitted_at_teardown.append(made.gate.admitted)
+            moved_on.set()
+            return stop(context)
         made.gate._changed.wait = interrupted_once
+        events.stop = stopping
         outcome = []
 
         def close():
@@ -2274,13 +2864,14 @@ class LifecycleTest(unittest.TestCase):
                 outcome.append('interrupted')
         closer = threading.Thread(target=close, daemon=True)
         closer.start()
-        self.assertTrue(waited.wait(BOUND_S))
-        self.assertTrue(events.in_stop.wait(0) is False and not store.closed, 'the interruption tore nothing down')
-        self.assertEqual(outcome, [], 'and did not end the close while the call is inside')
+        self.assertTrue(moved_on.wait(BOUND_S), 'the close went on after the interruption, one way or the other')
+        self.assertEqual((admitted_at_teardown, store.closed, outcome), ([], False, []),
+                         'it went on WAITING: nothing is torn down and the close has not ended while the call is inside')
         made.gate.leave()
         closer.join(BOUND_S)
         self.assertEqual((outcome, events.stop_calls, alive_at_close, store.closed), (['interrupted'], 1, [[]], True),
                          'it is raised once everything has been torn down')
+        self.assertEqual(admitted_at_teardown, [0], 'and the teardown began only when no call was inside')
 
     def test_a_second_close_waits_for_the_first_and_closes_nothing_itself(self) -> None:
         made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
@@ -2290,18 +2881,23 @@ class LifecycleTest(unittest.TestCase):
         events.go_on = threading.Event()
         self.addCleanup(events.go_on.set)
         done = []
-        first = threading.Thread(target=lambda: (made.finish_close(context), done.append('first')), daemon=True)
+        # What each closer finds at the moment its own call returns is written down then, so no schedule decides
+        # the test: a second close that returned early would say so however the threads are run.
+        first = threading.Thread(target=lambda: (made.finish_close(context), done.append(('first', store.closed))), daemon=True)
         first.start()
         self.assertTrue(events.in_stop.wait(BOUND_S), 'the first close is inside the service\'s stop')
-        second = threading.Thread(target=lambda: (made.finish_close(context), done.append('second')), daemon=True)
+        second = threading.Thread(target=lambda: (made.finish_close(context), done.append(('second', store.closed, events.alive()))),
+                                  daemon=True)
         second.start()
         self.assertTrue(made._lifecycle.contended.wait(BOUND_S), 'the second close has arrived')
-        self.assertEqual((done, store.closed, events.alive()), ([], False, True), 'and waits: nothing is closed under the first')
+        self.assertEqual((store.closed, events.alive()), (False, True), 'nothing is closed under the first')
         events.go_on.set()
         first.join(BOUND_S)
         second.join(BOUND_S)
-        self.assertEqual((sorted(done), events.stop_calls, alive_at_close), (['first', 'second'], 1, [[]]),
-                         'one teardown: the service was stopped once and the store closed once')
+        self.assertEqual((sorted(done), events.stop_calls, alive_at_close),
+                         ([('first', True), ('second', True, False)], 1, [[]]),
+                         'the second returned only when the teardown was complete; the service was stopped once and '
+                         'the store closed once')
         made.finish_close(context)       # and a close after it returns at once
         self.assertEqual(len(alive_at_close), 1)
 
@@ -2332,16 +2928,238 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual([(what, name) for what, name, _ in log], [('start', 'events'), ('stop', 'events')])
 
 
+    @quiet
+    def test_an_interruption_while_the_drain_takes_its_condition_does_not_end_the_wait(self) -> None:
+        """The second reads' witness. The drain is interrupted as it TAKES the admission condition, not while it
+        waits on it, with one call inside. The close goes on waiting: nothing is stopped and the store stays
+        open until the call has left. (The close used to take the interruption as the end of the drain.)"""
+        made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store))
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        self.assertTrue(made.gate.enter())                 # a call is inside
+        condition, drain, stop = made.gate._changed, made.gate.drain, events.stop
+        moved_on, admitted_at_teardown, state = threading.Event(), [], {'draining': False, 'taken': 0}
+
+        class InterruptedOnce:
+            def __enter__(self):
+                if state['draining']:
+                    state['taken'] += 1
+                    if state['taken'] == 1:
+                        raise KeyboardInterrupt        # as a signal would, while the drain asks for the condition
+                    moved_on.set()                     # the drain asked again: it went on
+                return condition.__enter__()
+
+            def __exit__(self, *exc):
+                return condition.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(condition, name)
+
+        def draining():
+            state['draining'] = True
+            return drain()
+
+        def stopping(context):
+            admitted_at_teardown.append(made.gate.admitted)
+            moved_on.set()
+            return stop(context)
+        made.gate._changed, made.gate.drain, events.stop = InterruptedOnce(), draining, stopping
+        outcome = []
+
+        def close():
+            try:
+                made.finish_close(context)
+                outcome.append('returned')
+            except KeyboardInterrupt:
+                outcome.append('interrupted')
+        closer = threading.Thread(target=close, daemon=True)
+        closer.start()
+        self.assertTrue(moved_on.wait(BOUND_S), 'the close went on after the interruption, one way or the other')
+        self.assertEqual((admitted_at_teardown, store.closed, outcome), ([], False, []),
+                         'it went on WAITING: nothing is torn down while the call is inside')
+        state['draining'] = False                          # the test's own leave is not the drain
+        made.gate.leave()
+        closer.join(BOUND_S)
+        self.assertEqual((outcome, admitted_at_teardown, events.stop_calls, alive_at_close, store.closed),
+                         (['interrupted'], [0], 1, [[]], True), 'the interruption is raised once everything is torn down')
+
+    def test_a_second_close_that_is_interrupted_while_it_waits_for_the_first_goes_on_waiting(self) -> None:
+        made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        events.go_on = threading.Event()
+        self.addCleanup(events.go_on.set)
+        seen = {}
+        first = threading.Thread(target=lambda: (made.finish_close(context), seen.update(first='returned')), daemon=True)
+        first.start()
+        self.assertTrue(events.in_stop.wait(BOUND_S), "the first close is inside the service's stop")
+        made._lifecycle.interrupt_next = 'before'          # the next thread that asks for the lifecycle is interrupted
+
+        def second_close():
+            # What the second close finds at the moment it leaves, however the threads are scheduled.
+            try:
+                made.finish_close(context)
+                seen['second'] = ('returned', store.closed, events.alive())
+            except KeyboardInterrupt:
+                seen['second'] = ('interrupted', store.closed, events.alive())
+        second = threading.Thread(target=second_close, daemon=True)
+        second.start()
+        self.assertTrue(made._lifecycle.contended.wait(BOUND_S), 'the second close has arrived, and was interrupted there')
+        events.go_on.set()
+        first.join(BOUND_S)
+        second.join(BOUND_S)
+        self.assertEqual(seen, {'first': 'returned', 'second': ('interrupted', True, False)},
+                         'its interruption is raised only after the owner finished: the store closed, the worker gone')
+        self.assertEqual((events.stop_calls, alive_at_close), (1, [[]]))
+
+    def test_an_interruption_that_arrives_as_the_lifecycle_is_taken_leaves_it_free_afterwards(self) -> None:
+        """The interruption lands after the lock was taken and before the caller knows it. The teardown runs
+        once, the interruption is raised after it, and the lifecycle is not left held."""
+        made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        made._lifecycle.interrupt_next = 'after'
+        with self.assertRaises(KeyboardInterrupt):
+            made.finish_close(context)
+        self.assertEqual((events.stop_calls, alive_at_close, store.closed), (1, [[]], True))
+        again = threading.Thread(target=lambda: made.finish_close(context), daemon=True)
+        again.start()
+        again.join(BOUND_S)
+        self.assertFalse(again.is_alive(), 'another caller is not left waiting for a lifecycle nobody holds')
+
+    @unittest.skipUnless(hasattr(signal, 'pthread_kill'), 'needs a signal that can be aimed at one thread')
+    def test_a_real_interrupt_while_a_close_waits_for_the_lifecycle_is_kept_until_the_owner_has_finished(self) -> None:
+        """The same with a real SIGINT, sent to this thread while it waits for the lifecycle that another close
+        owns. On a runtime where a blocked lock is interrupted by a signal, the interruption is kept and the
+        wait begins again; on one where it is not (free-threaded 3.14 on this machine), the interruption
+        arrives once the lock has been taken. Either way it is raised only after the owner has finished."""
+        if threading.current_thread() is not threading.main_thread():
+            self.skipTest('a signal is handled by the main thread only')
+        made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        events.go_on = threading.Event()
+        self.addCleanup(events.go_on.set)
+        let_go = []
+        first = threading.Thread(target=lambda: made.finish_close(context), daemon=True)
+        first.start()
+        self.assertTrue(events.in_stop.wait(BOUND_S))
+        asked_again, asks, acquire = threading.Event(), [], made._lifecycle.acquire
+
+        def counting(*args, **kwargs):
+            if threading.current_thread() is threading.main_thread():
+                asks.append(True)
+                if len(asks) == 2:
+                    asked_again.set()              # the interruption was kept, and the wait began again
+            return acquire(*args, **kwargs)
+        made._lifecycle.acquire = counting
+
+        def interrupt_then_let_the_owner_finish():
+            if made._lifecycle.contended.wait(BOUND_S):
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+                # Time for a runtime that interrupts a blocked lock to show that the wait began again. It never
+                # decides a pass: where nothing is interrupted the owner is simply let go after it.
+                asked_again.wait(SIGNAL_SETTLE_S)
+            let_go.append(True)
+            events.go_on.set()
+        # The signal interrupts as Python's own handler does, but only while this thread is inside the close: a
+        # close that did not wait has returned by then, and the signal must fail this test, not end the run.
+        inside, landed = [False], []
+
+        def interrupt(signum, frame):
+            landed.append(inside[0])
+            if inside[0]:
+                raise KeyboardInterrupt
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, interrupt))
+        helper = threading.Thread(target=interrupt_then_let_the_owner_finish, daemon=True)
+        helper.start()
+        inside[0] = True
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                made.finish_close(context)         # blocks behind the first close; the SIGINT lands here
+        finally:
+            inside[0] = False
+        at_the_raise = (list(let_go), store.closed, events.alive())
+        first.join(BOUND_S)
+        helper.join(BOUND_S)
+        self.assertEqual(landed, [True], 'one signal, and it landed inside the close')
+        self.assertEqual(at_the_raise, ([True], True, False),
+                         'the interruption was raised only after the owner had finished: the store closed, the worker gone')
+        self.assertIn(len(asks), (1, 2), 'asked once, or again after an interruption of the wait')
+        self.assertEqual((events.stop_calls, alive_at_close), (1, [[]]))
+
+    @quiet
+    def test_a_later_interruption_of_a_stop_is_not_lost_behind_an_earlier_ordinary_failure(self) -> None:
+        failures = [RuntimeError('could not stop'), KeyboardInterrupt()]
+
+        class Stubborn(WorkerService):
+            def stop(inner, context) -> None:
+                if failures:
+                    inner.stop_calls += 1
+                    raise failures.pop(0)
+                super().stop(context)
+        made, store, (events,), alive_at_close = self.made(lambda store: Stubborn('events', store))
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        with self.assertRaises(KeyboardInterrupt):
+            made.finish_close(context)
+        self.assertEqual((events.stop_calls, alive_at_close, store.closed), (3, [[]], True))
+
+    @quiet
+    def test_a_service_whose_stop_failed_is_still_tracked_while_its_stop_is_tried_again(self) -> None:
+        tracked = []
+
+        class Asks(WorkerService):
+            def stop(inner, context) -> None:
+                tracked.append((made.service_ready('events'), [service.name for service in made._started]))
+                super().stop(context)
+        made, store, (events,), _ = self.made(lambda store: Asks('events', store, fail_stops=2))
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        with self.assertRaises(RuntimeError):
+            made.finish_close(context)
+        self.assertEqual(tracked, [(True, ['events'])] * 3, 'tracked, and ready, until a stop has returned')
+        self.assertEqual((made._started, made.service_ready('events')), ([], False))
+
+    def test_a_lifecycle_method_called_from_inside_another_is_refused_and_does_not_wait_for_itself(self) -> None:
+        made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store))
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        seen, asked, stop = [], [], events.stop
+
+        def stopping(context):
+            if not asked:
+                asked.append(True)       # once, whatever comes of it: a teardown that did re-enter ends, and is seen
+                for method in (made.finish_close, made.stop_services):
+                    try:
+                        method(context)
+                        seen.append('ran')
+                    except H.HookError:
+                        seen.append('refused')
+            return stop(context)
+        events.stop = stopping
+        made.finish_close(context)
+        self.assertEqual((seen, events.stop_calls, alive_at_close, store.closed), (['refused', 'refused'], 1, [[]], True))
+
+
 class AncestorDiscoveryTest(unittest.TestCase):
     """A registrant whose parent's own parent is not installed is absent, not broken (the read's note 4)."""
 
     def test_an_absent_ancestor_is_absence_and_a_broken_installed_one_fails(self) -> None:
-        fake = FakePackages(self)
-        made = H.compose((f'{fake.prefix}_nothing_here.child.hooks', f'{fake.prefix}_nothing_here.a.b.c'))
+        fake = FakeLanes(self)
+        self.assertIsNone(importlib.util.find_spec('recursion_core.control.mcp'), 'that ancestor is absent in this tree')
+        made = H.compose()
         self.assertEqual(made.methods.registered(), ())
-        broken = fake.package('broken_parent', init='raise RuntimeError("this package does not import")\n')
+        fake.lane('control.mcp', init='raise RuntimeError("this package does not import")\n')
         with self.assertRaises(H.HookError):
-            H.compose((f'{broken}.child.hooks',))
+            H.compose()
 
 
 if __name__ == "__main__":

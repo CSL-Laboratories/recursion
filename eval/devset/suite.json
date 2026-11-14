@@ -1,0 +1,112 @@
+{
+ "schema": "recursion-eval-suite/1",
+ "id": "dev",
+ "version": "1",
+ "split": "dev",
+ "frozen": false,
+ "runner": null,
+ "evaluated_commit": null,
+ "engines": {
+  "standin": "eval-standin/1",
+  "claude_code": null
+ },
+ "arms": {},
+ "tasks": [
+  {
+   "id": "dev-01-slugify",
+   "file": "tasks/dev-01-slugify.txtar",
+   "sha256": "ccc401792d3671575c655d7860267bfee65f26baa882f7ec2e6bd9d15c299c50",
+   "parent_tree": "eb6a068b3d9bb94b2c7f8e82969649b86e78d985",
+   "parent_commit": "cf1e4b1010f15440b50324272fc80b9e236b0854",
+   "commit": "27c9367563bdff1bc0816ea90523061f723c9c25"
+  },
+  {
+   "id": "dev-02-roman",
+   "file": "tasks/dev-02-roman.txtar",
+   "sha256": "29dd5d7d710cec4ee8f436a19913ca4cdabb054a78c0a4634662ef55d2bf8509",
+   "parent_tree": "489897b9925f8ef38519402a1bf5a878078bde2a",
+   "parent_commit": "91d6a78a2ada6c925bf1fce4145ba42293ac80b1",
+   "commit": "d1315d27f1abbc22fe6a8d14fba9b4aa35a666a7"
+  },
+  {
+   "id": "dev-03-merge-intervals",
+   "file": "tasks/dev-03-merge-intervals.txtar",
+   "sha256": "e094ccbb030d6560d0d692cc3464e1e7bde11977f85493450c875f1edbce732f",
+   "parent_tree": "188f6bae85195662f050a7b8e0219fae575ece6c",
+   "parent_commit": "6c8b2643b8df7eb641002fdd1fcccdcc4cf64777",
+   "commit": "aad77675a3c73bdb98fad0809ef2f43ab907fea1"
+  },
+  {
+   "id": "dev-04-top-words",
+   "file": "tasks/dev-04-top-words.txtar",
+   "sha256": "a691ed06ca91f1fdef32f893fb5833e816afe27eacf22c9a0be83e167c38e345",
+   "parent_tree": "48ae416262ea29cb724c9cf2ca52732feaec5709",
+   "parent_commit": "56a26ff7db9043e94c6a774b333f5dd64bbf84b8",
+   "commit": "661d1c748450ac99b106e9e749c96bcb9fdda1c0"
+  },
+  {
+   "id": "dev-05-semver",
+   "file": "tasks/dev-05-semver.txtar",
+   "sha256": "f5866615ed1972443855120285434d2567a9d98e7206d92dac07ba9ebfa123da",
+   "parent_tree": "9b3255f23d016774d6fa8c53d4206b061cee5388",
+   "parent_commit": "62d4bf6ec20f5297b7396ec2b5a301e8255222c3",
+   "commit": "a724d077e6c064eb1a7d2f90d0fb58af06955aa3"
+  },
+  {
+   "id": "dev-06-config",
+   "file": "tasks/dev-06-config.txtar",
+   "sha256": "8905d9b0f1d91e9df511ae874857e80378856115b2658eb8010a96a6443dac5e",
+   "parent_tree": "9c8aa245bdaae33a03f242a3237e41bd29bf4339",
+   "parent_commit": "6d5975e0306d3da0d2ce89e66498347041eca5a1",
+   "commit": "eeaa56a01422225357e8030d481f9d451507d754"
+  },
+  {
+   "id": "dev-07-lru",
+   "file": "tasks/dev-07-lru.txtar",
+   "sha256": "2576db5f793e3e27a1c40acfa693ca6332b765ee07aead3b4e4d80cea191c7f5",
+   "parent_tree": "ffd655c221c80ab49534c987bbe9aaada6747e27",
+   "parent_commit": "5aa685f1b32220ba44caec7050bd90338243c2a6",
+   "commit": "9da675db9bcd161606eee349408b5dc8d60ad6b8"
+  },
+  {
+   "id": "dev-08-column-total",
+   "file": "tasks/dev-08-column-total.txtar",
+   "sha256": "3b97890c713589adbe2b05d2e440a3aef68384fada4e2e9fa3eda2b4e6dcf4b9",
+   "parent_tree": "fda2164e687f010676c802b7ae8eff3b4f60ec8e",
+   "parent_commit": "e9d6f38cca8294827d13d1715583e0c324addf32",
+   "commit": "dbe53d179e740ae3291e869c27b7010f58ebe086"
+  },
+  {
+   "id": "dev-09-run-length",
+   "file": "tasks/dev-09-run-length.txtar",
+   "sha256": "e6f02d6eab3b25d43da23f9439fcde7ac20931df24f1456be2406d120a7fc52e",
+   "parent_tree": "e80bbaaa72261662c51db7e56149d9f1486eb170",
+   "parent_commit": "4d167ff6527bc11b2e497b423b7fe0c23d690250",
+   "commit": "bbba709b98c5f5c6b1de0d2b018ee7dc571333c7"
+  },
+  {
+   "id": "dev-10-rotate",
+   "file": "tasks/dev-10-rotate.txtar",
+   "sha256": "af848f8449c9255cb0d249e40f6a8a6c95f53430eeb7055cee0d204206b69735",
+   "parent_tree": "dd3e4aca857a8f3acae1d50a9c2d007a9c1206c7",
+   "parent_commit": "48d846d728fa06fcb0bf22b0dfe5c8ade6fb2e82",
+   "commit": "a92333843c960a92959ec63bb00b46c9fa4e6fa4"
+  },
+  {
+   "id": "dev-11-unique",
+   "file": "tasks/dev-11-unique.txtar",
+   "sha256": "4c8923e13104115ee97bcc6aa01ecdb237b35120a5d8a395ffb9d0fd7b7625dc",
+   "parent_tree": "35df2aaaa74e3455d658f12846eb2a5490450330",
+   "parent_commit": "420ab9f958c72f7808b615492739678b414681db",
+   "commit": "fc58c1d3c83441e934bb1686c70d8bbe6aef870d"
+  },
+  {
+   "id": "dev-12-normalize-path",
+   "file": "tasks/dev-12-normalize-path.txtar",
+   "sha256": "56c4346425d7127539f47815ffe89f0e5d73ff90b7cc4bfd456d0b1dba9b64e4",
+   "parent_tree": "ccc21e61055e2aa535f4d9715c10674da72fa833",
+   "parent_commit": "a21974c6ca7e2da8ff100719bcd3c62d9bd2a7f5",
+   "commit": "4e7b2763409bb7a9523fcfca31d66ac2bab3b2af"
+  }
+ ]
+}

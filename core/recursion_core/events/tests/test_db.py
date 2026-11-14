@@ -99,6 +99,34 @@ class Announcing:
         return False
 
 
+class Bounded:
+    """Stands in for the helper's lock: a wait for it that would never end fails the test instead of hanging it."""
+
+    def __init__(self, lock) -> None:
+        self._lock = lock
+
+    def acquire(self, blocking=True, timeout=-1):
+        if blocking and timeout == -1:
+            if not self._lock.acquire(timeout=BOUND_S):
+                raise AssertionError('waited for the helper\'s lock without end')
+            return True
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        self._lock.release()
+
+    def locked(self):
+        return self._lock.locked()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
 class FailingConnection:
     """Stands in for the writer connection: the named statement raises the given error, the rest pass."""
 
@@ -169,6 +197,7 @@ class Cases:
 
     def test_a_second_transaction_in_the_same_thread_raises_and_does_not_wait(self) -> None:
         store = self.make()
+        store._lock = Bounded(store._lock)
         with store.transaction():
             self.assertEqual(self.refused(lambda: store.transaction().__enter__()), 'nested_transaction')
             self.assertEqual(self.refused(lambda: store.register_tables('queue', 1, QUEUE)), 'nested_transaction')
@@ -354,6 +383,12 @@ class Cases:
                     with self.assertRaises(TypeError):
                         tx.receipt_put(tenant, method, command_id, payload, {'code': 'ok'})
         self.assertEqual(committed(store, 'SELECT * FROM receipts'), [])
+        # A key that cannot exist is the caller's error on a read too, not a quiet "no receipt".
+        for tenant, method, command_id, _ in bad[:5]:
+            with self.subTest(read=(tenant, method, command_id)):
+                with store.transaction() as tx:
+                    with self.assertRaises(TypeError):
+                        tx.receipt_get(tenant, method, command_id)
 
     def test_a_duplicate_command_id_returns_the_identical_answer_and_another_payload_is_conflict(self) -> None:
         store = self.make()
@@ -469,6 +504,7 @@ class Cases:
 
     def test_a_declaration_can_only_declare_and_leaves_nothing_behind(self) -> None:
         store = self.make()
+        store.register_tables('owners', 1, 'CREATE TABLE owners_items (owner TEXT); CREATE INDEX by_owner ON owners_items (owner)')
         with store.transaction() as tx:
             tx.receipt_put('t1', 'session.turn', CMD, digest('a'), {'code': 'ok'})
             tx.execute('INSERT INTO work VALUES (?, ?, ?)', (CMD, 'op-1', 'pending'))
@@ -488,6 +524,8 @@ class Cases:
             "the helper's table read": 'CREATE TABLE mine AS SELECT * FROM receipts',
             "the helper's table declared again, quietly": 'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS receipts (id TEXT)',
             "the helper's meta table": 'CREATE TABLE store_meta (id TEXT)',
+            "the helper's indexes rebuilt": 'CREATE TABLE mine (id TEXT); REINDEX receipts',
+            "another lane's indexes rebuilt": 'CREATE TABLE mine (id TEXT); REINDEX by_owner',
             'a temporary table': 'CREATE TEMP TABLE mine (id TEXT)',
             'a pragma': 'CREATE TABLE mine (id TEXT); PRAGMA foreign_keys=OFF',
             'an attached file': "ATTACH DATABASE ':memory:' AS other; CREATE TABLE other.mine (id TEXT)",
@@ -637,6 +675,7 @@ class Cases:
 
     def test_a_close_is_refused_while_a_transaction_is_open_and_a_closed_store_refuses(self) -> None:
         store = self.make()
+        store._lock = Bounded(store._lock)
         with store.transaction() as tx:
             tx.execute('INSERT INTO work VALUES (?, ?, ?)', (CMD, 'op-1', 'written before the close'))
             self.assertEqual(self.refused(store.close), 'transactions_active')

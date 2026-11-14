@@ -196,12 +196,11 @@ def _check_value(value, depth: int = 0) -> None:
 def _wire(value) -> str:
     """The stored text of a value: canonical JSON (sorted keys, no spaces), UTF-8 that encodes. Only objects
     with text keys, arrays, text, whole and finite numbers, booleans and null are kept, so what is read back
-    equals what was written and belongs to the reader. A tuple, a set or any other object is refused, and a
-    text with a lone surrogate is refused."""
+    equals what was written and belongs to the reader. A tuple, a set or any other object is refused. A text
+    with a lone surrogate is refused when it is written: SQLite's binding cannot encode it (UnicodeEncodeError,
+    a ValueError), and the transaction it was in is rolled back by its block."""
     _check_value(value)
-    text = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
-    text.encode('utf-8')            # UnicodeEncodeError (a ValueError) on a lone surrogate
-    return text
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
 
 
 def _timestamp(seconds: float) -> str:
@@ -787,9 +786,7 @@ class EventStore:
                 created.add(first)
                 return sqlite3.SQLITE_OK
             if action == sqlite3.SQLITE_CREATE_INDEX:
-                if second not in created or first in taken:
-                    return sqlite3.SQLITE_DENY
-                indexes.add(first)
+                indexes.add(first)          # only on a table of its own: indexing READs the table, refused below
                 return sqlite3.SQLITE_OK
             if action == sqlite3.SQLITE_REINDEX:          # what creating an index asks for, of that same index
                 return sqlite3.SQLITE_OK if first in indexes else sqlite3.SQLITE_DENY

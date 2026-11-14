@@ -403,7 +403,10 @@ class RouteStarter:
                 if ctx.result is None:
                     ctx.finished(route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
                                                        detail=f'drive owner failure: {type(exc).__name__}'))
-                if ctx.process is not None and not getattr(self._daemon, 'closed', False):
+                # "Unless the daemon is closing" is the whole of the close, its drain included: the gate is shut
+                # as closing begins, before the daemon itself says closed. Closing leaves a run alive.
+                closing = getattr(self._daemon, 'closed', False) or (self._hooks is not None and self._hooks.gate.closed)
+                if ctx.process is not None and not closing:
                     self._settle(ctx)  # ends what is left of its tree, as after any result
             finally:
                 release()  # whatever the settling did: the run is not left active with nobody driving it
@@ -1035,49 +1038,63 @@ class Composition:
         self.client = ControlClient(control.page_transport)  # the page goes through the seams (S5, S11, S13)
         self._closing = threading.RLock()  # the close has one owner (control.hooks.own_teardown)
         self._closed = False
+        self._close_step = 0  # how far the close has got: one that was interrupted goes on from here
 
     def close(self):
         """Close once, and return only when that close is complete. One caller owns it. Another that calls while
         it runs, or after it, waits for the owner and closes nothing itself; if it is interrupted while it waits
         it goes on waiting, and raises the interruption only once the owner has finished. So nobody who called
-        this can go on to close the registry while a service or a store of this composition is still in use."""
+        this can go on to close the registry while a service or a store of this composition is still in use.
+
+        The close is complete only when its last step has been taken. Whatever interrupts it, at its first step
+        as at any other, is kept, and the same owner goes on from the step that was interrupted: an interruption
+        never leaves the composition marked closed with calls still admitted."""
         kept = []
         control_hooks.own_teardown(self._closing, kept)
         try:
-            if not self._closed:
+            while not self._closed:
                 try:
-                    self._close()
-                except BaseException as exc:  # noqa: BLE001 - every step was attempted; raised below, once
+                    self._close(kept)
+                except BaseException as exc:  # noqa: BLE001 - between two steps: kept, and the close goes on
                     kept.append(exc)
-                self._closed = True
         finally:
             self._closing.release()
         control_hooks.raise_kept(kept)
 
-    def _close(self):
+    def _close(self, kept):
         """Seam S13. First no new client call is admitted, on any entry, and whoever waits is told. Then the
         transport stops. Then every admitted call is waited for, WITHOUT a timeout and with its services and
         stores alive; only then are the services stopped, in reverse, and the store closed. With nothing
-        registered the first and third steps do nothing, and this is the close it always was."""
-        if self.hooks is not None:
-            self.hooks.begin_close()
-        try:
-            self.server.close()
-        finally:
+        registered the first and third steps do nothing, and this is the close it always was.
+
+        The steps are taken in that order, each once it is reached. Closing the admission and the wait for the
+        admitted calls must RETURN before anything after them is touched: such a step is taken again for as
+        long as it raises. An interruption of any other step takes that step again too (each can be taken
+        twice). An ordinary failure of one of the others is kept and the close goes on, as it always did."""
+        def begin():
+            if self.hooks is not None:
+                self.hooks.begin_close()
+
+        def finish():
+            if self.hooks is not None:
+                self.hooks.finish_close(self.context)
+
+        def unmark():
+            if self.context is not None and getattr(self.context.registry, 'mark_changed', None) is not None:
+                self.context.registry.mark_changed = None
+
+        steps = [(begin, True), (self.server.close, False), (finish, True), (unmark, False), (self.door.close, False)]
+        steps.extend((item.close, False) for item in (self.plugins, self.breaker) if item is not None)
+        while self._close_step < len(steps):
+            action, must_return = steps[self._close_step]
             try:
-                if self.hooks is not None:
-                    try:
-                        self.hooks.finish_close(self.context)
-                    finally:
-                        if self.context is not None and getattr(self.context.registry, 'mark_changed', None) is not None:
-                            self.context.registry.mark_changed = None
-            finally:
-                try:
-                    self.door.close()
-                finally:
-                    for item in (self.plugins, self.breaker):
-                        if item is not None:
-                            item.close()
+                action()
+            except BaseException as exc:  # noqa: BLE001 - kept; raised once the whole close is over
+                kept.append(exc)
+                if must_return or not isinstance(exc, Exception):
+                    continue
+            self._close_step += 1
+        self._closed = True
 
 
 def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.monotonic,
@@ -1135,6 +1152,14 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
                         'earlier trips, run bindings and faults are not known to this daemon')
     plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, **(plugin_options or {}))
     adapters, binaries = {}, {}
+    # PROVISIONAL (rulings of Nov 13 and 14, 2026). What an adapter EXECUTES is known here for the two seed
+    # constructors only, and only where nobody replaced them: the class is this file's own import, and its command is
+    # the configured binary or the constructor's own default. A factory a lane registered may hand its adapter any
+    # executable, whatever options it was given, and nothing yet makes it say which; such an engine gets no entry
+    # below, so no selected route entry is launchable for it. What replaces this is a contract by which a registered
+    # factory states its adapter's executable.
+    seeds = {'claude_code': ClaudeCodeAdapter, 'codex': CodexAdapter}
+    defaults = {engine: seed.__init__.__kwdefaults__['binary'] for engine, seed in seeds.items()}
     # Seam S3: the engine table's active factories, which are today's two classes in today's order unless a lane
     # registered one. Seam S7: the credential lookup is the hooks'; its default raises KeyError(connection_id).
     def credentials(connection_id, env_name):
@@ -1155,7 +1180,9 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
             launcher = ProductionLauncher(engine, daemon, manager, state_dir, hooks=hooks)
             options = {'binary': entry['binary']} if entry and entry.get('binary') else {}
             adapters[engine] = factory(launcher, clock, credentials, environ, **options)
-            binaries[engine] = options.get('binary')   # None: the adapter launches its own default command name
+            seed = seeds.get(engine)
+            if seed is not None and factory is seed and type(adapters[engine]) is seed:
+                binaries[engine] = options.get('binary') or defaults[engine]
     except BaseException:
         # A lane's factory failed: the plugin host and the breaker store opened above are not left open.
         try:
@@ -1178,11 +1205,13 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     def launchable(entry):
         """PROVISIONAL (ruling of Nov 13, 2026). An adapter is built once, above, with the configured entry's binary,
         and that is the binary every launch of its engine runs. So a route entry a registrant chose is launchable
-        only when it names that same binary: the same absolute path, or none where the adapter was built with
-        none (it then launches its default command name, found on the child's PATH). The comparison is of what
-        the two entries SAY, as the launcher would be given it; two spellings of one file are not the same."""
+        only when it names that same command: the same absolute path, or none where the adapter was built with
+        none (both then mean the constructor's default command name, found on the child's PATH). The comparison
+        is of what the two SAY, as the launcher would be given it; two spellings of one file are not the same.
+        And only for an engine whose executable is known (``binaries``): never for a replaced or registered
+        factory."""
         engine = entry['route']['engine']
-        return engine in binaries and entry.get('binary') == binaries[engine]
+        return engine in binaries and (entry.get('binary') or defaults[engine]) == binaries[engine]
 
     api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s,
                      methods=table, start_hooks=hooks, launchable=launchable)

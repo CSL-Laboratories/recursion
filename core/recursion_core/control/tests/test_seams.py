@@ -61,6 +61,7 @@ import pathlib
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -3461,6 +3462,7 @@ class CliSeamTest(unittest.TestCase):
         five = (['list'], ['status', 'run-1'], ['stop', 'run-1'],
                 ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p'], ['conditions'])
         self.assertEqual(tuple(argv[0] for argv in five), commands.BUILT_IN)
+        self.assertEqual(cli.BUILT_IN, commands.BUILT_IN, "the CLI's own five are the names no family may register")
         for argv in five:
             with self.subTest(argv=argv):
                 client = Client()
@@ -3480,6 +3482,46 @@ class CliSeamTest(unittest.TestCase):
                     self.assertEqual(cli.run(argv, lambda: client), cli.EXIT_ERROR)
                 self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
                 self.assertEqual(client.calls, [])
+
+
+class CliImportTest(unittest.TestCase):
+    """What importing the CLI loads, in a process of its own: the five commands cost what they cost before the
+    seams, so none of the seam modules is loaded for them. (It is told in a fresh process because this one has
+    them all loaded already.)"""
+
+    SEAM_MODULES = {'recursion_core.control.hooks', 'recursion_core.control.methods', 'recursion_core.control.commands',
+                    'recursion_core.routes.engines'}
+    CODE = (
+        "import contextlib, io, json, sys\n"
+        "from recursion_core.control import cli\n"
+        "class Client:\n"
+        "    def call(self, method, params=None):\n"
+        "        return {'code': 'ok', 'runs': []}\n"
+        "loaded = {'import': sorted(name for name in sys.modules if name.startswith('recursion_core'))}\n"
+        "statuses = []\n"
+        "for argv in (['list'], ['status', 'run-1'], ['stop', 'run-1'],\n"
+        "             ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p'], ['conditions']):\n"
+        "    with contextlib.redirect_stdout(io.StringIO()):\n"
+        "        statuses.append(cli.run(argv, Client))\n"
+        "loaded['five'] = sorted(name for name in sys.modules if name.startswith('recursion_core'))\n"
+        "with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):\n"
+        "    statuses.append(cli.run(['session', 'ses-1'], Client))\n"
+        "loaded['other'] = sorted(name for name in sys.modules if name.startswith('recursion_core'))\n"
+        "print(json.dumps({'loaded': loaded, 'statuses': statuses}))\n")
+
+    def test_the_cli_and_its_five_commands_load_none_of_the_seam_modules(self) -> None:
+        core = str(pathlib.Path(H.__file__).resolve().parents[2])
+        done = subprocess.run([sys.executable, '-B', '-c', self.CODE], capture_output=True, text=True, check=False,
+                              env={**os.environ, 'PYTHONPATH': core})
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        told = json.loads(done.stdout)
+        self.assertEqual(told['statuses'][:5], [cli.EXIT_OK] * 5, 'each of the five ran')
+        for when in ('import', 'five'):
+            self.assertEqual(self.SEAM_MODULES & set(told['loaded'][when]), set(), f'after {when}')
+        self.assertIn('recursion_core.control.cli', told['loaded']['import'])
+        # Anything else needs the families: only then are the seam modules brought in.
+        self.assertEqual(told['statuses'][5], cli.EXIT_USAGE, 'a name nobody registered, with nothing installed')
+        self.assertLessEqual({'recursion_core.control.hooks', 'recursion_core.control.commands'}, set(told['loaded']['other']))
 
 
 KEYED = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'client_key': 'k1'}
@@ -3610,8 +3652,11 @@ class StartPathOnTest(unittest.TestCase):
         made.freeze()
         return made
 
-    def api(self, starter=None, routing=True, ids=None):
-        return control_api(self.registry, starter, start_hooks=self.hooks(routing), ids=ids)
+    def api(self, starter=None, routing=True, ids=None, comparator=lambda entry: True):
+        """``comparator`` stands in for the composition's own word that it would launch exactly the entry a
+        registrant chose (PROVISIONAL: the binary rule). These tests are about the start path, so theirs says yes
+        to every entry; a control API that is given none refuses every chosen entry, which has a test of its own."""
+        return control_api(self.registry, starter, start_hooks=self.hooks(routing), ids=ids, launchable=comparator)
 
     def ran(self) -> list:
         return [name for name, *_ in self.log]
@@ -3774,6 +3819,29 @@ class StartPathOnTest(unittest.TestCase):
         after = registry.get('run-1')
         self.assertEqual((after['launch'], after['principal'], after['start_key']), (kept['launch'], kept['principal'], kept['start_key']))
         self.assertEqual(len(registry.list()), 1)
+
+    def test_with_nobody_to_compare_a_chosen_entry_is_refused_on_a_new_start_and_on_a_relaunch(self) -> None:
+        """PROVISIONAL, with the binary rule. A control API that was given no comparator cannot say that the
+        composition would launch exactly the entry a registrant chose, so it lets none through unchecked: a new
+        start stores nothing, and a relaunch writes no new starting intent and reaches no starter."""
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}
+        refused = {'code': 'unavailable', 'detail': 'start_registrant_failed'}
+        api, registry, starter = self.api(comparator=None)
+        self.assertEqual(api.call('run.start', request), refused)
+        self.assertEqual((registry.list(), starter.calls), ([], []))
+        # A record made while there was a comparator, whose start failed. Its retry comes to an API with none.
+        api, registry, starter = self.api(Recorder(fail=1))
+        self.assertEqual(api.call('run.start', request)['code'], 'start_failed')
+        kept = registry.get('run-1')
+        self.assertEqual(kept['launch']['route_entry'], entry('codex'))
+        later = Recorder()
+        with_none, _, _ = control_api(registry, later, start_hooks=self.hooks(), ids=iter(("run-2",)).__next__)
+        self.assertEqual(with_none.call('run.start', request), refused)
+        self.assertEqual((registry.get('run-1'), later.calls, self.ran()), (kept, [], ['routing', 'workspace'] * 2),
+                         'the stored record is as it was, nothing was launched and no registrant ran again')
+        # A start for which no registrant chose an entry has nothing to compare, and needs nobody.
+        named = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'hand_pick': {'engine': 'none'}}
+        self.assertEqual(with_none.call('run.start', named)['code'], 'started')
 
     def test_a_failed_start_that_was_stopped_and_an_unconfirmed_one_are_answered_as_the_base_answers_them(self) -> None:
         api, registry, starter = self.api(Recorder(fail=2))

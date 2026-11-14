@@ -21,7 +21,8 @@ from unittest import mock
 import recursion_core.daemon as daemon_module
 from recursion_core.control import hooks as H, methods
 from recursion_core.control.client import SocketAPI
-from recursion_core.control.tests.test_seams import FakeStore, Service, WatchedLock as OwnerLock, quiet, row_names_service
+from recursion_core.control.tests.test_seams import (
+    FakeStore, Service, WatchedLock as OwnerLock, answered_from_another_thread, quiet, row_names_service, watch)
 from recursion_core.daemon import Daemon, Registry, control_adapter as adapter, launcher
 from recursion_core.daemon.tests.test_composition import (
     BOOT, LINUX, LINUX_ONLY, STANDIN, ProcessUnitManager, Units, until,
@@ -961,6 +962,106 @@ class LaunchSeamTest(Composed):
         self.assertEqual((again['code'], again['run']['run_id'], log), ('started', run_id, ['registrant']), again)
         self.stop(composed.control, run_id)
 
+    def chooses(self, log=None):
+        """A start registrant that chooses the configured entry itself, as a router would."""
+        def register(made):
+            made.start_registrant('routing', ('hand_pick',), ('route_entry', 'route_decision'),
+                                  lambda principal, request: (log.append('registrant') if log is not None else None) or {
+                                      'route_entry': json.loads(json.dumps(self.routes['claude_code'])), 'route_decision': None},
+                                  chooses_engine=True)
+        return register
+
+    def test_only_an_unreplaced_seed_constructor_has_an_executable_the_composition_can_vouch_for(self):
+        """PROVISIONAL (the second read's B1). What the composition compared a chosen entry with was the option it
+        HANDED the factory, not what the returned adapter runs. A factory a lane put in the seed's place can run
+        anything: here it builds the real adapter with another binary than the one it was given. Its engine has
+        no executable the composition can vouch for, so a chosen entry is refused before anything is stored,
+        although the entry and the configuration say the same path."""
+        other = self.tmp / 'bin' / 'elsewhere' / 'claude'
+        other.parent.mkdir(mode=0o700)
+        shutil.copyfile(self.engine, other)
+        os.chmod(other, 0o700)
+        built = []
+
+        def replacement(launch, clock, credentials, environ, **options):
+            built.append(options)
+            return ClaudeCodeAdapter(launch, clock, credentials, environ, binary=str(other))
+
+        def register(made):
+            self.chooses()(made)
+            made.engines.register('claude_code', replacement, replace=True)
+        _, composed = self.boot(hooks_of(register))
+        self.assertEqual(built, [{'binary': str(self.engine)}], 'the factory was handed the configured binary')
+        answer = composed.control.call('run.start', {'tenant': 't1', 'prompt': LIVE, 'client_key': 'k1'})
+        self.assertEqual(answer, {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+        self.assertEqual((composed.control.registry.list(), self.units.started), ([], []), 'no run, no launch record, no unit')
+        # A subclass in the seed's place is not the seed either.
+        self.shutdown()
+
+        class Mine(ClaudeCodeAdapter):
+            pass
+
+        def register_subclass(made):
+            self.chooses()(made)
+            made.engines.register('claude_code', Mine, replace=True)
+        _, composed = self.boot(hooks_of(register_subclass))
+        self.assertEqual(composed.control.call('run.start', {'tenant': 't1', 'prompt': LIVE, 'client_key': 'k1'}),
+                         {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+        self.assertEqual(composed.control.registry.list(), [])
+
+    def test_a_relaunch_is_refused_when_the_factory_changed_behind_an_unchanged_configuration(self):
+        """PROVISIONAL, the same on a relaunch. The entry was chosen and stored under the seed constructor and its
+        start failed. The daemon comes back with the SAME route file and another factory for that engine. The
+        retry writes no new starting intent, launches nothing and runs no registrant; the stored record is as
+        it was. With the seed constructor back, the same retry relaunches the run."""
+        log, verdicts = [], ['not_this_time']
+
+        def register(made, factory=None):
+            self.chooses(log)(made)
+            made.set('launch_check', lambda ctx, executable: verdicts.pop(0) if verdicts else None)
+            if factory is not None:
+                made.engines.register('claude_code', factory, replace=True)
+        request = {'tenant': 't1', 'prompt': LIVE, 'client_key': 'k1'}
+        _, composed = self.boot(hooks_of(register))
+        first = composed.control.call('run.start', request)
+        self.assertEqual(first['code'], 'start_failed', first)
+        run_id = first['run_id']
+        self.shutdown()
+        _, composed = self.boot(hooks_of(lambda made: register(made, lambda *args, **options: ClaudeCodeAdapter(*args, **options))))
+        before = composed.control.registry.get(run_id)
+        self.assertEqual(composed.control.call('run.start', request), {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+        self.assertEqual((composed.control.registry.get(run_id), self.units.started, log), (before, [], ['registrant']))
+        self.shutdown()
+        _, composed = self.boot(hooks_of(register))
+        again = composed.control.call('run.start', request)
+        self.assertEqual((again['code'], again['run']['run_id'], log), ('started', run_id, ['registrant']), again)
+        self.stop(composed.control, run_id)
+
+    def test_with_no_binary_configured_and_none_chosen_both_mean_the_constructors_default(self):
+        """PROVISIONAL, the constructor default. The route file names no binary and the chosen entry names none:
+        both mean the command the seed constructor launches by default, found on the child's PATH. That entry is
+        launchable. One that names a path is not: the adapter would launch its default, not that path."""
+        self.routes['claude_code']['binary'] = None
+        self.environ['PATH'] = f"{self.tmp / 'bin'}:/usr/bin:/bin"       # where the default command name is found
+        choices = [dict(json.loads(json.dumps(self.routes['claude_code'])), binary=str(self.engine)),
+                   json.loads(json.dumps(self.routes['claude_code']))]
+
+        def register(made):
+            made.start_registrant('routing', ('hand_pick',), ('route_entry', 'route_decision'),
+                                  lambda principal, request: {'route_entry': choices[0], 'route_decision': None}, chooses_engine=True)
+        _, composed = self.boot(hooks_of(register))
+        request = {'tenant': 't1', 'prompt': LIVE, 'client_key': 'k1'}
+        self.assertEqual(composed.control.call('run.start', request), {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+        self.assertEqual(composed.control.registry.list(), [])
+        del choices[0]
+        answer = composed.control.call('run.start', request)
+        self.assertEqual(answer['code'], 'started', answer)
+        run_id = answer['run']['run_id']
+        self.assertIsNone(composed.control.registry.get(run_id)['launch']['route_entry']['binary'])
+        argv = self.units.started[-1]['argv']
+        self.assertEqual(argv[argv.index('--') + 1], str(self.engine), 'the default name, found on the PATH, is what ran')
+        self.stop(composed.control, run_id)
+
     def test_a_route_entry_a_registrant_chose_is_what_the_starter_launches(self):
         chosen = json.loads(json.dumps(self.routes['claude_code']))
         chosen['route']['model'] = 'chosen-model'
@@ -1252,6 +1353,33 @@ class RunThreadLifetimeTest(unittest.TestCase):
         self.assertEqual(seen, [False], 'the store was open for as long as the hand-over lasted')
         self.assertTrue(until(lambda: not starter.active('run-1')))
 
+    @quiet
+    def test_an_owner_that_fails_while_the_composition_closes_is_released_and_its_run_is_not_settled(self):
+        """The second read's B3. "Unless the daemon is closing" is the whole of the close: while it waits for the
+        hand-over the daemon has not said closed yet, and the composition is closing. An owner that fails then
+        is released, its run gets the engine-error result, and nothing of the run is settled: closing leaves a
+        run alive."""
+        store = FakeStore()
+        entered, leave, settled = threading.Event(), threading.Event(), []
+        self.addCleanup(leave.set)
+
+        class Owner:
+            def run(self, ctx, request, service, record_result, fault_run, settle, release):
+                ctx.process = mock.Mock()              # it launched an engine
+                entered.set()
+                leave.wait(HELD_BOUND_S)
+                raise RuntimeError('lost the worker')
+        made = self.made(store, drive_owner=lambda ctx, request: Owner())
+        starter, service = self.starter(made, 0)
+        starter._settle = lambda ctx: settled.append((ctx.run_id, made.gate.closed))
+        with self.assertRaises(adapter.StartRefused) as caught:
+            starter(dict(DriveOwnerSeamTest.PARAMS))
+        self.assertEqual(caught.exception.code, 'launch_timeout')
+        self.assertFalse(starter._daemon.closed, 'the daemon itself has not said closed')
+        close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), entered, leave)
+        self.assertTrue(until(lambda: not starter.active('run-1')), 'released')
+        self.assertEqual(settled, [], 'nothing of the run was settled while the composition closed')
+
     def test_once_closing_has_begun_a_run_is_refused_before_its_chooser_is_asked(self):
         store, asked = FakeStore(), []
         made = self.made(store, drive_owner=lambda ctx, request: asked.append(ctx.run_id))
@@ -1263,7 +1391,7 @@ class RunThreadLifetimeTest(unittest.TestCase):
         self.assertEqual((asked, service.requests), ([], []), 'nothing was chosen and nothing was driven')
         self.assertTrue(until(lambda: not starter.active('run-1')))
 
-    def test_a_close_waits_for_a_launch_that_is_inside_one_of_its_hooks(self):
+    def test_a_close_waits_for_a_launch_that_is_inside_one_of_its_hooks_and_that_launch_then_starts_nothing(self):
         for hook in ('launch_check', 'working_directory'):
             with self.subTest(hook=hook):
                 store = FakeStore()
@@ -1275,8 +1403,9 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 user.start()
                 close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), entered, leave)
                 user.join(HELD_BOUND_S)
-                self.assertEqual((seen, outcome), ([False], ['reached the unit manager']),
-                                 'the store was open while the hook was inside, and until the launch it belongs to had ended')
+                self.assertEqual((seen, outcome), ([False], [(c.LAUNCH_REFUSED, 'daemon_closing')]),
+                                 'the store was open while the hook was inside; closing had begun when it returned, so nothing is launched')
+                manager.prepare.assert_not_called()
 
     def test_once_closing_has_begun_nothing_is_launched_and_no_launch_hook_is_asked(self):
         store, asked = FakeStore(), []
@@ -1922,6 +2051,43 @@ class ServicesSeamTest(Composed):
 
     def test_a_second_close_that_is_interrupted_while_it_waits_goes_on_waiting(self):
         self.two_closers(interrupted=True)
+
+    def test_an_interruption_at_the_first_step_of_the_close_does_not_end_it(self):
+        """The second read's B2. A call is inside. The close is interrupted at its very first step, as it takes
+        the admission condition: before the condition is taken, and after. It used to raise there, with the
+        composition marked closed, the gate open and the call still admitted, and a later close did nothing. Now
+        the same owner goes on: the gate is shut, the close waits for the call with the store open, everything
+        is closed once, and only then is the interruption raised. The condition is left free."""
+        for when in ('before', 'after'):
+            log, entered, leave = [], threading.Event(), threading.Event()
+            self.addCleanup(leave.set)
+            made, store, events = self.registered(log, entered, leave)
+            daemon, composed = self.boot(made)
+            self.open.remove((daemon, composed))
+            self.addCleanup(daemon.close)
+            caller = threading.Thread(target=lambda: composed.control.call('events.follow', {'session_id': 'ses-1'}), daemon=True)
+            caller.start()
+            self.assertTrue(entered.wait(HELD_BOUND_S), 'the call was admitted and is inside')
+            counts, close_plugins, outcome = [], composed.plugins.close, []
+            composed.plugins.close = lambda: (counts.append('plugins'), close_plugins())[1]
+            lock = watch(made.gate)
+            lock.interrupt_next = when                  # the next taking of the admission condition is the close's first step
+
+            def close():
+                try:
+                    composed.close()
+                    outcome.append(('returned', store.closed, list(counts)))
+                except KeyboardInterrupt:
+                    outcome.append(('interrupted', store.closed, made.gate.admitted, list(counts)))
+            with self.subTest(interrupted=when):
+                close_waits(self, made, store, close, entered, leave)
+                caller.join(HELD_BOUND_S)
+                self.assertEqual(outcome, [('interrupted', True, 0, ['plugins'])],
+                                 'raised only once the whole close was over: the store closed, nobody inside, the plugin host closed')
+                self.assertTrue(made.gate.closed and made.closing.is_set())
+                composed.close()                        # it is closed: a later close does nothing
+                self.assertEqual(counts, ['plugins'])
+                self.assertEqual((lock._is_owned(), answered_from_another_thread(self, made.gate)), (False, [False]))
 
     def test_a_failure_inside_the_close_is_raised_once_after_everything_was_closed(self):
         log, entered, leave = [], threading.Event(), threading.Event()

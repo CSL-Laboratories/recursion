@@ -7,14 +7,18 @@ MANDATORY built-ins: every daemon answers them, none of them can answer ``unsupp
 cannot replace one.
 
 ``METHODS`` lists every method of the published table (``schemas/control/v1/methods.table.v1.json``) with
-the three facts the dispatcher needs: its scope, whether it mutates, and how it is keyed. A name that is
-not in ``METHODS`` is answered ``method_unknown``, as today, a name some plan has reserved included. A
-name that is in ``METHODS`` and has no handler in this daemon is answered ``unsupported`` with detail
-``not_implemented``. Adding a row is a request to the lane that keeps this file.
+the facts the dispatcher needs: its scope, whether it mutates, how it is keyed, and the service it waits
+for. A name that is not in ``METHODS`` is answered ``method_unknown``, as today, a name some plan has
+reserved included. A name that is in ``METHODS`` and has no handler in this daemon is answered
+``unsupported`` with detail ``not_implemented``. Adding a row is a request to the lane that keeps this file.
+
+A method's service declaration is part of its versioned public row and cannot be changed privately by
+registration. The same published version supplies scope, mutation/keying, capability requirements,
+fallbacks and readiness; composition rejects disagreement.
 
 A lane registers a handler from its registrant module's ``register(hooks)``::
 
-    hooks.methods.register("session.turn", handler, service="sessions", tenant=tenant_of)
+    hooks.methods.register("session.turn", handler, service=None, tenant=tenant_of)
 
     handler(ctx, params) -> answer          a dict with a "code"
     tenant_of(principal, params) -> tenant  for a method keyed by command_id only; see "the tenant" below
@@ -26,16 +30,30 @@ A lane registers a handler from its registrant module's ``register(hooks)``::
 ``ctx.tx``
     For a method keyed by ``command_id``: the open transaction of the event store, owned by the
     DISPATCHER. The handler makes its state changes and appends its events through it and opens no
-    transaction of its own. For every other method it is ``None``, and a handler that needs to read
-    consistently opens its own.
+    transaction of its own. For every other method it is ``None``; a read that is NOT inside a command
+    may open its own, through its lane's interface.
 ``ctx.after_commit(fn)``
     Schedules ``fn()`` for after the dispatcher's commit is confirmed. See "After the commit" below.
 ``ctx.call(method, params)``
     Calls another control method as the same principal, inside this dispatch: it passes the authorizer
-    again and takes no new client admission. It reaches the built-in methods and the methods that are
-    not keyed by ``command_id``. A method keyed by ``command_id`` cannot be called this way (it answers
-    ``request_invalid``, detail ``nested_command``): one command has one receipt and one transaction.
-    Inside a handler, another lane's change is made through that lane's own interface with ``ctx.tx``.
+    again and takes no new client admission.
+
+    A nested call inherits the active dispatch's admission and transaction restrictions. While a command
+    transaction is open, ``ctx.call`` refuses mutating built-ins with ``request_invalid/nested_effect``,
+    as well as command-id methods with ``request_invalid/nested_command``. Registry, daemon, engine and
+    filesystem effects use the committed work-intent path. Nested read handlers still receive
+    ``ctx.tx=None``; they cannot open a second helper transaction. Same-transaction lane reads and
+    writes use the lane's interface with the already-owned ``ctx.tx``.
+
+    Callbacks registered by successful nested reads belong to the enclosing command's callback scope.
+    They run in registration order only after that command commits and releases its locks; they are
+    discarded if it rolls back. A failed nested handler contributes no callbacks. Outside a command, a
+    successful read's callbacks run after its handler returns.
+
+    The restriction follows the dispatch, not the caller's position in it: a command that calls a read
+    that calls a built-in is still inside the command. A method keyed by ``command_id`` is refused as
+    ``nested_command`` wherever the nested call is made. Once the outermost dispatch has returned,
+    ``ctx.call`` answers ``request_invalid/dispatch_ended``: its admission is over.
 ``ctx.closing``
     A ``threading.Event`` that is set when the daemon begins to close. A handler that waits (a long
     poll) waits on this and returns when it is set.
@@ -46,8 +64,10 @@ WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher do
 2. It takes the command's slot: commands with the same ``(tenant, method, command_id)`` run one at a
    time in this process, so two identical commands sent at once run the handler once.
 3. It opens the store's transaction and looks the receipt up IN it. A receipt with the same payload
-   digest returns the stored answer: the handler is not called and no callback is staged, whatever
-   has changed since. A receipt with another digest answers ``conflict``, detail ``command_id_reused``.
+   digest returns the stored answer: the handler is not called and no callback is staged. Global
+   admission, current authorization, store presence and per-method readiness are prerequisites to
+   receipt lookup. Once those pass, a receipt hit precedes handler preconditions such as revision and
+   live-turn checks. A receipt with another digest answers ``conflict``, detail ``command_id_reused``.
 4. On a miss it calls the handler with ``ctx.tx``. The handler checks its own preconditions (a stale
    revision or turn is ``conflict``; a live turn is ``busy``; a missing driver flag is ``unsupported``,
    before any side effect).
@@ -62,8 +82,10 @@ handler that raises anything else is rolled back the same way and the caller get
 The payload digest is the SHA-256 of the UTF-8 bytes of the params AS SUPPLIED without ``command_id``,
 written as RFC 8785 writes JSON (keys in UTF-16 order, no spaces, numbers as ECMAScript writes them).
 Absence is preserved: no default is inserted before the digest is taken. Params that have no such text
-(a whole number outside the exact range, a number that is not finite, half a surrogate pair) are
-``request_invalid``.
+(a whole number outside the exact range, however it is spelled; a number that is not finite; half a
+surrogate pair) are ``request_invalid``. The rule for numbers is the one the approval records use
+(``schemas/control/v1``, the call profile): an integral value outside -(2^53 - 1) .. 2^53 - 1 has no text
+whether it arrives as an int or as a float, so every text this writes reads back to the same value.
 
 THE TENANT of the identity ``(tenant, method, command_id)`` is derived from the AUTHORIZED TARGET, never
 taken from params and never inferred. The caller is authorized for the target before the dispatcher is
@@ -81,6 +103,9 @@ committed receipt and does not stop the callbacks after it. A replay from a rece
 A callback can be lost when the process exits between the commit and the call, so no lane may make one
 the only record that work must happen.
 
+The committed response is an owned snapshot. A handler or callback retaining the handler's original
+result object cannot change either the first returned answer or later replays.
+
 So a handler whose command needs an effect outside the store (on the run registry, the daemon, an
 engine, the file system) records its lane's TYPED WORK INTENT through ``ctx.tx``, with a stable
 operation id and its recovery state, in the SAME commit as the receipt and its events. Its answer
@@ -94,25 +119,36 @@ has a documented rule that makes a repeat safe. The delivery of a queued message
 the engine's acceptance) is one instance of this contract.
 
 The tables of that work, and the workers that do it and recover it, are each lane's, built with the
-event store's helper. This module runs no effect and adds nothing to the run registry.
+event store's helper. This module runs no effect and adds nothing to the run registry. SPINE schedules
+callbacks and passes transactions; the behavior-owning lane supplies work tables and recovery, and
+EVENTS supplies the transaction protocol, event append and receipt persistence.
 
 WHAT THE DISPATCHER NEEDS OF THE EVENT STORE. ``store`` is the event store's transaction helper, or
-``None`` when no event store is composed::
+``None`` when no event store is composed. The names are the published helper's (the lanes' preamble,
+"Shared state"); the dispatcher uses these two of them::
 
     with store.transaction() as tx:      commits on a normal exit and raises if the commit failed;
-                                         rolls back when the block raises
-        tx.receipt(tenant, method, command_id) -> None, or (digest, answer)
-        tx.put_receipt(tenant, method, command_id, digest, answer)
+                                         rolls back when the block raises; a second transaction() in
+                                         the same thread raises
+        tx.receipt_get(tenant, method, command_id)  # None, or (payload_digest, answer)
+        tx.receipt_put(tenant, method, command_id, payload_digest, answer)
 
-READINESS. A handler registered with ``service="<name>"`` needs that service (seam S13). Until the
-service says it is ready, the method answers ``unavailable``, detail ``service_starting``; the check
-comes before the command's transaction is opened.
+Lane tables are declared through ``db.register_tables(lane, version, ddl)`` and accessed through the
+EVENTS transaction's ``execute(sql, params)``; events use ``tx.append(event)``. There is no shared
+``tx.put(table, key, value)`` API. The return shape of ``receipt_get`` is published once, with the event
+store; ``(payload_digest, answer)`` is what this dispatcher reads until then.
+
+READINESS. A method waits for the service its PUBLISHED ROW names (seam S13), and a handler is
+registered with that same name or the registration is refused. Until the service says it is ready, the
+method answers ``unavailable``, detail ``service_starting``; the check comes before the command's
+transaction is opened.
 
 Registration happens once, at composition, before anything is served; ``freeze()`` then closes the
 table, so nothing changes it while calls are served. A second handler for one name fails composition.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import threading
@@ -134,6 +170,7 @@ class Row(NamedTuple):
     mutating: bool
     idempotency: str    # none | client_key | command_id
     beta: bool = True   # every method is beta except the six the daemon answers today
+    service: str | None = None   # the service the published row says the method waits for; None in every row today
 
 
 def _rows() -> dict:
@@ -176,14 +213,38 @@ class NoCanonicalText(ValueError):
     """The value has no RFC 8785 text."""
 
 
+class _Dispatch:
+    """One dispatch that is running. ``command`` is the enclosing dispatch whose command transaction was open
+    when this one began, or None; ``root`` is the outermost dispatch, whose admission every nested call shares."""
+
+    __slots__ = ('command', 'root', 'callbacks', 'in_transaction', 'ended')
+
+    def __init__(self, parent) -> None:
+        self.command = _command_of(parent)
+        self.root = parent.root if parent is not None else self
+        self.callbacks: list = []
+        self.in_transaction = False
+        self.ended = False
+
+
+def _command_of(scope):
+    """The dispatch whose command transaction is open around ``scope``: itself, the one it is nested in, or None."""
+    if scope is None:
+        return None
+    if scope.in_transaction:
+        return scope
+    outer = scope.command
+    return outer if outer is not None and outer.in_transaction else None
+
+
 class Context:
     """What a handler is given. Made by the dispatcher for one call and not kept after it."""
 
     __slots__ = ('principal', 'tx', 'closing', '_callbacks', '_call')
 
-    def __init__(self, principal, tx, closing, call) -> None:
+    def __init__(self, principal, tx, closing, call, callbacks: list) -> None:
         self.principal, self.tx, self.closing = principal, tx, closing
-        self._callbacks: list = []
+        self._callbacks = callbacks     # the enclosing command's list when this is a read nested in a command
         self._call = call
 
     def after_commit(self, fn: Callable[[], object]) -> None:
@@ -207,6 +268,8 @@ def _number(number) -> str:
         return str(number)
     if number != number or number in (float('inf'), float('-inf')):
         raise NoCanonicalText('number')
+    if number.is_integer() and not -MAX_INT <= number <= MAX_INT:
+        raise NoCanonicalText('integer')
     if number == 0:
         return '0'
     sign = '-' if number < 0 else ''
@@ -287,6 +350,7 @@ class MethodTable:
         self.closing = threading.Event()
         self._slots_lock = threading.Lock()
         self._slots: dict[tuple, list] = {}          # (tenant, method, command_id) -> [lock, waiters]
+        self._active = threading.local()             # .scope: the dispatch running on this thread, or None
 
     # -- registration ----------------------------------------------------------------------------
     def register(self, name: str, handler: Callable, *, service: str | None = None, tenant=None) -> None:
@@ -302,6 +366,8 @@ class MethodTable:
             raise MethodTableError(f'method {name!r}: the handler is not callable')
         if service is not None and not (isinstance(service, str) and service):
             raise MethodTableError(f'method {name!r}: service is a name')
+        if service != METHODS[name].service:
+            raise MethodTableError(f'method {name!r}: service differs from the published row')
         if METHODS[name].idempotency == 'command_id':
             if tenant != INSTALL_TENANT and not callable(tenant):
                 raise MethodTableError(f'method {name!r} keeps a receipt: register it with tenant=, a function of '
@@ -334,10 +400,20 @@ class MethodTable:
     def services_needed(self) -> dict:
         return dict(self._needs)
 
+    def command_open(self) -> bool:
+        """Whether the calling thread is inside a dispatch whose command transaction is open, directly or through
+        nested reads. An entry point that answers a mutating built-in itself asks this first and refuses
+        ``request_invalid/nested_effect``: such a call must not reach an effect before the commit."""
+        return _command_of(getattr(self._active, 'scope', None)) is not None
+
     # -- dispatch --------------------------------------------------------------------------------
     def dispatch(self, method, params: dict, principal, call: Callable) -> dict:
         """Answer a method that is not built in. ``call(method, params)`` is how ``ctx.call`` reaches the
-        other methods as the same principal; the caller already holds this dispatch's admission."""
+        other methods as the same principal; the caller already holds this dispatch's admission.
+
+        This is an already-authorized, already-admitted primitive, not an entry point (see ``control/hooks.py``).
+        A dispatch that is reached from inside another one, through that one's ``ctx.call``, is nested in it and
+        inherits its restrictions."""
         row = METHODS.get(method) if isinstance(method, str) else None
         if row is None or method in BUILT_IN:
             return {'code': 'method_unknown', 'detail': str(method)}
@@ -349,30 +425,61 @@ class MethodTable:
         needs = self._needs.get(method)
         if needs is not None and not self.service_ready(needs):
             return {'code': 'unavailable', 'detail': 'service_starting'}
+        parent = getattr(self._active, 'scope', None)
+        scope = _Dispatch(parent)
 
         def nested(inner, inner_params=None):
+            if scope.root.ended:
+                return {'code': 'request_invalid', 'detail': 'dispatch_ended'}
             inner_row = METHODS.get(inner) if isinstance(inner, str) else None
             if inner_row is not None and inner_row.idempotency == 'command_id':
                 return {'code': 'request_invalid', 'detail': 'nested_command'}
-            return call(inner, inner_params)
-
-        if row.idempotency != 'command_id':
-            ctx = Context(principal, None, self.closing, nested)
+            if _command_of(scope) is not None and inner_row is not None and inner_row.mutating:
+                return {'code': 'request_invalid', 'detail': 'nested_effect'}
+            # The scope travels with the call, whichever thread makes it, so that the dispatch it reaches is
+            # nested in this one and a command -> read -> built-in chain keeps the command's restriction.
+            before = getattr(self._active, 'scope', None)
+            self._active.scope = scope
             try:
-                answer = handler(ctx, params)
-                if not isinstance(answer, dict) or not isinstance(answer.get('code'), str):
-                    raise TypeError(f'handler of {method} returned no answer')
-            except NotAccepted as refusal:
-                return refusal.answer
-            except Exception as exc:  # noqa: BLE001 - a handler's bug is an answer, never a dropped call
-                log.exception('handler of %s failed', method)
-                return {'code': 'unavailable', 'detail': f'handler:{type(exc).__name__}'}
-            # No transaction of the dispatcher's here, so nothing to wait for: the handler returned.
-            self._run_callbacks(method, ctx)
-            return answer
-        return self._command(method, params, principal, handler, nested)
+                return call(inner, inner_params)
+            finally:
+                self._active.scope = before
 
-    def _command(self, method, params, principal, handler, nested) -> dict:
+        self._active.scope = scope
+        try:
+            if row.idempotency != 'command_id':
+                return self._read(method, params, principal, handler, nested, scope)
+            return self._command(method, params, principal, handler, nested, scope)
+        finally:
+            self._active.scope = parent
+            if scope.root is scope:
+                scope.ended = True
+
+    def _read(self, method, params, principal, handler, nested, scope) -> dict:
+        enclosing = scope.command   # the command this read is nested in, whose transaction is open; or None
+        callbacks = enclosing.callbacks if enclosing is not None else scope.callbacks
+        mark = len(callbacks)
+        ctx = Context(principal, None, self.closing, nested, callbacks)
+        try:
+            answer = handler(ctx, params)
+            if not isinstance(answer, dict) or not isinstance(answer.get('code'), str):
+                raise TypeError(f'handler of {method} returned no answer')
+        except NotAccepted as refusal:
+            del callbacks[mark:]         # a failed handler contributes no callbacks
+            return copy.deepcopy(refusal.answer)
+        except Exception as exc:  # noqa: BLE001 - a handler's bug is an answer, never a dropped call
+            del callbacks[mark:]
+            log.exception('handler of %s failed', method)
+            return {'code': 'unavailable', 'detail': f'handler:{type(exc).__name__}'}
+        if enclosing is not None:
+            return answer                # its callbacks wait for the enclosing command's commit
+        if callbacks:
+            answer = copy.deepcopy(answer)   # what the caller gets is not what a callback still holds
+        # No transaction of the dispatcher's here, so nothing to wait for: the handler returned.
+        self._run_callbacks(method, callbacks)
+        return answer
+
+    def _command(self, method, params, principal, handler, nested, scope) -> dict:
         store = self.store
         if store is None:
             return {'code': 'unsupported', 'detail': 'store_absent'}
@@ -395,35 +502,43 @@ class MethodTable:
                 log.exception('the tenant of %s could not be derived', method)
                 return {'code': 'unavailable', 'detail': f'tenant:{type(exc).__name__}'}
         key = (tenant, method, command_id)
-        ctx, stage = None, 'store'
+        stage = 'store'
         with self._slot(key):
             try:
                 with store.transaction() as tx:
-                    receipt = tx.receipt(tenant, method, command_id)
+                    receipt = tx.receipt_get(tenant, method, command_id)
                     if receipt is not None:
                         kept_digest, kept_answer = receipt
                         if kept_digest == digest:
-                            return dict(kept_answer)     # a replay: no handler, no callback
+                            return copy.deepcopy(kept_answer)     # a replay: no handler, no callback
                         return {'code': 'conflict', 'detail': 'command_id_reused'}
-                    ctx, stage = Context(principal, tx, self.closing, nested), 'handler'
+                    # From here to the end of the transaction this dispatch is a command with its transaction
+                    # open: nested calls are restricted, and nested reads' callbacks join this command's.
+                    scope.in_transaction = True
+                    ctx, stage = Context(principal, tx, self.closing, nested, scope.callbacks), 'handler'
                     answer = handler(ctx, params)
                     if not isinstance(answer, dict) or not isinstance(answer.get('code'), str):
                         raise TypeError(f'handler of {method} returned no answer')
+                    # An owned snapshot: neither the handler's object nor the store's copy of it.
+                    committed_answer = copy.deepcopy(answer)
                     stage = 'store'
-                    tx.put_receipt(tenant, method, command_id, digest, answer)
+                    tx.receipt_put(tenant, method, command_id, digest, copy.deepcopy(committed_answer))
             except NotAccepted as refusal:
-                return refusal.answer
+                return copy.deepcopy(refusal.answer)
             except Exception as exc:  # noqa: BLE001 - rolled back by the store's own context manager
                 # Whatever failed (the handler, the receipt's write, the commit itself), nothing of this
-                # command is committed and no callback runs.
+                # command is committed and no callback runs, the nested reads' included.
                 log.exception('command %s was rolled back (%s)', method, stage)
                 return {'code': 'unavailable', 'detail': f'{stage}:{type(exc).__name__}'}
-        # Committed, and the slot is released: callbacks run outside every lock of the dispatcher.
-        self._run_callbacks(method, ctx)
-        return answer
+            finally:
+                scope.in_transaction = False
+        # Committed, and the slot is released: callbacks run outside every lock of the dispatcher, the ones
+        # nested reads registered among them, in the order they were registered.
+        self._run_callbacks(method, scope.callbacks)
+        return committed_answer
 
-    def _run_callbacks(self, method, ctx) -> None:
-        for fn in ctx._callbacks:
+    def _run_callbacks(self, method, callbacks) -> None:
+        for fn in list(callbacks):
             try:
                 fn()
             except Exception:  # noqa: BLE001 - the receipt is committed; a later callback still runs

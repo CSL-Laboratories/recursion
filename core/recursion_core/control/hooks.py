@@ -10,6 +10,8 @@ CLI). It goes through a fixed list of registrant modules, ``REGISTRANTS``: one p
 nowhere else. Adding a name is a request to the lane that keeps this file. For each name:
 
 1. ``importlib.util.find_spec`` of its parent package returns None: that lane is not installed. Skipped.
+   The ancestors are looked for one at a time, outermost first, so a name whose parent's own parent is
+   absent is skipped the same way and is not mistaken for a broken install.
 2. ``find_spec`` of the registrant itself returns None: the package is there and has no hooks module. Skipped.
 3. Otherwise the module is imported and ``module.register(hooks)`` is called. ANY exception, from the
    import or from ``register``, a ``ModuleNotFoundError`` for something the module imports included,
@@ -102,8 +104,8 @@ S13 ``hooks.service(service)``, ``hooks.start_services(context)``, ``hooks.stop_
     single-valued hook, ``hooks.set("event_store", factory)``: ``factory(state_dir) -> the store's
     transaction helper``, called once by composition, on the composing thread, before any service
     starts; what the dispatcher needs of that helper is in ``control/methods/__init__.py``. Raises:
-    composition fails. A service whose ``start`` raises: the services already started are stopped in
-    reverse and composition fails.
+    composition fails. A service whose ``start`` raises: it and the services already started are
+    stopped in reverse and composition fails.
 
 The after-commit subscription to events is not a hook: it is the event store's own interface, which
 other lanes call from their services.
@@ -115,6 +117,12 @@ not through a guess of them. The one fake of the event store's transaction helpe
 ``control/tests/test_seams.py``. The calls themselves are in ``control/api.py``, ``control/cli.py``,
 ``daemon/control_adapter.py``, ``daemon/launcher.py`` and ``daemon/__init__.py``, each marked with its
 seam's number, and are tested in the two ``test_seams.py`` files.
+
+Direct MethodTable.dispatch is an already-authorized, already-admitted primitive, not an entry point.
+Entry points must preserve the supplied principal, authorize before receipt access, hold the one
+admission through all callbacks, and release it in finally. Services, table registration and store
+initialization precede serving. Lifecycle APIs are called by the one composition owner; lanes do not
+invoke them from admitted handlers.
 """
 from __future__ import annotations
 
@@ -223,6 +231,9 @@ class LaunchContext:
     The starter builds it from the stored record with ``from_record``, never from the client's params,
     and carries it as ``ctx.launch`` to the working-directory provider, the drive owner, the launch
     check and the launcher. With the versioned start path off, ``ctx.launch`` is None.
+
+    ``launch`` and ``principal`` are stored together or not at all. A record with one and not the other
+    is refused; a record with neither is a legacy record and has no launch context.
     """
     route_entry: dict | None
     route_decision: dict | None
@@ -232,21 +243,21 @@ class LaunchContext:
     turn_id: str | None
     owner: str
     budget: dict
-    principal: Principal | None
+    principal: Principal
 
     @classmethod
     def from_record(cls, record: dict) -> 'LaunchContext | None':
-        launch = record.get('launch')
-        if launch is None:
+        has_launch, has_principal = 'launch' in record, 'principal' in record
+        if has_launch != has_principal:
+            raise ValueError('launch and principal must be stored together')
+        if not has_launch:
             return None
+        launch, kept = record['launch'], record['principal']
         if not isinstance(launch, dict) or set(launch) != set(LAUNCH_KEYS):
-            raise ValueError('the record\'s launch object does not have exactly its eight fields')
-        kept = record.get('principal')
-        principal = None
-        if kept is not None:
-            if not isinstance(kept, dict):
-                raise ValueError('the record\'s principal is not an object')
-            principal = Principal(kept.get('kind'), kept.get('id'))
+            raise ValueError('invalid launch object')
+        if not isinstance(kept, dict) or set(kept) != {'kind', 'id'}:
+            raise ValueError('invalid principal object')
+        principal = Principal(kept['kind'], kept['id'])
         return cls(principal=principal, **{key: launch[key] for key in LAUNCH_KEYS})
 
 
@@ -384,6 +395,12 @@ class ServiceContext:
     ``start`` returns promptly, after starting its thread; ``ready`` becomes true only when the
     initialisation the service needs has succeeded. ``stop`` joins its workers, leaves pending durable
     work recoverable and leaves ambiguous attempts marked for reconciliation.
+
+    ``stop`` RETURNS only when every worker of the service has joined: its return is what tells the
+    teardown that nothing of the service still uses the store. It is safe after a ``start`` that raised
+    part way (the service is tracked before its start is attempted, and is stopped if the start
+    fails), and it is idempotent: after a ``stop`` that raised, the teardown keeps the service and
+    everything it may use alive and calls ``stop`` again.
     """
     daemon: object = None
     registry: object = None
@@ -406,7 +423,8 @@ class Admission:
     ``drain`` has no timeout, on purpose. The daemon's main closes its registry after the composition
     closes, even when closing raises, so closing must not return while a handler, a callback or a
     worker can still use a service or a store: a stalled drain is logged and the wait goes on with
-    their resources alive. A timeout is never taken as permission to tear them down.
+    their resources alive. A timeout is never taken as permission to tear them down. Neither is an
+    interruption of the wait: it is kept, the wait goes on, and it is raised once every call has left.
 
     The gate does nothing until it is ``enabled``, which composition does when a lane has registered a
     handler, a service or an event store. With nothing registered a call is never refused and closing
@@ -452,10 +470,18 @@ class Admission:
     def drain(self) -> None:
         if not self.enabled:
             return
+        interrupted = None
         with self._changed:
             while self._admitted > 0:
-                if not self._changed.wait(self.stall_log_s):
-                    log.warning('closing waits for %d admitted call(s); services and stores stay alive', self._admitted)
+                try:
+                    if not self._changed.wait(self.stall_log_s):
+                        log.warning('closing waits for %d admitted call(s); services and stores stay alive', self._admitted)
+                except BaseException as exc:  # noqa: BLE001 - calls are still inside: the wait is not over
+                    interrupted = interrupted or exc
+                    log.warning('the wait for %d admitted call(s) was interrupted (%s); it goes on',
+                                self._admitted, type(exc).__name__)
+        if interrupted is not None:
+            raise interrupted
 
 
 # ------------------------------------------------------------------------------------------ the hooks
@@ -475,6 +501,10 @@ class Hooks:
         self.closing = self.methods.closing
         self.gate = Admission()
         self.store = None
+        # The lifecycle has one owner at a time: starting, stopping and closing are serialised by this lock.
+        self._lifecycle = threading.Lock()
+        self._closed = False
+        self.stop_retry_s = 1.0      # between two tries of a service's stop that raised
 
     # -- registration -----------------------------------------------------------------------------
     def _open(self, what: str) -> None:
@@ -522,7 +552,8 @@ class Hooks:
             raise HookError(f'start registrant {name!r}: not callable')
         if not all(isinstance(field, str) and field for field in fields):
             raise HookError(f'start registrant {name!r}: fields are names')
-        reserved = {'tenant', 'engine', 'prompt', 'client_key', 'run_id', 'principal', 'owner'}
+        reserved = {'tenant', 'engine', 'prompt', 'prompt_sha256', 'client_key',
+                    'run_id', 'principal', 'owner', 'intent_version', 'intent_sha256'}
         if reserved & set(fields):
             raise HookError(f'start registrant {name!r}: {sorted(reserved & set(fields))!r} are not extension fields')
         for key in keys:
@@ -737,7 +768,8 @@ class Hooks:
 
     def start_intent_text(self, params: dict, prompt_sha256: str) -> str:
         """The exact preimage of ``start_intent``."""
-        intent = {'engine': params.get('engine'), 'prompt_sha256': prompt_sha256, **self.declared_present(params)}
+        intent = {**self.declared_present(params),
+                  'engine': params.get('engine'), 'prompt_sha256': prompt_sha256}
         return canonical_text(intent)
 
     def launch_snapshot(self, principal: Principal, request: dict):
@@ -768,78 +800,135 @@ class Hooks:
         return launch, None
 
     # -- S13 --------------------------------------------------------------------------------------
+    # Lifecycle operations have one owner. A concurrent or repeated close waits for the owner's completed
+    # teardown; it never independently closes resources. Once closing begins, no store or service can be
+    # opened or started. A service is tracked before its start is attempted. Its stop is safe after partial
+    # startup and is idempotent. A stop failure is retained as an error, not interpreted as proof that its
+    # workers joined. Keep the service and all resources it may use alive until stop confirms quiescence. Log
+    # a stalled cleanup and keep waiting. Propagate retained teardown errors only after all resource users
+    # have left.
     def open_store(self, state_dir):
         """Call the event store's factory, once, before any service starts. None when no lane registered one."""
-        factory = self._single.get('event_store')
-        if factory is not None:
-            self.store = factory(state_dir)
-            self.methods.store = self.store
-        return self.store
+        with self._lifecycle:
+            if self.closing.is_set() or self._closed:
+                raise HookError('closing has begun: no store is opened')
+            factory = self._single.get('event_store')
+            if factory is not None:
+                self.store = factory(state_dir)
+                self.methods.store = self.store
+            return self.store
 
     def start_services(self, context: ServiceContext) -> None:
-        """Start the registered services in order. One that fails stops the ones already started, in
-        reverse, and raises: the composition is torn down and no thread is left with a closed store."""
-        for service in self._services:
-            try:
-                service.start(context)
-            except BaseException:
-                log.exception('service %s did not start; stopping the ones that did', service.name)
-                self._stop_started(context)
-                raise
-            self._started.append(service)
+        """Start the registered services in order. Each is tracked BEFORE its start is attempted, so one that
+        started a worker and then raised is stopped like the others: it and the ones already started are
+        stopped in reverse, and the start's own error is raised. No thread is left with a closed store."""
+        with self._lifecycle:
+            for service in self._services:
+                if self.closing.is_set() or self._closed:
+                    log.error('closing began while services were starting; stopping the ones that did')
+                    self._stop_started(context)
+                    raise HookError('closing has begun: no service is started')
+                self._started.append(service)
+                try:
+                    service.start(context)
+                except BaseException:
+                    log.exception('service %s did not start; stopping it and the ones that did', service.name)
+                    self._stop_started(context)
+                    raise
 
     def stop_services(self, context: ServiceContext) -> None:
-        """Stop every started service, in reverse order. Every one is stopped even when one fails; the
-        first failure is raised after the last."""
-        errors = self._stop_started(context)
-        if errors:
-            raise errors[0]
+        """Stop every started service, in reverse order, each until its stop has returned. The first failure
+        is raised after the last service has stopped."""
+        with self._lifecycle:
+            errors = self._stop_started(context)
+        self._raise_first(errors)
 
     def _stop_started(self, context) -> list:
+        """Stop the tracked services, newest first. A service leaves the list only when its ``stop`` has
+        RETURNED, which is what says its workers have joined. A ``stop`` that raises, or is interrupted, is kept
+        as an error and tried again after ``stop_retry_s``, for as long as it takes: nothing the service may
+        use is torn down on the strength of a failure. The caller holds the lifecycle lock."""
         errors = []
         while self._started:
-            service = self._started.pop()
-            try:
-                service.stop(context)
-            except Exception as exc:  # noqa: BLE001
-                log.exception('service %s did not stop cleanly', service.name)
-                errors.append(exc)
+            service = self._started[-1]
+            failed = False
+            while True:
+                try:
+                    service.stop(context)       # a normal return confirms all of its resource users joined
+                    break
+                except BaseException as exc:    # noqa: BLE001 - not proof that anything stopped
+                    if not failed:
+                        failed = True
+                        errors.append(exc)
+                        log.exception('service %s did not stop; it and what it uses stay alive, and its stop '
+                                      'is tried again', service.name)
+                    else:
+                        log.warning('service %s has still not stopped (%s); waiting', service.name, type(exc).__name__)
+                try:
+                    time.sleep(self.stop_retry_s)
+                except BaseException as exc:    # noqa: BLE001 - an interruption does not end the teardown
+                    errors.append(exc)
+            self._started.pop()                 # only after that confirmation
         return errors
+
+    @staticmethod
+    def _raise_first(errors: list) -> None:
+        """An interruption that was kept is raised before an ordinary failure; either only after the teardown."""
+        for exc in errors:
+            if not isinstance(exc, Exception):
+                raise exc
+        if errors:
+            raise errors[0]
 
     def service_ready(self, name: str) -> bool:
         return any(service.name == name and bool(service.ready) for service in self._started)
 
     def begin_close(self) -> None:
-        """First step of closing: no new client call is admitted, and everyone who waits is told."""
+        """First step of closing: no new client call is admitted, and everyone who waits is told. From here on
+        no store is opened and no service is started."""
         self.gate.close()
         self.closing.set()
 
     def finish_close(self, context: ServiceContext) -> None:
-        """After the transports stopped admitting: wait for every admitted call to leave, with its
-        services and stores alive; then stop the services in reverse; then close the store. A teardown
-        error is raised only after all of that."""
-        self.gate.drain()
-        errors = self._stop_started(context)
-        store, self.store = self.store, None
-        self.methods.store = None
-        close = getattr(store, 'close', None)
-        if callable(close):
+        """After the transports stopped admitting: wait for every admitted call to leave, with its services
+        and stores alive; then stop the services in reverse, each until its stop has returned; then close the
+        store. A teardown error, or an interruption, is raised only after all of that.
+
+        One caller owns the teardown. Another that calls while it runs, or after it, waits for the owner to
+        finish and then returns: it closes nothing itself."""
+        with self._lifecycle:
+            if self._closed:
+                return
+            self.begin_close()
+            errors = []
             try:
-                close()
-            except Exception as exc:  # noqa: BLE001
-                log.exception('the event store did not close cleanly')
+                self.gate.drain()
+            except BaseException as exc:  # noqa: BLE001 - raised by the drain only once every call had left
                 errors.append(exc)
-        if errors:
-            raise errors[0]
+            errors.extend(self._stop_started(context))
+            store, self.store = self.store, None
+            self.methods.store = None
+            close = getattr(store, 'close', None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    log.exception('the event store did not close cleanly')
+                    errors.append(exc)
+            self._closed = True
+        self._raise_first(errors)
 
 
 def compose(registrants=REGISTRANTS) -> Hooks:
     """The hooks of one composition: every registrant that is installed has registered, and the tables are frozen."""
     hooks = Hooks()
     for name in registrants:
-        parent = name.rpartition('.')[0]
+        parts = name.split('.')
         try:
-            if importlib.util.find_spec(parent) is None:
+            # Each ancestor, outermost first: the first that is not there says the lane is not installed.
+            # find_spec of a dotted name imports its parent, so an installed ancestor that fails to import
+            # raises here and fails composition; it is never read as absence.
+            if any(importlib.util.find_spec('.'.join(parts[:depth])) is None for depth in range(1, len(parts))):
                 continue        # the lane is not installed
             if importlib.util.find_spec(name) is None:
                 continue        # the package is there and has no hooks module

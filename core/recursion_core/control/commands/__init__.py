@@ -12,10 +12,18 @@ to the table::
 
 ``names``
     The top-level command names the family adds: a tuple of one or more.
-``parser(subparsers)``
-    Adds exactly those names to the CLI's argparse subparsers, with their own arguments. It adds
-    nothing else and changes no other command: an option on another family's command (``--workspace``
-    on ``start``, say) is a request to that command's keeper, and the table refuses it.
+``parser(family)``
+    Adds exactly those names, each with ``family.add_parser(name, **kwargs)``, which takes what
+    argparse's own ``add_parser`` takes (``help``, ``aliases`` and the rest) and returns the new
+    command's parser for the family to give its arguments to.
+
+    A family receives an add-parser facade that can create only its declared names. It cannot obtain
+    or mutate existing parsers or their actions. The table verifies that every declared name was added
+    once. Existing parser behavior is not authenticated by rendered help text.
+
+    An alias is a name too: it is declared in ``names`` like any other. An option on another family's
+    command (``--workspace`` on ``start``, say) is a request to that command's keeper. This is an
+    ownership boundary between lane modules that cooperate, not a sandbox against Python reflection.
 ``dispatch(args, client) -> exit status``
     Runs one parsed command. ``args`` is the argparse namespace: ``args.command`` is the name, and
     ``args.out`` and ``args.err`` are the streams to print to. ``client`` is the control client the CLI
@@ -38,6 +46,21 @@ BUILT_IN = ('list', 'status', 'stop', 'start', 'conditions')   # control/cli.py'
 
 class CommandTableError(Exception):
     """A registration, or a parser, that the table refuses. The CLI does not run a command after one."""
+
+
+class FamilyParsers:
+    """What a family's ``parser`` is given: it can add the family's declared names and nothing else."""
+
+    def __init__(self, target, names) -> None:
+        self._target, self._names, self.added = target, frozenset(names), set()
+
+    def add_parser(self, name, **kwargs):
+        claimed = {name, *kwargs.get('aliases', ())}
+        if not claimed <= self._names or claimed & self.added:
+            raise CommandTableError('parser claimed an undeclared or duplicate name')
+        parser = self._target.add_parser(name, **kwargs)
+        self.added.update(claimed)
+        return parser
 
 
 class CommandTable:
@@ -79,19 +102,19 @@ class CommandTable:
     def add_parsers(self, subparsers) -> None:
         """Let each family add its commands to the CLI's subparsers, after the CLI added its own.
 
-        A family that adds a name it did not register, leaves one out, or changes a command that was
-        already there is refused.
+        Each family is handed a ``FamilyParsers`` over them, not the subparsers themselves. A family that adds
+        a name it did not register, adds one twice, leaves one out, or reaches for anything else is refused.
         """
         for names, parser, _ in self._families:
-            before = {name: sub.format_help() for name, sub in subparsers.choices.items()}
-            parser(subparsers)
-            after = subparsers.choices
-            added = set(after) - set(before)
-            if added != set(names):
-                raise CommandTableError(f'commands {names!r}: the parser added {sorted(added)!r}')
-            changed = sorted(name for name, text in before.items() if after[name].format_help() != text)
-            if changed:
-                raise CommandTableError(f'commands {names!r}: the parser changed {changed!r}, which another keeps')
+            family = FamilyParsers(subparsers, names)
+            try:
+                parser(family)
+            except CommandTableError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the facade has no way to another parser; whatever it tried failed
+                raise CommandTableError(f'commands {names!r}: the parser failed: {type(exc).__name__}: {exc}') from exc
+            if family.added != set(names):
+                raise CommandTableError('parser did not add every declared name')
 
     def dispatch(self, args, client) -> int:
         """Run the registered command ``args.command``. Only called for a name that is in the table."""

@@ -27,7 +27,8 @@ A factory alone does not make an engine launchable. The launcher refuses an engi
 its own profile table (``daemon.launcher.ENGINE_PROFILES``); that entry is asked of that table's keeper.
 
 Nothing here imports an adapter until a table is made, so this module can be imported from anywhere in
-``routes`` without a cycle.
+``routes`` without a cycle. This module delays its own adapter lookup until table construction; importing
+the existing routes package may load its eager adapter exports.
 """
 from __future__ import annotations
 

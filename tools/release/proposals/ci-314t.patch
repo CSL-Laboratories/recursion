@@ -1,0 +1,293 @@
+Proposal (lane RELEASE, C9 (a)): a hosted job on free-threaded CPython 3.14.
+
+Not applied: .github/workflows/ and tools/ are frozen; only Lucas applies this, by
+his hand or his word. Apply from the repository root, after the change that adds
+tools/release/requirements-ci-314t.txt is on the branch:
+
+    git apply --check tools/release/proposals/ci-314t.patch
+    git apply tools/release/proposals/ci-314t.patch
+
+What it does:
+- .github/workflows/ci.yml: a job core-314t ("core 3.14t") on ubuntu-24.04, allocated
+  exactly like linux-tests (same if:), that installs cryptography from the
+  hash-locked tools/release/requirements-ci-314t.txt, checks that the interpreter is
+  free-threaded with the GIL off, and runs
+      PYTHONPATH=core python -X gil=0 -B -m unittest discover -s core -t core
+  with TMPDIR in a fresh folder under /tmp (outside /home/runner) and
+  XDG_RUNTIME_DIR in a fresh folder under /dev/shm, the session bus unset.
+  The required linux shell needs core-314t to succeed on full scope and to be
+  skipped on docs-only scope, as it already does for linux-tests.
+- tools/test_ci_scheduling.py: the workflow-shape, if: oracle and fail-closed
+  matrices taught the new job and the new input of the linux shell.
+
+Blank context lines are written as empty lines, which git apply accepts; the file
+then has no trailing whitespace for the gate's whitespace check.
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 4511af647f546ddd62c113eede7a3cd452c01266..d22cb21b65dc60ffc67ad9d7eca4447e575bda86 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -16,9 +16,13 @@
+ #   exactly true, the PR is not a draft, and settle has its expected result.
+ #   always() && !cancelled() keeps a deliberately skipped settle from blocking
+ #   it while never starting it on a cancelled run.
++# - core-314t (ubuntu-24.04, free): the core suite on the daemon's own runtime,
++#   free-threaded CPython 3.14 with the GIL off and cryptography installed from
++#   a hash-locked file. Same allocation rule as linux-tests, run beside it.
+ # - linux (ubuntu-latest, free, required): no checkout. A shell that fails
+ #   closed on drafts, cancelled or failed dependencies, missing or malformed
+-#   outputs, an unexpected settle result, or a non-success full suite.
++#   outputs, an unexpected settle result, or a non-success full suite on
++#   either interpreter (linux-tests and core-314t).
+ #   Docs-only scope requires verified lightweight checks and expected skips.
+ # - windows and macos: platform coverage unchanged; gated on preflight, settle
+ #   and linux with explicit status functions so a skipped settle does not
+@@ -211,7 +215,7 @@ jobs:
+   # Required check. Runs on every outcome and fails closed in the shell.
+   linux:
+     name: linux
+-    needs: [preflight, settle, linux-tests]
++    needs: [preflight, settle, linux-tests, core-314t]
+     if: always()
+     runs-on: ubuntu-latest
+     timeout-minutes: 3
+@@ -229,6 +233,7 @@ jobs:
+           PAID: ${{ needs.preflight.outputs.paid }}
+           SETTLE: ${{ needs.settle.result }}
+           TESTS: ${{ needs.linux-tests.result }}
++          CORE_314T: ${{ needs.core-314t.result }}
+         run: |
+           set -eu
+           case "$EVENT_NAME" in
+@@ -276,6 +281,9 @@ jobs:
+             if [ "$TESTS" != success ]; then
+               echo "::error::Linux tests result is '$TESTS'"; exit 1
+             fi
++            if [ "$CORE_314T" != success ]; then
++              echo "::error::core 3.14t result is '$CORE_314T'"; exit 1
++            fi
+             echo "linux: full suite passed on the paid runner"
+           else
+             if [ "$PAID" != false ]; then
+@@ -284,6 +292,9 @@ jobs:
+             if [ "$TESTS" != skipped ]; then
+               echo "::error::Linux tests result is '$TESTS' on docs-only scope"; exit 1
+             fi
++            if [ "$CORE_314T" != skipped ]; then
++              echo "::error::core 3.14t result is '$CORE_314T' on docs-only scope"; exit 1
++            fi
+             echo "linux: docs-only scope, lightweight checks passed in preflight"
+           fi
+
+@@ -368,3 +379,52 @@ jobs:
+
+       - name: Provider-free gate
+         run: python -X utf8 -B tools/ci_gate.py --force
++
++  # Free: the core suite on free-threaded CPython 3.14, GIL off, with cryptography
++  # (lane RELEASE, C9 (a)). Allocated exactly like linux-tests and run beside it;
++  # the required linux shell needs its success. TMPDIR is a fresh folder under
++  # /tmp, outside the home folder: runner.temp lies under /home/runner, and the
++  # subscription-route guard refuses a route home inside the operator's home,
++  # which turns about 180 route tests red. XDG_RUNTIME_DIR is a fresh tmpfs
++  # folder and the session bus is unset, so no test reaches the runner's user
++  # manager and the real-manager tests skip.
++  core-314t:
++    name: core 3.14t
++    needs: [preflight, settle]
++    if: >
++      always() && !cancelled() &&
++      needs.preflight.result == 'success' &&
++      needs.preflight.outputs.paid == 'true' &&
++      needs.preflight.outputs.run_full == 'true' &&
++      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
++      ((github.event_name == 'pull_request' && github.event.action == 'synchronize' && needs.settle.result == 'success') ||
++       (!(github.event_name == 'pull_request' && github.event.action == 'synchronize') && needs.settle.result == 'skipped'))
++    runs-on: ubuntu-24.04
++    timeout-minutes: 20
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - name: Set up Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.14t"
++
++      - name: Install dependencies
++        working-directory: ${{ runner.temp }}
++        env:
++          REQUIREMENTS_314T: ${{ github.workspace }}/tools/release/requirements-ci-314t.txt
++        shell: bash
++        run: 'python -P -m pip install --only-binary=:all: --require-hashes -r "$REQUIREMENTS_314T"'
++
++      - name: Core suite, free-threaded with the GIL off
++        shell: bash
++        run: |
++          set -eu
++          python -X gil=0 -B -c 'import sys, sysconfig, cryptography; assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1, "not a free-threaded build"; assert not sys._is_gil_enabled(), "the GIL is on"; print(sys.version, "cryptography", cryptography.__version__)'
++          scratch_tmp=$(mktemp -d /tmp/recursion-ci-tmp.XXXXXX)
++          scratch_run=$(mktemp -d /dev/shm/recursion-ci-run.XXXXXX)
++          chmod 700 "$scratch_tmp" "$scratch_run"
++          env -u DBUS_SESSION_BUS_ADDRESS TMPDIR="$scratch_tmp" XDG_RUNTIME_DIR="$scratch_run" PYTHONPATH=core \
++            python -X gil=0 -B -m unittest discover -s core -t core
+diff --git a/tools/test_ci_scheduling.py b/tools/test_ci_scheduling.py
+index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a30a29c1df 100644
+--- a/tools/test_ci_scheduling.py
++++ b/tools/test_ci_scheduling.py
+@@ -218,6 +218,7 @@ def context(event, action, draft, label, pre, settle, dep, run_full, paid) -> di
+         "needs.preflight.result": pre,
+         "needs.settle.result": settle,
+         "needs.linux-tests.result": dep,
++        "needs.core-314t.result": dep,
+         "needs.linux.result": dep,
+         "needs.preflight.outputs.run_full": run_full,
+         "needs.preflight.outputs.paid": paid,
+@@ -243,7 +244,7 @@ def oracle(job, event, action, draft, label, cancelled, pre, settle, dep, run_fu
+         return pr_sync(event, action) and draft is False
+     paid_ok = (run_full == "true" and paid == "true" and (not pr or draft is False)
+                and settle == expected_settle(event, action))
+-    if job == "linux-tests":
++    if job in ("linux-tests", "core-314t"):
+         return paid_ok
+     labelled = pr and draft is False and label
+     if job == "windows":
+@@ -253,7 +254,7 @@ def oracle(job, event, action, draft, label, cancelled, pre, settle, dep, run_fu
+     raise AssertionError(job)
+
+
+-def shell_oracle(EVENT_NAME, EVENT_ACTION, PR_DRAFT, PREFLIGHT, RUN_FULL, PAID, SETTLE, TESTS) -> int:
++def shell_oracle(EVENT_NAME, EVENT_ACTION, PR_DRAFT, PREFLIGHT, RUN_FULL, PAID, SETTLE, TESTS, CORE_314T) -> int:
+     if EVENT_NAME == "pull_request":
+         if EVENT_ACTION not in PR_ACTIONS or PR_DRAFT != "false":
+             return 1
+@@ -264,8 +265,8 @@ def shell_oracle(EVENT_NAME, EVENT_ACTION, PR_DRAFT, PREFLIGHT, RUN_FULL, PAID,
+     if SETTLE != expected_settle(EVENT_NAME, EVENT_ACTION):
+         return 1
+     if RUN_FULL == "true":
+-        return 0 if PAID == "true" and TESTS == "success" else 1
+-    return 0 if PAID == "false" and TESTS == "skipped" else 1
++        return 0 if PAID == "true" and TESTS == "success" and CORE_314T == "success" else 1
++    return 0 if PAID == "false" and TESTS == "skipped" and CORE_314T == "skipped" else 1
+
+
+ # --- bash batch runner -------------------------------------------------------
+@@ -317,7 +318,7 @@ class WorkflowShapeTests(unittest.TestCase):
+
+     def test_job_layout(self) -> None:
+         jobs = re.findall(r"(?m)^  ([\w-]+):\n", TEXT.split("\njobs:\n", 1)[1])
+-        self.assertEqual(jobs, ["preflight", "settle", "linux-tests", "linux", "windows", "macos"])
++        self.assertEqual(jobs, ["preflight", "settle", "linux-tests", "linux", "windows", "macos", "core-314t"])
+         self.assertEqual(TEXT.count("name: linux"), 1)
+         settle = job_block("settle")
+         self.assertIn("runs-on: ubuntu-latest", settle)
+@@ -352,6 +353,27 @@ class WorkflowShapeTests(unittest.TestCase):
+         for block in (windows, macos):
+             self.assertIn("fetch-depth: 0", block)
+             self.assertIn("tools/ci_gate.py --force", block)
++        threaded = job_block("core-314t")
++        self.assertIn("name: core 3.14t\n", threaded)
++        self.assertIn("runs-on: ubuntu-24.04", threaded)
++        self.assertIn("timeout-minutes: 20\n", threaded)
++        self.assertEqual(job_needs(threaded), ["preflight", "settle"])
++        self.assertEqual(job_if(threaded), job_if(tests))
++        self.assertIn('python-version: "3.14t"', threaded)
++        install = step_block(threaded, "Install dependencies")
++        self.assertIn("working-directory: ${{ runner.temp }}", install)
++        self.assertEqual(step_env(install),
++                         {"REQUIREMENTS_314T": "${{ github.workspace }}/tools/release/requirements-ci-314t.txt"})
++        self.assertEqual(step_run(install),
++                         """'python -P -m pip install --only-binary=:all: --require-hashes -r "$REQUIREMENTS_314T"'""")
++        suite = step_run(step_block(threaded, "Core suite, free-threaded with the GIL off"))
++        for needle in ('get_config_var("Py_GIL_DISABLED") == 1', "not sys._is_gil_enabled()", "cryptography",
++                       "mktemp -d /tmp/", "mktemp -d /dev/shm/", "env -u DBUS_SESSION_BUS_ADDRESS",
++                       'TMPDIR="$scratch_tmp"', 'XDG_RUNTIME_DIR="$scratch_run"',
++                       "python -X gil=0 -B -m unittest discover -s core -t core"):
++            self.assertIn(needle, suite)
++        self.assertNotIn("runner.temp", suite)  # under /home/runner: route homes there are refused
++        self.assertNotIn("cache", threaded)
+         for line in TEXT.splitlines():
+             if line.lstrip().startswith("run:"):
+                 self.assertNotIn("${{", line, "expressions reach shells via env, not interpolation")
+@@ -410,7 +432,7 @@ class WorkflowShapeTests(unittest.TestCase):
+
+
+ class ExpressionTests(unittest.TestCase):
+-    JOBS = ("settle", "linux-tests", "linux", "windows", "macos")
++    JOBS = ("settle", "linux-tests", "core-314t", "linux", "windows", "macos")
+
+     @classmethod
+     def setUpClass(cls) -> None:
+@@ -469,18 +491,18 @@ class ExpressionTests(unittest.TestCase):
+         # GitHub == is case-insensitive; exactness comes from the preflight shell (tested below).
+         self.assertTrue(self.runs("linux-tests", "push", paid="TRUE"))
+         self.assertFalse(self.exprs["settle"][0].uses_status)
+-        for job in ("linux-tests", "linux", "windows", "macos"):
++        for job in ("linux-tests", "core-314t", "linux", "windows", "macos"):
+             self.assertTrue(self.exprs[job][0].uses_status, job)
+
+     def test_incomplete_dependencies_and_malformed_outputs_block_allocation(self) -> None:
+         keys = {"preflight": "pre", "settle": "settle", "linux": "dep"}
+-        for job in ("settle", "linux-tests", "windows", "macos"):
++        for job in ("settle", "linux-tests", "core-314t", "windows", "macos"):
+             for dependency in self.exprs[job][1]:
+                 for result in ("", "pending", "failure", "cancelled", "skipped"):
+                     with self.subTest(job=job, dependency=dependency, result=result):
+                         self.assertFalse(self.runs(job, "pull_request", "synchronize", False,
+                                                    label=True, **{keys[dependency]: result}))
+-        for job, key, value in itertools.product(("linux-tests", "windows", "macos"),
++        for job, key, value in itertools.product(("linux-tests", "core-314t", "windows", "macos"),
+                                                  ("run_full", "paid"), ("", "yes", "1", "pending", "true ")):
+             with self.subTest(job=job, key=key, value=value):
+                 self.assertFalse(self.runs(job, "pull_request", "synchronize", False,
+@@ -535,6 +557,7 @@ class AggregateTests(unittest.TestCase):
+         "PR_DRAFT": "${{ github.event.pull_request.draft }}", "PREFLIGHT": "${{ needs.preflight.result }}",
+         "RUN_FULL": "${{ needs.preflight.outputs.run_full }}", "PAID": "${{ needs.preflight.outputs.paid }}",
+         "SETTLE": "${{ needs.settle.result }}", "TESTS": "${{ needs.linux-tests.result }}",
++        "CORE_314T": "${{ needs.core-314t.result }}",
+     }
+
+     def test_wiring(self) -> None:
+@@ -542,7 +565,7 @@ class AggregateTests(unittest.TestCase):
+         self.assertIn("name: linux\n", block)
+         self.assertIn("runs-on: ubuntu-latest", block)
+         self.assertIn("timeout-minutes: 3\n", block)
+-        self.assertEqual(job_needs(block), ["preflight", "settle", "linux-tests"])
++        self.assertEqual(job_needs(block), ["preflight", "settle", "linux-tests", "core-314t"])
+         self.assertEqual(job_if(block), "always()")
+         self.assertNotIn("uses:", block)
+         self.assertIn("run_full: ${{ needs.preflight.outputs.run_full }}", block)
+@@ -554,9 +577,9 @@ class AggregateTests(unittest.TestCase):
+         script = step_run(step_block(job_block("linux"), "Required status"))
+         cases: list[dict[str, str]] = []
+
+-        def add(event, action, draft, run_full, paid, pre, settle, tests) -> None:
++        def add(event, action, draft, run_full, paid, pre, settle, tests, core) -> None:
+             cases.append(dict(EVENT_NAME=event, EVENT_ACTION=action, PR_DRAFT=draft, PREFLIGHT=pre,
+-                              RUN_FULL=run_full, PAID=paid, SETTLE=settle, TESTS=tests))
++                              RUN_FULL=run_full, PAID=paid, SETTLE=settle, TESTS=tests, CORE_314T=core))
+
+         valid = [("pull_request", a, "false") for a in PR_ACTIONS] + [("push", "", ""), ("workflow_dispatch", "", "")]
+         odd = [("pull_request", a, d) for a in PR_ACTIONS + ("labeled",) for d in ("true", "", "yes")]
+@@ -565,15 +588,16 @@ class AggregateTests(unittest.TestCase):
+         bad_scopes = (("true", "false"), ("false", "true"), ("", ""), ("True", "true"), ("true", "TRUE"), ("true", "pending"))
+         for state in valid + odd:
+             for run_full, paid in scopes + bad_scopes:
+-                control = ["success", expected_settle(state[0], state[1]), "success" if run_full == "true" else "skipped"]
++                ran = "success" if run_full == "true" else "skipped"
++                control = ["success", expected_settle(state[0], state[1]), ran, ran]
+                 add(*state, run_full, paid, *control)
+                 if state in valid and (run_full, paid) in scopes:
+-                    for dim, value in itertools.product(range(3), SHELL_RESULTS):
++                    for dim, value in itertools.product(range(4), SHELL_RESULTS):
+                         varied = list(control)
+                         varied[dim] = value
+                         add(*state, run_full, paid, *varied)
+-        for pre, settle, tests in itertools.product(SHELL_RESULTS, repeat=3):
+-            add("pull_request", "synchronize", "false", "true", "true", pre, settle, tests)
++        for pre, settle, tests, core in itertools.product(SHELL_RESULTS, repeat=4):
++            add("pull_request", "synchronize", "false", "true", "true", pre, settle, tests, core)
+         outcomes = set()
+         for case, (rc, _) in zip(cases, bash_cases(script, cases)):
+             want = shell_oracle(**case)

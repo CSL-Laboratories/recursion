@@ -285,7 +285,7 @@ class Adv2BreakerTests(unittest.TestCase):
         stored = self.store()
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), stored)
         with self.assertLogs('recursion_core.daemon.breaker', 'ERROR'):
-            self.assertEqual(durable.bind_run('run-2', CONN, 'claude_code', 'opus[1m]'), 'invalid_model_version')
+            self.assertEqual(durable.bind_run('run-2', CONN, 'claude_code', 'opus[1m]\n'), 'invalid_model_version')
         with self.assertRaises(Refused) as caught:
             stored.check('run-2', CONN, 'host')
         self.assertEqual(caught.exception.code, 'run_unknown')
@@ -306,6 +306,53 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertNotEqual(row['blocker'], adapter.NO_BAR_EVIDENCE, row)
         self.assertEqual(row['breaker']['state'], 'unknown', row)
         self.assertIn('could not be read', row['blocker'])
+
+    def test_route_list_names_what_the_store_cannot_bind_and_the_custody_refusal_before_it(self):
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), self.store())
+        route = {'engine': 'claude_code', 'model': 'mod\u00e8le',
+                 'connection': {'kind': 'subscription', 'id': 'adv2-login'}}
+        routes = {'claude_code': {'route': route, 'deadline_s': 60.0, 'binary': None}}
+        control = adapter.DaemonControl(None, None, None, None, self.tmp, routes=routes, breaker=durable)
+
+        def blocker(of=control):
+            return next(r for r in of.route_records() if r['id'] == 'engine:claude_code')['blocker']
+
+        self.assertEqual(blocker(), 'breaker_model_unrepresentable: model')
+        route['model'] = 'claude sonnet 4.5'  # a space is not recorded either
+        self.assertEqual(blocker(), 'breaker_model_unrepresentable: model')
+        # A connection id the store cannot key is named the same way, and before a model: a start
+        # answers it first.
+        route['connection'] = {'kind': 'subscription', 'id': 'has space'}
+        self.assertEqual(blocker(), 'breaker_connection_unrepresentable: connection id')
+        route['model'] = 'opus[1m]'
+        self.assertEqual(blocker(), 'breaker_connection_unrepresentable: connection id')
+        route['connection'] = {'kind': 'subscription', 'id': 'adv2-login'}
+        listed = {'engine': 'claude_code', 'model': 'm', 'connection': {'kind': 'subscription', 'id': 'has space'}}
+        for on_limit, expected in (('ask', adapter.NO_BAR_EVIDENCE), ('wait', adapter.NO_BAR_EVIDENCE),
+                                   ('fallback', 'breaker_connection_unrepresentable: connection id')):
+            route['limits'] = {'on_limit': on_limit, 'fallback': [dict(listed)]}
+            self.assertEqual(blocker(), expected, on_limit)
+        listed['connection']['id'], listed['model'] = 'other-login', 'claude sonnet 4.5'
+        for on_limit, expected in (('ask', adapter.NO_BAR_EVIDENCE), ('wait', adapter.NO_BAR_EVIDENCE),
+                                   ('fallback', 'breaker_model_unrepresentable: fallback 1: model')):
+            route['limits'] = {'on_limit': on_limit, 'fallback': [dict(listed)]}
+            self.assertEqual(blocker(), expected, on_limit)
+        del route['limits']
+        route['model'] = 'mod\u00e8le'
+        # A start answers the custody refusal first, so that is the one the inventory names.
+        route['connection'] = {'kind': 'passthrough', 'id': 'aws-work', 'method': 'bedrock'}
+        self.assertEqual(blocker(), 'launch_refused: no credential custody: a passthrough route is not launched')
+        route['connection'] = {'kind': 'subscription', 'id': 'adv2-login'}
+        route['model'] = 'opus[1m]'
+        self.assertEqual(blocker(), adapter.NO_BAR_EVIDENCE)
+        # A model the validator refuses is not named as the store's blocker.
+        for model in ('', None, 7):
+            route['model'] = model
+            self.assertEqual(blocker(), adapter.NO_BAR_EVIDENCE, repr(model))
+        # With no breaker no run is bound, so nothing about the model blocks the route.
+        route['model'] = 'mod\u00e8le'
+        bare = adapter.DaemonControl(None, None, None, None, self.tmp, routes=routes)
+        self.assertEqual(blocker(bare), adapter.NO_BAR_EVIDENCE)
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
@@ -334,6 +381,52 @@ class Adv2StarterTests(unittest.TestCase):
         self.addCleanup(stored.close)
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(Clock()), stored)
         starter = self.starter('has space', breaker=durable)
+        with self.assertRaises(adapter.StartRefused) as caught:
+            starter({'run_id': 'run-1', 'engine': 'codex', 'tenant': 't', 'prompt': 'p'})
+        self.assertEqual(caught.exception.code, 'breaker_connection_unrepresentable')
+
+    def test_a_model_the_store_cannot_record_refuses_the_start_with_its_own_code(self):
+        stored, _ = daemon_breaker.open_breaker_store(self.tmp, clock=Clock())
+        self.addCleanup(stored.close)
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(Clock()), stored)
+        for model in ('m', 'opus[1m]', 'a+b', '"quoted"', 'm' * 128):
+            self.assertTrue(durable.model_representable(model), model)
+        for model in ('m' * 129, ' ', 'claude sonnet 4.5', 'opus[1m]\n', 'opus\x07', 'mod\u00e8le'):
+            with self.subTest(model=ascii(model)[:24]):
+                self.assertFalse(durable.model_representable(model))
+                starter = self.starter('ok', breaker=durable)
+                starter._routes['codex']['route']['model'] = model
+                with self.assertRaises(adapter.StartRefused) as caught:
+                    starter({'run_id': 'run-1', 'engine': 'codex', 'tenant': 't', 'prompt': 'p'})
+                self.assertEqual((caught.exception.code, caught.exception.detail),
+                                 ('breaker_model_unrepresentable', 'model'))
+                self.assertEqual(starter.failures['run-1'],
+                                 {'code': 'breaker_model_unrepresentable', 'detail': 'model'})
+        # A model that is missing, empty or not text is the route validator's to refuse (request_invalid:
+        # route.model, as before this rule): the store would not record it, and this check says nothing.
+        for model in ('', None, 7):
+            with self.subTest(left_to_the_validator=repr(model)):
+                self.assertFalse(durable.model_representable(model))
+                entry = {'route': {'engine': 'codex', 'model': model,
+                                   'connection': {'kind': 'subscription', 'id': 'ok'}}}
+                self.assertIsNone(adapter.route_unbindable(entry, durable))
+                listed = {'engine': 'codex', 'model': 'm', 'connection': {'kind': 'subscription', 'id': 'ok'},
+                          'limits': {'on_limit': 'fallback', 'fallback': [dict(entry['route'])]}}
+                self.assertIsNone(adapter.route_unbindable({'route': listed}, durable))
+        entry = {'route': {'engine': 'codex', 'connection': {'kind': 'subscription', 'id': 'ok'}}}
+        self.assertIsNone(adapter.route_unbindable(entry, durable), 'a route with no model at all')
+        # Asking wrote nothing: no run is bound and no connection is tripped.
+        with self.assertRaises(Refused) as caught:
+            stored.check('run-1', 'subscription:ok', 'host')
+        self.assertEqual(caught.exception.code, 'run_unknown')
+        self.assertFalse(stored.tripped('subscription:ok'))
+
+    def test_a_connection_the_store_cannot_key_is_named_before_a_model_it_cannot_record(self):
+        stored, _ = daemon_breaker.open_breaker_store(self.tmp, clock=Clock())
+        self.addCleanup(stored.close)
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(Clock()), stored)
+        starter = self.starter('has space', breaker=durable)
+        starter._routes['codex']['route']['model'] = 'mod\u00e8le'
         with self.assertRaises(adapter.StartRefused) as caught:
             starter({'run_id': 'run-1', 'engine': 'codex', 'tenant': 't', 'prompt': 'p'})
         self.assertEqual(caught.exception.code, 'breaker_connection_unrepresentable')

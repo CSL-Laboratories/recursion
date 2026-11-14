@@ -21,7 +21,7 @@ import json
 import os
 import unittest
 
-from recursion_core.plugin_security import ApprovalGate, Authority, Refused
+from recursion_core.plugin_security import ApprovalGate, Authority, Refused, canonical
 from recursion_core.plugin_security.tests.support import (
     World, authenticate, effect, manifest_bytes, needs_crypto, profile,
 )
@@ -45,6 +45,14 @@ for obj in gc.get_objects():
     "patch_verify_function": ("succeeds", b"""
 import recursion_core.plugin_security.authority as authority_module
 authority_module.verify = lambda *args: True
+"""),
+    "plant_verify_cache_entry": ("succeeds", b"""
+import gc
+from recursion_core.plugin_security.authority import Authority
+for obj in gc.get_objects():
+    if isinstance(obj, Authority):
+        with obj._verified_lock:
+            obj._verified[(FORGED_SIGNATURE, FORGED_PROFILE)] = None
 """),
     "rewrite_ledger_rows": ("succeeds", b"""
 import gc
@@ -88,6 +96,10 @@ class SameUidMutantTests(unittest.TestCase):
     def _load_mutant(self, name: str, source: bytes) -> None:
         attacker = self.w.developer.__class__()
         source = source.replace(b"ATTACKER_PUBLIC", json.dumps(attacker.public).encode())
+        if name == "plant_verify_cache_entry":
+            self.forged = profile(attacker, profile_id="fresh", total=10**6, max_effect=10**6)
+            source = source.replace(b"FORGED_SIGNATURE", repr(self.forged["signature"]).encode())
+            source = source.replace(b"FORGED_PROFILE", repr(canonical(self.forged["profile"])).encode())
         raw = manifest_bytes(attacker.public, plugin_id="mutant." + name.replace("_", "-"), source=source,
                              permissions=())
         loaded = self.w.loader.load(raw, attacker.sign(raw), source)
@@ -106,6 +118,8 @@ class SameUidMutantTests(unittest.TestCase):
         if name in ("swap_anchor_attribute", "patch_verify_function"):
             forged = profile(self.attacker, profile_id="fresh", total=10**6, max_effect=10**6)
             return self._result_of(self.w.authorize(eff, self.w.approve(eff), forged))
+        if name == "plant_verify_cache_entry":
+            return self._result_of(self.w.authorize(eff, self.w.approve(eff), self.forged))
         if name == "rewrite_ledger_rows":
             return self._result_of(self.w.authorize(eff, self.w.approve(eff), self.env))
         if name == "self_approve_in_gate_memory":
@@ -145,15 +159,20 @@ class SameUidMutantTests(unittest.TestCase):
         observed = {}
         for name, (expected, source) in MUTANTS.items():
             with self.subTest(mutant=name):
-                self.setUp()
-                if source is not None and name != "self_approve_in_gate_memory":
-                    self._load_mutant(name, source)
-                observed[name] = self._attempt(name)
-                self.assertEqual(observed[name], expected, name)
-                self.tearDown()
+                try:
+                    self.setUp()
+                    if source is not None and name != "self_approve_in_gate_memory":
+                        self._load_mutant(name, source)
+                    observed[name] = self._attempt(name)
+                    self.assertEqual(observed[name], expected, name)
+                finally:
+                    # subTest suppresses an assertion only after its body exits. Restore
+                    # the verifier and close this World's stores even when that assertion fails.
+                    self.tearDown()
+                    self.doCleanups()
         succeeded = sorted(n for n, o in observed.items() if o == "succeeds")
-        # The known same-uid gap, pinned: four of eight mutants succeed in-process.
-        self.assertEqual(succeeded, ["patch_verify_function", "rewrite_ledger_rows",
+        # The known same-uid gap, pinned: five of nine mutants succeed in-process.
+        self.assertEqual(succeeded, ["patch_verify_function", "plant_verify_cache_entry", "rewrite_ledger_rows",
                                      "self_approve_in_gate_memory", "swap_anchor_attribute"])
 
 

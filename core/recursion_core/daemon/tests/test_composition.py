@@ -332,6 +332,43 @@ class ComposedDaemonTest(unittest.TestCase):
         self.assertEqual((receipt['code'], receipt['state']), ('stopped', 'stopped'), receipt)
         self.assertIsNotNone(proc.poll())  # the receipt came after the process was gone
 
+    def test_a_start_that_gave_up_while_its_run_was_being_bound_launches_nothing(self):
+        """The breaker store can keep a bind waiting for longer than the start waits. The start then
+        gives up and answers ``launch_timeout`` while its run is still being bound. When the bind
+        lands, the launcher has to look again before it launches anything: an engine started for a
+        start that was already answered as failed is one nobody is waiting for. Nothing is timed:
+        the bind is held on an event, and the start's wait is entered only once the bind is reached."""
+        _, composed = self.boot()
+        control = composed.control
+        reached, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        bind, wait = composed.breaker._stored.bind_run, launcher.RunContext.wait_started
+
+        def held_bind(*args, **kwargs):
+            reached.set()
+            release.wait(self.HELD_BOUND_S)
+            return bind(*args, **kwargs)
+
+        def runs_out(ctx, timeout_s):
+            self.assertTrue(reached.wait(self.HELD_BOUND_S), 'the launcher got as far as binding the run')
+            return wait(ctx, 0)
+
+        with mock.patch.object(composed.breaker._stored, 'bind_run', side_effect=held_bind), \
+                mock.patch.object(launcher.RunContext, 'wait_started', runs_out):
+            answer = control.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1',
+                                                'client_key': 'bound-late'})
+            self.assertEqual((answer['code'], (answer.get('start_error') or {}).get('code')),
+                             ('start_failed', 'launch_timeout'), answer)
+            run = answer['run_id']
+            self.assertEqual(self.units.started, [], 'nothing is launched while the run is being bound')
+            release.set()
+            for thread in threading.enumerate():
+                if thread.name == f'recursion-run-{run}':
+                    thread.join(self.HELD_BOUND_S)
+                    self.assertFalse(thread.is_alive(), 'the route worker ended')
+        self.assertEqual(self.units.started, [], 'an engine was launched for a start already answered as failed')
+        self.assertEqual(control.call('run.status', {'run_id': run})['run']['state'], 'start_failed')
+
     def test_engine_gets_only_the_policy_environment_and_no_secret_is_in_the_unit_command(self):
         _, composed = self.boot()
         run_id = self.start(self.api(composed))
@@ -898,6 +935,275 @@ class ComposedDaemonTest(unittest.TestCase):
         with self.assertRaises(adapter.Refused) as caught:
             stored.check(run_id, 'subscription:stand-in-login', 'host')
         self.assertEqual(caught.exception.code, 'run_faulted')
+
+    def test_fallback_route_validates_representable_connection_and_binds_launched_route(self):
+        self.routes['claude_code']['route']['limits'] = {
+            'on_limit': 'fallback',
+            'fallback': [{'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                          'connection': {'kind': 'subscription', 'id': 'bad space id'}}]}
+        _, composed = self.boot()
+        api = self.api(composed)
+        refused = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+        self.assertEqual((refused['code'], (refused.get('start_error') or {}).get('code')),
+                         ('start_failed', 'breaker_connection_unrepresentable'), refused)
+        self.shutdown()
+
+        self.routes['claude_code']['route']['limits'] = {
+            'on_limit': 'fallback',
+            'fallback': [{'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                          'connection': {'kind': 'subscription', 'id': 'fallback-login'}}]}
+        _, composed = self.boot()
+        composed.breaker._stored.report('subscription:stand-in-login', 'plan_limit')
+        api = self.api(composed)
+        started = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 ticks=1 fast=1'})
+        self.assertEqual(started['code'], 'started', started)
+        rid = started['run']['run_id']
+        until(lambda: (api.call('run.status', {'run_id': rid})['run'].get('result') or {}).get('status') == 'ok')
+        bound = composed.breaker._stored.check(rid, 'subscription:fallback-login', 'host')
+        self.assertEqual(bound, {'provider': 'claude_code', 'model_version': 'fallback-model'})
+
+    def test_cached_connection_cannot_launch_without_durable_binding(self):
+        import sqlite3
+        _, composed = self.boot()
+        self.assertTrue(composed.breaker.admit('subscription:stand-in-login', 'm', 't1')['admitted'])
+        with mock.patch.object(composed.breaker._stored, 'bind_run',
+                               side_effect=sqlite3.OperationalError('disk I/O error')):
+            answer = self.api(composed).call('run.start', {
+                'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+        self.assertEqual(answer['code'], 'start_failed', answer)
+        self.assertEqual(answer['start_error']['code'], 'launch_refused', answer)
+        self.assertIn('breaker_bind_failed:', answer['start_error']['detail'])
+        self.assertEqual(self.units.started, [])
+        rid = self.start(self.api(composed), 'helper=0 fast=1')
+        self.assertEqual(self.api(composed).call('run.stop', {'run_id': rid})['code'], 'stopped')
+
+    def test_only_a_fallback_list_the_daemon_would_launch_from_is_checked_for_its_connections(self):
+        """A fallback list that is only shown to the user (``on_limit`` ask or wait) is never launched
+        from, so a connection id in it that the breaker store cannot represent does not refuse the
+        route that lists it. A list the daemon would launch from (``on_limit`` fallback) still does,
+        and the route's own connection is checked whatever ``on_limit`` says."""
+        pristine = json.loads(json.dumps(self.routes))
+        listed = {'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                  'connection': {'kind': 'subscription', 'id': 'bad space id'}}  # valid for the route contract
+        for on_limit in ('ask', 'wait', 'fallback'):
+            for bad_primary in (False, True):
+                with self.subTest(on_limit=on_limit, bad_primary=bad_primary):
+                    self.routes = json.loads(json.dumps(pristine))
+                    route = self.routes['claude_code']['route']
+                    if bad_primary:
+                        route['connection']['id'] = 'bad primary id'
+                    route['limits'] = {'on_limit': on_limit, 'fallback': [dict(listed)]}
+                    _, composed = self.boot()
+                    try:
+                        api = self.api(composed)
+                        launched = len(self.units.started)
+                        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                        'prompt': 'helper=0 fast=1'})
+                        if bad_primary or on_limit == 'fallback':
+                            self.assertEqual((answer['code'], (answer.get('start_error') or {}).get('code')),
+                                             ('start_failed', 'breaker_connection_unrepresentable'), answer)
+                            self.assertEqual(len(self.units.started), launched, 'a refused start launched nothing')
+                        else:
+                            self.assertEqual(answer['code'], 'started', answer)
+                            self.assertEqual(len(self.units.started), launched + 1)
+                            api.call('run.stop', {'run_id': answer['run']['run_id']})
+                    finally:
+                        self.shutdown()
+
+    def test_every_route_in_a_fallback_list_the_daemon_would_launch_from_is_checked(self):
+        """Not the first entry alone: the route service tries the list in order, so any entry can be the
+        one that is launched. An id the store cannot represent refuses the start wherever it stands."""
+        pristine = json.loads(json.dumps(self.routes))
+
+        def listed(connection_id):
+            return {'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                    'connection': {'kind': 'subscription', 'id': connection_id}}
+
+        for place in (2, 3):
+            with self.subTest(place_of_the_entry_in_the_list=place):
+                entries = [listed(f'fallback-login-{number}') for number in range(1, place)] + [listed('bad space id')]
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['limits'] = {'on_limit': 'fallback', 'fallback': entries}
+                _, composed = self.boot()
+                try:
+                    answer = self.api(composed).call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                                   'prompt': 'helper=0 fast=1'})
+                    self.assertEqual((answer['code'], (answer.get('start_error') or {}).get('code')),
+                                     ('start_failed', 'breaker_connection_unrepresentable'), answer)
+                    self.assertEqual(self.units.started, [], 'a refused start launched nothing')
+                finally:
+                    self.shutdown()
+
+    def test_a_launch_beside_a_breaker_with_no_admission_on_record_is_refused(self):
+        """The launcher binds a run to what the breaker admitted for it. The route service asks the
+        breaker before every launch, so no path in the daemon launches without that record. Here the
+        record is made to go missing: the launch is refused, and no engine is started unbound."""
+        _, composed = self.boot()
+        admit_without_a_record = composed.breaker._inner.admit  # admits, and notes nothing on the run
+        with mock.patch.object(composed.breaker, 'admit', side_effect=admit_without_a_record):
+            answer = self.api(composed).call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                           'prompt': 'helper=0 fast=1'})
+        self.assertEqual(answer['code'], 'start_failed', answer)
+        self.assertEqual(answer['start_error'], {'code': 'launch_refused', 'detail': 'breaker_admission_missing'})
+        self.assertEqual(self.units.started, [])
+        rid = self.start(self.api(composed), 'helper=0 fast=1')  # with the record, the same start launches
+        self.assertEqual(self.api(composed).call('run.stop', {'run_id': rid})['code'], 'stopped')
+
+    def test_the_pidfd_is_closed_when_the_process_wrapper_cannot_be_made(self):
+        """The pidfd of the unit's main process is opened just before the wrapper that then owns it. When
+        the wrapper cannot be made nothing owns the descriptor, and the launcher closes it with the rest
+        of the failed launch. It stayed open before: one descriptor lost for each such failure."""
+        _, composed = self.boot()
+        api = self.api(composed)
+        opened = []
+        real_open = ProcessUnitManager.open_main_pidfd
+
+        def open_and_note(manager, group, pid):
+            pidfd = real_open(manager, group, pid)
+            opened.append((pidfd, os.readlink(f'/proc/self/fd/{pidfd}')))  # the link names what the number is
+            return pidfd
+
+        def still_that_pidfd(pidfd, link):
+            try:
+                return os.readlink(f'/proc/self/fd/{pidfd}') == link
+            except OSError:
+                return False
+
+        with mock.patch.object(ProcessUnitManager, 'open_main_pidfd', open_and_note), \
+                mock.patch.object(launcher, 'UnitEngineProcess',
+                                  side_effect=OSError('the process wrapper could not be made')):
+            answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0 fast=1'})
+            self.assertEqual(answer['code'], 'start_failed', answer)
+            self.assertEqual(len(opened), 1, 'the launch never got as far as the pidfd: nothing was tested')
+            closed = until(lambda: not still_that_pidfd(*opened[0]), 5)
+            if not closed:
+                os.close(opened[0][0])  # not left open in the test process either
+            self.assertTrue(closed, 'the pidfd of the failed launch was left open')
+        self.assertEqual(len(self.units.started), 1)
+        self.assertTrue(until(lambda: all(proc.poll() is not None for proc in self.units.procs.values())),
+                        'the unit of the failed launch was left running')
+        rid = self.start(api, 'helper=0 fast=1')  # the next start launches and stops as usual
+        self.assertEqual(api.call('run.stop', {'run_id': rid})['code'], 'stopped')
+
+    def engine_row(self, api):
+        return next(r for r in api.call('route.list')['routes'] if r['id'] == 'engine:claude_code')
+
+    def test_a_model_name_outside_the_id_grammar_starts_and_is_bound_as_given(self):
+        """The store records a model as the route gives it when it is printable ASCII with no space, so a
+        vendor's own spelling starts like any other name, and the run's binding holds the exact string."""
+        pristine = json.loads(json.dumps(self.routes))
+        for name in ('opus[1m]', 'claude-sonnet-4.5(beta)', 'a+b'):
+            with self.subTest(model=name):
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['model'] = name
+                _, composed = self.boot()
+                try:
+                    api = self.api(composed)
+                    launched = len(self.units.started)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                    'prompt': 'helper=0 fast=1'})
+                    self.assertEqual(answer['code'], 'started', answer)
+                    self.assertEqual(len(self.units.started), launched + 1)
+                    rid = answer['run']['run_id']
+                    self.assertEqual(composed.breaker._stored.check(rid, 'subscription:stand-in-login', 'host'),
+                                     {'provider': 'claude_code', 'model_version': name})
+                    self.assertNotIn('breaker_model_unrepresentable', self.engine_row(api)['blocker'])
+                    api.call('run.stop', {'run_id': rid})
+                finally:
+                    self.shutdown()
+
+    def test_a_model_the_store_cannot_record_is_refused_before_the_breaker_is_asked(self):
+        """Too long, a space, a control character, not ASCII: the run's binding could not hold the name. The start
+        is refused with a code of its own before the breaker is asked and before anything is launched,
+        and route.list names it as the route's blocker."""
+        pristine = json.loads(json.dumps(self.routes))
+        for name in ('m' * 129, 'claude sonnet 4.5', 'opus\x07', 'mod\u00e8le'):
+            with self.subTest(model=ascii(name)[:24]):
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['model'] = name
+                _, composed = self.boot()
+                try:
+                    api = self.api(composed)
+                    with mock.patch.object(composed.breaker, 'admit', wraps=composed.breaker.admit) as admit:
+                        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                        'prompt': 'helper=0 fast=1'})
+                    self.assertEqual(answer['code'], 'start_failed', answer)
+                    self.assertEqual(answer['start_error'],
+                                     {'code': 'breaker_model_unrepresentable', 'detail': 'model'})
+                    admit.assert_not_called()
+                    self.assertEqual(self.units.started, [], 'a refused start launched nothing')
+                    self.assertEqual(self.engine_row(api)['blocker'], 'breaker_model_unrepresentable: model')
+                finally:
+                    self.shutdown()
+
+    def test_a_fallback_model_the_store_cannot_record_refuses_only_a_list_the_daemon_would_launch_from(self):
+        """As for a connection id: a fallback list that is only shown to the user (``on_limit`` ask or
+        wait) is never launched from, so a model in it that the store cannot record blocks nothing. In
+        a list the daemon would launch from it refuses the start, wherever it stands in the list."""
+        pristine = json.loads(json.dumps(self.routes))
+
+        def listed(model, login):
+            return {'engine': 'claude_code', 'model': model, 'api_key_helper': 'absent',
+                    'connection': {'kind': 'subscription', 'id': login}}
+
+        cases = (('ask', 1, None), ('wait', 1, None),
+                 ('fallback', 1, 'fallback 1: model'), ('fallback', 2, 'fallback 2: model'))
+        for on_limit, place, refusal in cases:
+            with self.subTest(on_limit=on_limit, place_of_the_entry_in_the_list=place):
+                entries = [listed('fallback-model', f'fallback-login-{number}') for number in range(1, place)]
+                entries.append(listed('mod\u00e8le', 'fallback-login-9'))
+                self.routes = json.loads(json.dumps(pristine))
+                self.routes['claude_code']['route']['limits'] = {'on_limit': on_limit, 'fallback': entries}
+                _, composed = self.boot()
+                try:
+                    api = self.api(composed)
+                    launched = len(self.units.started)
+                    answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                    'prompt': 'helper=0 fast=1'})
+                    blocker = self.engine_row(api)['blocker']
+                    if refusal is None:
+                        self.assertEqual(answer['code'], 'started', answer)
+                        self.assertEqual(len(self.units.started), launched + 1)
+                        self.assertNotIn('breaker_model_unrepresentable', blocker)
+                        api.call('run.stop', {'run_id': answer['run']['run_id']})
+                    else:
+                        self.assertEqual((answer['code'], answer.get('start_error')), (
+                            'start_failed', {'code': 'breaker_model_unrepresentable', 'detail': refusal}), answer)
+                        self.assertEqual(len(self.units.started), launched, 'a refused start launched nothing')
+                        self.assertEqual(blocker, f'breaker_model_unrepresentable: {refusal}')
+                finally:
+                    self.shutdown()
+
+    def test_a_route_with_no_model_is_still_the_validators_to_refuse(self):
+        """A model that is missing, empty or not text is refused by the route validator, request_invalid,
+        as it was before the store's rule was looked at before launch. That check leaves such a route
+        alone, for the route itself and for a route in a fallback list the daemon would launch from."""
+        pristine = json.loads(json.dumps(self.routes))
+        for where in ('route', 'fallback'):
+            for model in ('', None, 7, 'no model key'):
+                with self.subTest(where=where, model=repr(model)):
+                    self.routes = json.loads(json.dumps(pristine))
+                    route = self.routes['claude_code']['route']
+                    target = route
+                    if where == 'fallback':
+                        target = {'engine': 'claude_code', 'model': 'fallback-model', 'api_key_helper': 'absent',
+                                  'connection': {'kind': 'subscription', 'id': 'fallback-login'}}
+                        route['limits'] = {'on_limit': 'fallback', 'fallback': [target]}
+                    if model == 'no model key':
+                        del target['model']
+                    else:
+                        target['model'] = model
+                    _, composed = self.boot()
+                    try:
+                        api = self.api(composed)
+                        answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code',
+                                                        'prompt': 'helper=0 fast=1'})
+                        self.assertEqual(answer['code'], 'start_failed', answer)
+                        self.assertEqual(answer['start_error'], {'code': 'request_invalid', 'detail': 'route.model'})
+                        self.assertEqual(self.units.started, [], 'a refused start launched nothing')
+                        self.assertNotIn('breaker_model_unrepresentable', self.engine_row(api)['blocker'])
+                    finally:
+                        self.shutdown()
 
     def test_a_breaker_store_that_cannot_be_read_refuses_starts_and_keeps_reads(self):
         path = daemon_breaker.store_path(self.state)

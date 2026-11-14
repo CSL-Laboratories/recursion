@@ -57,6 +57,7 @@ from collections import OrderedDict
 from typing import Callable
 
 from .approval import SCOPE_FIELDS
+from .breaker import ConnectionBreaker
 from .canonical import MAX_INT, canonical, parse
 from .errors import Refused
 from .signing import key_id, parse_public_key, verify
@@ -70,9 +71,11 @@ _FIELDS = frozenset({"schema", "profile_id", "issuer", "plugin_id", "artifact_sh
 _BUDGETS = frozenset({"currency", "max_effect_minor", "total_minor"})
 _ID = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}")
 _SCOPE_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
-# Provider and model version use the same grammar ``ConnectionBreaker.bind_run`` accepts (``breaker._ID``),
-# so every model a run can be bound to (``vendor/model``, ``model@rev``) can also be named in a profile.
-_MODEL_VALUE = re.compile(r"[A-Za-z0-9_.:@/-]{1,128}")
+# A profile names its provider in the id grammar ``ConnectionBreaker.bind_run`` holds a provider to
+# (``breaker._ID``), and its model version by the rule ``bind_run`` records one by, which is asked of
+# the store and not written again here. So whatever a run can be bound to (``vendor/model``,
+# ``model@rev``, ``opus[1m]``) can be named in a profile, and nothing else can.
+_PROVIDER_VALUE = re.compile(r"[A-Za-z0-9_.:@/-]{1,128}")
 _KIND = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 _LEDGER_MAGIC = "csl-authority-ledger/v0"
 _VERIFY_CACHE_SIZE = 256  # positive signature verdicts kept per Authority
@@ -84,6 +87,11 @@ def _int(value: object, low: int = 0) -> bool:
 
 # Each charge sums prior charges for its profile; index that lookup (no full scan).
 _CHARGES_INDEX = "CREATE INDEX IF NOT EXISTS charges_by_profile ON charges (profile_id)"
+
+
+def _model_version_ok(value: object) -> bool:
+    """Whether a profile may name this model version: exactly when a run can be bound to it."""
+    return ConnectionBreaker.model_recordable(value)
 
 
 def create_ledger(path: str, anchor_public_key: str) -> None:
@@ -116,19 +124,25 @@ class Authority:
         self._clock = clock
         if not os.path.isfile(ledger_path):
             raise Refused("ledger_missing")
-        self._db = sqlite3.connect(ledger_path, isolation_level=None, check_same_thread=False,
-                                   timeout=30)
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute("PRAGMA busy_timeout=30000")
+        self._db = None
         try:
+            self._db = sqlite3.connect(ledger_path, isolation_level=None, check_same_thread=False,
+                                       timeout=30)
+            self._db.execute("PRAGMA synchronous=FULL")
+            self._db.execute("PRAGMA busy_timeout=30000")
             meta = dict(self._db.execute("SELECT k, v FROM meta").fetchall())
-        except sqlite3.DatabaseError:
-            self._db.close()
+        except sqlite3.Error:
+            if self._db is not None:
+                self._db.close()
             raise Refused("ledger_invalid") from None
         if meta.get("magic") != _LEDGER_MAGIC or meta.get("anchor") != self._anchor_id:
             self._db.close()
             raise Refused("ledger_anchor_mismatch")
-        self._db.execute(_CHARGES_INDEX)  # ledgers created before the index gain it here
+        try:
+            self._db.execute(_CHARGES_INDEX)  # ledgers created before the index gain it here
+        except sqlite3.Error:
+            self._db.close()
+            raise Refused("ledger_invalid") from None
         self._lock = threading.Lock()
         # Positive Ed25519 verdicts for this instance's fixed anchor, keyed by the exact
         # (signature hex, canonical bytes) pair; LRU, bounded, own lock (free-threaded safe).
@@ -186,8 +200,8 @@ class Authority:
         if (type(scope) is not dict or set(scope) != SCOPE_FIELDS
                 or any(type(v) is not str or not _SCOPE_VALUE.fullmatch(v) for v in scope.values())):
             raise Refused("profile_scope")
-        if any(type(profile[k]) is not str or not _MODEL_VALUE.fullmatch(profile[k])
-               for k in ("provider", "model_version")):
+        if (type(profile["provider"]) is not str or not _PROVIDER_VALUE.fullmatch(profile["provider"])
+                or not _model_version_ok(profile["model_version"])):
             raise Refused("profile_model")
         # TODO(CSL-738 follow-up): the tuple refusal is a shape rule kept by owner call
         # Nov 11 2:20am PST; review it and possibly change it later (the signed bytes of a
@@ -266,4 +280,5 @@ class Authority:
                 "remaining_minor": profile["budgets"]["total_minor"] - spent - amount_minor}
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._db.close()

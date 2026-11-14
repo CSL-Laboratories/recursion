@@ -10,18 +10,49 @@ this snippet does not auto-approve it.
 
 from __future__ import annotations
 
-import json
 import re
 
 from recursion_core.control.mcp_tools import STOP_TOOL
 
-_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+# fullmatch, not match with "$": "$" also matches before a trailing newline, so "rc\n" passed and the
+# table header broke the file (Nov 12 review, finding 14).
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+
+
+def toml_string(value: str) -> str:
+    """``value`` as a TOML basic string, ASCII only.
+
+    Printable ASCII is written as itself; the short escapes are used where TOML has one; every other
+    character is a Unicode scalar escape, ``\\uXXXX`` or, above U+FFFF, ``\\UXXXXXXXX`` (JSON's
+    surrogate pairs are not valid TOML, and JSON leaves DEL bare, which TOML refuses). Up to U+FFFF,
+    DEL aside, the text is what ``json.dumps`` wrote before. A lone surrogate is no Unicode scalar
+    value and has no TOML form: ``ValueError``.
+    """
+
+    if type(value) is not str:
+        raise TypeError("a TOML string value must be a str")
+    out = ['"']
+    for ch in value:
+        code = ord(ch)
+        if ch in _SHORT_ESCAPES:
+            out.append(_SHORT_ESCAPES[ch])
+        elif 0x20 <= code < 0x7F:
+            out.append(ch)
+        elif 0xD800 <= code <= 0xDFFF:
+            raise ValueError("a lone surrogate has no TOML form")
+        elif code <= 0xFFFF:
+            out.append(f"\\u{code:04x}")  # lower-case hex, as json.dumps wrote it before
+        else:
+            out.append(f"\\U{code:08x}")
+    out.append('"')
+    return "".join(out)
 
 
 def codex_operator_snippet(server_id: str, command: str, args: list[str] | None = None) -> str:
     """TOML for the operator's ``~/.codex/config.toml``. ``command``/``args`` launch the Control MCP server."""
 
-    if not _BARE_KEY.match(server_id):
+    if type(server_id) is not str or _BARE_KEY.fullmatch(server_id) is None:
         raise ValueError("server_id must be a bare TOML key")
     lines = [
         "# Recursion Control MCP (PRODUCT.md 055cc7a5, O41).",
@@ -30,8 +61,8 @@ def codex_operator_snippet(server_id: str, command: str, args: list[str] | None 
         "# can still force a prompt. Without this setting, stop prompts in Auto mode and is refused under",
         "# `codex exec`. start is not auto-approved here.",
         f"[mcp_servers.{server_id}]",
-        f"command = {json.dumps(command)}",
-        f"args = [{', '.join(json.dumps(a) for a in args or [])}]",
+        f"command = {toml_string(command)}",
+        f"args = [{', '.join(toml_string(a) for a in args or [])}]",
         "",
         f"[mcp_servers.{server_id}.tools.{STOP_TOOL}]",
         'approval_mode = "approve"',

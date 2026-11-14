@@ -8,8 +8,10 @@ When the daemon cannot be reached, or does not answer, the result is ``control_a
 what is known about delivery. A Stop that got no answer is never reported as stopped (PRODUCT.md
 d84cdd26, CSLR-D-012, section 3.4 S6 line 888):
 
-* ``delivered: false``: nothing listened, the peer was refused, or the server was at its connection
-  cap. The request did not reach the control API.
+* ``delivered: false``: nothing listened, the peer was refused, the server was at its connection
+  cap, or the request could not be framed at all (over the frame cap, or not JSON: detail
+  ``not_sent:<reason>``, checked before anything is connected). The request did not reach the
+  control API.
 * ``delivered: "unknown"``: the request was written and no complete reply came back. It may have
   been carried out; read the run's status before retrying.
 
@@ -22,8 +24,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from recursion_core.control_transport import (PeerNotAdmitted, PlatformNotSupported, TransportBusy, TransportRefused,
-                                              UnixControlClient)
+from recursion_core.control_transport import (FrameError, PeerNotAdmitted, PlatformNotSupported, TransportBusy,
+                                              TransportRefused, UnixControlClient)
+from recursion_core.control_transport.framing import encode_frame
 
 SOCKET_DIR = "recursion"  # $XDG_RUNTIME_DIR/recursion/control.sock
 UNAVAILABLE = "control_api_unavailable"
@@ -57,6 +60,15 @@ class SocketAPI:
     def call(self, method: str, params: dict | None = None) -> dict:
         if self.path is None:
             return {"code": UNAVAILABLE, "delivered": False, "detail": "platform_unsupported"}
+        message = {"op": "control", "method": method, "params": dict(params or {})}
+        try:
+            # A request the transport cannot frame is refused before any byte is written, so it was
+            # not delivered; reported after the write it read as "unknown" (Nov 12 review, finding 8).
+            encode_frame(message)
+        except FrameError as err:
+            return {"code": UNAVAILABLE, "delivered": False, "detail": f"not_sent:{err}"}
+        except (TypeError, ValueError):
+            return {"code": UNAVAILABLE, "delivered": False, "detail": "not_sent:frame_not_json"}
         try:
             client = self._connect(self.path, timeout_s=self._timeout_s)
         except PlatformNotSupported:
@@ -64,7 +76,7 @@ class SocketAPI:
         except (OSError, TransportRefused) as err:
             return {"code": UNAVAILABLE, "delivered": False, "detail": f"connect:{type(err).__name__}"}
         try:
-            reply = client.request({"op": "control", "method": method, "params": dict(params or {})})
+            reply = client.request(message)
         except TransportBusy:
             return {"code": UNAVAILABLE, "delivered": False, "detail": "busy"}
         except PeerNotAdmitted:  # refused at accept (a peer inside a run unit): no handler saw the request

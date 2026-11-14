@@ -5,12 +5,21 @@ carry a run start or stop. It has its own socket file, apart from any control so
 
 Security model: no token. Access is the socket owner's user only.
 
+- Runtime folder: when no path is given, the folder the default path lives in (``$XDG_RUNTIME_DIR``,
+  else ``/run/user/<uid>``) must exist, be a real directory owned by this uid and be closed to group
+  and other, or the server refuses to serve (``SocketUnsafe``). A folder others can write to would let
+  them swap the ``recursion`` directory under it.
 - Directory: created ``0700`` if missing. The server refuses to serve (``SocketUnsafe``) if the
   directory is a symlink, is not owned by this uid, or is open to group or other.
+- Start lock: before it looks at the socket path, a server takes an exclusive ``flock`` on
+  ``<path>.lock`` (an owner-only regular file it creates) and holds it while it serves; a second server
+  for the same path refuses (``SocketUnsafe``) instead of probing, unlinking and binding alongside the
+  first. ``close()`` removes the lock file. A crashed holder's lock is dropped by the kernel.
 - Socket file: bound under umask ``0o077``, set to ``0600`` and checked before ``listen``.
-- Peer: each connection's uid is read with ``SO_PEERCRED``; another uid is answered ``peer_refused`` and
-  closed unread. Where ``AF_UNIX``, ``SO_PEERCRED`` or ``os.getuid`` is missing (macOS, Windows) the
-  server refuses to serve with ``PlatformNotSupported``.
+- Peer: each connection's uid is read with ``SO_PEERCRED``; another uid is answered ``peer_refused`` with
+  no host profile (``NO_PROFILE``) and closed unread. Refusals (``peer_refused``, ``busy``) are written
+  without blocking the accept thread. Where ``AF_UNIX``, ``SO_PEERCRED``, ``flock`` or ``os.getuid`` is
+  missing (macOS, Windows) the server refuses to serve with ``PlatformNotSupported``.
 
 Framing: one request per connection. The client sends one JSON object line ``{"method": str,
 "params": {}}`` of at most ``MAX_REQUEST_BYTES`` bytes; the server answers one JSON line and closes.
@@ -22,6 +31,9 @@ Default path: ``$XDG_RUNTIME_DIR/recursion/operator-reads.sock``, else
 
 The client's ``call`` never raises. Unreachable answers ``control_api_unavailable`` with ``delivered``
 ``False``; a request that was written but got no complete reply answers ``delivered`` ``"unknown"``.
+The client checks the server's uid with ``SO_PEERCRED`` before it writes; where that is missing it
+connects to nothing and answers ``control_api_unavailable``, ``delivered`` ``False``, detail
+``platform_unsupported``, as the server refuses to serve there.
 """
 
 from __future__ import annotations
@@ -34,6 +46,11 @@ import struct
 import threading
 import time
 from collections.abc import Callable, Mapping
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; start() refuses PlatformNotSupported there
+    fcntl = None  # type: ignore[assignment]
 
 from recursion_core.control.operator_reads import (
     BUSY,
@@ -58,6 +75,10 @@ _AF_UNIX = getattr(socket, "AF_UNIX", None)
 _SO_PEERCRED = getattr(socket, "SO_PEERCRED", None)
 _UMASK_LOCK = threading.Lock()  # the umask is process-wide
 _BACKLOG = 32  # waiting to be accepted, not served: the accept loop answers "busy" over the cap
+_LOCK_SUFFIX = ".lock"
+# A holder that closes removes the lock file; one who opened it just before may lock the removed file.
+# Such a server opens the path again, this many times at most, then refuses.
+_LOCK_ATTEMPTS = 3
 
 
 class PlatformNotSupported(RuntimeError):
@@ -75,14 +96,35 @@ def _getuid() -> int:
     return getuid()
 
 
-def default_socket_path(environ: Mapping[str, str] | None = None) -> str:
-    """``$XDG_RUNTIME_DIR/recursion/operator-reads.sock``, else under ``/run/user/<uid>``."""
+def _runtime_dir(environ: Mapping[str, str] | None = None) -> str:
+    """``$XDG_RUNTIME_DIR`` when it is an absolute path, else ``/run/user/<uid>``."""
 
     uid = _getuid()
     base = (os.environ if environ is None else environ).get("XDG_RUNTIME_DIR") or ""
     if not os.path.isabs(base):
         base = f"/run/user/{uid}"
-    return os.path.join(base, SOCKET_DIR, SOCKET_NAME)
+    return base
+
+
+def default_socket_path(environ: Mapping[str, str] | None = None) -> str:
+    """``$XDG_RUNTIME_DIR/recursion/operator-reads.sock``, else under ``/run/user/<uid>``."""
+
+    return os.path.join(_runtime_dir(environ), SOCKET_DIR, SOCKET_NAME)
+
+
+def _check_runtime_dir(directory: str, uid: int) -> None:
+    """The runtime folder must exist and be a real directory of this uid, closed to group and other."""
+
+    try:
+        st = os.lstat(directory)
+    except FileNotFoundError:
+        raise SocketUnsafe("the runtime folder does not exist") from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise SocketUnsafe("the runtime folder is not a directory")
+    if st.st_uid != uid:
+        raise SocketUnsafe("the runtime folder is not owned by this user")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        raise SocketUnsafe("the runtime folder is open to group or other")
 
 
 def _peer_uid(conn: socket.socket) -> int:
@@ -104,6 +146,57 @@ def _secure_dir(directory: str, uid: int) -> None:
         raise SocketUnsafe("the socket directory is open to group or other")
 
 
+def _take_start_lock(path: str, uid: int) -> tuple[int, tuple[int, int]]:
+    """Take an exclusive ``flock`` on ``path`` (an owner-only regular file) and return ``(fd, identity)``.
+
+    Held while the server serves, it orders the stale-socket probe, unlink and bind of two servers on
+    one path: without it both could find the same stale socket, both unlink and bind, and the first
+    would go on listening on an inode nobody can reach. A holder that closes removes the file, so a
+    server whose lock landed on a file already removed opens the path again.
+    """
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    for _ in range(_LOCK_ATTEMPTS):
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise SocketUnsafe(f"the start lock cannot be opened ({type(exc).__name__})") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or stat.S_IMODE(st.st_mode) & 0o077:
+                raise SocketUnsafe("the start lock is not an owner-only file of this user")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SocketUnsafe("another server is starting or serving on this path") from None
+            identity = (st.st_dev, st.st_ino)
+            try:
+                now = os.lstat(path)
+            except FileNotFoundError:
+                now = None
+            if now is not None and (now.st_dev, now.st_ino) == identity:
+                return fd, identity
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)  # the file we locked was removed by the holder before us: open the path again
+    raise SocketUnsafe("the start lock kept changing under this server")
+
+
+def _release_start_lock(path: str, held: tuple[int, tuple[int, int]]) -> None:
+    """Remove the lock file if it is still the one we locked, then drop the lock."""
+
+    fd, identity = held
+    try:
+        st = os.lstat(path)
+        if (st.st_dev, st.st_ino) == identity:
+            os.unlink(path)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _clear_stale(path: str) -> None:
     """Remove a socket file nobody listens on. A live listener or a non-socket is left alone."""
 
@@ -117,6 +210,8 @@ def _clear_stale(path: str) -> None:
     try:
         probe.settimeout(1.0)
         probe.connect(path)
+    except FileNotFoundError:
+        return  # removed since the lstat: nothing is left to clear
     except ConnectionRefusedError:
         os.unlink(path)
         return
@@ -147,6 +242,7 @@ class OperatorReadsServer:
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._identity: tuple[int, int] | None = None
+        self._start_lock: tuple[int, tuple[int, int]] | None = None
         self._uid = -1
 
     @property
@@ -156,34 +252,45 @@ class OperatorReadsServer:
     def start(self) -> OperatorReadsServer:
         if self._listener is not None or self._stop.is_set():
             raise RuntimeError("the server was already started")
-        if _AF_UNIX is None or _SO_PEERCRED is None:
-            raise PlatformNotSupported("AF_UNIX with SO_PEERCRED is needed to serve owner-only")
+        if _AF_UNIX is None or _SO_PEERCRED is None or fcntl is None:
+            raise PlatformNotSupported("AF_UNIX with SO_PEERCRED and flock is needed to serve owner-only")
         self._uid = _getuid()
-        path = self._path or default_socket_path()
+        path = self._path
+        if path is None:
+            runtime = _runtime_dir()
+            _check_runtime_dir(runtime, self._uid)
+            path = os.path.join(runtime, SOCKET_DIR, SOCKET_NAME)
         _secure_dir(os.path.dirname(path), self._uid)
-        _clear_stale(path)
-        listener = socket.socket(_AF_UNIX, socket.SOCK_STREAM)
+        lock_path = path + _LOCK_SUFFIX
+        held = _take_start_lock(lock_path, self._uid)
         try:
-            with _UMASK_LOCK:
-                old = os.umask(0o077)
-                try:
-                    listener.bind(path)
-                finally:
-                    os.umask(old)
+            _clear_stale(path)
+            listener = socket.socket(_AF_UNIX, socket.SOCK_STREAM)
             try:
-                os.chmod(path, 0o600)
-                st = os.lstat(path)
-                if not stat.S_ISSOCK(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) != 0o600:
-                    raise SocketUnsafe("the socket file is not an owner-only socket")
-                listener.listen(_BACKLOG)
-                listener.settimeout(0.1)
+                with _UMASK_LOCK:
+                    old = os.umask(0o077)
+                    try:
+                        listener.bind(path)
+                    finally:
+                        os.umask(old)
+                try:
+                    os.chmod(path, 0o600)
+                    st = os.lstat(path)
+                    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) != 0o600:
+                        raise SocketUnsafe("the socket file is not an owner-only socket")
+                    listener.listen(_BACKLOG)
+                    listener.settimeout(0.1)
+                except BaseException:
+                    os.unlink(path)
+                    raise
             except BaseException:
-                os.unlink(path)
+                listener.close()
                 raise
         except BaseException:
-            listener.close()
+            _release_start_lock(lock_path, held)
             raise
         self._path, self._identity, self._listener = path, (st.st_dev, st.st_ino), listener
+        self._start_lock = held
         self._thread = threading.Thread(target=self._accept_loop, name="operator-reads-accept", daemon=True)
         self._thread.start()
         return self
@@ -213,6 +320,9 @@ class OperatorReadsServer:
                 os.unlink(self._path)
         except OSError:
             pass
+        held, self._start_lock = self._start_lock, None
+        if held is not None:  # after the socket is gone, so the next server finds nothing live
+            _release_start_lock(self._path + _LOCK_SUFFIX, held)
 
     def __enter__(self) -> OperatorReadsServer:
         return self.start()
@@ -255,9 +365,16 @@ class OperatorReadsServer:
                 self._reject(conn, BUSY)
 
     def _reject(self, conn: socket.socket, code: str) -> None:
+        """Answer a refused connection on the accept thread, without ever waiting on the peer.
+
+        A peer of another uid (or one whose uid cannot be read) is not authenticated, so its refusal
+        carries no host profile. The frame is written once, non-blocking: a peer that does not read
+        cannot stall the accept loop.
+        """
+        profile = None if code == PEER_REFUSED else self._reads.profile
         try:
-            conn.settimeout(0.5)
-            conn.sendall(self._encode(refusal(code, profile=self._reads.profile)))
+            conn.setblocking(False)
+            conn.send(self._encode(refusal(code, profile=profile)))
         except OSError:
             pass
         finally:
@@ -346,7 +463,9 @@ class OperatorReadsClient:
         line = json.dumps({"method": method, "params": {}}, separators=(",", ":")).encode("ascii") + b"\n"
         if len(line) > MAX_REQUEST_BYTES:
             return _local(METHOD_NOT_ALLOWED, False, "method name too long; nothing was sent")
-        if _AF_UNIX is None:
+        if _AF_UNIX is None or _SO_PEERCRED is None:
+            # Without SO_PEERCRED the server's uid cannot be checked: connect to nothing, as the server
+            # refuses to serve there (finding 2 of the Nov 12 review).
             return _local(CONTROL_API_UNAVAILABLE, False, PLATFORM_UNSUPPORTED)
         try:
             uid = _getuid()
@@ -364,7 +483,7 @@ class OperatorReadsClient:
             try:
                 conn.settimeout(timeout)
                 conn.connect(path)
-                if _SO_PEERCRED is not None and _peer_uid(conn) != uid:
+                if _peer_uid(conn) != uid:
                     return _local(CONTROL_API_UNAVAILABLE, False, "server_not_this_user")
             except (OSError, ValueError, TypeError, struct.error) as exc:
                 return _local(CONTROL_API_UNAVAILABLE, False, f"connect_failed: {type(exc).__name__}")

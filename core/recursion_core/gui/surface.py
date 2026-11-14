@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections.abc import Mapping
 from html import escape
 from typing import Callable
 from urllib.parse import parse_qs, quote
@@ -87,15 +88,23 @@ def _sign_in_cell(value: object) -> str:
 
 
 def withhold_venue_data(value: object) -> object:
-    """Hide venue data unless the control API marks its switch exactly ``on``."""
-    if type(value) is dict:
+    """Hide venue data unless the control API marks its switch exactly ``on``.
+
+    Any mapping is read as a dict and any list or tuple as a list, at every depth, and they
+    come back as a dict and a list (C7 finding 4: a tuple of rows or a mapping proxy used to
+    pass through unredacted). A value JSON cannot carry (a set, a deque, any other object) is
+    replaced by a fixed marker, never shown.
+    """
+    if isinstance(value, Mapping):
         out = {k: withhold_venue_data(v) for k, v in value.items()}
         if "venue_data" in value and value.get("venue_data_switch") != "on":
             out["venue_data"] = "[withheld: venue data switch is off]"
         return out
-    if type(value) is list:
+    if isinstance(value, (list, tuple)):
         return [withhold_venue_data(v) for v in value]
-    return value
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    return "[withheld: not JSON data]"
 
 
 def _venue_scope_sentence(venue: str) -> str:

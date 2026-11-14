@@ -51,6 +51,7 @@ import threading
 import time
 import uuid
 
+from recursion_core.control import hooks as control_hooks
 from recursion_core.control.api import ControlAPI
 from recursion_core.control.client import socket_directory
 from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
@@ -141,8 +142,11 @@ class RoutesUnreadable(Exception):
     pass
 
 
-def load_routes(path):
+def load_routes(path, engines=WIRED_ENGINES):
     """Read the operator's route file: ``{"routes": {"<engine>": {...}}}``, or {} when there is none.
+
+    ``engines`` are the engines an entry may name: the names of the composition's engine table (seam S3),
+    which are today's two unless a lane registered a factory.
 
     Each entry is the route part of a ``recursion.route/v0`` request (model, connection, and the
     engine's own fields) plus ``deadline_s`` and an optional absolute ``binary``. Nothing is
@@ -166,8 +170,8 @@ def load_routes(path):
         raise RoutesUnreadable('routes file has no "routes" object')
     out = {}
     for engine, entry in routes.items():
-        if engine not in WIRED_ENGINES or not isinstance(entry, dict):
-            raise RoutesUnreadable(f'route {engine!r}: only claude_code and codex are wired')
+        if engine not in engines or not isinstance(entry, dict):
+            raise RoutesUnreadable(f'route {engine!r}: only {" and ".join(engines)} are wired')
         deadline = entry.get('deadline_s')
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or deadline <= 0:
             raise RoutesUnreadable(f'route {engine}: deadline_s')
@@ -294,8 +298,9 @@ class RouteStarter:
     """
 
     def __init__(self, service, routes, daemon, state_dir, *, start_timeout_s=20.0, exit_grace_s=5.0,
-                 breaker=None, breaker_unavailable=None):
+                 breaker=None, breaker_unavailable=None, hooks=None):
         self._service, self._routes, self._daemon = service, dict(routes), daemon
+        self._hooks = hooks  # the composed hooks (control.hooks), or None: then no hook is asked, as before
         # ``breaker`` is the DurableRouteBreaker (None in a test that composes without one);
         # ``breaker_unavailable`` is why its store could not be opened, and refuses every start.
         self._breaker, self._breaker_unavailable = breaker, breaker_unavailable
@@ -310,11 +315,22 @@ class RouteStarter:
         with self._lock:
             return run_id in self._active
 
-    def __call__(self, params):
+    def __call__(self, params, record=None):
+        """``record`` is the run's stored record, handed over by the control API when a lane is on the start path
+        (seam S6); None otherwise, and then everything below is as before. The run's launch context is built
+        here, from the whole stored launch object and the principal beside it, never from the client's params."""
         run_id, engine = params['run_id'], params['engine']
         if not RUN_ID.fullmatch(run_id):
             raise self._refuse(run_id, 'request_invalid', 'run_id')
-        entry = self._routes.get(engine)
+        launch = None
+        if record is not None:
+            try:
+                launch = control_hooks.LaunchContext.from_record(record)
+            except (TypeError, ValueError):
+                raise self._refuse(run_id, route_contract.LAUNCH_REFUSED, 'launch_snapshot_invalid') from None
+        # A route entry a registrant chose is used as it was stored. With none, the configured entry is looked up
+        # here, as today, so route_not_configured keeps its timing.
+        entry = launch.route_entry if launch is not None and launch.route_entry is not None else self._routes.get(engine)
         if entry is None:
             raise self._refuse(run_id, 'route_not_configured', engine)
         unsupported = route_unsupported(entry)
@@ -329,7 +345,7 @@ class RouteStarter:
         request = {'contract': route_contract.CONTRACT_VERSION, 'request_id': run_id,
                    'tenant': params['tenant'], 'prompt': params['prompt'],
                    'deadline_s': entry['deadline_s'], 'route': json.loads(json.dumps(entry['route']))}
-        ctx = RunContext(run_id, breaker=self._breaker)
+        ctx = RunContext(run_id, breaker=self._breaker, launch=launch)
         with self._lock:
             in_flight = run_id in self._active
             if not in_flight:
@@ -356,7 +372,67 @@ class RouteStarter:
             self.failures[run_id] = {'code': code, 'detail': detail}
         return StartRefused(code, detail)
 
+    def _fault_run(self, run_id):
+        if self._breaker is not None:
+            self._breaker.fault_run(run_id)
+
+    def _hand_over(self, owner, ctx, request):
+        """Seam S9, a run its owner accepted. ``owner.run`` is a HAND-OVER: it returns promptly, and the caller
+        holds a lifetime reference around it, so closing waits for it. What outlives it is a worker of a
+        registered service of the owner's lane, which that service's ``stop`` joins before the store closes.
+
+        The run is bound to this thread for the call, as on today's path; an owner that calls the route service
+        from another thread binds that thread itself, with ``bound_run(ctx)``.
+
+        The run stays active until the owner calls ``release``, which counts once. If ``owner.run`` raises, the
+        run is given an engine-error result when it has none, what was launched is settled unless the daemon is
+        closing, and the run is released: an owner that wants another end does not raise."""
+        released = threading.Lock()
+
+        def release():
+            if released.acquire(blocking=False):
+                with self._lock:
+                    self._active.pop(ctx.run_id, None)
+
+        try:
+            with bound_run(ctx):
+                owner.run(ctx, request, self._service, self._record_result, self._fault_run, self._settle, release)
+        except Exception as exc:  # noqa: BLE001 - an owner that fails after accepting must not strand the run
+            log.exception('the drive owner of %s failed after accepting it', ctx.run_id)
+            try:
+                if ctx.result is None:
+                    ctx.finished(route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
+                                                       detail=f'drive owner failure: {type(exc).__name__}'))
+                if ctx.process is not None and not getattr(self._daemon, 'closed', False):
+                    self._settle(ctx)  # ends what is left of its tree, as after any result
+            finally:
+                release()  # whatever the settling did: the run is not left active with nobody driving it
+
     def _drive(self, ctx, request):
+        # Seam S9, at the top: a registered drive owner may accept the run before anything is driven. It then takes
+        # over this whole method, the removal from _active included, and the run stays active until the owner
+        # calls release(), which counts once. None (the default), or an owner that fails before it accepts: the
+        # run is driven below, exactly as before.
+        if self._hooks is not None:
+            # This thread is the run's own. The start that made it may have answered already, so no client call's
+            # admission covers the chooser or the hand-over to an owner: they hold one lifetime reference of their
+            # own (seam S13). Closing waits for them, and once closing has begun the run is refused here: nothing
+            # is chosen, handed over, driven or launched.
+            gate = self._hooks.gate
+            if not gate.enter():
+                try:
+                    ctx.finished(route_contract.result(ctx.run_id, route_contract.LAUNCH_REFUSED, detail='daemon_closing'))
+                finally:
+                    with self._lock:
+                        self._active.pop(ctx.run_id, None)
+                return
+            try:
+                owner = self._hooks.drive_owner(ctx, request)
+                if owner is not None:
+                    self._hand_over(owner, ctx, request)
+                    return
+            finally:
+                gate.leave()
         try:
             with bound_run(ctx):
                 try:
@@ -420,8 +496,11 @@ class DaemonControl:
     """``call(method, params) -> dict`` for the socket, the CLI and the GUI."""
 
     def __init__(self, api, registry, daemon, starter, state_dir, *, routes=None, plugins=None, breaker=None,
-                 breaker_store='not composed', list_reply_bytes=LIST_REPLY_BYTES):
+                 breaker_store='not composed', list_reply_bytes=LIST_REPLY_BYTES, hooks=None):
         self.api, self.registry, self.daemon, self.starter = api, registry, daemon, starter
+        # The composed hooks. With none given: hooks nobody registered into, whose defaults are today's behaviour.
+        self._hooks = hooks if hooks is not None else control_hooks.bare()
+        self._engines = tuple(self._hooks.engines.names())  # seam S3: today's two unless a lane registered one
         self._list_reply_bytes = list_reply_bytes
         self._state = Path(state_dir)
         self._routes, self.plugins, self._breaker = dict(routes or {}), plugins, breaker
@@ -431,27 +510,65 @@ class DaemonControl:
         self._starts_in_flight = 0  # run.start calls of this process that have not answered yet
 
     # -- calls ---------------------------------------------------------------------------------
-    def call(self, method, params=None):
-        return self._answer(method, params, 0)
+    def call(self, method, params=None, principal=None, reserved_bytes=0):
+        """Seam S5: every client entry comes through here. ``principal`` is made by the server from the way the
+        request came in (control.hooks.Principal); None is an in-process call made for the owner. The call is
+        admitted, authorized, then answered. A refusal by the authorizer is the answer."""
+        refusal, answer = self._dispatch(method, params, control_hooks.OWNER if principal is None else principal,
+                                         reserved_bytes)
+        return answer
 
-    def _answer(self, method, params, reserved_bytes):
+    def _dispatch(self, method, params, principal, reserved_bytes):
+        """``(the authorizer's refusal or None, the answer)``. The admission is held until the answer is made,
+        through a table method's transaction and all its after-commit callbacks (seam S13). ``reserved_bytes`` is
+        a number, or a function that gives it: it is asked only for a request the authorizer let through, by the
+        one answer that needs it (a page of ``run.list``)."""
+        gate = self._hooks.gate
+        if not gate.enter():
+            return None, {'code': 'unavailable', 'detail': 'daemon_closing'}
+        try:
+            refusal = self._hooks.authorize(principal, method, params)
+            if refusal is not None:
+                return refusal, {'code': refusal['code'], 'detail': refusal['detail']}
+            return None, self._answer(method, params, reserved_bytes, principal)
+        finally:
+            gate.leave()
+
+    def nested(self, method, params, principal):
+        """A call that is ALREADY admitted: one a table method makes through ``ctx.call`` (the same principal,
+        authorized again, inside the admission the outer call holds), or the page's ``/v1/control``, which admits
+        the request itself before it asks a lane anything. It is not a client entry: it takes no admission."""
+        refusal = self._hooks.authorize(principal, method, params)
+        if refusal is not None:
+            return {'code': refusal['code'], 'detail': refusal['detail']}
+        return self._answer(method, params, 0, principal)
+
+    def _answer(self, method, params, reserved_bytes, principal=control_hooks.OWNER):
+        if method in ('run.start', 'run.stop') and self._hooks.methods.command_open():
+            # Seam S1: a mutating built-in reached from inside a command whose transaction is open, by a handler
+            # that called this object itself and not ctx.call. It is refused as ctx.call refuses it: such an
+            # effect belongs after the commit, on the lane's committed work-intent path.
+            return {'code': 'request_invalid', 'detail': 'nested_effect'}
         if method == 'run.list':
-            return self._list(params, reserved_bytes)
+            return self._list(params, reserved_bytes() if callable(reserved_bytes) else reserved_bytes)
         if method == 'route.list':
             return {'code': 'ok', 'routes': self.route_records(), 'breaker_store': self._breaker_store}
         if method == 'plugin.list':
             if self.plugins is None:
                 return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
             return {'code': 'ok', **self.plugins.inventory()}
-        if method != 'run.start':
+        if method in ('run.status', 'run.stop'):
             answer = self.api.call(method, dict(params or {}))
+        elif method != 'run.start':
+            # Seam S1: anything else goes to the control API with the principal, which the method table needs.
+            return self.api.call(method, dict(params or {}), principal)
         else:
             # The API writes the launch intent before the starter knows the run. reconcile() must not
             # read that gap as a start that never reached a unit (ADV1-8).
             with self._starts_lock:
                 self._starts_in_flight += 1
             try:
-                answer = self.api.call(method, dict(params or {}))
+                answer = self.api.call(method, dict(params or {}), principal)  # the principal: seam S6's ON path
             finally:
                 with self._starts_lock:
                     self._starts_in_flight -= 1
@@ -460,7 +577,7 @@ class DaemonControl:
             if failure is not None:
                 answer['start_error'] = dict(failure)
         if isinstance(answer.get('run'), dict):
-            self._observe(answer['run'], full=True)
+            self._observe(answer['run'], full=True, ask_reader=(method == 'run.status'))
         if isinstance(answer.get('runs'), list):
             for run in answer['runs']:
                 if isinstance(run, dict):
@@ -499,7 +616,7 @@ class DaemonControl:
         No bar is claimed: the daemon records no bar evidence, so every row is beta (O50).
         """
         records = []
-        for engine in WIRED_ENGINES:
+        for engine in self._engines:
             entry = self._routes.get(engine)
             record = {'id': f'engine:{engine}', 'class': 'engine', 'engine': engine, 'sign_in': '',
                       'configured': False, 'maturity': 'beta', 'beta': True, 'bars': {}}
@@ -552,8 +669,11 @@ class DaemonControl:
             log.exception('daemon registry read for %s failed', run_id)
             return False
 
-    def _observe(self, run, *, full):
-        """Add what the daemon last observed of the run's unit. The stored record is not changed."""
+    def _observe(self, run, *, full, ask_reader=False):
+        """Add what the daemon last observed of the run's unit. The stored record is not changed.
+
+        ``ask_reader`` (seam S8) is true for run.status only: when the run has no result in memory and none in
+        result.json, the registered result reader is asked. Never for run.list or run.start."""
         run_id = run.get('run_id')
         row = self._row(run_id) if isinstance(run_id, str) else None
         if row is False:
@@ -568,6 +688,8 @@ class DaemonControl:
                 run['recorded_state'] = run['state']
                 run['state'] = {'terminated': ENDED, 'lost_reboot': LOST_REBOOT}.get(row.state, 'unknown')
         result = self._result(run_id) if isinstance(run_id, str) else None
+        if result is None and ask_reader and isinstance(run_id, str):
+            result = self._hooks.read_result(run_id)
         if result is not None:
             run['result'] = result if full else {k: result.get(k) for k in ('status', 'code', 'detail')}
         if full and isinstance(run_id, str):
@@ -686,18 +808,27 @@ class DaemonControl:
         method, params = message.get('method'), message.get('params')
         if not isinstance(method, str) or not isinstance(params, (dict, type(None))):
             return {'ok': False, 'error': {'code': 'request_invalid'}}
-        if peer_is_engine(conn.peer.pid):
-            # The uid check passes for every engine child too (control_transport.handlers). Until
-            # scopes exist (D3), a peer inside a run unit, or one whose cgroup cannot be read, gets
-            # no control at all.
-            return {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}}
-        # The transport echoes the request's "id" in the reply frame; a run.list page leaves room for it.
-        reserved = _wire_size(message['id']) + len(',"id":') if 'id' in message else 0
-        return {'ok': True, 'result': self._answer(method, params, reserved)}
+        # The uid check passes for every engine child too (control_transport.handlers). The socket's principal
+        # carries today's predicate: the peer is inside a run unit, or its cgroup cannot be read. The default
+        # authorizer refuses such a peer, as before; a registered one takes the decision over (seam S5).
+        principal = control_hooks.Principal('owner', 'local', in_run_unit=peer_is_engine(conn.peer.pid))
+        # The transport echoes the request's "id" in the reply frame; a run.list page leaves room for it. The room
+        # is worked out only for a request that is answered, as before the seams: a refused peer's id is not sized.
+        reserved = (lambda: _wire_size(message['id']) + len(',"id":')) if 'id' in message else 0
+        refusal, answer = self._dispatch(method, params, principal, reserved)
+        if refusal is not None:
+            return {'ok': False, 'error': refusal}
+        return {'ok': True, 'result': answer}
 
     # -- GUI -----------------------------------------------------------------------------------
     def gui_transport(self, method, path, body):
-        """The GUI client's transport, in process: Stop, the route inventory and the O7 reads."""
+        """The GUI client's transport, in process: Stop, the route inventory and the O7 reads.
+
+        On a real ``DaemonControl`` this name is ``page_transport``: one page transport, with the device principal,
+        the authorizer and the lifetime admission in front. The body below is kept only for the stand-ins that
+        the existing tests hand to it unbound; it is not a second client entry."""
+        if isinstance(self, DaemonControl):
+            return self.page_transport(method, path, body)
         if (method, path) == ('POST', '/v1/runs/stop'):
             try:
                 payload = json.loads(body or b'')
@@ -720,6 +851,80 @@ class DaemonControl:
                 return 503, b'{"error": "unavailable: no plugin host is composed"}'
             status, answer = self.plugins.operator(payload)
             return status, json.dumps(answer, sort_keys=True).encode()
+        return 404, b'{"error": "not_found"}'
+
+    def page_transport(self, method, path, body):
+        """What the composition hands the page: the three paths of ``gui_transport`` with the seams in front, and a
+        fourth. S5: the page's Stop and its two reads are calls of ``run.stop``, ``route.list`` and ``operator.read``
+        made by the device principal, authorized like any call, and answered in the shapes the page has always had.
+        S11: ``POST /v1/control`` reaches the methods a lane listed. S13: each is admitted by the gate, or told the
+        daemon is closing, before any lane code runs for it. ``gui_transport`` above comes here too."""
+        if (method, path) == ('POST', '/v1/runs/stop'):
+            try:
+                payload = json.loads(body or b'')
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                return 400, b'{"error": "request_invalid"}'
+            answer = self.call('run.stop', {'run_id': payload.get('run_id')}, control_hooks.DEVICE)
+            return 200, json.dumps(answer, sort_keys=True).encode()
+        if (method, path) == ('GET', '/v1/routes'):
+            # Authorized like any call (seam S5). The authorizer's refusal is 403 with its own code, whatever that
+            # code is; only the gate's own answer is the closing daemon, as the read below answers it.
+            refusal, answer = self._dispatch('route.list', {}, control_hooks.DEVICE, 0)
+            if refusal is not None:
+                return 403, json.dumps({'error': refusal['code']}, sort_keys=True).encode()
+            if answer.get('code') != 'ok':
+                return 503, b'{"error": "unavailable: daemon_closing"}'
+            return 200, json.dumps({'routes': answer['routes']}, sort_keys=True).encode()
+        if (method, path) == ('POST', '/v1/operator'):
+            try:
+                payload = json.loads(body or b'')
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                return 400, b'{"error": "request_invalid"}'
+            # The operator reads are an authorized call of operator.read (seam S5), admitted like any other and
+            # answered here in the shape the page has always had. They are answered by the plugin host directly:
+            # this path does not dispatch a registered operator.read handler, so registering one does not replace
+            # it. Whoever builds that handler unifies the two or adapts this path; until then nobody may assume it.
+            gate = self._hooks.gate
+            if not gate.enter():
+                return 503, b'{"error": "unavailable: daemon_closing"}'
+            try:
+                refusal = self._hooks.authorize(control_hooks.DEVICE, 'operator.read', payload)
+                if refusal is not None:
+                    return 403, json.dumps({'error': refusal['code']}, sort_keys=True).encode()
+                if self.plugins is None:
+                    return 503, b'{"error": "unavailable: no plugin host is composed"}'
+                status, answer = self.plugins.operator(payload)
+                return status, json.dumps(answer, sort_keys=True).encode()
+            finally:
+                gate.leave()
+        if (method, path) == ('POST', '/v1/control'):
+            # Seam S11: the page may call the methods a lane listed, as the device principal. With none listed
+            # (the default) this path is not there: 404, as before. The list is a lane's own code, so the request
+            # is admitted BEFORE it is asked for (seam S13) and stays admitted until its answer is made: closing
+            # waits for a provider that is inside, and after closing has begun none is called.
+            gate = self._hooks.gate
+            if not gate.enter():
+                return 200, b'{"code": "unavailable", "detail": "daemon_closing"}'
+            try:
+                allowed = self._hooks.page_methods()
+                if allowed:
+                    try:
+                        payload = json.loads(body or b'')
+                    except ValueError:
+                        payload = None
+                    if not isinstance(payload, dict) or not isinstance(payload.get('method'), str) \
+                            or not isinstance(payload.get('params'), (dict, type(None))):
+                        return 400, b'{"error": "request_invalid"}'
+                    if payload['method'] in allowed:
+                        # Already admitted: authorized and answered as the device, like any call.
+                        answer = self.nested(payload['method'], payload.get('params'), control_hooks.DEVICE)
+                        return 200, json.dumps(answer, sort_keys=True).encode()
+            finally:
+                gate.leave()
         return 404, b'{"error": "not_found"}'
 
 
@@ -823,25 +1028,60 @@ class DeviceDoor:
 class Composition:
     """What ``compose_control`` built, and how to stop it. Closing never stops a run."""
 
-    def __init__(self, control, server, door, plugins=None, breaker=None):
+    def __init__(self, control, server, door, plugins=None, breaker=None, hooks=None, context=None):
         self.control, self.server, self.door = control, server, door
         self.plugins, self.breaker = plugins, breaker
-        self.client = ControlClient(control.gui_transport)
+        self.hooks, self.context = hooks, context
+        self.client = ControlClient(control.page_transport)  # the page goes through the seams (S5, S11, S13)
+        self._closing = threading.RLock()  # the close has one owner (control.hooks.own_teardown)
+        self._closed = False
 
     def close(self):
+        """Close once, and return only when that close is complete. One caller owns it. Another that calls while
+        it runs, or after it, waits for the owner and closes nothing itself; if it is interrupted while it waits
+        it goes on waiting, and raises the interruption only once the owner has finished. So nobody who called
+        this can go on to close the registry while a service or a store of this composition is still in use."""
+        kept = []
+        control_hooks.own_teardown(self._closing, kept)
+        try:
+            if not self._closed:
+                try:
+                    self._close()
+                except BaseException as exc:  # noqa: BLE001 - every step was attempted; raised below, once
+                    kept.append(exc)
+                self._closed = True
+        finally:
+            self._closing.release()
+        control_hooks.raise_kept(kept)
+
+    def _close(self):
+        """Seam S13. First no new client call is admitted, on any entry, and whoever waits is told. Then the
+        transport stops. Then every admitted call is waited for, WITHOUT a timeout and with its services and
+        stores alive; only then are the services stopped, in reverse, and the store closed. With nothing
+        registered the first and third steps do nothing, and this is the close it always was."""
+        if self.hooks is not None:
+            self.hooks.begin_close()
         try:
             self.server.close()
         finally:
             try:
-                self.door.close()
+                if self.hooks is not None:
+                    try:
+                        self.hooks.finish_close(self.context)
+                    finally:
+                        if self.context is not None and getattr(self.context.registry, 'mark_changed', None) is not None:
+                            self.context.registry.mark_changed = None
             finally:
-                for item in (self.plugins, self.breaker):
-                    if item is not None:
-                        item.close()
+                try:
+                    self.door.close()
+                finally:
+                    for item in (self.plugins, self.breaker):
+                        if item is not None:
+                            item.close()
 
 
 def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.monotonic,
-                    confirm_timeout_s=5.0, plugin_dirs=(), plugin_options=None):
+                    confirm_timeout_s=5.0, plugin_dirs=(), plugin_options=None, hooks=None):
     """Build the control API over ``daemon`` and serve it on the owner-only socket.
 
     ``daemon.manager`` must be an ``EngineUnitManager``. ``routes`` overrides the operator's
@@ -857,6 +1097,10 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     arguments for tests (a simulated GIL probe on a GIL build, a missing verification backend).
     """
     require_launcher_platform()  # Windows: typed PlatformUnsupported; no socket, token file or state is made
+    # The hooks of this composition (control.hooks): every installed lane's registrant has registered, once, before
+    # anything is served, and the tables are frozen. ``hooks`` overrides them (tests). With nothing installed each
+    # hook is its default, which is what this function did before the seams.
+    hooks = control_hooks.compose() if hooks is None else hooks
     environ = dict(os.environ if environ is None else environ)
     manager = daemon.manager
     if not isinstance(manager, EngineUnitManager):
@@ -865,7 +1109,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     if routes is None:
         config = Path(environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')) / 'recursion' / ROUTES_FILE
         try:
-            routes = load_routes(config)
+            routes = load_routes(config, hooks.engines.names())
         except RoutesUnreadable as exc:
             log.error('no route can start: %s', exc)
             routes = {}
@@ -890,19 +1134,66 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
             log.warning('the breaker store was missing and was created empty while run records exist: '
                         'earlier trips, run bindings and faults are not known to this daemon')
     plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, **(plugin_options or {}))
-    adapters = {}
-    for engine, cls in (('claude_code', ClaudeCodeAdapter), ('codex', CodexAdapter)):
-        entry = routes.get(engine)
-        launcher = ProductionLauncher(engine, daemon, manager, state_dir)
-        options = {'binary': entry['binary']} if entry and entry.get('binary') else {}
-        adapters[engine] = cls(launcher, clock, no_custody, environ, **options)
+    adapters, binaries = {}, {}
+    # Seam S3: the engine table's active factories, which are today's two classes in today's order unless a lane
+    # registered one. Seam S7: the credential lookup is the hooks'; its default raises KeyError(connection_id).
+    def credentials(connection_id, env_name):
+        # An adapter asks for a credential on the run's own thread, which no client call's admission covers once
+        # the start has answered. The lane's source gets one lifetime reference of its own (seam S13): closing
+        # waits for it, and once closing has begun the launch is refused before the source is asked.
+        gate = hooks.gate
+        if not gate.enter():
+            raise route_contract.RouteError(route_contract.LAUNCH_REFUSED, 'daemon_closing')
+        try:
+            return hooks.credentials(connection_id, env_name)
+        finally:
+            gate.leave()
+
+    try:
+        for engine, factory in hooks.engines.items():
+            entry = routes.get(engine)
+            launcher = ProductionLauncher(engine, daemon, manager, state_dir, hooks=hooks)
+            options = {'binary': entry['binary']} if entry and entry.get('binary') else {}
+            adapters[engine] = factory(launcher, clock, credentials, environ, **options)
+            binaries[engine] = options.get('binary')   # None: the adapter launches its own default command name
+    except BaseException:
+        # A lane's factory failed: the plugin host and the breaker store opened above are not left open.
+        try:
+            plugins.close()
+        finally:
+            if breaker is not None:
+                breaker.close()
+        raise
     service = RouteService(adapters, breaker if breaker is not None else route_breaker, clock)
     starter = RouteStarter(service, routes, daemon, state_dir, breaker=breaker,
-                           breaker_unavailable=breaker_unavailable)
-    api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s)
+                           breaker_unavailable=breaker_unavailable, hooks=hooks)
+    composed = {}
+
+    def table(method, params, principal):
+        # Seam S1: the method table's dispatcher. A handler's ctx.call comes back through the control object, as the
+        # same principal and inside the admission the outer call holds.
+        return hooks.methods.dispatch(method, params, principal,
+                                      lambda inner, inner_params=None: composed['control'].nested(inner, inner_params, principal))
+
+    def launchable(entry):
+        """PROVISIONAL (ruling of Nov 13, 2026). An adapter is built once, above, with the configured entry's binary,
+        and that is the binary every launch of its engine runs. So a route entry a registrant chose is launchable
+        only when it names that same binary: the same absolute path, or none where the adapter was built with
+        none (it then launches its default command name, found on the child's PATH). The comparison is of what
+        the two entries SAY, as the launcher would be given it; two spellings of one file are not the same."""
+        engine = entry['route']['engine']
+        return engine in binaries and entry.get('binary') == binaries[engine]
+
+    api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s,
+                     methods=table, start_hooks=hooks, launchable=launchable)
     control = DaemonControl(api, registry, daemon, starter, state_dir, routes=routes, plugins=plugins,
                             breaker=breaker, breaker_store='durable' if breaker is not None
-                            else f'unavailable: {breaker_unavailable}')
+                            else f'unavailable: {breaker_unavailable}', hooks=hooks)
+    composed['control'] = control
+    # Seam S13: one context for every service, with declared fields only.
+    context = control_hooks.ServiceContext(daemon=daemon, registry=daemon.registry, control_registry=registry,
+                                           control=control, store=None, state_dir=state_dir, clock=clock,
+                                           closing=hooks.closing)
     directory = socket_directory(environ)
     door = DeviceDoor(directory, publish=False)
     server = UnixControlServer(directory, with_ping_health(control.handle), admit=admit_peer,
@@ -913,15 +1204,45 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
             if item is not None:
                 item.close()
 
+    def unwind():
+        # Whatever of the services and the store exists is stopped and closed before the rest is released: no
+        # thread is left with a closed store.
+        hooks.begin_close()
+        try:
+            hooks.finish_close(context)
+        finally:
+            daemon.registry.mark_changed = None
+
+    # Seam S13: the store is opened and the services are started, in registration order, BEFORE the socket is
+    # served and the door is published. Seam S12: the registry tells the change marker only when a lane consumes it.
+    try:
+        context.store = hooks.open_store(state_dir)
+        if hooks.changes is not None:
+            daemon.registry.mark_changed = hooks.mark_changed
+        hooks.start_services(context)
+    except BaseException:
+        try:
+            unwind()
+        finally:
+            release()
+        raise
     try:
         server.start()
     except BaseException:
-        release()
+        try:
+            unwind()
+        finally:
+            release()
         raise
     try:
         door.publish()  # only now: the socket lock is ours, so no live daemon's token file is replaced
     except BaseException:
-        server.close()
-        release()
+        try:
+            server.close()
+        finally:
+            try:
+                unwind()
+            finally:
+                release()
         raise
-    return Composition(control, server, door, plugins, breaker)
+    return Composition(control, server, door, plugins, breaker, hooks=hooks, context=context)

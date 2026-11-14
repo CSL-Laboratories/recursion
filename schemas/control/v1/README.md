@@ -51,6 +51,12 @@ carry because its event says so, what happens to a queued message step by step, 
 or of a turn must say). `vectors/index.json` lists
 them. A client in another language implements the same rules and checks the same vectors.
 
+**Conformance requires the semantic rules, including x-instant; ordinary Draft 2020-12 validation
+alone is insufficient. Every client must run the published positive and negative fixtures.** The
+schemas alone accept records that these rules refuse: a timestamp on a day that does not exist (a
+validator ignores a keyword it does not know), an approval whose digest is not its effect's, a page
+in another projection than the one that was asked for.
+
 ## Storage records and public records are different records
 
 The registry stores `run.record.v1`. A client never reads that. It reads `run.view.v1`, which adds:
@@ -78,7 +84,12 @@ the bad fixtures show both.
 - **A Task is derived, never stored.** It comes from a turn of a session, or from a run that was
   started with no session, and says which (`source`). Its times are the times the core logged. A run
   with no session is not given one to make its Task. `conformance/rules.py` states the derivation and
-  `vectors/task.derivation/` holds a case for every state of each source.
+  `vectors/task.derivation/` holds a case for every state of each source. Its `created_at` is the
+  time of the event that establishes the creation of the run or the turn: its first `state.changed`,
+  when the log saw it as it was made (reason `commit`) and is whole up to it. A snapshot of something
+  that already existed, a record a later scan found, a retained tail and a gap establish no creation,
+  and `created_at` is then null. A run of today's daemon existed before logging began, so its Task has
+  none.
 - **A queued message is delivered when the engine says so, and only then.** In one commit, BEFORE it
   writes anything toward the engine, the daemon stores the item as `delivering`, a delivery id that
   is never used again, and the full target BINDING: the item, the log, the run, the worker's
@@ -87,10 +98,12 @@ the bad fixtures show both.
   `steer.sent` records a write into a turn in progress; it is not acceptance. The item becomes
   `delivered` only when the engine's own typed acceptance, an `input.accepted` event from a driver's
   parse, agrees with the binding in its delivery, log, run, turn and how; a difference in any of them
-  changes nothing. With no acceptance at a restart, or by the end of the turn it was written into,
-  the item is `outcome_unknown`, which a surface shows as: Delivery outcome unknown; the message may
+  changes nothing. With no acceptance at a restart, or by the end of its target turn (the turn in
+  progress a steer was written into, or the new turn allocated for the message: either `how`), the
+  item is `outcome_unknown`, which a surface shows as: Delivery outcome unknown; the message may
   not have been sent. It will not be resent automatically. An acceptance that arrives after that is
-  kept as evidence and promotes nothing by itself. One commit cannot make a delivery to an engine
+  kept as evidence and promotes nothing by itself. A message for the next turn is never written into
+  the turn in progress. One commit cannot make a delivery to an engine
   happen exactly once: this design gives up a possible delivery to avoid an automatic duplicate.
   `vectors/queue.delivery/` walks each crash point.
 - **A log is read from a cursor.** `events.read` and `events.follow` take the cursor a read returned
@@ -100,10 +113,14 @@ the bad fixtures show both.
   answer's cursor is the last position represented, or the same cursor for an empty page. A first
   read uses epoch 1 and seq 0; an older epoch reads on and the answer says the epoch advanced; a
   cursor from a future epoch, or past the end of its log, is refused. A client keeps one cursor for
-  each log: the cursor is the only thing a read names.
+  each log: the cursor is the only thing a read names. The answer is in the projection the request
+  asked for, `raw` when it names none; a transcript page is made only from a raw page that is itself
+  a right answer to the cursor, because a line carries neither its log nor where a gap starts.
 - **A timestamp is a moment that exists.** The pattern of a timestamp cannot say that February has
   no 31st, so the schemas mark every such field with the keyword `x-instant`, which the conformance
   client checks. A validator that does not know the keyword ignores it and must make that check itself.
+  Seconds are 00 to 59: the profile supports no leap second, and a `:60` is refused, never read as
+  the first second of the next minute.
 - **A digest in a record is the digest of something.** `post_image_sha256` and `input_digest` are
   SHA-256 over the UTF-8 bytes of the value as RFC 8785 writes it, and a start's `intent_sha256` is
   over the exact preimage that `vectors/start.intent/` gives byte for byte.
@@ -186,6 +203,7 @@ tool's input as an object. The three are read strictly and bound as they are:
 | Numbers | Admission does not depend on how a number is spelled, nor on whether a language would call it an integer or a float. An integral value outside -(2^53 - 1) .. 2^53 - 1 is refused (`integer_out_of_range`) whether it is written as digits, with a fraction or with an exponent, and the check is made before any conversion that could lose it; so is a number whose nearest binary64 is such a value. Every other number is a finite binary64. An exact quantity or an identifier that needs more is sent as a string |
 | Written and read again | An admitted call, written as RFC 8785 writes it and read again, is admitted with the same bytes |
 | The value that is dispatched | The normalised one that was bound: `1.0` is `1`, minus zero is `0`. A bridge that can only say yes or no to the engine's own pending request must first establish that the request means these same numbers; that it is the same pending request is not enough |
+| Where that is enforced | Not only where a call's text is read. The exact range check does not depend on the host's decimal context and gives a typed refusal for every number (1e1000000 is `integer_out_of_range`, never an exception of the host's arithmetic). The numbers of a bound effect are normalised before it is created, changed or restored; a record that is already bound and holds `1.0` or minus zero is refused when it is validated (`call`, `digest`, `rendered`) and when it is consumed. Plugin effects under `csl-cj/v0` and today's signatures are not touched |
 | Half of a surrogate pair on its own, in a string or a key | Refused |
 | Unicode normalisation | None. A string is kept as it was written |
 | Depth | 64 at most |
@@ -228,6 +246,20 @@ and carries nothing out. Eight more vectors in `vectors/approval.lifecycle/` wal
 a change that cannot be drawn, openings and answers in another order, an answer at the deadline and
 one millisecond before it, and consumption across a restart.
 
+**A change is made whole or not at all.** The core builds the changed request as a candidate and
+validates all of it (its digest, its lines, its envelope against its effect) before it replaces the
+pending request; a refusal is typed and leaves the record, its revision and the binding as they were.
+A change of content is not a change of target: an effect bound to another run, session or engine, or
+from another plugin, is refused (`target`).
+
+**The binding names the approval.** For an engine's call, the private binding's `approval_id`,
+`run_id` and `engine` are each compared with the approval it is used against (the record's id, the
+record's and the effect's run, the effect's engine), at every consumption, after a restart too: being
+equal to the binding the daemon kept is not enough. A plugin's effect has no pending request of an
+engine, so it has no binding and is consumed once against its approval, revision and digest.
+Consumption also checks the whole record once more and refuses one that does not agree with itself.
+Six more vectors (`s11` to `s16`) hold these.
+
 ## The method table
 
 `methods.table.v1.json` is data: one row per method. `methods.v1.json` gives, for every method, the
@@ -245,9 +277,16 @@ schema of its params and of everything it can answer, and states the rules (in i
 - One vocabulary for refusals: `conflict` with a detail, `busy`, `unsupported` with a detail,
   `prompt_not_shown`, `scope_refused`, and `<thing>_unknown`.
 
+- `unavailable` says why. `daemon_closing` is the one reason every method can give. `service_starting`
+  is the readiness of the service a row names, and no row names one yet, so no method can answer it:
+  every row's answer schema refuses it. `plugin.list` keeps today's own refusal, word for word, when no
+  plugin host is composed; that is its legacy exception and not a service that is starting.
+- An interrupt that fell back to Stop carries the Stop's own answer. While that Stop is pending the
+  answer's code is `pending` and the session is `stop_pending`; `pending` means that and nothing else.
+
 Today's daemon answers six of the thirty-eight: `run.start`, `run.status`, `run.list`, `run.stop`,
-`route.list`, `plugin.list`. Seventeen whole exchanges of those six, refusals included, are captured
-under `fixtures/good/methods.v1/` and validate against the table.
+`route.list`, `plugin.list`. Whole exchanges of those six, refusals included, are captured
+under `fixtures/good/methods.v1/` (the files named `c*`) and validate against the table.
 
 ## Reserved
 

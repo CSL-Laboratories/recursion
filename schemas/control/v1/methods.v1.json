@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "methods.v1.json",
   "title": "methods.v1: the method table of the control API",
-  "x-version": "1.0-draft.7",
-  "description": "The method table of the control API, version 1: one row for every method, kept as data (methods.table.v1.json beside this file validates against this schema's root), and for every method the schema of its params and of everything it can answer. A request is {method, params}; a recorded request with its answer is an exchange ($defs/exchange). RULES, frozen with the table. (1) Unknown and unbuilt. A name that is not in the table is answered 'method_unknown': that includes every name a plan has reserved and that has no row here yet. A name that is in the table and has no handler in the running daemon is answered 'unsupported' with detail 'not_implemented'. The six legacy methods and methods.list are mandatory built-ins. Optional method handlers may return unsupported/not_implemented only on rows that declare unsupported. methods.list lists the rows of the table and says which are implemented now; it never lists a name that has no row. (2) Idempotency. Every mutating method except run.start and run.stop takes a command_id. There is one identity domain: (tenant, method, command_id), kept durably across restarts, with no part that changes at a restart. run.start keeps client_key, which is its command id, under that name on every surface. run.stop takes neither a key nor a revision: an emergency Stop never needs fresh state. A client that is a model does not mint unique ids, so on a surface a model drives the server mints the id and hands it to the caller. (3) Order of checks. The caller is authorized first. Then the receipt is looked up: the same id with the same payload digest returns the first answer, even if the revision it named is stale by now; the same id with another digest is 'conflict' (detail command_id_reused). Only then is expected_revision or expected_turn_id checked: stale is 'conflict' (detail stale_revision or stale_turn). A live turn is 'busy'. A missing driver flag is 'unsupported', before any side effect. The payload digest is the SHA-256 of the UTF-8 bytes of the params without the command_id, in the text of RFC 8785 (conformance/rules.py, text_of(..., display=False)); the method is part of the identity, so it is not hashed again. Authorize the target before returning a cached receipt. The receipt identity remains (tenant, method, command_id), with tenant derived from the authorized target. Caller/target authorization still applies before replay; principal is not an extra receipt-key component. An install-wide/targetless entry point uses an explicitly named fixed tenant namespace, never an inferred tenant. The replay payload is the supplied validated params minus command_id; absence is preserved rather than silently inserting defaults, unless a method declares a normalization rule and vectors. busy applies only to methods that require an idle target, not universally to steering, queue operations, Stop or reads. run.start is the exception in name only: its key is client_key, and the same key with another engine or prompt is answered as today's daemon answers it, 'request_invalid' with detail 'client_key_reused' (control/api.py), never a new top-level code. (4) Who may Stop. PROVISIONAL, the owner's decision. run.stop needs a currently held 'run' scope. An owner or a device holding 'run' may stop any run, including one whose record names no principal (every run from before version 1): no run is stranded. A session principal may stop only runs of its own session and of the sessions it started. A caller without 'run' cannot stop. The daemon's own recovery Stop is not a client's call and no authorizer applies to it. A plugin principal holding 'run' may stop only a run whose record's launch.owner is that plugin, as the host derived it: never a host-owned run, never another plugin's, never a run with no owner recorded. (5) Approvals. approval.list returns summaries and shows nothing. approval.open records that a surface displayed the prompt. approval.answer without an open record for the current revision is refused 'prompt_not_shown'. Neither is ever offered as an MCP tool. (6) Params are closed for a caller: a conforming client sends only what is listed. Today's daemon ignores a key it does not know on run.start; it never stores one. A principal, an owner, a budget's reservation and a session's identity are never taken from params. (7) Reading a log. events.read and events.follow take the cursor a read returned, not a bare number. The request cursor's session_id identifies the one requested log, and authorization is checked for that log. Every returned event or transcript line belongs to it. Return only positions strictly after cursor.seq, in order. Every skipped retained-log position is represented by the prescribed replay.gap; projection does not silently filter positions. A gap has from <= to, starts at the next missing position, and has envelope seq equal to to. The response cursor is the last represented position, or the unchanged input position for an empty response. Its log ID never changes. A first read uses epoch 1 and seq 0. An older epoch continues on the same persistent log sequence and returns the current epoch with epoch_advanced=true. Equal epoch returns epoch_advanced=false. A future epoch is request_invalid with detail cursor_epoch_ahead. A seq beyond the current high-water mark is request_invalid with detail cursor_ahead; a seq at the high-water mark is a valid empty read or follow wait. An existing empty log accepts seq 0; an unknown log returns session_unknown. Epoch 1 is the minimum/bootstrap token, not a claim that the client previously observed the log. epoch_advanced is true exactly when a successful continuation replaces an older requested epoch with the current one; it is not a reset-to-zero instruction. A cursor is the only thing a read names: a client stores its cursors per log, and the server authorizes the log the cursor names and never splices another log into the answer. (8) Not ready and not composed. A method whose row names a service answers 'unavailable' with detail 'service_starting' until that service is ready; the check comes before any command transaction is opened. A method that takes a command_id needs a receipt: in a daemon composed with no event store it answers 'unsupported' with detail 'store_absent', before any side effect. Neither of those two is given by a method that needs neither a service nor a receipt. That does not limit closing, which is global and is no service's readiness: Once closing begins, every new client method, including methods.list and the otherwise ungated legacy methods, may return unavailable with detail daemon_closing. This does not stop internal recovery/Stop work or reinterpret already admitted calls. If a start registrant refuses before a run is accepted/created, return unavailable with detail start_registrant_failed. Once a run has been accepted, a launch failure remains start_failed with the appropriate durable start_error; it is not retroactively an admission refusal.",
+  "x-version": "1.0-draft.8",
+  "description": "The method table of the control API, version 1: one row for every method, kept as data (methods.table.v1.json beside this file validates against this schema's root), and for every method the schema of its params and of everything it can answer. A request is {method, params}; a recorded request with its answer is an exchange ($defs/exchange). RULES, frozen with the table. (1) Unknown and unbuilt. A name that is not in the table is answered 'method_unknown': that includes every name a plan has reserved and that has no row here yet. A name that is in the table and has no handler in the running daemon is answered 'unsupported' with detail 'not_implemented'. The six legacy methods and methods.list are mandatory built-ins. Optional method handlers may return unsupported/not_implemented only on rows that declare unsupported. methods.list lists the rows of the table and says which are implemented now; it never lists a name that has no row. (2) Idempotency. Every mutating method except run.start and run.stop takes a command_id. There is one identity domain: (tenant, method, command_id), kept durably across restarts, with no part that changes at a restart. run.start keeps client_key, which is its command id, under that name on every surface. run.stop takes neither a key nor a revision: an emergency Stop never needs fresh state. A client that is a model does not mint unique ids, so on a surface a model drives the server mints the id and hands it to the caller. (3) Order of checks. The caller is authorized first. Then the receipt is looked up: the same id with the same payload digest returns the first answer, even if the revision it named is stale by now; the same id with another digest is 'conflict' (detail command_id_reused). Only then is expected_revision or expected_turn_id checked: stale is 'conflict' (detail stale_revision or stale_turn). A live turn is 'busy'. A missing driver flag is 'unsupported', before any side effect. The payload digest is the SHA-256 of the UTF-8 bytes of the params without the command_id, in the text of RFC 8785 (conformance/rules.py, text_of(..., display=False)); the method is part of the identity, so it is not hashed again. Authorize the target before returning a cached receipt. The receipt identity remains (tenant, method, command_id), with tenant derived from the authorized target. Caller/target authorization still applies before replay; principal is not an extra receipt-key component. An install-wide/targetless entry point uses an explicitly named fixed tenant namespace, never an inferred tenant. The replay payload is the supplied validated params minus command_id; absence is preserved rather than silently inserting defaults, unless a method declares a normalization rule and vectors. busy applies only to methods that require an idle target, not universally to steering, queue operations, Stop or reads. run.start is the exception in name only: its key is client_key, and the same key with another engine or prompt is answered as today's daemon answers it, 'request_invalid' with detail 'client_key_reused' (control/api.py), never a new top-level code. (4) Who may Stop. PROVISIONAL, the owner's decision. run.stop needs a currently held 'run' scope. An owner or a device holding 'run' may stop any run, including one whose record names no principal (every run from before version 1): no run is stranded. A session principal may stop only runs of its own session and of the sessions it started. A caller without 'run' cannot stop. The daemon's own recovery Stop is not a client's call and no authorizer applies to it. A plugin principal holding 'run' may stop only a run whose record's launch.owner is that plugin, as the host derived it: never a host-owned run, never another plugin's, never a run with no owner recorded. (5) Approvals. approval.list returns summaries and shows nothing. approval.open records that a surface displayed the prompt. approval.answer without an open record for the current revision is refused 'prompt_not_shown'. Neither is ever offered as an MCP tool. (6) Params are closed for a caller: a conforming client sends only what is listed. Today's daemon ignores a key it does not know on run.start; it never stores one. A principal, an owner, a budget's reservation and a session's identity are never taken from params. (7) Reading a log. events.read and events.follow take the cursor a read returned, not a bare number. The request cursor's session_id identifies the one requested log, and authorization is checked for that log. Every returned event or transcript line belongs to it. Return only positions strictly after cursor.seq, in order. Every skipped retained-log position is represented by the prescribed replay.gap; projection does not silently filter positions. A gap has from <= to, starts at the next missing position, and has envelope seq equal to to. The response cursor is the last represented position, or the unchanged input position for an empty response. Its log ID never changes. A first read uses epoch 1 and seq 0. An older epoch continues on the same persistent log sequence and returns the current epoch with epoch_advanced=true. Equal epoch returns epoch_advanced=false. A future epoch is request_invalid with detail cursor_epoch_ahead. A seq beyond the current high-water mark is request_invalid with detail cursor_ahead; a seq at the high-water mark is a valid empty read or follow wait. An existing empty log accepts seq 0; an unknown log returns session_unknown. Epoch 1 is the minimum/bootstrap token, not a claim that the client previously observed the log. epoch_advanced is true exactly when a successful continuation replaces an older requested epoch with the current one; it is not a reset-to-zero instruction. A cursor is the only thing a read names: a client stores its cursors per log, and the server authorizes the log the cursor names and never splices another log into the answer. A successful events.read or events.follow response uses the projection explicitly requested by the caller. Validate that equality before checking the returned page. When projection is omitted, the method must document one default and test it. A transcript page is produced only from a raw page whose log identity, sequence continuity and gap bounds have already been validated. A transcript line's missing log and gap-start fields do not waive those producer checks. The default: a read that names no projection asks for 'raw', the events as they were logged (conformance/rules.py, PROJECTION_DEFAULT; page_problems and transcript_page_problems state both rules as code). (8) Not ready and not composed. A method whose row names a service answers 'unavailable' with detail 'service_starting' until that service is ready; the check comes before any command transaction is opened. unavailable with detail service_starting is permitted only when the method's row names the service whose readiness is being checked. A null service cannot produce service_starting. daemon_closing is the global admission reason and does not require a row service. Preserve plugin.list's existing no-plugin-host refusal as its explicit legacy exception, distinct from service_starting. (That refusal is 'unavailable' with the detail 'no plugin host is composed', as today's daemon answers plugin.list when it was composed with no plugin host.) A method that takes a command_id needs a receipt: in a daemon composed with no event store it answers 'unsupported' with detail 'store_absent', before any side effect. Neither of those two is given by a method that needs neither a service nor a receipt. That does not limit closing, which is global and is no service's readiness: Once closing begins, every new client method, including methods.list and the otherwise ungated legacy methods, may return unavailable with detail daemon_closing. This does not stop internal recovery/Stop work or reinterpret already admitted calls. If a start registrant refuses before a run is accepted/created, return unavailable with detail start_registrant_failed. Once a run has been accepted, a launch failure remains start_failed with the appropriate durable start_error; it is not retroactively an admission refusal.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -139,7 +139,7 @@
       }
     },
     "row": {
-      "description": "One method. params and result name this file's own definitions for the method. codes lists EVERY code the method can answer. idempotency: 'command_id' (the request carries one), 'client_key' (run.start's own key, which is its command id), 'none'. precondition: which field a request must carry to prove it read the current state. requires: the driver flags without which the method is refused 'unsupported', naming the flag, before any side effect, whatever else is true. unsupported detail is not_implemented, a missing flag listed in requires, or store_absent for a method that requires a command receipt. falls_back: the driver flags whose absence changes HOW the method works rather than refusing it, each with what the method does then, and the answer says which path was taken: session.interrupt without 'interrupt' is 'stop_then_resume' (the run is asked to stop, the interrupt's outcome says fell_back_to_stop, and the answer carries the Stop's own answer: A pending fallback Stop yields a pending answer and a stop_pending session; resume is not allowed until Stop is confirmed.); session.steer without 'mid_turn_input' is 'next_turn' (the message is queued for the next turn, and the item's delivery says so). service: the service the method needs, or null; until a named service is ready the method alone answers 'unavailable' with detail service_starting. No row names one yet: a lane names its service when it registers one, and the six methods of today's daemon never need one. mcp: whether the Control MCP server offers the method as a tool, under which name, with which annotations. beta: shown as beta until its first proof is recorded. lane: who implements it.",
+      "description": "One method. params and result name this file's own definitions for the method. codes lists EVERY code the method can answer. idempotency: 'command_id' (the request carries one), 'client_key' (run.start's own key, which is its command id), 'none'. precondition: which field a request must carry to prove it read the current state. requires: the driver flags without which the method is refused 'unsupported', naming the flag, before any side effect, whatever else is true. unsupported detail is not_implemented, a missing flag listed in requires, or store_absent for a method that requires a command receipt. falls_back: the driver flags whose absence changes HOW the method works rather than refusing it, each with what the method does then, and the answer says which path was taken: session.interrupt without 'interrupt' is 'stop_then_resume' (the run is asked to stop, the interrupt's outcome says fell_back_to_stop, and the answer carries the Stop's own answer: A pending fallback Stop yields a pending answer and a stop_pending session; resume is not allowed until Stop is confirmed. If interrupt.outcome is fell_back_to_stop and stop.code is pending, the answer code is pending and session.state is stop_pending. An ok answer or live/idle session is invalid in that case. Resume remains prohibited until Stop is confirmed. The schema of the answer states it, and the other way round too: an answer whose code is pending is that of a pending fallback Stop, and only an interrupt that fell back to Stop carries a Stop's answer.); session.steer without 'mid_turn_input' is 'next_turn' (the message is queued for the next turn, and the item's delivery says so). service: the service the method needs, or null; until a named service is ready the method alone answers 'unavailable' with detail service_starting. unavailable with detail service_starting is permitted only when the method's row names the service whose readiness is being checked. A null service cannot produce service_starting. daemon_closing is the global admission reason and does not require a row service. Preserve plugin.list's existing no-plugin-host refusal as its explicit legacy exception, distinct from service_starting. The answer schema of every row whose service is null refuses service_starting. No row names one yet: a lane names its service when it registers one, and the six methods of today's daemon never need one. mcp: whether the Control MCP server offers the method as a tool, under which name, with which annotations. beta: shown as beta until its first proof is recorded. lane: who implements it.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1611,7 +1611,31 @@
                     "scope_refused"
                   ]
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "enum": [
+                          "daemon_closing",
+                          "no plugin host is composed"
+                        ]
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -1735,7 +1759,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -1832,7 +1879,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -1918,7 +1988,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2000,7 +2093,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2077,6 +2193,94 @@
                   "stop"
                 ]
               }
+            },
+            {
+              "if": {
+                "required": [
+                  "interrupt",
+                  "stop"
+                ],
+                "properties": {
+                  "interrupt": {
+                    "required": [
+                      "outcome"
+                    ],
+                    "properties": {
+                      "outcome": {
+                        "const": "fell_back_to_stop"
+                      }
+                    }
+                  },
+                  "stop": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "pending"
+                      }
+                    }
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "const": "pending"
+                  },
+                  "session": {
+                    "properties": {
+                      "state": {
+                        "const": "stop_pending"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "code"
+                ],
+                "properties": {
+                  "code": {
+                    "const": "pending"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "stop"
+                ],
+                "properties": {
+                  "stop": {
+                    "properties": {
+                      "code": {
+                        "const": "pending"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "stop"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "interrupt": {
+                    "properties": {
+                      "outcome": {
+                        "const": "fell_back_to_stop"
+                      }
+                    }
+                  }
+                }
+              }
             }
           ]
         },
@@ -2117,7 +2321,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2206,7 +2433,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2298,7 +2548,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2397,7 +2670,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2490,7 +2786,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2568,7 +2887,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2677,7 +3019,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2780,7 +3145,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2861,7 +3249,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -2946,7 +3357,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3027,7 +3461,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3124,7 +3581,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3149,7 +3629,8 @@
           "enum": [
             "raw",
             "transcript"
-          ]
+          ],
+          "description": "The projection the answer must be in. When it is left out the read asks for 'raw'."
         }
       }
     },
@@ -3271,7 +3752,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3296,7 +3800,8 @@
           "enum": [
             "raw",
             "transcript"
-          ]
+          ],
+          "description": "The projection the answer must be in. When it is left out the read asks for 'raw'."
         },
         "wait_ms": {
           "type": "integer",
@@ -3424,7 +3929,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3509,7 +4037,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3585,7 +4136,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3656,7 +4230,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3731,7 +4328,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3814,7 +4434,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -3902,7 +4545,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4011,7 +4677,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4082,7 +4771,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4175,7 +4887,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4274,7 +5009,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4389,7 +5147,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4534,7 +5315,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4598,7 +5402,30 @@
                     ]
                   }
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": [
+                      "code"
+                    ],
+                    "properties": {
+                      "code": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "detail": {
+                        "not": {
+                          "const": "service_starting"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             }
           ]
         }

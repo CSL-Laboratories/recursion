@@ -13,19 +13,94 @@ Nothing is frozen yet.
 
 | Schema | Version |
 |---|---|
-| `common.v1.json` | 1.0-draft.3 |
+| `common.v1.json` | 1.0-draft.4 |
 | `run.record.v1.json` | 1.0-draft.4 |
 | `run.view.v1.json` | 1.0-draft.4 |
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
-| `queue.item.v1.json` | 1.0-draft.5 |
-| `event.v1.json` | 1.0-draft.6 |
-| `approval.v1.json` | 1.0-draft.5 |
+| `queue.item.v1.json` | 1.0-draft.6 |
+| `event.v1.json` | 1.0-draft.7 |
+| `approval.v1.json` | 1.0-draft.6 |
 | `driver.v2.json` | 1.0-draft.4 |
-| `mcp.task.v1.json` | 1.0-draft.4 |
+| `mcp.task.v1.json` | 1.0-draft.5 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.7 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.8 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## After another model family read the whole set a third time (Nov 13, 2026)
+
+That read (of commit `108b11da`) found the eight corrections of the second read applied word for word,
+and still judged the drafts not yet ready: new cases contradicted the corrected rules. It wrote nine
+corrections, C1 to C9, each with its wording. The wording is in the schemas and in `rules.py` as it was
+written. Nothing here reopens the owner's decisions.
+
+| Correction | What changed | What it breaks |
+|---|---|---|
+| C1. Numbers, again | The exact range check no longer depends on the host's decimal context: `1e1000000` is refused `integer_out_of_range` like every other integral value outside the range (the reader took an absolute value in the host's context and raised its overflow). The bound form of a number is now enforced where a value is HELD, not only where text is read: `normalised` and `unnormalised` in `rules.py`; a held call or effect with `1.0` or minus zero is refused (`not_normalised`) by `check_call`, has no bytes to digest and no lines; a model normalises as it is made from a record and when it changes one; consumption refuses a record that is not normalised. `approval.v1` draft 6 | A producer that keeps `1.0` or `-0.0` in a bound record and relies on the digest, which cannot see either |
+| C2. The private binding | For an engine's call the binding's `approval_id`, `run_id` and `engine` are each compared with the approval it is used against, at every consumption, after a restart too. Equal to the binding that was kept is not enough | An implementation that compares the offered binding with the kept one and stops there |
+| C3. A change of content | A change is built as a candidate and validated whole before it replaces the pending request; a refusal is typed and leaves the record, its revision and the binding as they were. An effect bound to another run, session or engine, or from another plugin, is refused (`target`). The earlier premise that a plugin's `kind` is short was wrong: its pattern has no length, and vectors hold it at 3,992, 3,993 and 5,002 characters | An implementation that writes the new effect into the record and validates afterwards |
+| C4. The end of the target turn | An item still `delivering` when its binding's target turn ends is `outcome_unknown` for either `how`, `new_turn` as well as `mid_turn`; the end of another turn changes nothing; a later acceptance is kept as evidence. `queue.item.v1` draft 6, and the word `turn_ended` of `effect.outcome_unknown` in `event.v1` draft 7 says the same | A producer that left a `new_turn` delivery `delivering` after its turn ended, and delivered it on a late acceptance |
+| C5. The projection that was asked for | A page is the answer to its request only in the projection the request names; a read that names none asks for `raw`. A transcript page is made only from a raw page that is itself a right answer to the cursor: `transcript_page_problems`. `page_problems` now takes the request's params, not its cursor alone. `methods` draft 8 | A caller of `page_problems(cursor, page)`; a reader that judged a page by the page's own projection |
+| C6. A fallback Stop that is pending | When an interrupt fell back to Stop and the Stop is pending, the answer's code is `pending` and the session is `stop_pending`: the answer schema says so. `methods` draft 8 | An answer `ok`, or a session `live` or `idle`, beside a pending fallback Stop |
+| C7. `service_starting` | Only a row that names a service can answer it, and no row names one: every row's answer schema refuses it. `plugin.list` keeps today's own refusal when no plugin host is composed (`no plugin host is composed`), pinned beside `daemon_closing` as its legacy exception; the real exchange is captured (`c20`). The good exchange `h62` showed `service_starting` from `events.follow`, whose row names no service: it is a closing example now, and its old value is a bad fixture (`b36`). `methods` draft 8 | A daemon that answers `service_starting` from a method with no service |
+| C8. The origin of a Task | `created_at` is the time of the event that establishes the entity's creation: its first `state.changed` when its reason is `commit`, in a log that is whole up to it. A `snapshot` (the entity already existed when logging began) and a `reconcile` establish nothing, and neither does another event that only names the run or the turn. Position 1 and no gap are retention checks. `mcp.task.v1` draft 5. Every Task vector of a run whose log begins with a snapshot now has a null `created_at` | A Task that gave a snapshot's time, or the time of the first event filed under a turn |
+| C9. Seconds | The real-instant check validates the seconds. The profile of these records supports no leap second: seconds are 00 to 59 in the pattern and in the check, and a `:60` is refused in an ordinary minute and on a day that had a leap second alike (it was read as the first second of the next minute). `common.v1` draft 4 | A producer that writes `:60` |
+
+The read took ten rules away and one stayed green: that the private binding names the record's
+approval. It is refused now by vectors `s12` to `s14`, one for each member, and by a test of the model.
+
+The read also asked that the requirement be plain at the entry point, and both READMEs now open their
+account of conformance with it: conformance requires the semantic rules, including `x-instant`;
+ordinary Draft 2020-12 validation alone is insufficient; every client runs the published positive and
+negative fixtures.
+
+`csl-approval-lines/v0` is unchanged by `approval.v1` draft 6: the lines of every effect are what
+draft 5 drew.
+
+### Found by asking the same questions of every operation that changes a record
+
+After that read, each operation of `rules.py` that changes a record was asked three things: is the
+whole candidate validated before anything is committed, and is the state untouched on a refusal; is
+every identity member of every binding compared with the record it is used against; does a rule that
+names one case of a list of values hold for the other cases. What that found, beyond C1 to C9:
+
+- **A plugin's effect could never be consumed.** Consumption required a kept engine binding, and a
+  plugin's effect has no pending request of an engine. It has no binding now, and is consumed once
+  against its approval, revision and digest; a binding kept or offered for it is `binding_mismatch`.
+- **An answer that was not `approve` was read as a denial.** Any other word, and no word, denied the
+  request. `approval.answer` now takes `approve` or `deny` and refuses anything else `request_invalid`,
+  naming the field, with no receipt kept; so is a request that lacks a field. A caller with a kind and
+  no id is `scope_refused`.
+- **Consumption did not look at the record.** An approved record whose digest, lines or envelope were
+  not its effect's was carried out. It is refused `record_invalid`.
+- **An effect could carry a member that is on no line.** The schema closes an effect; the rule did not,
+  so where only the rule was applied a member more was bound by the digest and never drawn. An effect
+  has exactly the members of its source's effect, and a plugin effect's scope exactly its five
+  (`approval_problems` says `effect`); a change to such an effect is refused.
+- **The range check on a held float had no test of its own.** It was held only by an approval vector,
+  which the new bound-form check now refuses first. It is tested directly, for every digest that uses it.
+- **A change could name nothing, or a deadline that is not a moment.** Refused (`nothing_to_change`,
+  `timestamp`); an effect that is not one of the request's source is refused (`effect`) instead of
+  raising an error of the host language.
+- **A message for the next turn could be bound to the turn in progress.** A binding's `how` is now one
+  the item's `delivery` allows: `next_turn` is `new_turn`; a `steer` is `mid_turn`, or `new_turn` where
+  the driver cannot take input in the middle of a turn.
+- **Steps of a delivery raised errors of the host language** for a write or a turn's end that named
+  nothing. They are typed refusals now (`delivery_mismatch`, `turn`). An edit that names no field, an
+  empty text or a delivery word nobody defined is refused (`edit`) and no revision is spent.
+- **`pending` and a Stop's answer on an interrupt.** Besides C6: an answer `pending` is that of a
+  pending fallback Stop and of nothing else, and only an interrupt that fell back to Stop carries a
+  Stop's answer.
+- **The exact reading of a number where the host does not trap an invalid operation.** With that trap
+  off, an exponent too large for an exact decimal came back as a silent not-a-number and the refusal
+  changed its code. One outcome now, under every context tried.
+- **The time check stood on the pattern.** `milliseconds` took an hour of 24 or a minute of 60 if the
+  pattern had not been applied first. It checks the whole spelling itself.
+
+Looked at and left as it is, on purpose: a number too small for a binary64 (`1e-1000000`) is still read
+as zero, as every binary64 reader reads it; a refused late acceptance is kept as evidence even when it
+names another delivery; a model can still be MADE from a record that does not agree with itself, and
+what refuses such a record is validation (`approval_problems`) and consumption.
 
 ## After another model family read the whole set a second time (Nov 13, 2026)
 

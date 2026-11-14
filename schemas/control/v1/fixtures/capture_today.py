@@ -136,6 +136,10 @@ def capture(out_dir: Path, with_exchanges: bool = False) -> dict[str, object]:
         # A run id that is not well formed is looked up like any other, and echoed in the answer as it was given.
         exchange('c18-run-status-of-an-id-that-is-not-one', 'run.status', {'run_id': 'not/a/run'})
         exchange('c19-run-stop-of-an-id-that-is-not-one', 'run.stop', {'run_id': 'not/a/run'})
+        # compose_control always hands the control object a plugin host. One made from this same daemon's own
+        # parts WITHOUT a host answers plugin.list with today's own refusal; nothing else is asked of it.
+        bare = type(composed.control)(composed.control.api, daemon.registry, daemon, composed.control.starter, case.state)
+        exchange('c20-plugin-list-with-no-plugin-host', 'plugin.list', {}, socket=bare)
 
         # A unit the manager can no longer observe is never reported running.
         run_d = case.start(api)

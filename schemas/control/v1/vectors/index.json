@@ -1,5 +1,5 @@
 {
-  "about": "Every vector of this folder. A vector is checked against a rule that no schema can state (conformance/rules.py), named by 'rule'. call.profile: one tool call as an engine wrote it (tool, cwd, input_text) and the text that is bound for it (call_text: its cwd, input and tool, as one object, as RFC 8785 writes it), or the code it is refused with. approval.binding: one approval record of the right shape, and exactly what does not agree inside it (an empty list when everything does); effect_text, where present, is the text whose UTF-8 bytes the digest is taken over. approval.lifecycle: one request, then calls on it one after another, each with who is calling, the answer, and the record after it. The call texts, the effect texts, three whole sets of lines and the order of the answers were written by hand and then checked against the rule, not copied from it. queue.delivery: one queued message and what happens to it, step by step: the item after each step, or the code the step is refused with; a step may carry the event of the log that belongs to it, and an acceptance always carries its input.accepted event. task.derivation: a run's view or a session and one of its turns, the log, the approvals pending, a Task, and exactly which of the Task's fields are not what the source says (an empty list when all are). start.intent: a start request, the extensions the start path declared (null when no lane is on it), the exact preimage of its intent, the start_key it stores, and how it compares with a key already stored. event.cursor: a cursor, its log and the daemon's epoch, and what the read is answered. event.page: the cursor a read was asked with and the page it was answered, and exactly where the page is not its continuation. These files are plain ASCII: a character outside it is written as a JSON escape.",
+  "about": "Every vector of this folder. A vector is checked against a rule that no schema can state (conformance/rules.py), named by 'rule'. call.profile: one tool call as an engine wrote it (tool, cwd, input_text) and the text that is bound for it (call_text: its cwd, input and tool, as one object, as RFC 8785 writes it), or the code it is refused with. approval.binding: one approval record of the right shape, and exactly what does not agree inside it (an empty list when everything does); effect_text, where present, is the text whose UTF-8 bytes the digest is taken over. approval.lifecycle: one request, then calls on it one after another, each with who is calling, the answer, and the record after it. The call texts, the effect texts, three whole sets of lines and the order of the answers were written by hand and then checked against the rule, not copied from it. queue.delivery: one queued message and what happens to it, step by step: the item after each step, or the code the step is refused with; a step may carry the event of the log that belongs to it, and an acceptance always carries its input.accepted event. task.derivation: a run's view or a session and one of its turns, the log, the approvals pending, a Task, and exactly which of the Task's fields are not what the source says (an empty list when all are). start.intent: a start request, the extensions the start path declared (null when no lane is on it), the exact preimage of its intent, the start_key it stores, and how it compares with a key already stored. event.cursor: a cursor, its log and the daemon's epoch, and what the read is answered. event.page: the request a read was made with (its cursor, and its projection when it names one) and the page it was answered, and exactly where the page is not the answer to that request or not the continuation of its cursor; 'raw', where a transcript page carries it, is the raw page of the same read, which the transcript page must be the projection of. In the approval vectors records are compared exactly: 1 is not 1.0 and 0 is not -0.0. These files are plain ASCII: a character outside it is written as a JSON escape.",
   "vectors": [
     {
       "file": "call.profile/p01-a-plain-call.json",
@@ -182,6 +182,31 @@
       "shows": "A number that is not integral and is larger than any binary64: not finite."
     },
     {
+      "file": "call.profile/r25-one-followed-by-a-million-zeros.json",
+      "rule": "call.profile",
+      "shows": "1e1000000 is an integral value far outside the range and is refused as one. The check is exact and does not depend on the host's decimal context: a reader that takes the absolute value in a default context raises that context's overflow here, which is no typed refusal at all."
+    },
+    {
+      "file": "call.profile/r26-minus-one-followed-by-a-million-zeros.json",
+      "rule": "call.profile",
+      "shows": "The same value, negative."
+    },
+    {
+      "file": "call.profile/r27-a-million-zeros-with-a-fraction-in-its-digits.json",
+      "rule": "call.profile",
+      "shows": "1.5e1000000 is integral too."
+    },
+    {
+      "file": "call.profile/r28-the-largest-exponent-of-a-default-decimal-context.json",
+      "rule": "call.profile",
+      "shows": "1e999999 fits a default decimal context exactly and is refused the same way: one outcome on both sides of that limit."
+    },
+    {
+      "file": "call.profile/p13-zero-whatever-its-exponent.json",
+      "rule": "call.profile",
+      "shows": "Zero written with an exponent of a million is zero, and one divided by ten a million times is below what a binary64 holds and reads as zero (p12): both are bound as the whole number 0."
+    },
+    {
       "file": "approval.binding/g01-a-tool-call.json",
       "rule": "approval.binding",
       "shows": "A request for a tool call: its digest is the SHA-256 of the UTF-8 bytes of effect_text, which is the whole effect as RFC 8785 writes it, and its lines are the lines of that effect."
@@ -329,7 +354,7 @@
     {
       "file": "approval.binding/g17-every-long-field-of-a-plugin-effect.json",
       "rule": "approval.binding",
-      "shows": "Each text field of a plugin's effect that the schema lets be long (its connection and the five parts of its scope), at 4,100 characters: each is two lines, none longer than the schema allows. Its plugin id, kind, run and currency are kept short by their own patterns."
+      "shows": "Each text field of a plugin's effect that the schema lets be long (its connection and the five parts of its scope), at 4,100 characters: each is two lines, none longer than the schema allows. Its plugin id and its currency are kept short by their own patterns. Its kind is not (g18 to g20), and its run is short only because it must be the record's own (x20)."
     },
     {
       "file": "approval.binding/g16-a-plugin-effect-of-exactly-two-hundred-lines.json",
@@ -355,6 +380,36 @@
       "file": "approval.binding/x12-the-same-showing-twice.json",
       "rule": "approval.binding",
       "shows": "The same principal on the same surface at the same revision is recorded once."
+    },
+    {
+      "file": "approval.binding/g18-a-plugin-kind-that-exactly-fills-a-line.json",
+      "rule": "approval.binding",
+      "shows": "A plugin's kind of 3,992 characters: with its label and its quotes the line is exactly 4,000 characters. The kind's pattern sets no length, so the renderer cannot rely on one."
+    },
+    {
+      "file": "approval.binding/g19-a-plugin-kind-one-character-longer.json",
+      "rule": "approval.binding",
+      "shows": "One character more: the closing quote continues on a line that starts with two spaces."
+    },
+    {
+      "file": "approval.binding/g20-a-plugin-kind-of-five-thousand-characters.json",
+      "rule": "approval.binding",
+      "shows": "A kind of 5,002 characters is two lines, neither longer than the schema allows. Nothing is cut."
+    },
+    {
+      "file": "approval.binding/x21-a-long-plugin-kind-on-one-line.json",
+      "rule": "approval.binding",
+      "shows": "The same kind drawn on one line, cut to fit: not the lines of the effect."
+    },
+    {
+      "file": "approval.binding/x20-a-plugin-effect-whose-run-is-not-the-records.json",
+      "rule": "approval.binding",
+      "shows": "A plugin effect's own run_id has no pattern and no length: here it is 5,000 characters, and it is drawn whole, on two lines. What keeps it short in an approval is that it must be the record's run, which this one is not."
+    },
+    {
+      "file": "approval.binding/x19-a-bound-minus-zero.json",
+      "rule": "approval.binding",
+      "shows": "The call holds minus zero. Its digest and its lines are those of the call that holds zero, because RFC 8785 writes both as 0: a digest cannot see the difference and a dispatch can. The bound value is the normalised one, so this record is not an approval: it has no canonical bytes, no digest and no lines. (In the file the number is spelled -0.0.)"
     },
     {
       "file": "approval.lifecycle/s01-open-answer-replay.json",
@@ -405,6 +460,36 @@
       "file": "approval.lifecycle/s09-no-binding-no-consumption.json",
       "rule": "approval.lifecycle",
       "shows": "An approval for which the daemon holds no private binding cannot be carried out, whatever binding is offered."
+    },
+    {
+      "file": "approval.lifecycle/s11-a-durable-record-is-restored-in-its-bound-form.json",
+      "rule": "approval.lifecycle",
+      "shows": "The record as another serialiser left it where it is durable: the whole number 1 spelled 1.0 and zero spelled -0.0. The digest and the lines are those of the bound call. The model is made from it, which is what a restart does: the numbers are normalised before anything is digested, drawn or carried out, so every record from here on holds 1 and 0, and that is the value that is carried out. Records are compared exactly here: 1 is not 1.0 and 0 is not -0.0."
+    },
+    {
+      "file": "approval.lifecycle/s12-a-binding-that-names-another-approval.json",
+      "rule": "approval.lifecycle",
+      "shows": "Each member of the private binding is compared with the approval it is used against. Here the binding kept for this approval names ANOTHER approval. Being equal to the binding that is kept is not enough."
+    },
+    {
+      "file": "approval.lifecycle/s13-a-binding-that-names-another-run.json",
+      "rule": "approval.lifecycle",
+      "shows": "The binding kept for this approval names another run than the record and its effect."
+    },
+    {
+      "file": "approval.lifecycle/s14-a-binding-that-names-another-engine.json",
+      "rule": "approval.lifecycle",
+      "shows": "The binding kept for this approval names another engine than the effect."
+    },
+    {
+      "file": "approval.lifecycle/s15-a-change-is-made-whole-or-not-at-all.json",
+      "rule": "approval.lifecycle",
+      "shows": "The core builds a changed request as a candidate and checks all of it before it replaces the request. Each of these is refused with a typed code and leaves the record, its revision and its binding exactly as they were: an effect bound to another run, to another session, to another engine; a deadline that is not a moment; a change that changes nothing. Changing the content is not permission to change the target."
+    },
+    {
+      "file": "approval.lifecycle/s16-a-plugin-effect-is-changed-and-carried-out-once.json",
+      "rule": "approval.lifecycle",
+      "shows": "A plugin's effect. Another plugin's effect, or one bound to another run, cannot take its place; a change of its content can, and raises the revision. A plugin's effect has no pending request of an engine, so the daemon keeps no binding for it and none is offered: it is carried out once against its approval, revision and digest."
     },
     {
       "file": "transcript.projection/g01-a-log-and-its-lines.json",
@@ -502,9 +587,24 @@
       "shows": "Delivering is committed WITH its binding or not at all: a binding of another item, of another log, without the worker's incarnation, or with a 'how' that is not one of the two, is refused and the item stays queued."
     },
     {
+      "file": "queue.delivery/d12-a-message-for-a-new-turn-whose-turn-ended-with-no-acceptance.json",
+      "rule": "queue.delivery",
+      "shows": "A message for the next turn. Its binding names the new turn, allocated before the dispatch. That turn ends and no acceptance of the delivery was ever committed: nobody can say whether the engine took the message. The item is quarantined exactly as a steer is, and an acceptance that arrives afterwards is kept as evidence and delivers nothing. (Until the third read only a mid-turn delivery was quarantined here: this item stayed delivering, and the late acceptance delivered it.)"
+    },
+    {
+      "file": "queue.delivery/d13-a-steer-that-begins-the-next-turn.json",
+      "rule": "queue.delivery",
+      "shows": "A steer for an engine whose driver cannot take input in the middle of a turn: it is queued for the next turn, so its binding says new_turn and names the new turn. The acceptance agrees and it is delivered as that turn."
+    },
+    {
+      "file": "queue.delivery/d14-a-step-is-whole-or-refused.json",
+      "rule": "queue.delivery",
+      "shows": "What the core is told is taken whole or refused, and a refusal changes nothing, the revision included: an edit that names nothing, a text that is empty, a delivery word nobody defined, the end of a turn that names no turn, a write that names no delivery."
+    },
+    {
       "file": "task.derivation/t01-turn-working.json",
       "rule": "task.derivation",
-      "shows": "A turn in progress. The Task is created when the first event of the turn was logged, and last changed at its latest state.changed: the times the core logged."
+      "shows": "A turn in progress. created_at is the time of the event that establishes the turn's creation: its first state.changed, seen as it was made (reason commit), in a log that is whole up to it. updated_at is the time of its latest state.changed. Both are times the core logged."
     },
     {
       "file": "task.derivation/t02-turn-waiting-for-an-approval.json",
@@ -554,12 +654,22 @@
     {
       "file": "task.derivation/r11-run-running.json",
       "rule": "task.derivation",
-      "shows": "Work started with run.start and no session: the Task id is the run id, there is no session and no turn, and it does not expire. Its times are those of the run's own log, 'run:<run_id>'."
+      "shows": "Work started with run.start and no session: the Task id is the run id, there is no session and no turn, and it does not expire. Its times are those of the run's own log, 'run:<run_id>'. That log begins with a snapshot: the run already existed when logging began, so nothing retained establishes when it was created, and created_at is null. A snapshot is not a creation. updated_at is the time of the latest state.changed all the same."
     },
     {
       "file": "task.derivation/r12-run-starting.json",
       "rule": "task.derivation",
-      "shows": "A run that is being started: working. Its log holds one event so far, so both times are that event's."
+      "shows": "A run that is being started: working. Its log holds one event so far, a snapshot: updated_at is that event's time and created_at is null."
+    },
+    {
+      "file": "task.derivation/r29-run-whose-creation-the-log-saw.json",
+      "rule": "task.derivation",
+      "shows": "A run made after logging began. Its first record is the commit that made it (reason commit, at position 1, nothing missing before it): that event establishes its creation, and created_at is its time."
+    },
+    {
+      "file": "task.derivation/r30-run-first-seen-by-a-scan.json",
+      "rule": "task.derivation",
+      "shows": "A run whose first record was found by a later scan (reason reconcile): earlier steps may be missing, so it does not establish the creation either. created_at is null."
     },
     {
       "file": "task.derivation/r13-run-waiting-for-an-approval.json",
@@ -639,12 +749,42 @@
     {
       "file": "task.derivation/r28-run-with-a-gap-after-its-first-event.json",
       "rule": "task.derivation",
-      "shows": "A gap later in the log does not hide the origin: the first event is the creation, and created_at is its time."
+      "shows": "A gap later in the log does not hide the origin: the run's first record is the commit that made it, nothing is missing before it, and created_at is its time."
+    },
+    {
+      "file": "task.derivation/t31-turn-that-existed-when-logging-began.json",
+      "rule": "task.derivation",
+      "shows": "A turn whose first record is a snapshot: it already existed when logging began. Position 1 and no gap before it say that nothing was dropped, not that the turn was made then. created_at is null."
+    },
+    {
+      "file": "task.derivation/t32-turn-whose-first-event-is-not-its-first-record.json",
+      "rule": "task.derivation",
+      "shows": "The first events filed under this turn are the engine's acceptance and the turn's start; its record is first logged after them, as it was made. The creation is that first record, not the first event that names the turn."
+    },
+    {
+      "file": "task.derivation/t33-turn-behind-a-gap-of-one-position.json",
+      "rule": "task.derivation",
+      "shows": "A gap that stands for one position: the numbers a reader sees have no hole, 1, 2, 3, and the event the gap stands for may have been this turn's first record. created_at is null."
     },
     {
       "file": "task.derivation/x09-a-creation-time-taken-from-a-tail.json",
       "rule": "task.derivation",
       "shows": "The Task of a turn whose log is a retained tail gives the tail's first event as its creation."
+    },
+    {
+      "file": "task.derivation/x11-a-snapshot-given-as-the-creation.json",
+      "rule": "task.derivation",
+      "shows": "The Task of a run whose log begins with a snapshot gives the snapshot's time as its creation. (A vector of the second draft did exactly this.)"
+    },
+    {
+      "file": "task.derivation/x12-a-scan-given-as-the-creation.json",
+      "rule": "task.derivation",
+      "shows": "The same for a first record that a scan found."
+    },
+    {
+      "file": "task.derivation/x13-the-first-event-of-a-turn-given-as-its-creation.json",
+      "rule": "task.derivation",
+      "shows": "The Task gives the time of the first event filed under the turn, an acceptance, where the turn's creation is its first record."
     },
     {
       "file": "task.derivation/x10-a-pending-stop-with-no-stop-record-not-flagged.json",
@@ -890,6 +1030,51 @@
       "file": "event.page/x11-a-gap-that-does-not-start-at-the-next-position.json",
       "rule": "event.page",
       "shows": "Asked from seq 2, a gap that starts at 5: positions 3 and 4 are unaccounted for."
+    },
+    {
+      "file": "event.page/g07-a-read-that-names-no-projection.json",
+      "rule": "event.page",
+      "shows": "A read that names no projection asks for raw, the events as they were logged: that is the one default, and this is its answer."
+    },
+    {
+      "file": "event.page/x12-a-transcript-page-for-a-read-that-asked-raw.json",
+      "rule": "event.page",
+      "shows": "The request asks for raw and the answer is a transcript page. Each side fits the schema on its own, and the page is a right continuation of the cursor; it is not the answer to this request. (The third read's case: until then the page was judged by its own projection and passed.)"
+    },
+    {
+      "file": "event.page/x13-a-raw-page-for-a-read-that-asked-the-transcript.json",
+      "rule": "event.page",
+      "shows": "The other way round."
+    },
+    {
+      "file": "event.page/x14-a-transcript-page-for-a-read-that-names-no-projection.json",
+      "rule": "event.page",
+      "shows": "A read that names no projection is answered raw, never with lines."
+    },
+    {
+      "file": "event.page/g08-a-transcript-page-and-the-raw-page-it-was-made-from.json",
+      "rule": "event.page",
+      "shows": "A transcript page with the raw page of the same read beside it: the raw page is a right answer to the cursor (its log, its positions, its gap), and there is one line for each of its events, with the event's seq and type. A line carries neither its log nor where a gap starts, so only the raw page can show those."
+    },
+    {
+      "file": "event.page/x15-a-transcript-page-made-from-a-page-with-another-logs-event.json",
+      "rule": "event.page",
+      "shows": "The lines look right: 42, then 43. The raw page they were made from holds an event of another log at 43. A line does not carry its log, so nothing in the transcript page shows it; the producer's check on the raw page does, and no transcript page may be made from it."
+    },
+    {
+      "file": "event.page/x16-a-transcript-gap-line-over-a-gap-that-starts-too-late.json",
+      "rule": "event.page",
+      "shows": "Asked from seq 2. The raw page's gap starts at 5, so positions 3 and 4 are neither given nor covered. Its transcript line carries only the gap's last position, 9, and looks exactly like the line of a right gap. The producer's check on the raw page catches what the line cannot show."
+    },
+    {
+      "file": "event.page/x17-a-transcript-page-that-leaves-out-an-event-of-its-raw-page.json",
+      "rule": "event.page",
+      "shows": "The raw page holds 42 and 43 and the transcript page has a line for 42 only, under the same cursor."
+    },
+    {
+      "file": "event.page/x18-a-transcript-page-under-another-cursor-than-its-raw-page.json",
+      "rule": "event.page",
+      "shows": "One line for each event, and the transcript page says there is more where the raw page said there was none."
     }
   ]
 }

@@ -5,6 +5,15 @@ their vectors. It is the check that someone outside the product can build agains
 it imports the Python standard library and `jsonschema` (Draft 2020-12), and nothing from
 `recursion_core`.
 
+**Conformance requires the semantic rules, including x-instant; ordinary Draft 2020-12 validation
+alone is insufficient. Every client must run the published positive and negative fixtures.** A schema
+validator that does not know the keyword `x-instant` ignores it, as the dialect says of any keyword
+it does not know, and then takes a timestamp on a day that does not exist; and no schema states the
+rules of `rules.py` at all (that a digest is its effect's, that a page is in the projection that was
+asked for, that a binding names the approval it is used against). A client that validates the shapes
+and stops there accepts records that this folder's negative fixtures and vectors refuse, and is not
+conformant.
+
 ```
 python3.12 -m unittest discover -s conformance      # EVERYTHING: one test per fixture and per vector, and the consistency checks
 python3.12 conformance/wire_client.py               # the fixtures and the vectors only, one line each; exit 1 on any failure
@@ -21,14 +30,19 @@ Three files:
 
 - `wire_client.py`: reads the schemas, the fixtures and the vectors, and checks one of each.
 - `rules.py`: the rules a JSON Schema cannot state, as plain functions over plain values, importing the
-  standard library alone: the strict reading of a tool's input, the text of a value as RFC 8785 writes
-  it, the digest of an effect, the lines of an approval, `approval.open` and `approval.answer` one
-  call at a time with its deadline, a change of content and the single consumption, what a transcript
-  line must carry because its event says so, what each thing that happens to a queued message does to
-  it against the binding committed before the write, the Task of a run and of a turn, the identity of
-  a start request, reading a log from a cursor, and the digests an event carries. A client in another
-  language implements these and checks the same vectors.
-- `tests.py`: all of it as tests.
+  standard library alone: the strict reading of a tool's input, the bound form of a number, the text
+  of a value as RFC 8785 writes it, the digest of an effect, the lines of an approval,
+  `approval.open` and `approval.answer` one call at a time with its deadline, a change of content
+  made whole or not at all, and the single consumption against a binding that names the approval,
+  what a transcript line must carry because its event says so, what each thing that happens to a
+  queued message does to it against the binding committed before the write, the Task of a run and of
+  a turn, the identity of a start request, reading a log from a cursor in the projection that was
+  asked for, and the digests an event carries. A client in another language implements these and
+  checks the same vectors.
+- `tests.py`: all of it as tests. Its class `RulesTest` holds what a vector file cannot: the host's
+  own state around a rule (the Decimal context a number is read under), a record changed behind a
+  model's back, a request the method table would not let into an exchange. A client in another
+  language needs the same cases in its own tests; each test's first lines say what it holds.
 
 ## What it checks
 
@@ -66,16 +80,24 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   turn, log, run, `how` or delivery, and after a second write, and each time the vector is refused;
 - a start request stores exactly the `start_key` its vector gives, from exactly the preimage its
   vector gives; a cursor is answered as its vector says; a page has exactly the faults its vector
-  lists against the cursor it was asked with, and so has no fault in any good exchange;
+  lists against the request it was asked with (its cursor, and the projection it asked for, which is
+  `raw` when it names none), and so has no fault in any good exchange, where the same page under
+  the other projection is caught; a transcript page that carries the raw page of the same read is
+  the projection of a raw page that is itself right;
+- in an approval vector records are compared exactly (1 is not 1.0 and 0 is not -0.0), a refused step
+  leaves the record and the private binding as they were, and the binding never changes;
 - wherever a good fixture or a vector holds an event, a `state.changed` carries the digest of its
   post-image and a `tool.call` the digest of its input, and in the good fixtures a `replay.gap` is a
   span filed under its last position;
-- every field typed as a timestamp holds a moment that exists (the keyword `x-instant`, which this
-  client adds to its validator);
+- every field typed as a timestamp holds a moment that exists, with seconds from 00 to 59 (the
+  keyword `x-instant`, which this client adds to its validator; the check stands without the
+  pattern);
 - in the method table, the seven mandatory built-ins are exactly the rows that cannot answer
   `unsupported`; every row can answer `unavailable`; a built-in that waits on no service answers it
-  only for a closing daemon (and `run.start` for a start registrant that refused); and each row's
-  `falls_back` and `service` are the ones pinned in `tests.py`;
+  only for a closing daemon (`run.start` also for a start registrant that refused, `plugin.list` also
+  with today's own words when no plugin host is composed); a row that names no service, which today
+  is every row, can never answer `service_starting`; and each row's `falls_back` and `service` are
+  the ones pinned in `tests.py`;
 - a Task vector agrees with the rule for every state a run's view can show and every state a turn can
   be in, and every status a Task can have is reached from each source;
 - every approval inside a good fixture, wherever it sits, has the digest of its effect and the lines

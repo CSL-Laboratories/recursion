@@ -11,7 +11,7 @@
   "pending_approval_ids": [
     "apr-00c5"
   ],
-  "created_at": "2026-11-13T07:33:58.120Z",
+  "created_at": null,
   "updated_at": "2026-11-13T07:33:58.412Z",
   "expires_at": null,
   "poll_interval_ms": 1000,

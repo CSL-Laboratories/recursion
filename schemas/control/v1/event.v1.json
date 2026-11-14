@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "event.v1.json",
   "title": "event.v1: one event of a session's log",
-  "x-version": "1.0-draft.6",
+  "x-version": "1.0-draft.7",
   "description": "PUBLIC record, and the row lane EVENTS stores. Each log is ordered and append-only; everything a client shows comes from it. seq starts at 1 in each log, has no holes, and is never used twice. session_id names the LOG: a session's id, or 'run:<run_id>' for a run that has no session. run_id and turn_id are null for an event that belongs to no run or no turn. time is when the core wrote the event. source says where the event's content came from: 'core' (the daemon's own code), 'engine' (an engine's output or its typed stream), 'plugin', or 'client' (something a user or a calling program sent). trust says whether the content may be shown as the product's own words: content from an engine or a plugin is always 'untrusted', and a core event that carries engine text is 'untrusted' too. Every type has exactly one payload schema, below; none is a name only. The lane that emits an event owns its payload: it may reshape a draft here by sending a fixture. Only the core writes approval.requested: a surface opens its approval state on that event and on nothing an engine printed. A number that is not known is null with quality 'unknown', never 0. Engine-shaped values (a tool call's input) are open objects marked untrusted; nothing a core lane reads lives in one. A reader that meets a type it does not know keeps the envelope, shows nothing from the payload, and reads on.",
   "type": "object",
   "additionalProperties": false,
@@ -518,7 +518,7 @@
       "$ref": "common.v1.json#/$defs/route_decision"
     },
     "effect.outcome_unknown": {
-      "description": "DRAFT, lane EVENTS supplies the fields. Something with an effect outside the daemon was in flight when the daemon stopped watching it, and nobody can say whether it happened: for a queued message, delivery outcome unknown; the message may not have been sent. It will not be resent automatically. It is shown to the user and is never retried by itself; it is committed together with the state that quarantines the effect. effect names what it was and which one; why is a typed code: 'turn_ended' is a message written into a turn that ended with no acceptance of it from the engine.",
+      "description": "DRAFT, lane EVENTS supplies the fields. Something with an effect outside the daemon was in flight when the daemon stopped watching it, and nobody can say whether it happened: for a queued message, delivery outcome unknown; the message may not have been sent. It will not be resent automatically. It is shown to the user and is never retried by itself; it is committed together with the state that quarantines the effect. effect names what it was and which one; why is a typed code: 'turn_ended' is a queued message whose target turn (the turn in progress it was written into, or the new turn allocated for it) ended with no acceptance of it from the engine.",
       "type": "object",
       "additionalProperties": false,
       "required": ["effect", "why"],

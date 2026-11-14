@@ -1,21 +1,21 @@
 {
-  "task_id": "turn-000c",
-  "source": "turn",
-  "session_id": "ses-7f3a9c2e51d04b6a",
+  "task_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "source": "run",
+  "session_id": null,
   "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-  "turn_id": "turn-000c",
+  "turn_id": null,
   "status": "completed",
-  "outcome": "waiting",
+  "outcome": null,
   "cancel_requested": "x-nobody-defined-this",
   "status_message": null,
   "pending_approval_ids": [],
-  "created_at": "2026-11-13T07:33:59.950Z",
-  "updated_at": "2026-11-13T07:35:02.512Z",
+  "created_at": null,
+  "updated_at": "2026-11-13T07:36:10.250Z",
   "expires_at": null,
   "poll_interval_ms": null,
   "result": {
     "code": null,
     "detail": "",
-    "result_ref": "result:turn-000c"
+    "result_ref": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7"
   }
 }

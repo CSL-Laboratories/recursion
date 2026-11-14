@@ -1012,6 +1012,11 @@
       "shows": "Who holds a run for now, in which daemon epoch, and until when."
     },
     {
+      "file": "good/common.v1/h60-the-last-second-of-a-minute.json",
+      "schema": "common.v1.json#/$defs/timestamp",
+      "shows": "The last second of a minute is 59, here in the last minute of a day."
+    },
+    {
       "file": "bad/common.v1/b01-cursor-negative-seq.json",
       "schema": "common.v1.json#/$defs/cursor",
       "rule": "seq is never below 0.",
@@ -1143,6 +1148,24 @@
       "rule": "A timestamp is a real moment: February has no 31st. The pattern cannot say so; the keyword x-instant does.",
       "expect": {
         "keyword": "x-instant",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/b61-a-second-of-sixty.json",
+      "schema": "common.v1.json#/$defs/timestamp",
+      "rule": "Seconds are 00 to 59. A :60 in an ordinary minute is not a moment, and it is never read as the first second of the next minute.",
+      "expect": {
+        "keyword": "pattern",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/common.v1/b62-a-leap-second.json",
+      "schema": "common.v1.json#/$defs/timestamp",
+      "rule": "The profile of these records supports no leap second: 23:59:60 on a day that had one (the last was Dec 31, 2016) is refused like any other :60.",
+      "expect": {
+        "keyword": "pattern",
         "at": ""
       }
     },
@@ -4314,7 +4337,7 @@
     {
       "file": "good/mcp.task.v1/h01-turn-working.json",
       "schema": "mcp.task.v1.json",
-      "shows": "A turn in progress. The Task is created when the first event of the turn was logged, and last changed at its latest state.changed: the times the core logged."
+      "shows": "A turn in progress. created_at is the time of the event that establishes the turn's creation: its first state.changed, seen as it was made (reason commit), in a log that is whole up to it. updated_at is the time of its latest state.changed. Both are times the core logged."
     },
     {
       "file": "good/mcp.task.v1/h02-turn-waiting-for-an-approval.json",
@@ -4364,12 +4387,12 @@
     {
       "file": "good/mcp.task.v1/h11-run-running.json",
       "schema": "mcp.task.v1.json",
-      "shows": "Work started with run.start and no session: the Task id is the run id, there is no session and no turn, and it does not expire. Its times are those of the run's own log, 'run:<run_id>'."
+      "shows": "Work started with run.start and no session: the Task id is the run id, there is no session and no turn, and it does not expire. Its times are those of the run's own log, 'run:<run_id>'. That log begins with a snapshot: the run already existed when logging began, so nothing retained establishes when it was created, and created_at is null. A snapshot is not a creation. updated_at is the time of the latest state.changed all the same."
     },
     {
       "file": "good/mcp.task.v1/h12-run-starting.json",
       "schema": "mcp.task.v1.json",
-      "shows": "A run that is being started: working. Its log holds one event so far, so both times are that event's."
+      "shows": "A run that is being started: working. Its log holds one event so far, a snapshot: updated_at is that event's time and created_at is null."
     },
     {
       "file": "good/mcp.task.v1/h13-run-waiting-for-an-approval.json",
@@ -4449,7 +4472,32 @@
     {
       "file": "good/mcp.task.v1/h28-run-with-a-gap-after-its-first-event.json",
       "schema": "mcp.task.v1.json",
-      "shows": "A gap later in the log does not hide the origin: the first event is the creation, and created_at is its time."
+      "shows": "A gap later in the log does not hide the origin: the run's first record is the commit that made it, nothing is missing before it, and created_at is its time."
+    },
+    {
+      "file": "good/mcp.task.v1/h29-run-whose-creation-the-log-saw.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A run made after logging began. Its first record is the commit that made it (reason commit, at position 1, nothing missing before it): that event establishes its creation, and created_at is its time."
+    },
+    {
+      "file": "good/mcp.task.v1/h30-run-first-seen-by-a-scan.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A run whose first record was found by a later scan (reason reconcile): earlier steps may be missing, so it does not establish the creation either. created_at is null."
+    },
+    {
+      "file": "good/mcp.task.v1/h31-turn-that-existed-when-logging-began.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A turn whose first record is a snapshot: it already existed when logging began. Position 1 and no gap before it say that nothing was dropped, not that the turn was made then. created_at is null."
+    },
+    {
+      "file": "good/mcp.task.v1/h32-turn-whose-first-event-is-not-its-first-record.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "The first events filed under this turn are the engine's acceptance and the turn's start; its record is first logged after them, as it was made. The creation is that first record, not the first event that names the turn."
+    },
+    {
+      "file": "good/mcp.task.v1/h33-turn-behind-a-gap-of-one-position.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "A gap that stands for one position: the numbers a reader sees have no hole, 1, 2, 3, and the event the gap stands for may have been this turn's first record. created_at is null."
     },
     {
       "file": "bad/mcp.task.v1/b01-completed-without-a-result.json",
@@ -4907,6 +4955,11 @@
       "shows": "Captured: the same for run.stop."
     },
     {
+      "file": "good/methods.v1/c20-plugin-list-with-no-plugin-host.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "Captured: plugin.list asked of the daemon's control object made with no plugin host: 'unavailable', with today's own words for it. This is plugin.list's legacy refusal; it is not a service that is starting."
+    },
+    {
       "file": "good/methods.v1/h01-session-turn-ok.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "A turn is accepted: the session after it, and the new turn."
@@ -5187,9 +5240,9 @@
       "shows": "A method that takes a command_id needs a receipt. This daemon was composed with no event store to keep one in: 'unsupported', store_absent, before any side effect."
     },
     {
-      "file": "good/methods.v1/h62-a-method-whose-service-is-still-starting.json",
+      "file": "good/methods.v1/h62-a-read-asked-of-a-daemon-that-is-closing.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "shows": "The service a method's row names is not ready yet: 'unavailable', service_starting. The caller may ask again."
+      "shows": "A method whose row names no service, asked of a daemon that is closing: 'unavailable', daemon_closing, the one reason every method can give. (Until its third read this fixture showed service_starting here. No row names a service, so no method can say that yet: see b36.)"
     },
     {
       "file": "good/methods.v1/h63-a-read-from-past-the-end-of-the-log.json",
@@ -5235,6 +5288,16 @@
       "file": "good/methods.v1/h71-a-status-asked-of-a-daemon-that-is-closing.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "And for run.status."
+    },
+    {
+      "file": "good/methods.v1/h72-plugin-list-asked-of-a-daemon-that-is-closing.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "plugin.list is refused by a closing daemon like every other method."
+    },
+    {
+      "file": "good/methods.v1/h73-interrupt-that-fell-back-to-a-stop-confirmed-at-once.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The interrupt fell back to Stop and the Stop was confirmed in the same call: the answer is ok, it carries the Stop's own answer, and the session is no longer live. Only a Stop that is still pending makes the answer pending."
     },
     {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",
@@ -5894,6 +5957,69 @@
       "expect": {
         "keyword": "enum",
         "at": "/answer/detail"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b36-a-service-starting-from-a-row-that-names-no-service.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "service_starting is the readiness of the service a row names. events.follow's row names none, so it can never say it.",
+      "expect": {
+        "keyword": "not",
+        "at": "/answer/detail"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b37-plugin-list-waiting-on-a-service.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "plugin.list names no service either: its 'unavailable' is the closing daemon or its own legacy refusal, no plugin host.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b38-a-pending-fallback-stop-answered-ok.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The interrupt fell back to Stop and the Stop is pending: the answer's code is pending. 'ok' would tell the caller the turn was dealt with.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b39-a-pending-fallback-stop-with-a-live-session.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The same Stop with a session that still says live: while a Stop is pending the session is stop_pending, and no resume is allowed until it is confirmed.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer/session/state"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b40-a-pending-answer-with-no-stop.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "'pending' is the answer of a pending fallback Stop and of nothing else: an interrupt that was delivered is not pending.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b41-a-pending-answer-whose-stop-is-confirmed.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "A pending answer that carries a confirmed Stop contradicts itself.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer/stop/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b42-a-stops-answer-on-an-interrupt-that-was-delivered.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "Only an interrupt that fell back to Stop carries a Stop's answer.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer/interrupt/outcome"
       }
     },
     {
@@ -6935,6 +7061,15 @@
       "file": "bad/methods.v1/m-methods.v1.answer.session.fork.anyOf.0.session.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "rule": "The object described at methods.v1.json#/$defs/answer.session.fork/anyOf/0 always carries 'session'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.session.interrupt.anyOf.0.allOf.0.then.stop.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.session.interrupt/anyOf/0/allOf/0/then always carries 'stop'.",
       "expect": {
         "keyword": "required",
         "at": "/answer"

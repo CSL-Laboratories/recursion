@@ -9,7 +9,7 @@
   "cancel_requested": false,
   "status_message": null,
   "pending_approval_ids": [],
-  "created_at": "2026-11-13T07:33:58.120Z",
+  "created_at": null,
   "updated_at": "2026-11-13T07:36:10.250Z",
   "expires_at": null,
   "poll_interval_ms": null,

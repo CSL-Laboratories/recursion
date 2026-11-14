@@ -24,6 +24,7 @@ at the instance location it names, so a fixture cannot be refused by accident fo
 """
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from contextlib import contextmanager
@@ -419,15 +420,10 @@ def _misfit(schemas: SchemaSet, ref: str, instance: Any) -> str | None:
     return f"{keyword} at {location or '/'}: {message[:160]}"
 
 
-def _unnormalised(value) -> bool:
-    """True when a value read for a call still holds a float whose value is integral."""
-    if type(value) is float:
-        return value.is_integer()
-    if isinstance(value, dict):
-        return any(_unnormalised(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_unnormalised(item) for item in value)
-    return False
+def _exact(value) -> str:
+    """A value as text that keeps what ``==`` in this language loses: 1 is not 1.0 and 0 is not -0.0. Two bound
+    values are the same only when this text is the same."""
+    return json.dumps(value, sort_keys=True)
 
 
 def events_in(value: Any) -> Iterator[dict]:
@@ -462,9 +458,9 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
         if text != expect["call_text"]:
             return f"the call's text is {text[:200]!r}, expected {expect['call_text'][:200]!r}"
         # The value that is bound is the value that is dispatched: every integral number is the whole number.
-        if _unnormalised(call["input"]):
+        if rules.unnormalised(call["input"]):
             return "the bound input holds a number that is not normalised (an integral float, or minus zero)"
-        if "input" in expect and (call["input"] != expect["input"] or rules.text_of(call["input"]) != rules.text_of(expect["input"])):
+        if "input" in expect and _exact(call["input"]) != _exact(expect["input"]):
             return "the bound input is not the vector's"
         # Closed under its own text: written as RFC 8785 writes it and read again, it is admitted with the same bytes.
         try:
@@ -502,9 +498,13 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
             misfit = _misfit(schemas, "approval.v1.json#/$defs/binding", binding)
             if misfit:
                 return f"the private binding does not fit approval.v1's: {misfit}"
+        # The model is made from the record as it is durable. The numbers of an engine's call are normalised as it
+        # is made, so the record every later step is compared with is the restored one. Records are compared
+        # EXACTLY: a whole number and a float of the same value are not the same record, nor are 0 and -0.0.
         model = rules.ApprovalModel(vector["record"], binding)
-        records = [("the starting record", vector["record"])]
+        records = [("the starting record, as the model restores it", copy.deepcopy(model.record))]
         for number, step in enumerate(vector["steps"], 1):
+            before = (_exact(model.record), _exact(model.binding))
             if "core" in step:
                 core = dict(step["core"])
                 happening = core.pop("happening")
@@ -522,6 +522,8 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
                     result = refusal.code
                 if result != step["result"]:
                     return f"step {number}: the rule gives '{result}', the vector says '{step['result']}'"
+                if result != "ok" and (_exact(model.record), _exact(model.binding)) != before:
+                    return f"step {number}: a refused step changed the record or the binding"
             else:
                 request = step["request"]
                 answer = model.call(step["principal"], request["method"], request["params"], step["at"])
@@ -530,8 +532,10 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
                 misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", dict(request, answer=answer))
                 if misfit:
                     return f"step {number}: the call and its answer do not fit the method table: {misfit}"
-            if model.record != step["record"]:
+            if _exact(model.record) != _exact(step["record"]):
                 return f"step {number}: the record after the step is not the vector's"
+            if _exact(model.binding) != _exact(binding):
+                return f"step {number}: the private binding changed; nothing a client or the core does here changes it"
             records.append((f"step {number}", step["record"]))
         for where, record in records:
             misfit = _misfit(schemas, "approval.v1.json", record)
@@ -580,14 +584,16 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
                     return f"step {number}: a write into a turn is a steer.sent event"
                 facts = {"delivery_id": event["payload"]["delivery_id"], "item_id": event["payload"]["item_id"],
                          "turn_id": event["turn_id"]}
-            before = json.dumps(model.item, sort_keys=True)
+            before = _exact([model.item, model.binding, model.written])
             try:
                 model.step(happening, facts)
             except rules.Refused as refusal:
                 if step.get("refused") != refusal.code:
                     return f"step {number}: refused as '{refusal.code}', the vector says {step.get('refused') or step.get('item')}"
-                if json.dumps(model.item, sort_keys=True) != before:
-                    return f"step {number}: a refused step changed the item"
+                # A refusal changes nothing: not the item, not its binding, not the record of the write. (A late
+                # acceptance that is refused is kept as evidence; the vector says so itself, and it is checked below.)
+                if _exact([model.item, model.binding, model.written]) != before:
+                    return f"step {number}: a refused step changed the item, its binding or the record of its write"
             else:
                 if "refused" in step:
                     return f"step {number}: taken, the vector says refused '{step['refused']}'"
@@ -653,13 +659,22 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
         answer = rules.cursor_answer(vector["cursor"], vector["log"], vector["epoch"])
         return None if answer == vector["expect"] else f"the rule answers {answer}, the vector says {vector['expect']}"
     if rule == "event.page":
-        # The cursor a read was asked with and the page it was answered: where the page is not the
-        # continuation of that cursor.
+        # The request a read was made with and the page it was answered: where the page is not the answer to
+        # that request (another projection than the one asked for), or not the continuation of its cursor.
+        # 'raw', where a vector of a transcript page carries it, is the raw page of the same read: a transcript
+        # page is made only from a raw page that is itself right, and the check is the producer's.
         exchange = {"method": vector["method"], "params": vector["params"], "answer": vector["page"]}
         misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", exchange)
         if misfit:
             return f"the request and its page do not fit the method table: {misfit}"
-        found = rules.page_problems(vector["params"]["cursor"], vector["page"])
+        if "raw" in vector:
+            asked_raw = dict(vector["params"], projection="raw")
+            misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", dict(exchange, params=asked_raw, answer=vector["raw"]))
+            if misfit:
+                return f"the raw page does not fit the method table: {misfit}"
+            found = rules.transcript_page_problems(vector["params"], vector["raw"], vector["page"])
+        else:
+            found = rules.page_problems(vector["params"], vector["page"])
         return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
     return f"no rule named {rule!r}"
 

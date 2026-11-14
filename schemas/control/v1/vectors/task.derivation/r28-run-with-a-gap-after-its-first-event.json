@@ -97,7 +97,7 @@
           }
         },
         "post_image_sha256": "45188083c94f8489455d91b854931294e567a663a33039b430b3ec933686d03a",
-        "reason": "snapshot",
+        "reason": "commit",
         "coalesced": null
       }
     },

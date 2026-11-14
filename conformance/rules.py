@@ -11,6 +11,7 @@ the product; a client in another language implements the same functions and chec
 What is here:
 
 * ``read_strict``: the strict reading of JSON text that came from an engine (the input of a tool call).
+* ``normalised`` and ``unnormalised``: the bound form of a number, for a value that is already held.
 * ``text_of``: the text of a value as RFC 8785 writes it; its UTF-8 bytes are what is hashed. With
   ``display`` on, the same text with the characters no terminal should be handed raw written as escapes.
 * ``call_of``, ``call_in`` and ``check_call``: what an engine supplied for one tool call (its tool, its
@@ -28,7 +29,8 @@ What is here:
 * ``ApprovalModel``: approval.open and approval.answer step by step, with replay; the deadline; a change
   of content; the single consumption of an approved effect.
 * ``start_intent_text``, ``start_key_of`` and ``start_retry``: the identity of a start request.
-* ``cursor_answer``, ``page_problems`` and ``gap_problem``: reading a log from a cursor.
+* ``cursor_answer``, ``page_problems``, ``transcript_page_problems`` and ``gap_problem``: reading a log
+  from a cursor, in the projection that was asked for.
 * ``post_image_digest`` and ``input_digest``: the digests an event carries.
 """
 from __future__ import annotations
@@ -75,10 +77,15 @@ def read_strict(text: str):
     other number is a finite binary64 (one that is not finite is ``number_out_of_range``). A quantity
     or an identifier that needs more than that is sent as a string.
 
+    Exact numeric range checks are independent of the host Decimal context and never escape as host
+    arithmetic exceptions. Every integral value outside the safe range, including 1e1000000, is refused
+    as integer_out_of_range.
+
     THE VALUE THAT IS BOUND IS THE VALUE THAT IS DISPATCHED. What this returns is normalised: a number
     whose value is integral is the whole number, so ``1.0`` is ``1`` and minus zero is ``0``. Writing an
     admitted value as RFC 8785 writes it and reading that text again gives an admitted value with the
-    same bytes.
+    same bytes. ``normalised`` and ``unnormalised`` state the same rule for a value that is already
+    held, and ``check_call`` refuses a held call that breaks it.
     """
     if not isinstance(text, str):
         raise Refused("not_json")
@@ -96,8 +103,11 @@ def read_strict(text: str):
             exact = decimal.Decimal(token)
         except decimal.InvalidOperation:        # an exponent beyond what an exact decimal holds
             exact = None
+        if exact is not None and not exact.is_finite():     # the same, where the host's context does not trap it
+            exact = None
         if exact is not None and exact == exact.to_integral_value():
-            if abs(exact) > MAX_INT:
+            # copy_abs, not abs(): abs() rounds in the host's Decimal context and raises its Overflow for 1e1000000.
+            if exact.copy_abs() > MAX_INT:
                 raise Refused("integer_out_of_range")
             return int(exact)
         value = float(token)
@@ -156,6 +166,39 @@ def check_value(value, depth: int = 0) -> None:
             check_value(item, depth + 1)
     else:
         raise Refused("not_a_json_value")
+
+
+def unnormalised(value) -> bool:
+    """True when a held value carries a number that is not in its bound form: a float whose value is
+    integral (``1.0``, where the bound value is the whole number ``1``) or minus zero (bound as ``0``).
+
+    The text RFC 8785 writes is the same for both spellings, so a digest cannot see the difference; a
+    dispatch can. In a language with one number type the first case does not exist and the second is
+    ``Object.is(x, -0)``.
+    """
+    if type(value) is float:
+        return value.is_integer()
+    if isinstance(value, dict):
+        return any(unnormalised(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(unnormalised(item) for item in value)
+    return False
+
+
+def normalised(value):
+    """The same value in its bound form: every float whose value is integral and inside the exact range is
+    the whole number, and so minus zero is ``0``. Nothing else is touched, and a value outside the profile
+    is left for ``check_value`` to refuse. This is what ``read_strict`` does to what it reads; a value that
+    reaches the core another way (a changed effect, a record read back from where it is durable) goes
+    through this before it is digested, drawn or carried out.
+    """
+    if type(value) is float and value.is_integer() and abs(value) <= MAX_INT:
+        return int(value)
+    if isinstance(value, dict):
+        return {key: normalised(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [normalised(item) for item in value]
+    return value
 
 
 # ------------------------------------------------------------------------------- the text of a value
@@ -262,6 +305,14 @@ def check_call(call) -> None:
     characters), the tool's input (an object) and the directory the call would run in (a string, or
     null when the engine does not say). Every value in it is one ``read_strict`` could have produced.
     The UTF-8 bytes of its text are at most ``CALL_MAX``: a larger call is refused, never cut.
+
+    Before creating, changing or restoring a bound engine-tool effect, normalize its numeric values
+    under this profile. Already-bound-effect validation and consumption must reject a nonnormalized
+    effect; successful call-text parsing is not the only enforcement boundary. Digesting, rendering and
+    dispatch use that same normalized value. This does not change csl-cj/v0 plugin effects or existing
+    signature formats. So a held call that carries an integral float or minus zero is refused here
+    (``not_normalised``): its text and its digest would be those of the normalised call, and what would
+    be dispatched would not.
     """
     if type(call) is not dict or set(call) != {"cwd", "input", "tool"} or type(call["input"]) is not dict:
         raise Refused("not_a_call")
@@ -271,6 +322,8 @@ def check_call(call) -> None:
     if cwd is not None and (not isinstance(cwd, str) or not cwd):
         raise Refused("cwd")
     check_value(call)
+    if unnormalised(call):
+        raise Refused("not_normalised")
     if len(text_of(call).encode("utf-8")) > CALL_MAX:
         raise Refused("too_large")
 
@@ -334,10 +387,14 @@ def effect_bytes(digest_form: str, effect) -> bytes:
 
     ``rfc8785/v1``: the UTF-8 bytes of ``text_of(effect)``, the whole effect, the core's own fields and
     the engine's call alike. ``csl-cj/v0``: ``canonical_v0(effect)``. A form that is not one of the two
-    is refused; a later form is a new name.
+    is refused; a later form is a new name. An effect of the first form that holds a number which is
+    not normalised has no bytes here (``not_normalised``): the digest is taken over the value that is
+    dispatched and over no other.
     """
     if digest_form == "rfc8785/v1":
         check_value(effect)
+        if unnormalised(effect):
+            raise Refused("not_normalised")
         return text_of(effect).encode("utf-8")
     if digest_form == "csl-cj/v0":
         return canonical_v0(effect)
@@ -412,10 +469,21 @@ def approval_lines(source: str, effect: dict) -> list:
     return lines
 
 
+# Every member of an effect is on a line, and nothing else is bound: so an effect has exactly these members.
+EFFECT_MEMBERS = {"engine_tool": {"kind", "engine", "session_id", "run_id", "tool", "cwd", "input"},
+                  "plugin_effect": {"schema", "kind", "plugin_id", "run_id", "connection", "scope", "currency", "amount_minor",
+                                    "payload"}}
+SCOPE_MEMBERS = {"account", "venue", "contract_family", "adapter", "environment"}
+
+
 def approval_problems(record: dict) -> list:
     """What does not agree inside one approval record; an empty list when everything does.
 
-    ``call``: the engine effect's call is not in its profile. ``digest_form``: the form is not the one
+    ``effect``: the effect does not have exactly the members of its source's effect (and, for a plugin's
+    effect, its scope exactly the five of a scope). A member more would be bound by the digest and shown
+    on no line; a member less has nothing to draw. ``call``: the engine effect's call is not in its
+    profile; that includes a call that holds a number which is not normalised (an integral float, minus
+    zero), and such a record has no digest and no lines either. ``digest_form``: the form is not the one
     the source uses. ``digest``: the digest is not the digest of the effect. ``rendered``: the lines are
     not the lines of the effect (an effect that cannot be drawn whole has no lines, so any lines are
     wrong). ``envelope``: the record's own run, or for an engine's call its session, is not the one its
@@ -424,6 +492,9 @@ def approval_problems(record: dict) -> list:
     """
     problems = []
     source, effect = record.get("source"), record.get("effect")
+    if (not isinstance(effect, dict) or set(effect) != EFFECT_MEMBERS.get(source)
+            or (source == "plugin_effect" and (not isinstance(effect["scope"], dict) or set(effect["scope"]) != SCOPE_MEMBERS))):
+        problems.append("effect")
     if source == "engine_tool":
         try:
             check_call(call_in(effect))
@@ -460,16 +531,25 @@ def milliseconds(timestamp: str) -> int:
     """A timestamp of these records as milliseconds since the start of 1970, or refuse.
 
     The pattern in the schemas takes any day from 01 to 31 in any month. A date that does not exist
-    (2026-02-31) is refused here, with ``timestamp``. A second of 60 is read as the minute's last
-    second plus one.
+    (2026-02-31) is refused here, with ``timestamp``.
+
+    The real-instant check validates the seconds spelling as well as the calendar date. A :60 spelling
+    is accepted only for an actual UTC leap second supported by the timestamp profile; it is not
+    normalized from an arbitrary minute into its successor. Otherwise it is refused as timestamp. THE
+    PROFILE OF THESE RECORDS SUPPORTS NO LEAP SECOND: seconds are 00 to 59, so every :60 is refused, on
+    a day that had a leap second as on any other. The check stands on its own: the hour is 00 to 23, the
+    minute and the second 00 to 59, and the text has exactly this shape, whatever a pattern said before.
     """
     try:
-        day, clock = timestamp[:-1].split("T")
-        year, month, date = (int(part) for part in day.split("-"))
-        hour, minute, rest = clock.split(":")
-        second, milli = rest.split(".")
+        # The exact spelling, digit for digit: the ten ASCII digits and no other character a language calls one.
+        if "".join("0" if ch in "0123456789" else ch for ch in timestamp) != "0000-00-00T00:00:00.000Z":
+            raise ValueError(timestamp)
+        year, month, date = int(timestamp[0:4]), int(timestamp[5:7]), int(timestamp[8:10])
+        hour, minute, second, milli = int(timestamp[11:13]), int(timestamp[14:16]), int(timestamp[17:19]), int(timestamp[20:23])
+        if hour > 23 or minute > 59 or second > 59:
+            raise ValueError(timestamp)
         days = datetime.date(year, month, date).toordinal() - datetime.date(1970, 1, 1).toordinal()
-        return ((days * 24 + int(hour)) * 60 + int(minute)) * 60000 + int(second) * 1000 + int(milli)
+        return ((days * 24 + hour) * 60 + minute) * 60000 + second * 1000 + milli
     except (ValueError, AttributeError, TypeError):
         raise Refused("timestamp") from None
 
@@ -543,6 +623,8 @@ def transcript_problems(events: list, lines: list) -> list:
 
 # ------------------------------------------------------------------------- the delivery of a queue item
 BINDING_KEYS = ("delivery_id", "item_id", "session_id", "run_id", "worker_incarnation", "target_turn_id", "how")
+# What a binding's 'how' may be for each 'delivery' an item can ask for.
+HOW_OF = {"next_turn": ("new_turn",), "steer": ("mid_turn", "new_turn")}
 
 
 class DeliveryModel:
@@ -557,11 +639,16 @@ class DeliveryModel:
     ``mid_turn``). Only this transition owns the write. Only a ``queued`` item can begin
     (``not_queued``), so seeing ``delivering``, retrying a callback or replaying a command never sends
     again. A binding that does not name this item and its log, or is not whole, is refused (``binding``).
+    So is one whose ``how`` the item's own ``delivery`` does not allow: a message for the next turn
+    (``next_turn``) is never written into the turn in progress, so its ``how`` is ``new_turn``; a
+    ``steer`` goes into the turn in progress (``mid_turn``) or, where the driver cannot take input in
+    the middle of a turn, begins the next one (``new_turn``).
 
     ``written`` (facts: delivery_id, and for a write into a turn in progress the turn). The write
     returned. It changes nothing in the item: a crash before the write and a crash after it leave the
     same ``delivering`` item. There is AT MOST ONE write for one binding: a second is refused
-    (``already_written``); one that names another delivery or another turn is ``delivery_mismatch``.
+    (``already_written``); one that names another delivery, another item or another turn, or names no
+    delivery at all, is ``delivery_mismatch``.
 
     ``accepted`` (facts: the acceptance as the engine's typed event carries it: delivery_id, session_id,
     run_id, turn_id, how). The core checks every one of them against the durable binding. All equal: the
@@ -569,16 +656,28 @@ class DeliveryModel:
     log, another run, another turn, the other ``how``) is ``delivery_mismatch`` and changes nothing.
     Nothing else makes an item ``delivered``.
 
-    ``restart`` (the daemon starts again) and ``turn_ended`` (facts: turn_id; the turn the input was
-    aimed into has ended): an item still ``delivering`` has no acceptance and becomes
-    ``outcome_unknown``. Its delivery outcome is unknown and the message may not have been sent; it is
-    not sent again by itself. An acceptance that only arrives after that is refused
+    ``restart`` (the daemon starts again): an item still ``delivering`` has no acceptance and becomes
+    ``outcome_unknown``, whichever ``how`` its binding says. Its delivery outcome is unknown and the
+    message may not have been sent; it is not sent again by itself.
+
+    ``turn_ended`` (facts: turn_id). A turn_ended notification carries the ended turn's identity. If an
+    item is still delivering and that identity equals its durable binding's target_turn_id, atomically
+    quarantine it as outcome_unknown and record the outcome-unknown event, for both new_turn and
+    mid_turn deliveries. Ending a different turn changes nothing. A subsequent acceptance is retained
+    as evidence and does not promote the quarantined item automatically. A notification that names no
+    turn is refused (``turn``) and changes nothing.
+
+    An acceptance that only arrives after the item became ``outcome_unknown`` is refused
     (``not_delivering``) and the item stays as it is, but the acceptance is KEPT, in ``evidence``, for
     a later reconciliation that proves the binding: it is never dropped and never promotes the item
     by itself.
 
     ``edit`` (facts: text and/or delivery) and ``cancel``: only while ``queued`` (``not_queued``); an
-    edit raises the revision.
+    edit raises the revision. The edited item is made as a whole and checked before it replaces the
+    item: an edit that names neither field, a text that is not text or is empty, and a delivery that is
+    not one of the two are refused (``edit``) and nothing changes, the revision included.
+
+    Every refusal leaves the item, the binding, the record of the write and the evidence as they were.
     """
 
     def __init__(self, item: dict) -> None:
@@ -594,7 +693,7 @@ class DeliveryModel:
             if state != "queued":
                 raise Refused("not_queued")
             if (set(facts) != set(BINDING_KEYS) or facts["item_id"] != item["item_id"]
-                    or facts["session_id"] != item["session_id"] or facts["how"] not in ("new_turn", "mid_turn")
+                    or facts["session_id"] != item["session_id"] or facts["how"] not in HOW_OF.get(item["delivery"], ())
                     or not all(isinstance(facts[key], str) and facts[key] for key in BINDING_KEYS)):
                 raise Refused("binding")
             self.binding, self.written = dict(facts), False
@@ -602,7 +701,7 @@ class DeliveryModel:
         elif happening == "written":
             if state != "delivering":
                 raise Refused("not_delivering")
-            if (facts["delivery_id"] != binding["delivery_id"] or facts.get("item_id", binding["item_id"]) != binding["item_id"]
+            if (facts.get("delivery_id") != binding["delivery_id"] or facts.get("item_id", binding["item_id"]) != binding["item_id"]
                     or facts.get("turn_id", binding["target_turn_id"]) != binding["target_turn_id"]):
                 raise Refused("delivery_mismatch")
             if self.written:
@@ -622,7 +721,10 @@ class DeliveryModel:
             if state == "delivering":
                 item.update(state="outcome_unknown")
         elif happening == "turn_ended":
-            if state == "delivering" and binding["how"] == "mid_turn" and facts["turn_id"] == binding["target_turn_id"]:
+            ended = facts.get("turn_id")
+            if not isinstance(ended, str) or not ended:
+                raise Refused("turn")
+            if state == "delivering" and ended == binding["target_turn_id"]:      # whichever 'how' the binding says
                 item.update(state="outcome_unknown")
         elif happening in ("edit", "cancel"):
             if state != "queued":
@@ -630,29 +732,50 @@ class DeliveryModel:
             if happening == "cancel":
                 item.update(state="cancelled")
             else:
-                item.update({key: facts[key] for key in ("text", "delivery") if key in facts}, revision=item["revision"] + 1)
+                changes = {key: facts[key] for key in ("text", "delivery") if key in facts}
+                if (not changes or not isinstance(changes.get("text", "text"), str) or not changes.get("text", "text")
+                        or not isinstance(changes.get("delivery", "steer"), str) or changes.get("delivery", "steer") not in HOW_OF):
+                    raise Refused("edit")
+                item.update(changes, revision=item["revision"] + 1)
         else:
             raise Refused("happening")
 
 
 # ----------------------------------------------------------------------------------------- the Task
 
-def _log_times(events: list, of_turn: str | None = None) -> tuple:
-    """created_at and updated_at as the core logged them: the time of the first event of the run or the
-    turn, and of its latest state.changed; null where the log holds none.
+def _log_times(events: list, entity_id: str, of_turn: str | None = None) -> tuple:
+    """created_at and updated_at of the Task of one entity (a run or a turn, named by its id: the ids of
+    the two kinds never coincide), from the log as it is retained: the time of the event that
+    establishes the entity's creation, and the time of the latest state.changed of the run or the turn;
+    each is null where the log holds no such event.
 
-    The origin is the ACTUAL creation event or nothing. ``events`` is the log as it is retained. When it
-    does not begin at the log's first position (a retained tail), or a replay.gap stands before the
-    first event of the run or the turn, that first event may not be the creation: a tail and a gap are
-    not a creation time, and created_at is null.
+    Task created_at comes from retained creation metadata or an event that establishes creation of that
+    entity. Position 1 and absence of an earlier replay.gap are retention checks, not proof of creation.
+    In particular, state.changed with reason snapshot describes an entity that already existed when
+    logging began and is not its creation event; reconcile likewise does not establish creation. If no
+    retained fact establishes the origin, created_at is null. updated_at may still use a later retained
+    state change.
+
+    THE EVENT THAT ESTABLISHES CREATION is the entity's FIRST state.changed in the log (its
+    ``entity_id`` names it) when its reason is ``commit``: the log saw the record as it was first made.
+    That event counts only where the log is whole up to it: the log begins at position 1, every
+    position up to the event is there, and no replay.gap stands before it, not even one that stands
+    for a single position. An event of another type filed under the run or the turn (an acceptance,
+    the turn's start, output) establishes nothing. No
+    record of this version carries creation metadata of its own in the timestamp form, so the log is
+    the only source here, and a Task whose origin the log does not establish says null.
     """
     mine = [event for event in events if of_turn is None or event.get("turn_id") == of_turn]
     changed = [event["time"] for event in mine if event["type"] == "state.changed"]
     created = None
-    if mine and events[0]["seq"] == 1:
-        before = events[:events.index(mine[0]) + 1]
-        if not any(event["type"] == "replay.gap" for event in before):
-            created = mine[0]["time"]
+    for position, event in enumerate(events, 1):
+        if event.get("seq") != position or event["type"] == "replay.gap":
+            break                       # a retained tail, a hole, or a gap: whatever follows proves no origin
+        payload = event["payload"]
+        if event["type"] == "state.changed" and payload.get("entity_id") == entity_id:
+            if payload.get("reason") == "commit":
+                created = event["time"]
+            break                       # the first image decides: a snapshot or a reconcile is not a creation
     return created, (changed[-1] if changed else None)
 
 
@@ -676,7 +799,7 @@ def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) 
     ``lost_reboot``. A Task of a run has no turn outcome and does not expire.
     """
     state, run_id, result = view["state"], view["run_id"], view.get("result")
-    created_at, updated_at = _log_times(list(events))
+    created_at, updated_at = _log_times(list(events), run_id)
     task = {"task_id": run_id, "source": "run", "session_id": None, "run_id": run_id, "turn_id": None,
             "outcome": None, "cancel_requested": False, "pending_approval_ids": [], "expires_at": None,
             "created_at": created_at, "updated_at": updated_at, "result": None}
@@ -720,7 +843,7 @@ def task_of_turn(session: dict, turn_id: str, events: list = (), pending_approva
     turn = next((item for item in session["turns"] if item["turn_id"] == turn_id), None)
     if turn is None:
         raise Refused("turn_unknown")
-    created_at, updated_at = _log_times(list(events), of_turn=turn_id)
+    created_at, updated_at = _log_times(list(events), turn_id, of_turn=turn_id)
     live = turn["state"] in ("queued", "running")
     status = {"queued": "working", "running": "working", "ended": "completed", "failed": "failed",
               "interrupted": "cancelled", "stopped": "cancelled"}[turn["state"]]
@@ -740,6 +863,10 @@ def task_problems(wanted: dict, task: dict) -> list:
 
 
 # ------------------------------------------------------------------- approval.open and approval.answer
+# The members of an effect that say WHOSE effect it is and what it is bound to. A change of content keeps them.
+TARGET_MEMBERS = {"engine_tool": ("kind", "engine", "session_id", "run_id"), "plugin_effect": ("schema", "plugin_id", "run_id")}
+
+
 class ApprovalModel:
     """One approval request, and everything that can happen to it, one happening at a time.
 
@@ -752,7 +879,9 @@ class ApprovalModel:
 
     ``call(principal, method, params, at)`` is approval.open or approval.answer; ``at`` is the server's
     current time. The order of checks for approval.answer: the caller is an owner or a device (else
-    scope_refused); the same command id with the same params returns the first answer, and with other
+    scope_refused); a request that lacks a field, or whose answer is neither 'approve' nor 'deny', is
+    'request_invalid' naming the field, keeps no receipt and changes nothing; the same command id with
+    the same params returns the first answer, and with other
     params is 'conflict' (command_id_reused): such a replay is HISTORICAL, it reports what was answered
     and never carries an effect out again; then, before a fresh answer is taken, the current time is
     compared with expires_at under the same serialisation as the request's state: at or after the
@@ -764,14 +893,44 @@ class ApprovalModel:
 
     ``change(effect=..., expires_at=...)`` is the core changing the content of a pending request: the
     digest and the lines are made again from the effect and the revision rises by one. Refused
-    (``resolved``) once the request is no longer pending.
+    (``resolved``) once the request is no longer pending. Build a proposed approval revision in a
+    separate candidate. Validate the complete candidate's shape, canonical digest, rendered lines and
+    envelope/effect identity before committing it. A failure is a typed refusal and leaves the prior
+    record, revision and binding unchanged. Only a valid candidate replaces the pending record. Changing
+    content is not permission to change the target through an inconsistent envelope. The refusals:
+    ``nothing_to_change`` (neither an effect nor a deadline); ``effect`` (not an effect of the request's
+    source, or one with a member more or less than such an effect has); ``target`` (the new effect is bound to another run, session or engine, or comes from
+    another plugin, than the effect it replaces); ``timestamp`` (a deadline that is not a real instant);
+    the renderer's own code for an effect that cannot be drawn whole (``too_many_lines``, ``too_large``
+    and the like); and, for whatever else does not agree inside the candidate, the first word
+    ``approval_problems`` gives for it. The numbers of an engine's call are normalised in the candidate
+    before it is digested and drawn.
 
     ``consume(revision, digest, binding)`` is the core carrying the effect out. It consumes exactly the
     approved ``(approval_id, revision, digest)`` and the private engine binding the daemon keeps for
     it, ONCE: 'approved' becomes 'consumed'. Anything else is refused and changes nothing:
     ``not_approved`` (pending, denied, expired, vetoed), ``already_consumed``, ``approval_mismatch``
-    (another revision or digest), ``binding_mismatch`` (not the binding kept for this approval). A
-    cached successful answer never authorises another revision or another dispatch.
+    (another revision or digest), ``binding_mismatch`` (not the binding kept for this approval, or a
+    binding that does not name this approval's own target), ``record_invalid`` (the record does not
+    agree with itself: see below). A cached successful answer never authorises another revision or
+    another dispatch.
+
+    THE BINDING. For an engine-tool approval, the private binding's approval_id, run_id and engine must
+    equal the approved record's approval_id, the record/effect run_id, and the effect's engine. These
+    equalities are checked after recovery as well as on first consumption. A mismatch returns
+    binding_mismatch and changes neither approval state nor consumption state. Equality with an
+    internally retained binding object alone is insufficient. Consumption still requires the exact
+    approved revision and digest and occurs at most once. A PLUGIN'S EFFECT has no pending request of
+    an engine, so the daemon keeps no binding for it and none is offered: it is consumed once against
+    its approval, revision and digest, and a binding kept or offered for it is ``binding_mismatch``.
+
+    WHAT IS CARRIED OUT IS A RECORD THAT AGREES WITH ITSELF. A model is made from a record (a new
+    request, or one read back from where it is durable), and the numbers of an engine's call are
+    normalised as it is made, so 1.0 written by another serialiser is the whole number again and minus
+    zero is zero before anything is digested, drawn or carried out. Consumption checks the whole record
+    once more (``approval_problems``) and refuses one that holds a number which is not normalised, or
+    whose digest, lines or envelope are not its effect's (``record_invalid``): successful parsing of a
+    call's text is not the only boundary.
 
     ``binding`` and ``receipts`` are durable beside the record: a model made again from the three (a
     restart) answers and consumes exactly as the first would have.
@@ -779,12 +938,28 @@ class ApprovalModel:
 
     def __init__(self, record: dict, binding: dict | None = None, receipts: dict | None = None) -> None:
         self.record = copy.deepcopy(record)
+        if self.record.get("source") == "engine_tool" and isinstance(self.record.get("effect"), dict):
+            self.record["effect"] = normalised(self.record["effect"])       # creating or restoring: the bound form
         self.binding = copy.deepcopy(binding)
         self.receipts: dict = dict(receipts or {})
 
+    _NEEDS = {"approval.open": ("command_id", "approval_id", "surface"),
+              "approval.answer": ("command_id", "approval_id", "surface", "expected_revision", "digest", "answer")}
+
     def call(self, principal: dict, method: str, params: dict, at: str) -> dict:
-        if principal.get("kind") not in ("owner", "device"):
+        if method not in self._NEEDS:
+            raise Refused("method")
+        milliseconds(at)                    # the server's own clock; a time that is not a moment is refused whole
+        if (not isinstance(principal, dict) or principal.get("kind") not in ("owner", "device")
+                or not isinstance(principal.get("id"), str) or not principal["id"]):
             return {"code": "scope_refused", "detail": "approve"}
+        # A request that is not whole is refused before any receipt is looked up or kept, and changes nothing. An
+        # answer is 'approve' or 'deny' and nothing else: no other word is ever read as either.
+        for field in self._NEEDS[method]:
+            value = params.get(field) if isinstance(params, dict) else None
+            whole = (type(value) is int and value >= 1) if field == "expected_revision" else (isinstance(value, str) and bool(value))
+            if not whole or (field == "answer" and value not in ("approve", "deny")):
+                return {"code": "request_invalid", "detail": field}
         receipt_key = (method, params.get("command_id"))
         payload = text_of({key: value for key, value in params.items() if key != "command_id"})
         if receipt_key in self.receipts:
@@ -831,12 +1006,30 @@ class ApprovalModel:
         record = self.record
         if record["state"] != "pending":
             raise Refused("resolved")
+        if effect is None and expires_at is None:
+            raise Refused("nothing_to_change")
+        candidate = copy.deepcopy(record)           # nothing below touches the record until the candidate is whole
+        source = record["source"]
         if effect is not None:
-            lines = approval_lines(record["source"], effect)       # refused here, nothing is changed
-            record.update(effect=copy.deepcopy(effect), digest=digest_of(record["source"], effect), rendered=lines)
+            if not isinstance(effect, dict):
+                raise Refused("effect")
+            new = normalised(copy.deepcopy(effect)) if source == "engine_tool" else copy.deepcopy(effect)
+            # The target is not content: what the core itself put in the effect stays what it was.
+            if any(new.get(member) != record["effect"].get(member) for member in TARGET_MEMBERS.get(source, ())):
+                raise Refused("target")
+            try:
+                lines = approval_lines(source, new)             # the renderer's own refusal, by its code
+                candidate.update(effect=new, digest=digest_of(source, new), rendered=lines)
+            except (KeyError, TypeError):
+                raise Refused("effect") from None
         if expires_at is not None:
-            record["expires_at"] = expires_at
-        record["revision"] += 1
+            milliseconds(expires_at)                            # 'timestamp' for a deadline that is not a moment
+            candidate["expires_at"] = expires_at
+        candidate["revision"] = record["revision"] + 1
+        problems = approval_problems(candidate)
+        if problems:
+            raise Refused(problems[0])
+        self.record = candidate
 
     def consume(self, revision: int, digest: str, binding: dict | None) -> None:
         record = self.record
@@ -844,10 +1037,21 @@ class ApprovalModel:
             raise Refused("already_consumed")
         if record["state"] != "approved":
             raise Refused("not_approved")
+        if approval_problems(record):
+            raise Refused("record_invalid")
         if (revision, digest) != (record["revision"], record["digest"]):
             raise Refused("approval_mismatch")
-        if self.binding is None or binding != self.binding or binding.get("approval_id") != record["approval_id"]:
-            raise Refused("binding_mismatch")
+        if record["source"] == "engine_tool":
+            kept, effect = self.binding, record["effect"]
+            # The binding kept, the binding offered, and each identity member against the approval itself. (The
+            # record's own run is its effect's: a record where they differ was refused just above.)
+            if (not isinstance(kept, dict) or binding != kept
+                    or binding.get("approval_id") != record["approval_id"]
+                    or binding.get("run_id") != effect["run_id"]
+                    or binding.get("engine") != effect["engine"]):
+                raise Refused("binding_mismatch")
+        elif self.binding is not None or binding is not None:
+            raise Refused("binding_mismatch")       # a plugin's effect has no engine request to bind
         record["state"] = "consumed"
 
 
@@ -941,11 +1145,22 @@ def gap_problem(event: dict) -> bool:
     return not (1 <= payload["from"] <= payload["to"] == event["seq"])
 
 
-def page_problems(cursor: dict, page: dict) -> list:
-    """Where an answered page is not the continuation of the cursor it was asked with; empty when it is.
+PROJECTION_DEFAULT = "raw"      # what a read that names no projection asks for: the events as they were logged
 
-    ``cursor`` is the request's; ``page`` is the 'ok' answer of events.read or events.follow. The
-    cursor's session_id names the one log asked for. Every event or line returned belongs to it
+
+def page_problems(params: dict, page: dict) -> list:
+    """Where an answered page is not the answer to the request it was asked with; empty when it is.
+
+    ``params`` is the request's (its ``cursor``, and its ``projection`` when it names one); ``page`` is
+    the 'ok' answer of events.read or events.follow.
+
+    A successful events.read or events.follow response uses the projection explicitly requested by the
+    caller. Validate that equality before checking the returned page. When projection is omitted, the
+    method must document one default and test it. The default is ``raw`` (``PROJECTION_DEFAULT``). A
+    page in another projection than the one asked for is ``projection``, and nothing else is looked at:
+    it is not the answer to this request.
+
+    The cursor's session_id names the one log asked for. Every event or line returned belongs to it
     (``log``). Only positions strictly after ``cursor.seq`` are returned, in order, and none is skipped:
     each position is an event or a line of its own, or lies inside a replay.gap that starts at the next
     missing position and whose own seq is the last position it stands for (``order``; ``gap`` for a
@@ -953,7 +1168,13 @@ def page_problems(cursor: dict, page: dict) -> list:
     The answer's cursor is the last position represented, or the request's own position for an empty
     page, and its log never changes (``cursor``). Its epoch is the request's or a later one, and
     ``epoch_advanced`` says exactly whether it is later (``epoch``).
+
+    A transcript line carries neither its log nor the first position of a gap, so a page of lines can
+    only be checked for order here. ``transcript_page_problems`` is the producer's side of it.
     """
+    cursor = params["cursor"]
+    if page["projection"] != params.get("projection", PROJECTION_DEFAULT):
+        return ["projection"]
     problems = []
     raw = page["projection"] == "raw"
     items = page["events"] if raw else page["lines"]
@@ -979,6 +1200,35 @@ def page_problems(cursor: dict, page: dict) -> list:
     if answered["epoch"] < cursor["epoch"] or page["epoch_advanced"] != (answered["epoch"] > cursor["epoch"]):
         problems.append("epoch")
     return problems
+
+
+def transcript_page_problems(params: dict, raw_page: dict, page: dict) -> list:
+    """Where a transcript page is not the projection of the raw page it was made from; empty when it is.
+
+    A transcript page is produced only from a raw page whose log identity, sequence continuity and gap
+    bounds have already been validated. A transcript line's missing log and gap-start fields do not
+    waive those producer checks.
+
+    ``params`` is the request's, and it asks for the transcript; ``raw_page`` is the raw page of the
+    same read (the same cursor, asked raw); ``page`` is the transcript page given for it. ``source``:
+    the raw page is not itself a right answer to that cursor (``page_problems`` finds something in it:
+    an event of another log, a position skipped, a gap that does not start at the next missing position
+    or carries the wrong seq), so no transcript page may be made from it. ``lines``: there is not one
+    line for each event of the raw page, in order, with the event's seq and type. ``envelope``: the
+    transcript page's cursor, ``more`` or ``epoch_advanced`` is not the raw page's. Then whatever
+    ``page_problems`` finds in the transcript page itself.
+    """
+    asked_raw = dict(params, projection="raw")
+    if raw_page.get("projection") != "raw" or page_problems(asked_raw, raw_page):
+        return ["source"]
+    problems = []
+    lines, events = page.get("lines"), raw_page["events"]
+    if (not isinstance(lines, list) or len(lines) != len(events)
+            or any(line.get("seq") != event["seq"] or line.get("event_type") != event["type"] for line, event in zip(lines, events))):
+        problems.append("lines")
+    if any(page.get(member) != raw_page.get(member) for member in ("cursor", "more", "epoch_advanced")):
+        problems.append("envelope")
+    return problems + [found for found in page_problems(params, page) if found not in problems]
 
 
 # ------------------------------------------------------------------------ digests an event carries

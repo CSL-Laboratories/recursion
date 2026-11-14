@@ -86,7 +86,8 @@ run's environment changes:
   untouched; `/login` is the engine's. If the user's settings carry an `apiKeyHelper` (reported by the
   surface as `route.api_key_helper`; this adapter never opens settings), the result is
   `route_choice_required`: the run would bill their API key, and they pick (`billing_ack`, the API-key
-  route, or cancel). Not reported is the same question.
+  route, or cancel). Not reported is the same question, and the same answer, `billing_ack: "api_key_helper"`,
+  runs it (R3-13 part 1: the question offered that answer and the adapter then refused it).
 - `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
   (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
   `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.
@@ -128,6 +129,9 @@ end. `route.limits` or the service default sets `on_limit`: `ask` (default:
 nothing else runs), `wait` (nothing else runs; re-submit at `reset_at`) or `fallback` (the user's own
 `fallback` routes in the user's order, each switch shown as a `fallback` event and `switched_to`).
 Every attempt shares the request's one deadline. Nothing picks a route by itself; `fallback` with an empty list is refused.
+A fallback route may carry the keys a primary route's adapter reads, `wrapper` (the Pi and Hermes launcher
+pin) among them (R3-13 part 2); `subscription_routes` still refuses a wrapper that is not a measured pin
+when the route is launched. Any other key is `request_invalid`.
 
 Lesson: [CSL-608](https://linear.app/csl-laboratories/issue/CSL-608) (Done research) found master's breaker
 keyed by engine, shared by every tenant and never reset. This module does not claim to have measured

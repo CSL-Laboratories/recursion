@@ -61,9 +61,10 @@ API_KEY_HELPER_STATES = ("absent", "present")
 # Passthrough route (refused before launch until credential custody exists: PASSTHROUGH_REFUSED below; these
 # tables are the rules passthrough_env keeps for that day): the method the user picked gets its own variables
 # for this run, and nothing else from the daemon's environment (no other engine's key, no stray
-# ANTHROPIC_API_KEY that would move the run to the API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude Code's public docs (code.claude.com/docs/en/
-# amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway; retrieved 2026-11-09), not from engine
-# source. A method not listed here is refused, never widened to the whole environment.
+# ANTHROPIC_API_KEY that would move the run to the API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude
+# Code's public docs (code.claude.com/docs/en/amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway;
+# retrieved 2026-11-09), not from engine source. A method not listed here is refused, never widened to the whole
+# environment.
 PASSTHROUGH_METHOD_ENV = {
     "bedrock": ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_CONFIG_FILE",
@@ -194,14 +195,15 @@ class ClaudeCodeAdapter(RouteAdapter):
         The surface reports whether the user's settings carry one (``route.api_key_helper``); this adapter
         never opens the settings. Present, or not reported, is a typed question, not a silent override.
         The user answers with ``route.billing_ack = "api_key_helper"`` (run anyway, billing their API key)
-        or by picking the API-key route.
+        or by picking the API-key route. The question offers that answer in both cases, so it works in both
+        (R3-13 part 1): an acknowledgment given while the state was not reported runs the route too.
         """
         state = route.get("api_key_helper")
         if state is not None and state not in API_KEY_HELPER_STATES:
             raise c.RouteError(c.REQUEST_INVALID, "route.api_key_helper")
         if state == "absent":
             return
-        if state == "present" and route.get("billing_ack") == "api_key_helper":
+        if route.get("billing_ack") == "api_key_helper":
             return
         if state == "present":
             why = ("your Claude Code settings carry an apiKeyHelper, which outranks the sign-in: "

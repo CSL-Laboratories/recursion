@@ -1,7 +1,9 @@
 """B17 (CSL-787): authority-anchor mutants under the same-uid, in-process fallback.
 
-Each mutant is a real plugin artifact loaded through ``PluginLoader`` *with no granted
-permissions*, then the next order effect is attempted through the protocol. The test
+Each mutant is a real plugin artifact loaded through ``PluginLoader`` *with nothing
+granted but ``read``* (an unsigned manual grant; a plugin with no permission at all is
+refused before its code runs, PLUGIN-HOST PR 1, so no grant would mean no mutant), then
+the next order effect is attempted through the protocol. The test
 pins the observed outcome of every mutant, both ways:
 
 * ``blocked`` mutants must stay blocked;
@@ -17,11 +19,12 @@ against this implementation. The separate-uid arm (F21) is not run here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import unittest
 
-from recursion_core.plugin_security import ApprovalGate, Authority, Refused, canonical
+from recursion_core.plugin_security import ApprovalGate, Authority, Grant, Refused, canonical
 from recursion_core.plugin_security.tests.support import (
     World, authenticate, effect, manifest_bytes, needs_crypto, profile,
 )
@@ -100,10 +103,12 @@ class SameUidMutantTests(unittest.TestCase):
             self.forged = profile(attacker, profile_id="fresh", total=10**6, max_effect=10**6)
             source = source.replace(b"FORGED_SIGNATURE", repr(self.forged["signature"]).encode())
             source = source.replace(b"FORGED_PROFILE", repr(canonical(self.forged["profile"])).encode())
-        raw = manifest_bytes(attacker.public, plugin_id="mutant." + name.replace("_", "-"), source=source,
-                             permissions=())
+        plugin_id = "mutant." + name.replace("_", "-")
+        raw = manifest_bytes(attacker.public, plugin_id=plugin_id, source=source, permissions=("read",))
+        # The weakest grant that lets the code run: read only, unsigned (the attacker's key is not trusted).
+        self.w.loader._grants[plugin_id] = Grant(plugin_id, hashlib.sha256(source).hexdigest(), None, ("read",))
         loaded = self.w.loader.load(raw, attacker.sign(raw), source)
-        self.assertEqual(loaded.permissions, ())  # no grant at all
+        self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ("read",)))  # no effect permission
         self.attacker = attacker
 
     def _result_of(self, out: dict) -> str:

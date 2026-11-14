@@ -15,7 +15,8 @@ from unittest.mock import patch
 from recursion_core.routes import contract as c
 from recursion_core.routes import limits as lim
 from recursion_core.routes.breaker import ConnectionBreaker
-from recursion_core.routes.claude_code import ClaudeCodeAdapter, SUBSCRIPTION_DROP_ENV
+from recursion_core.routes.claude_code import (PASSTHROUGH_REFUSED, SUBSCRIPTION_DROP_ENV, ClaudeCodeAdapter,
+                                               passthrough_env)
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import (HANG, FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok,
@@ -147,10 +148,10 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
             req["route"]["connection"]["key_source"] = "api_key_helper"
             self.assertEqual(Harness([]).handle(req)["code"], c.REQUEST_INVALID, (engine, kind))
 
-    @runs_adapter
     def test_cloud_methods_pass_only_their_own_variables(self) -> None:
-        # The picked method's variables pass through unchanged for this run; the daemon's other secrets
-        # (another engine's key, a stray ANTHROPIC_API_KEY that would bill the API) never reach it.
+        # The picked method's variables pass through unchanged; the daemon's other secrets (another engine's
+        # key, a stray ANTHROPIC_API_KEY that would bill the API) never do. These are passthrough_env's rules,
+        # which no launch reaches while every passthrough route is refused (A2, A8; test_r3_finding_8).
         parent = dict(PARENT, AWS_SECRET_ACCESS_KEY="aws-s", AWS_PROFILE="p", CLOUD_ML_REGION="us-east5",
                       ANTHROPIC_VERTEX_PROJECT_ID="proj", VERTEX_REGION_CLAUDE_HAIKU_4_5="eu",
                       ANTHROPIC_FOUNDRY_RESOURCE="res", ANTHROPIC_BASE_URL="https://gw.example", DAEMON_SECRET="d")
@@ -165,17 +166,15 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         base = {"PATH": "/usr/bin", "HOME": "/home/op", "LANG": "C.UTF-8",
                 "CLAUDE_CODE_OAUTH_TOKEN": "users-own-token", "CLAUDE_CONFIG_DIR": "/home/op/.claude-alt"}
         for method, own in expected.items():
-            h = Harness([claude_ok()])
-            h.service._adapters["claude_code"]._parent_env = dict(parent)
-            req = request(kind="passthrough", conn_id=f"user-{method}")
-            req["route"]["connection"]["method"] = method
-            self.assertEqual(h.handle(req)["status"], "ok", method)
-            env = h.launcher.calls[0]["env"]
-            self.assertEqual(env, {**base, **own}, method)  # this run: the method's own names, values unchanged
+            env = passthrough_env(dict(parent), method)
+            self.assertEqual(env, {**base, **own}, method)  # the method's own names, values unchanged
             for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "DAEMON_SECRET"):
                 self.assertNotIn(name, env, (method, name))
 
     def test_unlisted_passthrough_method_refuses_before_launch(self) -> None:
+        with self.assertRaises(c.RouteError) as caught:
+            passthrough_env(dict(PARENT), "some-other-builtin")
+        self.assertEqual(caught.exception.code, c.LAUNCH_REFUSED)
         h = Harness([])
         req = request(kind="passthrough", conn_id="user-x")
         req["route"]["connection"]["method"] = "some-other-builtin"
@@ -193,50 +192,37 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         for method, names in cases.items():
             for name in names:
                 for value in (None, "", "0", "false"):
-                    h = Harness([claude_ok()])
                     env = dict(parent)
                     if value is None:
                         env.pop(name)
                     else:
                         env[name] = value
-                    h.service._adapters["claude_code"]._parent_env = env
-                    req = request(kind="passthrough", conn_id=f"user-{method}")
-                    req["route"]["connection"]["method"] = method
-                    res = h.handle(req)
-                    self.assertEqual(res["code"], c.LAUNCH_REFUSED, (method, name, value))
-                    self.assertEqual(h.launcher.calls, [], (method, name, value))
+                    with self.assertRaises(c.RouteError, msg=(method, name, value)) as caught:
+                        passthrough_env(env, method)
+                    self.assertEqual(caught.exception.code, c.LAUNCH_REFUSED, (method, name, value))
 
-    @runs_adapter
     def test_passthrough_switch_must_be_clearly_on(self) -> None:
         # Bot review 4511550474 at 09d0c36f: a denylist of off values let "off" or "no" through, which claude
         # reads as off, so the run billed the sign-in under a cloud label. The switch is now an allowlist.
         for method, name in (("bedrock", "CLAUDE_CODE_USE_BEDROCK"), ("vertex", "CLAUDE_CODE_USE_VERTEX"),
                              ("foundry", "CLAUDE_CODE_USE_FOUNDRY")):
-            for value, launches in (("off", False), ("no", False), ("disabled", False), ("2", False),
-                                    ("1", True), ("true", True), (" Yes ", True), ("ON", True)):
-                h = Harness([claude_ok()])
-                h.service._adapters["claude_code"]._parent_env = dict(PARENT, **{name: value})
-                req = request(kind="passthrough", conn_id=f"user-{method}")
-                req["route"]["connection"]["method"] = method
-                res = h.handle(req)
-                self.assertEqual(res["code"] != c.LAUNCH_REFUSED, launches, (method, value, res["code"]))
-                self.assertEqual(bool(h.launcher.calls), launches, (method, value))
-                if launches:
-                    # The child sees the canonical spelling, not the padded or capitalised parent value.
-                    self.assertEqual(h.launcher.calls[0]["env"][name], value.strip().lower())
+            for value, on in (("off", False), ("no", False), ("disabled", False), ("2", False),
+                              ("1", True), ("true", True), (" Yes ", True), ("ON", True)):
+                parent = dict(PARENT, **{name: value})
+                if not on:
+                    with self.assertRaises(c.RouteError, msg=(method, value)) as caught:
+                        passthrough_env(parent, method)
+                    self.assertEqual(caught.exception.code, c.LAUNCH_REFUSED, (method, value))
+                    continue
+                # The child would see the canonical spelling, not the padded or capitalised parent value.
+                self.assertEqual(passthrough_env(parent, method)[name], value.strip().lower(), (method, value))
 
-    @runs_adapter
     def test_bedrock_passthrough_keeps_the_web_identity_role(self) -> None:
         # Bot review 4511222552 at 92a897b3: an AWS web-identity role (EKS IRSA) lost its two variables.
-        h = Harness([claude_ok()])
-        h.service._adapters["claude_code"]._parent_env = dict(
+        env = passthrough_env(dict(
             PARENT, AWS_ROLE_ARN="arn:aws:iam::123456789012:role/bedrock",
             AWS_WEB_IDENTITY_TOKEN_FILE="/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
-            AWS_ROLE_SESSION_NAME="recursion")
-        req = request(kind="passthrough", conn_id="user-bedrock")
-        req["route"]["connection"]["method"] = "bedrock"
-        h.handle(req)
-        env = h.launcher.calls[0]["env"]
+            AWS_ROLE_SESSION_NAME="recursion"), "bedrock")
         for name in ("AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_SESSION_NAME"):
             self.assertIn(name, env)
         for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
@@ -248,25 +234,29 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         req["route"]["connection"]["method"] = "x"
         self.assertEqual(Harness([]).handle(req)["code"], c.REQUEST_INVALID)
 
-    @runs_adapter
     def test_bare_is_the_users_choice_on_passthrough(self) -> None:
-        h = Harness([claude_ok()])
+        # --bare is refused only on the subscription route; a passthrough route's argv keeps the user's choice.
+        # (The route itself is refused at env() until credential custody exists: test_r3_finding_8.)
         req = request(kind="passthrough", bare=True)
         req["route"]["connection"]["method"] = "bedrock"
-        self.assertEqual(h.handle(req)["status"], "ok")
-        self.assertEqual(h.launcher.calls[0]["argv"][:2], ["claude", "--bare"])
-        self.assertEqual(h.launcher.calls[0]["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
+        adapter = Harness([]).service._adapters["claude_code"]
+        self.assertEqual(adapter.argv(c.validate_request(req))[:2], ["claude", "--bare"])
+        self.assertEqual(passthrough_env(dict(PARENT), "bedrock")["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
 
     @runs_adapter
     def test_oauth_token_kept_on_every_route_and_parent_env_never_changed(self) -> None:
         before = dict(PARENT)
-        h = Harness([claude_ok(), claude_ok(), claude_ok(), claude_ok()])
+        h = Harness([claude_ok(), claude_ok(), claude_ok()])
         reqs = [request(rid="s"), request(rid="k", kind="api_key", conn_id="key-2", credential_env="ANTHROPIC_API_KEY"),
                 request(rid="h", kind="api_key", conn_id="helper"), request(rid="p", kind="passthrough")]
         reqs[2]["route"]["connection"]["key_source"] = "api_key_helper"
         reqs[3]["route"]["connection"]["method"] = "vertex"
-        for req in reqs:
+        for req in reqs[:3]:
             self.assertEqual(h.handle(req)["status"], "ok", req["request_id"])
+        # The passthrough route is refused before launch (A2, A8); its method rules still keep the sign-in.
+        self.assertEqual(h.handle(reqs[3])["detail"], PASSTHROUGH_REFUSED)
+        self.assertEqual(len(h.launcher.calls), 3)
+        self.assertEqual(passthrough_env(dict(PARENT), "vertex")["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
         for call in h.launcher.calls:
             self.assertEqual(call["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
         self.assertEqual(PARENT, before)

@@ -91,7 +91,15 @@ run's environment changes:
   (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
   `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.
 - `passthrough` (a cloud provider or gateway the user picks, `connection.method`: `bedrock`, `vertex`,
-  `foundry` or `gateway`): that method's own variables (names from Claude Code's public docs) pass through
+  `foundry` or `gateway`): refused before launch, by this adapter, for every method: `launch_refused`,
+  `no credential custody: a passthrough route is not launched`, the daemon's own words (Lucas, Nov 12,
+  decision sheet A2: "The daemon refuses routes with key_source: api_key_helper and cloud passthrough
+  routes until credential custody is built"; A8: the gateway method stays refused with the cloud ones;
+  R3-8). `env()` refuses before it reads a variable, so no caller of the adapter launches one. The method
+  rules below are kept in `passthrough_env()`, which no launch path calls; before one does, R3-8's open
+  point has to be settled (a gateway still receives the user's `CLAUDE_CODE_OAUTH_TOKEN` and an
+  `ANTHROPIC_BASE_URL` that may carry credentials). The rules: that method's own variables (names from
+  Claude Code's public docs) pass through
   unchanged for that run, with the base allowlist and the user's sign-in; nothing else from the daemon's
   environment does (no other engine's key, no stray `ANTHROPIC_API_KEY`). A method with no listed
   variables is `launch_refused`, and so is a method whose own switch or credential is unset

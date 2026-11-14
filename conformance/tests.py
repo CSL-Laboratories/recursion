@@ -913,7 +913,7 @@ class RulesTest(unittest.TestCase):
         alternative that is already true."""
         fits = self.rules.fits
         wrong = {"type": [{"type": "integr"}, {"type": []}, {"type": 3}, {"type": ["string", "string"]}],
-                 "enum": [{"enum": "abc"}, {"enum": []}],
+                 "enum": [{"enum": "abc"}, {"enum": {"a": 1}}],
                  "minLength": [{"minLength": "2"}, {"minLength": -1}, {"minLength": True}],
                  "maxLength": [{"maxLength": "2"}], "minItems": [{"minItems": 1.5}], "maxItems": [{"maxItems": None}],
                  "pattern": [{"pattern": "("}, {"pattern": 3}],
@@ -930,6 +930,11 @@ class RulesTest(unittest.TestCase):
                 with self.subTest(keyword=keyword, schema=schema):
                     with self.assertRaises(ValueError):
                         fits("x.json", "ab", {"x.json": {"anyOf": [True, schema]}})
+        # The forms the dialect does give are read: an empty list of values takes nothing, as the validator says.
+        for schema, value, verdict in (({"enum": []}, "ab", False), ({"required": []}, {}, True), ({"minLength": 0}, "", True)):
+            with self.subTest(read=schema):
+                self.assertIs(fits("x.json", value, {"x.json": schema}), verdict)
+                self.assertIs(client.Validator(schema).is_valid(value), verdict, "the case is wrong")
 
     def test_the_reader_resolves_a_reference_as_the_dialect_does_or_refuses_it(self):
         """A reference is resolved the way Draft 2020-12 resolves it, or the schema is refused (ValueError)

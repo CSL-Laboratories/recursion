@@ -570,7 +570,7 @@ def _pattern(want) -> bool:
 # The form of the value of every keyword that is a rule and does not hold schemas: a value of another form is not
 # read as if it were one (a string where a list of names belongs would be read one character at a time).
 _RULE_VALUE = {
-    "type": _types, "enum": lambda want: isinstance(want, list) and bool(want), "const": lambda want: True,
+    "type": _types, "enum": lambda want: isinstance(want, list), "const": lambda want: True,
     "minLength": _count, "maxLength": _count, "minItems": _count, "maxItems": _count, "pattern": _pattern,
     "x-instant": lambda want: isinstance(want, bool), "uniqueItems": lambda want: isinstance(want, bool),
     "minimum": _number, "maximum": _number, "exclusiveMinimum": _number, "required": _names,

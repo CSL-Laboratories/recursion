@@ -718,6 +718,49 @@ class CommitFenceTests(unittest.TestCase):
         self.assertFalse(revoker.is_alive(), "the revocation did not finish")
         self.assertTrue(revoked["out"]["ok"], revoked["out"])
 
+    def test_a_halt_does_not_wait_while_a_charge_waits_for_the_ledger(self) -> None:
+        # The commit section is entered only once the ledger's write transaction has begun, so a charge
+        # waiting for the ledger's write lock (another connection holds it) holds no fence.
+        w = World(self)
+        w.load()
+        w.bind()
+        env = profile(w.installer)
+        eff = effect(amount=1_000)
+        approval = w.approve(eff)
+        beginning = threading.Event()
+        real_db = w.authority._db
+
+        class _Db:
+            def execute(self, sql, params=()):
+                if sql == "BEGIN IMMEDIATE":
+                    beginning.set()
+                return real_db.execute(sql, params)
+
+            def close(self) -> None:
+                real_db.close()
+
+        w.authority._db = _Db()
+        holder = sqlite3.connect(w.ledger, isolation_level=None, timeout=30)
+        holder.execute("BEGIN IMMEDIATE")
+        out: dict[str, dict] = {}
+        worker = threading.Thread(target=lambda: out.__setitem__("r", w.authorize(eff, approval, env)))
+        drainer = threading.Thread(target=w.core.commit_fence.drain)
+        try:
+            worker.start()
+            self.assertTrue(beginning.wait(10.0), "the charge never began its ledger transaction")
+            drainer.start()
+            drainer.join(10.0)
+            self.assertFalse(drainer.is_alive(), "a drain waited while the charge waited for the ledger")
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+            worker.join(40.0)
+            if drainer.ident is not None:
+                drainer.join(10.0)
+        self.assertFalse(worker.is_alive(), "the charge did not finish")
+        self.assertTrue(out["r"]["ok"], out["r"])
+        self.assertEqual(_charges(w), 1)
+
     def test_an_injected_fence_is_the_one_every_commit_passes(self) -> None:
         w = World(self)
         shared = CommitFence()

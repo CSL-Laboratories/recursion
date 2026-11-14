@@ -509,6 +509,11 @@ class DaemonControl:
         return self._answer(method, params, 0, principal)
 
     def _answer(self, method, params, reserved_bytes, principal=control_hooks.OWNER):
+        if method in ('run.start', 'run.stop') and self._hooks.methods.command_open():
+            # Seam S1: a mutating built-in reached from inside a command whose transaction is open, by a handler
+            # that called this object itself and not ctx.call. It is refused as ctx.call refuses it: such an
+            # effect belongs after the commit, on the lane's committed work-intent path.
+            return {'code': 'request_invalid', 'detail': 'nested_effect'}
         if method == 'run.list':
             return self._list(params, reserved_bytes)
         if method == 'route.list':
@@ -1054,7 +1059,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
             log.warning('the breaker store was missing and was created empty while run records exist: '
                         'earlier trips, run bindings and faults are not known to this daemon')
     plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, **(plugin_options or {}))
-    adapters = {}
+    adapters, binaries = {}, {}
     # Seam S3: the engine table's active factories, which are today's two classes in today's order unless a lane
     # registered one. Seam S7: the credential lookup is the hooks'; its default raises KeyError(connection_id).
     for engine, factory in hooks.engines.items():
@@ -1062,6 +1067,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         launcher = ProductionLauncher(engine, daemon, manager, state_dir, hooks=hooks)
         options = {'binary': entry['binary']} if entry and entry.get('binary') else {}
         adapters[engine] = factory(launcher, clock, hooks.credentials, environ, **options)
+        binaries[engine] = options.get('binary')   # None: the adapter launches its own default command name
     service = RouteService(adapters, breaker if breaker is not None else route_breaker, clock)
     starter = RouteStarter(service, routes, daemon, state_dir, breaker=breaker,
                            breaker_unavailable=breaker_unavailable, hooks=hooks)
@@ -1073,8 +1079,17 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         return hooks.methods.dispatch(method, params, principal,
                                       lambda inner, inner_params=None: composed['control'].nested(inner, inner_params, principal))
 
+    def launchable(entry):
+        """PROVISIONAL (ruling of Nov 13, 2026). An adapter is built once, above, with the configured entry's binary,
+        and that is the binary every launch of its engine runs. So a route entry a registrant chose is launchable
+        only when it names that same binary: the same absolute path, or none where the adapter was built with
+        none (it then launches its default command name, found on the child's PATH). The comparison is of what
+        the two entries SAY, as the launcher would be given it; two spellings of one file are not the same."""
+        engine = entry['route']['engine']
+        return engine in binaries and entry.get('binary') == binaries[engine]
+
     api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s,
-                     methods=table, start_hooks=hooks)
+                     methods=table, start_hooks=hooks, launchable=launchable)
     control = DaemonControl(api, registry, daemon, starter, state_dir, routes=routes, plugins=plugins,
                             breaker=breaker, breaker_store='durable' if breaker is not None
                             else f'unavailable: {breaker_unavailable}', hooks=hooks)

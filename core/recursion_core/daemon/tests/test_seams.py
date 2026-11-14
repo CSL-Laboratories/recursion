@@ -21,7 +21,7 @@ from unittest import mock
 import recursion_core.daemon as daemon_module
 from recursion_core.control import hooks as H, methods
 from recursion_core.control.client import SocketAPI
-from recursion_core.control.tests.test_seams import FakeStore, Service, quiet
+from recursion_core.control.tests.test_seams import FakeStore, Service, quiet, row_names_service
 from recursion_core.daemon import Daemon, Registry, control_adapter as adapter, launcher
 from recursion_core.daemon.tests.test_composition import (
     BOOT, LINUX, LINUX_ONLY, STANDIN, ProcessUnitManager, Units, until,
@@ -344,10 +344,11 @@ class MethodSeamTest(Composed):
 
     def test_a_command_runs_once_in_the_dispatchers_transaction_and_is_replayed_from_its_receipt(self):
         store, calls, after, opened = FakeStore(), [], [], []
+        store.register_tables('sessions', 1, 'CREATE TABLE sessions (session_id TEXT PRIMARY KEY, state TEXT NOT NULL)')
 
         def start(ctx, params):
             calls.append((ctx.principal, params))
-            ctx.tx.put('sessions', 'ses-1', {'state': 'starting'})
+            ctx.tx.execute('INSERT INTO sessions VALUES (?, ?)', ('ses-1', 'starting'))
             ctx.after_commit(lambda: after.append('woken'))
             return {'code': 'ok', 'session_id': 'ses-1'}
 
@@ -369,6 +370,33 @@ class MethodSeamTest(Composed):
         self.shutdown()
         self.assertTrue(store.closed)
 
+    def test_a_handler_that_calls_the_control_object_itself_cannot_stop_a_run_inside_its_command(self):
+        store, holder, seen = FakeStore(), [], []
+
+        def start(ctx, params):
+            control, run_id = holder
+            seen.append(('through ctx.call', ctx.call('run.stop', {'run_id': run_id})))
+            seen.append(('the object itself', control.call('run.stop', {'run_id': run_id})))
+            seen.append(('a start', control.call('run.start', self.request())))
+            seen.append(('a read', control.call('run.status', {'run_id': run_id})['code']))
+            ctx.after_commit(lambda: seen.append(('after the commit', control.call('run.stop', {'run_id': run_id})['code'])))
+            return {'code': 'ok'}
+
+        def register(made):
+            made.methods.register('session.start', start, tenant=methods.INSTALL_TENANT)
+            made.set('event_store', lambda state_dir: store)
+        _, composed = self.boot(hooks_of(register))
+        run_id = self.start(composed.control)
+        holder.extend([composed.control, run_id])
+        launched = len(self.units.started)
+        self.assertEqual(self.api(composed).call('session.start', {'command_id': 'c-1'}), {'code': 'ok'})
+        refused = {'code': 'request_invalid', 'detail': 'nested_effect'}
+        self.assertEqual(seen, [('through ctx.call', refused), ('the object itself', refused), ('a start', refused),
+                                ('a read', 'ok'), ('after the commit', 'stopped')],
+                         'inside the command nothing is stopped or started; after its commit the Stop goes through')
+        self.assertEqual(len(self.units.started), launched)
+        self.settled(run_id)
+
     def test_a_method_that_needs_a_service_waits_for_it_and_the_run_methods_do_not(self):
         log, served = [], []
         directory = self.runtime / 'recursion'
@@ -379,6 +407,8 @@ class MethodSeamTest(Composed):
                 served.append(sorted(item.name for item in directory.iterdir() if item.is_socket() or item.name == 'gui-device-token'))
                 super().start(context)
         events = Events('events', log)
+
+        row_names_service(self, 'events.read', 'events')   # what the row of a lane with a service would say
 
         def register(made):
             made.service(events)
@@ -677,6 +707,32 @@ class LaunchSeamTest(Composed):
 
     def test_the_binding_of_a_first_launch_refuses_a_relaunch_on_another_connection_with_the_path_on(self):
         self.binding_case(on=True)
+
+    def test_a_chosen_entry_whose_binary_is_not_the_composed_adapters_is_refused_before_anything_is_stored(self):
+        # PROVISIONAL (ruling of Nov 13, 2026): the adapter was built with the configured binary, and that is what
+        # every launch of the engine runs; an entry that names another is never stored and launched as this one.
+        other = self.tmp / 'bin' / 'elsewhere' / 'claude'
+        other.parent.mkdir(mode=0o700)
+        shutil.copyfile(self.engine, other)
+        os.chmod(other, 0o700)
+        choices = [dict(self.routes['claude_code'], binary=str(other)), dict(self.routes['claude_code'], binary=None),
+                   json.loads(json.dumps(self.routes['claude_code']))]
+
+        def register(made):
+            made.start_registrant('routing', ('hand_pick',), ('route_entry', 'route_decision'), lambda principal, request: {
+                'route_entry': choices[0], 'route_decision': None}, chooses_engine=True)
+        _, composed = self.boot(hooks_of(register))
+        request = {'tenant': 't1', 'prompt': LIVE, 'client_key': 'k1'}
+        for refused in range(2):       # another path; and none, where the adapter was built with one
+            self.assertEqual(composed.control.call('run.start', request), {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+            self.assertEqual((composed.control.registry.list(), self.units.started), ([], []), 'no run, no launch record, no unit')
+            del choices[0]
+        answer = composed.control.call('run.start', request)     # the same binary the adapter was built with
+        self.assertEqual(answer['code'], 'started', answer)
+        self.assertEqual(composed.control.registry.get(answer['run']['run_id'])['launch']['route_entry']['binary'], str(self.engine))
+        argv = self.units.started[-1]['argv']
+        self.assertEqual(argv[argv.index('--') + 1], str(self.engine), 'and it is the binary that ran')
+        self.stop(composed.control, answer['run']['run_id'])
 
     def test_a_route_entry_a_registrant_chose_is_what_the_starter_launches(self):
         chosen = json.loads(json.dumps(self.routes['claude_code']))
@@ -1255,8 +1311,11 @@ class ServicesSeamTest(Composed):
 
     def registered(self, log, entered, leave, *, callback=False, poll=False):
         store = FakeStore(log)
+        store.register_tables('sessions', 1, 'CREATE TABLE intents (command_id TEXT PRIMARY KEY, what TEXT NOT NULL)')
         events = Service('events', log)
         events.ready = True
+        # No published row names a service today; these tests say what the row of a lane with one would say.
+        row_names_service(self, 'session.start' if callback else 'events.follow', 'events')
 
         def held(ctx, params):
             if poll:                     # a long poll: it waits for an event, or for the daemon to close
@@ -1270,7 +1329,7 @@ class ServicesSeamTest(Composed):
                 leave.wait(HELD_BOUND_S)
                 log.append(('left', 'callback' if callback else 'handler', None))
             if callback:
-                ctx.tx.put('sessions', params['command_id'], 'intent')
+                ctx.tx.execute('INSERT INTO intents VALUES (?, ?)', (params['command_id'], 'intent'))
                 ctx.after_commit(wait)
             else:
                 wait()
@@ -1389,11 +1448,11 @@ class ServicesSeamTest(Composed):
                 self.addCleanup(daemon.close)
                 with patches, self.assertRaises((RuntimeError, OSError)):
                     adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes, hooks=hooks_of(register))
-                # Every service that started was stopped, in reverse; the store was closed after them; nothing is served.
+                # Every service whose start was tried was stopped, in reverse, the one that failed part way among
+                # them; the store was closed after them; nothing is served.
                 started = [name for what, name, _ in log if what == 'start']
                 self.assertEqual(started, {'service': ['events', 'sessions'], 'store': []}.get(failing, ['events', 'sessions']))
-                expected = {'service': [('stop', 'events'), ('close', 'store')], 'store': []}.get(
-                    failing, [('stop', 'sessions'), ('stop', 'events'), ('close', 'store')])
+                expected = {'store': []}.get(failing, [('stop', 'sessions'), ('stop', 'events'), ('close', 'store')])
                 self.assertEqual([(what, name) for what, name, _ in log if what != 'start'], expected)
                 self.assertEqual(store.closed, failing != 'store')
                 self.assertIsNone(daemon.registry.mark_changed)

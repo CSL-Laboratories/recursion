@@ -2352,11 +2352,11 @@ class AncestorDiscoveryTest(unittest.TestCase):
 # registered both files answer as they did before; that is shown here against the control API built
 # the old way, and for every existing test by the suite itself.
 
-def control_api(registry=None, starter=None, *, table=None, start_hooks=None, ids=None):
+def control_api(registry=None, starter=None, *, table=None, start_hooks=None, ids=None, launchable=None):
     registry = InMemoryRunRegistry() if registry is None else registry
     starter = Recorder() if starter is None else starter
     made = A.ControlAPI(registry, FakeKillTree(), starter, clock=lambda: 1000.0, new_run_id=ids or run_ids(),
-                        methods=table, start_hooks=start_hooks)
+                        methods=table, start_hooks=start_hooks, launchable=launchable)
     return made, registry, starter
 
 
@@ -2741,6 +2741,23 @@ class StartPathOnTest(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(api.call('run.start', request), answer)
         self.assertEqual((len(registry.list()), len(starter.calls)), (1, 1))
+
+    def test_a_chosen_entry_the_composition_would_not_launch_as_it_is_refused_before_anything_is_stored(self) -> None:
+        asked = []
+
+        def launchable(chosen):
+            asked.append(chosen)
+            return chosen['route']['engine'] == 'codex'      # say the composed adapter of the other engine differs
+        api, registry, starter = control_api(self.registry, start_hooks=self.hooks(), launchable=launchable)
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1', 'hand_pick': {'engine': 'claude_code'}}),
+                         {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+        self.assertEqual((asked, registry.list(), starter.calls), ([entry('claude_code')], [], []),
+                         'invalid registrant output: no run, no launch record, nothing launched')
+        # The key is free, and an entry the composition launches as it is goes through; with no entry chosen nobody is asked.
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'})['code'], 'started')
+        self.assertEqual(asked[1:], [entry('codex')])
+        api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'hand_pick': {'engine': 'none'}})
+        self.assertEqual(len(asked), 2)
 
     def test_with_no_registrant_that_chooses_a_start_names_its_engine_as_today(self) -> None:
         api, registry, starter = self.api(routing=False)

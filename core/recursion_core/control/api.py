@@ -126,7 +126,8 @@ def _no_text(hooks, present: Mapping, digest: str) -> str:
 class ControlAPI:
     def __init__(self, registry: RunRegistry, kill_tree: KillTree, starter: Starter, clock: Callable[[], float],
                  *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id,
-                 methods: Callable[[str, dict, object], dict] | None = None, start_hooks: object = None) -> None:
+                 methods: Callable[[str, dict, object], dict] | None = None, start_hooks: object = None,
+                 launchable: Callable[[dict], bool] | None = None) -> None:
         self._registry, self._kill, self._starter, self._clock = registry, kill_tree, starter, clock
         # Seam S1: ``methods(method, params, principal) -> answer`` answers a method that is not one of the four
         # below (the method table's dispatcher, control/methods). None, the default: such a method is unknown, as today.
@@ -135,6 +136,9 @@ class ControlAPI:
         # versioned path ON. Otherwise None: start, _start and _retry are then the base's, a keyed record's
         # start_key has its three members, and no principal, launch or intent is stored.
         self._start_hooks = start_hooks if start_hooks is not None and start_hooks.start_on else None
+        # ``launchable(entry) -> bool``: whether the composition would launch exactly the route entry a registrant
+        # chose (seam S6 c). None: no such check, which is the case with no composition around this object.
+        self._launchable = launchable
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
         self._locks_lock = threading.Lock()
@@ -324,6 +328,12 @@ class ControlAPI:
                 route = entry.get("route") if isinstance(entry, dict) else None
                 launched_engine = route.get("engine") if isinstance(route, dict) else None
                 if not isinstance(launched_engine, str) or not launched_engine or engine not in (None, launched_engine):
+                    return {"code": "unavailable", "detail": "start_registrant_failed"}
+                # PROVISIONAL (ruling of Nov 13, 2026): until the launcher can execute the binary of the selected
+                # route entry, a registrant-selected entry whose binary differs from the composed adapter's binary
+                # is rejected before the launch intent is persisted. A selected binary is never persisted while a
+                # different one is launched. It is invalid registrant output, not a launch failure: no run exists.
+                if self._launchable is not None and not self._launchable(entry):
                     return {"code": "unavailable", "detail": "start_registrant_failed"}
             if launched_engine is None:
                 return {"code": REQUEST_INVALID, "detail": "engine"}  # none named, and no registrant chose one

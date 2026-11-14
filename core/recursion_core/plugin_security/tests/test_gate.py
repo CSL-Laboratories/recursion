@@ -7,12 +7,15 @@ Rust core would be driven, not through Python internals.
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
 import unittest
 from pathlib import Path
 
 from recursion_core.plugin_security import (
     PROTOCOL, CoreHealth, CoreService, Grant, PluginLoader, Refused, TrustStore, canonical, parse_manifest,
 )
+from recursion_core.plugin_security.protocol import CommitFence
 from recursion_core.plugin_security.tests.support import (
     AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_SOURCE, PLUGIN_TOKEN, FakeGilProbe, World, effect, needs_crypto,
     profile, scope_of,
@@ -437,6 +440,316 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(published, PROTOCOL)
         for op in PROTOCOL["ops"]:
             self.assertTrue(hasattr(CoreService, "_op_" + op.replace(".", "_")), op)
+
+
+@needs_crypto
+class HaltToctouTests(unittest.TestCase):
+    """An order effect in flight must not authorize or charge after a halt, revoke, fault, poison or veto."""
+
+    def test_halt_during_authorize_refuses_and_writes_no_charge(self) -> None:
+        cases = (
+            ("key_revoke", "permission_required"),
+            ("breaker_trip", "connection_tripped"),
+            ("run_fault", "run_faulted"),
+            ("sibling_veto", "approval_vetoed"),
+            ("core_poison", "core_poisoned_restart_required"),
+        )
+        for mode, expected_code in cases:
+            with self.subTest(mode=mode):
+                w = World(self)
+                w.load()
+                w.bind()
+                env = profile(w.installer)
+                eff = effect(amount=1_000, payload={"mode": mode})
+                approval_1 = w.approve(eff)
+                sibling = w.call(w.plugin, "effect.request", effect=eff)["result"]
+
+                entered = threading.Event()
+                release = threading.Event()
+                real_verify = w.authority._verify
+
+                def paused_verify(sig, raw, _e=entered, _r=release, _rv=real_verify):
+                    _e.set()
+                    assert _r.wait(5.0)
+                    return _rv(sig, raw)
+
+                w.authority._verify = paused_verify
+                holder: dict[str, dict] = {}
+                worker = threading.Thread(
+                    target=lambda: holder.__setitem__("out", w.authorize(eff, approval_1, env))
+                )
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(5.0))
+
+                    if mode == "key_revoke":
+                        self.assertTrue(w.call(w.host, "key.revoke", key_id=key_id(w.developer.public))["ok"])
+                    elif mode == "breaker_trip":
+                        self.assertTrue(
+                            w.call(w.host, "breaker.report", connection="conn-a", event_type="plan_limit")["ok"]
+                        )
+                    elif mode == "run_fault":
+                        self.assertTrue(w.call(w.host, "run.fault", run_id="run-1")["ok"])
+                    elif mode == "sibling_veto":
+                        self.assertTrue(
+                            w.call(
+                                w.host,
+                                "approval.decide",
+                                approval_id=sibling["approval_id"],
+                                digest=sibling["digest"],
+                                credential=OPERATOR_TOKEN,
+                                decision="veto",
+                            )["ok"]
+                        )
+                    else:
+                        w.health.poison("gil_enabled")
+
+                finally:
+                    release.set()
+                    worker.join(10.0)
+                self.assertFalse(worker.is_alive(), "authorizer did not finish")
+                self.assertEqual(_code(holder["out"]), expected_code)
+                db = sqlite3.connect(w.ledger)
+                try:
+                    spent = db.execute("SELECT COUNT(*) FROM charges").fetchone()[0]
+                finally:
+                    db.close()
+                self.assertEqual(spent, 0)
+
+
+def _charges(w: World) -> int:
+    db = sqlite3.connect(w.ledger)
+    try:
+        return db.execute("SELECT COUNT(*) FROM charges").fetchone()[0]
+    finally:
+        db.close()
+
+
+def _halt(w: World, mode: str, sibling: dict) -> dict:
+    """One acknowledged halt through the host's client, as the R4-1 modes name them."""
+    if mode in ("key_revoke", "key_revoke_not_durable"):
+        return w.call(w.host, "key.revoke", key_id=key_id(w.developer.public))
+    if mode == "breaker_trip":
+        return w.call(w.host, "breaker.report", connection="conn-a", event_type="plan_limit")
+    if mode == "run_fault":
+        return w.call(w.host, "run.fault", run_id="run-1")
+    if mode == "sibling_veto":
+        return w.call(w.host, "approval.decide", approval_id=sibling["approval_id"], digest=sibling["digest"],
+                      credential=OPERATOR_TOKEN, decision="veto")
+    raise AssertionError(mode)
+
+
+class _SignallingFence(CommitFence):
+    """The real fence, with an event set when a drain begins (before it waits)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.draining = threading.Event()
+
+    def drain(self) -> None:
+        self.draining.set()
+        super().drain()
+
+
+class _NotifyingLock:
+    """A real lock that sets an event when a thread other than the creator's tries to take it."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self._owner = threading.get_ident()
+        self.attempted = threading.Event()
+
+    def acquire(self, *args, **kwargs) -> bool:
+        if threading.get_ident() != self._owner:
+            self.attempted.set()
+        return self._real.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._real.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+@needs_crypto
+class CommitFenceTests(unittest.TestCase):
+    """R4-1 under D3, beyond Astra's five modes: the effect that is not charged, the halt's answer
+    waiting for a commit already under way, the lock order, and the injected fence."""
+
+    def test_halt_after_take_refuses_an_effect_that_is_not_charged(self) -> None:
+        # The answer is the commit for an effect with no authority profile: a halt acknowledged
+        # between take and that answer refuses it, and the approval stays used.
+        cases = (
+            ("breaker_trip", "connection_tripped"),
+            ("run_fault", "run_faulted"),
+            ("sibling_veto", "approval_vetoed"),
+            ("core_poison", "core_poisoned_restart_required"),
+        )
+        for mode, expected_code in cases:
+            with self.subTest(mode=mode):
+                w = World(self)
+                w.load()
+                w.bind()
+                eff = effect(kind="note.post", amount=0, payload={"mode": mode})
+                approval = w.approve(eff)
+                sibling = w.call(w.plugin, "effect.request", effect=eff)["result"]
+                entered, release = threading.Event(), threading.Event()
+                real_take = w.gate.take
+
+                def paused_take(approval_id, value, _e=entered, _r=release, _rt=real_take):
+                    digest = _rt(approval_id, value)
+                    _e.set()
+                    if not _r.wait(10.0):
+                        raise AssertionError("never released")
+                    return digest
+
+                w.gate.take = paused_take
+                holder: dict[str, dict] = {}
+                worker = threading.Thread(target=lambda: holder.__setitem__("out", w.authorize(eff, approval, None)))
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(10.0), "authorizer never took the approval")
+                    if mode == "core_poison":
+                        w.health.poison("test")
+                    else:
+                        self.assertTrue(_halt(w, mode, sibling)["ok"])
+                finally:
+                    release.set()
+                    worker.join(10.0)
+                self.assertFalse(worker.is_alive(), "authorizer did not finish")
+                self.assertEqual(_code(holder["out"]), expected_code)
+                with self.assertRaises(Refused) as used:
+                    real_take(approval, eff)
+                self.assertEqual(used.exception.code, "approval_replayed")
+
+    def test_halt_answers_only_after_a_commit_already_under_way(self) -> None:
+        # A commit section that read the state before the halt holds the fence: the halt changes its
+        # state, then waits, and answers only once that charge is committed.
+        cases = (
+            ("key_revoke", True),
+            ("key_revoke_not_durable", False),  # the order is off, the write failed: refused, still drained
+            ("breaker_trip", True),
+            ("run_fault", True),
+            ("sibling_veto", True),
+        )
+        for mode, halt_ok in cases:
+            with self.subTest(mode=mode):
+                w = World(self)
+                fence = _SignallingFence()
+                w.core.commit_fence = fence
+                w.load()
+                w.bind()
+                env = profile(w.installer)
+                eff = effect(amount=1_000, payload={"mode": mode})
+                approval = w.approve(eff)
+                sibling = w.call(w.plugin, "effect.request", effect=eff)["result"]
+                if mode == "key_revoke_not_durable":
+                    w.loader._trust._db.execute("PRAGMA query_only=ON")
+                entered, release = threading.Event(), threading.Event()
+                real_is_vetoed = w.gate.is_vetoed
+
+                def paused_is_vetoed(digest, _e=entered, _r=release, _rv=real_is_vetoed):
+                    answer = _rv(digest)  # the commit section's last read, before the halt
+                    _e.set()
+                    if not _r.wait(10.0):
+                        raise AssertionError("never released")
+                    return answer
+
+                w.gate.is_vetoed = paused_is_vetoed
+                out: dict[str, object] = {}
+                worker = threading.Thread(target=lambda: out.__setitem__("authorize", w.authorize(eff, approval, env)))
+                answered = threading.Event()
+
+                def halt() -> None:
+                    out["halt"] = _halt(w, mode, sibling)
+                    out["charges_at_answer"] = _charges(w)
+                    answered.set()
+
+                halter = threading.Thread(target=halt)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(10.0), "authorizer never reached its commit section")
+                    halter.start()
+                    self.assertTrue(fence.draining.wait(10.0), "the halt never drained the fence")
+                    self.assertFalse(answered.wait(0.3), "the halt answered while a commit held the fence")
+                finally:
+                    release.set()
+                    worker.join(10.0)
+                    if halter.ident is not None:
+                        halter.join(10.0)
+                self.assertFalse(worker.is_alive() or halter.is_alive(), "a thread did not finish")
+                self.assertTrue(out["authorize"]["ok"], out["authorize"])
+                self.assertEqual(out["authorize"]["result"]["charge"]["spent_minor"], 1_000)
+                self.assertEqual(out["halt"]["ok"], halt_ok, out["halt"])
+                if not halt_ok:
+                    self.assertEqual(_code(out["halt"]), "revocation_not_durable")
+                self.assertEqual(out["charges_at_answer"], 1)
+
+    def test_key_revoke_holds_no_fence_while_it_waits_for_the_loader(self) -> None:
+        # The loader's lock is held when the core is poisoned (CoreHealth.poison runs inside load).
+        # A revocation waiting for that lock must not hold the fence, or a drain made under the
+        # loader's lock would wait for it for ever.
+        w = World(self)
+        w.load()
+        w.bind()
+        real = w.loader._lock
+        notifying = _NotifyingLock(real)
+        w.loader._lock = notifying
+        revoked: dict[str, dict] = {}
+        revoker = threading.Thread(
+            target=lambda: revoked.__setitem__("out", w.call(w.host, "key.revoke", key_id=key_id(w.developer.public))))
+        drainer = threading.Thread(target=w.core.commit_fence.drain)
+        real.acquire()
+        try:
+            revoker.start()
+            self.assertTrue(notifying.attempted.wait(10.0), "the revocation never asked for the loader's lock")
+            drainer.start()
+            drainer.join(10.0)
+            self.assertFalse(drainer.is_alive(), "a drain under the loader's lock waited for the revocation")
+        finally:
+            real.release()
+            revoker.join(10.0)
+            if drainer.ident is not None:
+                drainer.join(10.0)
+        self.assertFalse(revoker.is_alive(), "the revocation did not finish")
+        self.assertTrue(revoked["out"]["ok"], revoked["out"])
+
+    def test_an_injected_fence_is_the_one_every_commit_passes(self) -> None:
+        w = World(self)
+        shared = CommitFence()
+        core = CoreService(loader=w.loader, gate=w.gate, breaker=w.breaker, health=w.health,
+                           authority=w.authority, effect_permissions={"order": "order", "note": "propose"},
+                           authority_required=frozenset({"order"}), commit_fence=shared)
+        self.assertIs(core.commit_fence, shared)
+        w.load()
+        w.bind()
+        plugin = core.client_for("demo.plugin")
+        eff = effect(kind="note.post", amount=0)
+        approval = w.approve(eff)
+        done = threading.Event()
+        out: dict[str, dict] = {}
+
+        def authorize() -> None:
+            out["r"] = w.call(plugin, "effect.authorize", effect=eff, approval_id=approval, authority=None)
+            done.set()
+
+        worker = threading.Thread(target=authorize)
+        with shared:
+            worker.start()
+            self.assertFalse(done.wait(0.3), "authorized while the shared fence was held")
+        worker.join(10.0)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(out["r"]["ok"], out["r"])
+        for wrong in (object(), threading.Lock()):
+            with self.subTest(wrong=type(wrong).__name__):
+                with self.assertRaises(TypeError):
+                    CoreService(loader=w.loader, gate=w.gate, breaker=w.breaker, health=w.health,
+                                authority=w.authority, effect_permissions={}, authority_required=frozenset(),
+                                commit_fence=wrong)
 
 
 if __name__ == "__main__":

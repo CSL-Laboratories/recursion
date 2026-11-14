@@ -373,12 +373,19 @@ class AdmissionTest(Case):
 class ConcurrencyTest(unittest.TestCase):
     """Two admissions on one paid connection at once never both take the headroom."""
 
-    def run_both(self, store: FakeStore, reads) -> list[dict]:
+    def run_both(self, store: FakeStore, reads, barrier: threading.Barrier | None = None) -> list[dict]:
         keys = Policies(store, **{"key-A": opted_in("5")})
         res = R.Reservations(store, keys, reads=reads)
         answers: list = []
-        threads = [threading.Thread(target=lambda run_id=run_id: answers.append(res.admit(KEY, key_route(), run_id)))
-                   for run_id in (RUN_A, RUN_B)]
+
+        def admit(run_id: str) -> None:
+            try:
+                answers.append(res.admit(KEY, key_route(), run_id))
+            finally:
+                if barrier is not None:
+                    barrier.abort()  # a worker that is done never leaves the other waiting at the barrier
+
+        threads = [threading.Thread(target=admit, args=(run_id,)) for run_id in (RUN_A, RUN_B)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -395,14 +402,21 @@ class ConcurrencyTest(unittest.TestCase):
     def test_a_store_that_refuses_a_conflict(self):
         store = declared(serial=False)
         barrier = threading.Barrier(2, timeout=BOUND_S)
+        arrived: list = []
 
         class BothOpen(Reads):
             def spent(self, tx, connection_id):
+                arrived.append(connection_id)
                 barrier.wait()  # both transactions have read before either writes
                 return R.known_spend(1)
 
-        with self.assertLogs("recursion_core.quota.reservation", "ERROR"):
-            answers = self.run_both(store, BothOpen())
+        # A reader held open by this thread for the whole test keeps the store's write-ahead log in place. With no
+        # connection open, the log is removed, and two connections that open it again at the same moment can be
+        # refused at their first read by the fake's zero busy timeout, before either reaches the barrier.
+        with store.transaction() as reader, self.assertLogs("recursion_core.quota.reservation", "ERROR"):
+            reader.execute("SELECT count(*) FROM quota_reservation")
+            answers = self.run_both(store, BothOpen(), barrier)
+        self.assertEqual(arrived, [KEY, KEY])  # both read the spend inside an open transaction
         self.assertEqual(sorted(answer["allowed"] for answer in answers), [False, True])
         self.assertEqual(len(held(store)), 1)
 

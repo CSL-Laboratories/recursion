@@ -467,7 +467,7 @@ class DaemonControl:
                  breaker_store='not composed', list_reply_bytes=LIST_REPLY_BYTES, hooks=None):
         self.api, self.registry, self.daemon, self.starter = api, registry, daemon, starter
         # The composed hooks. With none given: hooks nobody registered into, whose defaults are today's behaviour.
-        self._hooks = hooks if hooks is not None else control_hooks.compose(())
+        self._hooks = hooks if hooks is not None else control_hooks.bare()
         self._engines = tuple(self._hooks.engines.names())  # seam S3: today's two unless a lane registered one
         self._list_reply_bytes = list_reply_bytes
         self._state = Path(state_dir)

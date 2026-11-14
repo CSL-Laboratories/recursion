@@ -198,22 +198,22 @@ class NothingRegisteredTest(Composed):
         self.stop(api, run_id)
 
     def test_a_registrant_that_is_absent_changes_nothing_and_one_that_is_broken_stops_the_composition(self):
-        from recursion_core.control.tests.test_seams import FakePackages
-        packages = FakePackages(self)
-        bare = packages.package('bare')                                       # a package with no hooks module
-        broken = packages.package('broken', hooks='import a_module_nobody_has\n\ndef register(hooks):\n    pass\n')
-        raising = packages.package('raising', hooks='def register(hooks):\n    raise RuntimeError("no")\n')
-        real = H.compose
-        with mock.patch.object(H, 'compose', lambda: real((f'{packages.prefix}_absent.hooks', f'{bare}.hooks'))):
+        # The composition imports its registrants by their own names, so a lane is faked under its real name, for
+        # as long as the block lasts.
+        from recursion_core.control.tests.test_seams import FakeLanes
+        with contextlib.ExitStack() as installed:
+            lanes = FakeLanes(mock.Mock(addCleanup=installed.callback))
+            lanes.lane('keys')                                                # a lane's package with no hooks module
             _, composed = self.boot()
-        self.assertEqual((composed.hooks.gate.enabled, composed.hooks.methods.registered()), (False, ()))
-        self.assertEqual(self.api(composed).call('run.list'), {'code': 'ok', 'runs': []})
-        self.shutdown()
-        for name in (broken, raising):
-            with self.subTest(registrant=name):
-                with mock.patch.object(H, 'compose', lambda name=name: real((f'{name}.hooks',))):
-                    with self.assertRaises(H.HookError):
-                        self.boot()
+            self.assertEqual((composed.hooks.gate.enabled, composed.hooks.methods.registered()), (False, ()))
+            self.assertEqual(self.api(composed).call('run.list'), {'code': 'ok', 'runs': []})
+            self.shutdown()
+        for lane, text in (('events', 'import a_module_nobody_has\n\ndef register(hooks):\n    pass\n'),
+                           ('sessions', 'def register(hooks):\n    raise RuntimeError("no")\n')):
+            with self.subTest(registrant=lane), contextlib.ExitStack() as installed:
+                FakeLanes(mock.Mock(addCleanup=installed.callback)).lane(lane, hooks=text)
+                with self.assertRaises(H.HookError):
+                    self.boot()
                 # Nothing was served and nothing is left: no socket, no token file.
                 self.assertFalse((self.runtime / 'recursion' / 'gui-device-token').exists())
                 self.assertEqual(self.open, [])

@@ -73,6 +73,18 @@ class Write(unittest.TestCase):
         self.assertEqual(ok.status, r.OK, ok.model_text)
         self.assertEqual((ws.root / "a.py").read_text(), "new\n")
 
+    def test_a_file_changed_while_the_request_waits_is_not_replaced(self) -> None:
+        ws = workspace(self, {"a.py": "old\n"})
+        run(ws, "read", {"path": "a.py"})
+
+        def approve_then_change(call: b.ToolCall) -> perm.Decision:
+            (ws.root / "a.py").write_text("theirs\n")
+            return perm.Decision(perm.APPROVED, dict(call.input))
+
+        out = run(ws, "write", {"path": "a.py", "content": "mine\n"}, approve_then_change)
+        self.assertIn("stale_snapshot", out.model_text)
+        self.assertEqual((ws.root / "a.py").read_text(), "theirs\n")
+
     def test_git_folders_spill_files_and_outside_paths_are_not_written(self) -> None:
         ws = workspace(self)
         (ws.root / ".git").mkdir()
@@ -151,6 +163,17 @@ class Shell(unittest.TestCase):
         bad = run(ws, "shell", {"command": "exit 3"})
         self.assertEqual(bad.status, r.ERROR)
         self.assertTrue(bad.model_text.startswith("exit 3 after"))
+
+    def test_the_bound_input_is_checked_before_it_runs(self) -> None:
+        ws = workspace(self)
+
+        def float_timeout(call: b.ToolCall) -> perm.Decision:
+            return perm.Decision(perm.APPROVED, dict(call.input, timeout_s=5.5))
+
+        out = run(ws, "shell", {"command": "touch ran", "timeout_s": 5}, float_timeout)
+        self.assertEqual(out.status, r.ERROR)
+        self.assertIn("invalid approved input", out.model_text)
+        self.assertFalse((ws.root / "ran").exists())
 
     def test_a_denied_command_does_not_run(self) -> None:
         ws = workspace(self)

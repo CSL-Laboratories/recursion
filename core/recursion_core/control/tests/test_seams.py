@@ -3319,18 +3319,36 @@ class CliSeamTest(unittest.TestCase):
             self.assertEqual(cli.run(['session', 'ses-1'], lambda: client), 0)
         self.assertEqual(seen, [('session', 'ses-1', client)])
 
-    def test_run_with_nothing_installed_is_the_base_and_a_broken_registrant_stops_it(self) -> None:
+    def test_the_five_commands_never_compose_and_a_broken_registrant_stops_only_a_command_that_is_not_one_of_them(self) -> None:
         client = Client()
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(cli.run(['list'], lambda: client), cli.EXIT_OK)
         status, base_out, _, base_calls = self.run_main(['list'], None)
         self.assertEqual((cli.EXIT_OK, out.getvalue(), client.calls), (status, base_out, base_calls))
-        client = Client()
-        with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')), \
-                contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(cli.run(['list'], lambda: client), cli.EXIT_ERROR)
-        self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
-        self.assertEqual(client.calls, [])
+        # A registrant that is installed and broken. The CLI's own five commands answer what they answer with no
+        # table at all, and the composition is not asked: nothing of a lane is discovered or imported for them.
+        five = (['list'], ['status', 'run-1'], ['stop', 'run-1'],
+                ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p'], ['conditions'])
+        self.assertEqual(tuple(argv[0] for argv in five), commands.BUILT_IN)
+        for argv in five:
+            with self.subTest(argv=argv):
+                client = Client()
+                with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')) as compose, \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    status = cli.run(argv, lambda: client)
+                base_status, base_out, _, base_calls = self.run_main(argv, None)
+                self.assertEqual((status, out.getvalue(), client.calls), (base_status, base_out, base_calls))
+                self.assertNotEqual(client.calls, [], 'the command reached the client')
+                compose.assert_not_called()
+        # Anything else needs the families, and then the broken registrant stops it, loudly, before the client.
+        for argv in (['session', 'ses-1'], [], ['--help']):
+            with self.subTest(argv=argv):
+                client = Client()
+                with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(cli.run(argv, lambda: client), cli.EXIT_ERROR)
+                self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
+                self.assertEqual(client.calls, [])
 
 
 KEYED = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'client_key': 'k1'}

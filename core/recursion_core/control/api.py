@@ -351,6 +351,14 @@ class ControlAPI:
                 # A relaunch under the same run id, from the stored record: its engine, key, principal and launch
                 # object stay as they were written, and the write is a CAS on its generation.
                 rec = self._current(prior)
+                # PROVISIONAL, as for a new start above: the stored route entry is checked against what THIS
+                # composition would launch, before the new starting intent is written. The composition may have
+                # changed since the entry was chosen (another binary in the route file, a daemon restart). No
+                # registrant runs again and the stored record is left exactly as it was.
+                stored_launch = rec.get("launch")
+                entry = stored_launch.get("route_entry") if isinstance(stored_launch, dict) else None
+                if entry is not None and self._launchable is not None and not self._launchable(entry):
+                    return {"code": "unavailable", "detail": "start_registrant_failed"}
                 rec.update(state="starting", cgroup=None, started_at=self._clock())
             if self._commit(rec) != "ok":
                 raise _RegistryError("put:StaleGeneration")

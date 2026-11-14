@@ -21,7 +21,7 @@ from unittest import mock
 import recursion_core.daemon as daemon_module
 from recursion_core.control import hooks as H, methods
 from recursion_core.control.client import SocketAPI
-from recursion_core.control.tests.test_seams import FakeStore, Service, quiet, row_names_service
+from recursion_core.control.tests.test_seams import FakeStore, Service, WatchedLock as OwnerLock, quiet, row_names_service
 from recursion_core.daemon import Daemon, Registry, control_adapter as adapter, launcher
 from recursion_core.daemon.tests.test_composition import (
     BOOT, LINUX, LINUX_ONLY, STANDIN, ProcessUnitManager, Units, until,
@@ -48,6 +48,48 @@ def hooks_of(register=None, **single):
 def peer(pid=None):
     """A socket connection as ``DaemonControl.handle`` sees it."""
     return mock.Mock(peer=mock.Mock(pid=os.getpid() if pid is None else pid))
+
+
+def held_hook(store, answer=None):
+    """A lane's hook that stays inside until it is let go, and writes down whether its store was closed when it
+    left. ``(hook, entered, leave, seen)``."""
+    entered, leave, seen = threading.Event(), threading.Event(), []
+
+    def hook(*args):
+        entered.set()
+        leave.wait(HELD_BOUND_S)
+        seen.append(store.closed)
+        return answer
+    return hook, entered, leave, seen
+
+
+def close_waits(case, made, store, close, entered, leave):
+    """Lane code is inside (``entered``) on a thread that no client call's admission covers. ``close`` is called
+    now, on a thread of its own. It moves on in one of two ways: it WAITS in the drain (right), or it finishes
+    (wrong). Either sets one event, and what is true at that moment is what is asserted, so no schedule decides
+    the test. Then the lane code is let go, and the close ends with the store closed."""
+    case.assertTrue(entered.wait(HELD_BOUND_S), 'the lane code is inside')
+    moved_on, finished, wait = threading.Event(), [], made.gate._changed.wait
+
+    def waiting(timeout=None):
+        moved_on.set()
+        return wait(timeout)
+
+    def closing():
+        try:
+            close()
+        finally:
+            finished.append(store.closed)
+            moved_on.set()
+    made.gate._changed.wait = waiting
+    closer = threading.Thread(target=closing, daemon=True)
+    closer.start()
+    case.assertTrue(moved_on.wait(HELD_BOUND_S), 'the close moved on, one way or the other')
+    case.assertEqual((finished, store.closed, made.gate.admitted), ([], False, 1),
+                     'it WAITS: the store is open and the close has not ended while the lane code is inside')
+    leave.set()
+    closer.join(HELD_BOUND_S)
+    case.assertEqual((finished, store.closed), ([True], True))
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
@@ -292,6 +334,50 @@ class AuthorizeSeamTest(Composed):
             self.assertEqual(control.call('run.list'), {'code': 'scope_refused', 'detail': 'authorizer_failed'})
             self.assertEqual(self.api(composed).call('run.list')['detail'], 'daemon:scope_refused')
 
+    def test_a_refused_peers_reply_id_is_not_sized(self):
+        """As before the seams: the room for a reply's id is worked out for a request that is answered. A peer the
+        authorizer refuses costs no sizing of whatever it sent as its id."""
+        _, composed = self.boot()
+        frame = {'op': 'control', 'method': 'run.list', 'params': {}, 'id': 'x' * 64}
+        with mock.patch.object(adapter, '_wire_size', wraps=adapter._wire_size) as sized:
+            refused = composed.control.handle(dict(frame), peer(0))     # inside a run unit: refused by default
+            self.assertEqual((refused['ok'], refused['error']['code']), (False, 'scope_refused'))
+            sized.assert_not_called()
+            self.assertEqual(composed.control.handle(dict(frame), peer()), {'ok': True, 'result': {'code': 'ok', 'runs': []}})
+            self.assertIn(mock.call(frame['id']), sized.call_args_list, 'an answered request leaves room for its id')
+
+    def test_an_authorizers_own_unavailable_is_its_refusal_on_the_page_and_not_a_closing_daemon(self):
+        _, composed = self.boot(hooks_of(authorize=lambda principal, method, params: ('unavailable', 'policy_loading')))
+        self.assertFalse(composed.hooks.closing.is_set())
+        self.assertEqual(self.page(composed, 'GET', '/v1/routes'), (403, {'error': 'unavailable'}))
+        self.assertEqual(self.page(composed, 'POST', '/v1/operator', {'command': 'operator.health.inspect'}),
+                         (403, {'error': 'unavailable'}))
+        self.assertEqual(self.page(composed, 'POST', '/v1/runs/stop', {'run_id': 'run-none'}),
+                         (200, {'code': 'unavailable', 'detail': 'policy_loading'}))
+
+    def test_on_a_real_daemon_the_guis_old_transport_name_is_the_pages_one(self):
+        """One page transport. ``gui_transport`` on a real control object is ``page_transport``: the device
+        principal, the authorizer and the admission in front. Its old body answers only a stand-in handed to it
+        unbound, as the existing tests do."""
+        seen = []
+
+        def authorize(principal, method, params):
+            seen.append((principal, method))
+            return ('scope_refused', 'not yours')
+        _, composed = self.boot(hooks_of(authorize=authorize))
+        control = composed.control
+        self.assertEqual(control.gui_transport('GET', '/v1/routes', b''), (403, b'{"error": "scope_refused"}'))
+        status, body = control.gui_transport('POST', '/v1/runs/stop', b'{"run_id": "run-none"}')
+        self.assertEqual((status, json.loads(body)), (200, {'code': 'scope_refused', 'detail': 'not yours'}))
+        self.assertEqual(control.gui_transport('POST', '/v1/operator', b'{"command": "operator.health.inspect"}'),
+                         (403, b'{"error": "scope_refused"}'))
+        self.assertEqual(control.gui_transport('POST', '/v1/control', b'{}'), (404, b'{"error": "not_found"}'))
+        self.assertEqual(seen, [(H.DEVICE, 'route.list'), (H.DEVICE, 'run.stop'), (H.DEVICE, 'operator.read')])
+        stand_in = mock.Mock(spec=['route_records'])
+        stand_in.route_records.return_value = []
+        self.assertEqual(adapter.DaemonControl.gui_transport(stand_in, 'GET', '/v1/routes', b''), (200, b'{"routes": []}'))
+        self.assertEqual(len(seen), 3, 'the stand-in met no authorizer: it is not a client entry of a daemon')
+
 
 class MethodSeamTest(Composed):
     """S1, S11 and the readiness part of S13: a lane's method, served on every entry."""
@@ -324,6 +410,39 @@ class MethodSeamTest(Composed):
         self.assertEqual(len(seen), 3)
         self.assertEqual(self.api(composed).call('methods.list')['methods'][list(methods.METHODS).index('session.status')],
                          {'name': 'session.status', 'implemented': True, 'beta': True})
+
+    def test_the_page_is_admitted_before_its_list_of_methods_is_asked_for(self):
+        """S11 with S13. The list of the page's methods is a lane's own code. A request is admitted before the
+        list is asked for: a close waits for a provider that is inside, with the store open, and after the close
+        the page is told the daemon is closing and the provider is not asked at all."""
+        store, asked = FakeStore(), []
+        entered, leave = threading.Event(), threading.Event()
+        self.addCleanup(leave.set)
+
+        def listed():
+            asked.append(store.closed)
+            if len(asked) == 1:
+                entered.set()
+                leave.wait(HELD_BOUND_S)
+                asked.append(store.closed)
+            return frozenset({'session.status'})
+
+        def register(made):
+            made.methods.register('session.status', lambda ctx, params: {'code': 'ok'})
+            made.set('page_methods', listed)
+            made.set('event_store', lambda state_dir: store)
+        daemon, composed = self.boot(hooks_of(register))
+        request, answers = {'method': 'session.status', 'params': {'session_id': 'ses-1'}}, []
+        caller = threading.Thread(target=lambda: answers.append(self.page(composed, 'POST', '/v1/control', request)), daemon=True)
+        caller.start()
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        close_waits(self, composed.hooks, store, composed.close, entered, leave)
+        caller.join(HELD_BOUND_S)
+        self.assertEqual((asked, answers), ([False, False], [(200, {'code': 'ok'})]),
+                         'the store was open while the provider was inside, and the admitted request was answered')
+        self.assertEqual(self.page(composed, 'POST', '/v1/control', request), (200, {'code': 'unavailable', 'detail': 'daemon_closing'}))
+        self.assertEqual(len(asked), 2, 'after the close no lane code runs for the page')
 
     def test_a_call_made_inside_a_handler_is_authorized_again_as_the_same_principal(self):
         seen = []
@@ -474,6 +593,59 @@ class EngineSeamTest(Composed):
         with self.assertRaises(KeyError) as caught:
             composed.hooks.credentials('work', 'ANTHROPIC_API_KEY')
         self.assertEqual(caught.exception.args, ('work',))
+
+    def test_a_close_waits_for_a_credential_source_that_is_inside_and_after_it_a_launch_is_refused_unasked(self):
+        """S7 with S13. An adapter asks for a credential on the run's own thread, after the start may have
+        answered. The source holds a lifetime reference of its own; once closing has begun the lookup refuses
+        the launch, typed, before the source is asked."""
+        built, store = [], FakeStore()
+        source, entered, leave, seen = held_hook(store, 'the-secret')
+        self.addCleanup(leave.set)
+
+        def factory(launch, clock, credentials, environ, **options):
+            built.append(credentials)
+            return ClaudeCodeAdapter(launch, clock, credentials, environ, **options)
+
+        def register(made):
+            made.engines.register('claude_code', factory, replace=True)
+            made.set('credentials', source)
+            made.set('event_store', lambda state_dir: store)
+        daemon, composed = self.boot(hooks_of(register))
+        lookup, = built
+        got = []
+        user = threading.Thread(target=lambda: got.append(lookup('work', 'ANTHROPIC_API_KEY')), daemon=True)
+        user.start()
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        close_waits(self, composed.hooks, store, composed.close, entered, leave)
+        user.join(HELD_BOUND_S)
+        self.assertEqual((got, seen), (['the-secret'], [False]), 'the store was open for as long as the source was inside')
+        with self.assertRaises(c.RouteError) as caught:
+            lookup('work', 'ANTHROPIC_API_KEY')
+        self.assertEqual((caught.exception.code, caught.exception.detail, len(seen)), (c.LAUNCH_REFUSED, 'daemon_closing', 1))
+
+    def test_a_registered_factory_that_fails_leaves_no_plugin_host_and_no_breaker_store_open(self):
+        closed = []
+
+        class Host(adapter.PluginHost):
+            def close(inner):
+                closed.append('plugins')
+                return super().close()
+
+        class Breaker(adapter.DurableRouteBreaker):
+            def close(inner):
+                closed.append('breaker')
+                return super().close()
+
+        def factory(launch, clock, credentials, environ, **options):
+            raise RuntimeError('this engine cannot be built')
+        with mock.patch.object(adapter, 'PluginHost', Host), mock.patch.object(adapter, 'DurableRouteBreaker', Breaker):
+            with self.assertRaises(RuntimeError):
+                self.boot(hooks_of(lambda made: made.engines.register('claude_code', factory, replace=True)))
+            self.assertEqual(closed, ['plugins', 'breaker'], 'what was opened before the factories is closed, in that order')
+        self.assertEqual(self.open, [])
+        _, composed = self.boot()    # what it held is free again: the next composition opens the same stores
+        self.assertEqual(composed.control.call('route.list')['breaker_store'], 'durable')
 
     def test_an_engine_a_lane_registered_is_read_by_all_three_readers_of_the_engine_set(self):
         built = []
@@ -752,6 +924,43 @@ class LaunchSeamTest(Composed):
                 self.assertEqual((composed.control.registry.list(), self.units.started), ([], []), 'no run, no launch record, no unit')
                 self.shutdown()
 
+    def test_a_relaunch_from_a_stored_entry_is_checked_against_the_composition_that_would_launch_it(self):
+        # PROVISIONAL, the same ruling, on a relaunch. The entry was chosen and stored under one composition and
+        # its start failed. The daemon comes back with another binary for that engine: the retry writes no new
+        # starting intent and launches nothing, no registrant runs again, and the stored record is as it was. With
+        # the first binary back, the same retry relaunches the run.
+        log, verdicts = [], ['not_this_time']
+        chosen = json.loads(json.dumps(self.routes['claude_code']))
+
+        def register(made):
+            made.start_registrant('routing', ('hand_pick',), ('route_entry', 'route_decision'),
+                                  lambda principal, request: log.append('registrant') or {'route_entry': chosen, 'route_decision': None},
+                                  chooses_engine=True)
+            made.set('launch_check', lambda ctx, executable: verdicts.pop(0) if verdicts else None)
+        request = {'tenant': 't1', 'prompt': LIVE, 'client_key': 'k1'}
+        _, composed = self.boot(hooks_of(register))
+        first = composed.control.call('run.start', request)
+        self.assertEqual((first['code'], first['start_error']),
+                         ('start_failed', {'code': 'launch_refused', 'detail': 'launch_check:not_this_time'}), first)
+        run_id = first['run_id']
+        self.shutdown()
+        other = self.tmp / 'bin' / 'elsewhere' / 'claude'
+        other.parent.mkdir(mode=0o700)
+        shutil.copyfile(self.engine, other)
+        os.chmod(other, 0o700)
+        self.routes['claude_code']['binary'] = str(other)
+        _, composed = self.boot(hooks_of(register))
+        before = composed.control.registry.get(run_id)
+        self.assertEqual(before['launch']['route_entry']['binary'], str(self.engine))
+        self.assertEqual(composed.control.call('run.start', request), {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+        self.assertEqual((composed.control.registry.get(run_id), self.units.started, log), (before, [], ['registrant']))
+        self.shutdown()
+        self.routes['claude_code']['binary'] = str(self.engine)
+        _, composed = self.boot(hooks_of(register))
+        again = composed.control.call('run.start', request)
+        self.assertEqual((again['code'], again['run']['run_id'], log), ('started', run_id, ['registrant']), again)
+        self.stop(composed.control, run_id)
+
     def test_a_route_entry_a_registrant_chose_is_what_the_starter_launches(self):
         chosen = json.loads(json.dumps(self.routes['claude_code']))
         chosen['route']['model'] = 'chosen-model'
@@ -910,6 +1119,152 @@ class DriveOwnerSeamTest(unittest.TestCase):
         self.assertEqual((code, detail), (c.ENGINE_ERROR, 'drive owner failure: RuntimeError'))
         self.assertTrue(until(lambda: not starter.active('run-1')))
         self.assertEqual(service.requests, [])
+
+    @quiet
+    def test_an_owner_that_fails_after_it_launched_has_its_tree_settled_and_is_released_even_when_that_fails(self):
+        for settle_fails in (False, True):
+            with self.subTest(settle_fails=settle_fails):
+                settled, uncaught = [], []
+
+                class Owner:
+                    def run(self, ctx, *rest):
+                        ctx.process = mock.Mock()          # it launched an engine, and then lost its worker
+                        raise RuntimeError('lost the worker')
+
+                def settle(ctx):
+                    settled.append(ctx.run_id)
+                    if settle_fails:
+                        raise OSError('the tree could not be read')
+                starter, service = self.starter(lambda ctx, request: Owner())
+                starter._settle = settle
+                with mock.patch.object(threading, 'excepthook', lambda args: uncaught.append(args.exc_type)):
+                    self.assertEqual(self.refused(starter), (c.ENGINE_ERROR, 'drive owner failure: RuntimeError'))
+                    self.assertTrue(until(lambda: not starter.active('run-1')), 'released, whatever the settling did')
+                    self.assertTrue(until(lambda: uncaught or not settle_fails))
+                self.assertEqual((settled, uncaught), (['run-1'], [OSError] if settle_fails else []),
+                                 'what is left of its tree was settled, once; a failure of that is not swallowed')
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class RunThreadLifetimeTest(unittest.TestCase):
+    """S13 on a run's own thread. The start that made the thread may have answered already, so no client call's
+    admission covers the drive-owner chooser (S9) or the launcher with its two hooks (S10, S4). Each holds a
+    lifetime reference of its own: a close waits for it with the store open, and once closing has begun it is
+    refused before any lane code runs. (The credential source, S7, is in ``EngineSeamTest``: its lookup is made
+    by the composition.)"""
+
+    def made(self, store, **single):
+        made = hooks_of(event_store=lambda state_dir: store, **single)
+        made.open_store('/state')
+        self.addCleanup(made.finish_close, H.ServiceContext())
+        return made
+
+    def starter(self, made, start_timeout_s):
+        folder = tempfile.mkdtemp(prefix='rc-seams-life-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        service = FakeService()
+        return adapter.RouteStarter(service, DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False), folder, hooks=made,
+                                    start_timeout_s=start_timeout_s), service
+
+    def launch(self, made):
+        """The production launcher over stand-ins, called as an adapter calls it: ``(context, unit manager, state
+        folder, call, outcome)``. The stand-in manager prepares no unit, so a launch that gets that far ends
+        there with an ``OSError``."""
+        state = Path(tempfile.mkdtemp(prefix='rc-seams-launch-'))
+        self.addCleanup(shutil.rmtree, state, True)
+        os.chmod(state, 0o700)
+        manager = mock.Mock()
+        manager.prepare.side_effect = OSError('this test has no unit manager')
+        launch = launcher.ProductionLauncher('claude_code', mock.Mock(), manager, state, hooks=made)
+        ctx, outcome = launcher.RunContext('run-1'), []
+
+        def call():
+            try:
+                with launcher.bound_run(ctx):
+                    launch(['/bin/sh'], env={'PATH': '/usr/bin:/bin'})
+                outcome.append('launched')
+            except c.RouteError as exc:
+                outcome.append((exc.code, exc.detail))
+            except OSError:
+                outcome.append('reached the unit manager')
+        return ctx, manager, state, call, outcome
+
+    def test_a_close_waits_for_the_chooser_of_a_run_whose_start_has_already_answered(self):
+        store = FakeStore()
+        chooser, entered, leave, seen = held_hook(store)
+        self.addCleanup(leave.set)
+        made = self.made(store, drive_owner=chooser)
+        starter, service = self.starter(made, 0)
+        with self.assertRaises(adapter.StartRefused) as caught:
+            starter(dict(DriveOwnerSeamTest.PARAMS))
+        self.assertEqual(caught.exception.code, 'launch_timeout', 'the start has answered; the run\'s own thread goes on')
+        close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), entered, leave)
+        self.assertEqual(seen, [False], 'the store was open for as long as the chooser was inside')
+        self.assertTrue(until(lambda: not starter.active('run-1')))
+
+    def test_once_closing_has_begun_a_run_is_refused_before_its_chooser_is_asked(self):
+        store, asked = FakeStore(), []
+        made = self.made(store, drive_owner=lambda ctx, request: asked.append(ctx.run_id))
+        starter, service = self.starter(made, HELD_BOUND_S)
+        made.begin_close()
+        with self.assertRaises(adapter.StartRefused) as caught:
+            starter(dict(DriveOwnerSeamTest.PARAMS))
+        self.assertEqual((caught.exception.code, caught.exception.detail), (c.LAUNCH_REFUSED, 'daemon_closing'))
+        self.assertEqual((asked, service.requests), ([], []), 'nothing was chosen and nothing was driven')
+        self.assertTrue(until(lambda: not starter.active('run-1')))
+
+    def test_a_close_waits_for_a_launch_that_is_inside_one_of_its_hooks(self):
+        for hook in ('launch_check', 'working_directory'):
+            with self.subTest(hook=hook):
+                store = FakeStore()
+                held, entered, leave, seen = held_hook(store)
+                self.addCleanup(leave.set)
+                made = self.made(store, **{hook: held})
+                ctx, manager, state, call, outcome = self.launch(made)
+                user = threading.Thread(target=call, daemon=True)
+                user.start()
+                close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), entered, leave)
+                user.join(HELD_BOUND_S)
+                self.assertEqual((seen, outcome), ([False], ['reached the unit manager']),
+                                 'the store was open while the hook was inside, and until the launch it belongs to had ended')
+
+    def test_once_closing_has_begun_nothing_is_launched_and_no_launch_hook_is_asked(self):
+        store, asked = FakeStore(), []
+        made = self.made(store, launch_check=lambda ctx, executable: asked.append('check'),
+                         working_directory=lambda ctx: asked.append('folder'))
+        ctx, manager, state, call, outcome = self.launch(made)
+        made.begin_close()
+        call()
+        self.assertEqual((outcome, asked), ([(c.LAUNCH_REFUSED, 'daemon_closing')], []))
+        manager.prepare.assert_not_called()
+        # With hooks nobody registered into the gate is off: a launch during a close is the launch it always was.
+        bare = hooks_of()
+        bare.begin_close()
+        ctx, manager, state, call, outcome = self.launch(bare)
+        call()
+        self.assertEqual(outcome, ['reached the unit manager'])
+
+    def test_a_start_that_was_abandoned_while_a_launch_hook_ran_launches_nothing(self):
+        """The hook takes longer than the start waits: the start gives up and is answered while the hook is
+        inside. When the hook returns nothing is launched for it: no run directory, no unit."""
+        for hook in ('launch_check', 'working_directory'):
+            with self.subTest(hook=hook):
+                asked = []
+
+                def spans_the_wait(ctx, *rest):
+                    asked.append(hook)
+                    self.assertTrue(ctx.abandon(), 'the start gave up while the hook was inside')
+                    return None
+                hooks = {'launch_check': lambda ctx, executable: asked.append('launch_check'),
+                         'working_directory': lambda ctx: asked.append('working_directory'), hook: spans_the_wait}
+                made = hooks_of(**hooks)
+                ctx, manager, state, call, outcome = self.launch(made)
+                call()
+                self.assertEqual(outcome, [(c.LAUNCH_REFUSED, 'start_abandoned')])
+                # The check comes first. A start abandoned during it asks for no folder: no lane code runs for it.
+                self.assertEqual(asked, ['launch_check'] if hook == 'launch_check' else ['launch_check', 'working_directory'])
+                manager.prepare.assert_not_called()
+                self.assertFalse((state / 'runs').exists(), 'nothing of the unit was made')
 
 
 class WatchedLock:
@@ -1332,7 +1687,8 @@ class ServicesSeamTest(Composed):
         store.register_tables('sessions', 1, 'CREATE TABLE intents (command_id TEXT PRIMARY KEY, what TEXT NOT NULL)')
         events = Service('events', log)
         events.ready = True
-        # No published row names a service today; these tests say what the row of a lane with one would say.
+        # Only the two reads of a log name a service in the published table. The callback case is a command, so it
+        # says what the row of a lane with a service would say.
         row_names_service(self, 'session.start' if callback else 'events.follow', 'events')
 
         def held(ctx, params):
@@ -1461,6 +1817,102 @@ class ServicesSeamTest(Composed):
         composed.close()
         self.assertEqual(seen, [(True, {'code': 'unavailable', 'detail': 'daemon_closing'})])
         self.assertTrue(store.closed)
+
+    def two_closers(self, interrupted):
+        """The composition's close has one owner. The first close is held inside a service's stop. A second close
+        arrives then, on another thread (and is interrupted while it waits, when ``interrupted``). What each
+        closer finds at the moment its own call ends is written down then, so no schedule decides the test."""
+        log, in_stop, go_on = [], threading.Event(), threading.Event()
+        self.addCleanup(go_on.set)
+        store = FakeStore(log)
+
+        class Held(Service):
+            def stop(inner, context):
+                in_stop.set()
+                go_on.wait(HELD_BOUND_S)
+                super().stop(context)
+
+        def register(made):
+            made.service(Held('events', log))
+            made.set('event_store', lambda state_dir: store)
+        daemon, composed = self.boot(hooks_of(register))
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        counts, close_plugins = [], composed.plugins.close
+        composed.plugins.close = lambda: (counts.append('plugins'), close_plugins())[1]
+        composed._closing = OwnerLock()
+        done = []
+
+        def close(name):
+            try:
+                composed.close()
+                done.append((name, 'returned', store.closed, list(counts)))
+            except KeyboardInterrupt:
+                done.append((name, 'interrupted', store.closed, list(counts)))
+        first = threading.Thread(target=close, args=('first',), daemon=True)
+        first.start()
+        self.assertTrue(in_stop.wait(HELD_BOUND_S), 'the first close is inside the service\'s stop')
+        if interrupted:
+            composed._closing.interrupt_next = 'before'     # the next thread that asks for the close is interrupted
+        second = threading.Thread(target=close, args=('second',), daemon=True)
+        second.start()
+        self.assertTrue(composed._closing.contended.wait(HELD_BOUND_S), 'the second close has arrived')
+        self.assertEqual((store.closed, counts), (False, []), 'nothing is closed under the first')
+        go_on.set()
+        first.join(HELD_BOUND_S)
+        second.join(HELD_BOUND_S)
+        self.assertEqual(sorted(done), [('first', 'returned', True, ['plugins']),
+                                        ('second', 'interrupted' if interrupted else 'returned', True, ['plugins'])],
+                         'the second ended only when the whole close was complete, and closed nothing itself')
+        composed.close()            # and a close after it returns at once
+        self.assertEqual((counts, [what for what, _, _ in log if what in ('stop', 'close')]), (['plugins'], ['stop', 'close']))
+
+    def test_a_second_close_of_the_composition_waits_for_the_first_and_closes_nothing_itself(self):
+        self.two_closers(interrupted=False)
+
+    def test_a_second_close_that_is_interrupted_while_it_waits_goes_on_waiting(self):
+        self.two_closers(interrupted=True)
+
+    def test_a_failure_inside_the_close_is_raised_once_after_everything_was_closed(self):
+        log, entered, leave = [], threading.Event(), threading.Event()
+        made, store, events = self.registered(log, entered, leave)
+        daemon, composed = self.boot(made)
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        stop_transport = composed.server.close
+
+        def failing():
+            stop_transport()
+            raise OSError('the socket file could not be removed')
+        composed.server.close = failing
+        with self.assertRaises(OSError):
+            composed.close()
+        self.assertEqual(([(what, name) for what, name, _ in log if what != 'start'], store.closed),
+                         ([('stop', 'events'), ('close', 'store')], True), 'the rest of the close ran before the failure was raised')
+        composed.close()            # it is closed: a later close does nothing, and raises nothing
+
+    def test_a_close_called_from_inside_the_close_is_refused_and_does_not_wait_for_itself(self):
+        log, seen = [], []
+        store = FakeStore(log)
+
+        class Closes(Service):
+            def stop(inner, context):
+                try:
+                    composed.close()
+                    seen.append('ran')
+                except H.HookError:
+                    seen.append('refused')
+                super().stop(context)
+
+        def register(made):
+            made.service(Closes('events', log))
+            made.set('event_store', lambda state_dir: store)
+        daemon, composed = self.boot(hooks_of(register))
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        composed.close()
+        self.assertEqual((seen, store.closed, [what for what, _, _ in log if what in ('stop', 'close')]),
+                         (['refused'], True, ['stop', 'close']))
 
     @quiet
     def test_a_start_that_fails_part_way_releases_everything_it_made(self):

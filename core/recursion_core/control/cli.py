@@ -25,7 +25,7 @@ import sys
 from collections.abc import Callable
 from typing import TextIO
 
-from recursion_core.control.commands import CommandTableError
+from recursion_core.control.commands import BUILT_IN, CommandTableError
 from recursion_core.tui.protocol import answer_conditions, list_all_runs
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PENDING, EXIT_UNKNOWN = 0, 1, 2, 3, 4
@@ -115,6 +115,11 @@ def run(argv: list[str], api_factory: Callable[[], object] | None) -> int:
         print(json.dumps({"code": "control_api_unavailable", "detail": f"factory:{type(err).__name__}"}),
               file=sys.stdout)
         return EXIT_ERROR
+    if argv and argv[0] in BUILT_IN:
+        # This file's own five commands take the path they always took. No registrant is discovered or imported
+        # for them: a lane that is installed and broken cannot stop them, no family can reach their parsers, and
+        # they cost what they cost before the seams. No registrant can own one of these names.
+        return main(argv, api)
     try:  # seam S2: compose the hooks to learn the registered command families; with none this adds nothing
         from recursion_core.control import hooks
         commands = hooks.compose().commands

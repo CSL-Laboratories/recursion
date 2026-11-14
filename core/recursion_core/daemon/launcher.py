@@ -423,6 +423,21 @@ class ProductionLauncher:
 
     # -- launch --------------------------------------------------------------------------------
     def __call__(self, argv, *, env, shell=False, **options):
+        if self._hooks is None:
+            return self._launch(argv, env=env, shell=shell, **options)
+        # Seam S13. A launch runs on the run's own thread, which no client call's admission covers once the start
+        # has answered. It holds one lifetime reference of its own, through its hooks (S10, S4) and until it has
+        # launched or refused: closing waits for it with the services and the store alive, and once closing has
+        # begun nothing is launched. With nothing registered the gate is off and this is the call it always was.
+        gate = self._hooks.gate
+        if not gate.enter():
+            raise refused('daemon_closing')
+        try:
+            return self._launch(argv, env=env, shell=shell, **options)
+        finally:
+            gate.leave()
+
+    def _launch(self, argv, *, env, shell=False, **options):
         if shell is not False or options:
             raise refused('launch_option_denied')
         if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and '\0' not in a for a in argv):
@@ -466,10 +481,15 @@ class ProductionLauncher:
         if self._hooks is not None:
             # Seams S10 and S4, parent side: the executable is resolved, and nothing of the unit exists yet (no run
             # directory, no FIFO, no output file), so a refusal leaves nothing in the way of a relaunch. A hook
-            # that fails refuses the launch; it never lets it through.
+            # that fails refuses the launch; it never lets it through. A hook can take longer than the start
+            # waits: after each one, a start that was abandoned meanwhile launches nothing, as after the bind.
             try:
                 self._hooks.launch_check(ctx, executable)
+                if ctx.cancelled:
+                    raise refused('start_abandoned')
                 working_directory = self._hooks.working_directory(ctx)
+                if ctx.cancelled:
+                    raise refused('start_abandoned')
             except HookRefused as exc:
                 raise refused(exc.code + (':' + exc.detail if exc.detail else '')) from None
         run_dir = private_dir(self._state / 'runs' / ctx.run_id)

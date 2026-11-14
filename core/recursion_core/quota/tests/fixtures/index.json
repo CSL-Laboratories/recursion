@@ -1,0 +1,30 @@
+{
+  "about": "Lane QUOTA's fixtures, sent to lane SPINE for schemas/control/v1/fixtures/good/ and used by quota/tests. Each entry names the schema the file validates against (by its $id in schemas/control/v1/) and what it shows, in the form of SPINE's own index. Money and counts are hand-written; nothing here was captured from an engine.",
+  "fixtures": [
+    {
+      "file": "q01-claude-key-turn-usage-tokens-observed-cost-modelled.json",
+      "schema": "event.v1.json",
+      "shows": "Claude Code on an API key, a run with no session (its log is 'run:<run_id>'): one turn's usage from the result envelope. The tokens are observed; the cost is modelled (the engine prices the turn from a table), known, and kept with its own provenance; reasoning tokens are not reported and are null, not 0. A cap of 0.40 is reached by this turn alone; a cap of 1 leaves 0.5873."
+    },
+    {
+      "file": "q02-codex-key-session-total-cost-unknown.json",
+      "schema": "event.v1.json",
+      "shows": "Codex on an API key, in a session: the engine's running total for the session after its first turn. Every token count is observed; the cost is not reported, so it is unknown and null, and admission on this key refuses (spend_unknown) until a cost is known."
+    },
+    {
+      "file": "q03-codex-key-session-total-later-would-double-if-summed.json",
+      "schema": "event.v1.json",
+      "shows": "The same session's running total after its second turn. A session_total replaces the one before it in its log: the session's input is 11904, not 17024. Summing the two would double count."
+    },
+    {
+      "file": "q04-run-view-start-failed-reservation-refused.json",
+      "schema": "run.view.v1.json",
+      "shows": "RESERVED, as SPINE's h05 is (start_error is written once the lane that owns Stop writes it): a start the dollar reservation refused on the launch path, start_failed with start_error {code: reservation_refused, detail: no_opt_in}. The detail is the typed reason, never wording."
+    },
+    {
+      "file": "q05-run-start-refused-cap-zero.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "run.start answered start_failed because the key's cap is 0 (absent counts as 0): start_error {code: reservation_refused, detail: cap_zero}. It is not a direct code of run.start."
+    }
+  ]
+}

@@ -15,7 +15,7 @@ from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.claude_code import ClaudeCodeAdapter
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
-from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request
+from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request, runs_adapter
 
 PARENT_ENV = {
     "PATH": "/usr/bin", "HOME": "/home/op", "LANG": "C.UTF-8", "SECRET_THING": "x",
@@ -54,6 +54,7 @@ class CodexTest(unittest.TestCase):
         res = h.handle(request(engine="codex", model="gpt-5", **kw))
         return h, res
 
+    @runs_adapter
     def test_jsonrpc_sequence_and_answer(self) -> None:
         h, res = self.codex([codex_script("done")])
         self.assertEqual((res["status"], res["text"]), ("ok", "done"))
@@ -61,6 +62,7 @@ class CodexTest(unittest.TestCase):
         self.assertEqual(methods, ["initialize", "initialized", "account/rateLimits/read", "thread/start", "turn/start"])
         self.assertTrue(h.launcher.processes[0].stdin_closed)
 
+    @runs_adapter
     def test_rate_limits_read_exhausted_refuses_before_turn(self) -> None:
         limits = {"limitId": "codex", "primary": {"usedPercent": 100, "resetsAt": 1_000_500}}
         h, res = self.codex([codex_script(limits=limits)])
@@ -69,6 +71,7 @@ class CodexTest(unittest.TestCase):
                                         "source": "codex.account/rateLimits/read"})
         self.assertNotIn("turn/start", [m.get("method") for m in h.launcher.processes[0].sent])
 
+    @runs_adapter
     def test_rate_limits_updated_then_typed_turn_error(self) -> None:
         note = {"method": "account/rateLimits/updated",
                 "params": {"rateLimits": {"limitId": "gpt-5-bucket", "secondary": {"usedPercent": 100.0, "resetsAt": 1_000_900}}}}
@@ -82,6 +85,7 @@ class CodexTest(unittest.TestCase):
         self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5-bucket"), "open")
         self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
 
+    @runs_adapter
     def test_failed_turn_after_an_exhausted_bucket_opens_that_bucket(self) -> None:
         note = {"method": "account/rateLimits/updated",
                 "params": {"rateLimits": {"limitId": "gpt-5-bucket",
@@ -93,6 +97,7 @@ class CodexTest(unittest.TestCase):
         self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5"), "closed")
         self.assertEqual(h.handle(request(rid="other", engine="codex", model="gpt-5"))["text"], "next")
 
+    @runs_adapter
     def test_api_key_route_ignores_a_chatgpt_rate_limit_read_error(self) -> None:
         script = [{"id": 1, "result": {"userAgent": "fake"}},
                   {"id": 2, "error": {"code": -32000,
@@ -107,12 +112,14 @@ class CodexTest(unittest.TestCase):
         methods = [m.get("method") for m in h.launcher.processes[0].sent]
         self.assertIn("turn/start", methods)
 
+    @runs_adapter
     def test_typed_jsonrpc_error_is_plan_limit(self) -> None:
         script = codex_script()[:3] + [{"id": 4, "error": {"code": -32000, "message": "nope",
                                                            "data": {"codexErrorInfo": "usageLimitExceeded"}}}]
         _, res = self.codex([script])
         self.assertEqual((res["code"], res["limit"]["source"]), (c.PLAN_LIMIT, "codex.usageLimitExceeded"))
 
+    @runs_adapter
     def test_quota_text_in_error_is_short_fault_and_in_answer_is_nothing(self) -> None:
         turn = {"id": "tu-1", "status": "failed", "error": {"message": "rate limit exceeded upstream"}}
         _, res = self.codex([codex_script(turn=turn)])
@@ -120,12 +127,14 @@ class CodexTest(unittest.TestCase):
         _, res = self.codex([codex_script(text='{"codexErrorInfo": "usageLimitExceeded"} quota exhausted')])
         self.assertEqual((res["code"], res["breaker_effect"]), (None, "none"))
 
+    @runs_adapter
     def test_server_request_is_refused_not_hung(self) -> None:
         ask = {"id": 99, "method": "item/commandExecution/requestApproval", "params": {}}
         h, res = self.codex([codex_script(notes=[ask])])
         self.assertEqual(res["status"], "ok")
         self.assertIn({"id": 99, "error": {"code": -32601, "message": "unsupported"}}, h.launcher.processes[0].sent)
 
+    @runs_adapter
     def test_child_env_scrubs_codex_credentials(self) -> None:
         h, _ = self.codex([codex_script()])
         env = h.launcher.calls[0]["env"]
@@ -133,6 +142,7 @@ class CodexTest(unittest.TestCase):
             self.assertNotIn(name, env)
         self.assertEqual(env["CODEX_HOME"], "/home/op/.codex-route")
 
+    @runs_adapter
     def test_child_env_adds_only_the_selected_key(self) -> None:
         h, _ = self.codex([codex_script()], kind="api_key", conn_id="key-1", credential_env="OPENAI_API_KEY")
         env = h.launcher.calls[0]["env"]

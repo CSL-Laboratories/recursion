@@ -31,9 +31,19 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - `launch.py`: the injected launcher / process interface, `require_free_threaded()` (refuses a GIL build;
   the daemon calls it before starting processes and after each plugin load) and `child_env()` (explicit
   env from an allowlist; never `os.environ`).
+- `host.py`: `platform_supported()`, the one place in this package that reads `os` (`os.name` and whether
+  `os.geteuid` exists, the same test as `child_env` and `subscription_routes`). The adapter modules still
+  never import `os`.
 
 ## Rules it enforces
 
+- Windows refuses at the shared adapter boundary (Lucas, Nov 12, decision sheet D9: "Windows refuses
+  uniformly at the shared adapter boundary, before any path or connector is looked at"; R3-7).
+  `RouteAdapter.run`, which the Claude Code and Codex adapters share, answers `launch_refused` with detail
+  `platform_unsupported` before it builds an argv or an environment, asks for a credential or calls the
+  launcher. The profile routes keep their own refusal, `subscription_route_refused` with the same detail,
+  from `subscription_routes`. Route tests that run an adapter through a fake launcher carry
+  `fakes.runs_adapter` and are skipped on such a host; `tests/test_r3_finding_7.py` asserts the refusal there.
 - Only a typed limit signal opens a connection; it fences every tenant on that connection and no other
   connection. Text inside the model's payload (assistant/user content, Codex agent messages) is never
   inspected. Vague quota-sounding error text is a `short_fault`: one model, one tenant, 60 s (grill Q23).

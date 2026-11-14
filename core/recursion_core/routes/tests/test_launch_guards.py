@@ -16,7 +16,7 @@ from recursion_core.routes.base import Deadline
 from recursion_core.routes.launch import GilBuildRefused, child_env, require_free_threaded
 from recursion_core.routes.profile_route import profile_adapters
 from recursion_core.routes.service import RouteService
-from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request
+from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request, runs_adapter
 from recursion_core.subscription_routes import WrapperInstall, measure_package_pin
 
 PKG = pathlib.Path(__file__).resolve().parents[1]
@@ -26,6 +26,7 @@ POSIX_ONLY = ("POSIX-only: the route home owner check needs os.geteuid; subscrip
 
 
 class CodexUpdaterTest(unittest.TestCase):
+    @runs_adapter
     def test_stdio_worker_never_spawns_an_updater_over_a_simulated_hour(self) -> None:
         clock = FakeClock()
         launcher = FakeLauncher(lambda argv, env: codex_script("ok"), clock)

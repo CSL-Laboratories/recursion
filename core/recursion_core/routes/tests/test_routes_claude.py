@@ -14,7 +14,9 @@ from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.claude_code import ClaudeCodeAdapter
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
-from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok, request
+from recursion_core.routes.tests.fakes import (
+    FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok, request, runs_adapter,
+)
 
 PARENT_ENV = {
     "PATH": "/usr/bin", "HOME": "/home/op", "LANG": "C.UTF-8", "SECRET_THING": "x",
@@ -47,6 +49,7 @@ class Harness:
         return res
 
 
+@runs_adapter
 class ClaudeCodeTest(unittest.TestCase):
     def test_argv_and_stream_json_input(self) -> None:
         h = Harness([claude_ok()])

@@ -15,7 +15,7 @@ from recursion_core.routes.claude_code import ClaudeCodeAdapter
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import (
-    HANG, FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok, codex_script, request,
+    HANG, FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok, codex_script, request, runs_adapter,
 )
 
 PARENT_ENV = {
@@ -58,6 +58,7 @@ class ContractShapeTest(unittest.TestCase):
         self.assertEqual(h.handle(request(kind="api_key"))["code"], c.REQUEST_INVALID)
         self.assertEqual(h.launcher.calls, [])
 
+    @runs_adapter
     def test_ok_result_shape(self) -> None:
         h = Harness([claude_ok("hi")])
         res = h.handle(request())
@@ -67,6 +68,7 @@ class ContractShapeTest(unittest.TestCase):
         self.assertIsNone(res["limit_notice"])
 
 
+@runs_adapter
 class TenantIsolationTest(unittest.TestCase):
     def test_one_tenants_deadline_or_fault_never_fences_another(self) -> None:
         h = Harness([[HANG], claude_error("segfault"), ["garbage"], claude_ok("b")])

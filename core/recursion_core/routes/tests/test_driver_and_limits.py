@@ -19,7 +19,7 @@ from recursion_core.routes.claude_code import ClaudeCodeAdapter, SUBSCRIPTION_DR
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import (HANG, FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok,
-                                               codex_script, request)
+                                               codex_script, request, runs_adapter)
 
 PKG = Path(__file__).resolve().parents[1]
 PARENT = {
@@ -57,6 +57,7 @@ class Harness:
 
 
 class SubscriptionRouteTest(unittest.TestCase):
+    @runs_adapter
     def test_no_bare_and_per_run_drops(self) -> None:
         h = Harness([claude_ok()])
         self.assertEqual(h.handle(request())["status"], "ok")
@@ -66,6 +67,7 @@ class SubscriptionRouteTest(unittest.TestCase):
         for name in SUBSCRIPTION_DROP_ENV + ("ANTHROPIC_FEDERATION_EXAMPLE", "AWS_REGION"):
             self.assertNotIn(name, env)
 
+    @runs_adapter
     def test_users_own_sign_in_left_alone(self) -> None:
         h = Harness([claude_ok()])
         h.handle(request())
@@ -74,6 +76,7 @@ class SubscriptionRouteTest(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/home/op/.claude-alt")
         self.assertEqual(h.lookups, [])  # custody is never asked for a sign-in token
 
+    @runs_adapter
     def test_no_oauth_token_is_set_when_the_user_has_none(self) -> None:
         clock = FakeClock()
         launcher = FakeLauncher([claude_ok()], clock)
@@ -90,6 +93,7 @@ class SubscriptionRouteTest(unittest.TestCase):
         self.assertEqual(res["code"], c.LAUNCH_REFUSED)
         self.assertEqual(h.launcher.calls, [])
 
+    @runs_adapter
     def test_api_key_helper_present_is_shown_and_asked_not_overridden(self) -> None:
         h = Harness([claude_ok()])
         res = h.handle(request(api_key_helper="present"))
@@ -99,6 +103,7 @@ class SubscriptionRouteTest(unittest.TestCase):
         ok = h.handle(request(rid="r2", api_key_helper="present", billing_ack="api_key_helper"))
         self.assertEqual(ok["status"], "ok")  # the user picked: runs as their settings say, nothing changed
 
+    @runs_adapter
     def test_unreported_api_key_helper_is_a_question(self) -> None:
         h = Harness([])
         res = h.handle(request(api_key_helper=None))
@@ -106,11 +111,13 @@ class SubscriptionRouteTest(unittest.TestCase):
         self.assertEqual(h.handle(request(api_key_helper="maybe"))["code"], c.REQUEST_INVALID)
         self.assertEqual(h.launcher.calls, [])
 
+    @runs_adapter
     def test_bare_must_be_a_bool(self) -> None:
         self.assertEqual(Harness([]).handle(request(bare="yes"))["code"], c.REQUEST_INVALID)
 
 
 class ApiKeyAndPassthroughTest(unittest.TestCase):
+    @runs_adapter
     def test_api_key_route_custody_key_and_bare_allowed(self) -> None:
         h = Harness([claude_ok()])
         res = h.handle(request(kind="api_key", conn_id="key-2", credential_env="ANTHROPIC_API_KEY", bare=True))
@@ -122,6 +129,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         for name in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"):
             self.assertNotIn(name, call["env"])
 
+    @runs_adapter
     def test_api_key_helper_route_adds_no_key(self) -> None:
         h = Harness([claude_ok()])
         conn_req = request(kind="api_key", conn_id="helper-1")
@@ -139,6 +147,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
             req["route"]["connection"]["key_source"] = "api_key_helper"
             self.assertEqual(Harness([]).handle(req)["code"], c.REQUEST_INVALID, (engine, kind))
 
+    @runs_adapter
     def test_cloud_methods_pass_only_their_own_variables(self) -> None:
         # The picked method's variables pass through unchanged for this run; the daemon's other secrets
         # (another engine's key, a stray ANTHROPIC_API_KEY that would bill the API) never reach it.
@@ -197,6 +206,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
                     self.assertEqual(res["code"], c.LAUNCH_REFUSED, (method, name, value))
                     self.assertEqual(h.launcher.calls, [], (method, name, value))
 
+    @runs_adapter
     def test_passthrough_switch_must_be_clearly_on(self) -> None:
         # Bot review 4511550474 at 09d0c36f: a denylist of off values let "off" or "no" through, which claude
         # reads as off, so the run billed the sign-in under a cloud label. The switch is now an allowlist.
@@ -215,6 +225,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
                     # The child sees the canonical spelling, not the padded or capitalised parent value.
                     self.assertEqual(h.launcher.calls[0]["env"][name], value.strip().lower())
 
+    @runs_adapter
     def test_bedrock_passthrough_keeps_the_web_identity_role(self) -> None:
         # Bot review 4511222552 at 92a897b3: an AWS web-identity role (EKS IRSA) lost its two variables.
         h = Harness([claude_ok()])
@@ -237,6 +248,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         req["route"]["connection"]["method"] = "x"
         self.assertEqual(Harness([]).handle(req)["code"], c.REQUEST_INVALID)
 
+    @runs_adapter
     def test_bare_is_the_users_choice_on_passthrough(self) -> None:
         h = Harness([claude_ok()])
         req = request(kind="passthrough", bare=True)
@@ -245,6 +257,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         self.assertEqual(h.launcher.calls[0]["argv"][:2], ["claude", "--bare"])
         self.assertEqual(h.launcher.calls[0]["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
 
+    @runs_adapter
     def test_oauth_token_kept_on_every_route_and_parent_env_never_changed(self) -> None:
         before = dict(PARENT)
         h = Harness([claude_ok(), claude_ok(), claude_ok(), claude_ok()])
@@ -263,6 +276,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         for drop in (claude_code.SUBSCRIPTION_DROP_ENV, claude_code.API_KEY_DROP_ENV):
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", drop)
 
+    @runs_adapter
     def test_nothing_removes_a_sign_in_method_from_every_run(self) -> None:
         # Each route changes only its own run: the next subscription run still sees the user's sign-in.
         h = Harness([claude_ok(), claude_ok()])
@@ -287,6 +301,7 @@ class UnmodifiedBinaryTest(unittest.TestCase):
                           "os.environ", "import os"):
             self.assertNotIn(forbidden, code)
 
+    @runs_adapter
     def test_run_opens_no_file(self) -> None:
         h = Harness([claude_ok()])
         real_open = builtins.open
@@ -299,6 +314,7 @@ class UnmodifiedBinaryTest(unittest.TestCase):
         self.assertIs(builtins.open, real_open)
 
 
+@runs_adapter
 class CodexOwnLoginTest(unittest.TestCase):
     def test_codex_subscription_uses_its_own_cli_login_only(self) -> None:
         h = Harness([codex_script("ok")])
@@ -316,6 +332,7 @@ def limited_then(*scripts):
 
 
 class LimitsTest(unittest.TestCase):
+    @runs_adapter
     def test_default_is_show_and_ask_never_switch(self) -> None:
         h = Harness(limited_then(claude_ok("never")))
         fallback = [{"engine": "claude_code", "model": "m2", "connection": {"kind": "subscription", "id": "login-B"},
@@ -330,6 +347,7 @@ class LimitsTest(unittest.TestCase):
         self.assertIn("subscription:login-A", notice["message"])
         self.assertEqual(len(h.launcher.calls), 1)  # nothing else ran
 
+    @runs_adapter
     def test_service_default_is_ask(self) -> None:
         h = Harness(limited_then())
         res = h.handle(request())
@@ -337,6 +355,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(res["limit_notice"]["choices"], [{"action": "wait", "until": 1_000_500.0},
                                                           {"action": "cancel"}])
 
+    @runs_adapter
     def test_breaker_open_refusal_also_shows_the_limit(self) -> None:
         h = Harness(limited_then())
         h.handle(request())
@@ -344,6 +363,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(res["code"], c.BREAKER_OPEN)
         self.assertEqual(res["limit_notice"]["reset_at"], 1_000_500.0)
 
+    @runs_adapter
     def test_short_fault_refusal_is_no_limit_and_never_switches(self) -> None:
         # Grill Q23: vague quota text fences one model for one tenant; it is not a usage limit, so the
         # follow-up refusal gets no notice and the user's fallback order is not used.
@@ -355,6 +375,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual((res["code"], res["limit_notice"]), (c.SHORT_FAULT, None))
         self.assertEqual(len(h.launcher.calls), 1)  # no fallback route ever launched
 
+    @runs_adapter
     def test_probe_in_flight_shows_the_limit_and_follows_the_users_choice(self) -> None:
         h = Harness(limited_then(codex_script("codex answer")))
         h.handle(request())
@@ -370,6 +391,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(res["limit_notice"]["code"], c.PROBE_IN_FLIGHT)
         self.assertEqual(res["limit_notice"]["switched_to"]["engine"], "codex")
 
+    @runs_adapter
     def test_probe_lease_follows_the_run_deadline(self) -> None:
         # A probe run with a 600 s deadline still holds its lease 599 s in: no second probe is admitted.
         seen = []
@@ -389,11 +411,13 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual((res["text"], res["breaker_effect"]), ("probe", "closed"))
         self.assertEqual(seen, ["limit", c.PROBE_IN_FLIGHT])
 
+    @runs_adapter
     def test_wait_runs_nothing_else(self) -> None:
         h = Harness(limited_then())
         res = h.handle(request(limits={"on_limit": "wait"}))
         self.assertEqual((res["limit_notice"]["on_limit"], len(h.launcher.calls)), ("wait", 1))
 
+    @runs_adapter
     def test_fallback_follows_the_users_order_visibly(self) -> None:
         h = Harness(limited_then(claude_limit(), claude_ok("from C")))
         order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
@@ -410,6 +434,7 @@ class LimitsTest(unittest.TestCase):
                          ["subscription:login-B", "subscription:login-C"])
         self.assertEqual([call["argv"][-1] for call in h.launcher.calls], ["claude-sonnet", "m-b", "m-c"])
 
+    @runs_adapter
     def test_fallback_shares_the_request_deadline(self) -> None:
         # The primary consumes 40s of a 100s deadline. A hanging fallback must wait out the remainder,
         # not a fresh 100s.
@@ -432,6 +457,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(seen, ["claude-sonnet", "m-b"])
         self.assertEqual(h.clock.now, 1_000_000.0 + 100)  # 40s primary + 60s left, not 40 + 100
 
+    @runs_adapter
     def test_fallback_does_not_start_when_the_deadline_is_already_spent(self) -> None:
         # The limit is read, and the last line moves the clock onto the deadline. The fallback must not launch.
         clock = FakeClock()
@@ -471,6 +497,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         self.assertEqual(len(calls), 1)
 
+    @runs_adapter
     def test_fallback_all_limited_returns_the_first_limit_with_notice(self) -> None:
         h = Harness(limited_then(claude_limit()))
         order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
@@ -480,6 +507,7 @@ class LimitsTest(unittest.TestCase):
         self.assertIsNone(res["limit_notice"]["switched_to"])
         self.assertEqual([e["kind"] for e in res["events"]][-1], "fallback")
 
+    @runs_adapter
     def test_fallback_to_another_provider_per_request(self) -> None:
         h = Harness(limited_then(codex_script("codex answer")))
         order = [{"engine": "codex", "model": "gpt-5", "connection": {"kind": "subscription", "id": "codex-login"}}]
@@ -487,6 +515,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(res["text"], "codex answer")
         self.assertEqual(res["limit_notice"]["switched_to"]["engine"], "codex")
 
+    @runs_adapter
     def test_non_limit_failures_never_switch(self) -> None:
         h = Harness([[{"type": "result", "subtype": "error", "is_error": True, "result": "boom"}]])
         order = [{"engine": "codex", "model": "gpt-5", "connection": {"kind": "subscription", "id": "c"}}]

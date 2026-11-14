@@ -220,6 +220,48 @@ class DetectedOnlyTests(unittest.TestCase):
         self.assertGreater(n_refused, 0)
 
 
+class RuleMatchingTests(unittest.TestCase):
+    """What a rule's conditions mean: every condition given must hold, every listed tag, any listed kind."""
+
+    def engine(self, rules, task, **extra):
+        raw = copy.deepcopy(CONFIG)
+        raw["rules"] = rules
+        raw.update(extra)
+        return router.decide(config(raw), SENTRY, task)["engine"]
+
+    def test_tags_all_needs_every_tag(self) -> None:
+        rules = [{"id": "both", "when": {"tags_all": ["cheap", "offline"]}, "route": {"engine": "codex"}}]
+        for tags in ([], ["cheap"], ["offline"], ["cheap", "other"]):
+            self.assertEqual(self.engine(rules, {"tags": tags}), "claude_code", tags)
+        self.assertEqual(self.engine(rules, {"tags": ["offline", "extra", "cheap"]}), "codex")
+
+    def test_task_kind_and_tags_all_must_both_hold(self) -> None:
+        rules = [{"id": "both", "when": {"task_kind": ["review"], "tags_all": ["approved"]}, "route": {"engine": "codex"}}]
+        for task in ({"task_kind": "review"}, {"tags": ["approved"]}, {"task_kind": "chat", "tags": ["approved"]}, {}):
+            self.assertEqual(self.engine(rules, task), "claude_code", task)
+        self.assertEqual(self.engine(rules, {"task_kind": "review", "tags": ["approved"]}), "codex")
+
+    def test_any_listed_task_kind_matches(self) -> None:
+        rules = [{"id": "either", "when": {"task_kind": ["review", "audit"]}, "route": {"engine": "codex"}}]
+        for kind in ("review", "audit"):
+            self.assertEqual(self.engine(rules, {"task_kind": kind}), "codex", kind)
+        self.assertEqual(self.engine(rules, {"task_kind": "chat"}), "claude_code")
+
+    def test_the_first_matching_rule_wins_in_the_users_order(self) -> None:
+        first = {"id": "first", "when": {"tags_all": ["cheap"]}, "route": {"engine": "opencode"}}
+        second = {"id": "second", "when": {"task_kind": ["review"]}, "route": {"engine": "codex"}}
+        task = {"task_kind": "review", "tags": ["cheap"]}
+        self.assertEqual(self.engine([first, second], task), "opencode")
+        self.assertEqual(self.engine([second, first], task), "codex")
+
+    def test_an_explicit_model_wins_over_the_configured_one(self) -> None:
+        raw = copy.deepcopy(CONFIG)
+        raw["default"]["model"] = "explicit-default"
+        d = router.decide(config(raw), SENTRY, {"task_kind": "chat"})
+        self.assertEqual((d["engine"], d["model"]), ("claude_code", "explicit-default"))
+        self.assertEqual(router.decide(config(), SENTRY, {"task_kind": "chat"})["model"], "claude-model-a")
+
+
 class NoAlternationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.cfg = config()

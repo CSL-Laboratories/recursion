@@ -9,7 +9,8 @@ It answers one of::
 
 and a refusal launches nothing. On the wire a refused start answers as every launch-path refusal does today:
 ``start_failed`` with ``start_error`` {code: reservation_refused, detail: <reason>}. ``release(run_id)`` ends
-the run's reservation when the run is over.
+the run's reservation when the run is over. Until composition installs a ``Reservations`` (``install``), the
+module answers as if the lane were absent: everything is admitted and nothing is written.
 
 The rules. Decided: money is a reservation at zero unless the user opts in with their own pay-per-token key
 under a cap the user sets (grill Q44, O59); unknown stays unknown (P10); the meter is the connection (grill Q8).
@@ -48,6 +49,7 @@ RESERVATION_REFUSED = "reservation_refused"
 # Why an admission was allowed.
 NO_SPEND = "no_spend"
 WITHIN_CAP = "within_cap"
+NOT_COMPOSED = "quota_not_composed"  # no Reservations is installed: the lane acts as if absent
 # Why one was refused. The word is the refusal's detail; nothing downstream reads wording.
 NO_OPT_IN = "no_opt_in"
 CAP_ZERO = "cap_zero"
@@ -58,10 +60,9 @@ POLICY_UNAVAILABLE = "policy_unavailable"
 POLICY_INVALID = "policy_invalid"
 STORE_UNAVAILABLE = "store_unavailable"
 ROUTE_INVALID = "route_invalid"
-NOT_COMPOSED = "quota_not_composed"
-ALLOWED_REASONS = frozenset({NO_SPEND, WITHIN_CAP})
+ALLOWED_REASONS = frozenset({NO_SPEND, WITHIN_CAP, NOT_COMPOSED})
 REFUSAL_REASONS = frozenset({NO_OPT_IN, CAP_ZERO, CAP_REACHED, CAP_HELD, SPEND_UNKNOWN, POLICY_UNAVAILABLE,
-                             POLICY_INVALID, STORE_UNAVAILABLE, ROUTE_INVALID, NOT_COMPOSED})
+                             POLICY_INVALID, STORE_UNAVAILABLE, ROUTE_INVALID})
 
 # Why a route can spend money. None means it cannot.
 API_KEY = "api_key"
@@ -385,9 +386,11 @@ def install(reservations: Reservations) -> None:
 
 
 def admit(connection: str, route: Mapping, run_id: str) -> dict:
-    """Admission for the route service. Before composition installs a ``Reservations`` there is nowhere to record
-    a reservation and no cap to read, so a route that cannot spend is admitted with no reservation id and a route
-    that can is refused (``quota_not_composed``)."""
+    """Admission for the route service. Until composition installs a ``Reservations``, the lane acts as if it were
+    absent: every route is admitted, with no reservation id and no row (``no_spend``, or ``quota_not_composed`` for a
+    route that could spend), so launch behaves exactly as at the base. Today no route that can spend money launches
+    in the daemon (an API key has no custody yet; a helper or passthrough route is refused before launch), and the
+    composition that gives a key its custody is the one that installs this."""
 
     current = _installed
     if current is not None:
@@ -397,13 +400,11 @@ def admit(connection: str, route: Mapping, run_id: str) -> dict:
         basis = spend_basis(route)
     except (ValueError, KeyError, TypeError):
         return _answer(False, None, ROUTE_INVALID, False)
-    if basis is None:
-        return _answer(True, None, NO_SPEND, False)
-    return _answer(False, None, NOT_COMPOSED, True)
+    return _answer(True, None, NO_SPEND if basis is None else NOT_COMPOSED, basis is not None)
 
 
 def release(run_id: str) -> list[str] | None:
-    """Release for the route service: [] before composition, since nothing could have been held."""
+    """Release for the route service: [] before composition, since nothing was held."""
 
     current = _installed
     return current.release(run_id) if current is not None else []

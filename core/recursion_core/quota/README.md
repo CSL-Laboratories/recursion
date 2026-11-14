@@ -31,7 +31,7 @@ A refusal launches nothing. On the wire it is a launch-path refusal like every o
 | `policy_unavailable`, `policy_invalid` | KEYS failed or is not composed; or its answer is not `{metered_spend_allowed: bool, cap_usd: number >= 0}`. |
 | `store_unavailable` | The reservation could not be recorded. Nothing is admitted, a free route included. |
 | `route_invalid` | The call is malformed (the connection is not the route's, a bad run id). |
-| `quota_not_composed` | Before composition installs a `Reservations`, a route that can spend is refused; one that cannot is admitted with no reservation id. |
+| `quota_not_composed` | ADMITTED, with no reservation id and no row: no `Reservations` is installed, so the lane acts as if absent and launch behaves exactly as at the base. Today no route that can spend money launches in the daemon (an API key has no custody yet; a helper or passthrough route is refused before launch); the composition that gives a key its custody is the one that installs this. |
 
 What can spend money: an API-key route; a passthrough route; a subscription route the user told to bill its
 apiKeyHelper (`billing_ack: api_key_helper` with `api_key_helper: present`); a subscription that the meters show

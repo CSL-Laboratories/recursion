@@ -410,14 +410,14 @@ class ConcurrencyTest(unittest.TestCase):
 class ModuleTest(unittest.TestCase):
     """``reservation.admit`` and ``release``, which the route service calls."""
 
-    def test_before_composition_only_a_route_that_cannot_spend_is_admitted(self):
+    def test_before_composition_the_lane_acts_as_if_absent(self):
         with mock.patch.object(R, "_installed", None):
             self.assertEqual(R.admit(SUB, route(), RUN_A),
                              {"allowed": True, "code": None, "reservation_id": None, "reason": "no_spend",
                               "metered": False})
             self.assertEqual(R.admit(KEY, key_route(), RUN_A),
-                             {"allowed": False, "code": "reservation_refused", "reservation_id": None,
-                              "reason": "quota_not_composed", "metered": True})
+                             {"allowed": True, "code": None, "reservation_id": None, "reason": "quota_not_composed",
+                              "metered": True})
             self.assertEqual(R.admit(KEY, route(), RUN_A)["reason"], "route_invalid")
             self.assertEqual(R.release(RUN_A), [])
 

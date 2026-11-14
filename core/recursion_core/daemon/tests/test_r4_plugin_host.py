@@ -358,8 +358,10 @@ class StopWhileAPluginHangsTests(HostCase):
 
     An EXPECTED FAILURE until lane STOP applies decision D1's reorder in
     ``daemon/control_adapter.py`` (``compose_control`` builds the plugin host before
-    ``server.start()``). STOP removes ``expectedFailure`` in the pull request that does it: an
-    unexpected success fails the suite.
+    ``server.start()``; ``PluginHost(load=False)`` and ``load_installed()`` are what it needs).
+    The reorder makes this an unexpected success, which fails the suite, so ``expectedFailure``
+    comes off in step with it: this file is PLUGIN-HOST's, and the two lanes' order is the
+    Liaison's to set (PLUGIN-HOST's questions.md).
     """
 
     @unittest.expectedFailure

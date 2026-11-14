@@ -259,8 +259,12 @@ class WorkflowScanTests(TreeCase):
         self.assertProblem(r"tools/ci_gate\.py now installs something")
 
     def test_a_locked_file_nothing_installs_fails(self) -> None:
-        (self.tree.root / hl.PROPOSALS / "ci-314t.patch").unlink()
-        self.assertProblem(r"locks tools/release/requirements-ci-314t\.txt, which no workflow or proposal installs")
+        unused = "tools/release/requirements-unused.txt"
+        self.tree.write(unused, self.tree.read(THREADED))
+        record = self.tree.record()
+        record["files"][unused] = record["files"][THREADED]
+        self.tree.write_record(record)
+        self.assertProblem(r"locks tools/release/requirements-unused\.txt, which no workflow or proposal installs")
 
     def test_a_proposal_that_no_longer_applies_fails(self) -> None:
         ci = ".github/workflows/ci.yml"
@@ -268,8 +272,11 @@ class WorkflowScanTests(TreeCase):
         self.assertProblem(r"ci-314t\.patch neither applies to the tree nor is applied in it")
 
     def test_an_applied_proposal_is_read_from_the_tree(self) -> None:
-        result = hl.git_apply(self.tree.root, self.tree.root / hl.PROPOSALS / "ci-314t.patch")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        patch = self.tree.root / hl.PROPOSALS / "ci-314t.patch"
+        if hl.proposal_state(self.tree.root, patch) == "applies":  # not yet applied in the repository
+            result = hl.git_apply(self.tree.root, patch)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(hl.proposal_state(self.tree.root, patch), "applied")
         self.assertEqual(self.tree.problems(), [])
         installs, _ = hl.all_installs(self.tree.root)
         self.assertIn(("ci.yml", "core-314t", THREADED), {(i.source, i.job, i.file) for i in installs})

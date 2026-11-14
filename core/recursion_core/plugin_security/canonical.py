@@ -57,9 +57,25 @@ def check_value(value: object, depth: int = 0) -> None:
 
 def canonical(value: object) -> bytes:
     """Return the canonical bytes of ``value`` or refuse."""
-    check_value(value)
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-                      allow_nan=False).encode("ascii")
+    try:
+        check_value(value)
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                         allow_nan=False).encode("ascii")
+        # A caller can mutate its containers after check_value on a free-threaded
+        # build. Validate the captured bytes too, using a private decoded value;
+        # do not validate the caller's live object again or recurse through parse.
+        captured = json.loads(raw, object_pairs_hook=_no_duplicates, parse_float=_no_float,
+                              parse_constant=_no_constant)
+        check_value(captured)
+        # JSON can stringify keys inserted by a racing caller. Sorting integer
+        # keys before encoding need not match sorting the resulting string keys.
+        encoded = json.dumps(captured, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                             allow_nan=False).encode("ascii")
+        if encoded != raw:
+            raise Refused("noncanonical_value", "changed canonical form")
+    except (TypeError, ValueError, RecursionError, RuntimeError):
+        raise Refused("noncanonical_value", "changed or unencodable value") from None
+    return raw
 
 
 def _no_duplicates(pairs: list) -> dict:

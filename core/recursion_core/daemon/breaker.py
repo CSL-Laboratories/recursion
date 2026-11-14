@@ -42,7 +42,7 @@ from recursion_core.plugin_security import ConnectionBreaker as StoredBreaker
 from recursion_core.plugin_security import Refused, create_breaker_store
 from recursion_core.routes import contract as c
 
-from .launcher import private_dir, require_launcher_platform
+from .launcher import _current, private_dir, require_launcher_platform
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +150,13 @@ class DurableRouteBreaker:
             pass
         return True
 
+    def model_representable(self, model):
+        """Whether the store can record this model with a run's binding (``bind_run`` would take it).
+
+        The rule is the store's own (``ConnectionBreaker.model_recordable``); nothing is read or written.
+        """
+        return StoredBreaker.model_recordable(model)
+
     def state(self, connection):
         return self._inner.state(connection)
 
@@ -177,6 +184,10 @@ class DurableRouteBreaker:
             # as tripped; the next request reads the store again (ADV2-1).
             return {'admitted': False, 'code': c.BREAKER_OPEN, 'probe': None, 'retry_at': None, 'key': connection}
         answer = self._inner.admit(connection, model, tenant, deadline_s=deadline_s)
+        if answer.get('admitted'):
+            ctx = getattr(_current, 'ctx', None)
+            if ctx is not None:
+                ctx.admitted = (connection, str(model))
         probe = answer.get('probe')
         if answer.get('admitted') and probe is not None and self.tripped(connection):
             try:

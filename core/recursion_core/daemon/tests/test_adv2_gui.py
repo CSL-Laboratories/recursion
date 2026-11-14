@@ -18,6 +18,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 from urllib.parse import urlencode
 
 from recursion_core.daemon import control_adapter as adapter
@@ -115,15 +116,43 @@ class Adv2HungPluginTests(GuiCase):
         return predicate()
 
     def test_a_second_read_is_not_held_forever_behind_a_hung_plugin(self):
-        first = threading.Thread(target=self.host.operator, args=({'command': READ, 'request_id': 'r1'},), daemon=True)
+        # The original 3 s join also bounded the shipped turn wait. That bound is kept as a check of the
+        # wait this host was built with and would really use (setUp passes none), before it is overridden:
+        # the constant alone says nothing about a constructor that ignores it.
+        self.assertEqual(self.host._operator_turn_wait_s, plugins.OPERATOR_TURN_WAIT_S,
+                         'a host built with no turn wait does not use the shipped default')
+        self.assertLessEqual(self.host._operator_turn_wait_s, 3.0, 'the default turn wait holds an O7 read too long')
+        self.host._operator_turn_wait_s = 0.05
+        first_answers, answers, errors = [], [], []
+
+        def read(command, target):
+            try:
+                target.append(self.host.operator(command))
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=read, args=({'command': READ, 'request_id': 'r1'}, first_answers),
+                                 daemon=True)
+        second = threading.Thread(target=read, args=({'command': 'operator.health.inspect'}, answers), daemon=True)
         first.start()
-        self.assertTrue(self.wait_for(lambda: self.module.CALLS))
-        answers = []
-        second = threading.Thread(target=lambda: answers.append(self.host.operator({'command': 'operator.health.inspect'})),
-                                  daemon=True)
-        second.start()
-        second.join(3)
-        self.assertFalse(second.is_alive(), 'the second O7 read is still waiting on the hung plugin after 3 s')
+        try:
+            self.assertTrue(self.wait_for(lambda: self.module.CALLS))
+            second.start()
+            second.join(10)  # watchdog, not a speed assertion; the first read is still held by GATE
+            self.assertFalse(second.is_alive(), 'the second O7 read is still blocked')
+            self.assertEqual(errors, [], 'an operator read raised instead of returning a typed answer')
+            self.assertEqual(answers, [(503, {'error': 'unavailable: operator plugin busy with an earlier read; '
+                                                      'nothing was read'})])
+            self.assertEqual(self.module.CALLS, [READ], 'the busy refusal must not invoke the plugin')
+        finally:
+            self.module.GATE.set()
+            first.join(10)
+            if second.ident is not None:
+                second.join(10)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([answer[0] for answer in first_answers], [200])
 
     def test_a_timed_out_call_answers_504_marks_the_plugin_degraded_and_no_second_call_is_made(self):
         host = plugins.PluginHost(self.tmp / 'config' / 'recursion', self.tmp / 'state', gil_probe=FakeGilProbe(),
@@ -134,11 +163,26 @@ class Adv2HungPluginTests(GuiCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             status, body = host.operator({'command': READ})
         self.assertEqual((status, body), (504, {'error': plugins.OPERATOR_TIMED_OUT}))
-        started = time.monotonic()
-        status, body = host.operator({'command': READ})
-        self.assertLess(time.monotonic() - started, 0.2, 'a read into a stuck plugin is answered at once')
-        self.assertEqual(status, 504)
-        self.assertIn('no new call was made', body['error'])
+        # Check the first six stuck reads directly, including the very first one.
+        # Keep the broad first-read watchdog and the fastest-of-five latency check.
+        # A one-off sleep below ten seconds is intentionally not rejected.
+        host._operator_turn_wait_s = 30.0
+        fastest = None
+        with mock.patch.object(host._turn, 'wait_for',
+                               side_effect=AssertionError('a stuck read waited for the turn')), \
+                mock.patch.object(threading.Thread, 'start',
+                                  side_effect=AssertionError('a stuck read launched a new thread')):
+            for attempt in range(6):
+                started = time.monotonic()
+                status, body = host.operator({'command': READ})
+                took = time.monotonic() - started
+                self.assertEqual(status, 504)
+                self.assertIn('no new call was made', body['error'])
+                if attempt == 0:
+                    self.assertLess(took, 10.0, 'a read into a stuck plugin waited for the turn')
+                else:
+                    fastest = took if fastest is None else min(fastest, took)
+        self.assertLess(fastest, 0.2, 'the fastest of five reads into a stuck plugin was not answered at once')
         self.assertEqual(module.CALLS, [READ], 'no second call into the stuck plugin')
         self.assertIn('a call has still not returned', host.inventory()['plugins'][0]['degraded'])
         self.assertIn('degraded', host.route_records()[0]['blocker'])
@@ -196,6 +240,78 @@ class Adv2HungPluginTests(GuiCase):
                     reader.join(10)
         self.assertEqual(fake.call.stops, [{'run_id': 'run-2'}])
 
+    def test_evicted_buffered_connections_cannot_bypass_max_request_threads(self):
+        import socket
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        lock = threading.Lock()
+        active = [0]
+        peak = [0]
+
+        class CountingHost:
+            def operator(self, command):
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                gate.wait(10)
+                with lock:
+                    active[0] -= 1
+                return 200, {'status_code': 'ok', 'result': {}}
+
+        _, transport = control_over(CountingHost())
+        total = daemon_gui.MAX_REQUEST_THREADS + 6
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            port = gui.address[1]
+            orig = gui.server.headers_read
+            seen = [0]
+            arrived = threading.Event()
+
+            def sync_headers(req, method, path):
+                with lock:
+                    seen[0] += 1
+                    if seen[0] >= total:
+                        arrived.set()
+                arrived.wait(2.0)
+                return orig(req, method, path)
+
+            gui.server.headers_read = sync_headers
+            threads = []
+            for _ in range(total):
+                def hit():
+                    try:
+                        s = socket.create_connection(('127.0.0.1', port), timeout=5)
+                        s.sendall(f'GET /read?command={READ} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n'.encode())
+                        s.recv(4096)
+                        s.close()
+                    except OSError:
+                        pass
+                t = threading.Thread(target=hit, daemon=True)
+                t.start()
+                threads.append(t)
+                time.sleep(0.01)
+            self.wait_for(lambda: seen[0] >= total, seconds=3)
+            time.sleep(0.2)
+            observed_peak = peak[0]
+            gate.set()
+            for t in threads:
+                t.join(5)
+        self.assertLessEqual(observed_peak, daemon_gui.MAX_REQUEST_THREADS)
+
+    def test_a_read_thread_that_cannot_be_started_does_not_leave_the_plugin_host_busy(self):
+        """The host is marked busy before the thread that makes the read is started. When that thread
+        cannot be started the call raises, and the mark has to be cleared: the next read is served,
+        not refused as busy for good."""
+        from unittest import mock
+        self.module.GATE.set()  # the plugin answers at once; nothing here waits on it
+        self.host._operator_turn_wait_s = 0.05  # how long a read waits for its turn before it answers busy
+        with mock.patch.object(threading.Thread, 'start', side_effect=RuntimeError('cannot start new thread')):
+            with self.assertRaises(RuntimeError):
+                self.host.operator({'command': READ})
+        self.assertEqual(self.module.CALLS, [], 'the read whose thread never started reached the plugin')
+        status, body = self.host.operator({'command': READ})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.module.CALLS, [READ])
+
     def _read_quietly(self, gui):
         try:
             self.get(gui, '/read?command=' + READ, timeout=40)
@@ -208,6 +324,219 @@ class Adv2HungPluginTests(GuiCase):
             status, page = self.post(gui, '/stop', {'run_id': 'run-1', 'confirm': 'explicit'})
         self.assertEqual(status, 200)
         self.assertIn('stop_pending', page)
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class Adv2EvictedStopTests(GuiCase):
+    """A connection still among the readers when their room is full is closed to make way for a new
+    one. Its request may already be in the daemon's hands by then. A read on it is dropped (the test
+    above this class); a Stop that has arrived is carried out, and counted like any other Stop."""
+
+    def wait_for(self, predicate, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not predicate():
+            time.sleep(0.02)
+        return predicate()
+
+    def stop_bytes(self, port, sent, length=None):
+        """A ``POST /stop`` whose body is ``sent``; ``length`` is the Content-Length when it says more."""
+        length = len(sent) if length is None else length
+        return (f'POST /stop HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n'
+                f'Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {length}\r\n\r\n').encode() + sent
+
+    def evict_a_held_stop(self, gui, payload):
+        """Send ``payload``, hold its thread where its headers have just been read, and open quiet
+        connections until that connection is the one evicted. Then let the thread go on and wait
+        until it is done with the request."""
+        import socket
+        port = gui.address[1]
+        real = gui.server.headers_read
+        at_gate, go, seen = threading.Event(), threading.Event(), {}
+        self.addCleanup(go.set)
+
+        def held(request, method, path):
+            if method != 'POST' or 'request' in seen:
+                return real(request, method, path)
+            seen['request'] = request
+            at_gate.set()
+            go.wait(30)
+            seen['answer'] = real(request, method, path)
+            return seen['answer']
+
+        gui.server.headers_read = held
+        client = socket.create_connection(('127.0.0.1', port), timeout=5)
+        self.addCleanup(client.close)
+        client.sendall(payload)
+        self.assertTrue(at_gate.wait(10), 'the Stop never reached headers_read')
+        for _ in range(4 * daemon_gui.MAX_REQUEST_THREADS):
+            if seen['request'] not in gui.server._reading:
+                break
+            quiet = socket.create_connection(('127.0.0.1', port), timeout=5)  # connects and sends nothing
+            self.addCleanup(quiet.close)
+            time.sleep(0.02)
+        self.assertNotIn(seen['request'], gui.server._reading, 'the Stop was never evicted: nothing was tested')
+        go.set()
+        # Taken or not, the thread is done once headers_read has answered and the request is not being worked on.
+        self.assertTrue(self.wait_for(lambda: 'answer' in seen and seen['request'] not in gui.server._working),
+                        'the thread of the evicted connection did not finish')
+
+    def test_a_stop_that_had_arrived_is_carried_out_when_its_connection_is_evicted(self):
+        for busy in (False, True):
+            with self.subTest(every_request_thread_is_answering=busy):
+                release = threading.Event()
+                self.addCleanup(release.set)
+
+                class BlockedHost:
+                    def operator(self, command):
+                        release.wait(30)
+                        return 200, {'status_code': 'ok', 'result': {}}
+
+                def read_quietly(gui):
+                    try:
+                        self.get(gui, '/read?command=' + READ, timeout=40)
+                    except OSError:
+                        pass
+
+                fake, transport = control_over(BlockedHost())
+                with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+                    readers = [threading.Thread(target=read_quietly, args=(gui,), daemon=True)
+                               for _ in range(daemon_gui.MAX_REQUEST_THREADS if busy else 0)]
+                    for reader in readers:
+                        reader.start()
+                    try:
+                        self.assertTrue(self.wait_for(lambda: len(gui.server._working) == len(readers)))
+                        body = b'run_id=run-evicted&confirm=explicit'
+                        self.evict_a_held_stop(gui, self.stop_bytes(gui.address[1], body))
+                        self.assertEqual(fake.call.stops, [{'run_id': 'run-evicted'}],
+                                         'a Stop the daemon had received was dropped with its connection')
+                    finally:
+                        release.set()
+                        for reader in readers:
+                            reader.join(10)
+
+    def test_evicted_stops_are_counted_under_the_allowance_stop_has(self):
+        import socket
+        gate, lock = threading.Event(), threading.Lock()
+        self.addCleanup(gate.set)
+        active, peak, taken = [0], [0], [0]
+
+        def call(method, params=None):
+            with lock:
+                active[0] += 1
+                taken[0] += 1
+                peak[0] = max(peak[0], active[0])
+            gate.wait(20)
+            with lock:
+                active[0] -= 1
+            return {'code': 'pending', 'run_id': (params or {}).get('run_id'), 'state': 'stop_pending'}
+
+        fake = types.SimpleNamespace(call=call, plugins=FakeOperatorHost({}), route_records=lambda: [])
+        allowance = daemon_gui.MAX_REQUEST_THREADS + daemon_gui.STOP_RESERVED_THREADS
+        connections = allowance + 12  # so the oldest ones are evicted with their Stop already read
+        with LoopbackGUI(ControlClient(lambda method, path, body: adapter.DaemonControl.gui_transport(
+                fake, method, path, body)), lambda env: True, port=0) as gui:
+            port = gui.address[1]
+            real = gui.server.headers_read
+            go, arrived = threading.Event(), [0]
+            self.addCleanup(go.set)
+
+            def all_together(request, method, path):
+                with lock:
+                    arrived[0] += 1
+                go.wait(30)
+                return real(request, method, path)
+
+            gui.server.headers_read = all_together
+            for number in range(connections):
+                client = socket.create_connection(('127.0.0.1', port), timeout=5)
+                self.addCleanup(client.close)
+                client.sendall(self.stop_bytes(port, b'run_id=run-%d&confirm=explicit' % number))
+                # one at a time: every Stop is in the daemon's hands before a later connection evicts it
+                self.assertTrue(self.wait_for(lambda: arrived[0] > number), 'a Stop never reached headers_read')
+            go.set()
+            self.assertTrue(self.wait_for(lambda: taken[0] >= allowance),
+                            'fewer Stops were carried out than Stop has room for: evicted ones were dropped')
+            time.sleep(0.3)  # a Stop taken past the allowance would be inside the control API by now
+            observed = peak[0]
+            gate.set()
+        self.assertEqual(observed, allowance)
+
+    def test_a_stop_cut_short_by_the_eviction_names_no_run(self):
+        whole = b'confirm=explicit&run_id=run-1234567890'
+        sent = whole[:-8]  # ends inside the run id: "...run_id=run-12" is a well-formed Stop of another run
+        fake, transport = control_over(FakeOperatorHost({}))
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            self.evict_a_held_stop(gui, self.stop_bytes(gui.address[1], sent, length=len(whole)))
+        self.assertEqual(fake.call.stops, [], 'a Stop whose body had not all arrived was carried out')
+
+
+class Adv2ContentLengthTests(GuiCase):
+    """A request says once how long its body is. With two Content-Length headers the server read the
+    first, so a shorter first header made a prefix of the body the whole form: "...run_id=run-12" out
+    of "...run_id=run-1234567890", with the page's own length check satisfied. A request that names
+    its length more than once is refused before the page sees it. So is one with a Transfer-Encoding
+    header: the server decodes no transfer coding and would read such a body by its Content-Length."""
+
+    WHOLE = b'confirm=explicit&run_id=run-1234567890'
+
+    def post_raw(self, gui, lengths, body, more=''):
+        """POST /stop with one Content-Length header per entry of ``lengths`` (and the header lines in
+        ``more``); the status line that came back."""
+        import socket
+        port = gui.address[1]
+        head = (f'POST /stop HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n'
+                'Content-Type: application/x-www-form-urlencoded\r\n'
+                + ''.join(f'Content-Length: {length}\r\n' for length in lengths) + more + '\r\n').encode()
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
+            client.sendall(head + body)
+            client.shutdown(socket.SHUT_WR)
+            answer = b''
+            while chunk := client.recv(65536):
+                answer += chunk
+        return answer.split(b'\r\n', 1)[0].decode()
+
+    def test_a_request_with_more_than_one_content_length_is_refused(self):
+        whole = len(self.WHOLE)
+        fake, transport = control_over(FakeOperatorHost({}))
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            # The shorter one first (it named run-12), the longer one first, and the same one twice.
+            for lengths in ((whole - 8, whole), (whole, whole - 8), (whole, whole)):
+                with self.subTest(content_lengths=lengths):
+                    status = self.post_raw(gui, lengths, self.WHOLE)
+                    self.assertEqual(status.split()[1], '400', status)
+                    self.assertEqual(fake.call.stops, [], 'a request with two lengths was acted on')
+            # One length, for contrast: the same bytes are a Stop of the run they name.
+            self.assertEqual(self.post_raw(gui, (whole,), self.WHOLE).split()[1], '200')
+            self.assertEqual(fake.call.stops, [{'run_id': 'run-1234567890'}])
+            # A plain read is answered as before.
+            self.assertEqual(self.get(gui, '/')[0], 200)
+            # A refused request holds no place among the readers or the answering threads afterwards.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and (gui.server._reading or gui.server._working):
+                time.sleep(0.02)
+            self.assertEqual((len(gui.server._reading), len(gui.server._working)), (0, 0))
+
+    def test_a_request_with_a_transfer_encoding_is_refused(self):
+        whole = len(self.WHOLE)
+        chunked = 'Transfer-Encoding: chunked\r\n'
+        fake, transport = control_over(FakeOperatorHost({}))
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            # With one length (the shorter one named run-12), with two, and with none; and another coding.
+            for lengths, more in (((whole - 8,), chunked), ((whole,), chunked), ((whole - 8, whole), chunked),
+                                  ((), chunked), ((whole,), 'Transfer-Encoding: identity\r\n'),
+                                  ((whole,), 'transfer-encoding: gzip, chunked\r\n')):
+                with self.subTest(content_lengths=lengths, header=more.strip()):
+                    status = self.post_raw(gui, lengths, self.WHOLE, more)
+                    self.assertEqual(status.split(None, 2)[1:], ['400', 'ambiguous request length'], status)
+                    self.assertEqual(fake.call.stops, [], 'a request with a transfer coding was acted on')
+            # One length and no transfer coding, for contrast: a Stop of the run the body names. And a plain read.
+            self.assertEqual(self.post_raw(gui, (whole,), self.WHOLE).split()[1], '200')
+            self.assertEqual(fake.call.stops, [{'run_id': 'run-1234567890'}])
+            self.assertEqual(self.get(gui, '/')[0], 200)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and (gui.server._reading or gui.server._working):
+                time.sleep(0.02)
+            self.assertEqual((len(gui.server._reading), len(gui.server._working)), (0, 0))
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)

@@ -31,9 +31,15 @@ from recursion_core.plugin_security import ConnectionBreaker, Refused, create_br
 | `reset_after_probe(connection, lease, probe_ok)` | `True` only for the live lease and `probe_ok is True`; the trip is then cleared | `invalid_connection` |
 | `tripped(connection)` | `bool` | none |
 | `close()` | `None` | none |
+| `ConnectionBreaker.model_recordable(model_version)` (static; an addition) | `bool`: whether `bind_run` would record this model version. Needs no store | none |
 
 `TYPED_LIMITS` = `plan_limit`, `rate_limit`, `usage_window_exhausted`: the only events that trip.
-Ids match `[A-Za-z0-9_.:@/-]{1,128}`.
+Ids (`run_id`, `connection`, `plugin_id`, `provider`) match `[A-Za-z0-9_.:@/-]{1,128}`.
+A `model_version` is recorded as given when it is 1 to 128 printable ASCII characters with no
+space (0x21 to 0x7E); anything else is `invalid_model_version`. At the frozen head it had to
+match the id grammar as well. Every value that was accepted then still is, the refusal code is
+the same, and `check` returns the string that was bound. What is new for a consumer: `check` can
+return a `model_version` outside the id grammar, such as `opus[1m]`.
 
 ## Behaviour that is part of the contract
 

@@ -267,5 +267,45 @@ class DoctorAndGilTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "plugin_already_active")
 
 
+class CompileOverflowTests(unittest.TestCase):
+    """An unsigned plugin and no trusted key. Compiling a plugin and the GIL read after it involve no
+    signature, so this runs where ``cryptography`` is missing too."""
+
+    def test_compile_parser_overflow_runs_gil_gate_and_refuses_typed(self) -> None:
+        deep = b"~" * 10_000 + b"1"
+        # The manifest has to name a developer key; with no signature it is never used to verify.
+        raw = manifest_bytes("11" * 32, source=deep, permissions=())
+        for gil_on, expected in ((False, "plugin_compile_failed"), (True, "core_poisoned_gil_enabled")):
+            with self.subTest(gil_on=gil_on):
+                probe, health = FakeGilProbe([gil_on]), CoreHealth()
+                loader = _loader(None, None, probe, health=health)
+                with self.assertRaises(Refused) as ctx:
+                    loader.load(raw, None, deep)
+                self.assertEqual(ctx.exception.code, expected)
+                self.assertEqual(probe.calls, 1)
+                self.assertEqual(bool(health.poisoned), gil_on)
+                self.assertEqual(loader._active, {}, "a plugin that did not compile was made active")
+
+    def test_compile_stack_overflow_runs_gil_gate_and_refuses_typed(self) -> None:
+        # The other way a source is too deep. The input above stops in the parser, which raises
+        # MemoryError. This one parses, and overflows the stack of the compiler behind it, which raises
+        # RecursionError. That it does so on this interpreter is checked first: with another error from
+        # this input the test would pass without the loader's RecursionError being reached at all.
+        deep = b"a" + b".b" * 200_000
+        with self.assertRaises(RecursionError):
+            compile(deep, "<probe>", "exec", dont_inherit=True)
+        raw = manifest_bytes("11" * 32, source=deep, permissions=())
+        for gil_on, expected in ((False, "plugin_compile_failed"), (True, "core_poisoned_gil_enabled")):
+            with self.subTest(gil_on=gil_on):
+                probe, health = FakeGilProbe([gil_on]), CoreHealth()
+                loader = _loader(None, None, probe, health=health)
+                with self.assertRaises(Refused) as ctx:
+                    loader.load(raw, None, deep)
+                self.assertEqual(ctx.exception.code, expected)
+                self.assertEqual(probe.calls, 1)
+                self.assertEqual(bool(health.poisoned), gil_on)
+                self.assertEqual(loader._active, {}, "a plugin that did not compile was made active")
+
+
 if __name__ == "__main__":
     unittest.main()

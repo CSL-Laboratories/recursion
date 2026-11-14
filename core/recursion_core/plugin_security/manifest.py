@@ -186,24 +186,26 @@ class TrustStore:
     def _open_store(path: str) -> sqlite3.Connection:
         if not os.path.isfile(path):
             raise Refused("revocation_store_missing")
-        db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
+        db = None
         try:
+            db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
             db.execute("PRAGMA synchronous=FULL")
             db.execute("PRAGMA busy_timeout=30000")
             meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
             db.execute("SELECT key_id FROM revoked LIMIT 1").fetchall()
-        except sqlite3.DatabaseError:
-            db.close()
+            columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
+        except sqlite3.Error:
+            if db is not None:
+                db.close()
             raise Refused("revocation_store_invalid") from None
         if meta.get("magic") != _REVOCATION_MAGIC:
             db.close()
             raise Refused("revocation_store_invalid")
-        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
         if "generation" not in columns:
             try:
                 db.execute(
                     "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
-            except sqlite3.DatabaseError:
+            except sqlite3.Error:
                 db.close()
                 raise Refused("revocation_store_invalid") from None
         return db
@@ -248,10 +250,11 @@ class TrustStore:
             return generation
 
     def close(self) -> None:
-        db = self._db
-        self._db = None
-        if db is not None:
-            db.close()
+        with self._lock:
+            db = self._db
+            self._db = None
+            if db is not None:
+                db.close()
 
     def classify(self, manifest: Manifest, signature: object) -> tuple[str, str | None, str]:
         """Return ``(trust, signer_key_id, reason)``; trust is ``signed`` or ``unsigned``."""

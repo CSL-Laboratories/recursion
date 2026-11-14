@@ -1,0 +1,33 @@
+{
+  "declared": [
+    "hand_pick",
+    "workspace",
+    "containment_level",
+    "session_id",
+    "turn_id"
+  ],
+  "request": {
+    "tenant": "t1",
+    "engine": "codex",
+    "prompt": "Fix the failing test in tests/test_io.py.",
+    "client_key": "k-1",
+    "hand_pick": {
+      "model": "gpt-6",
+      "engine": "codex"
+    },
+    "workspace": {
+      "path": "/home/dev/projets/caf\u00e9"
+    },
+    "containment_level": "contained"
+  },
+  "expect": {
+    "preimage": "{\"containment_level\":\"contained\",\"engine\":\"codex\",\"hand_pick\":{\"engine\":\"codex\",\"model\":\"gpt-6\"},\"prompt_sha256\":\"aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3\",\"workspace\":{\"path\":\"/home/dev/projets/caf\u00e9\"}}",
+    "start_key": {
+      "client_key": "k-1",
+      "engine": "codex",
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3",
+      "intent_version": 1,
+      "intent_sha256": "fb9b6758f3782df5cfed64ec0d4ef3dd95e6f3df0df0ea134833283b6846dd5d"
+    }
+  }
+}

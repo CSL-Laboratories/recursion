@@ -1,0 +1,1004 @@
+{
+  "about": "Every fixture of this folder. A file under good/ must validate against 'schema'. A file under bad/ must be refused, and 'rule' says which rule it breaks; 'expect' names the schema keyword that refuses it and the place in the fixture where it does (a JSON Pointer, '' for the whole value). The keys and digests are made up for the fixtures. Files named h* and b* were written by hand. Files named u-*, m-*, v-* and f-* were generated: each is a good fixture with one change (u: a field nobody defined added; m: a required field removed; v: a value replaced by one outside the list of allowed values; f: a fixed value replaced), and each proves the one rule its 'rule' names.",
+  "fixtures": [
+    {
+      "file": "good/api.v1/h01-a-command.json",
+      "schema": "api.v1.json#/$defs/command",
+      "shows": "One command a plugin offers. A user reaches it only through plugin.call."
+    },
+    {
+      "file": "good/api.v1/h02-a-tool.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "shows": "One tool a plugin declares, as data. A call of it waits for approval like any other effect."
+    },
+    {
+      "file": "good/api.v1/h03-a-subscription.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "shows": "The event types a plugin asks to be given."
+    },
+    {
+      "file": "good/api.v1/h04-a-theme.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "shows": "A theme a plugin offers. It never reaches the approval area."
+    },
+    {
+      "file": "good/api.v1/h05-a-run-a-plugin-owns.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "shows": "What a plugin passes to start a run it owns. The host adds who is asking and who owns the run."
+    },
+    {
+      "file": "good/api.v1/h06-what-the-host-attaches-to-a-call.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "shows": "The principal the host sets on every call a plugin makes into the core."
+    },
+    {
+      "file": "good/api.v1/h07-registry-as-today.json",
+      "schema": "api.v1.json#/$defs/registry",
+      "shows": "What registry() returns today: panels and what they require. A panel's shape is the page's."
+    },
+    {
+      "file": "good/api.v1/h08-a-run-in-a-worktree-of-its-own.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "shows": "A plugin asks for its run to work in a worktree, not in the folder itself."
+    },
+    {
+      "file": "bad/api.v1/b01-a-command-behind-another-permission.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "A command is offered with the 'command' permission and no other.",
+      "expect": {
+        "keyword": "const",
+        "at": "/permission"
+      }
+    },
+    {
+      "file": "bad/api.v1/b02-a-run-request-naming-its-owner.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The host sets a run's owner. A plugin that names one, its own or another's, is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/b03-a-run-request-naming-a-principal.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The host sets the principal. A plugin cannot say who it is.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/b04-a-call-as-the-owner.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "A plugin's calls carry a plugin principal, whatever the plugin would like.",
+      "expect": {
+        "keyword": "const",
+        "at": "/principal/kind"
+      }
+    },
+    {
+      "file": "bad/api.v1/b05-a-call-as-the-core.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "No plugin can carry the core's own name.",
+      "expect": {
+        "keyword": "not",
+        "at": "/principal/id"
+      }
+    },
+    {
+      "file": "bad/api.v1/b06-a-subscription-to-nothing.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "rule": "A subscription names at least one event type.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/types"
+      }
+    },
+    {
+      "file": "bad/api.v1/b07-a-tool-with-no-input-schema.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "A tool is declared as data: its input's schema is part of the declaration.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/b08-a-surface-that-is-not-a-theme-or-a-layout.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "A plugin offers themes and layouts; it cannot offer an approval surface.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/kind"
+      }
+    },
+    {
+      "file": "bad/api.v1/f-api.v1.subscription.permission.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "rule": "The value at /permission is fixed by api.v1.json#/$defs/subscription/properties/permission.",
+      "expect": {
+        "keyword": "const",
+        "at": "/permission"
+      }
+    },
+    {
+      "file": "bad/api.v1/f-api.v1.surface.permission.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "The value at /permission is fixed by api.v1.json#/$defs/surface/properties/permission.",
+      "expect": {
+        "keyword": "const",
+        "at": "/permission"
+      }
+    },
+    {
+      "file": "bad/api.v1/f-api.v1.tool.permission.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "The value at /permission is fixed by api.v1.json#/$defs/tool/properties/permission.",
+      "expect": {
+        "keyword": "const",
+        "at": "/permission"
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.call-context.principal.id.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "The object described at api.v1.json#/$defs/call_context/properties/principal always carries 'id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/principal"
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.call-context.principal.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "The object described at api.v1.json#/$defs/call_context always carries 'principal'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.call-context.principal.kind.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "The object described at api.v1.json#/$defs/call_context/properties/principal always carries 'kind'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/principal"
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.command.arguments.items.name.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command/properties/arguments/items always carries 'name'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/arguments/0"
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.command.arguments.items.required.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command/properties/arguments/items always carries 'required'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/arguments/0"
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.command.arguments.items.summary.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command/properties/arguments/items always carries 'summary'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/arguments/0"
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.command.arguments.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command always carries 'arguments'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.command.name.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command always carries 'name'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.command.permission.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command always carries 'permission'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.command.summary.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command always carries 'summary'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.registry.panels.json",
+      "schema": "api.v1.json#/$defs/registry",
+      "rule": "The object described at api.v1.json#/$defs/registry always carries 'panels'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.registry.required.json",
+      "schema": "api.v1.json#/$defs/registry",
+      "rule": "The object described at api.v1.json#/$defs/registry always carries 'required'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.run-request.command-id.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The object described at api.v1.json#/$defs/run_request always carries 'command_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.run-request.prompt.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The object described at api.v1.json#/$defs/run_request always carries 'prompt'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.run-request.tenant.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The object described at api.v1.json#/$defs/run_request always carries 'tenant'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.run-request.workspace.path.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The object described at api.v1.json#/$defs/run_request/properties/workspace always carries 'path'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/workspace"
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.subscription.permission.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "rule": "The object described at api.v1.json#/$defs/subscription always carries 'permission'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.subscription.types.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "rule": "The object described at api.v1.json#/$defs/subscription always carries 'types'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.surface.kind.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "The object described at api.v1.json#/$defs/surface always carries 'kind'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.surface.name.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "The object described at api.v1.json#/$defs/surface always carries 'name'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.surface.permission.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "The object described at api.v1.json#/$defs/surface always carries 'permission'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.surface.title.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "The object described at api.v1.json#/$defs/surface always carries 'title'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.tool.description.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "The object described at api.v1.json#/$defs/tool always carries 'description'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.tool.name.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "The object described at api.v1.json#/$defs/tool always carries 'name'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/m-api.v1.tool.permission.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "The object described at api.v1.json#/$defs/tool always carries 'permission'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.call-context.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "The object described at api.v1.json#/$defs/call_context is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.call-context.principal.json",
+      "schema": "api.v1.json#/$defs/call_context",
+      "rule": "The object described at api.v1.json#/$defs/call_context/properties/principal is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/principal"
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.command.arguments.items.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command/properties/arguments/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/arguments/0"
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.command.json",
+      "schema": "api.v1.json#/$defs/command",
+      "rule": "The object described at api.v1.json#/$defs/command is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.registry.json",
+      "schema": "api.v1.json#/$defs/registry",
+      "rule": "The object described at api.v1.json#/$defs/registry is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.run-request.workspace.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The object described at api.v1.json#/$defs/run_request/properties/workspace is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/workspace"
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.subscription.json",
+      "schema": "api.v1.json#/$defs/subscription",
+      "rule": "The object described at api.v1.json#/$defs/subscription is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.surface.json",
+      "schema": "api.v1.json#/$defs/surface",
+      "rule": "The object described at api.v1.json#/$defs/surface is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/u-api.v1.tool.json",
+      "schema": "api.v1.json#/$defs/tool",
+      "rule": "The object described at api.v1.json#/$defs/tool is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/api.v1/v-api.v1.run-request.workspace.mode.json",
+      "schema": "api.v1.json#/$defs/run_request",
+      "rule": "The value at /workspace/mode must be one of the values listed at api.v1.json#/$defs/run_request/properties/workspace/properties/mode.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/workspace/mode"
+      }
+    },
+    {
+      "file": "good/install.v1/h01-one-trusted-key-one-grant.json",
+      "schema": "install.v1.json",
+      "shows": "One trusted developer key and one grant bound to a digest and that key."
+    },
+    {
+      "file": "good/install.v1/h02-empty.json",
+      "schema": "install.v1.json",
+      "shows": "An empty object: no trusted key and no grant, so nothing gets a permission."
+    },
+    {
+      "file": "good/install.v1/h03-manual-grant-to-an-unsigned-plugin.json",
+      "schema": "install.v1.json",
+      "shows": "A manual grant to an unsigned plugin (no signing key), with 'order' acknowledged behind the warning, and names reserved for an effect owner."
+    },
+    {
+      "file": "good/install.v1/h04-order-turned-back-on-after-a-revocation.json",
+      "schema": "install.v1.json",
+      "shows": "The user turned 'order' back on after the signing key was revoked."
+    },
+    {
+      "file": "bad/install.v1/b01-a-field-the-reader-does-not-know.json",
+      "schema": "install.v1.json",
+      "rule": "Today's reader refuses a top-level field it does not know, so version 1 adds none.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/install.v1/b02-a-grant-without-its-digest.json",
+      "schema": "install.v1.json",
+      "rule": "A grant is bound to one artifact digest.",
+      "expect": {
+        "keyword": "required",
+        "at": "/grants/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/b03-a-grant-of-a-permission-nobody-defined.json",
+      "schema": "install.v1.json",
+      "rule": "A grant lists permissions the manifest schema defines.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/grants/0/permissions/1"
+      }
+    },
+    {
+      "file": "bad/install.v1/b04-a-trusted-key-that-is-not-a-key.json",
+      "schema": "install.v1.json",
+      "rule": "A trusted key is 64 lower-case hex digits.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/trusted_keys/notes-dev"
+      }
+    },
+    {
+      "file": "bad/install.v1/b05-a-signer-that-is-not-a-key-id.json",
+      "schema": "install.v1.json",
+      "rule": "A signer is 'ed25519:' and 32 hex digits, or null for an unsigned plugin.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/grants/0/signer_key_id"
+      }
+    },
+    {
+      "file": "bad/install.v1/b06-a-secret-in-a-grant.json",
+      "schema": "install.v1.json",
+      "rule": "A grant holds ids, digests and permission names; a grant field the reader does not know is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/grants/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/b07-an-empty-reserved-host.json",
+      "schema": "install.v1.json",
+      "rule": "A reserved host is a non-empty string.",
+      "expect": {
+        "keyword": "minLength",
+        "at": "/reserved/hosts/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/b08-a-grant-of-a-permission-the-reader-does-not-take-yet.json",
+      "schema": "install.v1.json",
+      "rule": "'run' is a permission of the version 1 manifest, and today's reader refuses a grant that lists it: an install file holds only what today's daemon reads.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/grants/0/permissions/1"
+      }
+    },
+    {
+      "file": "bad/install.v1/m-install.v1.grant.permissions.json",
+      "schema": "install.v1.json",
+      "rule": "The object described at install.v1.json#/$defs/grant always carries 'permissions'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/grants/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/m-install.v1.grant.plugin-id.json",
+      "schema": "install.v1.json",
+      "rule": "The object described at install.v1.json#/$defs/grant always carries 'plugin_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/grants/0"
+      }
+    },
+    {
+      "file": "bad/install.v1/u-install.v1.reserved.json",
+      "schema": "install.v1.json",
+      "rule": "The object described at install.v1.json#/properties/reserved is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/reserved"
+      }
+    },
+    {
+      "file": "good/manifest.v1/h01-read-and-panel.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that reads and draws a panel. Every file of the package is listed with its digest."
+    },
+    {
+      "file": "good/manifest.v1/h02-network-and-credential.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that asks for one network destination and one credential by name."
+    },
+    {
+      "file": "good/manifest.v1/h03-the-version-1-permissions.json",
+      "schema": "manifest.v1.json",
+      "shows": "A plugin that asks for the five permissions that are new, and provisional, in version 1."
+    },
+    {
+      "file": "bad/manifest.v1/b01-the-old-schema-name.json",
+      "schema": "manifest.v1.json",
+      "rule": "This is the schema of 'csl-plugin-manifest/1'; a vNext manifest is read by the old parser.",
+      "expect": {
+        "keyword": "const",
+        "at": "/schema"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b02-no-files-map.json",
+      "schema": "manifest.v1.json",
+      "rule": "Version 1 lists every file of the package: the signature covers the whole package.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b03-a-path-that-leaves-the-package.json",
+      "schema": "manifest.v1.json",
+      "rule": "A path has no '..', no '.' segment and does not start with a slash.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b04-network-permission-with-no-destination.json",
+      "schema": "manifest.v1.json",
+      "rule": "'network' is asked together with at least one destination.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/network_destinations"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b05-a-destination-without-the-permission.json",
+      "schema": "manifest.v1.json",
+      "rule": "A destination is listed only with the network permission.",
+      "expect": {
+        "keyword": "maxItems",
+        "at": "/network_destinations"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b06-a-permission-nobody-defined.json",
+      "schema": "manifest.v1.json",
+      "rule": "A new permission is appended to the list in the schema; a manifest cannot invent one.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/permissions/1"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b07-claiming-the-cores-own-name.json",
+      "schema": "manifest.v1.json",
+      "rule": "'host' is the core's name and no plugin may claim it.",
+      "expect": {
+        "keyword": "not",
+        "at": "/plugin_id"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b08-a-runtime-nobody-defined.json",
+      "schema": "manifest.v1.json",
+      "rule": "The only runtime in this draft is 'python-inprocess/1'.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/runtime"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b09-a-credential-in-place-of-its-name.json",
+      "schema": "manifest.v1.json",
+      "rule": "credential_refs holds names. A value with spaces or capitals is not a name.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/credential_refs/0"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b10-a-digest-that-is-not-a-digest.json",
+      "schema": "manifest.v1.json",
+      "rule": "A digest is 64 lower-case hex digits.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files/plugin.py"
+      }
+    },
+    {
+      "file": "bad/manifest.v1/b11-an-untyped-field.json",
+      "schema": "manifest.v1.json",
+      "rule": "The manifest is a closed set of fields: the signed bytes mean one thing.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.artifact-sha256.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'artifact_sha256'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.credential-refs.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'credential_refs'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.dependency-lock-sha256.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'dependency_lock_sha256'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.developer-key.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'developer_key'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.install-scripts.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'install_scripts'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.interface.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'interface'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.network-destinations.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'network_destinations'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.permissions.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'permissions'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.plugin-id.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'plugin_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.runtime.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'runtime'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.schema.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'schema'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/m-manifest.v1.version.json",
+      "schema": "manifest.v1.json",
+      "rule": "The object described at manifest.v1.json#/ always carries 'version'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/manifest.v1/v-manifest.v1.interface.json",
+      "schema": "manifest.v1.json",
+      "rule": "The value at /interface must be one of the values listed at manifest.v1.json#/properties/interface.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/interface"
+      }
+    },
+    {
+      "file": "good/revoked-keys.v1/h01-one-revoked-key.json",
+      "schema": "revoked-keys.v1.json",
+      "shows": "A list that revokes one developer key, signed by a list key. The signature here is made up for the fixture."
+    },
+    {
+      "file": "good/revoked-keys.v1/h02-an-empty-list.json",
+      "schema": "revoked-keys.v1.json",
+      "shows": "A list that revokes nothing is still a list: it has a version, so an older one cannot replace it."
+    },
+    {
+      "file": "good/revoked-keys.v1/h03-two-keys-for-different-reasons.json",
+      "schema": "revoked-keys.v1.json",
+      "shows": "Two keys, one retired and one with no reason given."
+    },
+    {
+      "file": "bad/revoked-keys.v1/b01-a-list-with-no-version.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A list carries its version, so a lower one than the last accepted can be refused.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b02-version-zero.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "list_version starts at 1 and only rises.",
+      "expect": {
+        "keyword": "minimum",
+        "at": "/list_version"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b03-an-unsigned-list.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A list is applied only when it is signed by a list key the install trusts.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b04-a-signature-of-another-kind.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The signature is Ed25519.",
+      "expect": {
+        "keyword": "const",
+        "at": "/signature/alg"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b05-a-key-named-by-its-label.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A revoked key is named by its key id, not by a label an install gave it.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/keys/0/key_id"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b06-a-list-that-never-expires.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A list says when it expires; what an install does then is not decided, and the last accepted list stays in force.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/f-revoked-keys.v1.schema.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The value at /schema is fixed by revoked-keys.v1.json#/properties/schema.",
+      "expect": {
+        "keyword": "const",
+        "at": "/schema"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.issued-at.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/ always carries 'issued_at'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.keys.items.key-id.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/keys/items always carries 'key_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/keys/0"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.keys.items.reason.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/keys/items always carries 'reason'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/keys/0"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.keys.items.revoked-at.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/keys/items always carries 'revoked_at'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/keys/0"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.keys.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/ always carries 'keys'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.schema.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/ always carries 'schema'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.signature.alg.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/signature always carries 'alg'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/signature"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.signature.key-id.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/signature always carries 'key_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/signature"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/m-revoked-keys.v1.signature.value.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/signature always carries 'value'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/signature"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/u-revoked-keys.v1.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/ is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/u-revoked-keys.v1.keys.items.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/keys/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/keys/0"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/u-revoked-keys.v1.signature.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The object described at revoked-keys.v1.json#/properties/signature is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/signature"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/v-revoked-keys.v1.keys.items.reason.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The value at /keys/0/reason must be one of the values listed at revoked-keys.v1.json#/properties/keys/items/properties/reason.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/keys/0/reason"
+      }
+    }
+  ]
+}

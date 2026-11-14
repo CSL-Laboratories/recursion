@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "queue.item.v1.json",
+  "title": "queue.item.v1: one queued message of a session",
+  "x-version": "1.0-draft.6",
+  "description": "PUBLIC record. A message a user queued for a session. order is given when the item is made, is unique within its session and never changes; a session's items are delivered in that order. delivery 'next_turn' sends it as the next turn once the current one ends; 'steer' sends it into the turn in progress where the driver can take input mid-turn. If mid_turn_input is absent, steering is queued for the next turn; steering does not itself interrupt. Whether steering is offered without typed input acceptance remains the owner's separate decision. The item can be edited (queue.update) or withdrawn (queue.cancel) ONLY while its state is 'queued'; each edit raises revision. DELIVERY. Commit delivering, a never-reused delivery_id, and the full target binding before writing. Allocate a new turn's identity before dispatch. Only the successful queued-to-delivering transition owns the write; observing delivering, retrying a callback, or replaying a command never sends again. The driver correlates acceptance with its own pending request/protocol token and worker incarnation, not an arbitrary ID read from engine output. The core verifies delivery, item, log, run, turn and how against the durable binding; a mismatch is delivery_mismatch and changes nothing. Commit input.accepted, the delivered item and the associated turn transition/event together. Recovery quarantines uncertain delivery and never resends it automatically. The quarantine state and outcome-unknown event are also committed together. The binding is $defs/delivery_binding: private, kept by the daemon beside the item, never sent, and normative. 'delivering' means that commit was made; while it lasts the daemon has not seen the engine take the item. 'delivered' means the engine's own typed acceptance (an input.accepted event, event.v1) agreed with the binding in every member; turn_id is then the turn that took the item: the new turn it began, or the turn in progress it went into. Nothing else makes an item 'delivered': not the write, and not text the engine printed. An item still 'delivering' at a restart, or at the end of its target turn, has no acceptance and becomes 'outcome_unknown'. A turn_ended notification carries the ended turn's identity. If an item is still delivering and that identity equals its durable binding's target_turn_id, atomically quarantine it as outcome_unknown and record the outcome-unknown event, for both new_turn and mid_turn deliveries. Ending a different turn changes nothing. A subsequent acceptance is retained as evidence and does not promote the quarantined item automatically. (The target turn is the turn in progress a steer was written into, or the new turn allocated for the message before its dispatch.) A surface shows 'outcome_unknown' as: Delivery outcome unknown; the message may not have been sent. It will not be resent automatically. That is so on whichever side of the write the daemon stopped, and also when it had observed an acceptance and stopped before committing it: an observation is not a durable confirmation. LATE ACCEPTANCE, PROVISIONAL, the conservative rule: an acceptance that arrives after an item became 'outcome_unknown' changes nothing by itself. Never resend or silently promote a quarantined item merely because an unbound late packet arrived. Preserve late evidence; a later explicit reconciliation protocol may promote only after proving the durable binding and absence of a conflicting dispatch. The binding's 'how' is one the item's delivery allows: a message for the next turn is never written into the turn in progress, so its how is new_turn; a steer is mid_turn, or new_turn where the driver cannot take input in the middle of a turn. conformance/rules.py (DeliveryModel) states all of this as code, and the vectors in vectors/queue.delivery walk it, each crash point included. One database commit cannot make delivery to an engine happen exactly once: this design gives up a possible delivery to avoid an automatic duplicate, and the record says honestly which of the three it was. 'delivered', 'cancelled' and 'outcome_unknown' are final.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["item_id", "session_id", "order", "text", "revision", "delivery", "state", "delivery_id", "turn_id", "created_at"],
+  "properties": {
+    "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+    "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+    "order": {"type": "integer", "minimum": 1},
+    "text": {"type": "string", "minLength": 1},
+    "revision": {"$ref": "common.v1.json#/$defs/revision"},
+    "delivery": {"enum": ["next_turn", "steer"]},
+    "state": {"enum": ["queued", "delivering", "delivered", "cancelled", "outcome_unknown"]},
+    "delivery_id": {
+      "description": "The id of the delivery attempt; null until delivery begins.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/delivery_id"}]
+    },
+    "turn_id": {
+      "description": "The turn a delivered item became; null until then.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]
+    },
+    "created_at": {"$ref": "common.v1.json#/$defs/timestamp"}
+  },
+  "allOf": [
+    {
+      "if": {"required": ["state"], "properties": {"state": {"enum": ["queued", "cancelled"]}}},
+      "then": {"properties": {"delivery_id": {"type": "null"}, "turn_id": {"type": "null"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "delivering"}}},
+      "then": {"properties": {"delivery_id": {"type": "string"}, "turn_id": {"type": "null"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "delivered"}}},
+      "then": {"properties": {"delivery_id": {"type": "string"}, "turn_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "outcome_unknown"}}},
+      "then": {"properties": {"delivery_id": {"type": "string"}, "turn_id": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "delivery_binding": {
+      "description": "PRIVATE. Never sent to any client. What the daemon commits, in the same write as 'delivering' and before anything is written toward the engine: the delivery (an id that is never used again), the item, the log, the run, the incarnation of the worker the input is written to, the turn the input is aimed at (for 'new_turn' a turn id allocated before the dispatch; for 'mid_turn' the turn in progress), and how. There is at most one write for one binding. An acceptance makes the item 'delivered' only when its delivery, log, run, turn and how are these; the driver matches the engine's signal to its own pending request and to this worker incarnation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delivery_id", "item_id", "session_id", "run_id", "worker_incarnation", "target_turn_id", "how"],
+      "properties": {
+        "delivery_id": {"$ref": "common.v1.json#/$defs/delivery_id"},
+        "item_id": {"$ref": "common.v1.json#/$defs/item_id"},
+        "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+        "worker_incarnation": {"$ref": "common.v1.json#/$defs/token"},
+        "target_turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
+        "how": {"enum": ["new_turn", "mid_turn"]}
+      }
+    }
+  }
+}

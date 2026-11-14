@@ -1,0 +1,17 @@
+{
+  "answer": {
+    "code": "start_failed",
+    "detail": "StartRefused",
+    "recorded": true,
+    "start_error": {
+      "code": "route_not_configured",
+      "detail": "pi"
+    }
+  },
+  "method": "run.start",
+  "params": {
+    "engine": "pi",
+    "prompt": "x",
+    "tenant": "t1"
+  }
+}

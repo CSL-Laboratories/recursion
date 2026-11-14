@@ -1,0 +1,7 @@
+{
+  "method": "route.list",
+  "params": {},
+  "answer": {
+    "code": "unavailable"
+  }
+}

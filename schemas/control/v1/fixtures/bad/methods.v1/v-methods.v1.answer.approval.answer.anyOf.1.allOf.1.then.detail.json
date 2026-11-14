@@ -1,0 +1,15 @@
+{
+  "method": "approval.answer",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "approval_id": "apr-00c4",
+    "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+    "answer": "deny",
+    "expected_revision": 1,
+    "surface": "tui"
+  },
+  "answer": {
+    "code": "unsupported",
+    "detail": "multi_turn"
+  }
+}

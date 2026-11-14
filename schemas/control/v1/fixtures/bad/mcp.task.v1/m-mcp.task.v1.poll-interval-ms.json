@@ -1,0 +1,16 @@
+{
+  "task_id": "turn-000c",
+  "source": "turn",
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": null,
+  "turn_id": "turn-000c",
+  "status": "working",
+  "outcome": null,
+  "cancel_requested": false,
+  "status_message": null,
+  "pending_approval_ids": [],
+  "created_at": "2026-11-13T07:33:59.950Z",
+  "updated_at": "2026-11-13T07:33:59.950Z",
+  "expires_at": null,
+  "result": null
+}

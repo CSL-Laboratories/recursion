@@ -1,0 +1,12 @@
+{
+  "method": "queue.cancel",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "item_id": "qi-0002",
+    "expected_revision": 2
+  },
+  "answer": {
+    "code": "unsupported",
+    "detail": "not_implemented"
+  }
+}

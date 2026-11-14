@@ -1,0 +1,7 @@
+{
+  "method": "queue.cancel",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "expected_revision": 2
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "reindex",
+  "summary": "Rebuild the search index of the notes folder.",
+  "arguments": [
+    {
+      "name": "folder",
+      "summary": "Only this folder."
+    }
+  ],
+  "permission": "command"
+}

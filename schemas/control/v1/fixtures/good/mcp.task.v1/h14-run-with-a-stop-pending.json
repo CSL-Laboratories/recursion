@@ -1,0 +1,17 @@
+{
+  "task_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "source": "run",
+  "session_id": null,
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": null,
+  "status": "working",
+  "outcome": null,
+  "cancel_requested": true,
+  "status_message": "stop pending: cgroup_populated",
+  "pending_approval_ids": [],
+  "created_at": null,
+  "updated_at": "2026-11-13T07:34:40.031Z",
+  "expires_at": null,
+  "poll_interval_ms": 1000,
+  "result": null
+}

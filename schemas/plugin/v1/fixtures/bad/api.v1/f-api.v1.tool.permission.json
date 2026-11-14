@@ -1,0 +1,16 @@
+{
+  "name": "search-notes",
+  "description": "Search the notes folder and return matching lines.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "query"
+    ],
+    "properties": {
+      "query": {
+        "type": "string"
+      }
+    }
+  },
+  "permission": "x-nobody-defined-this"
+}

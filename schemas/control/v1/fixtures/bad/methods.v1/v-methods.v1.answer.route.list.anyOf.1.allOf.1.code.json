@@ -1,0 +1,8 @@
+{
+  "method": "route.list",
+  "params": {},
+  "answer": {
+    "code": "request_invalid",
+    "detail": "daemon_closing"
+  }
+}

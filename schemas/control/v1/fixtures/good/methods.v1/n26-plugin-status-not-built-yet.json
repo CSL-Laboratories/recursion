@@ -1,0 +1,10 @@
+{
+  "method": "plugin.status",
+  "params": {
+    "plugin_id": "notes.search"
+  },
+  "answer": {
+    "code": "unsupported",
+    "detail": "not_implemented"
+  }
+}

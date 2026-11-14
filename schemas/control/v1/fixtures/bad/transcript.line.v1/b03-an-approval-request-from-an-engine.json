@@ -1,0 +1,11 @@
+{
+  "seq": 3,
+  "time_rel_ms": 2074,
+  "event_type": "approval.requested",
+  "source": "engine",
+  "trust": "untrusted",
+  "state": null,
+  "text": "Approval needed",
+  "speech": null,
+  "focus": "approval"
+}

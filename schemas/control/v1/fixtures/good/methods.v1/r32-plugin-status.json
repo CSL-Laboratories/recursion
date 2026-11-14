@@ -1,0 +1,6 @@
+{
+  "method": "plugin.status",
+  "params": {
+    "plugin_id": "notes.search"
+  }
+}

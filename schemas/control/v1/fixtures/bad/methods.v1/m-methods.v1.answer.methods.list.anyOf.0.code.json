@@ -1,0 +1,19 @@
+{
+  "method": "methods.list",
+  "params": {},
+  "answer": {
+    "table_version": "1.0-draft.9",
+    "methods": [
+      {
+        "name": "run.stop",
+        "implemented": true,
+        "beta": false
+      },
+      {
+        "name": "session.turn",
+        "implemented": false,
+        "beta": true
+      }
+    ]
+  }
+}

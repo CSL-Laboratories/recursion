@@ -1,0 +1,41 @@
+{
+  "name": "session.turn",
+  "scope": "run",
+  "mutating": true,
+  "idempotency": "none",
+  "precondition": "expected_revision",
+  "requires": [],
+  "falls_back": [],
+  "service": null,
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_session_turn",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  "beta": true,
+  "codes": [
+    "ok",
+    "request_invalid",
+    "scope_refused",
+    "unavailable",
+    "unsupported",
+    "conflict",
+    "busy",
+    "session_unknown",
+    "start_failed",
+    "registry_unavailable",
+    "workspace_invalid",
+    "workspace_busy",
+    "reservation_refused",
+    "breaker_store_missing"
+  ],
+  "lane": "SESSIONS",
+  "params": "#/$defs/params.session.turn",
+  "result": "#/$defs/answer.session.turn"
+}

@@ -1,0 +1,11 @@
+{
+  "answer": {
+    "code": "run_unknown",
+    "detail": "prompt"
+  },
+  "method": "run.start",
+  "params": {
+    "engine": "claude_code",
+    "tenant": "t1"
+  }
+}

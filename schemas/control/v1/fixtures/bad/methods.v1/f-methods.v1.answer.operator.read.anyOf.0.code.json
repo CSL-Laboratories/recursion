@@ -1,0 +1,12 @@
+{
+  "method": "operator.read",
+  "params": {
+    "command": {
+      "command": "operator.conditions.inspect"
+    }
+  },
+  "answer": {
+    "code": "x-nobody-defined-this",
+    "detail": "not_implemented"
+  }
+}

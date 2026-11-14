@@ -1,0 +1,33 @@
+{
+  "name": "session.status",
+  "scope": "read",
+  "mutating": false,
+  "idempotency": "none",
+  "precondition": "expected_revision",
+  "requires": [],
+  "falls_back": [],
+  "service": null,
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_session_status",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  "beta": true,
+  "codes": [
+    "ok",
+    "request_invalid",
+    "scope_refused",
+    "unavailable",
+    "unsupported",
+    "session_unknown"
+  ],
+  "lane": "SESSIONS",
+  "params": "#/$defs/params.session.status",
+  "result": "#/$defs/answer.session.status"
+}

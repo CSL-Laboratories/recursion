@@ -1,0 +1,32 @@
+{
+  "seq": 28,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": null,
+  "time": "2026-11-13T07:34:28.036Z",
+  "type": "route.decision",
+  "source": "x-nobody-defined-this",
+  "trust": "trusted",
+  "payload": {
+    "chosen": {
+      "engine": "claude_code",
+      "model": "claude-sonnet-5-5",
+      "connection": {
+        "kind": "subscription",
+        "id": "personal-max"
+      }
+    },
+    "reason": "hand_pick",
+    "candidates": [
+      {
+        "engine": "claude_code",
+        "model": "claude-sonnet-5-5",
+        "skipped": null
+      }
+    ],
+    "hand_pick": {
+      "engine": "claude_code",
+      "model": "claude-sonnet-5-5"
+    }
+  }
+}

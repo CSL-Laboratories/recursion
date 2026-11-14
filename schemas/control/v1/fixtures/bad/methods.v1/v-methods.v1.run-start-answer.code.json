@@ -1,0 +1,12 @@
+{
+  "method": "run.start",
+  "params": {
+    "tenant": "t1",
+    "engine": "claude_code",
+    "prompt": "Summarise the repository.",
+    "client_key": "k-1"
+  },
+  "answer": {
+    "code": "x-nobody-defined-this"
+  }
+}

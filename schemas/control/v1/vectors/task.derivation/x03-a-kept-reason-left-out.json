@@ -1,0 +1,181 @@
+{
+  "source": "run",
+  "view": {
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "tenant": "t1",
+    "engine": "claude_code",
+    "state": "start_failed",
+    "cgroup": null,
+    "started_at": 1794555600.25,
+    "stop": null,
+    "start_key": {
+      "client_key": "k-1",
+      "engine": "claude_code",
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+    },
+    "generation": 2,
+    "cgroup_marker": null,
+    "members": [],
+    "stop_attestation": null,
+    "principal": {
+      "kind": "owner",
+      "id": "local"
+    },
+    "launch": {
+      "route_entry": null,
+      "route_decision": null,
+      "workspace": null,
+      "containment_level": null,
+      "session_id": null,
+      "turn_id": null,
+      "owner": "host",
+      "budget": {
+        "cap_usd": 0
+      }
+    },
+    "start_error": {
+      "code": "route_not_configured",
+      "detail": "claude_code"
+    },
+    "observed": null
+  },
+  "events": [
+    {
+      "seq": 1,
+      "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": null,
+      "time": "2026-11-13T07:33:58.120Z",
+      "type": "state.changed",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "entity": "run",
+        "entity_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "post_image": {
+          "daemon_row": null,
+          "control_record": {
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tenant": "t1",
+            "engine": "claude_code",
+            "state": "starting",
+            "cgroup": null,
+            "started_at": 1794555600.25,
+            "stop": null,
+            "start_key": {
+              "client_key": "k-1",
+              "engine": "claude_code",
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+            },
+            "generation": 1,
+            "cgroup_marker": null,
+            "members": [],
+            "stop_attestation": null,
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "launch": {
+              "route_entry": null,
+              "route_decision": null,
+              "workspace": null,
+              "containment_level": null,
+              "session_id": null,
+              "turn_id": null,
+              "owner": "host",
+              "budget": {
+                "cap_usd": 0
+              }
+            }
+          }
+        },
+        "post_image_sha256": "45188083c94f8489455d91b854931294e567a663a33039b430b3ec933686d03a",
+        "reason": "snapshot",
+        "coalesced": null
+      }
+    },
+    {
+      "seq": 2,
+      "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": null,
+      "time": "2026-11-13T07:33:58.300Z",
+      "type": "state.changed",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "entity": "run",
+        "entity_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "post_image": {
+          "daemon_row": null,
+          "control_record": {
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tenant": "t1",
+            "engine": "claude_code",
+            "state": "start_failed",
+            "cgroup": null,
+            "started_at": 1794555600.25,
+            "stop": null,
+            "start_key": {
+              "client_key": "k-1",
+              "engine": "claude_code",
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+            },
+            "generation": 2,
+            "cgroup_marker": null,
+            "members": [],
+            "stop_attestation": null,
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "launch": {
+              "route_entry": null,
+              "route_decision": null,
+              "workspace": null,
+              "containment_level": null,
+              "session_id": null,
+              "turn_id": null,
+              "owner": "host",
+              "budget": {
+                "cap_usd": 0
+              }
+            },
+            "start_error": {
+              "code": "route_not_configured",
+              "detail": "claude_code"
+            }
+          }
+        },
+        "post_image_sha256": "fe721228e8150eb4de9745552d89e03b5546ba25456983079ca6ccab75e56230",
+        "reason": "commit",
+        "coalesced": null
+      }
+    }
+  ],
+  "pending_approval_ids": [],
+  "task": {
+    "task_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "source": "run",
+    "session_id": null,
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "turn_id": null,
+    "status": "failed",
+    "outcome": null,
+    "cancel_requested": false,
+    "status_message": null,
+    "pending_approval_ids": [],
+    "created_at": null,
+    "updated_at": "2026-11-13T07:33:58.300Z",
+    "expires_at": null,
+    "poll_interval_ms": null,
+    "result": {
+      "code": "start_failed",
+      "detail": null,
+      "result_ref": null
+    }
+  },
+  "expect": [
+    "result"
+  ]
+}

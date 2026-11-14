@@ -1,0 +1,7 @@
+{
+  "tenant": "t1",
+  "command_id": "notes-search.0001",
+  "workspace": {
+    "path": "/home/dev/notes"
+  }
+}

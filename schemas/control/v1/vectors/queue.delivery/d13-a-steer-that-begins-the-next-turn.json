@@ -1,0 +1,111 @@
+{
+  "item": {
+    "item_id": "qi-0002",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "order": 2,
+    "text": "Stop refactoring; only fix the failing test.",
+    "revision": 1,
+    "delivery": "steer",
+    "state": "queued",
+    "delivery_id": null,
+    "turn_id": null,
+    "created_at": "2026-11-13T07:34:20.000Z"
+  },
+  "steps": [
+    {
+      "what": "Delivering and the binding are committed: how is new_turn.",
+      "happening": "begin",
+      "facts": {
+        "delivery_id": "dlv-0008",
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "worker_incarnation": "wrk-5b1f0c2d.1",
+        "target_turn_id": "turn-000d",
+        "how": "new_turn"
+      },
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "delivering",
+        "delivery_id": "dlv-0008",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The write returns.",
+      "happening": "written",
+      "facts": {
+        "delivery_id": "dlv-0008"
+      },
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "delivering",
+        "delivery_id": "dlv-0008",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "An acceptance that says it went into the turn in progress: not what was bound.",
+      "happening": "accepted",
+      "event": {
+        "seq": 52,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000d",
+        "time": "2026-11-13T07:35:03.100Z",
+        "type": "input.accepted",
+        "source": "engine",
+        "trust": "untrusted",
+        "payload": {
+          "delivery_id": "dlv-0008",
+          "turn_id": "turn-000d",
+          "how": "mid_turn"
+        }
+      },
+      "refused": "delivery_mismatch"
+    },
+    {
+      "what": "The acceptance that agrees: it began the new turn.",
+      "happening": "accepted",
+      "event": {
+        "seq": 53,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000d",
+        "time": "2026-11-13T07:35:03.120Z",
+        "type": "input.accepted",
+        "source": "engine",
+        "trust": "untrusted",
+        "payload": {
+          "delivery_id": "dlv-0008",
+          "turn_id": "turn-000d",
+          "how": "new_turn"
+        }
+      },
+      "item": {
+        "item_id": "qi-0002",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 2,
+        "text": "Stop refactoring; only fix the failing test.",
+        "revision": 1,
+        "delivery": "steer",
+        "state": "delivered",
+        "delivery_id": "dlv-0008",
+        "turn_id": "turn-000d",
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    }
+  ]
+}

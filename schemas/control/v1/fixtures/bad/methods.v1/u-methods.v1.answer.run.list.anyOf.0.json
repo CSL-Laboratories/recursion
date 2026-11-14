@@ -1,0 +1,70 @@
+{
+  "answer": {
+    "code": "ok",
+    "next_after": "run-5e00adb9034f479aadaa40aa964cd9a5",
+    "runs": [
+      {
+        "cgroup": "/test.slice/recursion-run-run-17d4a69723244aa087c0942d2be267d4.service",
+        "cgroup_marker": "cg-438ad55eb8c74a349d9239e40ebb5b30",
+        "engine": "claude_code",
+        "generation": 4,
+        "members": [],
+        "observed": {
+          "detail": "",
+          "state": "terminated",
+          "stop_requested": true,
+          "unit": "recursion-run-run-17d4a69723244aa087c0942d2be267d4.service"
+        },
+        "result": {
+          "code": "engine_exited",
+          "detail": "stdout closed before result",
+          "status": "error"
+        },
+        "run_id": "run-17d4a69723244aa087c0942d2be267d4",
+        "start_key": {
+          "client_key": "capture-1",
+          "engine": "claude_code",
+          "prompt_sha256": "3d7bb8776dad8b047d66746d9cd47c1b0c937eaba3ad596075a229b4a3137a98"
+        },
+        "started_at": 1794559509.998849,
+        "state": "stopped",
+        "stop": {
+          "cgroup": "/test.slice/recursion-run-run-17d4a69723244aa087c0942d2be267d4.service",
+          "cgroup_marker": "cg-438ad55eb8c74a349d9239e40ebb5b30",
+          "checks": 2,
+          "reason": null,
+          "requested": true,
+          "requested_at": 1794559510.1080728
+        },
+        "stop_attestation": {
+          "cgroup": "/test.slice/recursion-run-run-17d4a69723244aa087c0942d2be267d4.service",
+          "cgroup_marker": "cg-438ad55eb8c74a349d9239e40ebb5b30",
+          "generation": 3,
+          "member_ids": [],
+          "proof": "empty"
+        },
+        "tenant": "t1"
+      },
+      {
+        "cgroup": null,
+        "cgroup_marker": null,
+        "engine": "pi",
+        "generation": 2,
+        "members": [],
+        "observed": null,
+        "run_id": "run-5e00adb9034f479aadaa40aa964cd9a5",
+        "start_key": null,
+        "started_at": 1794559511.1271224,
+        "state": "start_failed",
+        "stop": null,
+        "stop_attestation": null,
+        "tenant": "t1"
+      }
+    ],
+    "x-nobody-defined-this": true
+  },
+  "method": "run.list",
+  "params": {
+    "limit": 2
+  }
+}

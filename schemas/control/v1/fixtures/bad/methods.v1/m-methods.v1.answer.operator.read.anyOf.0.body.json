@@ -1,0 +1,12 @@
+{
+  "method": "operator.read",
+  "params": {
+    "command": {
+      "command": "operator.conditions.inspect"
+    }
+  },
+  "answer": {
+    "code": "ok",
+    "http_status": 200
+  }
+}

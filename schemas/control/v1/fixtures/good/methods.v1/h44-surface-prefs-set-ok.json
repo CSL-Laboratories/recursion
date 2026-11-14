@@ -1,0 +1,18 @@
+{
+  "method": "surface.prefs.set",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "surface": "page",
+    "theme": "dusk",
+    "expected_revision": 3
+  },
+  "answer": {
+    "code": "ok",
+    "prefs": {
+      "surface": "page",
+      "layout": null,
+      "theme": "dusk",
+      "revision": 5
+    }
+  }
+}

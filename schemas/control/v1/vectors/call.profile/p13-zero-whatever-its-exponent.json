@@ -1,0 +1,13 @@
+{
+  "tool": "Calc",
+  "cwd": null,
+  "input_text": "{\"a\": 0e1000000, \"b\": 1e-1000000, \"c\": -0e1000000}",
+  "expect": {
+    "call_text": "{\"cwd\":null,\"input\":{\"a\":0,\"b\":0,\"c\":0},\"tool\":\"Calc\"}",
+    "input": {
+      "a": 0,
+      "b": 0,
+      "c": 0
+    }
+  }
+}

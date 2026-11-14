@@ -1,0 +1,11 @@
+{
+  "seq": 24,
+  "time_rel_ms": 23851,
+  "event_type": "stop.result",
+  "source": "core",
+  "trust": "trusted",
+  "state": "pending",
+  "text": "Stop pending: confirm_timeout",
+  "speech": "Stop pending",
+  "focus": null
+}

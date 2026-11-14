@@ -1,0 +1,26 @@
+{
+  "method": "run.start",
+  "params": {
+    "tenant": "t1",
+    "prompt": "Fix the failing test.",
+    "client_key": "k-2",
+    "hand_pick": {
+      "engine": "claude_code",
+      "model": "claude-sonnet-5-5"
+    },
+    "workspace": {
+      "path": "/home/dev/projects/atlas",
+      "x-nobody-defined-this": true
+    }
+  },
+  "answer": {
+    "code": "start_failed",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "detail": "StartRefused",
+    "recorded": true,
+    "start_error": {
+      "code": "reservation_refused",
+      "detail": "the cap for this key is 0"
+    }
+  }
+}

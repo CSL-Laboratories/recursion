@@ -1,0 +1,25 @@
+{
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "tenant": "t1",
+  "engine": "claude_code",
+  "state": "stopped",
+  "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+  "started_at": 1794555600.25,
+  "stop": {
+    "requested_at": 1794555660.5,
+    "checks": 1,
+    "reason": null,
+    "requested": true,
+    "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+    "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b"
+  },
+  "start_key": {
+    "client_key": "k-1",
+    "engine": "claude_code",
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+  },
+  "generation": 4,
+  "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
+  "members": [],
+  "stop_attestation": null
+}

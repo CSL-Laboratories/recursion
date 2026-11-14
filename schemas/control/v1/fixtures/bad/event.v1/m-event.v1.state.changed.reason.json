@@ -1,0 +1,27 @@
+{
+  "seq": 31,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:31.147Z",
+  "type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "entity": "turn",
+    "entity_id": "turn-000c",
+    "post_image": {
+      "turn_id": "turn-000c",
+      "index": 2,
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "state": "running",
+      "started_at": "2026-11-13T07:34:00.000Z",
+      "ended_at": null,
+      "outcome": null,
+      "result": null,
+      "expires_at": null
+    },
+    "post_image_sha256": "9ecac8b6e566ae094f94e3eaa28c09f2ee189f9fe8a80fa22a222f4c14accd27",
+    "coalesced": 1
+  }
+}

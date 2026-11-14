@@ -1,0 +1,18 @@
+{
+  "seq": 19,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:19.703Z",
+  "type": "steer.queued",
+  "source": "client",
+  "trust": "trusted",
+  "payload": {
+    "item_id": "qi-0002",
+    "order": 2,
+    "delivery": "x-nobody-defined-this",
+    "revision": 1,
+    "state": "queued"
+  },
+  "command_id": "tui-7c1e.0008"
+}

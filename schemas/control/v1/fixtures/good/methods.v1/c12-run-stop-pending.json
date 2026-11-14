@@ -1,0 +1,12 @@
+{
+  "answer": {
+    "code": "pending",
+    "reason": "cgroup_populated",
+    "run_id": "run-fd416edb7381434a8f809a30a2800e94",
+    "state": "pending"
+  },
+  "method": "run.stop",
+  "params": {
+    "run_id": "run-fd416edb7381434a8f809a30a2800e94"
+  }
+}

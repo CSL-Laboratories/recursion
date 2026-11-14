@@ -1,0 +1,9 @@
+{
+  "method": "plugin.call",
+  "params": {
+    "plugin_id": "notes.search",
+    "kind": "command",
+    "name": "reindex",
+    "arguments": {}
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "cgroup": "/test.slice/recursion-run-run-7af87d8421244ecdbc20ef7a4b9a7e44.service",
+  "cgroup_marker": "cg-0b5633272fcc41c5bfd9498c1c1e7858",
+  "engine": "claude_code",
+  "generation": 2,
+  "members": [],
+  "observed": {
+    "detail": "",
+    "state": "terminated",
+    "stop_requested": false,
+    "unit": "recursion-run-run-7af87d8421244ecdbc20ef7a4b9a7e44.service"
+  },
+  "output": {
+    "bytes": 1045,
+    "complete": true,
+    "lines": [
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 196861, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_stdin_eof\", \"note\": \"stdin closed; not treated as cancellation\"}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 1\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 2\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 3\"}]}}",
+      "{\"stand_in_engine\": true, \"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"result\": \"stand-in engine finished after 3 ticks\"}"
+    ]
+  },
+  "recorded_state": "running",
+  "result": {
+    "breaker_effect": "none",
+    "code": null,
+    "contract": "recursion.route/v0",
+    "detail": "",
+    "events": [],
+    "limit": null,
+    "limit_notice": null,
+    "request_id": "run-7af87d8421244ecdbc20ef7a4b9a7e44",
+    "retry_at": null,
+    "status": "ok",
+    "text": "stand-in engine finished after 3 ticks"
+  },
+  "run_id": "run-7af87d8421244ecdbc20ef7a4b9a7e44",
+  "start_key": null,
+  "started_at": 1794559510.762937,
+  "state": "ended",
+  "stop": null,
+  "stop_attestation": null,
+  "tenant": "t1"
+}

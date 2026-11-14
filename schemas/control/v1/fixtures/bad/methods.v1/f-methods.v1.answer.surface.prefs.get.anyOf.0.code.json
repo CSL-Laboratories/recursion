@@ -1,0 +1,10 @@
+{
+  "method": "surface.prefs.get",
+  "params": {
+    "surface": "page"
+  },
+  "answer": {
+    "code": "x-nobody-defined-this",
+    "detail": "not_implemented"
+  }
+}

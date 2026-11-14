@@ -1,0 +1,14 @@
+{
+  "tool": "Calc",
+  "cwd": null,
+  "input_text": "{\"zero\": -0.0, \"one\": 1.0, \"big\": 1e15, \"half\": 0.5}",
+  "expect": {
+    "call_text": "{\"cwd\":null,\"input\":{\"big\":1000000000000000,\"half\":0.5,\"one\":1,\"zero\":0},\"tool\":\"Calc\"}",
+    "input": {
+      "zero": 0,
+      "one": 1,
+      "big": 1000000000000000,
+      "half": 0.5
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "seq": 17,
+  "time_rel_ms": 16592,
+  "event_type": "turn.started",
+  "source": "core",
+  "trust": "trusted",
+  "state": null,
+  "text": "Fix the failing test in tests/test_io.py.",
+  "speech": null,
+  "focus": null
+}

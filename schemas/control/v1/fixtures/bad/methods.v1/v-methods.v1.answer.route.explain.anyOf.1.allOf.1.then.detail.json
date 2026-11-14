@@ -1,0 +1,14 @@
+{
+  "method": "route.explain",
+  "params": {
+    "hand_pick": {
+      "engine": "codex",
+      "model": null
+    },
+    "task_kind": "code_edit"
+  },
+  "answer": {
+    "code": "unsupported",
+    "detail": "store_absent"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "method": "methods.list",
+  "params": {},
+  "answer": {
+    "code": "x-nobody-defined-this",
+    "detail": "daemon_closing"
+  }
+}

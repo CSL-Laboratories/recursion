@@ -1,0 +1,9 @@
+{
+  "answer": {
+    "code": "method_unknown",
+    "detail": "run.kill",
+    "x-nobody-defined-this": true
+  },
+  "method": "run.kill",
+  "params": {}
+}

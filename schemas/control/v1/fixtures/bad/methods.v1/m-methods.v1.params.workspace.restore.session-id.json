@@ -1,0 +1,8 @@
+{
+  "method": "workspace.restore",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "checkpoint_id": "ckpt-0003",
+    "expected_revision": 9
+  }
+}

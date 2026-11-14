@@ -1,0 +1,14 @@
+{
+  "cgroup": null,
+  "cgroup_marker": null,
+  "engine": "pi",
+  "members": [],
+  "observed": null,
+  "run_id": "run-94d549d490904d779aef5070c9a63ebb",
+  "start_key": null,
+  "started_at": 1794559511.0385017,
+  "state": "start_failed",
+  "stop": null,
+  "stop_attestation": null,
+  "tenant": "t1"
+}

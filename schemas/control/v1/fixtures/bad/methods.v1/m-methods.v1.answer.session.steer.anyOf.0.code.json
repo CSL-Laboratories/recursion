@@ -1,0 +1,23 @@
+{
+  "method": "session.steer",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "text": "Only the failing test.",
+    "expected_turn_id": "turn-000c"
+  },
+  "answer": {
+    "item": {
+      "item_id": "qi-0002",
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "order": 2,
+      "text": "When the tests pass, also update the changelog.",
+      "revision": 1,
+      "delivery": "steer",
+      "state": "queued",
+      "delivery_id": null,
+      "turn_id": null,
+      "created_at": "2026-11-13T07:34:20.000Z"
+    }
+  }
+}

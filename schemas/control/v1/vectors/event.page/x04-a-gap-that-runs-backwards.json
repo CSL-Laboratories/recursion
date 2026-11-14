@@ -1,0 +1,43 @@
+{
+  "method": "events.read",
+  "params": {
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 49
+    },
+    "projection": "raw"
+  },
+  "page": {
+    "code": "ok",
+    "projection": "raw",
+    "events": [
+      {
+        "seq": 50,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": null,
+        "turn_id": null,
+        "time": "2026-11-13T07:34:02.000Z",
+        "type": "replay.gap",
+        "source": "core",
+        "trust": "trusted",
+        "payload": {
+          "from": 100,
+          "to": 50,
+          "reason": "retention"
+        }
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 50
+    },
+    "more": false,
+    "epoch_advanced": false
+  },
+  "expect": [
+    "gap",
+    "order"
+  ]
+}

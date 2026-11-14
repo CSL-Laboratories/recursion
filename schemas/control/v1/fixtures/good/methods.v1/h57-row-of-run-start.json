@@ -1,0 +1,38 @@
+{
+  "name": "run.start",
+  "scope": "run",
+  "mutating": true,
+  "idempotency": "client_key",
+  "precondition": "none",
+  "requires": [],
+  "falls_back": [],
+  "service": null,
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_run_start",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  "beta": false,
+  "codes": [
+    "started",
+    "start_failed",
+    "start_unconfirmed",
+    "request_invalid",
+    "registry_unavailable",
+    "unavailable",
+    "scope_refused",
+    "workspace_invalid",
+    "workspace_busy",
+    "reservation_refused",
+    "breaker_store_missing"
+  ],
+  "lane": "CONTROL",
+  "params": "#/$defs/params.run.start",
+  "result": "#/$defs/answer.run.start"
+}

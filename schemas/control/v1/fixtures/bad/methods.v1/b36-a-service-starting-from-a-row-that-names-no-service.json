@@ -1,0 +1,10 @@
+{
+  "method": "session.status",
+  "params": {
+    "session_id": "ses-7f3a9c2e51d04b6a"
+  },
+  "answer": {
+    "code": "unavailable",
+    "detail": "service_starting"
+  }
+}

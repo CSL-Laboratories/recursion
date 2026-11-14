@@ -1,0 +1,6 @@
+{
+  "principal": {
+    "kind": "plugin",
+    "id": "notes.search"
+  }
+}

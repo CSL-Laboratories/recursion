@@ -1,0 +1,11 @@
+{
+  "seq": 3,
+  "time_rel_ms": 2074,
+  "event_type": "engine.output",
+  "source": "engine",
+  "trust": "trusted",
+  "state": null,
+  "text": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reading the tests.\"}]}}\n",
+  "speech": null,
+  "focus": null
+}

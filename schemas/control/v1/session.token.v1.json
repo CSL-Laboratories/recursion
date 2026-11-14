@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "session.token.v1.json",
+  "title": "session.token.v1: a token scoped to one session",
+  "x-version": "1.0-draft.1",
+  "description": "A session token lets an engine that runs inside one session ask the daemon for a few things about that session and the sessions it starts, and nothing else. The token itself ($defs/token) is opaque: a client never parses it. It never appears in a record or an event; every closed record in this folder refuses a field that would hold one. The record at the root is the GRANT the daemon keeps for a token: it is PRIVATE, never sent to any client, and it holds the token's SHA-256, never the token. verbs lists what the token may call, each one of the delegable methods ($defs/delegable_method); approval.open, approval.answer and every method that needs 'manage' can never be delegated, so an engine can never approve its own request. A session principal's id is the session's id. NOT DEFINED HERE: how a token is presented and admitted on the socket. Today a peer inside a run unit is closed at accept, before any frame is read; admitting one with a token needs its own bounded admission capacity, so that it cannot take the connections kept for Stop before it has shown a valid token. That is a later design of the lanes that own the socket and Stop.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["token_id", "token_sha256", "session_id", "verbs", "issued_at", "expires_at", "revoked_at"],
+  "properties": {
+    "token_id": {
+      "description": "A label for the grant, safe to log. It is not the token and cannot be turned into it.",
+      "type": "string",
+      "pattern": "^stk-[A-Za-z0-9_-]{1,60}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "token_sha256": {"$ref": "common.v1.json#/$defs/sha256"},
+    "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+    "verbs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/delegable_method"}
+    },
+    "issued_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "expires_at": {
+      "description": "null means the token lasts as long as its session. A token never outlives its session.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]
+    },
+    "revoked_at": {
+      "description": "When the token was revoked, or null. A revoked token is refused at once.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]
+    }
+  },
+  "$defs": {
+    "token": {
+      "description": "The token as it travels: 'rst1_' and 43 characters of URL-safe base64 (32 random bytes). The prefix lets a secret scanner recognise one. Opaque: nothing is to be read out of it.",
+      "type": "string",
+      "pattern": "^rst1_[A-Za-z0-9_-]{43}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "delegable_method": {
+      "description": "PROVISIONAL, for the lanes that own scopes and delegation to confirm. The methods a session token may be granted. With one, an engine can start a child session, send it work, watch it, and stop its own subtree.",
+      "enum": ["session.start", "session.turn", "session.steer", "session.queue", "session.interrupt", "session.status", "session.list", "session.stop", "events.read", "events.follow", "methods.list"]
+    }
+  }
+}

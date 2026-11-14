@@ -1,0 +1,7 @@
+{
+  "method": "session.queue",
+  "params": {
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "text": "later"
+  }
+}

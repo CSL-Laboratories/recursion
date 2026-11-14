@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "install.v1.json",
+  "title": "install.v1: the plugin install file, install.json",
+  "x-version": "1.0-draft.2",
+  "description": "The file '$XDG_CONFIG_HOME/recursion/plugins/install.json' as the daemon reads it today (core/recursion_core/daemon/plugins.py, read_install): this install's trusted developer keys, the grants its user made, the destinations and credential names reserved for effect owners, and the installer's key for the authority ledger. Version 1 is today's format with nothing added, so a file written to this schema is read by today's daemon; it has no version field because today's reader refuses a field it does not know. Every top-level field may be left out; a missing file means no trusted key and no grant, so nothing gets a permission. The file is owner-only and is written by the install commands, never by a plugin. A grant is bound to one artifact digest and one signing key: a grant for another digest or key grants nothing. Two rules the reader enforces cannot be written in a schema: no two grants name the same plugin_id; and the file must be a regular file of the operator's that no one else can write.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "trusted_keys": {
+      "description": "This install's own trusted developer keys: a label for each, and the Ed25519 public key as 64 lower-case hex digits. 'Signed' means signed by one of these.",
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/hex64"}
+    },
+    "grants": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/grant"}
+    },
+    "reserved": {
+      "description": "Network destinations and credential-name prefixes that an effect owner reserves: no grant may name one.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hosts": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "credential_prefixes": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "authority_anchor": {
+      "description": "The installer's public key for the authority ledger, or null when none is configured.",
+      "anyOf": [{"type": "null"}, {"$ref": "#/$defs/hex64"}]
+    }
+  },
+  "$defs": {
+    "hex64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "key_id": {
+      "description": "A public key's stable id: 'ed25519:' and the first 32 hex digits of the key's SHA-256.",
+      "type": "string",
+      "pattern": "^ed25519:[0-9a-f]{32}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "grant": {
+      "description": "What the user granted one plugin. signer_key_id is the key the grant is bound to, or null for a manual grant to an unsigned plugin. unsigned_order_acknowledged records that the user granted 'order' to an unsigned plugin behind the warning. order_after_revoked_key and order_after_revocation_generation record that the user turned 'order' back on after that key was revoked, at that generation of the revoked-key list.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plugin_id", "artifact_sha256", "permissions"],
+      "properties": {
+        "plugin_id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{1,63}$", "not": {"pattern": "[\\r\\n]"}},
+        "artifact_sha256": {"$ref": "#/$defs/hex64"},
+        "signer_key_id": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]},
+        "permissions": {
+          "description": "The seven permissions today's reader takes (plugin_security/manifest.py, PERMISSIONS). The five names that are new in the version 1 manifest are NOT here: today's reader refuses a grant that lists one (daemon/plugins.py, read_install), so a file that granted one would not be read by today's daemon. Granting them needs the reader to change first; when it does, this list grows and this schema says so.",
+          "type": "array",
+          "items": {"enum": ["read", "propose", "panel", "network", "credential", "process", "order"]}
+        },
+        "unsigned_order_acknowledged": {"type": "boolean"},
+        "order_after_revoked_key": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]},
+        "order_after_revocation_generation": {"type": ["integer", "null"]}
+      }
+    }
+  }
+}

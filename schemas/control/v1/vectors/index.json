@@ -1,0 +1,1080 @@
+{
+  "about": "Every vector of this folder. A vector is checked against a rule that no schema can state (conformance/rules.py), named by 'rule'. call.profile: one tool call as an engine wrote it (tool, cwd, input_text) and the text that is bound for it (call_text: its cwd, input and tool, as one object, as RFC 8785 writes it), or the code it is refused with. approval.binding: one approval record of the right shape, and exactly what does not agree inside it (an empty list when everything does); effect_text, where present, is the text whose UTF-8 bytes the digest is taken over. approval.lifecycle: one request, then calls on it one after another, each with who is calling, the answer, and the record after it. The call texts, the effect texts, three whole sets of lines and the order of the answers were written by hand and then checked against the rule, not copied from it. queue.delivery: one queued message and what happens to it, step by step: the item after each step, or the code the step is refused with; a step may carry the event of the log that belongs to it, and an acceptance always carries its input.accepted event. task.derivation: a run's view or a session and one of its turns, the log, the approvals pending, a Task, and exactly which of the Task's fields are not what the source says (an empty list when all are). start.intent: a start request, the extensions the start path declared (null when no lane is on it), the exact preimage of its intent, the start_key it stores, and how it compares with a key already stored. event.cursor: a cursor, its log and the daemon's epoch, and what the read is answered. event.page: the request a read was made with (its cursor, and its projection when it names one) and the page it was answered, and exactly where the page is not the answer to that request or not the continuation of its cursor; 'raw', where a transcript page carries it, is the raw page of the same read, which the transcript page must be the projection of. In the approval vectors records are compared exactly: 1 is not 1.0 and 0 is not -0.0. These files are plain ASCII: a character outside it is written as a JSON escape.",
+  "vectors": [
+    {
+      "file": "call.profile/p01-a-plain-call.json",
+      "rule": "call.profile",
+      "shows": "A plain call: keys come out sorted, with no spaces, whatever order and spacing the engine used."
+    },
+    {
+      "file": "call.profile/p02-numbers-have-one-spelling.json",
+      "rule": "call.profile",
+      "shows": "Numbers are written as ECMAScript writes them: 1.0 is 1, 1e-7 stays 1e-7, 1E3 is 1000, minus zero is 0, 1.5e-300 stays as it is. Two serialisers that spell a number differently (1.0 against 1, 1e-07 against 1e-7) cannot give two digests, because neither spelling is what is hashed. Every number here is inside the profile: no integral value beyond 2^53 - 1, however it is spelled."
+    },
+    {
+      "file": "call.profile/p03-key-order-above-the-basic-plane.json",
+      "rule": "call.profile",
+      "shows": "Keys are ordered by their UTF-16 code units, not by code point: U+10000 sorts before U+E000. (A sort by code point would put them the other way round.)"
+    },
+    {
+      "file": "call.profile/p04-an-escaped-letter-is-the-letter.json",
+      "rule": "call.profile",
+      "shows": "A string has one spelling: the engine wrote the letter a as an escape, and the bound text holds the letter."
+    },
+    {
+      "file": "call.profile/p05-the-letter-itself.json",
+      "rule": "call.profile",
+      "shows": "The same call as p04, written plainly by the engine: the same text, so the same digest."
+    },
+    {
+      "file": "call.profile/p06-text-outside-ascii-everywhere.json",
+      "rule": "call.profile",
+      "shows": "Accented text in the tool's name, in the directory (a Windows path, with backslashes) and in the input, and a character above U+FFFF: each stands as itself. No field of an engine's call is held to one alphabet."
+    },
+    {
+      "file": "call.profile/p07-control-characters.json",
+      "rule": "call.profile",
+      "shows": "A tab keeps its short escape; any other character below U+0020 is a lower-case \\u escape; U+007F stands as itself in the bound text (the lines a surface prints escape it: see the approval vectors)."
+    },
+    {
+      "file": "call.profile/p08-nested-values.json",
+      "rule": "call.profile",
+      "shows": "Arrays keep their order; objects inside are sorted too; true, false and null are themselves."
+    },
+    {
+      "file": "call.profile/p09-nothing-is-normalised.json",
+      "rule": "call.profile",
+      "shows": "The letter e with an acute accent written as one character, and written as e followed by a combining accent, are two different strings and stay two: the core never normalises."
+    },
+    {
+      "file": "call.profile/p10-the-bound-value-is-the-value-dispatched.json",
+      "rule": "call.profile",
+      "shows": "What is bound is normalised, and that same value is what is dispatched: minus zero is 0, 1.0 is the whole number 1, 1e15 is the whole number. A bridge that can only say yes or no to the engine's own pending request must first establish that the request means these same numbers."
+    },
+    {
+      "file": "call.profile/p11-the-largest-whole-number-in-every-spelling.json",
+      "rule": "call.profile",
+      "shows": "The largest value the profile takes, written as digits, with a fraction and with an exponent, and its negative: one value, one text. Admission does not depend on the spelling."
+    },
+    {
+      "file": "call.profile/p12-too-small-for-a-binary64-is-zero.json",
+      "rule": "call.profile",
+      "shows": "A number below what a binary64 holds is read as zero. The profile is binary64, not exact arithmetic: an exact quantity is sent as a string."
+    },
+    {
+      "file": "call.profile/r01-a-key-named-twice.json",
+      "rule": "call.profile",
+      "shows": "An object that names a key twice is refused: the core never picks the first or the last."
+    },
+    {
+      "file": "call.profile/r02-a-key-named-twice-deeper.json",
+      "rule": "call.profile",
+      "shows": "The same, at any depth."
+    },
+    {
+      "file": "call.profile/r03-not-a-number.json",
+      "rule": "call.profile",
+      "shows": "NaN is not JSON."
+    },
+    {
+      "file": "call.profile/r04-infinity.json",
+      "rule": "call.profile",
+      "shows": "Neither is Infinity."
+    },
+    {
+      "file": "call.profile/r05-a-whole-number-too-large-to-keep.json",
+      "rule": "call.profile",
+      "shows": "A whole number beyond 2^53 - 1 would be changed by a binary64 reader (9007199254740993 becomes 9007199254740992), so the call is refused before anything can change it; such a number is sent as a string."
+    },
+    {
+      "file": "call.profile/r06-a-very-long-whole-number.json",
+      "rule": "call.profile",
+      "shows": "The same, for a number of twenty digits."
+    },
+    {
+      "file": "call.profile/r07-a-number-that-is-not-finite.json",
+      "rule": "call.profile",
+      "shows": "One followed by 999 zeros, written with an exponent: an integral value far outside the range, refused as one, before any conversion."
+    },
+    {
+      "file": "call.profile/r08-half-a-surrogate-pair.json",
+      "rule": "call.profile",
+      "shows": "Half of a surrogate pair on its own is not text."
+    },
+    {
+      "file": "call.profile/r09-half-a-surrogate-pair-in-a-key.json",
+      "rule": "call.profile",
+      "shows": "The same, in a key."
+    },
+    {
+      "file": "call.profile/r10-text-that-is-not-json.json",
+      "rule": "call.profile",
+      "shows": "An input that is not JSON is refused, never shown as if it were."
+    },
+    {
+      "file": "call.profile/r11-empty-text.json",
+      "rule": "call.profile",
+      "shows": "So is no input at all."
+    },
+    {
+      "file": "call.profile/r12-an-input-that-is-not-an-object.json",
+      "rule": "call.profile",
+      "shows": "A tool's input is an object."
+    },
+    {
+      "file": "call.profile/r13-a-leading-zero.json",
+      "rule": "call.profile",
+      "shows": "A number with a leading zero is not JSON."
+    },
+    {
+      "file": "call.profile/r14-nested-too-deep.json",
+      "rule": "call.profile",
+      "shows": "Nesting stops at 64."
+    },
+    {
+      "file": "call.profile/r15-a-tool-with-no-name.json",
+      "rule": "call.profile",
+      "shows": "A call names its tool."
+    },
+    {
+      "file": "call.profile/r16-a-large-whole-number-written-with-a-fraction.json",
+      "rule": "call.profile",
+      "shows": "The same value as r05, written with a fraction. A reader that only checks numbers written as digits would take it and round it to 9007199254740992. The rule is on the VALUE: refused."
+    },
+    {
+      "file": "call.profile/r17-a-large-whole-number-written-with-an-exponent.json",
+      "rule": "call.profile",
+      "shows": "The same value again, written with an exponent."
+    },
+    {
+      "file": "call.profile/r18-one-followed-by-twenty-zeros.json",
+      "rule": "call.profile",
+      "shows": "1e20 is an integral value outside the range. The first draft took it and wrote it as 100000000000000000000, which the same profile refuses when it reads its own text again."
+    },
+    {
+      "file": "call.profile/r19-one-followed-by-twenty-one-zeros.json",
+      "rule": "call.profile",
+      "shows": "So is 1e21, which the first draft showed as a number that is taken."
+    },
+    {
+      "file": "call.profile/r20-a-very-large-number-with-a-fraction-part-in-its-digits.json",
+      "rule": "call.profile",
+      "shows": "And 1.5e300: its value is integral."
+    },
+    {
+      "file": "call.profile/r21-two-to-the-fifty-third.json",
+      "rule": "call.profile",
+      "shows": "The first whole number outside the range, as digits."
+    },
+    {
+      "file": "call.profile/r22-two-to-the-fifty-third-negative-with-a-fraction.json",
+      "rule": "call.profile",
+      "shows": "Its negative, with a fraction."
+    },
+    {
+      "file": "call.profile/r23-a-number-that-rounds-to-one-outside-the-range.json",
+      "rule": "call.profile",
+      "shows": "Not an integral value as written, but the nearest binary64 is 9007199254740992, which is: a conversion that gives an integral value outside the range is refused too."
+    },
+    {
+      "file": "call.profile/r24-a-number-with-a-fraction-that-no-binary64-holds.json",
+      "rule": "call.profile",
+      "shows": "A number that is not integral and is larger than any binary64: not finite."
+    },
+    {
+      "file": "call.profile/r25-one-followed-by-a-million-zeros.json",
+      "rule": "call.profile",
+      "shows": "1e1000000 is an integral value far outside the range and is refused as one. The check is exact and does not depend on the host's decimal context: a reader that takes the absolute value in a default context raises that context's overflow here, which is no typed refusal at all."
+    },
+    {
+      "file": "call.profile/r26-minus-one-followed-by-a-million-zeros.json",
+      "rule": "call.profile",
+      "shows": "The same value, negative."
+    },
+    {
+      "file": "call.profile/r27-a-million-zeros-with-a-fraction-in-its-digits.json",
+      "rule": "call.profile",
+      "shows": "1.5e1000000 is integral too."
+    },
+    {
+      "file": "call.profile/r28-the-largest-exponent-of-a-default-decimal-context.json",
+      "rule": "call.profile",
+      "shows": "1e999999 fits a default decimal context exactly and is refused the same way: one outcome on both sides of that limit."
+    },
+    {
+      "file": "call.profile/p13-zero-whatever-its-exponent.json",
+      "rule": "call.profile",
+      "shows": "Zero written with an exponent of a million is zero, and one divided by ten a million times is below what a binary64 holds and reads as zero (p12): both are bound as the whole number 0."
+    },
+    {
+      "file": "approval.binding/g01-a-tool-call.json",
+      "rule": "approval.binding",
+      "shows": "A request for a tool call: its digest is the SHA-256 of the UTF-8 bytes of effect_text, which is the whole effect as RFC 8785 writes it, and its lines are the lines of that effect."
+    },
+    {
+      "file": "approval.binding/g02-a-tool-call-with-text-outside-ascii.json",
+      "rule": "approval.binding",
+      "shows": "Accented text in the input and in the directory, and a fraction written 1.50 by the engine: the bound text holds the text itself and the number as 1.5, and the lines show the same."
+    },
+    {
+      "file": "approval.binding/g03-a-plugin-effect.json",
+      "rule": "approval.binding",
+      "shows": "A plugin effect, under csl-cj/v0 as before: every field of it, and every field of its payload, is on a line."
+    },
+    {
+      "file": "approval.binding/g04-characters-a-surface-is-never-handed-raw.json",
+      "rule": "approval.binding",
+      "shows": "A file name with a right-to-left override in it (it would read notes/exe.png on a terminal), a zero-width space and U+007F. The bound text holds them as they are; the lines show each as an escape, so what is drawn cannot be reordered or hidden."
+    },
+    {
+      "file": "approval.binding/x01-lines-of-another-call.json",
+      "rule": "approval.binding",
+      "shows": "The effect is a Write to a menu file; the lines are those of a Bash call that removes a build folder. The owner would be shown one thing and approve another. (This is the mistake the first draft's fixtures made.)"
+    },
+    {
+      "file": "approval.binding/x02-the-digest-of-nothing.json",
+      "rule": "approval.binding",
+      "shows": "The digest is the SHA-256 of no bytes at all, not of the effect."
+    },
+    {
+      "file": "approval.binding/x03-the-digest-of-another-effect.json",
+      "rule": "approval.binding",
+      "shows": "The digest is another effect's: an answer that names it would approve that other effect."
+    },
+    {
+      "file": "approval.binding/x04-the-digest-of-another-serialisation.json",
+      "rule": "approval.binding",
+      "shows": "The digest is taken over the same effect as an everyday serialiser writes it, with escapes for the accented letters. Those are other bytes, so it is another digest: one canonical form, one digest."
+    },
+    {
+      "file": "approval.binding/x05-a-field-left-off-the-lines.json",
+      "rule": "approval.binding",
+      "shows": "The last field of the input is not on a line. Nothing may be hidden."
+    },
+    {
+      "file": "approval.binding/x06-a-comforting-line-added.json",
+      "rule": "approval.binding",
+      "shows": "A line nobody bound is added, in the core's own voice."
+    },
+    {
+      "file": "approval.binding/x07-an-untrusted-line-marked-trusted.json",
+      "rule": "approval.binding",
+      "shows": "The engine's own text is marked as the core's."
+    },
+    {
+      "file": "approval.binding/x08-a-payload-summed-up.json",
+      "rule": "approval.binding",
+      "shows": "A plugin effect drawn as one line of summary: the payload's fields (what is bought, how much) are not shown."
+    },
+    {
+      "file": "approval.binding/x09-a-raw-override-on-a-line.json",
+      "rule": "approval.binding",
+      "shows": "The lines carry the right-to-left override raw instead of as an escape: on a terminal the file name would read as another."
+    },
+    {
+      "file": "approval.binding/g05-a-run-with-no-session.json",
+      "rule": "approval.binding",
+      "shows": "A tool call of a run that has no session: the line says so, in the core's own word, and the effect's session is null like the record's."
+    },
+    {
+      "file": "approval.binding/x13-the-session-left-off-the-lines.json",
+      "rule": "approval.binding",
+      "shows": "The lines of the first draft: no line for the session the call is bound to. Two requests bound to two sessions would then look the same and carry two digests."
+    },
+    {
+      "file": "approval.binding/x14-an-effect-bound-to-another-session.json",
+      "rule": "approval.binding",
+      "shows": "The record says one session and its effect is bound to another. The digest and the lines agree with the effect, so nothing else notices."
+    },
+    {
+      "file": "approval.binding/x15-an-effect-bound-to-another-run.json",
+      "rule": "approval.binding",
+      "shows": "The same for the run, here for a plugin's effect."
+    },
+    {
+      "file": "approval.binding/g06-a-directory-that-exactly-fills-a-line.json",
+      "rule": "approval.binding",
+      "shows": "A directory of 3,987 characters: with its label and its quotes the line is exactly 4,000 characters, the most one line holds. One line."
+    },
+    {
+      "file": "approval.binding/g07-a-directory-one-character-longer.json",
+      "rule": "approval.binding",
+      "shows": "One character more: the line is full at 4,000 and the last character, the closing quote, continues on a line that starts with two spaces. The label counts toward the length; nothing is cut."
+    },
+    {
+      "file": "approval.binding/g08-a-directory-of-five-thousand-characters.json",
+      "rule": "approval.binding",
+      "shows": "The second read's case: a directory of 5,000 characters. The first draft drew it on one line of 5,013 characters, which the record's own schema refuses. It is two lines."
+    },
+    {
+      "file": "approval.binding/x16-a-long-directory-on-one-line.json",
+      "rule": "approval.binding",
+      "shows": "The same directory drawn on one line, cut to fit the schema: not the lines of the effect."
+    },
+    {
+      "file": "approval.binding/g09-the-longest-tool-name.json",
+      "rule": "approval.binding",
+      "shows": "A tool's name is at most 256 characters, so its line never continues. A call with no directory says null."
+    },
+    {
+      "file": "approval.binding/g10-an-input-value-that-exactly-fills-a-line.json",
+      "rule": "approval.binding",
+      "shows": "A field of the input whose key, colon and value make exactly 4,000 characters."
+    },
+    {
+      "file": "approval.binding/g11-an-input-value-one-character-longer.json",
+      "rule": "approval.binding",
+      "shows": "One character more: it continues."
+    },
+    {
+      "file": "approval.binding/g12-exactly-two-hundred-lines.json",
+      "rule": "approval.binding",
+      "shows": "An input of 193 fields: with the seven lines before them, exactly 200 lines, the most an approval has."
+    },
+    {
+      "file": "approval.binding/x17-two-hundred-and-one-lines-cut-to-two-hundred.json",
+      "rule": "approval.binding",
+      "shows": "One field more needs 201 lines. No approval is made of it: the call is refused (too_many_lines). A record that shows the first 200 lines is not an approval of the effect. Nothing is ever cut."
+    },
+    {
+      "file": "approval.binding/g13-a-plugin-payload-value-that-exactly-fills-a-line.json",
+      "rule": "approval.binding",
+      "shows": "The same encoder draws a plugin's effect: a payload value whose line is exactly 4,000 characters."
+    },
+    {
+      "file": "approval.binding/g14-a-plugin-payload-value-one-character-longer.json",
+      "rule": "approval.binding",
+      "shows": "One character more: it continues."
+    },
+    {
+      "file": "approval.binding/g15-a-long-field-of-a-plugin-effect.json",
+      "rule": "approval.binding",
+      "shows": "A field of a plugin's effect that is not in its payload (the account) goes through the same encoder: 4,100 characters are two lines."
+    },
+    {
+      "file": "approval.binding/g17-every-long-field-of-a-plugin-effect.json",
+      "rule": "approval.binding",
+      "shows": "Each text field of a plugin's effect that the schema lets be long (its connection and the five parts of its scope), at 4,100 characters: each is two lines, none longer than the schema allows. Its plugin id and its currency are kept short by their own patterns. Its kind is not (g18 to g20), and its run is short only because it must be the record's own (x20)."
+    },
+    {
+      "file": "approval.binding/g16-a-plugin-effect-of-exactly-two-hundred-lines.json",
+      "rule": "approval.binding",
+      "shows": "A plugin's effect with 188 payload fields: exactly 200 lines."
+    },
+    {
+      "file": "approval.binding/x10-a-whole-number-too-large-to-keep.json",
+      "rule": "approval.binding",
+      "shows": "The call holds a whole number beyond 2^53 - 1. A schema cannot refuse it; the profile does, so the record has no canonical bytes, no digest and no lines."
+    },
+    {
+      "file": "approval.binding/x18-a-large-number-held-as-a-float.json",
+      "rule": "approval.binding",
+      "shows": "The same for a number a language holds as a float: 1e20 is an integral value outside the range, whatever type carries it. The record has no canonical bytes, no digest and no lines."
+    },
+    {
+      "file": "approval.binding/x11-shown-at-a-revision-not-reached.json",
+      "rule": "approval.binding",
+      "shows": "An opening that names revision 2 on a request that is at revision 1."
+    },
+    {
+      "file": "approval.binding/x12-the-same-showing-twice.json",
+      "rule": "approval.binding",
+      "shows": "The same principal on the same surface at the same revision is recorded once."
+    },
+    {
+      "file": "approval.binding/g18-a-plugin-kind-that-exactly-fills-a-line.json",
+      "rule": "approval.binding",
+      "shows": "A plugin's kind of 3,992 characters: with its label and its quotes the line is exactly 4,000 characters. The kind's pattern sets no length, so the renderer cannot rely on one."
+    },
+    {
+      "file": "approval.binding/g19-a-plugin-kind-one-character-longer.json",
+      "rule": "approval.binding",
+      "shows": "One character more: the closing quote continues on a line that starts with two spaces."
+    },
+    {
+      "file": "approval.binding/g20-a-plugin-kind-of-five-thousand-characters.json",
+      "rule": "approval.binding",
+      "shows": "A kind of 5,002 characters is two lines, neither longer than the schema allows. Nothing is cut."
+    },
+    {
+      "file": "approval.binding/x21-a-long-plugin-kind-on-one-line.json",
+      "rule": "approval.binding",
+      "shows": "The same kind drawn on one line, cut to fit: not the lines of the effect."
+    },
+    {
+      "file": "approval.binding/x20-a-plugin-effect-whose-run-is-not-the-records.json",
+      "rule": "approval.binding",
+      "shows": "A plugin effect's own run_id has no pattern and no length: here it is 5,000 characters, and it is drawn whole, on two lines. What keeps it short in an approval is that it must be the record's run, which this one is not."
+    },
+    {
+      "file": "approval.binding/x19-a-bound-minus-zero.json",
+      "rule": "approval.binding",
+      "shows": "The call holds minus zero. Its digest and its lines are those of the call that holds zero, because RFC 8785 writes both as 0: a digest cannot see the difference and a dispatch can. The bound value is the normalised one, so this record is not an approval: it has no canonical bytes, no digest and no lines. (In the file the number is spelled -0.0.)"
+    },
+    {
+      "file": "approval.lifecycle/s01-open-answer-replay.json",
+      "rule": "approval.lifecycle",
+      "shows": "One request from the moment the core drew it: an answer before any showing, two surfaces showing it, a wrong digest, a stale revision, the answer, the same command again, the same command id with another answer, a second answer, an engine trying to answer, and a look after it is settled."
+    },
+    {
+      "file": "approval.lifecycle/s02-a-plugin-effect-approved-on-the-command-line.json",
+      "rule": "approval.lifecycle",
+      "shows": "A plugin effect: shown on the command line, then approved there."
+    },
+    {
+      "file": "approval.lifecycle/s03-the-content-changes-while-it-is-pending.json",
+      "rule": "approval.lifecycle",
+      "shows": "The content of a pending request changes twice: its deadline is moved, then its effect is replaced. Each change raises the revision, and everyone must look again: an answer for the revision that was read is stale, and an answer for the new one is refused until the surface has shown the new one. Once the request is resolved its content cannot change."
+    },
+    {
+      "file": "approval.lifecycle/s04-openings-and-answers-in-another-order.json",
+      "rule": "approval.lifecycle",
+      "shows": "An opening on one surface does not let another surface answer; the first valid answer wins; an opening after the request is settled adds nothing."
+    },
+    {
+      "file": "approval.lifecycle/s05-an-answer-at-the-deadline.json",
+      "rule": "approval.lifecycle",
+      "shows": "The deadline is 07:49:30.000. An answer AT the deadline is too late: before a fresh answer is taken, the server's time is compared with the deadline, and at or after it the pending request becomes expired, with no answer, no answerer and no answer time. A scheduler that has not run yet does not keep a request answerable."
+    },
+    {
+      "file": "approval.lifecycle/s06-an-answer-one-millisecond-before-the-deadline.json",
+      "rule": "approval.lifecycle",
+      "shows": "One millisecond before the deadline the answer is taken."
+    },
+    {
+      "file": "approval.lifecycle/s07-the-effect-is-carried-out-once.json",
+      "rule": "approval.lifecycle",
+      "shows": "An approved effect is carried out against exactly the approved approval, revision and digest and the private binding the daemon keeps, once. Another digest, another revision or another binding consumes nothing. After a restart, from what is durable (the record, the binding, the receipts), it is still once. A retry of the command that approved it returns the first answer: that is history, and carries nothing out again."
+    },
+    {
+      "file": "approval.lifecycle/s08-a-denied-request-is-never-carried-out.json",
+      "rule": "approval.lifecycle",
+      "shows": "A denied request cannot be consumed, and an approved one cannot be consumed by a daemon that kept no binding for it."
+    },
+    {
+      "file": "approval.lifecycle/s10-a-change-that-cannot-be-drawn-is-refused.json",
+      "rule": "approval.lifecycle",
+      "shows": "The core tries to replace the effect of a pending request with one that needs 201 lines. It cannot be drawn whole, so the change is refused with the typed code and the request stays exactly as it was: nothing is cut and no revision is spent."
+    },
+    {
+      "file": "approval.lifecycle/s09-no-binding-no-consumption.json",
+      "rule": "approval.lifecycle",
+      "shows": "An approval for which the daemon holds no private binding cannot be carried out, whatever binding is offered."
+    },
+    {
+      "file": "approval.lifecycle/s11-a-durable-record-is-restored-in-its-bound-form.json",
+      "rule": "approval.lifecycle",
+      "shows": "The record as another serialiser left it where it is durable: the whole number 1 spelled 1.0 and zero spelled -0.0. The digest and the lines are those of the bound call. The model is made from it, which is what a restart does: the numbers are normalised before anything is digested, drawn or carried out, so every record from here on holds 1 and 0, and that is the value that is carried out. Records are compared exactly here: 1 is not 1.0 and 0 is not -0.0."
+    },
+    {
+      "file": "approval.lifecycle/s12-a-binding-that-names-another-approval.json",
+      "rule": "approval.lifecycle",
+      "shows": "Each member of the private binding is compared with the approval it is used against. Here the binding kept for this approval names ANOTHER approval. Being equal to the binding that is kept is not enough."
+    },
+    {
+      "file": "approval.lifecycle/s13-a-binding-that-names-another-run.json",
+      "rule": "approval.lifecycle",
+      "shows": "The binding kept for this approval names another run than the record and its effect."
+    },
+    {
+      "file": "approval.lifecycle/s14-a-binding-that-names-another-engine.json",
+      "rule": "approval.lifecycle",
+      "shows": "The binding kept for this approval names another engine than the effect."
+    },
+    {
+      "file": "approval.lifecycle/s15-a-change-is-made-whole-or-not-at-all.json",
+      "rule": "approval.lifecycle",
+      "shows": "The core builds a changed request as a candidate and checks all of it before it replaces the request. Each of these is refused with a typed code and leaves the record, its revision and its binding exactly as they were: an effect bound to another run, to another session, to another engine; a deadline that is not a moment; a change that changes nothing. Changing the content is not permission to change the target."
+    },
+    {
+      "file": "approval.lifecycle/s16-a-plugin-effect-is-changed-and-carried-out-once.json",
+      "rule": "approval.lifecycle",
+      "shows": "A plugin's effect. Another plugin's effect, or one bound to another run, cannot take its place; a change of its content can, and raises the revision. A plugin's effect has no pending request of an engine, so the daemon keeps no binding for it and none is offered: it is carried out once against its approval, revision and digest."
+    },
+    {
+      "file": "transcript.projection/g01-a-log-and-its-lines.json",
+      "rule": "transcript.projection",
+      "shows": "Seven events of one log and the seven lines of its transcript: each line's seq, time, type, source, trust and state are its event's, and so is its text where the text is the event's own. The sentences, what is announced and where input goes are the renderer's."
+    },
+    {
+      "file": "transcript.projection/g02-the-clock-steps-back.json",
+      "rule": "transcript.projection",
+      "shows": "The third event carries an earlier time than the second: the clock stepped back. Its line keeps the time of the line before, so the transcript never runs backwards; the fourth goes on from the real clock."
+    },
+    {
+      "file": "transcript.projection/x01-a-time-that-is-not-the-events.json",
+      "rule": "transcript.projection",
+      "shows": "The second line says 1,840 ms; its event is 2,074 ms after the first. (The first draft's fixtures had this mistake.)"
+    },
+    {
+      "file": "transcript.projection/x02-a-text-that-is-not-the-events.json",
+      "rule": "transcript.projection",
+      "shows": "The engine's output is a whole line of its stream; the transcript line shows a sentence taken out of it. The text of an engine.output line is the payload's text, not a reading of it. (The first draft's fixtures had this mistake too.)"
+    },
+    {
+      "file": "transcript.projection/x03-a-state-that-is-not-the-events.json",
+      "rule": "transcript.projection",
+      "shows": "The turn ended 'waiting'; its line says 'done'."
+    },
+    {
+      "file": "transcript.projection/x04-engine-output-shown-as-the-cores.json",
+      "rule": "transcript.projection",
+      "shows": "A line of engine output marked as coming from the core and trusted."
+    },
+    {
+      "file": "transcript.projection/x05-an-event-with-no-line.json",
+      "rule": "transcript.projection",
+      "shows": "One line for each event, in order: here the last event has none."
+    },
+    {
+      "file": "transcript.projection/x07-a-time-that-runs-backwards.json",
+      "rule": "transcript.projection",
+      "shows": "After the clock stepped back, the line shows the smaller time instead of keeping the one before."
+    },
+    {
+      "file": "queue.delivery/d01-a-message-for-the-next-turn-is-delivered.json",
+      "rule": "queue.delivery",
+      "shows": "A message waiting for the next turn. In ONE commit, before anything is written: the item as delivering, its delivery id, and the binding (the item, the log, the run, the worker's incarnation, the new turn's id, allocated now, and how). Then the write, which changes nothing in the record. It is delivered only when the engine's own acceptance agrees with the binding, and then it carries the turn it began."
+    },
+    {
+      "file": "queue.delivery/d02-a-crash-before-the-write.json",
+      "rule": "queue.delivery",
+      "shows": "The daemon stops after the commit and BEFORE it wrote anything. At the restart the delivery's outcome is unknown and the message may not have been sent; it is not resent automatically, even though here nothing was sent."
+    },
+    {
+      "file": "queue.delivery/d03-a-crash-after-the-write.json",
+      "rule": "queue.delivery",
+      "shows": "The daemon stops AFTER the write returned and before any acceptance arrived. The record is the same as when it stops before the write, and so is the end. One commit cannot make a delivery to an engine happen exactly once; this gives up a possible delivery to avoid an automatic duplicate."
+    },
+    {
+      "file": "queue.delivery/d04-a-crash-after-seeing-the-acceptance-and-before-committing-it.json",
+      "rule": "queue.delivery",
+      "shows": "The engine's acceptance was observed, and the daemon stopped before it committed the acceptance, the delivered item and the turn together. An observation is not a durable confirmation: at the restart the outcome is unknown. When the same acceptance is read again afterwards it changes nothing by itself, and it is KEPT as evidence for a reconciliation that proves the binding; it is never dropped."
+    },
+    {
+      "file": "queue.delivery/d05-a-steer-written-into-the-turn-and-taken.json",
+      "rule": "queue.delivery",
+      "shows": "A steer message is written into the turn in progress. steer.sent records the write and changes nothing in the item; the engine's acceptance, how mid_turn, agrees with the binding and makes it delivered into that same turn."
+    },
+    {
+      "file": "queue.delivery/d06-a-steer-with-no-acceptance-by-the-end-of-its-turn.json",
+      "rule": "queue.delivery",
+      "shows": "A steer message was written into a turn, and the turn ended with no acceptance of it from the engine: nobody can say whether the engine read it. Its outcome is unknown; it is not delivered and not queued again. An acceptance that arrives later is kept as evidence and promotes nothing by itself."
+    },
+    {
+      "file": "queue.delivery/d07-an-item-can-be-changed-only-while-it-is-queued.json",
+      "rule": "queue.delivery",
+      "shows": "An edit while the item is queued raises its revision. Once delivering is committed, it can be neither edited nor withdrawn."
+    },
+    {
+      "file": "queue.delivery/d08-a-withdrawn-item-is-never-delivered.json",
+      "rule": "queue.delivery",
+      "shows": "An item withdrawn while it was queued cannot begin delivery."
+    },
+    {
+      "file": "queue.delivery/d09-an-acceptance-is-checked-against-the-binding-member-by-member.json",
+      "rule": "queue.delivery",
+      "shows": "Only an acceptance that agrees with the committed binding in every member makes the item delivered. Each of these is refused and changes nothing: another turn, another log, another run, the other 'how', another delivery. And there is at most one write for one binding."
+    },
+    {
+      "file": "queue.delivery/d10-a-restart-leaves-a-queued-item-queued.json",
+      "rule": "queue.delivery",
+      "shows": "A crash BEFORE delivering is committed leaves the item queued: no write was permitted yet, so a later first send is allowed. An acceptance for an item nothing was committed for changes nothing."
+    },
+    {
+      "file": "queue.delivery/d11-a-binding-is-whole-and-names-this-item.json",
+      "rule": "queue.delivery",
+      "shows": "Delivering is committed WITH its binding or not at all: a binding of another item, of another log, without the worker's incarnation, or with a 'how' that is not one of the two, is refused and the item stays queued."
+    },
+    {
+      "file": "queue.delivery/d12-a-message-for-a-new-turn-whose-turn-ended-with-no-acceptance.json",
+      "rule": "queue.delivery",
+      "shows": "A message for the next turn. Its binding names the new turn, allocated before the dispatch. That turn ends and no acceptance of the delivery was ever committed: nobody can say whether the engine took the message. The item is quarantined exactly as a steer is, and an acceptance that arrives afterwards is kept as evidence and delivers nothing. (Until the third read only a mid-turn delivery was quarantined here: this item stayed delivering, and the late acceptance delivered it.)"
+    },
+    {
+      "file": "queue.delivery/d13-a-steer-that-begins-the-next-turn.json",
+      "rule": "queue.delivery",
+      "shows": "A steer for an engine whose driver cannot take input in the middle of a turn: it is queued for the next turn, so its binding says new_turn and names the new turn. The acceptance agrees and it is delivered as that turn."
+    },
+    {
+      "file": "queue.delivery/d14-a-step-is-whole-or-refused.json",
+      "rule": "queue.delivery",
+      "shows": "What the core is told is taken whole or refused, and a refusal changes nothing, the revision included: an edit that names nothing, a text that is empty, a delivery word nobody defined, the end of a turn that names no turn, a write that names no delivery."
+    },
+    {
+      "file": "task.derivation/t01-turn-working.json",
+      "rule": "task.derivation",
+      "shows": "A turn in progress. created_at is the time of the event that establishes the turn's creation: its first state.changed, seen as it was made (reason commit), in a log that is whole up to it. updated_at is the time of its latest state.changed. Both are times the core logged."
+    },
+    {
+      "file": "task.derivation/t02-turn-waiting-for-an-approval.json",
+      "rule": "task.derivation",
+      "shows": "An approval is pending for the turn: a person must answer it on a surface that draws approvals. It is never answered through the Task."
+    },
+    {
+      "file": "task.derivation/t03-turn-done.json",
+      "rule": "task.derivation",
+      "shows": "The turn ended and its work is done. The result is the turn's own, and it expires when the turn's does."
+    },
+    {
+      "file": "task.derivation/t04-turn-over-and-waiting-for-the-user.json",
+      "rule": "task.derivation",
+      "shows": "The turn is over, so the Task is completed; its outcome says the engine waits for the user, which is not 'done'."
+    },
+    {
+      "file": "task.derivation/t05-turn-failed.json",
+      "rule": "task.derivation",
+      "shows": "The turn failed with a typed code. The worker is gone."
+    },
+    {
+      "file": "task.derivation/t06-turn-interrupted.json",
+      "rule": "task.derivation",
+      "shows": "Cancelling a turn's Task is an interrupt of that turn, not a Stop: the Task is cancelled because the turn's outcome is 'interrupted', and the worker lives on."
+    },
+    {
+      "file": "task.derivation/t07-turn-stopped.json",
+      "rule": "task.derivation",
+      "shows": "The run was stopped and the Stop was confirmed: the turn's Task is cancelled. 'cancelled' is never shown before that."
+    },
+    {
+      "file": "task.derivation/t08-turn-with-a-stop-pending.json",
+      "rule": "task.derivation",
+      "shows": "A Stop of the session was asked and is not confirmed: the turn is still working, with cancel_requested true."
+    },
+    {
+      "file": "task.derivation/t09-turn-still-queued.json",
+      "rule": "task.derivation",
+      "shows": "A turn that waits behind the turn in progress: it is bound to no run yet, and its only event is the one that recorded it."
+    },
+    {
+      "file": "task.derivation/t10-turn-earlier-on-a-shared-run.json",
+      "rule": "task.derivation",
+      "shows": "An earlier turn of a run that a later turn shares. Its Task carries its own result and its own times; nothing of the later turn, though that one ended last on the same run."
+    },
+    {
+      "file": "task.derivation/r11-run-running.json",
+      "rule": "task.derivation",
+      "shows": "Work started with run.start and no session: the Task id is the run id, there is no session and no turn, and it does not expire. Its times are those of the run's own log, 'run:<run_id>'. That log begins with a snapshot: the run already existed when logging began, so nothing retained establishes when it was created, and created_at is null. A snapshot is not a creation. updated_at is the time of the latest state.changed all the same."
+    },
+    {
+      "file": "task.derivation/r12-run-starting.json",
+      "rule": "task.derivation",
+      "shows": "A run that is being started: working. Its log holds one event so far, a snapshot: updated_at is that event's time and created_at is null."
+    },
+    {
+      "file": "task.derivation/r29-run-whose-creation-the-log-saw.json",
+      "rule": "task.derivation",
+      "shows": "A run made after logging began. Its first record is the commit that made it (reason commit, at position 1, nothing missing before it): that event establishes its creation, and created_at is its time."
+    },
+    {
+      "file": "task.derivation/r30-run-first-seen-by-a-scan.json",
+      "rule": "task.derivation",
+      "shows": "A run whose first record was found by a later scan (reason reconcile): earlier steps may be missing, so it does not establish the creation either. created_at is null."
+    },
+    {
+      "file": "task.derivation/r13-run-waiting-for-an-approval.json",
+      "rule": "task.derivation",
+      "shows": "An approval is pending for the run."
+    },
+    {
+      "file": "task.derivation/r14-run-with-a-stop-pending.json",
+      "rule": "task.derivation",
+      "shows": "A Stop was asked and is not confirmed. The Task keeps the status it had, working, and says cancel_requested. It is not 'cancelled'."
+    },
+    {
+      "file": "task.derivation/r15-run-stopped.json",
+      "rule": "task.derivation",
+      "shows": "The Stop is confirmed: only now is the Task cancelled."
+    },
+    {
+      "file": "task.derivation/r16-run-ended-with-its-result.json",
+      "rule": "task.derivation",
+      "shows": "The run ended and its result says ok: completed. The Task carries the result's code and detail and names the run as where the whole result is read (run.status)."
+    },
+    {
+      "file": "task.derivation/r17-run-ended-at-a-typed-limit.json",
+      "rule": "task.derivation",
+      "shows": "The run ended and its result is an error: failed, with the result's own code."
+    },
+    {
+      "file": "task.derivation/r23-run-whose-result-says-ok-and-carries-a-code.json",
+      "rule": "task.derivation",
+      "shows": "A result that breaks the route contract's own rule: it says ok and carries a code. The Task goes by the code: failed, never completed."
+    },
+    {
+      "file": "task.derivation/r24-run-whose-result-says-error-and-carries-no-code.json",
+      "rule": "task.derivation",
+      "shows": "The other way to break it: the result says error and names no code. The Task is failed, with the code result_invalid, and invents no reason."
+    },
+    {
+      "file": "task.derivation/r18-run-ended-and-no-result-was-kept.json",
+      "rule": "task.derivation",
+      "shows": "The run ended and there is no result to read: failed, with the code result_unavailable. It is never shown as completed."
+    },
+    {
+      "file": "task.derivation/r19-run-that-never-launched.json",
+      "rule": "task.derivation",
+      "shows": "A start that never launched, as the record is today: nothing durable says why, so the code is start_failed and the detail is null. The log holds nothing of it either, so both times are null. The Task invents none of this."
+    },
+    {
+      "file": "task.derivation/r20-run-that-never-launched-with-its-reason-kept.json",
+      "rule": "task.derivation",
+      "shows": "RESERVED: the same, once the record carries start_error (the lane that owns Stop writes it). The Task's detail is then that code."
+    },
+    {
+      "file": "task.derivation/r21-run-lost-at-a-reboot.json",
+      "rule": "task.derivation",
+      "shows": "The machine restarted under the run: failed, with the code lost_reboot."
+    },
+    {
+      "file": "task.derivation/r22-run-that-cannot-be-observed.json",
+      "rule": "task.derivation",
+      "shows": "The unit cannot be observed: nobody can say that the run ended, so the Task is still working."
+    },
+    {
+      "file": "task.derivation/r25-run-that-says-stop-pending-and-carries-no-stop-record.json",
+      "rule": "task.derivation",
+      "shows": "A view whose state is stop_pending and whose stop record is null: the schema takes it, so the rule answers it. The state alone says a Stop was asked and is not confirmed."
+    },
+    {
+      "file": "task.derivation/t26-turn-whose-log-is-a-retained-tail.json",
+      "rule": "task.derivation",
+      "shows": "The log as it is retained begins at position 4: the events before it were dropped. The first event that is left is not the turn's creation, so created_at is null. A tail is not a creation time."
+    },
+    {
+      "file": "task.derivation/t27-turn-whose-first-events-are-behind-a-gap.json",
+      "rule": "task.derivation",
+      "shows": "The log begins at its first position, and a replay.gap stands before the first event of this turn: the turn's creation may be in the gap, so created_at is null."
+    },
+    {
+      "file": "task.derivation/r28-run-with-a-gap-after-its-first-event.json",
+      "rule": "task.derivation",
+      "shows": "A gap later in the log does not hide the origin: the run's first record is the commit that made it, nothing is missing before it, and created_at is its time."
+    },
+    {
+      "file": "task.derivation/t31-turn-that-existed-when-logging-began.json",
+      "rule": "task.derivation",
+      "shows": "A turn whose first record is a snapshot: it already existed when logging began. Position 1 and no gap before it say that nothing was dropped, not that the turn was made then. created_at is null."
+    },
+    {
+      "file": "task.derivation/t32-turn-whose-first-event-is-not-its-first-record.json",
+      "rule": "task.derivation",
+      "shows": "The first events filed under this turn are the engine's acceptance and the turn's start; its record is first logged after them, as it was made. The creation is that first record, not the first event that names the turn."
+    },
+    {
+      "file": "task.derivation/t33-turn-behind-a-gap-of-one-position.json",
+      "rule": "task.derivation",
+      "shows": "A gap that stands for one position: the numbers a reader sees have no hole, 1, 2, 3, and the event the gap stands for may have been this turn's first record. created_at is null."
+    },
+    {
+      "file": "task.derivation/x09-a-creation-time-taken-from-a-tail.json",
+      "rule": "task.derivation",
+      "shows": "The Task of a turn whose log is a retained tail gives the tail's first event as its creation."
+    },
+    {
+      "file": "task.derivation/x11-a-snapshot-given-as-the-creation.json",
+      "rule": "task.derivation",
+      "shows": "The Task of a run whose log begins with a snapshot gives the snapshot's time as its creation. (A vector of the second draft did exactly this.)"
+    },
+    {
+      "file": "task.derivation/x12-a-scan-given-as-the-creation.json",
+      "rule": "task.derivation",
+      "shows": "The same for a first record that a scan found."
+    },
+    {
+      "file": "task.derivation/x13-the-first-event-of-a-turn-given-as-its-creation.json",
+      "rule": "task.derivation",
+      "shows": "The Task gives the time of the first event filed under the turn, an acceptance, where the turn's creation is its first record."
+    },
+    {
+      "file": "task.derivation/x10-a-pending-stop-with-no-stop-record-not-flagged.json",
+      "rule": "task.derivation",
+      "shows": "The view says stop_pending, carries no stop record, and the Task does not say a cancel was asked."
+    },
+    {
+      "file": "task.derivation/x01-a-pending-stop-shown-as-cancelled.json",
+      "rule": "task.derivation",
+      "shows": "A Stop is pending and the Task already says cancelled. 'cancelled' is shown only once the Stop is confirmed."
+    },
+    {
+      "file": "task.derivation/x02-a-reason-nobody-kept.json",
+      "rule": "task.derivation",
+      "shows": "The record of a start that never launched keeps no reason, and the Task gives one. After a restart nothing could back it."
+    },
+    {
+      "file": "task.derivation/x03-a-kept-reason-left-out.json",
+      "rule": "task.derivation",
+      "shows": "The record carries start_error and the Task's detail is null."
+    },
+    {
+      "file": "task.derivation/x04-no-result-shown-as-completed.json",
+      "rule": "task.derivation",
+      "shows": "The run ended with no result kept, and the Task says completed."
+    },
+    {
+      "file": "task.derivation/x05-the-latest-result-of-a-shared-run.json",
+      "rule": "task.derivation",
+      "shows": "The Task of an earlier turn carries the result of the turn that ended last on the same run."
+    },
+    {
+      "file": "task.derivation/x06-times-from-the-servers-own-clock.json",
+      "rule": "task.derivation",
+      "shows": "Both times are the moment the Task was asked for, not the times the core logged."
+    },
+    {
+      "file": "task.derivation/x07-an-interrupt-shown-as-a-pending-stop.json",
+      "rule": "task.derivation",
+      "shows": "Nothing is stopping the session, and the Task of its turn says cancel_requested."
+    },
+    {
+      "file": "task.derivation/x08-a-pending-approval-left-out.json",
+      "rule": "task.derivation",
+      "shows": "An approval is pending for the run and the Task says working, with no approval named."
+    },
+    {
+      "file": "start.intent/i01-the-legacy-path.json",
+      "rule": "start.intent",
+      "shows": "No lane has registered on the start path: the stored identity is today's three members and nothing else, whatever else the request carries. No intent is computed."
+    },
+    {
+      "file": "start.intent/i02-the-versioned-path-with-no-extension-present.json",
+      "rule": "start.intent",
+      "shows": "The start path is on and the request carries none of the declared extensions: the intent is the engine as supplied and the digest of the prompt. The preimage is the UTF-8 bytes of exactly this text."
+    },
+    {
+      "file": "start.intent/i03-a-request-that-names-no-engine.json",
+      "rule": "start.intent",
+      "shows": "A request that asks the router to choose: the engine member is there, and null. The intent is taken before anything is routed."
+    },
+    {
+      "file": "start.intent/i04-a-null-extension-is-an-absent-one.json",
+      "rule": "start.intent",
+      "shows": "An extension sent as null is the same request as one that leaves it out: the same preimage, so a retry."
+    },
+    {
+      "file": "start.intent/i05-an-extension-nobody-declared.json",
+      "rule": "start.intent",
+      "shows": "Only a routing registrant is on the path, and it declared hand_pick. The request carries a workspace, which nobody declared: it is ignored, as today's start ignores it, and is not part of the identity."
+    },
+    {
+      "file": "start.intent/i06-a-declared-extension-that-is-present.json",
+      "rule": "start.intent",
+      "shows": "The same request where the workspace lane has declared the field: it is part of the intent, under its own request name, so the same key now names another request."
+    },
+    {
+      "file": "start.intent/i07-a-start-for-a-turn.json",
+      "rule": "start.intent",
+      "shows": "The sessions lane declares session_id and turn_id, which it sends from inside the daemon: both are in the intent."
+    },
+    {
+      "file": "start.intent/i08-the-same-key-for-another-turn.json",
+      "rule": "start.intent",
+      "shows": "The same key, engine and prompt for ANOTHER turn of the session. The first draft's fixed list left the turn out, so this was a retry of the first turn's start. It is another request."
+    },
+    {
+      "file": "start.intent/i09-the-routing-default-changed-between-the-start-and-its-retry.json",
+      "rule": "start.intent",
+      "shows": "The same raw request is sent again after the operator changed which engine and model routing would choose. The intent is taken from what the client sent, before any registrant runs, and never from a registrant's output: it is the same, so this is a retry of the first start, which keeps the route it was given."
+    },
+    {
+      "file": "start.intent/i10-a-legacy-key-and-a-plain-request.json",
+      "rule": "start.intent",
+      "shows": "A key stored before the path was on (no intent) and a request with no declared extension present: compared on the three legacy members, as today. A retry."
+    },
+    {
+      "file": "start.intent/i11-a-legacy-key-and-a-request-with-an-extension.json",
+      "rule": "start.intent",
+      "shows": "The same stored key and a request that carries a declared extension: refused, because what the first request launched cannot be established."
+    },
+    {
+      "file": "start.intent/i12-a-versioned-key-read-where-the-path-is-off.json",
+      "rule": "start.intent",
+      "shows": "A key written with an intent, read by a daemon whose start path is off: it never equals a legacy key, so every retry of it is refused and nothing is launched."
+    },
+    {
+      "file": "start.intent/i13-a-request-with-no-key.json",
+      "rule": "start.intent",
+      "shows": "A request with no client_key stores no identity at all, on either path."
+    },
+    {
+      "file": "start.intent/i14-text-outside-ascii-and-a-nested-extension.json",
+      "rule": "start.intent",
+      "shows": "The preimage is RFC 8785 text: keys in order at every depth, text outside ASCII as itself. These are the bytes that are hashed."
+    },
+    {
+      "file": "event.cursor/c01-a-first-read.json",
+      "rule": "event.cursor",
+      "shows": "A first read: epoch 1 and seq 0. Epoch 1 is the bootstrap token, not a claim that the client saw the log before. The daemon is in epoch 3: the read goes on and the answer says the epoch advanced."
+    },
+    {
+      "file": "event.cursor/c02-the-same-epoch.json",
+      "rule": "event.cursor",
+      "shows": "A cursor of the current epoch."
+    },
+    {
+      "file": "event.cursor/c03-an-older-epoch-reads-on.json",
+      "rule": "event.cursor",
+      "shows": "A cursor from before the daemon restarted reads on along the same sequence. epoch_advanced is true exactly then; it does not mean start again from zero."
+    },
+    {
+      "file": "event.cursor/c04-at-the-last-position.json",
+      "rule": "event.cursor",
+      "shows": "A cursor at the last position of the log: a valid read of nothing, or a follow that waits."
+    },
+    {
+      "file": "event.cursor/c05-an-empty-log.json",
+      "rule": "event.cursor",
+      "shows": "A log that exists and holds nothing yet takes seq 0."
+    },
+    {
+      "file": "event.cursor/x01-an-epoch-from-the-future.json",
+      "rule": "event.cursor",
+      "shows": "A cursor that names an epoch the daemon has not reached."
+    },
+    {
+      "file": "event.cursor/x02-beyond-the-last-position.json",
+      "rule": "event.cursor",
+      "shows": "A cursor past the last position of the log."
+    },
+    {
+      "file": "event.cursor/x03-beyond-an-empty-log.json",
+      "rule": "event.cursor",
+      "shows": "The same for a log that holds nothing."
+    },
+    {
+      "file": "event.cursor/x04-a-log-that-does-not-exist.json",
+      "rule": "event.cursor",
+      "shows": "A cursor that names a log nobody knows."
+    },
+    {
+      "file": "event.page/g01-a-page-continues-its-cursor.json",
+      "rule": "event.page",
+      "shows": "Asked from seq 41: the page holds 42 and 43, in order, and its cursor is 43, the last position it represents."
+    },
+    {
+      "file": "event.page/g02-an-empty-page-keeps-the-cursor.json",
+      "rule": "event.page",
+      "shows": "Nothing after seq 43 yet: an empty page, and the cursor is the one that was sent."
+    },
+    {
+      "file": "event.page/g03-a-gap-stands-for-the-positions-it-covers.json",
+      "rule": "event.page",
+      "shows": "Positions 3 to 9 can no longer be given. One replay.gap stands for them: it starts at the next missing position and carries the seq of the last. Then 10. No position is skipped silently."
+    },
+    {
+      "file": "event.page/g04-an-older-epoch-reads-on.json",
+      "rule": "event.page",
+      "shows": "The cursor names epoch 2 and the daemon is in epoch 3: the same sequence goes on, the answer's cursor carries epoch 3, and epoch_advanced is true."
+    },
+    {
+      "file": "event.page/g05-a-transcript-page.json",
+      "rule": "event.page",
+      "shows": "The same for the transcript projection: one line for each position, none filtered out."
+    },
+    {
+      "file": "event.page/g06-a-transcript-page-with-a-gap.json",
+      "rule": "event.page",
+      "shows": "A transcript line for a gap carries the gap's last position; the next line is the position after it."
+    },
+    {
+      "file": "event.page/x01-an-event-from-before-the-cursor.json",
+      "rule": "event.page",
+      "shows": "Asked from seq 41, the page holds event 39 and says its cursor is 42. (A good fixture of the second draft did exactly this.)"
+    },
+    {
+      "file": "event.page/x02-positions-skipped-without-a-gap.json",
+      "rule": "event.page",
+      "shows": "Asked from the start, the page holds only position 3: positions 1 and 2 are neither given nor covered by a gap. (So did another.)"
+    },
+    {
+      "file": "event.page/x03-a-cursor-that-is-not-the-last-position.json",
+      "rule": "event.page",
+      "shows": "The page ends at 43 and its cursor says 45: the next read would skip 44."
+    },
+    {
+      "file": "event.page/x04-a-gap-that-runs-backwards.json",
+      "rule": "event.page",
+      "shows": "A gap from 100 to 50. Whatever the convention, a span cannot end before it starts."
+    },
+    {
+      "file": "event.page/x05-a-gap-filed-under-its-first-position.json",
+      "rule": "event.page",
+      "shows": "A gap for 3 to 9 that carries seq 3: the positions a reader sees would have a hole after it."
+    },
+    {
+      "file": "event.page/x06-an-event-of-another-log.json",
+      "rule": "event.page",
+      "shows": "An event of another log is spliced into the page."
+    },
+    {
+      "file": "event.page/x07-a-cursor-of-another-log.json",
+      "rule": "event.page",
+      "shows": "The answer's cursor names another log than the one that was asked."
+    },
+    {
+      "file": "event.page/x08-the-epoch-rose-and-the-answer-does-not-say-so.json",
+      "rule": "event.page",
+      "shows": "The cursor names epoch 2, the answer carries epoch 3 and says the epoch did not advance."
+    },
+    {
+      "file": "event.page/x09-an-answer-in-an-older-epoch-than-the-request.json",
+      "rule": "event.page",
+      "shows": "The answer carries an epoch below the one that was asked with."
+    },
+    {
+      "file": "event.page/x10-a-projection-that-filters.json",
+      "rule": "event.page",
+      "shows": "A transcript page that leaves out position 43, as if a line with nothing to print did not exist."
+    },
+    {
+      "file": "event.page/x11-a-gap-that-does-not-start-at-the-next-position.json",
+      "rule": "event.page",
+      "shows": "Asked from seq 2, a gap that starts at 5: positions 3 and 4 are unaccounted for."
+    },
+    {
+      "file": "event.page/g07-a-read-that-names-no-projection.json",
+      "rule": "event.page",
+      "shows": "A read that names no projection asks for raw, the events as they were logged: that is the one default, and this is its answer."
+    },
+    {
+      "file": "event.page/x12-a-transcript-page-for-a-read-that-asked-raw.json",
+      "rule": "event.page",
+      "shows": "The request asks for raw and the answer is a transcript page. Each side fits the schema on its own, and the page is a right continuation of the cursor; it is not the answer to this request. (The third read's case: until then the page was judged by its own projection and passed.)"
+    },
+    {
+      "file": "event.page/x13-a-raw-page-for-a-read-that-asked-the-transcript.json",
+      "rule": "event.page",
+      "shows": "The other way round."
+    },
+    {
+      "file": "event.page/x14-a-transcript-page-for-a-read-that-names-no-projection.json",
+      "rule": "event.page",
+      "shows": "A read that names no projection is answered raw, never with lines."
+    },
+    {
+      "file": "event.page/g08-a-transcript-page-and-the-raw-page-it-was-made-from.json",
+      "rule": "event.page",
+      "shows": "A transcript page with the raw page of the same read beside it: the raw page is a right answer to the cursor (its log, its positions, its gap), and there is one line for each of its events, with the event's seq and type. A line carries neither its log nor where a gap starts, so only the raw page can show those."
+    },
+    {
+      "file": "event.page/x15-a-transcript-page-made-from-a-page-with-another-logs-event.json",
+      "rule": "event.page",
+      "shows": "The lines look right: 42, then 43. The raw page they were made from holds an event of another log at 43. A line does not carry its log, so nothing in the transcript page shows it; the producer's check on the raw page does, and no transcript page may be made from it."
+    },
+    {
+      "file": "event.page/x16-a-transcript-gap-line-over-a-gap-that-starts-too-late.json",
+      "rule": "event.page",
+      "shows": "Asked from seq 2. The raw page's gap starts at 5, so positions 3 and 4 are neither given nor covered. Its transcript line carries only the gap's last position, 9, and looks exactly like the line of a right gap. The producer's check on the raw page catches what the line cannot show."
+    },
+    {
+      "file": "event.page/x17-a-transcript-page-that-leaves-out-an-event-of-its-raw-page.json",
+      "rule": "event.page",
+      "shows": "The raw page holds 42 and 43 and the transcript page has a line for 42 only, under the same cursor."
+    },
+    {
+      "file": "event.page/x18-a-transcript-page-under-another-cursor-than-its-raw-page.json",
+      "rule": "event.page",
+      "shows": "One line for each event, and the transcript page says there is more where the raw page said there was none."
+    }
+  ]
+}

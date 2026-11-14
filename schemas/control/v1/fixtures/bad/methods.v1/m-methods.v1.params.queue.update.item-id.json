@@ -1,0 +1,8 @@
+{
+  "method": "queue.update",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "text": "Only fix the failing test.",
+    "expected_revision": 1
+  }
+}

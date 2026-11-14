@@ -1,0 +1,46 @@
+{
+  "seq": 10,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:10.370Z",
+  "type": "usage",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "connection_id": "subscription:personal-max",
+    "model": null,
+    "bucket": null,
+    "span": "turn",
+    "input_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "output_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "reasoning_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cache_write_tokens": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    },
+    "cost_usd": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    }
+  }
+}

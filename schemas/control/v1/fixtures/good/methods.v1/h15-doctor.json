@@ -1,0 +1,26 @@
+{
+  "method": "doctor",
+  "params": {},
+  "answer": {
+    "code": "ok",
+    "report": {
+      "generated_at": "2026-11-13T07:40:00.000Z",
+      "checks": [
+        {
+          "id": "interpreter.free_threaded",
+          "subject": null,
+          "state": "ok",
+          "detail": "CPython 3.14, GIL off",
+          "fix": null
+        },
+        {
+          "id": "engine.binary",
+          "subject": "codex",
+          "state": "unknown",
+          "detail": "binary not found on PATH",
+          "fix": "install the engine, or set its binary in routes.json"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "answer": {
+    "breaker_store": "durable",
+    "code": "ok",
+    "routes": [
+      {
+        "bars": {},
+        "beta": true,
+        "blocker": "no bar evidence is recorded by the daemon",
+        "breaker": {
+          "connection": "subscription:stand-in-login",
+          "state": "x-nobody-defined-this",
+          "tripped_in_store": false
+        },
+        "class": "engine",
+        "configured": true,
+        "engine": "claude_code",
+        "id": "engine:claude_code",
+        "maturity": "beta",
+        "model": "stand-in-model",
+        "sign_in": "subscription"
+      },
+      {
+        "bars": {},
+        "beta": true,
+        "blocker": "route_not_configured: no entry for this engine in routes.json",
+        "class": "engine",
+        "configured": false,
+        "engine": "codex",
+        "id": "engine:codex",
+        "maturity": "beta",
+        "sign_in": ""
+      },
+      {
+        "bars": {},
+        "beta": true,
+        "blocker": "no bar evidence is recorded by the daemon",
+        "class": "surface",
+        "configured": true,
+        "id": "surface:cli",
+        "maturity": "beta",
+        "sign_in": "",
+        "surface": "cli"
+      },
+      {
+        "bars": {},
+        "beta": true,
+        "blocker": "0 panel(s) from loaded plugins; no bar evidence is recorded by the daemon",
+        "class": "plugin_panels",
+        "configured": false,
+        "id": "plugin_panels",
+        "maturity": "beta",
+        "sign_in": ""
+      }
+    ]
+  },
+  "method": "route.list",
+  "params": {}
+}

@@ -1,0 +1,8 @@
+{
+  "method": "methods.list",
+  "params": {},
+  "answer": {
+    "code": "ok",
+    "table_version": "1.0-draft.9"
+  }
+}

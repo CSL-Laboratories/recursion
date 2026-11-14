@@ -1,0 +1,35 @@
+{
+  "method": "events.read",
+  "params": {
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 41
+    },
+    "limit": 200,
+    "projection": "transcript"
+  },
+  "answer": {
+    "code": "ok",
+    "projection": "transcript",
+    "lines": [
+      {
+        "seq": 42,
+        "time_rel_ms": 2074,
+        "event_type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "state": null,
+        "text": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reading the tests.\"}]}}\n",
+        "speech": null,
+        "focus": null
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 42
+    },
+    "epoch_advanced": false
+  }
+}

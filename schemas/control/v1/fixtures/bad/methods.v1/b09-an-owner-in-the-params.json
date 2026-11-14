@@ -1,0 +1,9 @@
+{
+  "method": "run.start",
+  "params": {
+    "tenant": "t1",
+    "engine": "claude_code",
+    "prompt": "x",
+    "owner": "notes.search"
+  }
+}

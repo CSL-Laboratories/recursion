@@ -1,0 +1,700 @@
+{
+  "record": {
+    "approval_id": "apr-00c4",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "turn_id": "turn-000c",
+    "source": "engine_tool",
+    "effect": {
+      "kind": "engine_tool",
+      "engine": "claude_code",
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "tool": "Bash",
+      "cwd": "/home/dev/projects/atlas",
+      "input": {
+        "command": "rm -rf build && make",
+        "description": "clean build",
+        "count": 1.0,
+        "offset": -0.0
+      }
+    },
+    "digest_form": "rfc8785/v1",
+    "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+    "display": [],
+    "rendered_form": "csl-approval-lines/v0",
+    "rendered": [
+      {
+        "text": "Tool call waiting for an answer",
+        "trust": "trusted"
+      },
+      {
+        "text": "engine: claude_code",
+        "trust": "trusted"
+      },
+      {
+        "text": "session: ses-7f3a9c2e51d04b6a",
+        "trust": "trusted"
+      },
+      {
+        "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "trust": "trusted"
+      },
+      {
+        "text": "tool: \"Bash\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "directory: \"/home/dev/projects/atlas\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "input fields: 4",
+        "trust": "trusted"
+      },
+      {
+        "text": "\"command\": \"rm -rf build && make\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "\"count\": 1",
+        "trust": "untrusted"
+      },
+      {
+        "text": "\"description\": \"clean build\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "\"offset\": 0",
+        "trust": "untrusted"
+      }
+    ],
+    "requested_at": "2026-11-13T07:34:30.000Z",
+    "expires_at": "2026-11-13T07:49:30.000Z",
+    "state": "pending",
+    "opened_by": [],
+    "answered_by": null,
+    "answer": null,
+    "answered_at": null,
+    "revision": 1
+  },
+  "steps": [
+    {
+      "what": "The terminal shows it: the record it is handed holds the bound numbers.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:32.000Z",
+      "request": {
+        "method": "approval.open",
+        "params": {
+          "command_id": "tui-7c1e.0090",
+          "approval_id": "apr-00c4",
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Bash",
+            "cwd": "/home/dev/projects/atlas",
+            "input": {
+              "command": "rm -rf build && make",
+              "description": "clean build",
+              "count": 1,
+              "offset": 0
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Bash\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projects/atlas\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 4",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"command\": \"rm -rf build && make\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"count\": 1",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"description\": \"clean build\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"offset\": 0",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "pending",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "owner",
+                "id": "local"
+              },
+              "surface": "tui",
+              "revision": 1,
+              "at": "2026-11-13T07:34:32.000Z"
+            }
+          ],
+          "answered_by": null,
+          "answer": null,
+          "answered_at": null,
+          "revision": 1
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build",
+            "count": 1,
+            "offset": 0
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 4",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"count\": 1",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"offset\": 0",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "The owner approves.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:40.000Z",
+      "request": {
+        "method": "approval.answer",
+        "params": {
+          "command_id": "tui-7c1e.0091",
+          "approval_id": "apr-00c4",
+          "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+          "answer": "approve",
+          "expected_revision": 1,
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Bash",
+            "cwd": "/home/dev/projects/atlas",
+            "input": {
+              "command": "rm -rf build && make",
+              "description": "clean build",
+              "count": 1,
+              "offset": 0
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Bash\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projects/atlas\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 4",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"command\": \"rm -rf build && make\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"count\": 1",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"description\": \"clean build\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"offset\": 0",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "approved",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "owner",
+                "id": "local"
+              },
+              "surface": "tui",
+              "revision": 1,
+              "at": "2026-11-13T07:34:32.000Z"
+            }
+          ],
+          "answered_by": {
+            "kind": "owner",
+            "id": "local"
+          },
+          "answer": "approve",
+          "answered_at": "2026-11-13T07:34:40.000Z",
+          "revision": 1
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build",
+            "count": 1,
+            "offset": 0
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 4",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"count\": 1",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"offset\": 0",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "approved",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "owner",
+          "id": "local"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:40.000Z",
+        "revision": 1
+      }
+    },
+    {
+      "what": "The daemon starts again.",
+      "core": {
+        "happening": "restart"
+      },
+      "result": "ok",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build",
+            "count": 1,
+            "offset": 0
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 4",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"count\": 1",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"offset\": 0",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "approved",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "owner",
+          "id": "local"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:40.000Z",
+        "revision": 1
+      }
+    },
+    {
+      "what": "The core carries the effect out: the bound value, and no other.",
+      "core": {
+        "happening": "consume",
+        "revision": 1,
+        "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+        "binding": {
+          "approval_id": "apr-00c4",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "engine": "claude_code",
+          "engine_request_id": "req_01HV8",
+          "bound_at": "2026-11-13T07:34:30.000Z"
+        }
+      },
+      "result": "ok",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build",
+            "count": 1,
+            "offset": 0
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "4db3af417f57a62ed80bfa145765bc07cdb2a56a935d70a6e2328de2a22e8c9c",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 4",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"count\": 1",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"offset\": 0",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "consumed",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "owner",
+          "id": "local"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:40.000Z",
+        "revision": 1
+      }
+    }
+  ],
+  "binding": {
+    "approval_id": "apr-00c4",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "engine": "claude_code",
+    "engine_request_id": "req_01HV8",
+    "bound_at": "2026-11-13T07:34:30.000Z"
+  }
+}

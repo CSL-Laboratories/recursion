@@ -1,0 +1,24 @@
+{
+  "method": "events.read",
+  "params": {
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 43
+    },
+    "projection": "raw"
+  },
+  "page": {
+    "code": "ok",
+    "projection": "raw",
+    "events": [],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 43
+    },
+    "more": false,
+    "epoch_advanced": false
+  },
+  "expect": []
+}

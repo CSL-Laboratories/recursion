@@ -1,0 +1,10 @@
+{
+  "method": "session.export",
+  "params": {
+    "session_id": "ses-7f3a9c2e51d04b6a"
+  },
+  "answer": {
+    "code": "method_unknown",
+    "detail": "not_implemented"
+  }
+}

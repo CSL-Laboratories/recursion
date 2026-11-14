@@ -1,0 +1,39 @@
+{
+  "name": "session.fork",
+  "scope": "run",
+  "mutating": true,
+  "idempotency": "command_id",
+  "precondition": "none",
+  "requires": [
+    "fork"
+  ],
+  "falls_back": [],
+  "service": null,
+  "page_allowed": true,
+  "mcp": {
+    "exposed": true,
+    "tool": "recursion_session_fork",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  "beta": true,
+  "codes": [
+    "ok",
+    "request_invalid",
+    "scope_refused",
+    "unavailable",
+    "unsupported",
+    "conflict",
+    "session_unknown",
+    "workspace_invalid",
+    "workspace_busy",
+    "delegation_limit"
+  ],
+  "lane": "SESSIONS",
+  "params": "#/$defs/params.session.fork",
+  "result": "#/$defs/answer.session.fork"
+}

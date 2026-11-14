@@ -1,0 +1,16 @@
+{
+  "method": "session.stop",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "scope": "subtree"
+  },
+  "answer": {
+    "code": "pending",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "scope": "subtree",
+    "pending": [
+      "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    ]
+  }
+}

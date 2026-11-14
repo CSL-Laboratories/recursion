@@ -1,0 +1,9 @@
+{
+  "answer": {
+    "code": "ok"
+  },
+  "method": "run.status",
+  "params": {
+    "run_id": "run-fd416edb7381434a8f809a30a2800e94"
+  }
+}

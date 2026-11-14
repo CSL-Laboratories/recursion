@@ -1,0 +1,15 @@
+{
+  "name": "search-notes",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "query"
+    ],
+    "properties": {
+      "query": {
+        "type": "string"
+      }
+    }
+  },
+  "permission": "tool"
+}

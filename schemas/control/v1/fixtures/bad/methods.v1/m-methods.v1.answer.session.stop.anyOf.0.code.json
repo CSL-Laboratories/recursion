@@ -1,0 +1,29 @@
+{
+  "method": "session.stop",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "scope": "subtree"
+  },
+  "answer": {
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "scope": "subtree",
+    "runs": [
+      {
+        "code": "stopped",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "state": "stopped",
+        "repeat": false
+      },
+      {
+        "code": "pending",
+        "run_id": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "state": "pending",
+        "reason": "cgroup_populated"
+      }
+    ],
+    "pending": [
+      "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    ]
+  }
+}

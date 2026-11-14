@@ -1,0 +1,23 @@
+{
+  "method": "events.follow",
+  "params": {
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 42
+    },
+    "wait_ms": 20000
+  },
+  "answer": {
+    "code": "ok",
+    "projection": "raw",
+    "events": [],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 42
+    },
+    "epoch_advanced": false,
+    "timed_out": true
+  }
+}

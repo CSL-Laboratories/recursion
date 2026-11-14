@@ -8,9 +8,28 @@ bound to the artifact digest and the signing key) and 3.5 (plugins contribute pa
 The daemon never imports a plugin module by name. ``PluginHost`` reads each installed plugin as
 bytes and hands them to ``plugin_security.PluginLoader``, which checks the manifest, the artifact
 digest, the signature against this install's trusted keys and the installer's grant before any
-plugin code runs. A plugin the loader refuses stays out, its typed refusal and findings are kept,
-and the daemon runs without it. Nothing here is a containment boundary: a loaded plugin is
-ordinary Python in the daemon's process and uid (``plugin_security/README.md``).
+plugin code runs. A plugin left with no effective permission is refused ``plugin_not_granted``
+and none of its code is compiled or run. A plugin the loader refuses stays out, its typed refusal
+and findings are kept, and the daemon runs without it. Nothing here is a containment boundary: a
+loaded plugin is ordinary Python in the daemon's process and uid (``plugin_security/README.md``).
+
+What runs before a grant is checked: only Recursion's own code (the file reads below, the
+manifest parse, the digest, the signature check and reading ``install.json``). What runs after:
+the plugin's whole module body (its top level and everything it imports), then ``registry()``
+and ``bind_core()`` if it has the permission for them, all in the daemon's process.
+
+An install directory that exists and is not an operator-owned directory nobody else can write
+(a link, another owner, group- or other-writable) refuses every plugin, the ``--plugin``
+directories included, and its ``install.json`` is not read (decision D4, Lucas, Nov 12 2026:
+"An untrusted plugin config folder refuses every plugin").
+
+Loading can wait. ``PluginHost(..., load=False)`` is a host with nothing loaded yet
+(``state == 'loading'``); ``load_installed()`` loads every plugin once, on the calling thread, and
+``start_loading()`` does it on a thread of its own. Every read (the inventory, the GUI rows, an
+O7 read) answers while a plugin is still importing, from what has been published so far, and a
+plugin is published only whole: its record, its panels and its reader together. This is what lets
+the control socket and Stop come up before any plugin code runs (decision D1). A plugin that hangs
+while loading cannot be stopped in-process; it holds back only the plugins after it.
 
 Install layout, all operator-owned and not group- or other-writable::
 
@@ -35,7 +54,12 @@ What a loaded plugin may give the daemon (plain values; a plugin imports nothing
   Each call runs on its own thread with a deadline; past it the read answers 504, the plugin is
   marked degraded, and no new call goes to it until the stuck one returns.
 * ``bind_core(call)``, which receives this plugin's ``csl-core/v0`` client (canonical JSON bytes in
-  and out) for the approval gate, the authority profile and the breaker.
+  and out) for the approval gate, the authority profile and the breaker, only with a permission
+  that client serves (``order`` today: ``CORE_CLIENT_PERMISSIONS``). Without one it is not called.
+
+A plugin call that turns the GIL on (decision D2) poisons the core: what that plugin offered is
+not used (no panels, no reader, and ``bind_core`` is not called after a ``registry()`` that did
+it), the O7 read that did it answers 503 like every later one, and every later plugin is refused.
 
 No silent verification skip: when ``cryptography`` cannot be imported, no signature can be checked,
 so every installed plugin is refused ``plugin_verification_unavailable`` and none is loaded, signed
@@ -82,6 +106,11 @@ VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
 EFFECT_PERMISSIONS = {'order': 'order'}
 AUTHORITY_REQUIRED = frozenset({'order'})
+# R4 finding 7: bind_core() is called only for a plugin holding a permission its core client serves.
+CORE_CLIENT_PERMISSIONS = frozenset(EFFECT_PERMISSIONS.values())
+POISONED = 'unavailable: core_poisoned_restart_required'
+LOADING = 'plugins are still loading'
+CONFIG_UNTRUSTED = 'the install directory cannot be trusted, so its grants are not read'
 _INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor'})
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
                          'order_after_revoked_key', 'order_after_revocation_generation'})
@@ -151,7 +180,10 @@ def _read_owned(path, limit, *, missing_ok=False):
         if info.st_size > limit:
             raise PluginRefused('plugin_file_too_large', Path(path).name)
         with os.fdopen(os.dup(fd), 'rb') as handle:
-            return handle.read(limit + 1)
+            data = handle.read(limit + 1)
+        if len(data) > limit:  # grew after the fstat above (R4 finding 7)
+            raise PluginRefused('plugin_file_too_large', Path(path).name)
+        return data
     finally:
         os.close(fd)
 
@@ -218,9 +250,11 @@ class PluginHost:
 
     def __init__(self, config_dir, state_dir, breaker=None, *, plugin_dirs=(), verification_available=None,
                  gil_probe=None, clock=time.time, operator_deadline_s=OPERATOR_DEADLINE_S,
-                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S):
+                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S, load=True):
+        """``load=False``: nothing is read or run yet; call ``load_installed()`` or ``start_loading()`` later."""
         require_launcher_platform()  # Windows: typed PlatformUnsupported; no plugin file is opened
         self._config, self._state = Path(config_dir) / PLUGINS_DIR, Path(state_dir)
+        self._breaker, self._plugin_dirs = breaker, tuple(plugin_dirs)
         self._gil = gil_probe if gil_probe is not None else GilProbe()
         self._clock = clock
         # One operator() call at a time: the plugin is in-process code of unknown thread safety.
@@ -231,22 +265,55 @@ class PluginHost:
         self.degraded = {}  # plugin id -> operator() calls that passed their deadline
         self.health = CoreHealth()
         self.loader = self.core = self.gate = self.authority = self._trust = None
+        # Published state. Readers take it as it stands; a plugin is published whole, under _published.
+        self._published = threading.Lock()
         self.records, self.registries = [], ()
-        self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self._operators = {}
         self._panels = []
+        self.state = 'loading'           # 'ready' once load_installed() has finished
+        self.ready = threading.Event()   # set with state 'ready'
+        self.loading_source = None       # the plugin directory being loaded now, if any
+        self._load_started = self._closed = False
+        self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self.authority_state = 'not configured'
-        available = backend_available() if verification_available is None else verification_available()
-        self.verification = 'available' if available else f'unavailable: {CRYPTOGRAPHY_MISSING}'
-        sources = self._sources(plugin_dirs)
+        self._available = backend_available() if verification_available is None else verification_available()
+        self.verification = 'available' if self._available else f'unavailable: {CRYPTOGRAPHY_MISSING}'
+        if load:
+            self.load_installed()
+
+    # -- loading --------------------------------------------------------------------------------
+    def load_installed(self):
+        """Discover and load every installed plugin, on this thread. Once per host."""
+        with self._published:
+            if self._load_started:
+                raise RuntimeError('PluginHost.load_installed runs once')
+            self._load_started = True
+        try:
+            self._load_all()
+        finally:
+            self.loading_source = None
+            self.state = 'ready'
+            self.ready.set()
+
+    def start_loading(self):
+        """``load_installed()`` on a daemon thread of its own; returns the thread. Reads answer meanwhile."""
+        thread = threading.Thread(target=self.load_installed, name='recursion-plugin-load', daemon=True)
+        thread.start()
+        return thread
+
+    def _load_all(self):
+        sources, trusted = self._sources(self._plugin_dirs)
         if not sources:
             return
-        if not available:
+        if not self._available:
             # No signature can be checked. Loading anyway, even as "unsigned", would be an
             # unverified load: refuse every plugin and say why.
             log.error('%s: %s; %d plugin(s) refused, none loaded', VERIFICATION_UNAVAILABLE, CRYPTOGRAPHY_MISSING,
                       len(sources))
             self._refuse_all(sources, VERIFICATION_UNAVAILABLE, CRYPTOGRAPHY_MISSING)
+            return
+        if not trusted:
+            self._refuse_all(sources, 'plugin_directory_untrusted', CONFIG_UNTRUSTED)
             return
         try:
             install = read_install(self._config)
@@ -260,27 +327,42 @@ class PluginHost:
             self._refuse_all(sources, 'revocation_store_invalid', type(exc).__name__)
             return
         self.loader = PluginLoader(self._trust, install['grants'], install['reserved'], self.health, self._gil)
-        self._compose_core(install, breaker)
+        self._compose_core(install, self._breaker)
         for source in sources:
-            self.records.append(self._load(source))
-        self.registries = tuple(self._registries)
+            if self._closed:
+                break
+            self.loading_source = str(source)
+            self._publish(*self._load(source))
+
+    def _publish(self, record, offer=None):
+        """Make one plugin visible to every read at once: its record, its panels and its reader."""
+        offer = offer or {}
+        with self._published:
+            if 'panels' in offer:
+                self._panels.append((record['plugin_id'], offer['panels']))
+            if 'operator' in offer:
+                self._operators[record['plugin_id']] = offer['operator']
+            self.records = [*self.records, record]
+            self.registries = tuple(entry for _, entry in self._panels)
 
     # -- discovery ------------------------------------------------------------------------------
     def _sources(self, plugin_dirs):
-        found = []
-        if self._config.is_dir():
-            if not _owned_directory(self._config):
-                log.error('plugin directory %s is not operator-owned or is group/other writable; ignored', self._config)
-                self.records.append({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
-                                     'code': 'plugin_directory_untrusted', 'detail': 'install directory', 'findings': []})
-            else:
-                found += sorted(p for p in self._config.iterdir() if p.is_dir() or p.is_symlink())
-        return found + [Path(p) for p in plugin_dirs]
+        """``(plugin directories, install directory trusted)``. An untrusted one is recorded here (D4)."""
+        explicit = [Path(p) for p in plugin_dirs]
+        if not os.path.lexists(self._config):
+            return explicit, True
+        if not _owned_directory(self._config):
+            log.error('plugin directory %s is not an operator-owned directory, or is group/other writable: '
+                      'install.json is not read and every plugin is refused', self._config)
+            self._publish({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
+                           'code': 'plugin_directory_untrusted', 'detail': 'install directory', 'findings': []})
+            return explicit, False
+        return sorted(p for p in self._config.iterdir() if p.is_dir() or p.is_symlink()) + explicit, True
 
     def _refuse_all(self, sources, code, detail):
         for source in sources:
-            self.records.append({'source': str(source), 'plugin_id': None, 'state': 'refused', 'code': code,
-                                 'detail': detail, 'findings': [_finding(code, 'refuse', detail)]})
+            self._publish({'source': str(source), 'plugin_id': None, 'state': 'refused', 'code': code,
+                           'detail': detail, 'findings': [_finding(code, 'refuse', detail)]})
 
     def _revocation_store(self):
         path = private_dir(self._state / STORE_DIR) / REVOCATION_FILE
@@ -309,9 +391,10 @@ class PluginHost:
 
     # -- one plugin -----------------------------------------------------------------------------
     def _load(self, source):
+        """``(record, offer)``: what to publish for this plugin; ``offer`` holds its panels and reader."""
         record = {'source': str(source), 'plugin_id': None, 'state': 'refused', 'code': None, 'detail': '',
                   'findings': []}
-        # Loads are serial (the constructor's loop; the loader holds its own lock), so the modules
+        # Loads are serial (load_installed's loop; the loader holds its own lock), so the modules
         # that appear between here and the end of this load were first imported for this plugin.
         before = set(sys.modules)
         try:
@@ -332,30 +415,32 @@ class PluginHost:
             if manifest_ok is not None:
                 record['plugin_id'] = manifest_ok.get('detail')
             log.error('plugin at %s refused: %s; the daemon runs without it', source, exc)
-            return record
+            return record, {}
         record.update(plugin_id=loaded.plugin_id, state='loaded', code=None, trust=loaded.trust,
                       signer_key_id=loaded.signer_key_id, registry_label=loaded.registry_label,
                       permissions=list(loaded.permissions), artifact_sha256=loaded.artifact_sha256,
                       findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained')
-        self._attach(loaded, record)
+        offer = self._attach(loaded, record)
         # After registry() and bind_core(), which are plugin code too. The plugin stays loaded.
         record['findings'] += self._import_findings(before, loaded.module)
         log.info('plugin %s loaded through the plugin loader: trust=%s permissions=%s provides=%s',
                  loaded.plugin_id, loaded.trust, ','.join(loaded.permissions) or '-', ','.join(record['provides']) or '-')
-        return record
+        return record, offer
 
     @staticmethod
     def _import_findings(before, own=None):
         names = _first_imports(before, own)
         return [_finding(UNVERIFIED_IMPORTS, 'warn', ','.join(names))] if names else []
 
-    @property
-    def _registries(self):
-        return [entry for _, entry in self._panels]
-
     def _attach(self, loaded, record):
-        """Take what the plugin offers, each part only with its permission. Plugin code runs here."""
+        """Take what the plugin offers, each part only with its permission. Plugin code runs here.
+
+        Returns the offer to publish (``panels``, ``operator``) and fills ``record['provides']``.
+        Nothing is published from a plugin whose own call turned the GIL on (D2, R4 finding 4), and
+        ``bind_core`` is not called after a ``registry()`` that did.
+        """
         module, perms = loaded.module, loaded.permissions
+        offer, client = {}, False
         factory = getattr(module, 'registry', None)
         if callable(factory):
             if 'panel' not in perms:
@@ -369,28 +454,44 @@ class PluginHost:
                         raise ValueError('required must map a class to subject strings')
                     snapshot = {key: snapshot[key] for key in ('panels', 'required') if key in snapshot}
                     # The GUI's own validation, over every panel already accepted plus these.
-                    panel_registry([p for _, entry in self._panels for p in entry.get('panels', ())]
-                                   + list(snapshot.get('panels', ())))
+                    with self._published:
+                        accepted = [p for _, entry in self._panels for p in entry.get('panels', ())]
+                    panel_registry(accepted + list(snapshot.get('panels', ())))
                 except BaseException as exc:  # noqa: BLE001 - a bad registry costs the plugin its panels, not the daemon
                     record['findings'].append(_finding('plugin_registry_invalid', 'refuse',
                                                        f'{type(exc).__name__}: panels not registered'))
                 else:
-                    self._panels.append((loaded.plugin_id, snapshot))
-                    record['provides'].append('panels')
+                    offer['panels'] = snapshot
+        if self.health.poisoned:
+            return self._poisoned(record)
         handler = getattr(module, 'operator', None)
         if callable(handler):
             if 'read' not in perms:
                 record['findings'].append(_finding('read_permission_required', 'warn', 'operator() not used'))
             else:
-                self._operators[loaded.plugin_id] = handler
-                record['provides'].append('operator_reads')
+                offer['operator'] = handler
         bind = getattr(module, 'bind_core', None)
         if callable(bind) and self.core is not None:
-            try:
-                self._guarded(bind, self.core.client_for(loaded.plugin_id))
-                record['provides'].append('core_client')
-            except BaseException as exc:  # noqa: BLE001 - SystemExit or KeyboardInterrupt included (_guarded)
-                record['findings'].append(_finding('plugin_bind_core_failed', 'warn', type(exc).__name__))
+            if not CORE_CLIENT_PERMISSIONS & set(perms):
+                record['findings'].append(_finding('core_client_permission_required', 'warn',
+                                                   'bind_core() not called: needs ' + ' or '.join(
+                                                       sorted(CORE_CLIENT_PERMISSIONS))))
+            else:
+                try:
+                    self._guarded(bind, self.core.client_for(loaded.plugin_id))
+                    client = True
+                except BaseException as exc:  # noqa: BLE001 - SystemExit or KeyboardInterrupt included (_guarded)
+                    record['findings'].append(_finding('plugin_bind_core_failed', 'warn', type(exc).__name__))
+        if self.health.poisoned:
+            return self._poisoned(record)
+        record['provides'] += ([name for key, name in (('panels', 'panels'), ('operator', 'operator_reads'))
+                                if key in offer] + (['core_client'] if client else []))
+        return offer
+
+    def _poisoned(self, record):
+        record['findings'].append(_finding('core_poisoned_restart_required', 'refuse',
+                                           f'{self.health.poisoned}: nothing this plugin offers is used'))
+        return {}
 
     def _guarded(self, call, *args):
         """Run plugin code, then read the GIL: a plugin that turned it on poisons the core (4.1).
@@ -457,10 +558,14 @@ class PluginHost:
         if name not in READS:
             return 400, {'error': 'command_not_in_operator_contract'}
         if self.health.poisoned:
-            return 503, {'error': 'unavailable: core_poisoned_restart_required'}
-        providers = [pid for pid in self._operators if 'read' in self.loader.permissions(pid)]
+            return 503, {'error': POISONED}
+        with self._published:
+            operators = dict(self._operators)
+        providers = [pid for pid in operators if 'read' in self.loader.permissions(pid)]
         if not providers:
-            if not self.records:
+            if self.state == 'loading':
+                reason = LOADING
+            elif not self.records:
                 reason = 'no operator plugin is installed'
             elif self.verification != 'available':
                 reason = f'{VERIFICATION_UNAVAILABLE}: {CRYPTOGRAPHY_MISSING}'
@@ -470,7 +575,10 @@ class PluginHost:
         if len(providers) > 1:
             return 503, {'error': 'unavailable: more than one loaded plugin serves the operator contract'}
         plugin_id = providers[0]
-        outcome = self._call_operator(plugin_id, self._operators[plugin_id], json.loads(json.dumps(command)))
+        outcome = self._call_operator(plugin_id, operators[plugin_id], json.loads(json.dumps(command)))
+        if self.health.poisoned:
+            # D2: the call that turned the GIL on answers 503, as every later read does; its answer is not used.
+            return 503, {'error': POISONED}
         if isinstance(outcome, tuple):
             return outcome
         if 'error' in outcome:
@@ -532,6 +640,7 @@ class PluginHost:
         return 504, {'error': OPERATOR_TIMED_OUT}
 
     def close(self):
+        self._closed = True  # a load still running publishes nothing more than the plugin it is in
         for item in (self.authority, self._trust):
             if item is not None:
                 item.close()

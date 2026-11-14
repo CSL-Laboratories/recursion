@@ -65,8 +65,9 @@ class RealEntryTests(unittest.TestCase):
                 self.assertIsNotNone(answer)
                 self.assertEqual(answer['code'], 'ok', (answer, log_path.read_text()))
                 record, = answer['plugins']
+                # read and panel only: bind_core() needs order (R4 finding 7, PLUGIN-HOST PR 1).
                 self.assertEqual((record['state'], record['provides']),
-                                 ('loaded', ['panels', 'operator_reads', 'core_client']))
+                                 ('loaded', ['panels', 'operator_reads']))
                 self.assertIsNone(answer['core_poisoned'])
                 self.assertGreaterEqual(len((tmp / 'sweeps').read_text().splitlines()), 2)
                 child.terminate()

@@ -351,10 +351,6 @@ class ErrorStaysTest(unittest.TestCase):
         self.assertIn("usage error", app.errors[-1])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class StopBeforeLaunchRecordedTest(unittest.TestCase):
     """Red-team round 3 finding 1: a Stop sent while the launch is unrecorded stays visible after refresh."""
 
@@ -412,3 +408,7 @@ class StopBeforeLaunchRecordedTest(unittest.TestCase):
         for run, want in cases:
             with self.subTest(run=run):
                 self.assertIs(p.stop_unconfirmed({"run_id": "r", **run}), want)
+
+
+if __name__ == "__main__":
+    unittest.main()

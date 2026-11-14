@@ -47,6 +47,12 @@ class Read(unittest.TestCase):
         self.assertLessEqual(len(out.model_text.encode()), r.DEFAULT_MAX_BYTES)
         self.assertRegex(out.model_text, r"\[Showing lines 1-\d+ of 5000\. Use offset=\d+ to continue\.\]\n$")
 
+    def test_a_page_fits_a_smaller_line_cap_too(self) -> None:
+        ws = workspace(self, {"f.txt": "".join(f"{i}\n" for i in range(500))})
+        out = run(registry(max_lines=50), ws, "read", {"path": "f.txt"})
+        self.assertFalse(out.truncated)
+        self.assertIn("[Showing lines 1-49 of 500. Use offset=50 to continue.]", out.model_text)
+
     def test_long_lines_are_cut(self) -> None:
         ws = workspace(self, {"wide.txt": "a" * 5000 + "\n"})
         out = run(registry(), ws, "read", {"path": "wide.txt"})
@@ -142,6 +148,24 @@ class Search(unittest.TestCase):
         out = run(registry(), ws, "search", {"pattern": "hit", "max_results": 10})
         self.assertEqual(out.model_text.count("many.txt:"), 10)
         self.assertIn("there are more", out.model_text)
+
+    def test_results_fit_a_smaller_line_cap(self) -> None:
+        ws = workspace(self, {"many.txt": "hit\n" * 300})
+        out = run(registry(max_lines=20), ws, "search", {"pattern": "hit"})
+        self.assertFalse(out.truncated, "search kept itself under the cap")
+        self.assertEqual(out.model_text.count("many.txt:"), 19)
+        self.assertIn("there are more", out.model_text)
+
+    @unittest.skipUnless(POSIX, "needs symbolic links")
+    def test_links_leading_outside_are_skipped(self) -> None:
+        ws = workspace(self, {"inside.txt": "needle\n"})
+        outside = ws.root.parent / f"{ws.root.name}-outside.txt"
+        outside.write_text("needle outside\n", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        os.symlink(outside, ws.root / "escape.txt")
+        out = run(registry(), ws, "search", {"pattern": "needle"})
+        self.assertEqual(out.model_text, "inside.txt:1:needle\n[1 files searched; skipped 1 linking outside the "
+                                         "workspace.]\n")
 
     @unittest.skipUnless(GIT, "git is not installed")
     def test_inside_git_ignored_files_are_skipped(self) -> None:

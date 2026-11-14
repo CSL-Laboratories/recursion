@@ -153,6 +153,8 @@ class Interrupts(unittest.TestCase):
         answered = {p.call_id for m in convo for p in m.parts if isinstance(p, b.ToolResult)}
         asked = {p.call_id for m in convo for p in m.parts if isinstance(p, b.ToolCall)}
         self.assertEqual(asked, answered, "every tool call has a result before the next call")
+        self.assertTrue(all(p.is_error for m in convo for p in m.parts if isinstance(p, b.ToolResult)),
+                        "the model is told those calls did not complete")
 
 
 class Endings(unittest.TestCase):

@@ -26,8 +26,8 @@ the lane's third pull request) adds only what the loop cannot know: the connecti
 and limit, the input digest on tool_call, and the envelope. ``reason`` and ``spill`` are the loop's own and are
 dropped or mapped there.
 
-Every string written passes through the redactor, which removes every secret the loop holds, before and after
-it is serialised.
+Every string written (field names included) passes through the redactor, which removes every secret the loop
+holds, before the line is serialised.
 """
 
 from __future__ import annotations
@@ -173,8 +173,9 @@ class Writer:
         # Positional-only: a line may carry a field called "kind" (limit lines do).
         doc = {"type": line_type}
         doc.update(fields)
+        # Every string (keys included) is scrubbed before serialising, so a secret holding a character JSON
+        # escapes cannot slip through in its escaped form; numbers, booleans and null cannot carry one.
         line = json.dumps(self._redactor.scrub_obj(doc), ensure_ascii=False, separators=(",", ":"))
-        line = self._redactor.scrub(line)
         with self._lock:
             self._stream.write(line + "\n")
             self._stream.flush()

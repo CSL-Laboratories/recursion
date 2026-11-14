@@ -30,6 +30,9 @@ class Inputs(unittest.TestCase):
             '{"kind":"approval_answer","approval_id":"apr-1","decision":"maybe"}': "bad_decision",
             '{"kind":"approval_answer","approval_id":"x-1","decision":"approve"}': "bad_approval_id",
             '{"kind":"user_message","turn_id":"turn-1\\n","text":"t","delivery_id":"dlv-1"}': "bad_turn_id",
+            '{"kind":"user_message","turn_id":"turn-1","text":"t","delivery_id":"dlv-1\\n"}': "bad_delivery_id",
+            '{"kind":"approval_answer","approval_id":"apr-1\\n","decision":"approve"}': "bad_approval_id",
+            '{"kind":"interrupt","turn_id":"turn-1\\n"}': "bad_turn_id",
         }
         for line, code in cases.items():
             with self.subTest(line=line), self.assertRaises(p.InputError) as cm:
@@ -62,6 +65,13 @@ class Outputs(unittest.TestCase):
         docs = [json.loads(line) for line in raw.splitlines()]
         self.assertEqual(docs[0], {"type": "text", "turn_id": "turn-1", "text": "the key is [redacted]\nand more"})
         self.assertEqual(docs[1]["input"], {"path": "[redacted]", "[redacted]": ["[redacted]"]})
+
+    def test_a_secret_json_would_escape_is_removed_too(self) -> None:
+        secret = 'sk-has"quote\\and-slash-1234'
+        lines = Lines([secret])
+        lines.writer.write("text", turn_id="turn-1", text=f"<{secret}>")
+        self.assertEqual(lines.all()[0]["text"], "<[redacted]>")
+        self.assertNotIn(json.dumps(secret)[1:-1], lines.raw())
 
     def test_a_short_secret_is_refused(self) -> None:
         with self.assertRaises(ValueError):

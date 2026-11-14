@@ -62,6 +62,17 @@ def _home(path: str) -> Path:
     return home
 
 
+def take_keys(environ) -> list[str]:
+    """Remove every key named in KEY_ENV from ``environ`` and return their values, for the redactor."""
+
+    taken = []
+    for name in KEY_ENV:
+        value = environ.pop(name, None)
+        if value and len(value) >= 8:
+            taken.append(value)
+    return taken
+
+
 def build(args: argparse.Namespace, env: dict[str, str]):
     if args.provider == "anthropic":
         if not args.model:
@@ -84,11 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_steps < 1 or args.max_output_tokens < 1:
         raise SystemExit("recursion_loop: --max-steps and --max-output-tokens must be positive")
     provider, model = build(args, dict(os.environ))
-    secrets = [s for s in getattr(provider, "secrets", ()) if s]
-    secrets += [os.environ[name] for name in KEY_ENV if len(os.environ.get(name, "")) >= 8]
     # The provider holds the key now; nothing else in this process, or any child of it, gets it.
-    for name in KEY_ENV:
-        os.environ.pop(name, None)
+    secrets = [s for s in getattr(provider, "secrets", ()) if s] + take_keys(os.environ)
     home = _home(args.home)
     try:
         workspace = Workspace(Path(args.workspace) if args.workspace else Path.cwd(), SpillStore(home))

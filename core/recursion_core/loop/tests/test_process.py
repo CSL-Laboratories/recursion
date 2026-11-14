@@ -34,6 +34,15 @@ def user(turn: str, text: str, delivery: str) -> dict:
     return {"kind": "user_message", "turn_id": turn, "text": text, "delivery_id": delivery}
 
 
+class Keys(unittest.TestCase):
+    def test_keys_leave_the_environment_and_go_to_the_redactor(self) -> None:
+        from recursion_core.loop import __main__ as entry
+        env = {"ANTHROPIC_API_KEY": FAKE_KEY, "OPENAI_API_KEY": "sk-openai-made-up-0001", "PATH": "/usr/bin",
+               "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+        self.assertEqual(entry.take_keys(env), [FAKE_KEY, "sk-openai-made-up-0001"])
+        self.assertEqual(env, {"PATH": "/usr/bin", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"})
+
+
 @unittest.skipUnless(POSIX, "the engine runs in a Linux run unit")
 class FakeProviderProcess(unittest.TestCase):
     def test_a_read_and_an_answer_over_stdin_and_stdout(self) -> None:

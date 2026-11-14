@@ -237,5 +237,27 @@ class LinearRendererTest(unittest.TestCase):
         self.assertEqual(log.since(4), ([log.latest("notice")], 0))
 
 
+class JsonLinesSeparatorTest(unittest.TestCase):
+    """R2 finding 11, the log's own half: a U+2028 or U+2029 that reaches an event (here written
+    straight into the log, past the sanitizer) neither splits its record nor is lost."""
+
+    def test_the_writer_escapes_line_and_paragraph_separators(self) -> None:
+        log = EventLog()
+        for ch in (chr(0x2028), chr(0x2029)):
+            log.append(0, "notice", "recursion", "live", f"a{ch}b", f"a{ch}b", "runs")
+        text = to_jsonl(log)
+        self.assertNotIn(chr(0x2028), text)
+        self.assertNotIn(chr(0x2029), text)
+        self.assertEqual(len(text.splitlines()), 2, "str.splitlines sees one line per event")
+        self.assertEqual(from_jsonl(text), list(log))
+
+    def test_the_reader_splits_only_on_lf_so_an_older_log_reads_whole(self) -> None:
+        log = EventLog()
+        log.append(0, "notice", "recursion", "live", f"a{chr(0x2028)}b", "", "runs")
+        old_form = "".join(json.dumps(e.as_dict(), ensure_ascii=False) + "\n" for e in log)
+        self.assertIn(chr(0x2028), old_form)
+        self.assertEqual(from_jsonl(old_form), list(log))
+
+
 if __name__ == "__main__":
     unittest.main()

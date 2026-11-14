@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
+import os
 import unittest
 
 from recursion_core.tui import term
@@ -29,6 +31,73 @@ class PlainModeTest(unittest.TestCase):
         self.assertEqual(term.main(["--plain"], None, stdin=io.StringIO(""), stdout=out, environ={}, stderr=err), 1)
         self.assertIn("status=control_api_unavailable", err.getvalue())
         self.assertEqual(out.getvalue(), "", "diagnostics go to stderr (O7)")
+
+
+class TtyInputTest(unittest.TestCase):
+    """R2 finding 10 (Astra's fix-10.patch, split into one test per defect so each fails on its own).
+
+    Astra's EOF test ran interactive() on a thread and failed if it was still alive after 2 s. The
+    preamble allows no wall-clock limit in a test, so this one counts reads instead: a terminal at the
+    end of input may be read once, and a read after it reported the end fails the test at once."""
+
+    def test_tty_buffers_pasted_bytes_and_reports_eof(self) -> None:
+        r_fd, w_fd = os.pipe()
+        try:
+            tty_in = object.__new__(term.Tty)
+            tty_in.fd = r_fd
+            os.write(w_fd, b":stop run-1\n")
+            os.close(w_fd)
+            w_fd = -1
+            got = []
+            for _ in range(32):
+                k = tty_in.read_key(0.05)
+                if not k:
+                    break
+                got.append(k)
+            self.assertEqual(got, [":", *"stop run-1", "enter"])
+            self.assertTrue(tty_in.eof)
+        finally:
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
+
+    def test_interactive_closes_and_exits_on_terminal_eof(self) -> None:
+        eof_r, eof_w = os.pipe()
+        os.close(eof_w)
+        try:
+            tty_eof = object.__new__(term.Tty)
+            tty_eof.fd = eof_r
+            tty_eof.cbreak = contextlib.nullcontext  # type: ignore[assignment]
+            tty_eof.size = lambda: os.terminal_size((80, 24))  # type: ignore[assignment]
+            real_read, reads = tty_eof.read_key, []
+
+            def read_key(timeout: float):
+                if getattr(tty_eof, "eof", False):
+                    raise AssertionError("interactive() read the terminal again after it ended input")
+                reads.append(timeout)
+                if len(reads) > 100:
+                    raise AssertionError("interactive() kept reading a terminal at the end of input")
+                return real_read(timeout)
+
+            tty_eof.read_key = read_key  # type: ignore[assignment]
+            apps: list = []
+            code = term.interactive(FakeDriver().api, io.StringIO(), {"NO_COLOR": "1"}, tty_eof,
+                                    on_app=apps.append, stderr=io.StringIO())
+            self.assertEqual(code, 0)
+            self.assertTrue(apps[0].closed)
+            self.assertEqual(len(reads), 1)
+        finally:
+            os.close(eof_r)
+
+    def test_main_reports_a_failing_api_factory_as_unavailable(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        code = term.main(["--plain"], lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+                         stdin=io.StringIO("q\n"), stdout=out, stderr=err, environ={})
+        self.assertEqual(code, 1)
+        self.assertIn("status=control_api_unavailable", err.getvalue())
+        self.assertIn("factory:RuntimeError", err.getvalue())
+        self.assertNotIn("boom", err.getvalue(), "the exception's text is not shown")
+        self.assertEqual(out.getvalue(), "")
 
 
 if __name__ == "__main__":

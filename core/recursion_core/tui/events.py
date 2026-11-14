@@ -81,12 +81,22 @@ class EventLog:
         return None
 
 
+# U+2028 and U+2029 end a line for str.splitlines and for JavaScript, so a record that held one raw
+# would read as two (R2 finding 11). The writer escapes them; JSON allows the escape inside a string,
+# which is the only place a non-ASCII character can be.
+_SEPARATOR_ESCAPES = {0x2028: "\\" + "u2028", 0x2029: "\\" + "u2029"}
+
+
 def to_jsonl(events: Iterable[Event]) -> str:
-    return "".join(json.dumps(e.as_dict(), ensure_ascii=False) + "\n" for e in events)
+    return "".join(json.dumps(e.as_dict(), ensure_ascii=False).translate(_SEPARATOR_ESCAPES) + "\n"
+                   for e in events)
 
 
 def from_jsonl(text: str) -> list[Event]:
-    return [Event(**json.loads(line)) for line in text.splitlines() if line]
+    """One event per LF-ended line. Only LF ends a record, so a log written before the writer escaped
+    U+2028 and U+2029 still reads back whole."""
+
+    return [Event(**json.loads(line)) for line in text.split("\n") if line]
 
 
 def speech_lines(events: Iterable[Event]) -> list[str]:

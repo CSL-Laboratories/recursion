@@ -14,11 +14,18 @@
 stderr; stdout carries only the screen or the line-mode transcript.
 
 All three read the app's one event log. Ctrl-C or ``q`` closes the TUI; that sends nothing and stops
-no run.
+no run. So does the end of input (a terminal that hung up): the TUI closes and exits 0, never spins.
+
+Keys come from ``keys.KeyDecoder``: every character of a read, in order, CSI and SS3 keys by name, a
+lone Esc after ``keys.ESC_WAIT_S``, and a bracketed paste (turned on while the TUI runs) as one
+``keys.Paste``. A key that came in one read with other input is marked ``burst`` (an unbracketed paste,
+or typing faster than the client reads); the app does not let such a key confirm a Stop or send the
+command line.
 """
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import os
 import select
@@ -30,10 +37,11 @@ from typing import TextIO
 
 from recursion_core.tui.app import Loop, TuiApp
 from recursion_core.tui.events import speech_lines
+from recursion_core.tui.keys import ESC_WAIT_S, Key, KeyDecoder
 from recursion_core.tui.view import InlinePainter, to_ansi
 
-_KEYS = {"\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace", "\x1b": "esc",
-         "\x1b[A": "up", "\x1b[B": "down"}
+PASTE_ON, PASTE_OFF = "\x1b[?2004h", "\x1b[?2004l"  # bracketed paste mode (xterm), off again on every exit
+READ_BYTES = 4096
 FLAGS = {"--plain": "plain", "--screen-reader": "plain", "--no-alt-screen": "no_alt_screen", "--no-color": "no_color"}
 USAGE = "usage: recursion-tui [--plain | --screen-reader] [--no-alt-screen] [--no-color]"
 
@@ -84,7 +92,18 @@ class TerminalUnsupported(RuntimeError):
 
 
 class Tty:
-    """The real terminal: cbreak mode, key reads and size. Tests pass a fake with the same methods."""
+    """The real terminal: cbreak mode, key reads and size. Tests pass a fake with the same methods.
+
+    ``read_key`` returns one key per call from what has been read, reading more only when none is
+    left. ``eof`` turns true when the terminal ends input (a read of nothing, or EIO after a hangup);
+    ``burst`` says whether the key just returned came in one read with other input. The read state is
+    created on first use, so a ``Tty`` made without ``__init__`` (as a test may) reads the same way."""
+
+    eof = False
+    burst = False
+    esc_wait_s = ESC_WAIT_S
+    _decoder: KeyDecoder | None = None
+    _ready: collections.deque | None = None
 
     def __init__(self, stdin: TextIO) -> None:
         try:
@@ -109,12 +128,45 @@ class Tty:
         finally:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
 
-    def read_key(self, timeout: float) -> str | None:
+    def read_key(self, timeout: float) -> Key | None:
+        """The next key, waiting up to ``timeout`` for input; None when there is none (or at the end)."""
+
+        if self._decoder is None:
+            self._decoder, self._ready = KeyDecoder(), collections.deque()
+        if not self._ready and not self.eof:
+            self._fill(timeout)
+        if not self._ready:
+            return None
+        key, self.burst = self._ready.popleft()
+        return key
+
+    def _read(self, timeout: float) -> bytes | None:
         ready, _, _ = select.select([self.fd], [], [], timeout)
         if not ready:
             return None
-        data = os.read(self.fd, 16).decode("utf-8", "replace")
-        return _KEYS.get(data, data[:1] if data[:1] != "\x1b" else "esc")
+        try:
+            return os.read(self.fd, READ_BYTES)
+        except OSError:  # EIO: the terminal hung up, which is the end of input
+            return b""
+
+    def _fill(self, timeout: float) -> None:
+        """One read, plus the short waits that tell a lone Esc from the start of a sequence."""
+
+        decoder, keys = self._decoder, []
+        data = self._read(timeout)
+        while data is not None:
+            if not data:
+                self.eof = True
+                keys += decoder.end()
+                break
+            keys += decoder.feed(data)
+            if not decoder.waiting:
+                break
+            data = self._read(self.esc_wait_s)
+            if data is None:
+                keys += decoder.timeout()
+        burst = len(keys) > 1
+        self._ready.extend((key, burst) for key in keys)
 
 
 def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, alt_screen: bool = True,
@@ -149,15 +201,21 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
                     render=lambda: [], size=size)
     try:
         with terminal.cbreak():
+            write(PASTE_ON)
             loop.start()
             while not app.closed:
                 key = terminal.read_key(0.1)
                 if key:
-                    loop.press(key)
+                    loop.press(key, burst=bool(getattr(terminal, "burst", False)))
+                elif getattr(terminal, "eof", False):
+                    break  # the terminal ended input (R2 finding 10): close below; never read it again
     except KeyboardInterrupt:
-        app.close()
+        pass  # Ctrl-C closes, below, like q: nothing is sent
     finally:
         loop.shutdown()
+        if not app.closed:  # closed only after the loop's thread has stopped, so no tick races it
+            app.close()
+        write(PASTE_OFF)
         if alt_screen:
             write("\x1b[?25h\x1b[?1049l")
         else:
@@ -183,7 +241,14 @@ def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: Te
     if api_factory is None:
         print("status=control_api_unavailable: no control API client was given; nothing sent", file=stderr)
         return 1
-    api = api_factory()
+    try:
+        api = api_factory()
+    except Exception as err:  # noqa: BLE001 - a client that cannot be built is the API being unavailable
+        # The CLI's answer for the same failure, as a diagnostic on stderr (R2 finding 10). Only the
+        # exception's type is shown: its text may hold a path or a value.
+        print(f"status=control_api_unavailable: the control API client could not be built "
+              f"(factory:{type(err).__name__}); nothing sent", file=stderr)
+        return 1
 
     def is_tty(stream) -> bool:
         return bool(getattr(stream, "isatty", lambda: False)())

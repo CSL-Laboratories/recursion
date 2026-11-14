@@ -27,7 +27,8 @@ from collections.abc import Callable, Mapping
 
 from recursion_core.tui import protocol as p
 from recursion_core.tui.events import LOG_CAP, Event, EventLog
-from recursion_core.tui.sanitize import OutputSanitizer, cell_width, field, wrap
+from recursion_core.tui.keys import Key, Paste
+from recursion_core.tui.sanitize import OutputSanitizer, cell_width, field, printable_only, wrap
 from recursion_core.tui.view import Row, color_enabled
 
 Dispatch = Callable[[str, dict, Callable[[str, dict, dict], None]], None]
@@ -36,6 +37,7 @@ PARTIAL_CAP = 8192  # unfinished line with no newline; older cells are marked, n
 RUN_ROWS = 5
 CONDITION_ROWS = 4
 _TRUNCATED = "⟦truncated⟧"
+_CURSOR = "▏"  # where the command line's cursor is, drawn only when it is not at the end
 
 
 def _fmt(params: Mapping) -> str:
@@ -116,6 +118,7 @@ class TuiApp:
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
+        self.cursor = 0  # the command line's insertion point, 0..len(line)
         self.notice = ""
         self.closed = False
         self._state = "live"
@@ -223,9 +226,13 @@ class TuiApp:
         self._answer_keyed = p.keyed_conditions(answer)
         self.answer_conditions = [(label, text) for label, _, text in self._answer_keyed]
         self._uncertain.update({subject: text for label, subject, text in self._answer_keyed if label == p.UNCERTAIN})
-        open_stop = {f"run={r.get('run_id')}": p.stop_unconfirmed(r) for r in self.runs}
-        for subject in list(self._uncertain):  # a later answer about another run does not clear it
-            if not open_stop.get(subject, True):
+        # Only an attested stop clears it: the API lists the run as `stopped`, which the registry stores
+        # only with an attestation. A listed run with no stop record is not proof: a pending Stop whose
+        # write to the registry failed (recorded=false) leaves the run `running` with no stop (R2 finding
+        # 6). A later answer about another run, or a run absent from the list, does not clear it either.
+        attested = {f"run={r.get('run_id')}" for r in self.runs if r.get("state") == "stopped"}
+        for subject in list(self._uncertain):
+            if subject in attested:
                 del self._uncertain[subject]
         # A stopped answer for a run that is not in this snapshot still confirms that Stop.
         # The cleanup above keeps it when the run is absent (bot review 4504133355).
@@ -270,24 +277,27 @@ class TuiApp:
                    state=self._state)
 
     # -- keys -----------------------------------------------------------------------------------
-    def press(self, key: str) -> None:
+    def press(self, key: Key, *, burst: bool = False) -> None:
+        """One key (a name from ``keys.KeyDecoder``, or a ``Paste``). ``burst`` means it came in one
+        read with other input: an unbracketed paste, or typing faster than the client reads. Such a
+        key cannot confirm a Stop or send the command line, because pasted text would otherwise act."""
+
         if self.mode == "confirm_stop":
             target, self.mode, self.stop_target = self.stop_target, "keys", None
-            if key in ("y", "Y"):
+            if key in ("y", "Y") and not burst:
                 self.stop(target)
+            elif key in ("y", "Y"):
+                self._notice(f"stop of {field(target)} cancelled: the y came in one read with other input "
+                             f"(a paste?); nothing sent; press s and then y again")
             else:
                 self._notice(f"stop of {field(target)} cancelled; nothing sent")
             return
         if self.mode == "command":
-            if key == "enter":
-                line, self.mode, self.line = self.line, "keys", ""
-                self.command(line)
-            elif key == "esc":
-                self.mode, self.line = "keys", ""
-            elif key == "backspace":
-                self.line = self.line[:-1]
-            elif len(key) == 1 and key.isprintable():
-                self.line += key
+            self._edit(key, burst)
+            return
+        if isinstance(key, Paste):
+            self._notice("paste ignored: the run list takes keys, not text; press : to paste a command; "
+                         "nothing sent")
             return
         if key in ("j", "down", "k", "up"):
             self._move(1 if key in ("j", "down") else -1)
@@ -301,9 +311,43 @@ class TuiApp:
             else:
                 self._notice("no run selected; nothing to stop")
         elif key == ":":
-            self.mode, self.line = "command", ""
+            self.mode, self.line, self.cursor = "command", "", 0
         elif key == "q":
             self.close()
+
+    def _edit(self, key: Key, burst: bool) -> None:
+        """The ":" command line: left, right, Home and End move the cursor; Backspace deletes before it
+        and Delete at it; typed and pasted text goes in at it; Esc leaves the line; Enter sends it."""
+
+        line, at = self.line, self.cursor
+        if isinstance(key, Paste):
+            text = printable_only(key.text)  # a pasted line break is a space: a paste never sends the line
+            self.line, self.cursor = line[:at] + text + line[at:], at + len(text)
+            if key.dropped:
+                self._notice(f"paste cut: {key.dropped} characters past the first {len(key.text)} were not kept")
+        elif key == "enter" and burst:
+            self._notice("the command line was not sent: Enter came in one read with other input (a paste?); "
+                         "press Enter to send it")
+        elif key == "enter":
+            self.mode, self.line, self.cursor = "keys", "", 0
+            self.command(line)
+        elif key == "esc":
+            self.mode, self.line, self.cursor = "keys", "", 0
+        elif key == "backspace":
+            if at:
+                self.line, self.cursor = line[:at - 1] + line[at:], at - 1
+        elif key == "delete":
+            self.line = line[:at] + line[at + 1:]
+        elif key == "left":
+            self.cursor = max(0, at - 1)
+        elif key == "right":
+            self.cursor = min(len(line), at + 1)
+        elif key == "home":
+            self.cursor = 0
+        elif key == "end":
+            self.cursor = len(line)
+        elif len(key) == 1 and key.isprintable():
+            self.line, self.cursor = line[:at] + key + line[at:], at + 1
 
     def command(self, line: str) -> None:
         """A command line in the CLI's grammar: ``list``, ``status RUN``, ``stop RUN``, ``start ...``,
@@ -625,7 +669,9 @@ class TuiApp:
         if self.mode == "confirm_stop":
             return f"recursion: stop run {field(self.stop_target)}? y sends run.stop, any other key cancels"
         if self.mode == "command":
-            return f"recursion: {self.line}"
+            at = self.cursor
+            shown = self.line if at >= len(self.line) else self.line[:at] + _CURSOR + self.line[at:]
+            return f"recursion: {shown}"
         return "recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)"
 
     # -- notices and errors (logged; an error is never redrawn away) -----------------------------
@@ -680,8 +726,8 @@ class Loop:
         app.dispatch = self._dispatch
 
     # thread-safe inputs
-    def press(self, key: str) -> None:
-        self._keys.put(key)
+    def press(self, key: Key, *, burst: bool = False) -> None:
+        self._keys.put((key, burst))
         self._wake.set()
 
     def post_event(self, event: Mapping) -> None:
@@ -731,9 +777,10 @@ class Loop:
         app = self.app
         while True:  # 1. keys first: Stop never waits behind output
             try:
-                app.press(self._keys.get_nowait())
+                key, burst = self._keys.get_nowait()
             except queue.Empty:
                 break
+            app.press(key, burst=burst)
         while True:  # 2. API answers
             try:
                 done, method, params, answer = self._answers.get_nowait()

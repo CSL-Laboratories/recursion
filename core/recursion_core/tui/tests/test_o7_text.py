@@ -247,6 +247,25 @@ class StaleWatchOnlyTest(unittest.TestCase):
         self.assertNotIn("run=run-1", app._uncertain)
         self.assertNotIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
 
+    def test_unrecorded_pending_stop_stays_uncertain_across_refresh(self) -> None:
+        from recursion_core.control.tests.fakes import run_ids
+        from recursion_core.control.tests.test_stop import FailingRegistry
+
+        reg = FailingRegistry()
+        api = ControlAPI(reg, FakeKillTree([POPULATED]), lambda params: {"cgroup": f"/cg/{params['run_id']}"},
+                         clock=lambda: 1000.0, new_run_id=run_ids())
+        run_id = api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"})["run"]["run_id"]
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        reg.fail_puts = True
+        app.press("s")
+        app.press("y")
+        self.assertEqual((app.last["code"], app.last["recorded"]), ("pending", False))
+        self.assertIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
+        app.press("r")
+        self.assertIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
+        self.assertFalse(any("UNCERTAIN cleared" in e.text for e in app.log))
+
     def test_stale_list_stays_stale_after_a_fresh_status(self) -> None:
         # 4503920848: attaching replaced the stale list answer and watch_only turned off.
         run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}

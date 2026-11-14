@@ -734,6 +734,24 @@ class LaunchSeamTest(Composed):
         self.assertEqual(argv[argv.index('--') + 1], str(self.engine), 'and it is the binary that ran')
         self.stop(composed.control, answer['run']['run_id'])
 
+    def test_a_chosen_entry_for_an_engine_with_no_composed_adapter_is_refused_before_anything_is_stored(self):
+        # PROVISIONAL, the same ruling: where no adapter was built for the entry's engine there is no binary the
+        # entry could be the same as, whether it names one or names none. Nothing is stored and nothing launched.
+        # (opencode is a name of the catalogue with no factory, so this composition built no adapter for it.)
+        for binary in (None, str(self.engine)):
+            chosen = dict(json.loads(json.dumps(self.routes['claude_code'])), binary=binary)
+            chosen['route'] = dict(chosen['route'], engine='opencode')
+
+            def register(made, chosen=chosen):
+                made.start_registrant('routing', ('hand_pick',), ('route_entry', 'route_decision'), lambda principal, request: {
+                    'route_entry': chosen, 'route_decision': None}, chooses_engine=True)
+            with self.subTest(binary=binary):
+                daemon, composed = self.boot(hooks_of(register))
+                answer = composed.control.call('run.start', {'tenant': 't1', 'prompt': LIVE, 'client_key': 'k1'})
+                self.assertEqual(answer, {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+                self.assertEqual((composed.control.registry.list(), self.units.started), ([], []), 'no run, no launch record, no unit')
+                self.shutdown()
+
     def test_a_route_entry_a_registrant_chose_is_what_the_starter_launches(self):
         chosen = json.loads(json.dumps(self.routes['claude_code']))
         chosen['route']['model'] = 'chosen-model'
@@ -1423,6 +1441,26 @@ class ServicesSeamTest(Composed):
 
     def test_a_long_poll_on_the_socket_is_woken_too(self):
         self.held_close('socket', poll=True)
+
+    def test_a_close_shuts_the_gate_before_it_stops_the_transport(self):
+        """The order of a close. FIRST no new client call is admitted and whoever waits is told; only THEN does
+        the transport stop. At the moment the transport is asked to stop, the closing is already signalled and
+        a call made in this process is already refused."""
+        log, entered, leave = [], threading.Event(), threading.Event()
+        self.addCleanup(leave.set)
+        made, store, events = self.registered(log, entered, leave)
+        daemon, composed = self.boot(made)
+        seen, stop_transport = [], composed.server.close
+
+        def stopping():
+            seen.append((made.closing.is_set(), composed.control.call('run.list')))
+            return stop_transport()
+        composed.server.close = stopping
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        composed.close()
+        self.assertEqual(seen, [(True, {'code': 'unavailable', 'detail': 'daemon_closing'})])
+        self.assertTrue(store.closed)
 
     @quiet
     def test_a_start_that_fails_part_way_releases_everything_it_made(self):

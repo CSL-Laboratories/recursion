@@ -9,3 +9,4 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"text","te
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial"}}
 
+: end of the recording

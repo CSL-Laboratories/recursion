@@ -6,3 +6,4 @@ data: {"type":"message_start","message":{"id":"msg_fixture_03","type":"message",
 event: error
 data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
 
+: end of the recording

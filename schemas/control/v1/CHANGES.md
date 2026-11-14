@@ -20,12 +20,28 @@ Nothing is frozen yet.
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |
 | `event.v1.json` | 1.0-draft.7 |
-| `approval.v1.json` | 1.0-draft.7 |
+| `approval.v1.json` | 1.0-draft.8 |
 | `driver.v2.json` | 1.0-draft.4 |
 | `mcp.task.v1.json` | 1.0-draft.6 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## After two reads of the fourth read's answer (Nov 14, 2026)
+
+`approval` draft 8; every other schema keeps its draft. Two independent reads of the answer to the
+fourth read (commit `c77aa2e0`) each said not yet, and required the same corrections in different
+words: a malformed durable record could still raise a host exception before the new validation was
+reached, and the new schema reader decided whether a schema was supported by the branch a value
+took. The wording is in the approval's description, in `conformance/rules.py` and in the
+conformance README as it was written. No schema changes shape.
+
+| What changed | What it breaks |
+|---|---|
+| A consumption checks the record's shape before it reads its state or any other member; a change checks the retained state's shape before branching on it, and a pending record's complete shape before it reads its source, effect or revision to build a candidate. A member that is missing, of another type or outside its list is `record_invalid`, never a host exception, and changes nothing. A state outside the list is `record_invalid` too, no longer `not_approved` or `resolved` | A core that raised its host's own error on a record read back without its state, source or revision, or answered `not_approved` for a state that is not one |
+| `rules.fits` checks the whole schema set before it looks at a value: a keyword it does not know anywhere in a schema location (an unused definition, an absent property, an unselected branch, a short-circuited alternative, array items, a document no reference reaches) is refused (`ValueError`), and so is a keyword's value of a form it would misread. Names of properties and values of const and enum are not schema locations. The published set is checked once, when it is first read | A schema with such a keyword, which the reader took when the value did not reach it |
+| References: `fits` resolves a bare document name of the set or none, then a JSON Pointer through objects to a schema location, and refuses every other form before it looks at a value: an embedded `$id` or `$schema`, a root `$id` that is not the document's name, another dialect, any other URI, a fragment that is a name, a percent-encoded pointer, a pointer through an array, into a value or to nothing. None of these occurs in the published files | A schema program that relied on one of them (it got a host exception or a wrong answer before) |
+| `conformance/tests.py`: five tests, the two reads' own regressions among them; the docstring of the page test says `transcript` when a request names no projection | |
 
 ## After another model family read the whole set a fourth time (Nov 14, 2026)
 

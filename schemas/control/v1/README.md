@@ -254,7 +254,11 @@ one millisecond before it, and consumption across a restart.
 validates all of it (its digest, its lines, its envelope against its effect) before it replaces the
 pending request; a refusal is typed and leaves the record, its revision and the binding as they were.
 A change of content is not a change of target: an effect bound to another run, session or engine, or
-from another plugin, is refused (`target`).
+from another plugin, is refused (`target`). A record read back from where it is durable is checked
+before it is read: a consumption checks its shape before its state, and a change checks its state
+before branching on it and a pending record whole before building the candidate from it. A member
+that is missing, of another type or outside its list is `record_invalid`, never a host exception,
+and the record, its revision, the binding and the receipts stay as they were.
 
 **The binding names the approval.** For an engine's call, the private binding's `approval_id`,
 `run_id` and `engine` are each compared with the approval it is used against (the record's id, the

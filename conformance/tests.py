@@ -12,6 +12,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -434,7 +435,7 @@ class PublishedFilesTest(unittest.TestCase):
 
     def test_every_page_in_a_good_exchange_continues_its_cursor(self):
         """A good exchange of events.read or events.follow that answers a page: the page is in the projection
-        the request asked for (raw when it names none) and is the continuation of the cursor it was asked
+        the request asked for (transcript when it names none) and is the continuation of the cursor it was asked
         with. (Each side validates alone; this is the join.) The same exchange asked in the OTHER projection
         still fits the schema, and is caught here."""
         found, projections, unnamed = 0, set(), 0
@@ -846,6 +847,174 @@ class RulesTest(unittest.TestCase):
                     if "another file" not in keyword:       # and the table itself is what the dialect's validator says
                         self.assertIs(client.Validator(schema).is_valid(value), verdict, "the case is wrong")
 
+    def test_the_reader_refuses_an_unsupported_keyword_wherever_a_schema_holds_it(self):
+        """The whole schema set is checked before any value is looked at, so the branch a value takes does not
+        decide whether a schema is supported. An unsupported keyword in an unused definition, an absent
+        property, an unselected branch, a short-circuited alternative, array items, below each keyword that
+        holds a schema, in a document that a reference reaches and in one that none reaches: each is refused
+        (ValueError) whatever the value. Names of properties and definitions and the values of const and enum
+        are not schema locations, and a keyword's name there is not a keyword. (The fifth reads, R5-2 and F5:
+        until then each of the first nine placements was true.)"""
+        fits = self.rules.fits
+        unknown = {"propertyNames": False}
+        placements = [  # the two reads' own schemas, each with the value it used
+            ({"anyOf": [{}, {"propertyNames": False}]}, {}),
+            ({"properties": {"absent": {"prefixItems": [False]}}}, {}),
+            ({"$defs": {"later": {"unevaluatedProperties": False}}}, {}),
+            ({"if": False, "then": {"propertyNames": False}}, {}),
+            ({"items": {"prefixItems": [False]}}, {}),
+            ({"else": {"propertyNames": False}}, {}),
+            ({"anyOf": [{}, {"prefixItems": [{"type": "integer"}]}]}, ["a"]),
+            ({"$defs": {"future": {"unevaluatedProperties": False}}, "type": "object"}, {}),
+            ({"if": {"const": 1}, "then": {}, "else": {"format": "date-time"}}, 1),
+        ]
+        # Below every keyword that holds a schema, behind an alternative that is already true for any value.
+        for holder in ({"$defs": {"d": unknown}}, {"properties": {"p": unknown}}, {"allOf": [unknown]}, {"anyOf": [unknown]},
+                       {"oneOf": [unknown]}, {"not": unknown}, {"if": unknown}, {"then": unknown}, {"else": unknown},
+                       {"items": unknown}, {"additionalProperties": unknown}):
+            placements.append(({"anyOf": [True, holder]}, {}))
+        for schema, value in placements:
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValueError):
+                    fits("x.json", value, {"x.json": schema})
+        # In another document of the set: one a reference reaches behind a true alternative, and one nothing reaches.
+        for schemas in ({"x.json": {"anyOf": [True, {"$ref": "y.json"}]}, "y.json": {"propertyNames": False}},
+                        {"x.json": {}, "y.json": {"$defs": {"z": unknown}}}):
+            with self.subTest(schemas=schemas):
+                with self.assertRaises(ValueError):
+                    fits("x.json", {}, schemas)
+        # The published set itself, with one unused definition that uses a keyword this reader does not know: every
+        # read of it is refused, of that file and of the others. (Until the fifth read the suite stayed green.)
+        changed = copy.deepcopy(self.schemas.schemas)
+        changed["approval.v1.json"]["$defs"]["future"] = {"prefixItems": [{"type": "integer"}]}
+        approval = client.read_json(next((self.folder / "fixtures" / "good" / "approval.v1").glob("h02-*.json")))
+        self.assertTrue(fits("approval.v1.json", approval, self.schemas.schemas))
+        for ref, value in (("approval.v1.json", approval), ("common.v1.json#/$defs/timestamp", "2026-11-13T07:34:30.000Z")):
+            with self.subTest(published=ref):
+                with self.assertRaises(ValueError):
+                    fits(ref, value, changed)
+        # Not schema locations: a keyword's name as a property, a definition, a required name or a dependency, and
+        # anything at all inside a value of const or enum.
+        for schema, value in (({"const": {"propertyNames": False, "$id": "elsewhere.json", "$ref": "#/nowhere"}},
+                               {"propertyNames": False, "$id": "elsewhere.json", "$ref": "#/nowhere"}),
+                              ({"enum": [{"prefixItems": [1]}, 2]}, {"prefixItems": [1]}),
+                              ({"properties": {"prefixItems": {"type": "integer"}, "$id": {"type": "string"}}},
+                               {"prefixItems": 1, "$id": "a"}),
+                              ({"required": ["$ref"], "dependentRequired": {"$id": ["format"]}}, {"$ref": 1}),
+                              ({"$defs": {"format": {"type": "string"}}, "$ref": "#/$defs/format"}, "a")):
+            with self.subTest(schema=schema):
+                self.assertIs(fits("x.json", value, {"x.json": schema}), True)
+                self.assertIs(client.Validator(schema).is_valid(value), True, "the case is wrong")
+
+    def test_the_reader_refuses_a_keyword_whose_value_it_would_misread(self):
+        """A rule's value of another form than the dialect gives it is not read as if it were one: a list of
+        values or of names that is a string would be read one character at a time, a length that is text
+        compared with a number. Each is refused (ValueError) before a value is looked at, behind an
+        alternative that is already true."""
+        fits = self.rules.fits
+        wrong = {"type": [{"type": "integr"}, {"type": []}, {"type": 3}, {"type": ["string", "string"]}],
+                 "enum": [{"enum": "abc"}, {"enum": []}],
+                 "minLength": [{"minLength": "2"}, {"minLength": -1}, {"minLength": True}],
+                 "maxLength": [{"maxLength": "2"}], "minItems": [{"minItems": 1.5}], "maxItems": [{"maxItems": None}],
+                 "pattern": [{"pattern": "("}, {"pattern": 3}],
+                 "x-instant": [{"x-instant": "true"}], "uniqueItems": [{"uniqueItems": 1}],
+                 "minimum": [{"minimum": "0"}, {"minimum": True}], "maximum": [{"maximum": [9]}],
+                 "exclusiveMinimum": [{"exclusiveMinimum": None}],
+                 "required": [{"required": "ab"}, {"required": ["a", "a"]}, {"required": [1]}],
+                 "dependentRequired": [{"dependentRequired": {"a": "b"}}, {"dependentRequired": ["a"]}],
+                 "$ref": [{"$ref": 3}], "allOf": [{"allOf": []}, {"allOf": {}}], "anyOf": [{"anyOf": True}],
+                 "oneOf": [{"oneOf": "x"}], "properties": [{"properties": [True]}], "$defs": [{"$defs": [True]}],
+                 "items": [{"items": 3}], "not": [{"not": "x"}], "additionalProperties": [{"additionalProperties": "no"}]}
+        for keyword, schemas in wrong.items():
+            for schema in schemas:
+                with self.subTest(keyword=keyword, schema=schema):
+                    with self.assertRaises(ValueError):
+                        fits("x.json", "ab", {"x.json": {"anyOf": [True, schema]}})
+
+    def test_the_reader_resolves_a_reference_as_the_dialect_does_or_refuses_it(self):
+        """A reference is resolved the way Draft 2020-12 resolves it, or the schema is refused (ValueError)
+        before any value is looked at: never a wrong answer, a KeyError or a TypeError. This reader resolves a
+        bare document name of the set or none, then nothing or a JSON Pointer through objects to a schema
+        location (with ~0 and ~1). It refuses an embedded $id or $schema, a root $id that is not the
+        document's name, another dialect, any other URI, a fragment that is a name, a percent-encoded
+        pointer, a pointer through an array, into a value that is not a schema, or to nothing. (The fifth
+        read, R5-3: until then an array pointer was a TypeError, an encoded one a KeyError, and an embedded
+        $id was passed over and gave the wrong answer.)"""
+        fits, dialect = self.rules.fits, "https://json-schema.org/draft/2020-12/schema"
+        # The read's six cases, and a percent-encoded pointer whose literal spelling names another definition:
+        # the dialect's answer, or a refusal.
+        either = {
+            "array": {"$ref": "#/$defs/n/anyOf/0", "$defs": {"n": {"anyOf": [{"type": "string"}, {"type": "number"}]}}},
+            "encoded": {"$ref": "#/$defs/a%20b", "$defs": {"a b": {"type": "string"}}},
+            "encoded, twin": {"$ref": "#/$defs/a%20b", "$defs": {"a b": {"type": "string"}, "a%20b": {"type": "integer"}}},
+            "nested": {"$id": "x.json", "$ref": "#/$defs/sub", "$defs": {
+                "thing": {"type": "string"}, "sub": {"$id": "sub.json", "$ref": "#/$defs/thing", "$defs": {"thing": {"type": "integer"}}}}},
+        }
+        for name, schema in either.items():
+            for value in ("x", 1):
+                with self.subTest(case=name, value=value):
+                    theirs = client.Validator(schema).is_valid(value)
+                    try:
+                        mine = fits("x.json", value, {"x.json": schema})
+                    except ValueError:
+                        continue
+                    self.assertIs(mine, theirs)
+        # Each form this reader does not resolve is refused, whatever the value, the read's own among them.
+        refused = {
+            "an embedded $id": {"x.json": {"$defs": {"s": {"$id": "s.json"}}}},
+            "an embedded $schema": {"x.json": {"$defs": {"s": {"$schema": dialect}}}},
+            "a root $id that is not the name": {"x.json": {"$id": "y.json"}},
+            "another dialect": {"x.json": {"$schema": "http://json-schema.org/draft-07/schema#"}},
+            "an absolute URI": {"x.json": {"$ref": "https://example.com/x.json"}},
+            "a path": {"x.json": {"$ref": "./y.json"}, "y.json": {}},
+            "a document of another folder": {"x.json": {"$ref": "sub/y.json"}, "y.json": {}},
+            "a document not in the set": {"x.json": {"$ref": "y.json#/$defs/a"}},
+            "a name for a fragment": {"x.json": {"$defs": {"a": {"$anchor": "a"}}, "$ref": "#a"}},
+            "a name for a fragment, alone": {"x.json": {"anyOf": [True, {"$ref": "#here"}]}},
+            "a percent-encoded pointer": {"x.json": either["encoded, twin"]},
+            "a pointer through an array": {"x.json": either["array"]},
+            "a pointer through a list of values": {"x.json": {"$ref": "#/$defs/e/enum/a", "$defs": {"e": {"enum": ["a"]}}}},
+            "a pointer through a text": {"x.json": {"$ref": "#/$defs/p/pattern/b", "$defs": {"p": {"pattern": "ab"}}}},
+            "a pointer into a value of const": {"x.json": {"$ref": "#/$defs/c/const", "$defs": {"c": {"const": {"type": "string"}}}}},
+            "a pointer to schemas by name": {"x.json": {"$ref": "#/$defs", "$defs": {"type": {"const": 1}}}},
+            "a pointer to nothing": {"x.json": {"$ref": "#/$defs/missing"}},
+            "a pointer token that is not one": {"x.json": {"$ref": "#/$defs/a~2b", "$defs": {"a~2b": {}}}},
+            "a document name that is a path": {"sub/x.json": {}},
+            # Back to itself on the same value: undefined in the dialect, and a read that never ends.
+            "a reference to its own document": {"x.json": {"$ref": "#"}},
+            "a loop through a condition": {"x.json": {"$ref": "#/$defs/a", "$defs": {"a": {"if": {"$ref": "#/$defs/b"}},
+                                                                                     "b": {"anyOf": [False, {"$ref": "#/$defs/a"}]}}}},
+            "a loop across documents": {"x.json": {"allOf": [{"$ref": "y.json"}]}, "y.json": {"not": {"$ref": "x.json#"}}},
+            "a loop in an unused definition": {"x.json": {"$defs": {"a": {"oneOf": [True, {"$ref": "#/$defs/a"}]}}}},
+        }
+        for name, schemas in refused.items():
+            ref = next(iter(schemas))
+            for value in ("x", 1):
+                with self.subTest(refused=name, value=value):
+                    with self.assertRaises(ValueError):
+                        fits(ref, value, schemas)
+        # The entry reference is held to the same.
+        entry = {"x.json": {"$defs": {"n": {"anyOf": [{"type": "string"}, {"type": "number"}]}}}}
+        self.assertIs(fits("x.json#/$defs/n", "x", entry), True)
+        for ref in ("nope.json", "x.json#/$defs/n/anyOf/0", "x.json#/$defs", "x.json#/$defs/n/missing", "#/$defs/n", "x.json#n"):
+            with self.subTest(entry=ref):
+                with self.assertRaises(ValueError):
+                    fits(ref, "x", entry)
+        with self.assertRaises(ValueError):     # and a set that is not schemas by name is not read as one
+            fits("x.json", "x", [("x.json", {})])
+        # And what it resolves, it resolves as the dialect does.
+        tree = {"type": "object", "properties": {"child": {"$ref": "#"}}, "additionalProperties": False}
+        escaped = {"$ref": "#/$defs/a~1b", "$defs": {"a/b": {"$ref": "#/$defs/c~0d"}, "c~d": {"type": "string"}}}
+        for schemas, ref, value, verdict in (({"x.json": tree}, "x.json", {"child": {"child": {}}}, True),
+                                             ({"x.json": tree}, "x.json", {"child": {"child": 1}}, False),
+                                             ({"x.json": escaped}, "x.json", "a", True), ({"x.json": escaped}, "x.json", 1, False),
+                                             ({"x.json": escaped}, "x.json#/$defs/c~0d", 1, False),
+                                             ({"x.json": {"$id": "x.json", "$ref": "y.json"}, "y.json": {"type": "string"}}, "x.json", "a", True),
+                                             ({"x.json": {"$id": "x.json", "$ref": "y.json"}, "y.json": {"type": "string"}}, "x.json", 1, False),
+                                             ({"x.json": {"$ref": "y.json#"}, "y.json": {"$schema": dialect, "type": "string"}}, "x.json", 1, False)):
+            with self.subTest(resolved=schemas, value=value):
+                self.assertIs(fits(ref, value, schemas), verdict)
+
     # ---- the private binding
     def test_each_member_of_the_binding_is_compared_with_the_approval_it_is_used_against(self):
         """The binding that is KEPT names another approval, another run or another engine, and the same
@@ -939,6 +1108,83 @@ class RulesTest(unittest.TestCase):
         model = rules.ApprovalModel(found["record"], found["binding"])
         model.record["state"] = "approved"
         self.refused("resolved", model.change, expires_at="2026-11-13T08:10:00.000Z")
+
+    def test_a_record_whose_members_cannot_be_read_is_record_invalid(self):
+        """A durable record read back without a member that a consumption or a change reads, or with one of
+        another type or outside its list, is refused 'record_invalid' before that member is read: never a
+        KeyError or a TypeError, and never a refusal chosen by a state that is not a state. The record, its
+        revision, the binding and the receipts stay as they were, also after a restart. (The fifth reads, R5-1
+        and F1: until then a missing state, source or revision was a KeyError, a null revision a TypeError,
+        and a state outside the list was 'not_approved'.)"""
+        rules = self.rules
+
+        def fixture(name):
+            return client.read_json(next((self.folder / "fixtures" / "good" / "approval.v1").glob(name + "-*.json")))
+
+        def spoiled(name, member, value):
+            record = fixture(name)
+            if value is ...:
+                del record[member]
+            else:
+                record[member] = value
+            return record
+
+        def refused_unchanged(model, operation, *args, **kwargs):
+            before = (client._exact(model.record), client._exact(model.binding), copy.deepcopy(model.receipts))
+            self.refused("record_invalid", operation, *args, **kwargs)
+            self.assertEqual((client._exact(model.record), client._exact(model.binding), model.receipts), before)
+
+        approved, pending = fixture("h02"), fixture("h01")
+        self.assertEqual((approved["state"], pending["state"]), ("approved", "pending"))
+        bad_states = [..., None, True, 1, "not-a-state", "approved-ish"]
+        # A consumption: the record's shape before its state, its revision, its digest or its source is read.
+        for member, value in [("state", value) for value in bad_states] + [
+                (member, ...) for member in ("revision", "digest", "source", "effect", "answer")] + [
+                ("revision", None), ("revision", "1"), ("source", "neither"), ("effect", None)]:
+            with self.subTest(consume=member, value=value):
+                record = spoiled("h02", member, value)
+                model = rules.ApprovalModel(record)
+                refused_unchanged(model, model.consume, approved["revision"], approved["digest"], None)
+                again = rules.ApprovalModel(model.record, model.binding, model.receipts)
+                refused_unchanged(again, again.consume, approved["revision"], approved["digest"], None)
+        # A change: the state's shape before it is branched on, and a pending record whole before its source, its
+        # effect or its revision is read to build a candidate; with a new deadline, and with a new effect.
+        new_effect = dict(pending["effect"], input={"command": "make"})
+        for member, value in [("state", value) for value in bad_states] + [
+                (member, ...) for member in ("source", "effect", "revision", "rendered")] + [
+                ("revision", None), ("revision", False), ("revision", "1"), ("revision", 0), ("source", "neither"),
+                ("effect", "rm -rf /"), ("effect", {})]:
+            for change in ({"expires_at": pending["expires_at"]}, {"effect": new_effect}):
+                with self.subTest(change=member, value=value, changing=next(iter(change))):
+                    model = rules.ApprovalModel(spoiled("h01", member, value))
+                    refused_unchanged(model, model.change, **change)
+        # A state that IS a state keeps its own refusal, and a whole pending record is changed as before.
+        for state in ("approved", "denied", "expired", "vetoed", "consumed"):
+            with self.subTest(resolved=state):
+                model = rules.ApprovalModel(spoiled("h01", "state", state))
+                self.refused("resolved", model.change, expires_at=pending["expires_at"])
+        model = rules.ApprovalModel(pending)
+        model.change(effect=new_effect)
+        self.assertEqual((model.record["revision"], model.record["effect"], rules.approval_problems(model.record)),
+                         (pending["revision"] + 1, new_effect, []))
+
+    def test_a_candidate_is_validated_whole_after_the_record_it_was_made_from(self):
+        """The pending record is checked whole before a candidate is built from it, and the candidate is
+        checked whole again before it replaces the record: lines the renderer drew outside the published
+        shape (here, a line holding a line break) are refused 'record_invalid' and never committed."""
+        rules = self.rules
+        found = self.vector("approval.lifecycle/s15-*.json")
+        model = rules.ApprovalModel(found["record"], found["binding"])
+        before = (client._exact(model.record), client._exact(model.binding))
+        drawn = rules.approval_lines
+
+        def broken(source, effect):
+            lines = drawn(source, effect)
+            return lines[:-1] + [dict(lines[-1], text=lines[-1]["text"] + "\n")]
+
+        with mock.patch.object(rules, "approval_lines", broken):
+            self.refused("record_invalid", model.change, effect=dict(found["record"]["effect"], input={"command": "make"}))
+        self.assertEqual((client._exact(model.record), client._exact(model.binding)), before)
 
     def test_a_change_binds_the_normalised_numbers_of_its_new_effect(self):
         rules = self.rules

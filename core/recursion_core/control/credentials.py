@@ -1,0 +1,420 @@
+"""Control API credentials: principal kinds, the scopes each may hold, and tokens the daemon mints.
+
+Lane CONTROL, frontier plan v3.3, step 2. Nothing in the daemon reads this module yet: the authorizer
+in ``scopes.py`` takes a ``CredentialStore`` when it is registered into seam S5 (a later pull request).
+
+SCOPES are the four of the method table (``schemas/control/v1/methods.v1.json``, ``$defs/scope``):
+``read`` looks, ``run`` starts, steers and stops work, ``approve`` shows and answers approvals, and
+``manage`` changes the install.
+
+PRINCIPAL KINDS and the most each may ever hold (``CEILING``). A grant above the ceiling is refused at
+mint, and the authorizer intersects with the ceiling again on every call, so a record that somehow
+names more is still held to it.
+
+    owner     read run approve manage   the user on the owner-only socket; never a bearer token
+    internal  read run approve manage   the daemon's own code, by name; never a bearer token
+    device    read run approve          the page and paired devices: pairing never grants manage (O34)
+    plugin    read run                  a loaded plugin: never approve (PRODUCT.md 1169-1171), never manage
+    session   read run                  an engine's own session: never approve or manage (session.token.v1)
+    agent     read run                  the MCP face: never approve, never manage
+
+``owner`` and ``internal`` come from the way a request arrives, never from a token, so they cannot be
+minted. ``agent`` is a credential kind with no principal kind in ``common.v1`` yet; how its calls are
+attributed is open (``questions.md``).
+
+TOKENS. ``CredentialStore.mint`` makes 32 random bytes, URL-safe base64, behind a prefix a secret scanner
+can recognise: ``rst1_`` for a session (as ``session.token.v1`` writes it) and ``rct1_`` for every other
+kind. The token is returned ONCE and never stored, logged or put in an event: the store keeps its
+SHA-256. Each grant has a ``token_id`` (``stk-...`` for a session, ``ctk-...`` otherwise), a label that is
+safe to log and cannot be turned into the token.
+
+THE STORE is one JSON file in an owner-only directory: the directory is ``0700`` and this user's, the
+file a regular file of this user's, ``0600``, opened without following a symlink. It is written whole
+to a new file and renamed into place, so a reader sees the old grants or the new ones. It is not the
+event database: tokens are secrets, and the event log is shown to surfaces. One process writes it (the
+daemon, which runs once per user).
+
+REVOCATION takes effect at once: after ``revoke`` returns, ``verify`` refuses that token in every thread.
+If the file cannot be written the token stays revoked in memory and ``CredentialStoreError`` is raised,
+so the caller knows the revocation would not survive a restart.
+
+EVENTS. ``emit(event_type, payload)`` is called after a mint or a revoke has been written, outside the
+store's lock: ``credential.issued`` with ``token_id``, ``kind``, ``id``, ``scopes``, ``issued_at`` and
+``expires_at``; ``credential.revoked`` with ``token_id``, ``kind``, ``id`` and ``revoked_at``. Neither
+carries the token or its digest. The event names wait on lane SPINE's event schema.
+
+FAILED CHECKS are counted per peer (``FailedAuthLimit``): after ``max_failures`` failed checks within
+``window_s`` seconds the peer is refused, valid token or not, until the window has passed. Every failed
+check is logged with the peer and the reason, never the token. All refusals are ``scope_refused`` with
+a detail (``CredentialRefused``), the method table's existing code.
+
+POSIX only: on a platform without uids or ``O_NOFOLLOW`` the store refuses to open.
+"""
+
+from __future__ import annotations
+
+import base64
+import collections
+import hashlib
+import json
+import logging
+import os
+import re
+import secrets
+import stat
+import threading
+import time
+from collections.abc import Callable, Hashable, Iterable
+from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
+
+SCOPES = ("read", "run", "approve", "manage")
+ALL_SCOPES = frozenset(SCOPES)
+KINDS = ("owner", "internal", "device", "plugin", "session", "agent")
+CEILING: dict[str, frozenset[str]] = {
+    "owner": ALL_SCOPES,
+    "internal": ALL_SCOPES,
+    "device": frozenset({"read", "run", "approve"}),
+    "plugin": frozenset({"read", "run"}),
+    "session": frozenset({"read", "run"}),
+    "agent": frozenset({"read", "run"}),
+}
+MINTABLE = frozenset({"device", "plugin", "session", "agent"})
+SCOPE_REFUSED = "scope_refused"
+STORE_VERSION = 1
+
+_LABEL = re.compile(r"[A-Za-z0-9._:-]{1,128}")   # common.v1 $defs/token: a principal's id
+_TOKEN = re.compile(r"(rst1|rct1)_[A-Za-z0-9_-]{43}")
+_TOKEN_ID = re.compile(r"(stk|ctk)-[A-Za-z0-9_-]{1,60}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_RECORD_FIELDS = frozenset({"token_id", "token_sha256", "kind", "id", "scopes", "issued_at", "expires_at",
+                            "revoked_at"})
+
+
+class CredentialRefused(Exception):
+    """A grant or a token the rules refuse. ``code`` is ``scope_refused``; ``detail`` says why."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"{SCOPE_REFUSED}: {detail}")
+        self.code, self.detail = SCOPE_REFUSED, detail
+
+
+class CredentialStoreError(Exception):
+    """The store cannot be read, written or trusted. Nothing is minted; a revocation stays in memory."""
+
+
+def ceiling(kind: object) -> frozenset[str]:
+    """The most a principal of ``kind`` may hold; nothing for a kind that is not known."""
+
+    return CEILING.get(kind, frozenset()) if isinstance(kind, str) else frozenset()
+
+
+def check_grant(kind: object, scopes: object) -> frozenset[str]:
+    """``scopes`` as a frozenset, if a credential of ``kind`` may be minted with them; else ``CredentialRefused``."""
+
+    if not isinstance(kind, str) or kind not in KINDS:
+        raise CredentialRefused("kind_unknown")
+    if kind not in MINTABLE:
+        raise CredentialRefused("kind_not_mintable")
+    if not isinstance(scopes, (set, frozenset, list, tuple)) or not scopes:
+        raise CredentialRefused("scopes_invalid")
+    wanted = frozenset(scopes)
+    if len(wanted) != len(scopes) or not all(isinstance(s, str) and s in ALL_SCOPES for s in wanted):
+        raise CredentialRefused("scopes_invalid")
+    if "manage" in wanted and "manage" not in CEILING[kind]:
+        raise CredentialRefused("manage_never_granted")
+    if "approve" in wanted and "approve" not in CEILING[kind]:
+        raise CredentialRefused("approve_never_granted")
+    return wanted
+
+
+def _digest(token: str) -> str:
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+@dataclass(frozen=True)
+class Credential:
+    """One grant as the store keeps it, without its digest: safe to log and to return."""
+
+    token_id: str
+    kind: str
+    id: str
+    scopes: frozenset[str]
+    issued_at: int
+    expires_at: int | None
+    revoked_at: int | None
+
+    def public(self) -> dict:
+        return {"token_id": self.token_id, "kind": self.kind, "id": self.id, "scopes": sorted(self.scopes),
+                "issued_at": self.issued_at, "expires_at": self.expires_at, "revoked_at": self.revoked_at}
+
+
+class FailedAuthLimit:
+    """Failed token checks per peer: ``max_failures`` within ``window_s`` seconds, then refused until it passes.
+
+    ``clock`` is monotonic seconds. At most ``max_peers`` peers are remembered; the one that failed least
+    recently is forgotten first, so a flood of peers costs bounded memory.
+    """
+
+    def __init__(self, *, max_failures: int = 10, window_s: float = 60.0, max_peers: int = 1024,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        if max_failures < 1 or not window_s > 0 or max_peers < 1:
+            raise ValueError("max_failures, window_s and max_peers must be positive")
+        self._max, self._window = int(max_failures), float(window_s)
+        self._max_peers, self._clock = int(max_peers), clock
+        self._lock = threading.Lock()
+        self._failures: collections.OrderedDict[Hashable, collections.deque] = collections.OrderedDict()
+
+    def _recent(self, peer: Hashable, now: float) -> collections.deque | None:
+        times = self._failures.get(peer)
+        if times is not None:
+            while times and now - times[0] >= self._window:
+                times.popleft()
+            if not times:
+                del self._failures[peer]
+                return None
+        return times
+
+    def blocked(self, peer: Hashable) -> bool:
+        with self._lock:
+            times = self._recent(peer, self._clock())
+            return times is not None and len(times) >= self._max
+
+    def failed(self, peer: Hashable) -> bool:
+        """Count one failed check; True when the peer is now refused."""
+        with self._lock:
+            now = self._clock()
+            times = self._recent(peer, now)
+            if times is None:
+                times = self._failures[peer] = collections.deque()
+            times.append(now)
+            self._failures.move_to_end(peer)
+            while len(self._failures) > self._max_peers:
+                self._failures.popitem(last=False)
+            return len(times) >= self._max
+
+
+class CredentialStore:
+    """Daemon-minted tokens for the control API, kept hashed in one owner-only file. See the module text."""
+
+    def __init__(self, path: str, *, emit: Callable[[str, dict], None] | None = None,
+                 wall: Callable[[], float] = time.time, limit: FailedAuthLimit | None = None) -> None:
+        if os.name == "nt" or not hasattr(os, "getuid") or not hasattr(os, "O_NOFOLLOW"):
+            raise CredentialStoreError("platform_unsupported: the credential store needs uids and O_NOFOLLOW")
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise CredentialStoreError("the store path must be absolute")
+        self._path, self._emit, self._wall = path, emit, wall
+        self._limit = limit if limit is not None else FailedAuthLimit()
+        self._uid = os.getuid()
+        self._lock = threading.Lock()
+        self._secure_dir(os.path.dirname(path))
+        self._grants: dict[str, dict] = {}    # token_id -> record
+        self._by_digest: dict[str, str] = {}  # token_sha256 -> token_id
+        for record in self._load():
+            self._grants[record["token_id"]] = record
+            self._by_digest[record["token_sha256"]] = record["token_id"]
+
+    # -- the file -----------------------------------------------------------------------------------
+    def _secure_dir(self, directory: str) -> None:
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise CredentialStoreError(f"the store directory cannot be made ({type(exc).__name__})") from None
+        st = os.lstat(directory)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) & 0o077:
+            raise CredentialStoreError("the store directory is not an owner-only directory of this user")
+
+    def _load(self) -> list[dict]:
+        try:
+            fd = os.open(self._path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise CredentialStoreError(f"the store cannot be opened ({type(exc).__name__})") from None
+        with os.fdopen(fd, "rb") as handle:
+            st = os.fstat(handle.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != self._uid or stat.S_IMODE(st.st_mode) & 0o077:
+                raise CredentialStoreError("the store is not an owner-only file of this user")
+            raw = handle.read()
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise CredentialStoreError("the store is not JSON") from None
+        if type(doc) is not dict or set(doc) != {"version", "credentials"} or doc["version"] != STORE_VERSION \
+                or type(doc["credentials"]) is not list:
+            raise CredentialStoreError("the store has an unknown shape")
+        records, seen_ids, seen_digests = [], set(), set()
+        for record in doc["credentials"]:
+            self._check_record(record)
+            if record["token_id"] in seen_ids or record["token_sha256"] in seen_digests:
+                raise CredentialStoreError("the store names one grant twice")
+            seen_ids.add(record["token_id"])
+            seen_digests.add(record["token_sha256"])
+            records.append(record)
+        return records
+
+    @staticmethod
+    def _check_record(record: object) -> None:
+        def stamp(value: object, optional: bool) -> bool:
+            return (optional and value is None) or (type(value) is int and value >= 0)
+
+        ok = (type(record) is dict and set(record) == _RECORD_FIELDS
+              and isinstance(record["token_id"], str) and _TOKEN_ID.fullmatch(record["token_id"]) is not None
+              and isinstance(record["token_sha256"], str) and _SHA256.fullmatch(record["token_sha256"]) is not None
+              and record["kind"] in MINTABLE
+              and isinstance(record["id"], str) and _LABEL.fullmatch(record["id"]) is not None
+              and type(record["scopes"]) is list and record["scopes"]
+              and all(isinstance(s, str) for s in record["scopes"])
+              and stamp(record["issued_at"], False) and stamp(record["expires_at"], True)
+              and stamp(record["revoked_at"], True))
+        if not ok:
+            raise CredentialStoreError("the store holds a grant of an unknown shape")
+        try:
+            check_grant(record["kind"], record["scopes"])
+        except CredentialRefused as exc:
+            raise CredentialStoreError(f"the store holds a grant the rules refuse ({exc.detail})") from None
+
+    def _write(self, grants: Iterable[dict]) -> None:
+        """Write every grant to a new file in the same directory and rename it over the store."""
+
+        directory = os.path.dirname(self._path)
+        temp = os.path.join(directory, f".{os.path.basename(self._path)}.{secrets.token_hex(8)}.tmp")
+        data = json.dumps({"version": STORE_VERSION, "credentials": list(grants)}, sort_keys=True,
+                          separators=(",", ":")).encode("ascii")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(temp, flags, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp, self._path)
+            except BaseException:
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+                raise
+            dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as exc:
+            raise CredentialStoreError(f"the store cannot be written ({type(exc).__name__})") from None
+
+    # -- grants -------------------------------------------------------------------------------------
+    @staticmethod
+    def _credential(record: dict) -> Credential:
+        return Credential(token_id=record["token_id"], kind=record["kind"], id=record["id"],
+                          scopes=frozenset(record["scopes"]), issued_at=record["issued_at"],
+                          expires_at=record["expires_at"], revoked_at=record["revoked_at"])
+
+    def _now(self) -> int:
+        return int(self._wall())
+
+    def mint(self, kind: str, principal_id: str, scopes: Iterable[str], *,
+             expires_at: int | None = None) -> tuple[str, Credential]:
+        """Mint a token for ``(kind, principal_id)`` holding ``scopes``. Returns ``(token, credential)``.
+
+        The token is returned here once and kept nowhere. Refused (``CredentialRefused``): an unknown or
+        unmintable kind, a scope not in ``SCOPES``, ``manage`` for a device, plugin, session or agent,
+        ``approve`` for a plugin, session or agent, a principal id that is not a label, or an expiry that
+        is not a whole second in the future.
+        """
+
+        granted = check_grant(kind, scopes if isinstance(scopes, (set, frozenset, list, tuple)) else None)
+        if not isinstance(principal_id, str) or _LABEL.fullmatch(principal_id) is None:
+            raise CredentialRefused("principal_id_invalid")
+        now = self._now()
+        if expires_at is not None and (type(expires_at) is not int or expires_at <= now):
+            raise CredentialRefused("expiry_invalid")
+        session = kind == "session"
+        secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")   # 43 characters
+        token = ("rst1_" if session else "rct1_") + secret
+        record = {"token_id": ("stk-" if session else "ctk-") + secrets.token_urlsafe(16),
+                  "token_sha256": _digest(token), "kind": kind, "id": principal_id, "scopes": sorted(granted),
+                  "issued_at": now, "expires_at": expires_at, "revoked_at": None}
+        with self._lock:
+            if record["token_id"] in self._grants or record["token_sha256"] in self._by_digest:
+                raise CredentialStoreError("a fresh grant collided with a stored one")  # 2^-128: never in practice
+            self._write([*self._grants.values(), record])
+            self._grants[record["token_id"]] = record
+            self._by_digest[record["token_sha256"]] = record["token_id"]
+        credential = self._credential(record)
+        self._notify("credential.issued", {"token_id": credential.token_id, "kind": kind, "id": principal_id,
+                                           "scopes": sorted(granted), "issued_at": now, "expires_at": expires_at})
+        return token, credential
+
+    def revoke(self, token_id: str) -> Credential:
+        """Revoke a grant at once. Revoking twice keeps the first ``revoked_at``. Unknown: ``CredentialRefused``."""
+
+        with self._lock:
+            record = self._grants.get(token_id) if isinstance(token_id, str) else None
+            if record is None:
+                raise CredentialRefused("token_unknown")
+            if record["revoked_at"] is not None:
+                return self._credential(record)
+            record["revoked_at"] = self._now()   # refused from here on, whatever the file write does
+            self._write(self._grants.values())
+            credential = self._credential(record)
+        self._notify("credential.revoked", {"token_id": credential.token_id, "kind": credential.kind,
+                                            "id": credential.id, "revoked_at": credential.revoked_at})
+        return credential
+
+    def verify(self, token: object, *, peer: Hashable) -> Credential:
+        """The live grant ``token`` names, or ``CredentialRefused``. Failed checks count against ``peer``."""
+
+        if self._limit.blocked(peer):
+            log.warning("credential check refused for peer %r: too many failed checks", peer)
+            raise CredentialRefused("auth_rate_limited")
+        reason = None
+        if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
+            reason = "token_malformed"
+        else:
+            with self._lock:
+                token_id = self._by_digest.get(_digest(token))
+                record = self._grants.get(token_id) if token_id is not None else None
+                if record is None:
+                    reason = "token_unknown"
+                elif record["revoked_at"] is not None:
+                    reason = "token_revoked"
+                elif record["expires_at"] is not None and self._now() >= record["expires_at"]:
+                    reason = "token_expired"
+                else:
+                    return self._credential(record)
+        now_limited = self._limit.failed(peer)
+        log.warning("credential check failed for peer %r: %s%s", peer, reason,
+                    "; the peer is now refused for a while" if now_limited else "")
+        raise CredentialRefused(reason)
+
+    def held(self, kind: object, principal_id: object) -> frozenset[str]:
+        """The scopes ``(kind, principal_id)`` holds NOW: the union of its live grants. Every grant is within
+        its kind's ceiling (checked at mint and when the file is read); the authorizer cuts to it again."""
+
+        now = self._now()
+        out: set[str] = set()
+        with self._lock:
+            for record in self._grants.values():
+                if (record["kind"] == kind and record["id"] == principal_id and record["revoked_at"] is None
+                        and (record["expires_at"] is None or now < record["expires_at"])):
+                    out.update(record["scopes"])
+        return frozenset(out)
+
+    def grants(self) -> list[Credential]:
+        """Every grant, revoked ones included, without digests."""
+
+        with self._lock:
+            return [self._credential(record) for record in self._grants.values()]
+
+    def _notify(self, event_type: str, payload: dict) -> None:
+        if self._emit is None:
+            return
+        try:
+            self._emit(event_type, payload)
+        except Exception:  # noqa: BLE001 - the grant is written; a failed notice does not undo it
+            log.exception("the %s event could not be recorded", event_type)

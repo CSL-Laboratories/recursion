@@ -143,9 +143,11 @@ that reaches the rule, make the one change, and list it with the keyword and the
 ## How the hosted gate runs this
 
 The hosted gate (`tools/ci_gate.py`) runs every file named `tools/test_*.py` and does not reach this
-folder. `tools/test_wire_conformance.py` is the bridge: it loads the test cases of `tests.py` where
-the gate's own runner collects them, and adds no check of its own. The gate is not edited. This was
-the owner's decision of Nov 13, 2026, marked for follow-up research.
+folder. `tools/test_wire_conformance.py` is the bridge: it loads every test class of `tests.py` where
+the gate's own runner collects them, and its one check of its own is that it carries all of them (a
+class added to `tests.py` once ran by hand and not under the gate, because the bridge named its
+classes one by one). The gate is not edited. This was the owner's decision of Nov 13, 2026, marked
+for follow-up research.
 
 The test file here is still named `tests.py`, not `test_*.py`: the gate fails when it finds a
 test-named file outside the folders it runs, and `unittest discover` finds `tests.py` by its default

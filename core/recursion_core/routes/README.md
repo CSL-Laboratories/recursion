@@ -36,6 +36,16 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - `launch.py`: the injected launcher / process interface, `require_free_threaded()` (refuses a GIL build;
   the daemon calls it before starting processes and after each plugin load) and `child_env()` (explicit
   env from an allowlist; never `os.environ`).
+- `driver.py`: driver contract version 2 (lane SPINE's `driver.v2` schema, draft 4, in #368). A driver
+  declares its engine, eight flags (`multi_turn`, `mid_turn_input`, `interrupt`, `resume`, `fork`,
+  `permission_bridge`, `typed_limits`, `usage`) and `input_ack`. `Driver` is the gate every engine's driver
+  subclasses: a call whose flag is false raises `DriverRefused` (`unsupported`, the call, the flag) before
+  the subclass is asked, so no process starts and no byte reaches the engine; a malformed call or one the
+  worker's state does not allow (closed input, a reused turn or delivery id, an interrupt of a turn not in
+  progress) is refused the same way. `parse` returns only the event types a driver may draft, with exactly
+  their keys, and an `input.accepted` only when it matches a delivery this worker wrote, with the turn and
+  the `how` of that write; anything else is dropped and counted. `one_turn(engine)` declares today's path,
+  `RouteAdapter.run`, with every flag false. No engine has a driver yet (later slices: Claude Code's).
 - `host.py`: `platform_supported()`, the one place in this package that reads `os` (`os.name` and whether
   `os.geteuid` exists, the same test as `child_env` and `subscription_routes`). The adapter modules still
   never import `os`.

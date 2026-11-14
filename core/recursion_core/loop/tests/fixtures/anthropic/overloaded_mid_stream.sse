@@ -1,0 +1,8 @@
+: Synthesized from the documented Messages API stream format (claude-api reference, read Nov 14, 2026).
+: Not a live capture: the attended run replaces these with redacted captures.
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_fixture_03","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":30,"output_tokens":1}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+

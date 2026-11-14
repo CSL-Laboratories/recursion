@@ -1,0 +1,200 @@
+"""The engine protocol: JSON lines in on standard input, typed JSON lines out on standard output.
+
+In (one object per line; the shapes of driver.v2's inputs, plus interrupt):
+    {"kind": "user_message", "turn_id": "turn-...", "text": "...", "delivery_id": "dlv-..."}
+    {"kind": "approval_answer", "approval_id": "apr-...", "decision": "approve" | "deny"}
+    {"kind": "interrupt", "turn_id": "turn-..."}
+    {"kind": "close"}
+A line that is not one of these gets a ``protocol_error`` line and changes nothing.
+
+Out (one object per line; standard output carries nothing else, diagnostics go to standard error):
+    ready           once, at start: protocol version, provider, model, tool names
+    input_accepted  {delivery_id, turn_id, how: "new_turn"}, written the moment the loop takes a message and
+                    before anything is sent to the model; never for a message the loop did not take
+    text            {turn_id, text}: one finished block of the model's text
+    tool_call       {turn_id, call_id, name, input}
+    tool_result     {turn_id, call_id, status, text, output_ref, truncated, spill}
+    usage           {turn_id, span: "call", model, input_tokens, ...}: one per model call that returned
+    limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
+    turn_ended      {turn_id, outcome, result, reason}
+    interrupt       {turn_id, delivered}
+    protocol_error  {code, detail}
+    closed          once, when the loop exits after close or the end of its input
+
+The payload fields match event.v1's payloads of the same name, so the driver (routes/engines/recursion_loop.py,
+the lane's third pull request) adds only what the loop cannot know: the connection id and the bucket on usage
+and limit, the input digest on tool_call, and the envelope. ``reason`` and ``spill`` are the loop's own and are
+dropped or mapped there.
+
+Every string written passes through the redactor, which removes every secret the loop holds, before and after
+it is serialised.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import IO, Any
+
+PROTOCOL_VERSION = 1
+MAX_INPUT_LINE = 32 * 1024 * 1024
+
+_TURN = re.compile(r"^turn-[A-Za-z0-9_-]{1,59}$")
+_DELIVERY = re.compile(r"^dlv-[A-Za-z0-9_-]{1,60}$")
+_APPROVAL = re.compile(r"^apr-[A-Za-z0-9_-]{1,60}$")
+
+
+class InputError(Exception):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+@dataclass(frozen=True)
+class UserMessage:
+    turn_id: str
+    text: str
+    delivery_id: str
+
+
+@dataclass(frozen=True)
+class ApprovalAnswer:
+    approval_id: str
+    decision: str
+
+
+@dataclass(frozen=True)
+class Interrupt:
+    turn_id: str
+
+
+@dataclass(frozen=True)
+class Close:
+    pass
+
+
+Input = UserMessage | ApprovalAnswer | Interrupt | Close
+
+_FIELDS = {
+    "user_message": {"kind", "turn_id", "text", "delivery_id"},
+    "approval_answer": {"kind", "approval_id", "decision"},
+    "interrupt": {"kind", "turn_id"},
+    "close": {"kind"},
+}
+
+
+def parse_input(line: bytes | str) -> Input:
+    if isinstance(line, bytes):
+        try:
+            line = line.decode("utf-8")
+        except UnicodeDecodeError:
+            raise InputError("not_utf8", "the line is not UTF-8") from None
+    try:
+        doc = json.loads(line)
+    except ValueError:
+        raise InputError("not_json", "the line is not JSON") from None
+    if not isinstance(doc, dict):
+        raise InputError("not_an_object", "the line is not a JSON object")
+    kind = doc.get("kind")
+    if kind not in _FIELDS:
+        raise InputError("unknown_kind", f"kind {kind!r} is not one of {sorted(_FIELDS)}")
+    extra = sorted(set(doc) - _FIELDS[kind])
+    missing = sorted(_FIELDS[kind] - set(doc))
+    if extra:
+        raise InputError("unknown_field", f"{kind} has unknown field(s): {', '.join(extra)}")
+    if missing:
+        raise InputError("missing_field", f"{kind} lacks: {', '.join(missing)}")
+    if kind == "user_message":
+        if not isinstance(doc["turn_id"], str) or not _TURN.fullmatch(doc["turn_id"]):
+            raise InputError("bad_turn_id", "turn_id")
+        if not isinstance(doc["delivery_id"], str) or not _DELIVERY.fullmatch(doc["delivery_id"]):
+            raise InputError("bad_delivery_id", "delivery_id")
+        if not isinstance(doc["text"], str) or not doc["text"]:
+            raise InputError("bad_text", "text must be a non-empty string")
+        return UserMessage(doc["turn_id"], doc["text"], doc["delivery_id"])
+    if kind == "approval_answer":
+        if not isinstance(doc["approval_id"], str) or not _APPROVAL.fullmatch(doc["approval_id"]):
+            raise InputError("bad_approval_id", "approval_id")
+        if doc["decision"] not in ("approve", "deny"):
+            raise InputError("bad_decision", "decision must be approve or deny")
+        return ApprovalAnswer(doc["approval_id"], doc["decision"])
+    if kind == "interrupt":
+        if not isinstance(doc["turn_id"], str) or not _TURN.fullmatch(doc["turn_id"]):
+            raise InputError("bad_turn_id", "turn_id")
+        return Interrupt(doc["turn_id"])
+    return Close()
+
+
+class Redactor:
+    """Removes every secret the loop holds from text it writes. Secrets shorter than 8 characters are refused:
+    replacing them would mangle ordinary text and they are not keys."""
+
+    def __init__(self, secrets: Iterable[str] = ()) -> None:
+        self._secrets: list[str] = []
+        for s in secrets:
+            self.add(s)
+
+    def add(self, secret: str) -> None:
+        if not isinstance(secret, str) or len(secret) < 8:
+            raise ValueError("a secret to redact must be a string of 8 characters or more")
+        if secret not in self._secrets:
+            self._secrets.append(secret)
+            self._secrets.sort(key=len, reverse=True)
+
+    def scrub(self, text: str) -> str:
+        for secret in self._secrets:
+            if secret in text:
+                text = text.replace(secret, "[redacted]")
+        return text
+
+    def scrub_obj(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self.scrub(value)
+        if isinstance(value, Mapping):
+            return {self.scrub(str(k)): self.scrub_obj(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.scrub_obj(v) for v in value]
+        return value
+
+
+class Writer:
+    """Writes one JSON object per line, whole, under a lock (the input thread writes too)."""
+
+    def __init__(self, stream: IO[str], redactor: Redactor) -> None:
+        self._stream = stream
+        self._redactor = redactor
+        self._lock = threading.Lock()
+
+    def write(self, line_type: str, /, **fields: Any) -> None:
+        # Positional-only: a line may carry a field called "kind" (limit lines do).
+        doc = {"type": line_type}
+        doc.update(fields)
+        line = json.dumps(self._redactor.scrub_obj(doc), ensure_ascii=False, separators=(",", ":"))
+        line = self._redactor.scrub(line)
+        with self._lock:
+            self._stream.write(line + "\n")
+            self._stream.flush()
+
+
+def read_lines(stream: IO[bytes], on_line: Callable[[bytes], None], on_too_long: Callable[[], None]) -> None:
+    """Read LF-terminated lines from ``stream`` until its end. A line longer than MAX_INPUT_LINE is skipped to
+    its end and reported once."""
+
+    while True:
+        line = stream.readline(MAX_INPUT_LINE + 1)
+        if not line:
+            return
+        if len(line) > MAX_INPUT_LINE and not line.endswith(b"\n"):
+            on_too_long()
+            while True:  # discard the rest of the long line
+                rest = stream.readline(MAX_INPUT_LINE)
+                if not rest or rest.endswith(b"\n"):
+                    break
+            continue
+        stripped = line.rstrip(b"\r\n")
+        if stripped.strip():
+            on_line(stripped)

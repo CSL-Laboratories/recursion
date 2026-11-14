@@ -2,10 +2,13 @@
 
 In (one object per line; the shapes of driver.v2's inputs, plus interrupt):
     {"kind": "user_message", "turn_id": "turn-...", "text": "...", "delivery_id": "dlv-..."}
-    {"kind": "approval_answer", "approval_id": "apr-...", "decision": "approve" | "deny"}
+    {"kind": "approval_answer", "approval_id": "apr-...", "decision": "approve" | "deny",
+     "request_id": "<the loop's own id>", "input": {...}}             input optional (the bound input)
     {"kind": "interrupt", "turn_id": "turn-..."}
     {"kind": "close"}
-A line that is not one of these gets a ``protocol_error`` line and changes nothing.
+A line that is not one of these gets a ``protocol_error`` line and changes nothing. ``approval_answer`` carries
+one field more than driver.v2's: the loop's request id, which the driver takes from approval.v1's private
+binding (``engine_request_id``), so the answer reaches the request it belongs to.
 
 Out (one object per line; standard output carries nothing else, diagnostics go to standard error):
     ready           once, at start: protocol version, provider, model, tool names
@@ -16,6 +19,10 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
     tool_result     {turn_id, call_id, status, text, output_ref, truncated, spill}
     usage           {turn_id, span: "call", model, input_tokens, ...}: one per model call that returned
     limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
+    permission_request  {turn_id, request_id, call_id, tool, cwd, input, profile, deadline_s}: write, edit and
+                    shell ask before they run (permissions.py); permission_expired {turn_id, request_id} when the
+                    deadline passes unanswered (the call is denied)
+    acceptance      {turn_id, command, exit_code, passed, text}: the harness's acceptance check (done.py)
     turn_ended      {turn_id, outcome, result, reason}
     interrupt       {turn_id, delivered}
     protocol_error  {code, detail}
@@ -65,6 +72,8 @@ class UserMessage:
 class ApprovalAnswer:
     approval_id: str
     decision: str
+    request_id: str
+    input: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -81,10 +90,11 @@ Input = UserMessage | ApprovalAnswer | Interrupt | Close
 
 _FIELDS = {
     "user_message": {"kind", "turn_id", "text", "delivery_id"},
-    "approval_answer": {"kind", "approval_id", "decision"},
+    "approval_answer": {"kind", "approval_id", "decision", "request_id"},
     "interrupt": {"kind", "turn_id"},
     "close": {"kind"},
 }
+_OPTIONAL = {"approval_answer": {"input"}}
 
 
 def parse_input(line: bytes | str) -> Input:
@@ -102,7 +112,7 @@ def parse_input(line: bytes | str) -> Input:
     kind = doc.get("kind")
     if kind not in _FIELDS:
         raise InputError("unknown_kind", f"kind {kind!r} is not one of {sorted(_FIELDS)}")
-    extra = sorted(set(doc) - _FIELDS[kind])
+    extra = sorted(set(doc) - _FIELDS[kind] - _OPTIONAL.get(kind, set()))
     missing = sorted(_FIELDS[kind] - set(doc))
     if extra:
         raise InputError("unknown_field", f"{kind} has unknown field(s): {', '.join(extra)}")
@@ -121,7 +131,13 @@ def parse_input(line: bytes | str) -> Input:
             raise InputError("bad_approval_id", "approval_id")
         if doc["decision"] not in ("approve", "deny"):
             raise InputError("bad_decision", "decision must be approve or deny")
-        return ApprovalAnswer(doc["approval_id"], doc["decision"])
+        rid = doc["request_id"]
+        if not isinstance(rid, str) or not 1 <= len(rid) <= 256 or "\r" in rid or "\n" in rid:
+            raise InputError("bad_request_id", "request_id: 1 to 256 characters, no line break")
+        bound = doc.get("input")
+        if "input" in doc and not isinstance(bound, dict):
+            raise InputError("bad_input", "input, when present, is the bound input object")
+        return ApprovalAnswer(doc["approval_id"], doc["decision"], rid, bound)
     if kind == "interrupt":
         if not isinstance(doc["turn_id"], str) or not _TURN.fullmatch(doc["turn_id"]):
             raise InputError("bad_turn_id", "turn_id")

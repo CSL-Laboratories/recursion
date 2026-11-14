@@ -5,11 +5,16 @@
 
 The key and the base URL come from the environment only (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL), never from an
 argument, a file or standard input. The key is removed from this process's environment as soon as the provider
-holds it, so no child the loop starts (the search worker, later the shell tool) inherits it.
+holds it, so no child the loop starts (the search worker, a shell command, the acceptance check) inherits it.
 
 The model has no default: it is the route's model, given by the driver. The engine home holds the spill folder;
 it must be a private folder (created 0700 if missing). The workspace is the current folder unless --workspace
 names another.
+
+Write, edit and shell ask the core before they run and are denied when no answer comes by --approval-timeout.
+``--permissions full_access`` skips the asking (grill Q20) only together with ``--acknowledge-full-access``,
+which the surface passes when the user acknowledged it for this run. ``--acceptance <command>`` is the task's
+acceptance check (done.py).
 """
 
 from __future__ import annotations
@@ -20,18 +25,21 @@ import sys
 import threading
 from pathlib import Path
 
+from recursion_core.loop import done as d
+from recursion_core.loop import instructions as ins
+from recursion_core.loop import permissions as perm
 from recursion_core.loop import protocol as p
 from recursion_core.loop.engine import DEFAULT_MAX_STEPS, Config, Engine, Session
 from recursion_core.loop.providers import anthropic, fake
-from recursion_core.loop.tools import read, search
+from recursion_core.loop.tools import edit, read, search, shell, write
 from recursion_core.loop.tools.registry import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolRegistry
 from recursion_core.loop.tools.workspace import SpillStore, ToolError, Workspace, check_private_dir
 
-TOOLS = (read.TOOL, search.TOOL)
+TOOLS = (read.TOOL, search.TOOL, write.TOOL, edit.TOOL, shell.TOOL)
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Keys the loop may find in its environment. Each one present is redacted from everything the loop writes and
 # removed from its environment, whichever provider runs. (OPENAI_API_KEY is LOOP-OAI's provider's.)
-KEY_ENV = (anthropic.ENV_KEY, "OPENAI_API_KEY")
+KEY_ENV = (anthropic.ENV_KEY, "OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,6 +53,15 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--effort", choices=EFFORTS, default=None)
     ap.add_argument("--output-cap-bytes", type=int, default=DEFAULT_MAX_BYTES)
     ap.add_argument("--output-cap-lines", type=int, default=DEFAULT_MAX_LINES)
+    ap.add_argument("--permissions", choices=(perm.ASK, perm.FULL_ACCESS), default=perm.ASK)
+    ap.add_argument("--acknowledge-full-access", action="store_true",
+                    help="the user acknowledged the full-access profile for this run")
+    ap.add_argument("--approval-timeout", type=float, default=perm.DEFAULT_DEADLINE_S,
+                    help="seconds a permission request waits before it is denied")
+    ap.add_argument("--acceptance", default=None, help="the task's acceptance check, a shell command")
+    ap.add_argument("--acceptance-rounds", type=int, default=d.DEFAULT_ROUNDS)
+    ap.add_argument("--no-project-instructions", action="store_true",
+                    help="do not read AGENTS.md and CLAUDE.md into the prompt")
     ap.add_argument("--fake-script", help="steps for the fake provider (tests and conformance runs)")
     ap.add_argument("--fake-record", help="append each request the fake provider receives to this file")
     return ap
@@ -94,6 +111,14 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.max_steps < 1 or args.max_output_tokens < 1:
         raise SystemExit("recursion_loop: --max-steps and --max-output-tokens must be positive")
+    if args.permissions == perm.FULL_ACCESS and not args.acknowledge_full_access:
+        raise SystemExit("recursion_loop: the full-access profile needs --acknowledge-full-access for this run")
+    if args.approval_timeout <= 0:
+        raise SystemExit("recursion_loop: --approval-timeout must be positive")
+    try:
+        acceptance = d.Acceptance(args.acceptance, rounds=args.acceptance_rounds) if args.acceptance else None
+    except ValueError as exc:
+        raise SystemExit(f"recursion_loop: {exc}") from None
     provider, model = build(args, dict(os.environ))
     # The provider holds the key now; nothing else in this process, or any child of it, gets it.
     secrets = [s for s in getattr(provider, "secrets", ()) if s] + take_keys(os.environ)
@@ -106,15 +131,19 @@ def main(argv: list[str] | None = None) -> int:
         registry = ToolRegistry(TOOLS, max_bytes=args.output_cap_bytes, max_lines=args.output_cap_lines)
     except ValueError as exc:
         raise SystemExit(f"recursion_loop: {exc}") from None
+    text, found = ("", []) if args.no_project_instructions else ins.discover(workspace.root)
     redactor = p.Redactor(secrets)
     out = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False, buffering=1)
     writer = p.Writer(out, redactor)
+    gate = perm.PermissionGate(writer, profile=args.permissions, deadline_s=args.approval_timeout)
     session = Session(provider, registry, workspace, writer, redactor,
                       Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
-                             effort=args.effort))
+                             effort=args.effort, acceptance=acceptance, instructions=text), gate=gate)
     engine = Engine(session, writer)
     writer.write("ready", protocol=p.PROTOCOL_VERSION, engine="recursion_loop", provider=provider.name, model=model,
-                 tools=list(registry.names()))
+                 tools=list(registry.names()), permissions=args.permissions,
+                 acceptance=acceptance.command if acceptance else None,
+                 instructions=[f.to_wire() for f in found])
 
     def pump() -> None:
         try:

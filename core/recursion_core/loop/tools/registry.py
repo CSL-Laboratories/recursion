@@ -29,6 +29,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from recursion_core.loop import permissions as perm
 from recursion_core.loop.providers import base as b
 from recursion_core.loop.tools.workspace import ToolError, Workspace
 
@@ -58,9 +59,12 @@ class ToolContext:
     scrub: Callable[[str], str]
     max_bytes: int = DEFAULT_MAX_BYTES
     max_lines: int = DEFAULT_MAX_LINES
+    # approve(call) -> permissions.Decision; None when nothing can be asked (then such tools are refused).
+    approve: Callable[[b.ToolCall], Any] | None = None
 
 
 ToolFn = Callable[[Mapping[str, Any], ToolContext], ToolOutput]
+CheckFn = Callable[[Mapping[str, Any], ToolContext], None]
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,9 @@ class Tool:
     spec: b.ToolSpec
     run: ToolFn
     needs_approval: bool = False
+    # Run before a permission request, without side effects; raises ToolError so that a call that would fail
+    # (a stale edit, an anchor that is not unique) is refused without asking anyone. ``run`` checks again.
+    precheck: CheckFn | None = None
 
 
 @dataclass(frozen=True)
@@ -254,14 +261,29 @@ class ToolRegistry:
             validate(tool.spec.input_schema, dict(call.input))
         except ToolError as exc:
             return self._finish(call, ToolOutput(f"invalid input: {exc}", ERROR), ctx)
-        if tool.needs_approval:
-            # The approval path arrives with write, edit and shell (second pull request). Until then a tool that
-            # needs approval is refused, never run without it.
-            return self._finish(call, ToolOutput("refused: this tool needs an approval and none can be asked yet",
-                                                 DENIED), ctx)
         ctx.max_bytes, ctx.max_lines = self.max_bytes, self.max_lines
+        args = dict(call.input)
+        if tool.needs_approval:
+            if tool.precheck is not None:
+                try:
+                    tool.precheck(args, ctx)
+                except ToolError as exc:
+                    return self._finish(call, ToolOutput(str(exc), ERROR), ctx)
+            if ctx.approve is None:
+                # Never run without an answer: with no way to ask, such a tool is refused.
+                return self._finish(call, ToolOutput("refused: this tool needs an approval and none can be asked",
+                                                     DENIED), ctx)
+            decision = ctx.approve(call)
+            if not decision.approved:
+                status = CANCELLED if decision.outcome == perm.CANCELLED else DENIED
+                return self._finish(call, ToolOutput(perm.REFUSALS.get(decision.outcome, "denied"), status), ctx)
+            args = dict(decision.input)
+            try:
+                validate(tool.spec.input_schema, args)  # what runs is the bound input; it is checked as well
+            except ToolError as exc:
+                return self._finish(call, ToolOutput(f"invalid approved input: {exc}", ERROR), ctx)
         try:
-            output = tool.run(dict(call.input), ctx)
+            output = tool.run(args, ctx)
         except b.Cancelled:
             output = ToolOutput("stopped: the turn was interrupted", CANCELLED)
         except ToolError as exc:

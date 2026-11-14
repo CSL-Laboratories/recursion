@@ -67,7 +67,15 @@ class Turns(unittest.TestCase):
         h.feed(msg("turn-1", "What does src/a.py do?", "dlv-1"))
         docs = h.finish()
         self.assertEqual(kinds(docs), ["input_accepted", "usage", "text", "tool_call", "tool_result", "usage", "text",
-                                       "turn_ended", "closed"])
+                                       "usage", "usage", "turn_ended", "closed"])
+        turn, total = docs[7], docs[8]
+        self.assertEqual((turn["span"], total["span"]), ("turn", "session_total"))
+        self.assertEqual(turn["input_tokens"], {"value": 240, "quality": "known", "provenance": "observed"})
+        self.assertEqual(turn["cache_read_tokens"], {"value": 90, "quality": "lower_bound", "provenance": "observed"},
+                         "one call did not report it: the sum is a lower bound, not a guess")
+        self.assertEqual(turn["reasoning_tokens"]["quality"], "unknown")
+        self.assertEqual(total["input_tokens"]["value"], 240)
+        docs = docs[:7] + docs[9:]
         self.assertEqual(docs[0], {"type": "input_accepted", "delivery_id": "dlv-1", "turn_id": "turn-1",
                                    "how": "new_turn"})
         self.assertEqual(docs[3], {"type": "tool_call", "turn_id": "turn-1", "call_id": "toolu_1", "name": "read",
@@ -214,7 +222,7 @@ class Endings(unittest.TestCase):
 
     def test_an_approval_answer_with_nothing_waiting_is_refused(self) -> None:
         h = Harness(self, [])
-        h.feed(b'{"kind":"approval_answer","approval_id":"apr-1","decision":"approve"}')
+        h.feed(b'{"kind":"approval_answer","approval_id":"apr-1","decision":"approve","request_id":"perm-1"}')
         docs = h.finish()
         self.assertEqual(docs[0]["code"], "no_pending_request")
 

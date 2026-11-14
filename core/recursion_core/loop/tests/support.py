@@ -3,7 +3,6 @@ provider streams, and a collector for the loop's output lines. No test here reac
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import queue
@@ -56,11 +55,36 @@ def context(ws: Workspace, scrub=lambda s: s, cancel: b.CancelToken | None = Non
     return ToolContext(ws, cancel or b.CancelToken(), scrub)
 
 
+class _Stream:
+    """A text sink another thread can read while the loop writes (no GIL on free-threaded 3.14). ``on_line``,
+    if set, is called with each parsed line after it is stored."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._parts: list[str] = []
+        self.on_line = None
+
+    def write(self, text: str) -> int:
+        with self._lock:
+            self._parts.append(text)
+        if self.on_line is not None:
+            for line in text.splitlines():
+                self.on_line(json.loads(line))
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> str:
+        with self._lock:
+            return "".join(self._parts)
+
+
 class Lines:
     """Collects what a Writer writes, as parsed objects."""
 
     def __init__(self, secrets=()) -> None:
-        self.buffer = io.StringIO()
+        self.buffer = _Stream()
         self.redactor = p.Redactor(secrets)
         self.writer = p.Writer(self.buffer, self.redactor)
 

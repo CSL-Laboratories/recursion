@@ -582,8 +582,9 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
             elif happening == "written" and event is not None:
                 if event["type"] != "steer.sent":
                     return f"step {number}: a write into a turn is a steer.sent event"
+                # Every identity the event carries reaches the rule: its item and delivery, and its log, run and turn.
                 facts = {"delivery_id": event["payload"]["delivery_id"], "item_id": event["payload"]["item_id"],
-                         "turn_id": event["turn_id"]}
+                         "session_id": event["session_id"], "run_id": event["run_id"], "turn_id": event["turn_id"]}
             before = _exact([model.item, model.binding, model.written])
             try:
                 model.step(happening, facts)

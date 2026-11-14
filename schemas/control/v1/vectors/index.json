@@ -492,6 +492,11 @@
       "shows": "A plugin's effect. Another plugin's effect, or one bound to another run, cannot take its place; a change of its content can, and raises the revision. A plugin's effect has no pending request of an engine, so the daemon keeps no binding for it and none is offered: it is carried out once against its approval, revision and digest."
     },
     {
+      "file": "approval.lifecycle/s17-a-proposed-effect-is-an-effect-before-it-is-compared-with-the-target.json",
+      "rule": "approval.lifecycle",
+      "shows": "A proposed effect must first have the shape of an effect of the request's own source. Each of these is refused as 'effect' and leaves the record, its revision and its digest as they were: a negative amount, a currency in lower case, a kind that is not a kind, an empty connection, a scope whose account is empty, a member a plugin's effect does not have, an effect with no run, and an engine's call. Only what is an effect is compared with the target it would replace: the last one is well made and bound to another run, and it is 'target'. (Until the fourth read the negative amount was committed at revision 2, and could be approved and carried out.)"
+    },
+    {
       "file": "transcript.projection/g01-a-log-and-its-lines.json",
       "rule": "transcript.projection",
       "shows": "Seven events of one log and the seven lines of its transcript: each line's seq, time, type, source, trust and state are its event's, and so is its text where the text is the event's own. The sentences, what is announced and where input goes are the renderer's."
@@ -574,7 +579,7 @@
     {
       "file": "queue.delivery/d09-an-acceptance-is-checked-against-the-binding-member-by-member.json",
       "rule": "queue.delivery",
-      "shows": "Only an acceptance that agrees with the committed binding in every member makes the item delivered. Each of these is refused and changes nothing: another turn, another log, another run, the other 'how', another delivery. And there is at most one write for one binding."
+      "shows": "Only an acceptance that agrees with the committed binding in every member makes the item delivered. Each of these is refused and changes nothing: another turn, another log, another run, the other 'how', another delivery. A write that is logged belongs to the same binding: a steer.sent of another turn, another item, another log or another run is not its write. And there is at most one write for one binding."
     },
     {
       "file": "queue.delivery/d10-a-restart-leaves-a-queued-item-queued.json",
@@ -604,7 +609,7 @@
     {
       "file": "task.derivation/t01-turn-working.json",
       "rule": "task.derivation",
-      "shows": "A turn in progress. created_at is the time of the event that establishes the turn's creation: its first state.changed, seen as it was made (reason commit), in a log that is whole up to it. updated_at is the time of its latest state.changed. Both are times the core logged."
+      "shows": "A turn in progress. updated_at is the time of its latest state.changed, a time the core logged. created_at is null: the turn's first state.changed is an observation of the record as it was committed, and nothing of this version says when the turn was made."
     },
     {
       "file": "task.derivation/t02-turn-waiting-for-an-approval.json",
@@ -662,9 +667,9 @@
       "shows": "A run that is being started: working. Its log holds one event so far, a snapshot: updated_at is that event's time and created_at is null."
     },
     {
-      "file": "task.derivation/r29-run-whose-creation-the-log-saw.json",
+      "file": "task.derivation/r29-run-whose-first-record-is-a-commit.json",
       "rule": "task.derivation",
-      "shows": "A run made after logging began. Its first record is the commit that made it (reason commit, at position 1, nothing missing before it): that event establishes its creation, and created_at is its time."
+      "shows": "A run made after logging began. Its first record is a commit, at position 1, with nothing missing before it. That is the first image the log observed, written when the core wrote the event, and one observation can stand for several steps of a record. It does not say when the run was made: created_at is null."
     },
     {
       "file": "task.derivation/r30-run-first-seen-by-a-scan.json",
@@ -749,7 +754,7 @@
     {
       "file": "task.derivation/r28-run-with-a-gap-after-its-first-event.json",
       "rule": "task.derivation",
-      "shows": "A gap later in the log does not hide the origin: the run's first record is the commit that made it, nothing is missing before it, and created_at is its time."
+      "shows": "A gap later in the log changes nothing about the origin, which the log does not establish in any case: created_at is null. updated_at is the time of the latest state.changed that is retained."
     },
     {
       "file": "task.derivation/t31-turn-that-existed-when-logging-began.json",
@@ -759,12 +764,17 @@
     {
       "file": "task.derivation/t32-turn-whose-first-event-is-not-its-first-record.json",
       "rule": "task.derivation",
-      "shows": "The first events filed under this turn are the engine's acceptance and the turn's start; its record is first logged after them, as it was made. The creation is that first record, not the first event that names the turn."
+      "shows": "The first events filed under this turn are the engine's acceptance and the turn's start; its record is first logged after them. Neither the first event that names the turn nor its first record says when the turn was made: created_at is null."
     },
     {
       "file": "task.derivation/t33-turn-behind-a-gap-of-one-position.json",
       "rule": "task.derivation",
       "shows": "A gap that stands for one position: the numbers a reader sees have no hole, 1, 2, 3, and the event the gap stands for may have been this turn's first record. created_at is null."
+    },
+    {
+      "file": "task.derivation/r34-run-first-observed-when-it-was-already-running.json",
+      "rule": "task.derivation",
+      "shows": "One observation can stand for several steps of a record. This log's first image of the run, a commit at position 1, already says running: the run's start was never observed on its own, and the time of the event is when the core wrote it. created_at is null."
     },
     {
       "file": "task.derivation/x09-a-creation-time-taken-from-a-tail.json",
@@ -784,7 +794,17 @@
     {
       "file": "task.derivation/x13-the-first-event-of-a-turn-given-as-its-creation.json",
       "rule": "task.derivation",
-      "shows": "The Task gives the time of the first event filed under the turn, an acceptance, where the turn's creation is its first record."
+      "shows": "The Task gives the time of the first event filed under the turn, an acceptance, as its creation. Nothing in the log establishes when the turn was made."
+    },
+    {
+      "file": "task.derivation/x14-a-first-commit-given-as-the-creation.json",
+      "rule": "task.derivation",
+      "shows": "The Task of a run whose first record is a commit gives that event's time as its creation. A first commit is an observation of a committed image: the record may have been made, and changed, before the log looked. (Until the fourth read the rule itself did this.)"
+    },
+    {
+      "file": "task.derivation/x15-a-coalesced-first-observation-given-as-the-creation.json",
+      "rule": "task.derivation",
+      "shows": "The same log, and a Task that gives the time of that first observation as the run's creation: a time later than the start it claims to be."
     },
     {
       "file": "task.derivation/x10-a-pending-stop-with-no-stop-record-not-flagged.json",
@@ -1034,7 +1054,7 @@
     {
       "file": "event.page/g07-a-read-that-names-no-projection.json",
       "rule": "event.page",
-      "shows": "A read that names no projection asks for raw, the events as they were logged: that is the one default, and this is its answer."
+      "shows": "A read that names no projection is answered with the transcript, the lines and not the events: that is the one default, and this is its answer."
     },
     {
       "file": "event.page/x12-a-transcript-page-for-a-read-that-asked-raw.json",
@@ -1047,9 +1067,9 @@
       "shows": "The other way round."
     },
     {
-      "file": "event.page/x14-a-transcript-page-for-a-read-that-names-no-projection.json",
+      "file": "event.page/x14-a-raw-page-for-a-read-that-names-no-projection.json",
       "rule": "event.page",
-      "shows": "A read that names no projection is answered raw, never with lines."
+      "shows": "A read that names no projection is answered with the transcript. The events themselves, with their whole payloads, are given only to a read that asks for raw."
     },
     {
       "file": "event.page/g08-a-transcript-page-and-the-raw-page-it-was-made-from.json",

@@ -12,8 +12,9 @@ that passes. From `1.0` on, a schema changes only by adding.
 Nothing here adds behaviour to the daemon. The drafts describe what the daemon answers today (the
 run records, the six methods it has) and what the lanes that are about to start will write.
 
-**The hosted gate does not check these files.** The checks in `conformance/` run where someone runs
-them (see "Checking the fixtures").
+**The hosted gate collects these checks through `tools/test_wire_conformance.py` when it runs; this
+draft has no hosted conformance result.** Until it has one, the checks in `conformance/` have run only
+where someone ran them (see "Checking the fixtures").
 
 ## What is in this folder
 
@@ -84,12 +85,13 @@ the bad fixtures show both.
 - **A Task is derived, never stored.** It comes from a turn of a session, or from a run that was
   started with no session, and says which (`source`). Its times are the times the core logged. A run
   with no session is not given one to make its Task. `conformance/rules.py` states the derivation and
-  `vectors/task.derivation/` holds a case for every state of each source. Its `created_at` is the
-  time of the event that establishes the creation of the run or the turn: its first `state.changed`,
-  when the log saw it as it was made (reason `commit`) and is whole up to it. A snapshot of something
-  that already existed, a record a later scan found, a retained tail and a gap establish no creation,
-  and `created_at` is then null. A run of today's daemon existed before logging began, so its Task has
-  none.
+  `vectors/task.derivation/` holds a case for every state of each source. Its `created_at` is null
+  in this version, for every Task. A first `state.changed`, also one with reason `commit` at the first
+  position of a whole log, is an observation of a record as it was committed: one observation can
+  stand for several steps, and its time is when the core wrote the event. A creation time needs
+  retained creation metadata, or an event whose producer writes it as part of creating the run or
+  the turn, and this version has neither. `updated_at` is the time of the latest `state.changed`
+  that is retained.
 - **A queued message is delivered when the engine says so, and only then.** In one commit, BEFORE it
   writes anything toward the engine, the daemon stores the item as `delivering`, a delivery id that
   is never used again, and the full target BINDING: the item, the log, the run, the worker's
@@ -114,8 +116,10 @@ the bad fixtures show both.
   read uses epoch 1 and seq 0; an older epoch reads on and the answer says the epoch advanced; a
   cursor from a future epoch, or past the end of its log, is refused. A client keeps one cursor for
   each log: the cursor is the only thing a read names. The answer is in the projection the request
-  asked for, `raw` when it names none; a transcript page is made only from a raw page that is itself
-  a right answer to the cursor, because a line carries neither its log nor where a gap starts.
+  asked for, and the `transcript` when it names none: the events themselves, with their whole
+  payloads, are given only to a read that asks for `raw`. A transcript page is made only from a raw
+  page that is itself a right answer to the cursor, because a line carries neither its log nor where
+  a gap starts.
 - **A timestamp is a moment that exists.** The pattern of a timestamp cannot say that February has
   no 31st, so the schemas mark every such field with the keyword `x-instant`, which the conformance
   client checks. A validator that does not know the keyword ignores it and must make that check itself.

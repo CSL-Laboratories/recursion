@@ -10,8 +10,8 @@
   },
   "answer": {
     "code": "ok",
-    "projection": "raw",
-    "events": [],
+    "projection": "transcript",
+    "lines": [],
     "more": false,
     "epoch_advanced": false,
     "timed_out": true

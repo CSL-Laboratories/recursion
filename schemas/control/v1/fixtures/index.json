@@ -4337,7 +4337,7 @@
     {
       "file": "good/mcp.task.v1/h01-turn-working.json",
       "schema": "mcp.task.v1.json",
-      "shows": "A turn in progress. created_at is the time of the event that establishes the turn's creation: its first state.changed, seen as it was made (reason commit), in a log that is whole up to it. updated_at is the time of its latest state.changed. Both are times the core logged."
+      "shows": "A turn in progress. updated_at is the time of its latest state.changed, a time the core logged. created_at is null: the turn's first state.changed is an observation of the record as it was committed, and nothing of this version says when the turn was made."
     },
     {
       "file": "good/mcp.task.v1/h02-turn-waiting-for-an-approval.json",
@@ -4472,12 +4472,12 @@
     {
       "file": "good/mcp.task.v1/h28-run-with-a-gap-after-its-first-event.json",
       "schema": "mcp.task.v1.json",
-      "shows": "A gap later in the log does not hide the origin: the run's first record is the commit that made it, nothing is missing before it, and created_at is its time."
+      "shows": "A gap later in the log changes nothing about the origin, which the log does not establish in any case: created_at is null. updated_at is the time of the latest state.changed that is retained."
     },
     {
-      "file": "good/mcp.task.v1/h29-run-whose-creation-the-log-saw.json",
+      "file": "good/mcp.task.v1/h29-run-whose-first-record-is-a-commit.json",
       "schema": "mcp.task.v1.json",
-      "shows": "A run made after logging began. Its first record is the commit that made it (reason commit, at position 1, nothing missing before it): that event establishes its creation, and created_at is its time."
+      "shows": "A run made after logging began. Its first record is a commit, at position 1, with nothing missing before it. That is the first image the log observed, written when the core wrote the event, and one observation can stand for several steps of a record. It does not say when the run was made: created_at is null."
     },
     {
       "file": "good/mcp.task.v1/h30-run-first-seen-by-a-scan.json",
@@ -4492,12 +4492,17 @@
     {
       "file": "good/mcp.task.v1/h32-turn-whose-first-event-is-not-its-first-record.json",
       "schema": "mcp.task.v1.json",
-      "shows": "The first events filed under this turn are the engine's acceptance and the turn's start; its record is first logged after them, as it was made. The creation is that first record, not the first event that names the turn."
+      "shows": "The first events filed under this turn are the engine's acceptance and the turn's start; its record is first logged after them. Neither the first event that names the turn nor its first record says when the turn was made: created_at is null."
     },
     {
       "file": "good/mcp.task.v1/h33-turn-behind-a-gap-of-one-position.json",
       "schema": "mcp.task.v1.json",
       "shows": "A gap that stands for one position: the numbers a reader sees have no hole, 1, 2, 3, and the event the gap stands for may have been this turn's first record. created_at is null."
+    },
+    {
+      "file": "good/mcp.task.v1/h34-run-first-observed-when-it-was-already-running.json",
+      "schema": "mcp.task.v1.json",
+      "shows": "One observation can stand for several steps of a record. This log's first image of the run, a commit at position 1, already says running: the run's start was never observed on its own, and the time of the event is when the core wrote it. created_at is null."
     },
     {
       "file": "bad/mcp.task.v1/b01-completed-without-a-result.json",
@@ -5017,7 +5022,7 @@
     {
       "file": "good/methods.v1/h12-events-follow-that-timed-out.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "shows": "events.follow is given the cursor the last read returned, waited, and nothing new arrived: an empty page, the same cursor, timed_out true."
+      "shows": "events.follow is given the cursor the last read returned, waited, and nothing new arrived: an empty page, the same cursor, timed_out true. The request names no projection, so the page is a transcript page: lines, of which there are none."
     },
     {
       "file": "good/methods.v1/h13-session-stop-of-a-subtree-still-pending.json",
@@ -5313,6 +5318,11 @@
       "file": "good/methods.v1/h76-a-session-read-asked-of-a-daemon-that-is-closing.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "A method whose row names no service, asked of a daemon that is closing: 'unavailable', daemon_closing. It could not say service_starting."
+    },
+    {
+      "file": "good/methods.v1/h77-events-follow-asked-raw.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.follow with projection 'raw' returns the events themselves, with their whole payloads: a caller that wants them says so."
     },
     {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",

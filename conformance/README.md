@@ -37,8 +37,11 @@ Three files:
   what a transcript line must carry because its event says so, what each thing that happens to a
   queued message does to it against the binding committed before the write, the Task of a run and of
   a turn, the identity of a start request, reading a log from a cursor in the projection that was
-  asked for, and the digests an event carries. A client in another language implements these and
-  checks the same vectors.
+  asked for, and the digests an event carries. It also reads the published schemas themselves with
+  the standard library (`fits`), because complete validation of an approval is its published shape
+  as well as what must agree inside it: a change and a consumption check both, and `fits` says what
+  the Draft 2020-12 validator says on every fixture of the control folder. A client in another
+  language implements these and checks the same vectors.
 - `tests.py`: all of it as tests. Its class `RulesTest` holds what a vector file cannot: the host's
   own state around a rule (the Decimal context a number is read under), a record changed behind a
   model's back, a request the method table would not let into an exchange. A client in another
@@ -81,7 +84,7 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
 - a start request stores exactly the `start_key` its vector gives, from exactly the preimage its
   vector gives; a cursor is answered as its vector says; a page has exactly the faults its vector
   lists against the request it was asked with (its cursor, and the projection it asked for, which is
-  `raw` when it names none), and so has no fault in any good exchange, where the same page under
+  the `transcript` when it names none), and so has no fault in any good exchange, where the same page under
   the other projection is caught; a transcript page that carries the raw page of the same read is
   the projection of a raw page that is itself right;
 - in an approval vector records are compared exactly (1 is not 1.0 and 0 is not -0.0), a refused step

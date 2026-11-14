@@ -707,6 +707,145 @@ class RulesTest(unittest.TestCase):
         model.consume(model.record["revision"], model.record["digest"], kept)
         self.assertEqual(model.record["state"], "consumed")
 
+    def test_a_record_that_is_not_the_shape_of_an_approval_is_never_carried_out(self):
+        """Complete validation is the published shape as well as what must agree inside the record. Each of
+        these records agrees with itself in everything ``approval_problems`` looks at and is not an approval:
+        approved and saying deny, with no answerer, with no answer time, in a form of lines this version
+        does not have. None is carried out, also after a restart, and the record, the binding and the
+        receipts stay as they were. (Until the fourth read each was.)"""
+        rules = self.rules
+
+        def says_deny(record):
+            record["answer"] = "deny"
+
+        def has_no_answerer(record):
+            record["answered_by"] = None
+
+        def has_no_answer_time(record):
+            record["answered_at"] = None
+
+        def is_in_another_form(record):
+            record["rendered_form"] = "csl-approval-lines/v9"
+
+        for spoil in (says_deny, has_no_answerer, has_no_answer_time, is_in_another_form):
+            model, kept = self.approved()
+            spoil(model.record)
+            before = (client._exact(model.record), client._exact(model.binding), copy.deepcopy(model.receipts))
+            with self.subTest(record=spoil.__name__):
+                self.assertEqual(rules.approval_problems(model.record), [], "nothing INSIDE the record disagrees")
+                self.assertFalse(rules.fits("approval.v1.json", model.record))
+                self.refused("record_invalid", model.consume, model.record["revision"], model.record["digest"], kept)
+                again = rules.ApprovalModel(model.record, model.binding, model.receipts)
+                self.refused("record_invalid", again.consume, again.record["revision"], again.record["digest"], kept)
+                self.assertEqual((client._exact(model.record), client._exact(model.binding), model.receipts), before)
+
+    def test_a_binding_that_is_not_the_shape_of_a_binding_is_a_mismatch(self):
+        """The binding kept and the binding offered are equal and name this approval, this run and this engine,
+        and they are not a binding: a member is missing, is of another type, or is a time that does not exist."""
+        for member, value in (("engine_request_id", ...), ("engine_request_id", 7), ("bound_at", ...),
+                              ("bound_at", "2026-02-31T07:34:30.000Z"), ("left_over", "x")):
+            model, kept = self.approved()
+            for held in (kept, model.binding):
+                if value is ...:
+                    del held[member]
+                else:
+                    held[member] = value
+            with self.subTest(member=member, value=value):
+                self.assertEqual(model.binding, kept)
+                self.assertFalse(self.rules.fits("approval.v1.json#/$defs/binding", kept))
+                self.refused("binding_mismatch", model.consume, 1, model.record["digest"], kept)
+                self.assertEqual(model.record["state"], "approved")
+
+    def test_the_model_owns_what_it_keeps(self):
+        """A caller's own object, changed after the call returned, changes nothing the model keeps: not who a
+        request was shown to, not who answered it, and not a receipt it was restored with."""
+        rules = self.rules
+        found = self.vector("approval.lifecycle/s07-*.json")
+        model = rules.ApprovalModel(found["record"], found["binding"])
+        record = model.record
+        opens = {"command_id": "t.1", "approval_id": record["approval_id"], "surface": "tui"}
+        answers = {"command_id": "t.2", "approval_id": record["approval_id"], "surface": "tui",
+                   "expected_revision": record["revision"], "digest": record["digest"], "answer": "approve"}
+        who = dict(self.OWNER)
+        self.assertEqual(model.call(who, "approval.open", opens, record["requested_at"])["code"], "ok")
+        who["id"] = "someone-else"
+        self.assertEqual(model.record["opened_by"][-1]["principal"], self.OWNER, "the opening is the model's own")
+        who = dict(self.OWNER)
+        self.assertEqual(model.call(who, "approval.answer", answers, record["requested_at"])["code"], "ok")
+        who["id"] = "someone-else"
+        self.assertEqual(model.record["answered_by"], self.OWNER, "so is the answerer")
+        receipts = copy.deepcopy(model.receipts)
+        restored = rules.ApprovalModel(model.record, model.binding, receipts)
+        for _, kept_answer in receipts.values():
+            kept_answer["code"] = "changed-later"
+            kept_answer["approval"]["state"] = "denied"
+        replay = restored.call(self.OWNER, "approval.answer", answers, record["requested_at"])
+        self.assertEqual((replay["code"], replay["approval"]["state"]), ("ok", "approved"), "and so is a restored receipt")
+
+    def test_the_reader_of_shapes_agrees_with_the_validator_on_every_fixture(self):
+        """``rules.fits`` reads the published schemas with the standard library only. On every fixture of this
+        folder, good and bad, it says what the Draft 2020-12 validator says of the same value."""
+        said = {True: 0, False: 0}
+        for entry in client.load_index(self.folder):
+            instance = client.read_json(self.folder / "fixtures" / entry["file"])
+            theirs = not client.error_objects(self.schemas.validator(entry["schema"]), instance)
+            with self.subTest(fixture=entry["file"]):
+                self.assertEqual(self.rules.fits(entry["schema"], instance, self.schemas.schemas), theirs)
+            said[theirs] += 1
+        self.assertGreater(said[True], 300, "fixtures that fit")
+        self.assertGreater(said[False], 1000, "fixtures that do not")
+        # A rule it does not know is never passed over as if it were not there.
+        with self.assertRaises(ValueError):
+            self.rules.fits("x.json", {}, {"x.json": {"propertyNames": {"maxLength": 3}}})
+
+    def test_the_reader_of_shapes_knows_each_keyword_the_published_files_use(self):
+        """One keyword at a time, away from the fixtures: a value the rule takes and one it refuses. A keyword
+        that speaks of one type of value says nothing of a value of another type, as the dialect has it."""
+        cases = {
+            "type": ({"type": "integer"}, [3, 3.0], [True, "3", 3.5, None]),
+            "type, several": ({"type": ["string", "null"]}, ["a", None], [1, [], {}]),
+            "type number": ({"type": "number"}, [1, 1.5], [True, "1"]),
+            "enum": ({"enum": ["a", 1, None]}, ["a", 1, 1.0, None], ["b", True, 2]),
+            "const": ({"const": True}, [True], [1, "true"]),
+            "allOf": ({"allOf": [{"type": "string"}, {"minLength": 2}]}, ["ab"], ["a", 12]),
+            "anyOf": ({"anyOf": [{"type": "string"}, {"type": "null"}]}, ["a", None], [1]),
+            "oneOf": ({"oneOf": [{"type": "integer"}, {"minimum": 5}]}, [3, 5.5, "x"], [7, 2.5]),
+            "not": ({"not": {"const": "service_starting"}}, ["daemon_closing", 1], ["service_starting"]),
+            "if, then": ({"if": {"const": 1}, "then": {"type": "string"}}, [2, "a"], [1]),
+            "if, else": ({"if": {"type": "string"}, "then": {"minLength": 1}, "else": {"type": "null"}}, ["a", None], ["", 1]),
+            "minLength": ({"minLength": 2}, ["ab", 1], ["a"]),
+            "maxLength": ({"maxLength": 2}, ["ab", 123], ["abc"]),
+            "pattern": ({"pattern": "^run-[0-9a-f]{4}$"}, ["run-00ff", 7], ["run-00fg", "xrun-00ff"]),
+            "pattern, anywhere in the text": ({"pattern": "[0-9]"}, ["a1b"], ["ab"]),
+            "x-instant": ({"x-instant": True}, ["2026-11-13T07:34:30.000Z", 7], ["2026-02-31T07:34:30.000Z"]),
+            "minimum": ({"minimum": 0}, [0, 2.5, "x"], [-1, -0.5]),
+            "maximum": ({"maximum": 9}, [9, "x"], [10]),
+            "exclusiveMinimum": ({"exclusiveMinimum": 0}, [1, 0.1], [0, -1]),
+            "minItems": ({"minItems": 1}, [[1], "x"], [[]]),
+            "maxItems": ({"maxItems": 1}, [[1], []], [[1, 2]]),
+            "uniqueItems": ({"uniqueItems": True}, [[1, "1", True], []], [[1, 1.0], [{"a": 1}, {"a": 1}]]),
+            "items": ({"items": {"type": "string"}}, [["a"], [], "x"], [["a", 1]]),
+            "required": ({"required": ["a"]}, [{"a": None}, 7], [{"b": 1}]),
+            "properties": ({"properties": {"a": {"type": "string"}}}, [{"a": "x"}, {"b": 1}], [{"a": 1}]),
+            "additionalProperties": ({"properties": {"a": {}}, "additionalProperties": False}, [{"a": 1}, {}], [{"a": 1, "b": 2}]),
+            "additionalProperties, a schema": ({"additionalProperties": {"type": "integer"}}, [{"a": 1}], [{"a": "x"}]),
+            "dependentRequired": ({"dependentRequired": {"launch": ["principal"]}}, [{"launch": 1, "principal": 2}, {"principal": 2}],
+                                  [{"launch": 1}]),
+            "$ref, in the file": ({"$ref": "#/$defs/word", "$defs": {"word": {"type": "string"}}}, ["a"], [1]),
+            "$ref, to another file": ({"$ref": "other.json#/$defs/id"}, ["id-1"], ["1"]),
+            "a schema that is true": (True, [1, None], []),
+            "a schema that is false": (False, [], [1, None]),
+        }
+        other = {"$defs": {"id": {"type": "string", "pattern": "^id-"}}}
+        for keyword, (schema, takes, refuses) in cases.items():
+            schemas = {"x.json": {"$defs": {"x": schema}} if isinstance(schema, bool) else schema, "other.json": other}
+            ref = "x.json#/$defs/x" if isinstance(schema, bool) else "x.json"
+            for value, verdict in [(value, True) for value in takes] + [(value, False) for value in refuses]:
+                with self.subTest(keyword=keyword, value=value):
+                    self.assertIs(self.rules.fits(ref, value, schemas), verdict)
+                    if "another file" not in keyword:       # and the table itself is what the dialect's validator says
+                        self.assertIs(client.Validator(schema).is_valid(value), verdict, "the case is wrong")
+
     # ---- the private binding
     def test_each_member_of_the_binding_is_compared_with_the_approval_it_is_used_against(self):
         """The binding that is KEPT names another approval, another run or another engine, and the same
@@ -766,12 +905,16 @@ class RulesTest(unittest.TestCase):
         too_many = dict(effect, input={"f%03d" % n: n for n in range(194)})
         changes = {"nothing_to_change": {}, "effect": {"effect": "rm -rf /"}, "timestamp": {"expires_at": "2026-11-13T07:49:60.000Z"},
                    "too_many_lines": {"effect": too_many}}
+        # A proposed effect is first held to the shape of an effect of the request's own source ('effect'). Only
+        # one that is such an effect is compared with the target it would replace ('target').
         targets = [dict(effect, run_id="run-" + "0" * 32), dict(effect, session_id="ses-" + "0" * 16), dict(effect, session_id=None),
-                   dict(effect, engine="codex"), dict(effect, kind="plugin_effect"), plugin,
-                   {key: value for key, value in effect.items() if key != "run_id"}]
+                   dict(effect, engine="codex")]
+        misshapen = [dict(effect, kind="plugin_effect"), plugin, {key: value for key, value in effect.items() if key != "run_id"},
+                     {key: value for key, value in effect.items() if key != "cwd"}, dict(effect, run_id="another run"),
+                     dict(effect, engine="")]
         cases = list(changes.items()) + [("target", {"effect": target}) for target in targets] \
-            + [("effect", {"effect": {key: value for key, value in effect.items() if key != "cwd"}}),
-               # A good new effect and a bad deadline in ONE change: the effect must not have been written first.
+            + [("effect", {"effect": other}) for other in misshapen] \
+            + [  # A good new effect and a bad deadline in ONE change: the effect must not have been written first.
                ("timestamp", {"effect": dict(effect, input={"command": "make"}), "expires_at": "tomorrow"})]
         for code, change in cases:
             model = rules.ApprovalModel(found["record"], found["binding"])
@@ -786,6 +929,12 @@ class RulesTest(unittest.TestCase):
         model.record["run_id"] = "run-" + "0" * 32
         before = client._exact(model.record)
         self.refused("envelope", model.change, expires_at="2026-11-13T08:10:00.000Z")
+        self.assertEqual(client._exact(model.record), before)
+        # Nor can a request that is not the shape of an approval: a pending one that already carries an answer.
+        model = rules.ApprovalModel(found["record"], found["binding"])
+        model.record["answer"] = "deny"
+        before = client._exact(model.record)
+        self.refused("record_invalid", model.change, expires_at="2026-11-13T08:10:00.000Z")
         self.assertEqual(client._exact(model.record), before)
         model = rules.ApprovalModel(found["record"], found["binding"])
         model.record["state"] = "approved"

@@ -11,7 +11,7 @@
   "answer": {
     "code": "ok",
     "projection": "x-nobody-defined-this",
-    "events": [],
+    "lines": [],
     "cursor": {
       "epoch": 3,
       "session_id": "ses-7f3a9c2e51d04b6a",

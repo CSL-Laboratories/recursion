@@ -4,8 +4,9 @@
     "cursor": {
       "epoch": 3,
       "session_id": "ses-7f3a9c2e51d04b6a",
-      "seq": 42
+      "seq": 41
     },
+    "projection": "raw",
     "wait_ms": 20000
   },
   "answer": {
@@ -18,6 +19,6 @@
     },
     "more": false,
     "epoch_advanced": false,
-    "timed_out": true
+    "timed_out": false
   }
 }

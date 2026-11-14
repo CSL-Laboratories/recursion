@@ -21,6 +21,7 @@ What is here:
 * ``effect_bytes`` and ``digest_of``: the bytes an approval's digest is taken over, by ``digest_form``.
 * ``approval_lines``: the lines every surface prints for an approval (``csl-approval-lines/v0``).
 * ``approval_problems``: what does not agree inside one approval record.
+* ``fits``: whether a value has the shape a published schema gives it, read with the standard library.
 * ``transcript_fields`` and ``transcript_problems``: what a transcript line must carry because its
   event says so.
 * ``DeliveryModel``: what happens to a queued message, one happening at a time, against the binding that
@@ -40,6 +41,8 @@ import decimal
 import datetime
 import hashlib
 import json
+import re
+from pathlib import Path
 
 MAX_INT = 2**53 - 1          # the largest whole number every binary64 reader keeps exact
 MAX_DEPTH = 64               # of a tool's input
@@ -525,6 +528,140 @@ def approval_problems(record: dict) -> list:
     return problems
 
 
+# ----------------------------------------------------------------------------- the shape of a record
+PUBLISHED = Path(__file__).resolve().parent.parent / "schemas" / "control" / "v1"
+_READ: dict = {}
+_NOT_RULES = ("$schema", "$id", "$defs", "title", "description", "x-version", "then", "else")
+
+
+def published() -> dict:
+    """The schemas of the published folder beside this file, by file name. Read once."""
+    if not _READ:
+        for file in sorted(PUBLISHED.glob("*.json")):
+            schema = json.loads(file.read_text(encoding="utf-8"))
+            if isinstance(schema, dict) and "$schema" in schema:
+                _READ[file.name] = schema
+    return _READ
+
+
+def _kind(value) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "integer" if value.is_integer() else "number"    # as the dialect has it: 1.0 is an integer
+    return {str: "string", list: "array", dict: "object"}.get(type(value), "none")
+
+
+def _same(one, other) -> bool:
+    """Equal as JSON values: true is not 1, and 1 is 1.0."""
+    if isinstance(one, bool) or isinstance(other, bool):
+        return isinstance(one, bool) and isinstance(other, bool) and one == other
+    if isinstance(one, (int, float)) and isinstance(other, (int, float)):
+        return one == other
+    if type(one) is not type(other):
+        return False
+    if isinstance(one, list):
+        return len(one) == len(other) and all(_same(a, b) for a, b in zip(one, other))
+    if isinstance(one, dict):
+        return one.keys() == other.keys() and all(_same(item, other[key]) for key, item in one.items())
+    return one == other
+
+
+def _fits(schemas: dict, base: str, schema, value) -> bool:
+    if isinstance(schema, bool):
+        return schema
+    text, number = isinstance(value, str), isinstance(value, (int, float)) and not isinstance(value, bool)
+    array, record = isinstance(value, list), isinstance(value, dict)
+    for keyword, want in schema.items():
+        if keyword in _NOT_RULES:
+            continue
+        if keyword == "$ref":
+            name, _, pointer = want.partition("#")
+            name, node = name or base, schemas[name or base]
+            for part in pointer.split("/")[1:]:
+                node = node[part.replace("~1", "/").replace("~0", "~")]
+            ok = _fits(schemas, name, node, value)
+        elif keyword == "type":
+            wanted = want if isinstance(want, list) else [want]
+            ok = _kind(value) in wanted or (number and "number" in wanted)
+        elif keyword == "enum":
+            ok = any(_same(value, item) for item in want)
+        elif keyword == "const":
+            ok = _same(value, want)
+        elif keyword == "allOf":
+            ok = all(_fits(schemas, base, part, value) for part in want)
+        elif keyword == "anyOf":
+            ok = any(_fits(schemas, base, part, value) for part in want)
+        elif keyword == "oneOf":
+            ok = sum(1 for part in want if _fits(schemas, base, part, value)) == 1
+        elif keyword == "not":
+            ok = not _fits(schemas, base, want, value)
+        elif keyword == "if":
+            ok = _fits(schemas, base, schema.get("then" if _fits(schemas, base, want, value) else "else", True), value)
+        elif keyword == "minLength":
+            ok = not text or len(value) >= want
+        elif keyword == "maxLength":
+            ok = not text or len(value) <= want
+        elif keyword == "pattern":
+            ok = not text or re.search(want, value) is not None
+        elif keyword == "x-instant":
+            ok = True
+            if want and text:
+                try:
+                    milliseconds(value)
+                except Refused:
+                    ok = False
+        elif keyword == "minimum":
+            ok = not number or value >= want
+        elif keyword == "maximum":
+            ok = not number or value <= want
+        elif keyword == "exclusiveMinimum":
+            ok = not number or value > want
+        elif keyword == "minItems":
+            ok = not array or len(value) >= want
+        elif keyword == "maxItems":
+            ok = not array or len(value) <= want
+        elif keyword == "uniqueItems":
+            ok = not (want and array) or not any(_same(a, b) for i, a in enumerate(value) for b in value[:i])
+        elif keyword == "items":
+            ok = not array or all(_fits(schemas, base, want, item) for item in value)
+        elif keyword == "required":
+            ok = not record or all(name in value for name in want)
+        elif keyword == "properties":
+            ok = not record or all(_fits(schemas, base, part, value[name]) for name, part in want.items() if name in value)
+        elif keyword == "additionalProperties":
+            named = schema.get("properties", {})
+            ok = not record or all(_fits(schemas, base, want, item) for name, item in value.items() if name not in named)
+        elif keyword == "dependentRequired":
+            ok = not record or all(other in value for name, others in want.items() if name in value for other in others)
+        else:
+            raise ValueError(f"the schema uses {keyword!r}, which this reader does not know")
+        if not ok:
+            return False
+    return True
+
+
+def fits(ref: str, value, schemas: dict | None = None) -> bool:
+    """Whether ``value`` has the shape the published schema ``ref`` gives it (``"approval.v1.json"``, or a
+    definition inside a file: ``"approval.v1.json#/$defs/binding"``), read with the standard library only.
+
+    The functions above say what must AGREE inside a record. This says that the value is a record at all:
+    every member it must have and none it must not, each of its type, in its list of values, of its length,
+    and a timestamp that is a real instant. Complete validation is both. ``schemas`` is the published files
+    by name; left out, they are read from the folder beside this file.
+
+    The reader knows the keywords the published files use and refuses a schema that uses any other
+    (``ValueError``): a rule it does not know is never passed over as if it were not there.
+    """
+    schemas = published() if schemas is None else schemas
+    name, _, _ = ref.partition("#")
+    return _fits(schemas, name, {"$ref": ref}, value)
+
+
 # ------------------------------------------------------------------------------------ the transcript
 
 def milliseconds(timestamp: str) -> int:
@@ -644,11 +781,17 @@ class DeliveryModel:
     ``steer`` goes into the turn in progress (``mid_turn``) or, where the driver cannot take input in
     the middle of a turn, begins the next one (``new_turn``).
 
-    ``written`` (facts: delivery_id, and for a write into a turn in progress the turn). The write
-    returned. It changes nothing in the item: a crash before the write and a crash after it leave the
-    same ``delivering`` item. There is AT MOST ONE write for one binding: a second is refused
-    (``already_written``); one that names another delivery, another item or another turn, or names no
-    delivery at all, is ``delivery_mismatch``.
+    ``written`` (facts: delivery_id, and for a write into a turn in progress what its steer.sent event
+    carries: the item, the log, the run and the turn). The write returned. It changes nothing in the
+    item: a crash before the write and a crash after it leave the same ``delivering`` item. There is AT
+    MOST ONE write for one binding: a second is refused (``already_written``); one that names another
+    delivery, another item, another log, another run or another turn, or names no delivery at all, is
+    ``delivery_mismatch``. A structured steer.sent write observation belongs to the durable delivery
+    binding's item, delivery, log, run and target turn. Preserve every one of those identities when
+    adapting the event to the delivery rule. A mismatch is delivery_mismatch and changes neither the
+    item nor its binding nor the recorded write. A local write-return notification that carries only
+    delivery_id remains associated with its already-owned binding; it does not replace validation of a
+    structured event.
 
     ``accepted`` (facts: the acceptance as the engine's typed event carries it: delivery_id, session_id,
     run_id, turn_id, how). The core checks every one of them against the durable binding. All equal: the
@@ -677,7 +820,8 @@ class DeliveryModel:
     item: an edit that names neither field, a text that is not text or is empty, and a delivery that is
     not one of the two are refused (``edit``) and nothing changes, the revision included.
 
-    Every refusal leaves the item, the binding, the record of the write and the evidence as they were.
+    Every refusal leaves item, binding and write state unchanged; an acceptance refused after quarantine
+    is additionally retained as evidence.
     """
 
     def __init__(self, item: dict) -> None:
@@ -702,6 +846,8 @@ class DeliveryModel:
             if state != "delivering":
                 raise Refused("not_delivering")
             if (facts.get("delivery_id") != binding["delivery_id"] or facts.get("item_id", binding["item_id"]) != binding["item_id"]
+                    or facts.get("session_id", binding["session_id"]) != binding["session_id"]
+                    or facts.get("run_id", binding["run_id"]) != binding["run_id"]
                     or facts.get("turn_id", binding["target_turn_id"]) != binding["target_turn_id"]):
                 raise Refused("delivery_mismatch")
             if self.written:
@@ -745,9 +891,9 @@ class DeliveryModel:
 
 def _log_times(events: list, entity_id: str, of_turn: str | None = None) -> tuple:
     """created_at and updated_at of the Task of one entity (a run or a turn, named by its id: the ids of
-    the two kinds never coincide), from the log as it is retained: the time of the event that
-    establishes the entity's creation, and the time of the latest state.changed of the run or the turn;
-    each is null where the log holds no such event.
+    the two kinds never coincide), from the log as it is retained: created_at is null, because no event
+    of this version establishes a creation and its time (see below), and updated_at is the time of the
+    latest state.changed of the run or the turn, or null where the log holds none.
 
     Task created_at comes from retained creation metadata or an event that establishes creation of that
     entity. Position 1 and absence of an earlier replay.gap are retention checks, not proof of creation.
@@ -756,27 +902,20 @@ def _log_times(events: list, entity_id: str, of_turn: str | None = None) -> tupl
     retained fact establishes the origin, created_at is null. updated_at may still use a later retained
     state change.
 
-    THE EVENT THAT ESTABLISHES CREATION is the entity's FIRST state.changed in the log (its
-    ``entity_id`` names it) when its reason is ``commit``: the log saw the record as it was first made.
-    That event counts only where the log is whole up to it: the log begins at position 1, every
-    position up to the event is there, and no replay.gap stands before it, not even one that stands
-    for a single position. An event of another type filed under the run or the turn (an acceptance,
-    the turn's start, output) establishes nothing. No
-    record of this version carries creation metadata of its own in the timestamp form, so the log is
-    the only source here, and a Task whose origin the log does not establish says null.
+    A first state.changed with reason commit is an observation of a committed image, not by itself proof
+    of creation or of its time. Coalesced or sampled observations, including coalesced null, cannot
+    supply created_at from the event's write time. Use retained creation metadata or an event whose
+    producer establishes creation and its timestamp as part of creating that entity. With no such
+    retained fact, created_at is null. A continuous prefix and reason commit do not replace this
+    requirement; updated_at may still use the retained observation time.
+
+    No record of this version carries creation metadata of its own in the timestamp form, and no event
+    type of this version is written by its producer as part of creating a run or a turn. So created_at
+    is null for every Task here, whatever the log holds, until a later version gives one of the two.
     """
     mine = [event for event in events if of_turn is None or event.get("turn_id") == of_turn]
     changed = [event["time"] for event in mine if event["type"] == "state.changed"]
-    created = None
-    for position, event in enumerate(events, 1):
-        if event.get("seq") != position or event["type"] == "replay.gap":
-            break                       # a retained tail, a hole, or a gap: whatever follows proves no origin
-        payload = event["payload"]
-        if event["type"] == "state.changed" and payload.get("entity_id") == entity_id:
-            if payload.get("reason") == "commit":
-                created = event["time"]
-            break                       # the first image decides: a snapshot or a reconcile is not a creation
-    return created, (changed[-1] if changed else None)
+    return None, (changed[-1] if changed else None)
 
 
 def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) -> dict:
@@ -865,6 +1004,8 @@ def task_problems(wanted: dict, task: dict) -> list:
 # ------------------------------------------------------------------- approval.open and approval.answer
 # The members of an effect that say WHOSE effect it is and what it is bound to. A change of content keeps them.
 TARGET_MEMBERS = {"engine_tool": ("kind", "engine", "session_id", "run_id"), "plugin_effect": ("schema", "plugin_id", "run_id")}
+EFFECT_SHAPE = {"engine_tool": "approval.v1.json#/$defs/engine_tool_effect", "plugin_effect": "approval.v1.json#/$defs/plugin_effect"}
+BINDING_SHAPE = "approval.v1.json#/$defs/binding"
 
 
 class ApprovalModel:
@@ -897,14 +1038,31 @@ class ApprovalModel:
     separate candidate. Validate the complete candidate's shape, canonical digest, rendered lines and
     envelope/effect identity before committing it. A failure is a typed refusal and leaves the prior
     record, revision and binding unchanged. Only a valid candidate replaces the pending record. Changing
-    content is not permission to change the target through an inconsistent envelope. The refusals:
-    ``nothing_to_change`` (neither an effect nor a deadline); ``effect`` (not an effect of the request's
-    source, or one with a member more or less than such an effect has); ``target`` (the new effect is bound to another run, session or engine, or comes from
-    another plugin, than the effect it replaces); ``timestamp`` (a deadline that is not a real instant);
-    the renderer's own code for an effect that cannot be drawn whole (``too_many_lines``, ``too_large``
-    and the like); and, for whatever else does not agree inside the candidate, the first word
-    ``approval_problems`` gives for it. The numbers of an engine's call are normalised in the candidate
-    before it is digested and drawn.
+    content is not permission to change the target through an inconsistent envelope.
+
+    Complete validation means both the published approval and private-binding shapes and the semantic
+    rules; approval_problems alone is not complete validation. Normalize an engine-tool effect before
+    this validation. A proposed effect must first fit the existing source's effect shape; a malformed
+    effect is refused as effect. Only a valid proposed effect is compared with the retained target; a
+    changed target is refused as target. Validate the whole candidate before replacing the record.
+    Before consumption, an invalid approval record is refused as record_invalid, and an invalid retained
+    or supplied private binding is refused as binding_mismatch, without changing record, binding,
+    receipts or consumption state. An approved or consumed record must carry answer approve and the
+    required answerer and answer time. Restoration is not permission to execute malformed durable data.
+
+    The refusals of a change, in the order they are looked for: ``nothing_to_change`` (neither an effect
+    nor a deadline); ``effect`` (not the shape of an effect of the request's source: a member more or
+    less, a value outside its list, its pattern or its range, an effect of the other source);
+    ``target`` (a well-shaped effect that is bound to another run, session or engine, or comes from
+    another plugin, than the effect it replaces); the renderer's own code for an effect that cannot be
+    drawn whole (``too_many_lines``, ``too_large`` and the like); ``timestamp`` (a deadline that is not
+    a real instant); ``record_invalid`` (the candidate as a whole is not the shape of an approval, which
+    with a well-shaped effect means the record it was made from was not); and, for whatever else does
+    not agree inside the candidate, the first word ``approval_problems`` gives for it. After validating a
+    proposed effect's source and shape, change preserves engine/session/run for engine_tool and
+    plugin_id/run for plugin_effect; a different retained target is refused as target without changing
+    the record, revision or binding. Malformed effects are effect; inconsistency already present
+    between record and effect is envelope.
 
     ``consume(revision, digest, binding)`` is the core carrying the effect out. It consumes exactly the
     approved ``(approval_id, revision, digest)`` and the private engine binding the daemon keeps for
@@ -928,9 +1086,16 @@ class ApprovalModel:
     request, or one read back from where it is durable), and the numbers of an engine's call are
     normalised as it is made, so 1.0 written by another serialiser is the whole number again and minus
     zero is zero before anything is digested, drawn or carried out. Consumption checks the whole record
-    once more (``approval_problems``) and refuses one that holds a number which is not normalised, or
-    whose digest, lines or envelope are not its effect's (``record_invalid``): successful parsing of a
-    call's text is not the only boundary.
+    once more, its published shape (``fits``) and what must agree inside it (``approval_problems``), and
+    refuses one that is not the shape of an approval (an approved record that says deny, or has no
+    answerer or no answer time; a form of lines this version does not have), that holds a number which
+    is not normalised, or whose digest, lines or envelope are not its effect's (``record_invalid``):
+    successful parsing of a call's text is not the only boundary. The binding kept and the binding
+    offered are held to the published shape of a binding as well (``binding_mismatch``).
+
+    The approval model owns copies of every retained principal and restored receipt, including nested
+    answers. Mutation of an object supplied by a caller after an operation returns cannot alter an
+    opening, an answerer, a receipt or a later replay. Returned records and answers remain copies.
 
     ``binding`` and ``receipts`` are durable beside the record: a model made again from the three (a
     restart) answers and consumes exactly as the first would have.
@@ -941,7 +1106,7 @@ class ApprovalModel:
         if self.record.get("source") == "engine_tool" and isinstance(self.record.get("effect"), dict):
             self.record["effect"] = normalised(self.record["effect"])       # creating or restoring: the bound form
         self.binding = copy.deepcopy(binding)
-        self.receipts: dict = dict(receipts or {})
+        self.receipts: dict = copy.deepcopy(receipts or {})
 
     _NEEDS = {"approval.open": ("command_id", "approval_id", "surface"),
               "approval.answer": ("command_id", "approval_id", "surface", "expected_revision", "digest", "answer")}
@@ -975,7 +1140,7 @@ class ApprovalModel:
         record = self.record
         if params.get("approval_id") != record["approval_id"]:
             return {"code": "approval_unknown", "approval_id": params.get("approval_id")}
-        shown = {"principal": principal, "surface": params["surface"], "revision": record["revision"], "at": at}
+        shown = {"principal": copy.deepcopy(principal), "surface": params["surface"], "revision": record["revision"], "at": at}
         already = any((o["principal"], o["surface"], o["revision"]) == (principal, params["surface"], record["revision"])
                       for o in record["opened_by"])
         if record["state"] == "pending" and not already:
@@ -998,7 +1163,7 @@ class ApprovalModel:
             return {"code": "prompt_not_shown", **refusal}
         if params["digest"] != record["digest"]:
             return {"code": "conflict", "detail": "digest_mismatch", **refusal}
-        record.update(state="approved" if params["answer"] == "approve" else "denied", answered_by=principal,
+        record.update(state="approved" if params["answer"] == "approve" else "denied", answered_by=copy.deepcopy(principal),
                       answer=params["answer"], answered_at=at)
         return {"code": "ok", "approval": copy.deepcopy(record)}
 
@@ -1014,7 +1179,10 @@ class ApprovalModel:
             if not isinstance(effect, dict):
                 raise Refused("effect")
             new = normalised(copy.deepcopy(effect)) if source == "engine_tool" else copy.deepcopy(effect)
-            # The target is not content: what the core itself put in the effect stays what it was.
+            # Its own shape first: what is not an effect of this source is 'effect', whatever else is true of it.
+            if source not in EFFECT_SHAPE or not fits(EFFECT_SHAPE[source], new):
+                raise Refused("effect")
+            # Only then the target, which is not content: what the core itself put in the effect stays what it was.
             if any(new.get(member) != record["effect"].get(member) for member in TARGET_MEMBERS.get(source, ())):
                 raise Refused("target")
             try:
@@ -1026,6 +1194,8 @@ class ApprovalModel:
             milliseconds(expires_at)                            # 'timestamp' for a deadline that is not a moment
             candidate["expires_at"] = expires_at
         candidate["revision"] = record["revision"] + 1
+        if not fits("approval.v1.json", candidate):         # the whole candidate, before it replaces anything
+            raise Refused("record_invalid")
         problems = approval_problems(candidate)
         if problems:
             raise Refused(problems[0])
@@ -1037,7 +1207,7 @@ class ApprovalModel:
             raise Refused("already_consumed")
         if record["state"] != "approved":
             raise Refused("not_approved")
-        if approval_problems(record):
+        if not fits("approval.v1.json", record) or approval_problems(record):
             raise Refused("record_invalid")
         if (revision, digest) != (record["revision"], record["digest"]):
             raise Refused("approval_mismatch")
@@ -1045,7 +1215,7 @@ class ApprovalModel:
             kept, effect = self.binding, record["effect"]
             # The binding kept, the binding offered, and each identity member against the approval itself. (The
             # record's own run is its effect's: a record where they differ was refused just above.)
-            if (not isinstance(kept, dict) or binding != kept
+            if (not isinstance(kept, dict) or binding != kept or not fits(BINDING_SHAPE, kept)
                     or binding.get("approval_id") != record["approval_id"]
                     or binding.get("run_id") != effect["run_id"]
                     or binding.get("engine") != effect["engine"]):
@@ -1145,7 +1315,7 @@ def gap_problem(event: dict) -> bool:
     return not (1 <= payload["from"] <= payload["to"] == event["seq"])
 
 
-PROJECTION_DEFAULT = "raw"      # what a read that names no projection asks for: the events as they were logged
+PROJECTION_DEFAULT = "transcript"       # what a read that names no projection asks for: the lines, not the events
 
 
 def page_problems(params: dict, page: dict) -> list:
@@ -1156,9 +1326,12 @@ def page_problems(params: dict, page: dict) -> list:
 
     A successful events.read or events.follow response uses the projection explicitly requested by the
     caller. Validate that equality before checking the returned page. When projection is omitted, the
-    method must document one default and test it. The default is ``raw`` (``PROJECTION_DEFAULT``). A
-    page in another projection than the one asked for is ``projection``, and nothing else is looked at:
-    it is not the answer to this request.
+    method must document one default and test it. When projection is omitted, events.read and
+    events.follow return transcript; raw events require projection raw explicitly
+    (``PROJECTION_DEFAULT``). Both projections preserve the authorized log's positions, gaps and cursor
+    rules, and a transcript is produced only from a validated raw page. A page in another projection
+    than the one asked for is ``projection``, and nothing else is looked at: it is not the answer to
+    this request.
 
     The cursor's session_id names the one log asked for. Every event or line returned belongs to it
     (``log``). Only positions strictly after ``cursor.seq`` are returned, in order, and none is skipped:

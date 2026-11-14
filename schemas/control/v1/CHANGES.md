@@ -13,19 +13,47 @@ Nothing is frozen yet.
 
 | Schema | Version |
 |---|---|
-| `common.v1.json` | 1.0-draft.4 |
+| `common.v1.json` | 1.0-draft.5 |
 | `run.record.v1.json` | 1.0-draft.4 |
 | `run.view.v1.json` | 1.0-draft.4 |
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
-| `queue.item.v1.json` | 1.0-draft.6 |
+| `queue.item.v1.json` | 1.0-draft.7 |
 | `event.v1.json` | 1.0-draft.7 |
-| `approval.v1.json` | 1.0-draft.6 |
+| `approval.v1.json` | 1.0-draft.7 |
 | `driver.v2.json` | 1.0-draft.4 |
-| `mcp.task.v1.json` | 1.0-draft.5 |
+| `mcp.task.v1.json` | 1.0-draft.6 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.9 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## After another model family read the whole set a fourth time (Nov 14, 2026)
+
+`approval` draft 7, `queue.item` draft 7, `mcp.task` draft 6, `common` draft 5, `methods` draft 10. The
+fourth read found the nine corrections of the third in place and required four more, each with its
+wording, which is in the descriptions as it was written. It also ruled on three choices the third
+round had left open. No schema changes shape in this round: every change is in what a record must
+mean, in `conformance/rules.py`, and in the fixtures and vectors.
+
+| What changed | What it breaks |
+|---|---|
+| F1. Complete validation of an approval. A change first holds the proposed effect to the shape of an effect of the request's own source (`effect`), then compares it with the target it would replace (`target`), then validates the whole candidate before it replaces the record (`record_invalid` for a candidate that is not the shape of an approval). A consumption refuses a record that is not the shape of an approval (`record_invalid`): approved and saying deny, with no answerer or no answer time, in a form of lines this version does not have. A binding that is kept or offered is held to the shape of a binding (`binding_mismatch`). `rules.fits` reads the published schemas with the standard library; it agrees with the validator on every fixture of this folder | A core that committed a changed effect with a negative amount, a currency in lower case or an empty scope, or carried out a restored record that says approved and deny. A caller that expected `target` for an effect of the other source or one with no run: it is `effect` now |
+| F2. A Task's `created_at` is null in this version, for every Task. A first `state.changed` with reason `commit` is an observation of a committed image, not proof of a creation or of its time; draft 5 took it for one. `updated_at` is unchanged | A reader that showed a creation time for a run or a turn |
+| F3. The approval model owns what it keeps: the principal of an opening, the answerer, and a restored receipt with its answer are copies. Changing the caller's own object afterwards changes nothing | Nothing on the wire |
+| F4. A `steer.sent` write belongs to its binding's item, delivery, log, run and turn. One logged in another log or for another run is `delivery_mismatch`; the conformance client now hands the rule the event's log and run | A core that took any `steer.sent` with the right delivery id as this binding's write |
+| The default projection is `transcript`. `events.read` and `events.follow` with no `projection` return lines; raw events are given only to a read that says `raw`. Draft 9 had `raw` | A client that left `projection` out and read `events` from the answer |
+| The method table's text carries the exact rule for the two rows that name a service (unchanged in substance since draft 9) | |
+| Fixtures and vectors: `event.page` g07 (no projection, answered with lines) and x14 (renamed: a raw page for a read that names none); `methods` h12 (a follow with no projection: a transcript page with no lines) and h77 (a follow that asks for raw); `task.derivation` r29 renamed, r34 new, x14 and x15 new, every `created_at` null; `queue.delivery` d09 with two more refused writes; `approval.lifecycle` s17 | |
+
+The three choices, as ruled after this read: the default projection is `transcript` (above). A
+plugin's effect is consumed with no engine binding, and offering one is `binding_mismatch`; the plugin
+gate must establish the caller, the plugin, the run and the connection and the current permission,
+veto, breaker and authority conditions against that same effect. `target` stays the refusal of a
+well-shaped effect that would change what a pending request is bound to; it is a word of the core's
+own change operation and not a code of a method.
+
+The row "C8. The origin of a Task" of the third round, below, is replaced by F2: it stays as the
+record of what draft 5 said.
 
 ## The two reads of a log name their service (Nov 13, 2026)
 

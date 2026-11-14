@@ -76,6 +76,44 @@
       "refused": "delivery_mismatch"
     },
     {
+      "what": "A write logged in another log is not it.",
+      "happening": "written",
+      "event": {
+        "seq": 50,
+        "session_id": "ses-2c4e6a8b0d1f3a5c",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:30.002Z",
+        "type": "steer.sent",
+        "source": "core",
+        "trust": "trusted",
+        "payload": {
+          "item_id": "qi-0002",
+          "delivery_id": "dlv-0008"
+        }
+      },
+      "refused": "delivery_mismatch"
+    },
+    {
+      "what": "Nor is a write of another run.",
+      "happening": "written",
+      "event": {
+        "seq": 50,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:30.003Z",
+        "type": "steer.sent",
+        "source": "core",
+        "trust": "trusted",
+        "payload": {
+          "item_id": "qi-0002",
+          "delivery_id": "dlv-0008"
+        }
+      },
+      "refused": "delivery_mismatch"
+    },
+    {
       "what": "The write returns, and the core logs steer.sent.",
       "happening": "written",
       "event": {

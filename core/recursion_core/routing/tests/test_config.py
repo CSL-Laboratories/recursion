@@ -1,0 +1,405 @@
+"""The routing config: its schema, the loader's cross-field rules, vendor identity, and the file checks.
+
+Ported from the vault prototype's SchemaTests and VendorIdentityTests (20261107-csl729-routing-config-q45-01,
+section 8.3), with the route contract's engine ids and the catalog the daemon already has (the key store's
+metadata and routes.json's sign-ins) in place of the prototype's fixture catalog. The prototype's table that
+kept every subscription on its own vendor's engines is not ported (it predates Lucas's Nov 8 answer); only
+the Claude rule is kept, and ``test_engine_vendor_compatibility`` checks exactly that.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from recursion_core.routes import contract
+from recursion_core.routes import limits as route_limits
+from recursion_core.routing import config as rc
+from recursion_core.routing.tests.fixtures import (CONFIG, KEYS, ROUTES, config, routes_with_second_claude_login,
+                                                   second_claude_route)
+
+try:
+    import jsonschema  # hosted CI installs it; the free-threaded interpreter has none
+except ImportError:  # pragma: no cover - depends on the interpreter
+    jsonschema = None
+
+SCHEMA = json.loads(rc.SCHEMA_FILE.read_text(encoding="utf-8"))
+POSIX_OWNER = hasattr(os, "geteuid") and sys.platform.startswith("linux")
+
+
+def mutated(mutate, raw=None):
+    bad = copy.deepcopy(CONFIG if raw is None else raw)
+    mutate(bad)
+    return bad
+
+
+class SchemaTests(unittest.TestCase):
+    # Shape defects: the JSON Schema and the loader both refuse each one.
+    SHAPE_DEFECTS = {
+        "bad_version": lambda c: c.update(version=2),
+        "unknown_field": lambda c: c.update(fallback="any_detected"),
+        "unknown_engine": lambda c: c["default"].update(engine="claude-code"),
+        "bad_rule": lambda c: c["rules"][0].update(when={}),
+        "bad_login": lambda c: c["logins"][0].update(kind="rotating_pool"),
+        "unknown_vendor": lambda c: c["logins"][0].update(vendor="Anthropic"),
+        "bad_model": lambda c: c["default"].update(model="two words"),
+        "bad_limits": lambda c: c["default"].update(limits={"on_limit": "fallback", "fallback": []}),
+        "bad_undetected_rule": lambda c: c.update(undetected_rule="fallback"),
+        "bad_route": lambda c: c["default"].update(provider="anthropic"),
+    }
+
+    @unittest.skipIf(jsonschema is None, "jsonschema not installed")
+    def test_json_schema_accepts_example_and_rejects_bad_shapes(self) -> None:
+        jsonschema.Draft202012Validator.check_schema(SCHEMA)
+        v = jsonschema.Draft202012Validator(SCHEMA)
+        self.assertEqual(list(v.iter_errors(CONFIG)), [])
+        with_limits = mutated(lambda c: c["rules"][0]["route"].update(limits={
+            "on_limit": "fallback", "fallback": [copy.deepcopy(ROUTES["claude_code"]["route"])]}))
+        self.assertEqual(list(v.iter_errors(with_limits)), [])
+        config(with_limits)  # and the loader takes it
+        for code, mutate in self.SHAPE_DEFECTS.items():
+            bad = mutated(mutate)
+            self.assertNotEqual(list(v.iter_errors(bad)), [], code)
+            with self.assertRaises(rc.ConfigError, msg=code) as cm:
+                config(bad)
+            self.assertEqual(cm.exception.code, code)
+
+    def test_schema_names_the_codes_own_engines_vendors_and_limits(self) -> None:
+        defs = SCHEMA["$defs"]
+        self.assertEqual(tuple(defs["engine"]["enum"]), contract.ENGINES)
+        self.assertIs(rc.ENGINES, contract.ENGINES)
+        self.assertEqual(tuple(defs["vendor"]["enum"]), rc.VENDORS)
+        self.assertEqual(tuple(defs["login"]["properties"]["kind"]["enum"]), rc.LOGIN_KINDS)
+        self.assertEqual(tuple(SCHEMA["properties"]["undetected_rule"]["enum"]), rc.UNDETECTED_RULES)
+        self.assertEqual(SCHEMA["properties"]["undetected_rule"]["default"], "skip")
+        self.assertEqual(tuple(defs["limits"]["properties"]["on_limit"]["enum"]), route_limits.ON_LIMIT)
+        self.assertEqual(defs["limits"]["properties"]["fallback"]["maxItems"], route_limits.MAX_FALLBACK)
+        self.assertEqual(set(defs["fallback_route"]["propertyNames"]["enum"]), set(route_limits._ROUTE_KEYS))
+        self.assertEqual(set(SCHEMA["properties"]), set(rc.TOP_LEVEL))
+        self.assertEqual(set(defs["login"]["properties"]), set(rc.LOGIN_KEYS))
+        self.assertEqual(set(defs["route"]["properties"]), set(rc.ROUTE_KEYS))
+        self.assertEqual(set(defs["rule"]["properties"]["when"]["properties"]), set(rc.WHEN_KEYS))
+
+    def test_loader_cross_field_rules(self) -> None:
+        cases = {
+            "second_login_same_vendor": (lambda c: c["logins"].append(
+                {"id": "anthropic-sub-2", "vendor": "anthropic", "kind": "subscription", "connection_id": "claude-second",
+                 "engines": ["claude_code"]}), routes_with_second_claude_login()),
+            "engine_bound_twice": (lambda c: c["logins"].append(
+                {"id": "google-key", "vendor": "google", "kind": "api_key", "connection_id": "gemini-api",
+                 "engines": ["opencode"]}), None),
+            "claude_subscription_outside_claude_code": (lambda c: c["logins"][0]["engines"].append("hermes"), None),
+            "engine_without_login": (lambda c: (c["logins"].pop(4), c["rules"].append(
+                {"id": "x", "when": {"task_kind": ["x"]}, "route": {"engine": "hermes"}})), None),
+            "unknown_field": (lambda c: c.update(fallback="any_detected"), None),
+            "duplicate_rule_id": (lambda c: c["rules"].append(copy.deepcopy(c["rules"][0])), None),
+            "duplicate_login_id": (lambda c: c["logins"].append(dict(c["logins"][2], connection_id="openai-api",
+                                                                     vendor="openai", engines=["pi"])), None),
+            "no_logins": (lambda c: c.update(logins=[]), None),
+            "login_route_mismatch": (lambda c: c["logins"][2].update(connection_id="anthropic-api-2"), None),
+            "fallback_not_a_login": (lambda c: c["default"].update(limits={"on_limit": "ask", "fallback": [second_claude_route()]}), None),
+        }
+        for code, (mutate, routes) in cases.items():
+            with self.assertRaises(rc.ConfigError, msg=code) as cm:
+                config(mutated(mutate), routes)
+            self.assertEqual(cm.exception.code, code)
+
+    def test_malformed_configs_raise_only_config_error(self) -> None:
+        bad_values = [None, 0, 1.0, True, "x", [], {}, [None], [[]], [{}], {"engine": None}, {"engine": ["codex"]}]
+        paths = [
+            lambda c, v: c.update(version=v), lambda c, v: c.update(logins=v), lambda c, v: c.update(default=v),
+            lambda c, v: c.update(rules=v), lambda c, v: c.update(undetected_rule=v),
+            lambda c, v: c["logins"][0].update(id=v), lambda c, v: c["logins"][0].update(engines=v),
+            lambda c, v: c["logins"][0].update(connection_id=v), lambda c, v: c["logins"][0].update(vendor=v),
+            lambda c, v: c["rules"][0].update(when=v), lambda c, v: c["rules"][0].update(id=v),
+            lambda c, v: c["rules"][0]["when"].update(task_kind=v), lambda c, v: c["default"].update(model=v),
+            lambda c, v: c["default"].update(limits=v), lambda c, v: c["rules"][0].update(route=v),
+        ]
+        n = 0
+        for path in paths:
+            for value in bad_values:
+                bad = mutated(lambda c, p=path, v=value: p(c, copy.deepcopy(v)))
+                try:
+                    config(bad)
+                except rc.ConfigError:
+                    n += 1
+                # A value that happens to be valid (an empty rules list, say) loads; anything else is a ConfigError.
+        self.assertGreater(n, len(paths) * len(bad_values) // 2)
+        for raw in (None, [], "routing", 1):
+            with self.assertRaises(rc.ConfigError):
+                rc.load_config(raw, ROUTES, KEYS)
+
+    def test_limits_are_validated_by_the_route_contracts_own_function(self) -> None:
+        # The routing file's limits are routes.limits' shape, checked by its own validator, not a copy.
+        calls = []
+        real = route_limits.validate_limits
+
+        def spy(value):
+            calls.append(value)
+            return real(value)
+
+        with mock.patch.object(route_limits, "validate_limits", spy):
+            cfg = config(mutated(lambda c: c["default"].update(limits={"on_limit": "wait"})))
+        self.assertEqual(calls, [{"on_limit": "wait"}])
+        self.assertEqual(cfg.default.limits, {"on_limit": "wait", "fallback": []})
+        for limits in ({"on_limit": "retry"}, {"on_limit": "fallback"}, {"fallback": "codex"}, {"x": 1},
+                       {"on_limit": "fallback", "fallback": [{"engine": "codex"}]}, [], "ask"):
+            with self.assertRaises(rc.ConfigError, msg=limits) as cm:
+                config(mutated(lambda c, v=limits: c["default"].update(limits=v)))
+            self.assertEqual(cm.exception.code, "bad_limits")
+
+    def test_fallback_routes_are_only_configured_logins_of_their_engine(self) -> None:
+        # A limit can only move a task to a login the user configured, bound to that engine: in the routing
+        # file's own limits, and in the routes.json entry an engine would launch with (a list only shown
+        # to the user, on_limit "ask", is checked too, because it is offered as a switch).
+        codex_route = copy.deepcopy(ROUTES["codex"]["route"])
+        ok = mutated(lambda c: c["default"].update(limits={"on_limit": "fallback", "fallback": [codex_route]}))
+        self.assertEqual(config(ok).default.limits["fallback"][0]["connection"]["id"], "chatgpt-main")
+        wrong_engine = dict(codex_route, engine="claude_code")
+        api_key_as_sign_in = dict(codex_route, connection={"kind": "api_key", "id": "chatgpt-main", "credential_env": "X"})
+        for fb in (second_claude_route(), wrong_engine, api_key_as_sign_in):
+            for on_limit in ("fallback", "ask"):
+                with self.assertRaises(rc.ConfigError, msg=(fb, on_limit)) as cm:
+                    config(mutated(lambda c, f=fb, o=on_limit: c["rules"][0]["route"].update(limits={"on_limit": o, "fallback": [f]})))
+                self.assertEqual(cm.exception.code, "fallback_not_a_login")
+        with self.assertRaises(rc.ConfigError) as cm:
+            config(routes=routes_with_second_claude_login())
+        self.assertEqual(cm.exception.code, "fallback_not_a_login")
+
+    def test_a_sign_in_login_needs_its_route_and_a_key_login_its_key(self) -> None:
+        # The catalog is what this machine has: a sign-in login whose route routes.json does not
+        # configure, or a key login whose key the key store does not hold, names an unknown connection.
+        routes = copy.deepcopy(ROUTES)
+        del routes["hermes"]
+        with self.assertRaises(rc.ConfigError) as cm:
+            config(routes=routes)
+        self.assertEqual((cm.exception.code, cm.exception.detail), ("unknown_connection", "xai-sub"))
+        keys = copy.deepcopy(KEYS)
+        del keys["xai-api"]
+        with self.assertRaises(rc.ConfigError) as cm:
+            config(keys=keys)
+        self.assertEqual((cm.exception.code, cm.exception.detail), ("unknown_connection", "xai-key"))
+        # A key login whose engine has no route on this machine still loads: its engine is never routable.
+        routes = copy.deepcopy(ROUTES)
+        del routes["pi"]
+        self.assertEqual(config(routes=routes).engine_login["pi"], "xai-key")
+
+    def test_model_null_means_the_model_routes_json_configures(self) -> None:
+        cfg = config()
+        self.assertIsNone(cfg.default.model)
+        self.assertEqual(cfg.rules[0].route.model, "codex-model-b")
+        self.assertEqual(cfg.routes["claude_code"]["route"]["model"], "claude-model-a")
+
+    def test_the_loaded_config_does_not_share_the_callers_objects(self) -> None:
+        routes = copy.deepcopy(ROUTES)
+        cfg = rc.load_config(copy.deepcopy(CONFIG), routes, KEYS)
+        routes["claude_code"]["route"]["connection"]["id"] = "changed"
+        self.assertEqual(cfg.routes["claude_code"]["route"]["connection"]["id"], "claude-main")
+        with self.assertRaises(TypeError):
+            cfg.routes["codex"] = {}
+        with self.assertRaises(TypeError):
+            cfg.engine_login["codex"] = "x"
+
+
+class VendorIdentityTests(unittest.TestCase):
+    """A login's vendor and kind are canonical ids matched against the catalog, not the operator's label."""
+
+    def assertRefused(self, code, mutate, routes=None, keys=None):
+        with self.assertRaises(rc.ConfigError, msg=code) as cm:
+            config(mutated(mutate), routes, keys)
+        self.assertEqual(cm.exception.code, code)
+
+    def test_catalog_is_required(self) -> None:
+        for routes, keys, code in ((ROUTES, None, "no_key_catalog"), (None, KEYS, "no_routes"), (ROUTES, [], "no_key_catalog")):
+            with self.assertRaises(rc.ConfigError) as cm:
+                rc.load_config(copy.deepcopy(CONFIG), routes, keys)
+            self.assertEqual(cm.exception.code, code)
+        with self.assertRaises(rc.ConfigError) as cm:
+            rc.load_config(copy.deepcopy(CONFIG), ROUTES, {"anthropic-api": "anthropic"})
+        self.assertEqual(cm.exception.code, "key_metadata_invalid")
+
+    def test_claude_subscription_relabelled_as_another_vendor_is_refused(self) -> None:
+        # The forgery the prototype's review described: the Claude subscription labelled openai and bound
+        # to Codex. The catalog (routes.json's claude_code sign-in) says anthropic subscription.
+        def forge(c):
+            c["logins"][1] = {"id": "openai-sub", "vendor": "openai", "kind": "subscription", "connection_id": "claude-main",
+                              "engines": ["codex"]}
+            c["logins"][0]["connection_id"] = "claude-second"
+        self.assertRefused("credential_mismatch", forge, routes_with_second_claude_login())
+        # The same credential with its kind relabelled api_key, bound to a harness.
+        self.assertRefused("credential_mismatch", lambda c: c["logins"].append(
+            {"id": "relabel", "vendor": "anthropic", "kind": "api_key", "connection_id": "claude-second", "engines": ["pi"]}),
+            routes_with_second_claude_login())
+
+    def test_vendor_spellings_are_not_merged_or_accepted(self) -> None:
+        for vendor in ("Anthropic", "ANTHROPIC", "anthropic-ai", " anthropic", "claude", ""):
+            self.assertRefused("unknown_vendor", lambda c, v=vendor: c["logins"].append(
+                {"id": "dup", "vendor": v, "kind": "subscription", "connection_id": "claude-second", "engines": ["claude_code"]}))
+
+    def test_second_login_under_another_label_is_refused(self) -> None:
+        # A second Claude subscription labelled as another canonical vendor on a free engine: the catalog
+        # exposes it.
+        self.assertRefused("credential_mismatch", lambda c: (c["logins"].pop(4), c["logins"].append(
+            {"id": "sneaky", "vendor": "xai", "kind": "subscription", "connection_id": "claude-second", "engines": ["hermes"]})),
+            routes_with_second_claude_login())
+        # The same connection under a second login id.
+        self.assertRefused("connection_reused", lambda c: c["logins"].append(
+            {"id": "again", "vendor": "anthropic", "kind": "subscription", "connection_id": "claude-main", "engines": ["pi"]}))
+        # A connection the catalog does not hold.
+        self.assertRefused("unknown_connection", lambda c: c["logins"].append(
+            {"id": "ghost", "vendor": "google", "kind": "api_key", "connection_id": "not-in-catalog", "engines": ["hermes"]}))
+
+    def test_engine_vendor_compatibility(self) -> None:
+        # Only the Claude rule is kept: the Claude subscription on any engine but claude_code is refused ...
+        for eng in ("codex", "pi", "hermes", "opencode"):
+            self.assertRefused("claude_subscription_outside_claude_code", lambda c, e=eng: c["logins"][0]["engines"].append(e))
+        # ... and the prototype's table keeping every other subscription on its own vendor's engines is gone
+        # (Lucas, Nov 8: a subscription may run through another harness's sign-in; subscription_routes
+        # decides which). An OpenAI subscription bound to Codex and to OpenCode loads.
+        routes = copy.deepcopy(ROUTES)
+        routes["opencode"]["route"]["connection"] = {"kind": "subscription", "id": "chatgpt-main"}
+        routes["opencode"]["route"]["profile"] = {"provider": "chatgpt", "auth": "subscription", "method": "sign_in_with_chatgpt"}
+
+        def harness(c):
+            c["logins"][1]["engines"] = ["codex", "opencode"]
+            del c["logins"][2]
+            c["rules"] = c["rules"][:2]
+        cfg = config(mutated(harness), routes)
+        self.assertEqual(cfg.engine_login["opencode"], "openai-sub")
+        # An API key of one vendor on another vendor's harness also loads (the key store says what it is).
+        cfg = config(mutated(lambda c: c["logins"][3].update(vendor="openai", connection_id="openai-api")),
+                     _with_connection(ROUTES, "pi", {"kind": "api_key", "id": "openai-api", "credential_env": "OPENAI_API_KEY"}),
+                     KEYS)
+        self.assertEqual((cfg.logins["xai-key"].vendor, cfg.engine_login["pi"]), ("openai", "xai-key"))
+
+    def test_residual_a_mislabelled_catalog_is_not_detected(self) -> None:
+        # The boundary of the guard, kept as a test so it is not overclaimed: if the key store's metadata
+        # records an Anthropic key as an xAI one, the loader accepts it. Attesting a credential's provider is
+        # a key-store job this module does not do.
+        lying = {**KEYS, "anthropic-api-2": {"provider": "xai"}}
+        cfg = config(mutated(lambda c: c["logins"][3].update(connection_id="anthropic-api-2")),
+                     _with_connection(ROUTES, "pi", {"kind": "api_key", "id": "anthropic-api-2", "credential_env": "XAI_API_KEY"}),
+                     lying)
+        self.assertEqual(cfg.logins["xai-key"].connection_id, "anthropic-api-2")
+
+
+def _with_connection(routes, engine, connection):
+    out = copy.deepcopy(routes)
+    out[engine]["route"]["connection"] = connection
+    return out
+
+
+class CatalogTests(unittest.TestCase):
+    def test_catalog_reads_sign_ins_from_routes_and_keys_from_the_key_store(self) -> None:
+        cat = rc.catalog(ROUTES, KEYS)
+        self.assertEqual(cat["claude-main"], {"vendor": "anthropic", "kind": "subscription"})
+        self.assertEqual(cat["chatgpt-main"], {"vendor": "openai", "kind": "subscription"})
+        self.assertEqual(cat["grok-sign-in"], {"vendor": "xai", "kind": "subscription"})  # hermes, by its profile label
+        self.assertEqual(cat["anthropic-api"], {"vendor": "anthropic", "kind": "api_key"})
+        self.assertEqual(cat["gemini-api"], {"vendor": "google", "kind": "api_key"})
+        # routes.json's api_key connections are not the catalog's: only the key store says what a key is.
+        self.assertNotIn("not-a-key", rc.catalog(_with_connection(ROUTES, "pi", {"kind": "api_key", "id": "not-a-key"}), KEYS))
+        # A sign-in named only in a fallback list is a routes.json sign-in too.
+        self.assertEqual(rc.catalog(routes_with_second_claude_login(), KEYS)["claude-second"],
+                         {"vendor": "anthropic", "kind": "subscription"})
+        # A harness sign-in whose label is not one Recursion knows has no vendor, so no login can name it.
+        unknown = _with_connection(ROUTES, "hermes", {"kind": "subscription", "id": "other-sign-in"})
+        unknown["hermes"]["route"]["profile"] = {"provider": "someone", "auth": "subscription"}
+        self.assertNotIn("other-sign-in", rc.catalog(unknown, KEYS))
+        self.assertEqual(rc.catalog({}, {}), {})
+
+    def test_one_connection_with_two_readings_is_refused(self) -> None:
+        # A key id that is also a sign-in's connection id.
+        with self.assertRaises(rc.ConfigError) as cm:
+            rc.catalog(ROUTES, {**KEYS, "claude-main": {"provider": "anthropic"}})
+        self.assertEqual(cm.exception.code, "catalog_conflict")
+        # One sign-in id on two vendors' engines.
+        with self.assertRaises(rc.ConfigError) as cm:
+            rc.catalog(_with_connection(ROUTES, "codex", {"kind": "subscription", "id": "claude-main"}), KEYS)
+        self.assertEqual(cm.exception.code, "catalog_conflict")
+
+
+@unittest.skipUnless(POSIX_OWNER, "the routing file's owner check needs a POSIX uid")
+class RoutingFileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="routing-file-"))
+        self.addCleanup(self._clean)
+
+    def _clean(self) -> None:
+        for path in sorted(self.dir.rglob("*"), reverse=True):
+            path.unlink() if not path.is_dir() or path.is_symlink() else path.rmdir()
+        self.dir.rmdir()
+
+    def write(self, name, value, mode=0o600) -> Path:
+        path = self.dir / name
+        path.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
+        os.chmod(path, mode)
+        return path
+
+    def test_absent_file_is_none_and_an_owner_only_file_is_read(self) -> None:
+        self.assertIsNone(rc.read_routing_file(self.dir / rc.CONFIG_FILE))
+        for mode in (0o600, 0o644, 0o400):
+            path = self.write(rc.CONFIG_FILE, CONFIG, mode)
+            self.assertEqual(rc.read_routing_file(path), CONFIG)
+
+    def test_writable_by_others_linked_or_not_a_file_is_refused(self) -> None:
+        for mode in (0o620, 0o602, 0o666):
+            path = self.write(rc.CONFIG_FILE, CONFIG, mode)
+            with self.assertRaises(rc.RoutingUnreadable, msg=oct(mode)):
+                rc.read_routing_file(path)
+        target = self.write("elsewhere.json", CONFIG)
+        link = self.dir / "linked.json"
+        link.symlink_to(target)
+        with self.assertRaises(rc.RoutingUnreadable):
+            rc.read_routing_file(link)
+        fifo = self.dir / "fifo.json"
+        os.mkfifo(fifo, 0o600)
+        with self.assertRaises(rc.RoutingUnreadable):  # refused, and the open did not wait for a writer
+            rc.read_routing_file(fifo)
+        (self.dir / "folder.json").mkdir(mode=0o700)
+        with self.assertRaises(rc.RoutingUnreadable):
+            rc.read_routing_file(self.dir / "folder.json")
+
+    def test_unparseable_file_is_refused(self) -> None:
+        for text in ("{", "\xff", ""):
+            path = self.dir / rc.CONFIG_FILE
+            path.write_bytes(text.encode("latin-1"))
+            os.chmod(path, 0o600)
+            with self.assertRaises(rc.RoutingUnreadable, msg=repr(text)):
+                rc.read_routing_file(path)
+
+    def test_load_reads_routes_json_with_load_routes_and_routing_json_beside_it(self) -> None:
+        try:
+            from recursion_core.daemon import control_adapter
+        except ImportError as exc:  # pragma: no cover - depends on the interpreter's packages
+            self.skipTest(f"daemon not importable here: {exc}")
+        wired = {eng: dict(entry["route"], deadline_s=600) for eng, entry in ROUTES.items() if eng in ("claude_code", "codex")}
+        for item in wired.values():
+            del item["engine"]
+        self.write("routes.json", {"routes": wired})
+        raw = {"version": 1, "logins": copy.deepcopy(CONFIG["logins"][:2]), "default": {"engine": "claude_code"},
+               "rules": [copy.deepcopy(CONFIG["rules"][0])]}
+        self.assertIsNone(rc.load(self.dir, {}))  # routes.json alone: no routing config
+        self.write(rc.CONFIG_FILE, raw)
+        calls = []
+        real = control_adapter.load_routes
+        with mock.patch.object(control_adapter, "load_routes", lambda path: calls.append(path) or real(path)):
+            cfg = rc.load(self.dir, {})
+        self.assertEqual(calls, [self.dir / "routes.json"])
+        self.assertEqual(cfg.routes["codex"]["route"]["connection"], {"kind": "subscription", "id": "chatgpt-main"})
+        self.assertEqual(cfg.routes["codex"]["route"]["engine"], "codex")
+        os.chmod(self.dir / "routes.json", 0o666)
+        with self.assertRaises(rc.RoutingUnreadable):
+            rc.load(self.dir, {})
+        self.assertEqual(stat.S_IMODE(os.stat(self.dir / rc.CONFIG_FILE).st_mode), 0o600)
+
+
+if __name__ == "__main__":
+    unittest.main()

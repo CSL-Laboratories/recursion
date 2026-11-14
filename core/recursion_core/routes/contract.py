@@ -8,7 +8,7 @@ Request::
 
     {"contract": "recursion.route/v0", "request_id": "r1", "tenant": "t1", "prompt": "...",
      "deadline_s": 120.0,
-     "route": {"engine": "claude_code" | "codex" | "pi" | "hermes" | "opencode",
+     "route": {"engine": "claude_code" | "codex" | "pi" | "hermes" | "opencode",  # or one registered (S3)
                "model": "<model id>",
                "connection": {"kind": "subscription" | "api_key" | "passthrough", "id": "<login or key id>",
                               "credential_env": "<name>",  # api_key, unless key_source is api_key_helper
@@ -45,6 +45,7 @@ Limit signal (the only thing that can trip a connection's breaker)::
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Mapping
 
 CONTRACT_VERSION = "recursion.route/v0"
@@ -88,9 +89,38 @@ CODES = frozenset(
 # Codes that come from the engine run itself (as opposed to a refusal before launch).
 ENGINE_CODES = frozenset({PLAN_LIMIT, SHORT_FAULT, ENGINE_ERROR, AUTH_FAILED, PROTOCOL_ERROR, ENGINE_EXITED})
 
-ENGINES = ("claude_code", "codex", "pi", "hermes", "opencode")
+# The five engines a route could name before the engine table (seam S3). The check in validate_request no
+# longer reads a tuple fixed at import: it asks engine_names() at the time of the call.
+BASE_ENGINES = ("claude_code", "codex", "pi", "hermes", "opencode")
+ENGINES = BASE_ENGINES  # kept for importers; validate_request reads engine_names(), not this name
 PROFILE_ENGINES = ("pi", "hermes", "opencode")
 CONNECTION_KINDS = ("subscription", "api_key", "passthrough")
+# common.v1's engine_name: lower-case letters, digits and underscores, at most 32, starting with a letter.
+_ENGINE_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
+
+
+def engine_names(registered: object = None) -> tuple[str, ...]:
+    """The engines a route may name, read at the time of the call: today's five, then each registered one.
+
+    ``registered`` is what a composition registered in its engine table (seam S3: SPINE's
+    ``routes.engines.EngineTable``, whose ``names()`` are the engines with an active factory), or any
+    iterable of names, or None for nothing registered. The table belongs to one composition and lives in
+    no module, so it reaches this check through its caller (the route service), not through an import.
+    A name that is only in S3's catalogue has no factory, is not in ``names()``, and stays
+    ``engine_unknown``. With nothing registered the answer is today's five, as before the table.
+    Raises ``ValueError`` for a registered name that is not an engine name.
+    """
+
+    names = list(BASE_ENGINES)
+    if registered is None:
+        return tuple(names)
+    source = registered.names() if callable(getattr(registered, "names", None)) else registered
+    for name in source:
+        if not isinstance(name, str) or not _ENGINE_NAME.fullmatch(name):
+            raise ValueError(f"registered engine name {name!r}")
+        if name not in names:
+            names.append(name)
+    return tuple(names)
 
 
 class RouteError(Exception):
@@ -102,8 +132,11 @@ class RouteError(Exception):
         self.code, self.detail = code, detail
 
 
-def validate_request(request: object) -> dict:
-    """Return a normalised copy of ``request`` or raise ``RouteError(REQUEST_INVALID)``."""
+def validate_request(request: object, *, engines: object = None) -> dict:
+    """Return a normalised copy of ``request`` or raise ``RouteError(REQUEST_INVALID)``.
+
+    ``engines`` is what the composition registered (see ``engine_names``); None means nothing registered.
+    """
 
     if not isinstance(request, Mapping):
         raise RouteError(REQUEST_INVALID, "request is not an object")
@@ -119,7 +152,7 @@ def validate_request(request: object) -> dict:
     if not isinstance(route, Mapping):
         raise RouteError(REQUEST_INVALID, "route")
     engine = route.get("engine")
-    if engine not in ENGINES:
+    if engine not in engine_names(engines):  # read now, not at import (seam S3)
         raise RouteError(ENGINE_UNKNOWN, str(engine))
     if not isinstance(route.get("model"), str) or not route["model"]:
         raise RouteError(REQUEST_INVALID, "route.model")
@@ -141,7 +174,7 @@ def validate_request(request: object) -> dict:
     if "limits" in route:
         from recursion_core.routes.limits import validate_limits  # local: limits imports this module
 
-        validate_limits(route["limits"])
+        validate_limits(route["limits"], engines=engines)
     if engine in PROFILE_ENGINES and not isinstance(route.get("profile"), Mapping):
         raise RouteError(REQUEST_INVALID, "route.profile")
     out = dict(request)

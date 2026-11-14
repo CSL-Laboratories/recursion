@@ -17,17 +17,23 @@ from recursion_core.routes.breaker import ConnectionBreaker
 
 class RouteService:
     def __init__(self, adapters: Mapping[str, RouteAdapter], breaker: ConnectionBreaker,
-                 clock: Callable[[], float], *, limits: Mapping | None = None) -> None:
+                 clock: Callable[[], float], *, limits: Mapping | None = None, engines: object = None) -> None:
         self._adapters, self._breaker, self._clock = dict(adapters), breaker, clock
+        # What the composition registered (seam S3): its engine table when given, otherwise the engines this
+        # service has an adapter for, which the daemon builds from that same table. validate_request asks
+        # for the names at each call (contract.engine_names); a bad name fails here, at composition.
+        self._engines = engines if engines is not None else tuple(self._adapters)
+        c.engine_names(self._engines)
         # The user's default limit behaviour; a request's own route.limits overrides it. Default: ask.
-        self._limits = lim.validate_limits(limits if limits is not None else lim.DEFAULT_LIMITS)
+        self._limits = lim.validate_limits(limits if limits is not None else lim.DEFAULT_LIMITS, engines=self._engines)
 
     def handle(self, request: object) -> dict:
         rid = request.get("request_id") if isinstance(request, Mapping) else None
         rid = rid if isinstance(rid, str) else ""
         try:
-            req = c.validate_request(request)
-            limits = lim.validate_limits(req["route"]["limits"]) if "limits" in req["route"] else self._limits
+            req = c.validate_request(request, engines=self._engines)
+            limits = (lim.validate_limits(req["route"]["limits"], engines=self._engines) if "limits" in req["route"]
+                      else self._limits)
         except c.RouteError as err:
             return c.result(rid, err.code, detail=err.detail)
         # One absolute deadline for the request, shared by every fallback. A later attempt does not

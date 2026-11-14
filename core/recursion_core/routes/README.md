@@ -10,7 +10,12 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - `contract.py`: the route contract. Requests, results, events and limit signals are plain dicts that
   round-trip through JSON; every refusal or failure has a typed code (`CODES`). Surfaces and the daemon
   call `RouteService.handle(request) -> result` and nothing else, so the tests drive behaviour through
-  the protocol and a later port can reuse them.
+  the protocol and a later port can reuse them. The engine a route names is checked against
+  `engine_names()` at the time of the call: today's five (`BASE_ENGINES`) plus the engines the
+  composition registered in its engine table (seam S3). The table belongs to one composition, so it
+  reaches the check through the route service: `RouteService(..., engines=<table>)`, or, by default, the
+  engines the service has an adapter for (the daemon builds those from the same table). A name that is
+  only in S3's catalogue stays `engine_unknown`; with nothing registered the answer is the five, as before.
 - `claude_code.py`: `ClaudeCodeAdapter`, `claude -p --input-format stream-json --output-format stream-json`.
   Reads typed limit signals only: `rate_limit_event` with `status: rejected`,
   `api_error_params.rate_limit_info` on an error `result`, and a typed `error: "rate_limit"`.

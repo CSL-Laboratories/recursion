@@ -38,8 +38,12 @@ LIMIT_CODES = (c.PLAN_LIMIT, c.BREAKER_OPEN, c.PROBE_IN_FLIGHT)
 _ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack", "wrapper"}
 
 
-def validate_limits(limits: object) -> dict:
-    """Return a normalised copy or raise ``RouteError(REQUEST_INVALID)``."""
+def validate_limits(limits: object, *, engines: object = None) -> dict:
+    """Return a normalised copy or raise ``RouteError(REQUEST_INVALID)``.
+
+    ``engines``: what the composition registered (``contract.engine_names``), so a fallback route may name
+    the same engines a primary route may.
+    """
 
     if not isinstance(limits, Mapping) or set(limits) - {"on_limit", "fallback"}:
         raise c.RouteError(c.REQUEST_INVALID, "route.limits")
@@ -57,7 +61,7 @@ def validate_limits(limits: object) -> dict:
             raise c.RouteError(c.REQUEST_INVALID, "route.limits.fallback entry")
         probe = {"contract": c.CONTRACT_VERSION, "request_id": "limits", "tenant": "limits", "prompt": "-",
                  "deadline_s": 1.0, "route": dict(entry)}
-        routes.append(c.validate_request(probe)["route"])  # same rules as a primary route
+        routes.append(c.validate_request(probe, engines=engines)["route"])  # same rules as a primary route
     return {"on_limit": on_limit, "fallback": routes}
 
 

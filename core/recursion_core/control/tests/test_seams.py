@@ -1530,7 +1530,10 @@ class StartRegistrantTest(unittest.TestCase):
             with self.subTest(record=one_sided):
                 with self.assertRaises(ValueError):
                     H.LaunchContext.from_record(one_sided)
-        for broken in ({'launch': dict(launch, principal={'kind': 'owner'})}, {'launch': {'owner': 'host'}}, {'launch': 'x'},
+        kept = H.OWNER.public()
+        for broken in ({'launch': dict(launch, principal={'kind': 'owner'}), 'principal': kept},
+                       {'launch': {'owner': 'host'}, 'principal': kept}, {'launch': 'x', 'principal': kept},
+                       {'launch': {key: value for key, value in launch.items() if key != 'budget'}, 'principal': kept},
                        {'launch': launch, 'principal': 'owner'}, {'launch': launch, 'principal': {'kind': 'root', 'id': 'x'}}):
             with self.subTest(record=broken):
                 with self.assertRaises(ValueError):
@@ -2089,8 +2092,16 @@ class FamilyParsersTest(unittest.TestCase):
             with self.subTest(names=names):
                 table = commands.CommandTable()
                 table.register(names, add, lambda args, client: 0)
+                parser, sub = self.parser()
                 with self.assertRaises(commands.CommandTableError):
-                    table.add_parsers(self.parser()[1])
+                    table.add_parsers(sub)
+        # A claim that is refused adds nothing: the undeclared alias was not made, nor the parser that carried it.
+        table = commands.CommandTable()
+        table.register(('session',), lambda sub: sub.add_parser('session', aliases=['s']), lambda args, client: 0)
+        parser, sub = self.parser()
+        with self.assertRaises(commands.CommandTableError):
+            table.add_parsers(sub)
+        self.assertEqual(sorted(sub.choices), ['start'])
 
 
 class IntentMembersTest(unittest.TestCase):

@@ -376,16 +376,48 @@ class RouteStarter:
         if self._breaker is not None:
             self._breaker.fault_run(run_id)
 
+    def _hand_over(self, owner, ctx, request):
+        """Seam S9, a run its owner accepted. ``owner.run`` is a HAND-OVER: it returns promptly, and the caller
+        holds a lifetime reference around it, so closing waits for it. What outlives it is a worker of a
+        registered service of the owner's lane, which that service's ``stop`` joins before the store closes.
+
+        The run is bound to this thread for the call, as on today's path; an owner that calls the route service
+        from another thread binds that thread itself, with ``bound_run(ctx)``.
+
+        The run stays active until the owner calls ``release``, which counts once. If ``owner.run`` raises, the
+        run is given an engine-error result when it has none, what was launched is settled unless the daemon is
+        closing, and the run is released: an owner that wants another end does not raise."""
+        released = threading.Lock()
+
+        def release():
+            if released.acquire(blocking=False):
+                with self._lock:
+                    self._active.pop(ctx.run_id, None)
+
+        try:
+            with bound_run(ctx):
+                owner.run(ctx, request, self._service, self._record_result, self._fault_run, self._settle, release)
+        except Exception as exc:  # noqa: BLE001 - an owner that fails after accepting must not strand the run
+            log.exception('the drive owner of %s failed after accepting it', ctx.run_id)
+            try:
+                if ctx.result is None:
+                    ctx.finished(route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
+                                                       detail=f'drive owner failure: {type(exc).__name__}'))
+                if ctx.process is not None and not getattr(self._daemon, 'closed', False):
+                    self._settle(ctx)  # ends what is left of its tree, as after any result
+            finally:
+                release()  # whatever the settling did: the run is not left active with nobody driving it
+
     def _drive(self, ctx, request):
         # Seam S9, at the top: a registered drive owner may accept the run before anything is driven. It then takes
         # over this whole method, the removal from _active included, and the run stays active until the owner
         # calls release(), which counts once. None (the default), or an owner that fails before it accepts: the
         # run is driven below, exactly as before.
-        owner = None
         if self._hooks is not None:
             # This thread is the run's own. The start that made it may have answered already, so no client call's
-            # admission covers the chooser: it holds one lifetime reference of its own (seam S13). Closing waits
-            # for it, and once closing has begun the run is refused here: nothing is chosen, driven or launched.
+            # admission covers the chooser or the hand-over to an owner: they hold one lifetime reference of their
+            # own (seam S13). Closing waits for them, and once closing has begun the run is refused here: nothing
+            # is chosen, handed over, driven or launched.
             gate = self._hooks.gate
             if not gate.enter():
                 try:
@@ -396,29 +428,11 @@ class RouteStarter:
                 return
             try:
                 owner = self._hooks.drive_owner(ctx, request)
+                if owner is not None:
+                    self._hand_over(owner, ctx, request)
+                    return
             finally:
                 gate.leave()
-        if owner is not None:
-            released = threading.Lock()
-
-            def release():
-                if released.acquire(blocking=False):
-                    with self._lock:
-                        self._active.pop(ctx.run_id, None)
-
-            try:
-                owner.run(ctx, request, self._service, self._record_result, self._fault_run, self._settle, release)
-            except Exception as exc:  # noqa: BLE001 - an owner that fails after accepting must not strand the run
-                log.exception('the drive owner of %s failed after accepting it', ctx.run_id)
-                try:
-                    if ctx.result is None:
-                        ctx.finished(route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
-                                                           detail=f'drive owner failure: {type(exc).__name__}'))
-                    if ctx.process is not None and not getattr(self._daemon, 'closed', False):
-                        self._settle(ctx)  # ends what is left of its tree, as after any result
-                finally:
-                    release()  # whatever the settling did: the run is not left active with nobody driving it
-            return
         try:
             with bound_run(ctx):
                 try:

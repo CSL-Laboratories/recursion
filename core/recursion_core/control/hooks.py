@@ -94,7 +94,15 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
     the starter returns; the run stays active until the owner calls ``release()``, exactly once. The
     owner learns the session and the turn from ``ctx.launch``. Raises before it accepts: logged, and
     the run is driven on today's path.
-S10 ``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's
+    ``owner.run`` is a hand-over: it returns promptly, and closing waits for it. What outlives it is a
+    worker of a registered service of the owner's lane, joined by that service's ``stop`` before the
+    store closes.
+    The seam binds the run to the thread it calls ``owner.run`` on. An owner that calls the route
+    service from another thread binds that thread itself, with ``bound_run(ctx)`` (``daemon.launcher``).
+    If ``owner.run`` raises, the seam gives the run an engine-error result when it has none, settles
+    what was launched unless the daemon is closing, and releases; an owner that wants another end does
+    not raise.
+S10``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's
     thread, after the executable is resolved and before the run directory's FIFOs and files are made,
     so a refusal leaves nothing in the way of a relaunch. It reads the route and the containment level
     from ``ctx.launch``. Parent side only: nothing is added to the child's environment. Default: None.
@@ -110,6 +118,10 @@ S13 ``hooks.service(service)``, ``hooks.start_services(context)``, ``hooks.stop_
     starts; what the dispatcher needs of that helper is in ``control/methods/__init__.py``. Raises:
     composition fails. A service whose ``start`` raises: it and the services already started are
     stopped in reverse and composition fails.
+    What is called on a run's own thread (S4, S7, S9, S10) is not covered by the admission of the start
+    that made the thread, which may have answered already. Each holds a lifetime reference of its own:
+    closing waits for it with the services and the store alive, and once closing has begun the run or
+    the launch is refused ``launch_refused``, ``daemon_closing`` before the hook is asked.
 
 The after-commit subscription to events is not a hook: it is the event store's own interface, which
 other lanes call from their services.

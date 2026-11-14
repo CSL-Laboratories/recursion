@@ -1120,6 +1120,36 @@ class DriveOwnerSeamTest(unittest.TestCase):
         self.assertTrue(until(lambda: not starter.active('run-1')))
         self.assertEqual(service.requests, [])
 
+    def test_the_owner_is_called_with_the_run_bound_to_its_thread_and_binds_any_other_thread_itself(self):
+        """As on today's path, the thread of the hand-over is bound to the run, so the route service called there
+        launches for it. Another thread is the owner's to bind."""
+        seen = []
+
+        def bound(ctx):
+            return getattr(launcher._current, 'ctx', None) is ctx
+
+        class Owner:
+            def run(self, ctx, request, service, record_result, fault_run, settle, release):
+                seen.append(('the thread of the hand-over', bound(ctx)))
+
+                def elsewhere():
+                    seen.append(('another thread', bound(ctx)))
+                    with launcher.bound_run(ctx):
+                        seen.append(('another thread, bound by the owner', bound(ctx)))
+                worker = threading.Thread(target=elsewhere, daemon=True)
+                worker.start()
+                worker.join(HELD_BOUND_S)
+                result = service.handle(request)          # the route service, called by the owner on this thread
+                ctx.finished(result)
+                release()
+        starter, service = self.starter(lambda ctx, request: Owner())
+        self.assertEqual(self.refused(starter), ('launch_refused', 'fake service'))
+        self.assertEqual(seen, [('the thread of the hand-over', True), ('another thread', False),
+                                ('another thread, bound by the owner', True)])
+        (request, ctx), = service.requests
+        self.assertEqual(ctx.run_id, 'run-1', 'the route service saw the run of the hand-over')
+        self.assertTrue(until(lambda: not starter.active('run-1')))
+
     @quiet
     def test_an_owner_that_fails_after_it_launched_has_its_tree_settled_and_is_released_even_when_that_fails(self):
         for settle_fails in (False, True):
@@ -1200,6 +1230,26 @@ class RunThreadLifetimeTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'launch_timeout', 'the start has answered; the run\'s own thread goes on')
         close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), entered, leave)
         self.assertEqual(seen, [False], 'the store was open for as long as the chooser was inside')
+        self.assertTrue(until(lambda: not starter.active('run-1')))
+
+    def test_a_close_waits_for_the_hand_over_to_an_owner_of_a_run_whose_start_has_already_answered(self):
+        """``owner.run`` is a hand-over, and closing waits for it: the lifetime reference of the chooser is held
+        until ``owner.run`` has returned."""
+        store = FakeStore()
+        inside, entered, leave, seen = held_hook(store)
+        self.addCleanup(leave.set)
+
+        class Owner:
+            def run(self, ctx, request, service, record_result, fault_run, settle, release):
+                inside()
+                release()
+        made = self.made(store, drive_owner=lambda ctx, request: Owner())
+        starter, service = self.starter(made, 0)
+        with self.assertRaises(adapter.StartRefused) as caught:
+            starter(dict(DriveOwnerSeamTest.PARAMS))
+        self.assertEqual(caught.exception.code, 'launch_timeout', 'the start has answered; the run\'s own thread goes on')
+        close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), entered, leave)
+        self.assertEqual(seen, [False], 'the store was open for as long as the hand-over lasted')
         self.assertTrue(until(lambda: not starter.active('run-1')))
 
     def test_once_closing_has_begun_a_run_is_refused_before_its_chooser_is_asked(self):

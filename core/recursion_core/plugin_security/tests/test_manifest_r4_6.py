@@ -4,8 +4,8 @@ D0: "take the stricter, fail-closed option that the reviewer's test already enco
 reads as: an entry not in normal form is refused as bad installer configuration, ports outside 1 to
 65535 are refused, and a manual grant is bound to the developer key it was given for. The reviewer's
 four tests (R4 ``fix-6.patch``, Codex GPT-6 Astra, SHA-256 88ad6d6f...) are kept here in their strict
-reading. Raw IP destinations are refused as the recommended answer to a question that is still
-Lucas's (C6's open question); one constant would change if he answers otherwise.
+reading. Raw IP destinations are refused by Lucas's decision B44 (Nov 14, 2026, C6's question): "a
+plugin's manifest may NOT name a raw IP address as a network destination".
 
 Keys are made up: ``K1``/``K2`` are well-formed public keys nothing signs with; the tests that need
 a signature or the revocation store's host op make a fresh key per run and need ``cryptography``.
@@ -14,8 +14,10 @@ a signature or the revocation store's host op make a fresh key per run and need 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
+import socket
 import unittest
 from pathlib import Path
 
@@ -125,13 +127,57 @@ class PortAndAddressTests(unittest.TestCase):
                 self.assertEqual(self.destinations(destination), ("accepted", "accepted"))
 
     def test_raw_ip_destinations_are_refused(self) -> None:
-        for destination in ("127.0.0.1", "127.0.0.1:8765", "127.1", "0x7f.1", "10.0.0.256", "1.2.3.4:443",
-                            "example.0x"):
+        # Lucas's decision B44. The spellings of the marketplace lane's probe (q7_probe.py), each one a
+        # resolver reads as an address, and more: a last label must begin with a letter.
+        for destination in ("10.0.0.1:8443", "203.0.113.5", "127.0.0.1", "169.254.169.254:80", "127.1",
+                            "0x7f.1", "0177.0.0.1", "0x7f.0.0.1", "10.0.0.1:99999", "2130706433", "[::1]:443",
+                            "::1", "127.0.0.1:8765", "10.0.0.256", "1.2.3.4:443", "example.0x", "1.0x7f",
+                            "example.1abc", "localhost"):
             with self.subTest(destination=destination):
                 self.assertEqual(self.destinations(destination), ("manifest_network_destinations",) * 2)
-        for destination in ("1.example", "api.3com.example", "0x7f.example"):
+        for destination in ("api.example.com", "api.example.com:443", "example.com", "x1.example.co",
+                            "123.example.com", "a.b", "1.example", "api.3com.example", "0x7f.example",
+                            "xn--80ak6aa92e.com"):
             with self.subTest(destination=destination):
                 self.assertEqual(self.destinations(destination), ("accepted", "accepted"))
+
+    def test_no_spelling_the_system_resolver_reads_as_ipv4_is_a_destination(self) -> None:
+        # Ties the rule to the platform's own reading: whatever inet_aton takes as an address, the
+        # grammar refuses, alone and with a port. (No name is resolved; inet_aton parses text only.)
+        parts = ("0", "1", "127", "255", "256", "0177", "0x7f", "0x0", "4294967295", "08", "0x")
+        candidates = {".".join(combo) for n in range(1, 5) for combo in itertools.product(parts, repeat=n)}
+        taken = 0
+        for host in sorted(candidates):
+            try:
+                socket.inet_aton(host)
+            except OSError:
+                continue
+            taken += 1
+            self.assertFalse(destination_in_normal_form(host), host)
+            self.assertFalse(destination_in_normal_form(host + ":443"), host)
+            self.assertFalse(host_in_normal_form(host), host)
+        self.assertGreater(taken, 100)
+
+    def test_port_range_edges(self) -> None:
+        for port in ("1", "9", "10", "9999", "10000", "59999", "60000", "64999", "65000", "65499", "65500",
+                     "65529", "65530", "65535"):
+            with self.subTest(port=port):
+                self.assertTrue(destination_in_normal_form("api.example.org:" + port))
+        for port in ("0", "00", "01", "65536", "65539", "65540", "65599", "65600", "65999", "66000", "69999",
+                     "70000", "99999", "100000", "1e3", " 443", "443 "):
+            with self.subTest(port=port):
+                self.assertFalse(destination_in_normal_form("api.example.org:" + port))
+
+    def test_one_expression_decides_a_destination_and_one_a_reserved_host(self) -> None:
+        # The marketplace checker and the plugin schema copy these two patterns; the predicates are
+        # exactly them, so a copy that matches the pattern agrees with the parser.
+        from recursion_core.plugin_security import manifest as m
+        for value in ("api.example.org", "api.example.org:443", "a.b", "127.0.0.1", "api.example.org:0",
+                      "API.example.org", "a" * 64 + ".org", "api.example.org.", "x.y:65535", "x.y:65536"):
+            with self.subTest(value=value):
+                self.assertEqual(destination_in_normal_form(value), m._HOST.fullmatch(value) is not None)
+                self.assertEqual(host_in_normal_form(value), m._HOSTNAME.fullmatch(value) is not None)
+        self.assertTrue(m._HOST.pattern.startswith(m._HOSTNAME.pattern))
 
     def test_a_host_name_is_at_most_253_characters(self) -> None:
         name = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61))
@@ -149,7 +195,14 @@ class PortAndAddressTests(unittest.TestCase):
         self.assertEqual(self.destinations("api." + "b" * 64 + ":443"), ("manifest_network_destinations",) * 2)
 
     def test_the_predicates_refuse_what_is_not_a_string(self) -> None:
-        for value in (None, 443, b"api.venue.example", ["api.venue.example"]):
+        class Text(str):  # a str subclass can change what comparing or matching it means
+            pass
+
+        class Named:
+            def __str__(self) -> str:
+                return "api.venue.example"
+
+        for value in (None, 443, b"api.venue.example", ["api.venue.example"], Text("api.venue.example"), Named()):
             with self.subTest(value=value):
                 self.assertFalse(host_in_normal_form(value))
                 self.assertFalse(destination_in_normal_form(value))

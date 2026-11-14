@@ -16,7 +16,8 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
   manual grant that names none never carries ``order``.
 * Installer configuration is refused unless it is in normal form: a reserved host is a
   lower-case host name with no port, no trailing dot and no IP address; a reserved
-  credential prefix is lower case. A declared destination's port is 1 to 65535.
+  credential prefix is lower case. A declared destination's port is 1 to 65535, and a
+  manifest may not name a raw IP address (Lucas's decision B44, Nov 14, 2026).
 * "Signed" means signed by a key on *this install's* trusted list. A signature by any
   other key, a revoked key, or a malformed signature loads as unsigned; it does not
   refuse the plugin. Verified (the registry's mark) is a label, never a gate.
@@ -92,17 +93,23 @@ _ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 # plugin client can carry a host-only identity (B17, CSL-787).
 RESERVED_PLUGIN_IDS = frozenset({"host"})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
-# A DNS label is 1 to 63 characters. (The vNext pattern, and SPINE's draft copy of it, allowed
-# 64: one character, up to 62, one more.)
+# A host name and a declared destination are one expression each (``_HOSTNAME``, ``_HOST``), so
+# the marketplace checker and the plugin schema can copy them verbatim. Both forms of manifest,
+# and the reserved hosts of install.json, use them:
+# - a label is 1 to 63 characters (the vNext pattern, and SPINE's draft copy, allowed 64);
+# - the last label begins with a letter. That refuses a raw IP address in every spelling a
+#   resolver reads as IPv4 ("10.0.0.1", "127.1", "0x7f.1", "0177.0.0.1", "2130706433"): each ends
+#   in a part that begins with a digit, and no top-level domain does (RFC 3696, section 2). Lucas's
+#   decision B44, Nov 14, 2026: a plugin's manifest may not name a raw IP address. IPv6 never
+#   matches (no ':' inside a host, no '[');
+# - a host name is at most 253 characters (the lookahead);
+# - a port is 1 to 65535, with no sign and no leading zero.
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-_HOSTNAME = re.compile(_LABEL + r"(?:\." + _LABEL + r")+")
-_MAX_HOSTNAME = 253
-# A last label that a URL parser reads as a number makes the whole host an IPv4 address
-# ("127.0.0.1", "127.1", "0x7f.1"): the WHATWG URL standard's "ends in a number" rule.
-_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
-# Normal form: no sign, no leading zero. The range is checked as a number.
-_PORT = re.compile(r"[1-9][0-9]{0,4}")
-_MAX_PORT = 65535
+_LAST_LABEL = r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOST_NAME = r"(?=[a-z0-9.-]{1,253}(?::|$))(?:" + _LABEL + r"\.)+" + _LAST_LABEL
+_PORT_NUMBER = r"(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])"
+_HOSTNAME = re.compile(_HOST_NAME)
+_HOST = re.compile(_HOST_NAME + r"(?::" + _PORT_NUMBER + r")?")
 _CRED = re.compile(r"[a-z][a-z0-9_.:/-]{1,127}")
 # A reserved credential prefix is a prefix of a credential name, in the same lower case.
 _CRED_PREFIX = re.compile(r"[a-z][a-z0-9_.:/-]{0,127}")
@@ -141,21 +148,15 @@ class Manifest:
 
 
 def host_in_normal_form(host: object) -> bool:
-    """True for a lower-case host name of two or more labels, with no port, no trailing
-    dot and no IP address (a raw IP is refused while C6's question to Lucas is open)."""
-    return (type(host) is str and len(host) <= _MAX_HOSTNAME and _HOSTNAME.fullmatch(host) is not None
-            and _NUMERIC_LABEL.fullmatch(host.rpartition(".")[2]) is None)
+    """True for a lower-case host name of two or more labels whose last label begins with a
+    letter: no port, no trailing dot, no IP address (Lucas's decision B44)."""
+    return type(host) is str and _HOSTNAME.fullmatch(host) is not None
 
 
 def destination_in_normal_form(destination: object) -> bool:
     """A host in normal form, optionally ``:port`` with a port from 1 to 65535 and no
-    leading zero."""
-    if type(destination) is not str:
-        return False
-    host, colon, port = destination.partition(":")
-    if not host_in_normal_form(host):
-        return False
-    return not colon or (_PORT.fullmatch(port) is not None and int(port) <= _MAX_PORT)
+    leading zero: exactly ``_HOST``."""
+    return type(destination) is str and _HOST.fullmatch(destination) is not None
 
 
 def _matches(pattern: re.Pattern):
@@ -439,8 +440,8 @@ def _bound_developer_key(grant: Grant) -> str | None:
     return None
 
 
-_RESERVED_SHAPE = ("lower-case host name of two or more labels, no port, no trailing dot, "
-                   "no IP address")
+_RESERVED_SHAPE = ("lower-case host name of two or more labels, the last beginning with a letter; "
+                   "no port, no trailing dot, no IP address")
 
 
 @dataclass(frozen=True)

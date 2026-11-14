@@ -31,6 +31,10 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   Delete, Shift+Tab, F1 to F12, with Ctrl/Alt/Shift modifiers), `alt+<key>` for ESC and a key,
   `ctrl+<letter>` for control characters, a lone Esc after a short wait (`ESC_WAIT_S`, 50 ms), and a
   bracketed paste as one `Paste` event. A sequence that names no key is dropped, never read as Esc.
+- `keymap.py`: one table of action ids (`ACTIONS`), default bindings by context (`global`, `runs`,
+  `output`, `command`, `help`), a matcher with a leader (`Ctrl+X`) and no timers (within a context no
+  binding is a prefix of another; a pending sequence waits for its next key, Esc cancels it), and the
+  binding file. Each action names its `--plain` command, or why the linear renderer needs none.
 - `view.py`: a frame is a list of `(text, style)` rows. It renders as plain text, as one full-screen
   ANSI repaint, or through `InlinePainter`. Colour is only decoration and is off under `NO_COLOR`.
 - `term.py`: the terminal driver. Its three modes all read the same log:
@@ -60,6 +64,31 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   anything. Closing (`q`, Ctrl-C, or the terminal ending input) sends nothing and exits 0; runs keep
   going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
   stderr with exit 1, as in the CLI.
+- Keys (all from the keymap, so a binding file can change them; `?` lists the ones in force, and the
+  prompt row's hints follow the keymap):
+  - run list: `j`/`k` or arrows select, `a`/Enter attach, `r` refresh, `s` stop (asks `y`), `Tab` the
+    output pager, `?` keys, `:` or `/` the command line, `q` or `Ctrl+D Ctrl+D` close (runs keep going);
+  - leader `Ctrl+X`, then: `k` stop (asks `y`), `r` refresh, `n` the command line with `start `, `c` the
+    conditions again, `q` close. While a sequence waits, the prompt row lists what can follow; Esc
+    cancels it, and an unbound key after `Ctrl+X` is said and does nothing;
+  - output pager: `j`/`k` a line, `Ctrl+D`/`Ctrl+U` or Page Down/Up half a page, `g g`/Home the oldest
+    line kept, `G`/End the newest (and follow), `/` search older lines (case-insensitive unless the
+    pattern has a capital), `n`/`N` the next older or newer match, `Tab`, Esc or `q` back to the run list;
+  - Esc only cancels local UI (a line, the help, a pending sequence, the pager focus, a Stop
+    confirmation); it never sends anything. No key approves anything, there is no `Ctrl+Y`, and no global
+    `Ctrl+P`.
+- Commands (`:` or `/`, and `--plain`): the CLI's `list` (also `runs`), `status RUN`, `stop RUN`,
+  `start ...`, `conditions`, and the TUI's own `help` (also `keys`) and `quit`, which send nothing. A
+  leading `/` is accepted.
+- The binding file: `$XDG_CONFIG_HOME/recursion/tui-keys.toml` (or `~/.config/...`), or `--keys FILE`;
+  `--print-keys` prints the defaults to start from. `version = 1`, an optional `leader`, a table per
+  context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action
+  id as the value, `"none"` to remove a default), and `[safety]`, which can only make the fixed rules
+  stricter: it may add keys to `never_bind` and restate `confirm_stop`, `esc_never_sends`,
+  `plugins_under_leader_p` and `no_key_approves` as `true`. Plugin actions (`plugin.<plugin>.<command>`)
+  are bound only under `<leader> p`; until a plugin host exists, pressing one says so and sends nothing. A
+  file that cannot be read, or that loosens `[safety]`, is not used at all; a refused binding is skipped.
+  Either way the reason is shown as an error when the TUI opens.
 - The `:` command line has a cursor: left, right, Home and End move it (it is drawn as `▏` when it is
   not at the end), Backspace deletes before it and Delete at it, Esc leaves the line, Enter sends it.
   Bracketed paste is on while the TUI runs: a paste goes into the command line whole, at the cursor,
@@ -99,7 +128,7 @@ does not add them.
 
 ## Running it against the daemon
 
-`python -m recursion_core.control.tui [--plain | --screen-reader] [--no-alt-screen] [--no-color]` hands
+`python -m recursion_core.control.tui [--plain | --screen-reader] [--no-alt-screen] [--no-color] [--keys FILE] [--print-keys]` hands
 `term.main` the control package's socket client (`control/client.py` `SocketAPI`, the daemon's owner-only
 Unix socket), the same factory the CLI uses, so `start`, `list`, `status` and `stop` act on the running
 daemon. The entry point lives in `control/` because this package's import boundary allows no transport.

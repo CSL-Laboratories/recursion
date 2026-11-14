@@ -37,13 +37,46 @@ from typing import TextIO
 
 from recursion_core.tui.app import Loop, TuiApp
 from recursion_core.tui.events import speech_lines
+from recursion_core.tui.keymap import Keymap, default_toml, load
 from recursion_core.tui.keys import ESC_WAIT_S, Key, KeyDecoder
 from recursion_core.tui.view import InlinePainter, to_ansi
 
 PASTE_ON, PASTE_OFF = "\x1b[?2004h", "\x1b[?2004l"  # bracketed paste mode (xterm), off again on every exit
 READ_BYTES = 4096
-FLAGS = {"--plain": "plain", "--screen-reader": "plain", "--no-alt-screen": "no_alt_screen", "--no-color": "no_color"}
-USAGE = "usage: recursion-tui [--plain | --screen-reader] [--no-alt-screen] [--no-color]"
+FLAGS = {"--plain": "plain", "--screen-reader": "plain", "--no-alt-screen": "no_alt_screen", "--no-color": "no_color",
+         "--print-keys": "print_keys"}
+USAGE = ("usage: recursion-tui [--plain | --screen-reader] [--no-alt-screen] [--no-color] [--keys FILE] "
+         "[--print-keys]")
+KEYS_FILE = ("recursion", "tui-keys.toml")  # under $XDG_CONFIG_HOME, or ~/.config
+
+
+def keys_path(environ: Mapping[str, str]) -> str | None:
+    """Where the user's binding file is looked for when ``--keys`` is not given (it may not exist)."""
+
+    base = environ.get("XDG_CONFIG_HOME") or (os.path.join(environ["HOME"], ".config") if environ.get("HOME") else "")
+    return os.path.join(base, *KEYS_FILE) if base else None
+
+
+def load_keymap(path: str | None, *, explicit: bool) -> Keymap:
+    """The defaults with the binding file at ``path`` applied. A missing default file is no file; a file
+    named with ``--keys`` that cannot be read is said, and the defaults are used."""
+
+    if path is None:
+        return Keymap.default()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        if not explicit:
+            return Keymap.default()
+        km = Keymap.default()
+        km.notes.append(f"binding file not used: {path} does not exist")
+        return km
+    except (OSError, UnicodeDecodeError) as err:
+        km = Keymap.default()
+        km.notes.append(f"binding file not used: {path} could not be read ({type(err).__name__})")
+        return km
+    return load(text)
 
 
 class LogReader:
@@ -60,12 +93,13 @@ class LogReader:
 
 
 def plain(api, stdin: Iterable[str], stdout: TextIO, environ: Mapping[str, str],
-          clock: Callable[[], float] = time.monotonic, app: TuiApp | None = None) -> int:
+          clock: Callable[[], float] = time.monotonic, app: TuiApp | None = None,
+          keymap: Keymap | None = None) -> int:
     """Linear renderer: each input line is a command; each logged event is said once, in order.
 
     A condition is said when it appears, changes or clears; ``conditions`` says the current set again."""
 
-    app = app or TuiApp(api, clock=clock, environ=environ)
+    app = app or TuiApp(api, clock=clock, environ=environ, keymap=keymap)
     reader = LogReader(app)
 
     def flush() -> None:
@@ -76,13 +110,14 @@ def plain(api, stdin: Iterable[str], stdout: TextIO, environ: Mapping[str, str],
     flush()
     for raw in stdin:
         line = raw.strip()
-        if line in ("q", "quit", "exit"):
+        if line.removeprefix("/") in ("q", "quit", "exit"):
             break
         if line:
             app.sync_conditions()  # a condition that appeared with time alone is said before the answer
             app.command(line)
             flush()
-    app.close()
+    if not app.closed:
+        app.close()
     flush()
     return 0
 
@@ -170,12 +205,13 @@ class Tty:
 
 
 def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, alt_screen: bool = True,
-                on_app: Callable[[TuiApp], None] | None = None, stderr: TextIO | None = None) -> int:
+                on_app: Callable[[TuiApp], None] | None = None, stderr: TextIO | None = None,
+                keymap: Keymap | None = None) -> int:
     def size() -> tuple[int, int]:  # polled every tick: a resize gets a frame that fits (no signal handler)
         now = terminal.size()
         return now.columns, now.lines
 
-    app = TuiApp(api, clock=time.monotonic, environ=environ, width=size()[0], height=size()[1])
+    app = TuiApp(api, clock=time.monotonic, environ=environ, width=size()[0], height=size()[1], keymap=keymap)
     if on_app is not None:
         on_app(app)
 
@@ -231,13 +267,25 @@ def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: Te
          clock: Callable[[], float] = time.monotonic, terminal=None, stderr: TextIO | None = None) -> int:
     stdin, stdout, stderr = stdin or sys.stdin, stdout or sys.stdout, stderr or sys.stderr
     environ = os.environ if environ is None else environ
-    unknown = [a for a in argv if a not in FLAGS]
+    args, keys_file, unknown = list(argv), None, []
+    while args:
+        arg = args.pop(0)
+        if arg == "--keys" and args:
+            keys_file = args.pop(0)
+        elif arg.startswith("--keys="):
+            keys_file = arg[len("--keys="):]
+        elif arg not in FLAGS:
+            unknown.append(arg)
     if unknown:  # diagnostics go to stderr, never into the transcript stream
         print(f"usage error: unrecognized arguments: {' '.join(unknown)}; {USAGE}", file=stderr)
         return 2
-    modes = {FLAGS[a] for a in argv}
+    modes = {FLAGS[a] for a in argv if a in FLAGS}
+    if "print_keys" in modes:  # the default binding file, to copy and edit; reads nothing, sends nothing
+        stdout.write(default_toml())
+        return 0
     if "no_color" in modes:
         environ = {**environ, "NO_COLOR": "1"}
+    keymap = load_keymap(keys_file or keys_path(environ), explicit=keys_file is not None)
     if api_factory is None:
         print("status=control_api_unavailable: no control API client was given; nothing sent", file=stderr)
         return 1
@@ -254,11 +302,11 @@ def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: Te
         return bool(getattr(stream, "isatty", lambda: False)())
 
     if "plain" in modes or environ.get("TERM") == "dumb" or not (is_tty(stdin) and is_tty(stdout)):
-        return plain(api, stdin, stdout, environ, clock)
+        return plain(api, stdin, stdout, environ, clock, keymap=keymap)
     try:
         terminal = terminal or Tty(stdin)
     except TerminalUnsupported as exc:
         print(f"status={exc}; nothing sent; --plain works without it", file=stderr)
         return 1
     return interactive(api, stdout, environ, terminal, alt_screen="no_alt_screen" not in modes,
-                       stderr=stderr)
+                       stderr=stderr, keymap=keymap)

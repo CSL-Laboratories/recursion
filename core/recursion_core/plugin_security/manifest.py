@@ -1,9 +1,22 @@
-"""Redesigned plugin manifest (``csl-plugin-manifest/vNext``), trust store and grants.
+"""Plugin manifests (``csl-plugin-manifest/1`` and ``/vNext``), trust store and grants.
 
 PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
 
 * The developer signs the canonical manifest bytes with their own Ed25519 key. The
   manifest carries the artifact's SHA-256, so the signature covers the code.
+* Two forms are read. ``csl-plugin-manifest/1`` (SPINE's draft schema
+  ``schemas/plugin/v1/manifest.v1.json``) adds ``runtime``, ``interface`` and ``files``:
+  every file of the package with its SHA-256, so the signed bytes name the whole package.
+  ``csl-plugin-manifest/vNext`` names ``plugin.py`` only; Lucas's rule (Nov 11, 2026) is
+  that such a signature is not enough for non-paper authority. Parsing ``files`` does not
+  verify the package: that is ``verify_package`` (lane PLUGIN-SIGN, next slice), and the
+  loader imports only ``plugin.py`` until it uses it.
+* Grants are bound to the developer key they were given for (review R4, finding 6, under
+  Lucas's D0, Nov 12, 2026): a grant naming another developer key grants nothing, and a
+  manual grant that names none never carries ``order``.
+* Installer configuration is refused unless it is in normal form: a reserved host is a
+  lower-case host name with no port, no trailing dot and no IP address; a reserved
+  credential prefix is lower case. A declared destination's port is 1 to 65535.
 * "Signed" means signed by a key on *this install's* trusted list. A signature by any
   other key, a revoked key, or a malformed signature loads as unsigned; it does not
   refuse the plugin. Verified (the registry's mark) is a label, never a gate.
@@ -31,33 +44,71 @@ from .errors import Refused
 from .signing import key_id, parse_public_key, verify
 
 __all__ = [
+    "ENTRY_FILE",
     "MANIFEST_SCHEMA",
+    "MANIFEST_SCHEMA_V1",
     "PERMISSIONS",
+    "PERMISSIONS_V1",
     "Grant",
     "Manifest",
     "ReservedEffects",
     "TrustStore",
     "create_revocation_store",
+    "destination_in_normal_form",
     "effective_permissions",
+    "host_in_normal_form",
     "parse_manifest",
 ]
 
+# The form whose signature covers plugin.py only. Still read; not enough for non-paper
+# authority (Lucas, Nov 11, 2026: sign the whole package first).
 MANIFEST_SCHEMA = "csl-plugin-manifest/vNext"
+# The form that names every file of the package (SPINE's manifest.v1.json, a draft).
+MANIFEST_SCHEMA_V1 = "csl-plugin-manifest/1"
 # Canonical permission order. Requests must list permissions in this order, so the
-# signed bytes for one permission set are unique.
+# signed bytes for one permission set are unique. These seven are also what a grant in
+# install.json may name today (daemon/plugins.py, read_install).
 PERMISSIONS = ("read", "propose", "panel", "network", "credential", "process", "order")
+# Version 1 only appends: an existing name never changes its place, so the signed bytes
+# for an existing set never change. The five new names and their order are PROVISIONAL
+# until Lucas answers DEC F12 (schemas/plugin/v1/README.md); a vNext manifest refuses them.
+PERMISSIONS_V1 = PERMISSIONS + ("surface", "command", "subscribe", "tool", "run")
+_RUNTIMES_V1 = frozenset({"python-inprocess/1"})   # ordinary Python in the daemon: not contained
+_INTERFACES_V1 = frozenset({"csl-plugin-api/1"})
+# The file the loader runs; its digest is artifact_sha256 (daemon/plugins.py, ARTIFACT).
+ENTRY_FILE = "plugin.py"
+# The signature's own envelope. The manifest cannot name its own digest, so neither file
+# may be listed in ``files``, under any case.
+_ENVELOPE_FILES = frozenset({"manifest.json", "manifest.sig"})
+_MAX_FILES, _MAX_PATH, _MAX_SEGMENT = 4096, 512, 255
 _FIELDS = frozenset({
     "schema", "plugin_id", "version", "artifact_sha256", "dependency_lock_sha256",
     "install_scripts", "developer_key", "permissions", "network_destinations",
     "credential_refs",
 })
+_FIELDS_V1 = _FIELDS | {"runtime", "interface", "files"}
 _ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 # Caller names the core binds for itself. A plugin manifest may never claim one, so no
 # plugin client can carry a host-only identity (B17, CSL-787).
 RESERVED_PLUGIN_IDS = frozenset({"host"})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
-_HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+(:[0-9]{1,5})?")
+# A DNS label is 1 to 63 characters. (The vNext pattern, and SPINE's draft copy of it, allowed
+# 64: one character, up to 62, one more.)
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME = re.compile(_LABEL + r"(?:\." + _LABEL + r")+")
+_MAX_HOSTNAME = 253
+# A last label that a URL parser reads as a number makes the whole host an IPv4 address
+# ("127.0.0.1", "127.1", "0x7f.1"): the WHATWG URL standard's "ends in a number" rule.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+# Normal form: no sign, no leading zero. The range is checked as a number.
+_PORT = re.compile(r"[1-9][0-9]{0,4}")
+_MAX_PORT = 65535
 _CRED = re.compile(r"[a-z][a-z0-9_.:/-]{1,127}")
+# A reserved credential prefix is a prefix of a credential name, in the same lower case.
+_CRED_PREFIX = re.compile(r"[a-z][a-z0-9_.:/-]{0,127}")
+_SCRIPT = re.compile(r"[ -~]{1,200}")
+_VERSION_V1 = re.compile(r"[ -~]{1,64}")
+_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
 
 
 @dataclass(frozen=True)
@@ -72,28 +123,107 @@ class Manifest:
     network_destinations: tuple
     credential_refs: tuple
     raw: bytes = field(repr=False)
+    schema: str = MANIFEST_SCHEMA
+    # Version 1 only (None for vNext). ``files`` is ``((path, sha256), ...)`` in path order;
+    # a vNext manifest names no file but plugin.py, through ``artifact_sha256``.
+    runtime: str | None = None
+    interface: str | None = None
+    files: tuple = ()
+
+    @property
+    def names_every_file(self) -> bool:
+        """True when the signed bytes list every file of the package (version 1).
+
+        A statement about the manifest, not about the package on disk: only
+        ``verify_package`` shows that the files match it.
+        """
+        return self.schema == MANIFEST_SCHEMA_V1
 
 
-def _str_list(value: object, pattern: re.Pattern, code: str, ordered: bool = True) -> tuple:
-    if type(value) is not list or any(type(v) is not str or not pattern.fullmatch(v) for v in value):
+def host_in_normal_form(host: object) -> bool:
+    """True for a lower-case host name of two or more labels, with no port, no trailing
+    dot and no IP address (a raw IP is refused while C6's question to Lucas is open)."""
+    return (type(host) is str and len(host) <= _MAX_HOSTNAME and _HOSTNAME.fullmatch(host) is not None
+            and _NUMERIC_LABEL.fullmatch(host.rpartition(".")[2]) is None)
+
+
+def destination_in_normal_form(destination: object) -> bool:
+    """A host in normal form, optionally ``:port`` with a port from 1 to 65535 and no
+    leading zero."""
+    if type(destination) is not str:
+        return False
+    host, colon, port = destination.partition(":")
+    if not host_in_normal_form(host):
+        return False
+    return not colon or (_PORT.fullmatch(port) is not None and int(port) <= _MAX_PORT)
+
+
+def _matches(pattern: re.Pattern):
+    return lambda value: type(value) is str and pattern.fullmatch(value) is not None
+
+
+def _str_list(value: object, ok, code: str, ordered: bool = True) -> tuple:
+    if type(value) is not list:
         raise Refused(code)
-    if len(set(value)) != len(value) or (ordered and value != sorted(value)):
+    items = tuple(value)  # one snapshot: every check below reads the same items
+    if not all(ok(v) for v in items):
+        raise Refused(code)
+    if len(set(items)) != len(items) or (ordered and list(items) != sorted(items)):
         raise Refused(code, "must be unique and sorted")
-    return tuple(value)
+    return items
+
+
+def _parse_files(value: object, artifact: str) -> tuple:
+    """``files`` of a version 1 manifest: safe relative paths to SHA-256, the entry file
+    with the artifact's digest, and no two paths that one file system could confuse."""
+    if type(value) is not dict or not 1 <= len(value) <= _MAX_FILES:
+        raise Refused("manifest_files", "1 to %d entries" % _MAX_FILES)
+    entries = tuple(value.items())
+    folded: dict[str, str] = {}
+    for path, digest in entries:
+        if (type(path) is not str or len(path) > _MAX_PATH or not _PATH.fullmatch(path)
+                or any(len(segment) > _MAX_SEGMENT for segment in path.split("/"))):
+            raise Refused("manifest_files_path",
+                          "a relative path of letters, digits, '_', '.' and '-', no segment "
+                          "starting with a dot, at most %d characters" % _MAX_PATH)
+        lowered = path.lower()
+        if lowered.split("/", 1)[0] in _ENVELOPE_FILES:
+            raise Refused("manifest_files_envelope", path)
+        if type(digest) is not str or not _HEX64.fullmatch(digest):
+            raise Refused("manifest_files_digest", path)
+        if lowered in folded:
+            raise Refused("manifest_files_conflict", "%s and %s differ only in case" % (folded[lowered], path))
+        folded[lowered] = path
+    for lowered, path in folded.items():
+        parts = lowered.split("/")
+        for depth in range(1, len(parts)):
+            parent = "/".join(parts[:depth])
+            if parent in folded:
+                raise Refused("manifest_files_conflict", "%s is a file and a folder of %s" % (folded[parent], path))
+    if value.get(ENTRY_FILE) != artifact:
+        raise Refused("manifest_files_entry", "%s must be listed with artifact_sha256" % ENTRY_FILE)
+    return tuple(sorted(entries))
 
 
 def parse_manifest(raw: bytes) -> Manifest:
-    """Parse and check manifest bytes. Refuses anything malformed; never guesses."""
+    """Parse and check manifest bytes, either form. Refuses anything malformed; never guesses.
+
+    ``csl-plugin-manifest/1`` is told apart by its ``schema``; anything else is read as
+    vNext, exactly as before, so a vNext manifest's refusals are unchanged.
+    """
     data = parse(raw)
-    if type(data) is not dict or set(data) != _FIELDS:
+    v1 = type(data) is dict and data.get("schema") == MANIFEST_SCHEMA_V1
+    if type(data) is not dict or set(data) != (_FIELDS_V1 if v1 else _FIELDS):
         raise Refused("manifest_fields")
-    if data["schema"] != MANIFEST_SCHEMA:
+    if data["schema"] != (MANIFEST_SCHEMA_V1 if v1 else MANIFEST_SCHEMA):
         raise Refused("manifest_schema")
+    order = PERMISSIONS_V1 if v1 else PERMISSIONS
     if type(data["plugin_id"]) is not str or not _ID.fullmatch(data["plugin_id"]):
         raise Refused("manifest_plugin_id")
     if data["plugin_id"] in RESERVED_PLUGIN_IDS:
         raise Refused("manifest_plugin_id_reserved")
-    if type(data["version"]) is not str or not 0 < len(data["version"]) <= 64:
+    version = data["version"]
+    if type(version) is not str or not 0 < len(version) <= 64 or (v1 and not _VERSION_V1.fullmatch(version)):
         raise Refused("manifest_version")
     if type(data["artifact_sha256"]) is not str or not _HEX64.fullmatch(data["artifact_sha256"]):
         raise Refused("manifest_artifact_digest")
@@ -102,20 +232,28 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_dependency_lock")
     parse_public_key(data["developer_key"])
     perms = data["permissions"]
-    if type(perms) is not list or any(p not in PERMISSIONS for p in perms):
+    if type(perms) is not list or any(p not in order for p in perms):
         raise Refused("manifest_unknown_permission")
-    if len(set(perms)) != len(perms) or perms != sorted(perms, key=PERMISSIONS.index):
+    if len(set(perms)) != len(perms) or perms != sorted(perms, key=order.index):
         raise Refused("manifest_permission_order")
-    nets = _str_list(data["network_destinations"], _HOST, "manifest_network_destinations")
-    creds = _str_list(data["credential_refs"], _CRED, "manifest_credential_refs")
+    nets = _str_list(data["network_destinations"], destination_in_normal_form, "manifest_network_destinations")
+    creds = _str_list(data["credential_refs"], _matches(_CRED), "manifest_credential_refs")
     if bool(nets) != ("network" in perms):
         raise Refused("manifest_network_mismatch")
     if bool(creds) != ("credential" in perms):
         raise Refused("manifest_credential_mismatch")
-    scripts = _str_list(data["install_scripts"], re.compile(r"[ -~]{1,200}"), "manifest_install_scripts",
-                        ordered=False)
-    return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
-                    data["developer_key"], tuple(perms), nets, creds, raw)
+    scripts = _str_list(data["install_scripts"], _matches(_SCRIPT), "manifest_install_scripts", ordered=False)
+    if not v1:
+        return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
+                        data["developer_key"], tuple(perms), nets, creds, raw)
+    if type(data["runtime"]) is not str or data["runtime"] not in _RUNTIMES_V1:
+        raise Refused("manifest_runtime", "only python-inprocess/1 is defined")
+    if type(data["interface"]) is not str or data["interface"] not in _INTERFACES_V1:
+        raise Refused("manifest_interface", "only csl-plugin-api/1 is defined")
+    files = _parse_files(data["files"], data["artifact_sha256"])
+    return Manifest(data["plugin_id"], version, data["artifact_sha256"], lock, scripts,
+                    data["developer_key"], tuple(perms), nets, creds, raw, MANIFEST_SCHEMA_V1,
+                    data["runtime"], data["interface"], files)
 
 
 _REVOCATION_MAGIC = "csl-revocation-store/v0"
@@ -283,14 +421,56 @@ class Grant:
     # equal to ``TrustStore.generation`` for that key (the ``key.revoke`` result).
     order_after_revoked_key: str | None = None
     order_after_revocation_generation: int | None = None
+    # The developer key id the manifest named when the user made this grant (R4 finding 6,
+    # under D0: a manual grant is bound to the developer key it was given for). A grant
+    # naming another key grants nothing. A manual grant (signer_key_id None) that names no
+    # key here may still be bound by ``order_after_revoked_key``, which names the key the
+    # user turned order back on for; with neither it is unbound and never carries order,
+    # and on a version 1 manifest it grants nothing.
+    developer_key_id: str | None = None
+
+
+def _bound_developer_key(grant: Grant) -> str | None:
+    """The developer key id a grant is bound to, or None when it names none."""
+    if grant.developer_key_id is not None:
+        return grant.developer_key_id
+    if grant.signer_key_id is None:
+        return grant.order_after_revoked_key
+    return None
+
+
+_RESERVED_SHAPE = ("lower-case host name of two or more labels, no port, no trailing dot, "
+                   "no IP address")
 
 
 @dataclass(frozen=True)
 class ReservedEffects:
-    """Credentials and destinations only an effect owner may hold (injected; consumer-neutral)."""
+    """Credentials and destinations only an effect owner may hold (injected; consumer-neutral).
+
+    Every entry must be in normal form (D0, Nov 12, 2026): an entry a destination could
+    never equal would reserve nothing, so it is refused as bad installer configuration
+    (``plugin_install_config_invalid``), never normalised and never kept.
+    """
 
     hosts: frozenset = frozenset()
     credential_prefixes: tuple = ()
+
+    def __post_init__(self) -> None:
+        if (type(self.hosts) not in (frozenset, set, tuple, list)
+                or type(self.credential_prefixes) not in (frozenset, set, tuple, list)):
+            raise Refused("plugin_install_config_invalid", "reserved: hosts and credential_prefixes are lists")
+        hosts, prefixes = tuple(self.hosts), tuple(self.credential_prefixes)  # one snapshot each
+        for host in hosts:
+            if not host_in_normal_form(host):
+                raise Refused("plugin_install_config_invalid",
+                              "reserved host %s is not in normal form (%s)" % (ascii(host)[:100], _RESERVED_SHAPE))
+        for prefix in prefixes:
+            if type(prefix) is not str or not _CRED_PREFIX.fullmatch(prefix):
+                raise Refused("plugin_install_config_invalid",
+                              "reserved credential prefix %s is not in normal form (lower case, as a "
+                              "credential name begins)" % ascii(prefix)[:100])
+        object.__setattr__(self, "hosts", frozenset(hosts))
+        object.__setattr__(self, "credential_prefixes", prefixes)
 
     def host_reserved(self, destination: str) -> bool:
         host = destination.split(":", 1)[0]
@@ -321,6 +501,13 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
     Naming the key alone covers the first revocation (generation 1). A later revocation
     stays off until the grant's ``order_after_revocation_generation`` equals
     ``revocation_generation`` (PRODUCT.md 4.4). ``None`` means generation 1.
+
+    The grant is also bound to the developer key it was given for (R4 finding 6, D0): a
+    grant whose bound key (``_bound_developer_key``) is not the manifest's developer key
+    grants nothing, so rewriting an unsigned manifest under another key does not carry a
+    manual grant (or escape that key's revocation). A manual grant bound to no key cannot
+    show which key it was for: it never carries ``order``, and on a version 1 manifest,
+    which the install commands always bind, it grants nothing.
     """
     dropped: list[tuple[str, str]] = []
     if grant is None:
@@ -329,8 +516,14 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
         return (), [("grant_artifact_mismatch", "grant is for another artifact; grant again")]
     if grant.signer_key_id != signer_key_id:
         return (), [("grant_signer_mismatch", "grant is for another signer; grant again")]
+    bound = _bound_developer_key(grant)
+    if bound is not None and bound != key_id(manifest.developer_key):
+        return (), [("grant_developer_key_mismatch", "grant is for another developer key; grant again")]
+    unbound_manual = grant.signer_key_id is None and bound is None
+    if unbound_manual and manifest.schema == MANIFEST_SCHEMA_V1:
+        return (), [("grant_developer_key_missing", "manual grant names no developer key; grant again")]
     out = []
-    for perm in PERMISSIONS:
+    for perm in PERMISSIONS_V1:
         if perm not in manifest.permissions:
             continue
         if perm not in grant.permissions:
@@ -344,5 +537,8 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
             if type(generation) is not int or not _order_cites_this_revocation(grant, revoked_key_id, generation):
                 dropped.append(("signer_key_revoked_order_off", revoked_key_id))
                 continue
+        if perm == "order" and unbound_manual:
+            dropped.append(("manual_grant_not_bound_to_developer_key", perm))
+            continue
         out.append(perm)
     return tuple(out), dropped

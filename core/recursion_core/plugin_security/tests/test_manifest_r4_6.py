@@ -1,0 +1,290 @@
+"""Review R4, finding 6, under Lucas's D0 (Nov 12, 2026): normal form, ports, grants bound to a key.
+
+D0: "take the stricter, fail-closed option that the reviewer's test already encodes", which lane C6
+reads as: an entry not in normal form is refused as bad installer configuration, ports outside 1 to
+65535 are refused, and a manual grant is bound to the developer key it was given for. The reviewer's
+four tests (R4 ``fix-6.patch``, Codex GPT-6 Astra, SHA-256 88ad6d6f...) are kept here in their strict
+reading. Raw IP destinations are refused as the recommended answer to a question that is still
+Lucas's (C6's open question); one constant would change if he answers otherwise.
+
+Keys are made up: ``K1``/``K2`` are well-formed public keys nothing signs with; the tests that need
+a signature or the revocation store's host op make a fresh key per run and need ``cryptography``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import unittest
+from pathlib import Path
+
+from recursion_core.plugin_security.canonical import canonical
+from recursion_core.plugin_security.errors import Refused
+from recursion_core.plugin_security.loader import CoreHealth, PluginLoader
+from recursion_core.plugin_security.manifest import (
+    Grant, ReservedEffects, TrustStore, destination_in_normal_form, effective_permissions,
+    host_in_normal_form, parse_manifest,
+)
+from recursion_core.plugin_security.signing import key_id
+from recursion_core.plugin_security.tests.support import (
+    PLUGIN_SOURCE, FakeGilProbe, Key, World, manifest_bytes, needs_crypto, temp_dir,
+)
+from recursion_core.plugin_security.tests.test_manifest_v1 import v1
+
+K1, K2 = "11" * 32, "22" * 32
+DIGEST = hashlib.sha256(PLUGIN_SOURCE).hexdigest()
+ALL = ("read", "propose", "order")
+INSTALL_CONFIG = "plugin_install_config_invalid"
+
+
+def refusal(call, *args, **kwargs) -> str:
+    try:
+        call(*args, **kwargs)
+    except Refused as exc:
+        return exc.code
+    return "accepted"
+
+
+class ReservedNormalFormTests(unittest.TestCase):
+    def test_reserved_host_aliases_are_refused_as_installer_configuration(self) -> None:
+        # R4 fix-6: "rejected or still block the destination"; D0 takes "rejected".
+        for host in ("Venue.Example", "api.venue.example:443", "venue.example.", "127.0.0.1", "10.0.0.1:80",
+                     "0x7f.1", "venue.0x", "localhost", "", " venue.example", "venue..example",
+                     "-venue.example", "venue.example/", "*.venue.example", "venue_x.example",
+                     "a" * 64 + ".example", None, 5, b"venue.example"):
+            with self.subTest(host=host):
+                self.assertEqual(refusal(ReservedEffects, hosts=frozenset({host})), INSTALL_CONFIG)
+
+    def test_uppercase_or_malformed_credential_prefix_is_refused(self) -> None:
+        for prefix in ("VENUE:", "Venue/", "", ":venue", " venue", "venue key", "v" * 129, None, b"venue:"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(refusal(ReservedEffects, credential_prefixes=(prefix,)), INSTALL_CONFIG)
+
+    def test_entries_in_normal_form_reserve_the_host_its_subdomains_and_prefixed_names(self) -> None:
+        policy = ReservedEffects(frozenset({"venue.example"}), ("venue:", "v"))
+        for destination, reserved in (("venue.example", True), ("api.venue.example:443", True),
+                                      ("othervenue.example", False), ("venue.example.org", False)):
+            with self.subTest(destination=destination):
+                self.assertIs(policy.host_reserved(destination), reserved)
+        self.assertTrue(policy.credential_reserved("venue:secret"))
+        self.assertTrue(policy.credential_reserved("vault/x"))
+        self.assertFalse(ReservedEffects(credential_prefixes=("venue:",)).credential_reserved("other:secret"))
+
+    def test_lists_are_taken_once_and_held_immutably(self) -> None:
+        hosts, prefixes = ["venue.example"], ["venue:"]
+        policy = ReservedEffects(hosts, prefixes)
+        hosts.append("Bad.Example")
+        prefixes.append("BAD")
+        self.assertEqual((policy.hosts, policy.credential_prefixes), (frozenset({"venue.example"}), ("venue:",)))
+        self.assertIs(type(policy.hosts), frozenset)
+        self.assertEqual(ReservedEffects(), ReservedEffects(frozenset(), ()))
+
+    def test_a_string_or_mapping_in_place_of_a_list_is_refused(self) -> None:
+        # A string is iterable: "venue.example" would otherwise reserve its single letters.
+        for value in ("venue.example", {"venue.example": True}, None, 3):
+            with self.subTest(value=value):
+                self.assertEqual(refusal(ReservedEffects, hosts=value), INSTALL_CONFIG)
+                self.assertEqual(refusal(ReservedEffects, credential_prefixes=value), INSTALL_CONFIG)
+        # Every letter of "venue" is itself a prefix in normal form, so only the type check refuses it.
+        self.assertEqual(refusal(ReservedEffects, credential_prefixes="venue"), INSTALL_CONFIG)
+
+    @unittest.skipUnless(os.name == "posix", "the daemon's plugin reader opens files with O_NOFOLLOW (Linux)")
+    def test_the_daemon_refuses_an_install_file_with_a_reserved_entry_not_in_normal_form(self) -> None:
+        from recursion_core.daemon.plugins import read_install  # PLUGIN-HOST's reader, unchanged
+        directory = Path(temp_dir(self))
+        for reserved in ({"hosts": ["Venue.Example"]}, {"hosts": ["venue.example:443"]},
+                         {"credential_prefixes": ["VENUE:"]}):
+            with self.subTest(reserved=reserved):
+                path = directory / "install.json"
+                path.write_text(json.dumps({"reserved": reserved}))
+                os.chmod(path, 0o600)
+                self.assertEqual(refusal(read_install, directory), INSTALL_CONFIG)
+        path.write_text(json.dumps({"reserved": {"hosts": ["venue.example"], "credential_prefixes": ["venue:"]}}))
+        self.assertEqual(read_install(directory)["reserved"].hosts, frozenset({"venue.example"}))
+
+
+class PortAndAddressTests(unittest.TestCase):
+    def destinations(self, *destinations: str):
+        """The refusal code for each form of manifest declaring these destinations."""
+        perms = ("read", "network")
+        return (refusal(parse_manifest, manifest_bytes(K1, permissions=perms, network=destinations)),
+                refusal(parse_manifest, v1(K1, permissions=perms, network=destinations)))
+
+    def test_out_of_range_or_unnormal_ports_are_refused(self) -> None:
+        # R4 fix-6 tests 0 and 99999; normal form also refuses a leading zero, a sign and an empty port.
+        for port in ("0", "99999", "65536", "100000", "00443", "0443", "+443", "-1", "", "44a", "443:1"):
+            with self.subTest(port=port):
+                self.assertEqual(self.destinations("api.venue.example:" + port),
+                                 ("manifest_network_destinations",) * 2)
+
+    def test_ports_in_range_are_accepted(self) -> None:
+        for destination in ("api.venue.example:1", "api.venue.example:443", "api.venue.example:65535",
+                            "api.venue.example"):
+            with self.subTest(destination=destination):
+                self.assertEqual(self.destinations(destination), ("accepted", "accepted"))
+
+    def test_raw_ip_destinations_are_refused(self) -> None:
+        for destination in ("127.0.0.1", "127.0.0.1:8765", "127.1", "0x7f.1", "10.0.0.256", "1.2.3.4:443",
+                            "example.0x"):
+            with self.subTest(destination=destination):
+                self.assertEqual(self.destinations(destination), ("manifest_network_destinations",) * 2)
+        for destination in ("1.example", "api.3com.example", "0x7f.example"):
+            with self.subTest(destination=destination):
+                self.assertEqual(self.destinations(destination), ("accepted", "accepted"))
+
+    def test_a_host_name_is_at_most_253_characters(self) -> None:
+        name = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61))
+        self.assertEqual(len(name), 253)
+        self.assertTrue(host_in_normal_form(name))
+        self.assertEqual(self.destinations(name), ("accepted", "accepted"))
+        self.assertFalse(host_in_normal_form(name + "d"))
+        self.assertEqual(self.destinations(name[:-1] + "dd"), ("manifest_network_destinations",) * 2)
+
+    def test_a_label_is_at_most_63_characters(self) -> None:
+        # The earlier pattern let a label of 64 characters through; DNS stops at 63.
+        self.assertEqual(self.destinations("a" * 63 + ".example"), ("accepted", "accepted"))
+        self.assertEqual(self.destinations("api." + "b" * 63), ("accepted", "accepted"))
+        self.assertEqual(self.destinations("a" * 64 + ".example"), ("manifest_network_destinations",) * 2)
+        self.assertEqual(self.destinations("api." + "b" * 64 + ":443"), ("manifest_network_destinations",) * 2)
+
+    def test_the_predicates_refuse_what_is_not_a_string(self) -> None:
+        for value in (None, 443, b"api.venue.example", ["api.venue.example"]):
+            with self.subTest(value=value):
+                self.assertFalse(host_in_normal_form(value))
+                self.assertFalse(destination_in_normal_form(value))
+
+
+class GrantBoundToDeveloperKeyTests(unittest.TestCase):
+    """``effective_permissions`` alone: no signature, so these run without ``cryptography``."""
+
+    def setUp(self) -> None:
+        self.m1 = parse_manifest(manifest_bytes(K1))
+        self.m2 = parse_manifest(manifest_bytes(K2))  # the same artifact, rewritten under another key
+
+    def test_a_manual_grant_follows_the_developer_key_it_was_given_for(self) -> None:
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
+        self.assertEqual(effective_permissions(self.m1, "unsigned", None, grant), (ALL, []))
+        self.assertEqual(effective_permissions(self.m2, "unsigned", None, grant),
+                         ((), [("grant_developer_key_mismatch", "grant is for another developer key; grant again")]))
+
+    def test_an_unbound_manual_grant_never_carries_order(self) -> None:
+        unbound = Grant("demo.plugin", DIGEST, None, ALL, True)
+        for manifest in (self.m1, self.m2):
+            with self.subTest(key=manifest.developer_key[:2]):
+                perms, dropped = effective_permissions(manifest, "unsigned", None, unbound)
+                self.assertEqual(perms, ("read", "propose"))
+                self.assertEqual(dropped, [("manual_grant_not_bound_to_developer_key", "order")])
+
+    def test_an_unbound_manual_grant_on_a_version_1_manifest_grants_nothing(self) -> None:
+        manifest = parse_manifest(v1(K1, permissions=ALL))
+        unbound = Grant("demo.plugin", DIGEST, None, ALL, True)
+        self.assertEqual(effective_permissions(manifest, "unsigned", None, unbound),
+                         ((), [("grant_developer_key_missing", "manual grant names no developer key; grant again")]))
+        bound = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
+        self.assertEqual(effective_permissions(manifest, "unsigned", None, bound), (ALL, []))
+
+    def test_the_key_order_was_turned_back_on_for_binds_a_manual_grant(self) -> None:
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True, order_after_revoked_key=key_id(K1))
+        self.assertEqual(effective_permissions(self.m1, "unsigned", None, grant)[0], ALL)
+        self.assertEqual(effective_permissions(self.m2, "unsigned", None, grant)[0], ())
+        # An explicit developer key wins over the key named for order.
+        both = Grant("demo.plugin", DIGEST, None, ALL, True, order_after_revoked_key=key_id(K1),
+                     developer_key_id=key_id(K2))
+        self.assertEqual(effective_permissions(self.m1, "unsigned", None, both)[0], ())
+        self.assertEqual(effective_permissions(self.m2, "unsigned", None, both)[0], ALL)
+
+    def test_a_signed_grant_naming_another_developer_key_grants_nothing(self) -> None:
+        signer = key_id(K1)
+        named_other = Grant("demo.plugin", DIGEST, signer, ALL, developer_key_id=key_id(K2))
+        self.assertEqual(effective_permissions(self.m1, "signed", signer, named_other)[0], ())
+        named_same = Grant("demo.plugin", DIGEST, signer, ALL, developer_key_id=signer)
+        self.assertEqual(effective_permissions(self.m1, "signed", signer, named_same)[0], ALL)
+        # A signed grant is bound through its signer; the key named for order does not unbind it.
+        signed = Grant("demo.plugin", DIGEST, signer, ALL, order_after_revoked_key=key_id(K2))
+        self.assertEqual(effective_permissions(self.m1, "signed", signer, signed)[0], ALL)
+
+    def test_version_1_permissions_pass_when_requested_and_granted(self) -> None:
+        # install.json cannot grant these yet (its reader takes the first seven); a Grant can.
+        requested = ("read", "order", "surface", "command", "subscribe", "tool", "run")
+        manifest = parse_manifest(v1(K1, permissions=requested))
+        grant = Grant("demo.plugin", DIGEST, key_id(K1), ("read", "command", "run"))
+        perms, dropped = effective_permissions(manifest, "signed", key_id(K1), grant)
+        self.assertEqual(perms, ("read", "command", "run"))
+        self.assertEqual(dropped, [("not_granted", "order"), ("not_granted", "surface"),
+                                   ("not_granted", "subscribe"), ("not_granted", "tool")])
+
+    def test_a_revoked_developer_key_still_turns_order_off_for_a_bound_grant(self) -> None:
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
+        perms, dropped = effective_permissions(self.m1, "unsigned", None, grant, key_id(K1), 1)
+        self.assertEqual(perms, ("read", "propose"))
+        self.assertEqual(dropped, [("signer_key_revoked_order_off", key_id(K1))])
+
+    def test_the_older_checks_still_come_first(self) -> None:
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K2))
+        self.assertEqual(effective_permissions(self.m1, "unsigned", None, None)[1][0][0], "no_grant")
+        other_artifact = Grant("demo.plugin", "0" * 64, None, ALL, True, developer_key_id=key_id(K2))
+        self.assertEqual(effective_permissions(self.m1, "unsigned", None, other_artifact)[1][0][0],
+                         "grant_artifact_mismatch")
+        self.assertEqual(effective_permissions(self.m1, "signed", key_id(K1), grant)[1][0][0],
+                         "grant_signer_mismatch")
+
+
+class LoaderBindingTests(unittest.TestCase):
+    """Through today's loader. Unsigned manifests under an untrusted key need no signature check."""
+
+    def load(self, raw: bytes, grant: Grant):
+        loader = PluginLoader(TrustStore({}), {"demo.plugin": grant}, ReservedEffects(), CoreHealth(),
+                              FakeGilProbe())
+        return loader.load(raw, None, PLUGIN_SOURCE)
+
+    def test_a_manual_grant_does_not_survive_a_change_of_the_declared_developer_key(self) -> None:
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
+        self.assertEqual(self.load(manifest_bytes(K1), grant).permissions, ALL)
+        swapped = self.load(manifest_bytes(K2), grant)
+        self.assertEqual((swapped.trust, swapped.permissions), ("unsigned", ()))
+        self.assertIn("grant_developer_key_mismatch", [f["code"] for f in swapped.findings])
+
+    def test_an_unbound_manual_grant_loads_without_order_and_says_why(self) -> None:
+        loaded = self.load(manifest_bytes(K1), Grant("demo.plugin", DIGEST, None, ALL, True))
+        self.assertEqual(loaded.permissions, ("read", "propose"))
+        self.assertIn("manual_grant_not_bound_to_developer_key", [f["code"] for f in loaded.findings])
+
+
+@needs_crypto
+class ManualGrantIdentityTests(unittest.TestCase):
+    """R4 fix-6's revocation test, with the grant the install commands will write (bound to the key)."""
+
+    def setUp(self) -> None:
+        self.world = World(self, signed=False, unsigned_ack=True)
+        self.kid = key_id(self.world.developer.public)
+
+    def reload(self, raw: bytes, grant: Grant):
+        trust = TrustStore({}, revocation_store=self.world.revocation_store)
+        self.addCleanup(trust.close)
+        loader = PluginLoader(trust, {"demo.plugin": grant}, self.world.reserved, CoreHealth(), FakeGilProbe())
+        return loader.load(raw, "", PLUGIN_SOURCE)
+
+    def test_rewrapping_the_same_artifact_does_not_undo_its_key_revocation(self) -> None:
+        bound = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True,
+                      developer_key_id=self.kid)
+        self.assertIn("order", self.reload(self.world.manifest, bound).permissions)
+        revoked = self.world.call(self.world.host, "key.revoke", key_id=self.kid)
+        self.assertTrue(revoked["ok"], revoked)
+        self.assertNotIn("order", self.reload(self.world.manifest, bound).permissions)
+        replacement = Key()
+        changed_manifest = manifest_bytes(replacement.public)
+        # Same plugin id, artifact bytes and grant; only the unsigned manifest's developer_key changed.
+        self.assertEqual(self.reload(changed_manifest, bound).permissions, ())
+        # The reviewer's own grant names no key: it is unbound, so it carries no order anywhere.
+        unbound = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True)
+        self.assertNotIn("order", self.reload(self.world.manifest, unbound).permissions)
+        self.assertNotIn("order", self.reload(changed_manifest, unbound).permissions)
+        # Order under the new key comes back only through a new grant the user makes for that key.
+        regranted = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True,
+                          developer_key_id=key_id(replacement.public))
+        self.assertEqual(self.reload(changed_manifest, regranted).permissions, ALL)
+
+
+if __name__ == "__main__":
+    unittest.main()

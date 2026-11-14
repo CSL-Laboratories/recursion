@@ -278,8 +278,10 @@ schema of its params and of everything it can answer, and states the rules (in i
   `prompt_not_shown`, `scope_refused`, and `<thing>_unknown`.
 
 - `unavailable` says why. `daemon_closing` is the one reason every method can give. `service_starting`
-  is the readiness of the service a row names, and no row names one yet, so no method can answer it:
-  every row's answer schema refuses it. `plugin.list` keeps today's own refusal, word for word, when no
+  is the readiness of the service a row names. Two rows name one: `events.read` and `events.follow`
+  name `events` and answer `service_starting` until that service's first scan has finished. Every
+  other row names none, and its answer schema refuses `service_starting`. A service is named by the
+  package that holds its lane's registrant; a row's service is part of the published row. `plugin.list` keeps today's own refusal, word for word, when no
   plugin host is composed; that is its legacy exception and not a service that is starting.
 - An interrupt that fell back to Stop carries the Stop's own answer. While that Stop is pending the
   answer's code is `pending` and the session is `stop_pending`; `pending` means that and nothing else.

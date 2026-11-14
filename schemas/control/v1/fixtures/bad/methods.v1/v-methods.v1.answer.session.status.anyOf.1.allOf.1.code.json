@@ -5,6 +5,6 @@
   },
   "answer": {
     "code": "method_unknown",
-    "detail": "not_implemented"
+    "detail": "daemon_closing"
   }
 }

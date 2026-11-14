@@ -24,8 +24,25 @@ Nothing is frozen yet.
 | `driver.v2.json` | 1.0-draft.4 |
 | `mcp.task.v1.json` | 1.0-draft.5 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.8 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.9 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## The two reads of a log name their service (Nov 13, 2026)
+
+`methods` draft 9. In the method table `events.read` and `events.follow` name the service `events`;
+every other row stays null. The lane that reads the briefs together went through all nineteen: one
+brief says which methods wait for a service (the two reads of a log, which wait until the event
+lane's first scan has finished) and none gives a service a name. The rule adopted with this draft: a
+service is named by the package that holds its lane's registrant, and a second service of one lane
+is `package.purpose`. No other row is given a service on a guess; a lane whose method must wait asks
+for its row to name one, and that is a new draft of this table, because a row's service is part of
+the published row.
+
+| What changed | What it breaks |
+|---|---|
+| The rows of `events.read` and `events.follow` carry `"service": "events"`. Their answer schemas no longer refuse `service_starting` (draft 8 refused it for every row, since no row named a service). Every other row's still does | A reader that took `service` to be null on every row |
+| A check pins each row's service by name; a mandatory built-in never names one | |
+| Fixtures: `events.follow` and `events.read` answered `unavailable`, `service_starting` are good exchanges (`h74`, `h75`); the negative (`b36`) is now `session.status`, whose row names no service; `h76` is that method refused by a closing daemon | |
 
 ## After another model family read the whole set a third time (Nov 13, 2026)
 
@@ -42,7 +59,7 @@ written. Nothing here reopens the owner's decisions.
 | C4. The end of the target turn | An item still `delivering` when its binding's target turn ends is `outcome_unknown` for either `how`, `new_turn` as well as `mid_turn`; the end of another turn changes nothing; a later acceptance is kept as evidence. `queue.item.v1` draft 6, and the word `turn_ended` of `effect.outcome_unknown` in `event.v1` draft 7 says the same | A producer that left a `new_turn` delivery `delivering` after its turn ended, and delivered it on a late acceptance |
 | C5. The projection that was asked for | A page is the answer to its request only in the projection the request names; a read that names none asks for `raw`. A transcript page is made only from a raw page that is itself a right answer to the cursor: `transcript_page_problems`. `page_problems` now takes the request's params, not its cursor alone. `methods` draft 8 | A caller of `page_problems(cursor, page)`; a reader that judged a page by the page's own projection |
 | C6. A fallback Stop that is pending | When an interrupt fell back to Stop and the Stop is pending, the answer's code is `pending` and the session is `stop_pending`: the answer schema says so. `methods` draft 8 | An answer `ok`, or a session `live` or `idle`, beside a pending fallback Stop |
-| C7. `service_starting` | Only a row that names a service can answer it, and no row names one: every row's answer schema refuses it. `plugin.list` keeps today's own refusal when no plugin host is composed (`no plugin host is composed`), pinned beside `daemon_closing` as its legacy exception; the real exchange is captured (`c20`). The good exchange `h62` showed `service_starting` from `events.follow`, whose row names no service: it is a closing example now, and its old value is a bad fixture (`b36`). `methods` draft 8 | A daemon that answers `service_starting` from a method with no service |
+| C7. `service_starting` | Only a row that names a service can answer it, and in draft 8 no row named one (draft 9, above, names `events` on the two reads of a log): every row's answer schema refuses it. `plugin.list` keeps today's own refusal when no plugin host is composed (`no plugin host is composed`), pinned beside `daemon_closing` as its legacy exception; the real exchange is captured (`c20`). The good exchange `h62` showed `service_starting` from `events.follow`, whose row names no service: it is a closing example now, and its old value is a bad fixture (`b36`). `methods` draft 8 | A daemon that answers `service_starting` from a method with no service |
 | C8. The origin of a Task | `created_at` is the time of the event that establishes the entity's creation: its first `state.changed` when its reason is `commit`, in a log that is whole up to it. A `snapshot` (the entity already existed when logging began) and a `reconcile` establish nothing, and neither does another event that only names the run or the turn. Position 1 and no gap are retention checks. `mcp.task.v1` draft 5. Every Task vector of a run whose log begins with a snapshot now has a null `created_at` | A Task that gave a snapshot's time, or the time of the first event filed under a turn |
 | C9. Seconds | The real-instant check validates the seconds. The profile of these records supports no leap second: seconds are 00 to 59 in the pattern and in the check, and a `:60` is refused in an ordinary minute and on a day that had a leap second alike (it was read as the first second of the next minute). `common.v1` draft 4 | A producer that writes `:60` |
 

@@ -5,6 +5,6 @@
   },
   "answer": {
     "code": "x-nobody-defined-this",
-    "detail": "not_implemented"
+    "detail": "daemon_closing"
   }
 }

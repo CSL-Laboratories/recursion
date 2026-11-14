@@ -5242,7 +5242,7 @@
     {
       "file": "good/methods.v1/h62-a-read-asked-of-a-daemon-that-is-closing.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "shows": "A method whose row names no service, asked of a daemon that is closing: 'unavailable', daemon_closing, the one reason every method can give. (Until its third read this fixture showed service_starting here. No row names a service, so no method can say that yet: see b36.)"
+      "shows": "A read asked of a daemon that is closing: 'unavailable', daemon_closing, the one reason every method can give, whether or not its row names a service."
     },
     {
       "file": "good/methods.v1/h63-a-read-from-past-the-end-of-the-log.json",
@@ -5298,6 +5298,21 @@
       "file": "good/methods.v1/h73-interrupt-that-fell-back-to-a-stop-confirmed-at-once.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "The interrupt fell back to Stop and the Stop was confirmed in the same call: the answer is ok, it carries the Stop's own answer, and the session is no longer live. Only a Stop that is still pending makes the answer pending."
+    },
+    {
+      "file": "good/methods.v1/h74-a-read-whose-service-is-still-starting.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "events.follow's row names the service 'events'. Until that service is ready (its first scan has finished) the method answers 'unavailable', service_starting; the caller may ask again. Only a row that names a service can say this."
+    },
+    {
+      "file": "good/methods.v1/h75-events-read-while-its-service-is-starting.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The same for events.read, the other row that names that service."
+    },
+    {
+      "file": "good/methods.v1/h76-a-session-read-asked-of-a-daemon-that-is-closing.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A method whose row names no service, asked of a daemon that is closing: 'unavailable', daemon_closing. It could not say service_starting."
     },
     {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",
@@ -5962,7 +5977,7 @@
     {
       "file": "bad/methods.v1/b36-a-service-starting-from-a-row-that-names-no-service.json",
       "schema": "methods.v1.json#/$defs/exchange",
-      "rule": "service_starting is the readiness of the service a row names. events.follow's row names none, so it can never say it.",
+      "rule": "service_starting is the readiness of the service a row names. session.status's row names none, so it can never say it.",
       "expect": {
         "keyword": "not",
         "at": "/answer/detail"

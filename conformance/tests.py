@@ -29,7 +29,9 @@ CLOSING_ONLY = {"run.start": ["daemon_closing", "start_registrant_failed"], "run
 UNAVAILABLE = dict(CLOSING_ONLY, **{"plugin.list": ["daemon_closing", "no plugin host is composed"]})
 FALLS_BACK = {"session.steer": [{"flag": "mid_turn_input", "then": "next_turn"}],
               "session.interrupt": [{"flag": "interrupt", "then": "stop_then_resume"}]}
-SERVICES = (None,)      # the services a row may name. None yet: a lane that registers one asks for its name here
+# The service each row names; every row that is not here names none. A service is named by the package that holds
+# its lane's registrant. Naming one more is a new draft of the table, and a line here.
+SERVICE_OF = {"events.read": "events", "events.follow": "events"}
 
 
 class PublishedFilesTest(unittest.TestCase):
@@ -294,19 +296,21 @@ class PublishedFilesTest(unittest.TestCase):
                     # Every method can be refused by a daemon that is closing. One that waits on no service of
                     # its own says 'unavailable' for that and for nothing a service would say.
                     self.assertIn("unavailable", row["codes"])
-                    pins = [(pin["if"], pin["then"]["properties"]["detail"]) for pin in limits["allOf"]]
+                    pins = [(pin["if"], pin["then"]["properties"]["detail"]) for pin in limits.get("allOf", ())]
                     unavailable = {"required": ["code"], "properties": {"code": {"const": "unavailable"}}}
+                    self.assertEqual(row["service"], SERVICE_OF.get(name))
                     if name in UNAVAILABLE:
                         self.assertEqual(pins, [(unavailable, {"enum": UNAVAILABLE[name]})])
-                    else:
+                        self.assertIsNone(row["service"], "a mandatory built-in never waits on a service")
+                    elif row["service"] is None:
                         # service_starting is the readiness of the service a row names. A row that names none can
                         # never say it; what else its 'unavailable' may come to say is not guessed here.
-                        self.assertIsNone(row["service"], "a row names a service: say here what its 'unavailable' may be")
                         self.assertEqual(pins, [(unavailable, {"not": {"const": "service_starting"}})])
+                    else:
+                        self.assertEqual(pins, [], "a row that names a service may say that it is starting")
                     self.assertNotIn("service_starting", UNAVAILABLE.get(name, ()))
                     # What a row says of fallbacks and of its service is data nothing else checks: pinned here.
                     self.assertEqual(row["falls_back"], FALLS_BACK.get(name, []))
-                    self.assertIn(row["service"], SERVICES)
                     # What the row says about keys and revisions is what the params schema requires.
                     required = set(params.get("required", ()))
                     self.assertEqual("command_id" in required, row["idempotency"] == "command_id")

@@ -3,7 +3,7 @@
   "params": {},
   "answer": {
     "code": "ok",
-    "table_version": "1.0-draft.8",
+    "table_version": "1.0-draft.9",
     "methods": [
       {
         "implemented": true,

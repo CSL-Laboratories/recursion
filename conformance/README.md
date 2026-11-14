@@ -95,8 +95,8 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
 - in the method table, the seven mandatory built-ins are exactly the rows that cannot answer
   `unsupported`; every row can answer `unavailable`; a built-in that waits on no service answers it
   only for a closing daemon (`run.start` also for a start registrant that refused, `plugin.list` also
-  with today's own words when no plugin host is composed); a row that names no service, which today
-  is every row, can never answer `service_starting`; and each row's `falls_back` and `service` are
+  with today's own words when no plugin host is composed); a row that names no service, which is
+  every row but `events.read` and `events.follow`, can never answer `service_starting`; and each row's `falls_back` and `service` are
   the ones pinned in `tests.py`;
 - a Task vector agrees with the rule for every state a run's view can show and every state a turn can
   be in, and every status a Task can have is reached from each source;

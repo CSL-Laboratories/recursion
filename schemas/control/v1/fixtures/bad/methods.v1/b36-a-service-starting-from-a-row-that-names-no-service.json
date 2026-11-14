@@ -1,13 +1,7 @@
 {
-  "method": "events.follow",
+  "method": "session.status",
   "params": {
-    "cursor": {
-      "epoch": 1,
-      "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
-      "seq": 0
-    },
-    "projection": "transcript",
-    "wait_ms": 20000
+    "session_id": "ses-7f3a9c2e51d04b6a"
   },
   "answer": {
     "code": "unavailable",

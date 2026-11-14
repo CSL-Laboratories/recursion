@@ -1,5 +1,5 @@
 {
-  "table_version": "1.0-draft.8",
+  "table_version": "1.0-draft.9",
   "methods": [
     {
       "name": "run.start",
@@ -777,7 +777,7 @@
       "precondition": "none",
       "requires": [],
       "falls_back": [],
-      "service": null,
+      "service": "events",
       "page_allowed": true,
       "mcp": {
         "exposed": true,
@@ -810,7 +810,7 @@
       "precondition": "none",
       "requires": [],
       "falls_back": [],
-      "service": null,
+      "service": "events",
       "page_allowed": true,
       "mcp": {
         "exposed": false,

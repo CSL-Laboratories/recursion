@@ -348,13 +348,9 @@ class WithTheRealStoreTest(unittest.TestCase):
 
 
 class RegistrantTest(unittest.TestCase):
-    def test_register_exists_and_registers_nothing_in_this_phase(self) -> None:
-        class Untouchable:
-            def __getattribute__(self, name):
-                raise AssertionError(f"register touched hooks.{name}")
-
+    def test_register_is_the_registrant_entry(self) -> None:
+        # What it registers, through SPINE's real hooks: test_scopes_seams.RegistrationTest.
         self.assertTrue(callable(scopes.register))
-        self.assertIsNone(scopes.register(Untouchable()))
 
 
 if __name__ == "__main__":

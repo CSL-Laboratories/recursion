@@ -1,10 +1,15 @@
 """The control API's authorizer: one decision per client call, from the method table's scope column.
 
-Lane CONTROL, frontier plan v3.3, step 3, built in phase c0 against a stand-in for seam S5. This module
-is a registrant that ``control/hooks.py`` imports by name once lane SPINE's seams land (its ``REGISTRANTS``
-list names ``recursion_core.control.scopes``). In THIS pull request ``register(hooks)`` registers
-nothing, so no daemon behaviour changes; the authorizer is registered into S5 in the next one, together
-with the method table it reads and the tests through every entry point.
+Lane CONTROL, frontier plan v3.3, step 3. This module is a registrant that ``control/hooks.py`` imports
+by name (its ``REGISTRANTS`` list names ``recursion_core.control.scopes``). ``register(hooks)`` registers
+the authorizer into S5, reading every method's scope from the method table
+(``control.methods.METHODS``), and one service, ``control.scopes``, which gives the authorizer what it
+reads at call time once the daemon starts it: the credential store, opened at
+``<state_dir>/control/credentials.json``, and the control registry's run records (for Stop's
+ownership rules). Until that service has started the authorizer holds no credentials and reads no
+record, so only owner, internal and the page's device principal hold scopes: the stricter state. A
+credential store that cannot be opened is logged and leaves token principals holding nothing; it never
+stops the daemon, so the owner's Stop keeps working.
 
 S5's contract (``control/hooks.py``, SPINE): ``authorize(principal, method, params)`` is called for every
 client call, before the method runs, and answers None (go on), a refusal code, or ``(code, detail)``. A
@@ -38,27 +43,76 @@ Every refusal is ``("scope_refused", detail)``; ``scope_refused`` is the method 
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable
 
-from recursion_core.control.credentials import ALL_SCOPES, SCOPE_REFUSED, CredentialStore, ceiling
+from recursion_core.control.credentials import (ALL_SCOPES, SCOPE_REFUSED, CredentialStore, CredentialStoreError,
+                                                ceiling)
+from recursion_core.control.methods import METHODS
+
+log = logging.getLogger(__name__)
 
 PAGE_PRINCIPAL_ID = "page"   # control/hooks.py DEVICE: the page's door, before per-device principals
 # The page's device principal: read, run, approve (the brief's recommended option (a); the owner decides).
 PAGE_SCOPES = frozenset({"read", "run", "approve"})
 STOP_METHOD = "run.stop"
 HOST_OWNER = "host"          # launch.owner of a run the host started (control/hooks.py launch_snapshot)
+SERVICE_NAME = "control.scopes"
+CREDENTIALS_PATH = ("control", "credentials.json")   # under the daemon's state directory
 
 Verdict = tuple[str, str] | None
 
 
-def register(hooks) -> None:
-    """The registrant entry ``control/hooks.py`` calls once at composition. Registers nothing yet.
+def table_scope(method: str) -> str | None:
+    """The method's scope in the method table this daemon runs (``control.methods.METHODS``), or None."""
 
-    The authorizer goes into S5 with ``hooks.set("authorize", ...)`` in the next pull request, which is
-    stacked on the seams. Until then this module changes no answer of any daemon.
+    row = METHODS.get(method)
+    return row.scope if row is not None else None
+
+
+def register(hooks) -> None:
+    """The registrant entry ``control/hooks.py`` calls once at composition: the authorizer into S5, and
+    the service that hands it the credential store and the run records when the daemon starts."""
+
+    authorizer = Authorizer(scope_of=table_scope)
+    hooks.set("authorize", authorizer)
+    hooks.service(ScopesService(authorizer))
+
+
+class ScopesService:
+    """Seam S13 service ``control.scopes``: attaches the credential store and the run records to the authorizer.
+
+    ``start`` opens ``CredentialStore(<state_dir>/control/credentials.json)`` and reads run records with
+    the control registry's ``get``. It never raises: a store that cannot be opened (or no state directory)
+    is logged and leaves token principals holding nothing, and the daemon still starts. It is ready once
+    it has attached. ``stop`` detaches, so a call after it holds only what owner, internal and the page hold.
     """
 
-    return None
+    name = SERVICE_NAME
+
+    def __init__(self, authorizer: Authorizer) -> None:
+        self._authorizer = authorizer
+        self.ready = False
+
+    def start(self, context) -> None:
+        store = None
+        state_dir = getattr(context, "state_dir", None)
+        if state_dir is None:
+            log.error("control.scopes: no state directory; no credential is honoured")
+        else:
+            try:
+                store = CredentialStore(os.path.join(os.fspath(state_dir), *CREDENTIALS_PATH))
+            except CredentialStoreError as exc:
+                log.error("control.scopes: the credential store cannot be used (%s); no credential is honoured", exc)
+        registry = getattr(context, "control_registry", None)
+        reader = getattr(registry, "get", None)
+        self._authorizer.attach(credentials=store, run_record=reader if callable(reader) else None)
+        self.ready = True
+
+    def stop(self, context) -> None:
+        self.ready = False
+        self._authorizer.attach(credentials=None, run_record=None)
 
 
 def _same_session(run_session: str, principal_session: str) -> bool:
@@ -80,6 +134,11 @@ class Authorizer:
         self._scope_of, self._credentials, self._run_record = scope_of, credentials, run_record
         self._in_subtree = in_subtree
         self._page_scopes = frozenset(page_scopes)   # cut to the device ceiling by held(), like every set
+
+    def attach(self, *, credentials: CredentialStore | None, run_record: Callable[[str], dict | None] | None) -> None:
+        """What the service hands over at start (and takes back at stop). Before any call is served."""
+
+        self._credentials, self._run_record = credentials, run_record
 
     def held(self, principal) -> frozenset[str]:
         """The scopes ``principal`` holds now, within its kind's ceiling."""

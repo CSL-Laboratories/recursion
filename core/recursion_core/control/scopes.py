@@ -2,14 +2,17 @@
 
 Lane CONTROL, frontier plan v3.3, step 3. This module is a registrant that ``control/hooks.py`` imports
 by name (its ``REGISTRANTS`` list names ``recursion_core.control.scopes``). ``register(hooks)`` registers
-the authorizer into S5, reading every method's scope from the method table
-(``control.methods.METHODS``), and one service, ``control.scopes``, which gives the authorizer what it
-reads at call time once the daemon starts it: the credential store, opened at
-``<state_dir>/control/credentials.json``, and the control registry's run records (for Stop's
-ownership rules). Until that service has started the authorizer holds no credentials and reads no
-record, so only owner, internal and the page's device principal hold scopes: the stricter state. A
-credential store that cannot be opened is logged and leaves token principals holding nothing; it never
-stops the daemon, so the owner's Stop keeps working.
+the authorizer into S5, reading every method's scope from the method table (``control.methods.METHODS``).
+It holds no credentials and reads no run record, so only owner, internal and the page's device principal
+hold scopes: the stricter state, and today's callers (the owner-only socket, in-process calls made for
+the owner, the page) keep every answer they have.
+
+``ScopesService`` (seam S13, ``control.scopes``) is built and tested here but NOT registered: once
+started it hands the authorizer the credential store (``<state_dir>/control/credentials.json``) and the
+control registry's run records, which a plugin or session principal needs. No entry point makes such a
+principal yet, and registering a service turns the composition's admission gate on for every daemon,
+so it is registered by the change that brings the first such principal (``questions.md``). A store
+that cannot be opened is logged and leaves token principals holding nothing; it never stops the daemon.
 
 S5's contract (``control/hooks.py``, SPINE): ``authorize(principal, method, params)`` is called for every
 client call, before the method runs, and answers None (go on), a refusal code, or ``(code, detail)``. A
@@ -72,12 +75,12 @@ def table_scope(method: str) -> str | None:
 
 
 def register(hooks) -> None:
-    """The registrant entry ``control/hooks.py`` calls once at composition: the authorizer into S5, and
-    the service that hands it the credential store and the run records when the daemon starts."""
+    """The registrant entry ``control/hooks.py`` calls once at composition: the authorizer into S5.
 
-    authorizer = Authorizer(scope_of=table_scope)
-    hooks.set("authorize", authorizer)
-    hooks.service(ScopesService(authorizer))
+    ``ScopesService`` is not registered yet (see the module text): ``hooks.service(ScopesService(a))``
+    is the one line that does it, for the change that brings the first plugin or session principal."""
+
+    hooks.set("authorize", Authorizer(scope_of=table_scope))
 
 
 class ScopesService:

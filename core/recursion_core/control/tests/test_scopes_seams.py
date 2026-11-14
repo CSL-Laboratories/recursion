@@ -46,24 +46,39 @@ def composed() -> H.Hooks:
     return hooks
 
 
+def with_service() -> tuple[H.Hooks, scopes.ScopesService]:
+    """The authorizer in S5 and its service, as the change that registers the service will compose them."""
+    hooks = H.Hooks()
+    authorizer = scopes.Authorizer(scope_of=scopes.table_scope)
+    service = scopes.ScopesService(authorizer)
+    hooks.set("authorize", authorizer)
+    hooks.service(service)
+    hooks.freeze()
+    return hooks, service
+
+
 def refused(detail: str) -> dict:
     return {"code": "scope_refused", "detail": detail}
 
 
 class RegistrationTest(unittest.TestCase):
-    def test_register_sets_the_authorizer_and_one_service_and_nothing_else(self) -> None:
+    def test_register_sets_the_authorizer_and_nothing_else(self) -> None:
         hooks = H.Hooks()
         scopes.register(hooks)
         self.assertIsInstance(hooks._single.get("authorize"), scopes.Authorizer)
         self.assertEqual(set(hooks._single), {"authorize"})
-        self.assertEqual([service.name for service in hooks._services], ["control.scopes"])
+        self.assertEqual(hooks._services, [])          # the service is not registered yet: the gate stays as it was
         self.assertEqual(hooks.methods.registered(), ())
         self.assertEqual(hooks.commands.names(), ())
         hooks.freeze()
+        self.assertFalse(hooks.gate.enabled)
 
     def test_the_composition_imports_this_registrant_and_s5_is_this_authorizer(self) -> None:
         hooks = H.compose()
-        self.assertIsInstance(hooks._single.get("authorize"), scopes.Authorizer)
+        authorizer = hooks._single.get("authorize")
+        # By module and name: SPINE's own tests may load control.scopes again, which makes a new class object.
+        self.assertEqual((type(authorizer).__module__, type(authorizer).__qualname__),
+                         ("recursion_core.control.scopes", "Authorizer"))
         self.assertEqual(hooks.authorize(H.Principal("device", "phone-9"), "run.list", {}), refused("needs_read"))
         self.assertIsNone(hooks.authorize(H.OWNER, "run.list", {}))
 
@@ -76,8 +91,8 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual({method: row.scope for method, row in METHODS.items()}, SCOPE_COLUMN)
 
 
-class BeforeTheServiceStartsTest(unittest.TestCase):
-    """Composed, not started: no credential is honoured and no record is read (the stricter state)."""
+class AsRegisteredTest(unittest.TestCase):
+    """As registered (no service): no credential is honoured and no record is read (the stricter state)."""
 
     def test_only_owner_internal_and_the_page_hold_scopes(self) -> None:
         hooks = composed()
@@ -109,8 +124,7 @@ class ServiceTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.base, True)
         self.state = os.path.join(self.base, "state")
         os.mkdir(self.state, 0o700)
-        self.hooks = composed()
-        (self.service,) = self.hooks._services
+        self.hooks, self.service = with_service()
 
     def context(self, **kwargs) -> H.ServiceContext:
         kwargs.setdefault("state_dir", self.state)

@@ -191,12 +191,13 @@ No host composes or starts this server yet; that belongs to the daemon adapter b
 
 `credentials.py` and `scopes.py` are the control API's caller scopes (`read`, `run`, `approve`,
 `manage`, the method table's scope column). `scopes.register(hooks)` registers the authorizer into seam
-S5 (`control/hooks.py`, lane SPINE), reading each method's scope from `control.methods.METHODS`, and one
-service, `control.scopes`, which at daemon start opens the credential store at
-`<state_dir>/control/credentials.json` and reads run records through the control registry's `get`.
-Before it starts, or when the store cannot be used (logged; the daemon still starts), only owner,
-internal and the page's device principal hold scopes. Every client call reaches the authorizer once
-the seams' daemon edits call S5.
+S5 (`control/hooks.py`, lane SPINE), reading each method's scope from `control.methods.METHODS`. As
+registered it holds no credentials and reads no run record, so only owner, internal and the page's
+device principal hold scopes, and today's callers keep every answer. `ScopesService` (S13,
+`control.scopes`) is built and tested but not registered: started, it opens the credential store at
+`<state_dir>/control/credentials.json` and reads run records through the control registry's `get`, for
+plugin and session principals, which no entry point makes yet. Every client call reaches the
+authorizer once the seams' daemon edits call S5.
 
 - **Credentials.** Each principal kind has a ceiling: `owner` and `internal` hold all four and are never
   tokens; `device` (the page and paired devices) never holds `manage`; `plugin`, `session` and `agent`

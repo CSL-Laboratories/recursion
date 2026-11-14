@@ -73,8 +73,8 @@ class SchemaTests(unittest.TestCase):
 
     def test_schema_names_the_codes_own_engines_vendors_and_limits(self) -> None:
         defs = SCHEMA["$defs"]
-        self.assertEqual(tuple(defs["engine"]["enum"]), contract.ENGINES)
-        self.assertIs(rc.ENGINES, contract.ENGINES)
+        self.assertEqual(tuple(defs["engine"]["enum"]), (*contract.ENGINES, "recursion_loop"))
+        self.assertEqual(rc.ENGINES, (*contract.ENGINES, "recursion_loop"))
         self.assertEqual(tuple(defs["vendor"]["enum"]), rc.VENDORS)
         self.assertEqual(tuple(defs["login"]["properties"]["kind"]["enum"]), rc.LOGIN_KINDS)
         self.assertEqual(tuple(SCHEMA["properties"]["undetected_rule"]["enum"]), rc.UNDETECTED_RULES)

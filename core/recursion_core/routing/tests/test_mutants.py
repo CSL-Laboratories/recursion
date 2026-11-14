@@ -24,8 +24,9 @@ from pathlib import Path
 import recursion_core
 
 CORE = Path(recursion_core.__file__).resolve().parents[1]
-TEST_MODULES = ("recursion_core.routing.tests.test_config", "recursion_core.routing.tests.test_router")
-CONFIG, ROUTER = "recursion_core.routing.config", "recursion_core.routing.router"
+TEST_MODULES = ("recursion_core.routing.tests.test_config", "recursion_core.routing.tests.test_router",
+                "recursion_core.routing.tests.test_detect", "recursion_core.routing.tests.test_explain_and_limits")
+CONFIG, ROUTER, DETECT = "recursion_core.routing.config", "recursion_core.routing.router", "recursion_core.routing.detect"
 
 MUTANTS = {
     "M1 rules evaluated before the hand pick": (
@@ -68,6 +69,32 @@ MUTANTS = {
         '        if lg.vendor == "anthropic" and lg.kind == "subscription" and set(lg.engines) != {"claude_code"}:\n',
         "        if False:\n",
         {"test_engine_vendor_compatibility", "test_loader_cross_field_rules"}),
+    # Slice 2.
+    "M10 a hand-picked run switched to a listed fallback at a limit": (
+        ROUTER,
+        '    if decision["reason"] == "hand_pick":\n        return {"action": "ask", "reason": "hand_pick", "choices": choices}\n',
+        "",
+        {"test_a_hand_pick_is_never_switched_away_from"}),
+    "M11 any failure treated as a limit (a blind retry)": (
+        ROUTER,
+        "    if code not in route_limits.LIMIT_CODES:\n",
+        "    if code is None:\n",
+        {"test_only_a_limit_leads_anywhere"}),
+    "M12 a route already tried offered again": (
+        ROUTER,
+        "        if any(_same_route(route, seen) for seen in attempts):\n",
+        "        if False:\n",
+        {"test_the_next_listed_route_in_the_users_order", "test_never_a_route_the_user_did_not_list"}),
+    "M13 an open breaker read as routable": (
+        DETECT,
+        '        if state == "open":\n            return "breaker_open"\n',
+        "",
+        {"test_an_open_or_unreadable_breaker_fences_its_connection", "test_decide_on_a_detected_snapshot_skips_a_fenced_rule"}),
+    "M14 a key route routable with no key present or opted in": (
+        DETECT,
+        '    if kind == "api_key":\n',
+        "    if False:\n",
+        {"test_a_key_route_needs_its_key_present_and_opted_in"}),
 }
 
 CHILD = r"""

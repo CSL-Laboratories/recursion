@@ -29,8 +29,8 @@
   "$defs": {
     "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
     "engine": {
-      "description": "The route contract's engine ids (recursion_core.routes.contract.ENGINES).",
-      "enum": ["claude_code", "codex", "pi", "hermes", "opencode"]
+      "description": "The route contract's engine ids (recursion_core.routes.contract.ENGINES) and recursion_loop, the own loop. An engine is routable only when routes.json configures it and detection finds it ready.",
+      "enum": ["claude_code", "codex", "pi", "hermes", "opencode", "recursion_loop"]
     },
     "vendor": {
       "description": "Canonical vendor id, matched exactly: no case folding, no alias.",

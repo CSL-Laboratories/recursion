@@ -214,7 +214,8 @@ class DetectedOnlyTests(unittest.TestCase):
                             self.assertEqual(d["engine"], t["hand_pick"]["engine"], (subset, t))
                     else:
                         n_refused += 1
-                        self.assertNotIn(d["engine"], subset, (subset, t))
+                        if d["code"] != "hand_pick_engine_without_login":  # as the prototype: no login, whatever detection says
+                            self.assertNotIn(d["engine"], subset, (subset, t))
         self.assertEqual(n_ok + n_refused, 2 ** len(rc.ENGINES) * len(tasks))
         self.assertGreater(n_ok, 0)
         self.assertGreater(n_refused, 0)

@@ -14,9 +14,12 @@ The order (grill Q45, ported from the vault prototype 20261107-csl729-routing-co
 An engine absent from it is ``not_detected``. The snapshot is validated as a whole before any entry is
 read: one malformed entry makes the whole snapshot unusable, and every task is refused with
 ``detection_malformed`` (a missing one: ``detection_unavailable``). An engine the snapshot marks
-routable but ``routes.json`` does not configure is ``route_not_configured``. (This slice takes the
-snapshot as an argument; ``detect.py``, which builds it from the loaded routes, the breaker and the
-key store, is the next slice.)
+routable but ``routes.json`` does not configure is ``route_not_configured``. ``detect.detect`` builds
+the snapshot from the loaded routes, the daemon's own refusals, the breaker and the key store.
+
+Two more answers read the same inputs: ``explain`` (the decision, and every rule's and the default's part
+in it, for ``routing show`` and QUOTA's ``route.explain``) and ``next_after_limit`` (after a limit on the
+decided route: the next route the user listed for it, or ask; never anything the user did not list).
 
 The task carries ``task_kind`` (a string), ``tags`` (a list of strings) and ``hand_pick``
 (``{engine, model}``, model null for the one routes.json configures), the words of the control schema's
@@ -26,9 +29,12 @@ no earlier result. A limit or an error an engine returned can never change the n
 
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Mapping
 
+from recursion_core.routes import contract
+from recursion_core.routes import limits as route_limits
 from recursion_core.routing.config import ENGINES, Config, _model_ok
 
 REASONS = ("hand_pick", "config", "default")   # common.v1 route_decision.reason
@@ -206,3 +212,143 @@ def route_decision(decision: Mapping) -> dict | None:
                        for c in decision["candidates"]],
         "hand_pick": None if decision["hand_pick"] is None else dict(decision["hand_pick"]),
     }
+
+
+# -- explain: the decision and every rule's part in it ------------------------------------------------------
+def explain(config: Config, detection: object, task: object) -> dict:
+    """The decision for ``task`` and why: every rule and the default, each with its outcome and reason.
+
+    ``{"decision": decide(...), "route_decision": route_decision(...) or None, "hand_pick": ...,
+    "rules": [{"id", "engine", "model", "outcome", "reason"}], "default": {"engine", "model", "outcome", "reason"}}``
+
+    Outcomes: ``chosen``; ``skipped`` (it matched, its engine is not routable, the next was tried; the
+    reason is detection's); ``refused`` (it matched, its engine is not routable, and the config refuses);
+    ``no_match`` (the reason names the condition that failed: ``task_kind`` or ``tags_all``);
+    ``not_reached`` (a route was chosen or refused before it, or the task itself was refused); ``hand_pick``
+    (the task carries a hand pick, so no rule and no default is considered). The decision is ``decide``'s:
+    this reads it and never decides again in another way.
+    """
+    decision = decide(config, detection, task)
+    model_of = {c["source"]: c["model"] for c in decision["candidates"]}
+    skipped_of = {c["source"]: c["skipped"] for c in decision["candidates"]}
+    hand = decision["hand_pick"] is not None
+    bad_task = decision.get("code") in ("bad_task", "bad_hand_pick")
+    try:
+        kind, tags, _ = _task(task)
+    except _Refuse:
+        kind, tags = None, frozenset()
+    done = hand or bad_task
+    rules = []
+    for rule in config.rules:
+        source = f"rule:{rule.id}"
+        configured = rule.route.model if rule.route.model is not None else _configured_model(config, rule.route.engine)
+        row = {"id": rule.id, "engine": rule.route.engine, "model": model_of.get(source, configured)}
+        if hand:
+            row.update(outcome="hand_pick", reason=None)
+        elif bad_task:
+            row.update(outcome="not_reached", reason=decision["code"])
+        elif rule.task_kind is not None and kind not in rule.task_kind:
+            row.update(outcome="no_match", reason="task_kind")
+        elif rule.tags_all is not None and not rule.tags_all <= tags:
+            row.update(outcome="no_match", reason="tags_all")
+        elif done:
+            row.update(outcome="not_reached", reason=None)
+        elif source in skipped_of and skipped_of[source] is None:
+            row.update(outcome="chosen", reason=None)
+            done = True
+        elif not decision["ok"] and decision.get("rule") == rule.id:
+            row.update(outcome="refused", reason=skipped_of.get(source))
+            done = True
+        else:
+            row.update(outcome="skipped", reason=skipped_of.get(source))
+        rules.append(row)
+    configured = (config.default.model if config.default.model is not None
+                  else _configured_model(config, config.default.engine))
+    default = {"engine": config.default.engine, "model": model_of.get("default", configured)}
+    if hand:
+        default.update(outcome="hand_pick", reason=None)
+    elif done:
+        default.update(outcome="not_reached", reason=decision["code"] if bad_task else None)
+    elif decision["ok"]:
+        default.update(outcome="chosen", reason=None)
+    else:
+        default.update(outcome="refused", reason=skipped_of.get("default"))
+    return {"decision": decision, "route_decision": route_decision(decision), "hand_pick": decision["hand_pick"],
+            "rules": rules, "default": default}
+
+
+# -- next_after_limit: what a limit on the decided route leads to ---------------------------------------------
+def _route_limits(config: Config, decision: Mapping) -> tuple[dict, str]:
+    """``(limits, source)`` for a routed decision: the routing file's own limits for the route it chose, else
+    those of the ``routes.json`` entry the engine launches with, else the user's default (show and ask)."""
+    route = None
+    if decision["reason"] == "config":
+        route = next((r.route for r in config.rules if r.id == decision["rule"]), None)
+    elif decision["reason"] == "default":
+        route = config.default
+    if route is not None and route.limits is not None:
+        return copy.deepcopy(dict(route.limits)), "routing"
+    entry = config.routes.get(decision["engine"])
+    raw = entry.get("route", {}).get("limits") if isinstance(entry, Mapping) else None
+    if raw is not None:
+        try:
+            return route_limits.validate_limits(raw), "routes"
+        except contract.RouteError:
+            pass  # the route service refuses such a route before it runs; nothing is switched to
+    return route_limits.validate_limits(route_limits.DEFAULT_LIMITS), "default"
+
+
+def _same_route(route: Mapping, seen: Mapping) -> bool:
+    mine = (route["engine"], route["model"], contract.connection_key(route))
+    return mine == (seen.get("engine"), seen.get("model"), seen.get("connection"))
+
+
+def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detection: object = None) -> dict:
+    """What a limit on a decided route leads to: the next route the user listed, or ask; never anything else.
+
+    ``limit`` is the route result that ended the run (its ``code`` and, when the route service made one, its
+    ``limit_notice`` with the ``attempts`` already made). The answer::
+
+        {"action": "none", "reason"}                    not a limit (no blind retry), or no route was decided
+        {"action": "ask", "reason", "choices"}          show the limit and let the user choose
+        {"action": "wait", "until", "choices"}          the user's on_limit is wait
+        {"action": "switch", "place", "route", "source", "skipped", "choices"}   the next listed route
+
+    A switch is only ever to a route in the user's own fallback list for the decided route (the loader has
+    already refused a list that names a login not configured for its engine), in the user's order, passing
+    over a route already tried and, when ``detection`` is given, one whose engine is not routable. The
+    switch is a new run that the caller (SESSIONS) starts; this function starts nothing. A hand pick is
+    never switched away from on its own: the user chose that route for this task, so the answer is ask.
+    """
+    if not decision.get("ok"):
+        return {"action": "none", "reason": "no_route"}
+    code = limit.get("code") if isinstance(limit, Mapping) else None
+    if code not in route_limits.LIMIT_CODES:
+        return {"action": "none", "reason": "not_a_limit"}
+    limits, source = _route_limits(config, decision)
+    choices = [route_limits.describe(r) for r in limits["fallback"]]
+    if decision["reason"] == "hand_pick":
+        return {"action": "ask", "reason": "hand_pick", "choices": choices}
+    if limits["on_limit"] == "ask":
+        return {"action": "ask", "reason": "on_limit_ask", "choices": choices}
+    if limits["on_limit"] == "wait":
+        signal = limit.get("limit") if isinstance(limit.get("limit"), Mapping) else {}
+        return {"action": "wait", "until": signal.get("reset_at", limit.get("retry_at")), "choices": choices}
+    notice = limit.get("limit_notice") if isinstance(limit.get("limit_notice"), Mapping) else {}
+    attempts = [a for a in notice.get("attempts", ()) if isinstance(a, Mapping)]
+    attempts.append({"engine": decision["engine"], "model": decision["model"],
+                     "connection": f"{decision['connection']['kind']}:{decision['connection']['id']}"})
+    entries, err = snapshot(detection) if detection is not None else (None, None)
+    skipped = []
+    for place, route in enumerate(limits["fallback"], 1):
+        if any(_same_route(route, seen) for seen in attempts):
+            skipped.append({"place": place, **route_limits.describe(route), "skipped": "already_tried"})
+            continue
+        if detection is not None:
+            why = _state(config, entries, err, route["engine"])
+            if why is not None:
+                skipped.append({"place": place, **route_limits.describe(route), "skipped": why})
+                continue
+        return {"action": "switch", "place": place, "route": copy.deepcopy(route), "source": source,
+                "skipped": skipped, "choices": choices}
+    return {"action": "ask", "reason": "fallback_exhausted", "skipped": skipped, "choices": choices}

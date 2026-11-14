@@ -127,6 +127,13 @@ class RegisteredTest(unittest.TestCase):
         service = RouteService({"claude_code": EchoAdapter(), "recursion_loop": EchoAdapter()},
                                ConnectionBreaker(clock), clock, limits=limits)  # the service default, too
         self.assertEqual(service.handle(request(engine="claude_code"))["status"], "ok")
+        # And a request's own route.limits, which validate_request checks before the service reads it.
+        self.assertEqual(service.handle(request(rid="r2", engine="claude_code", limits=limits))["status"], "ok")
+        self.assertEqual(c.validate_request(request(limits=limits), engines=StandInTable("recursion_loop"))
+                         ["route"]["limits"]["fallback"][0]["engine"], "recursion_loop")
+        with self.assertRaises(c.RouteError) as caught:
+            c.validate_request(request(limits=limits))
+        self.assertEqual(caught.exception.code, c.ENGINE_UNKNOWN)
 
     def test_a_registered_name_that_is_not_an_engine_name_fails_composition(self) -> None:
         clock = FakeClock()

@@ -133,6 +133,8 @@ class FlagRefusalTest(unittest.TestCase):
         driver = StandIn()
         self.assertRefused("resume", "resume", lambda: driver.start(start_record("conv-1"), {}), driver)
         self.assertRefused("resume", "resume", lambda: driver.resume(start_record("conv-1"), {}), driver)
+        # resume is refused for its flag whatever it is given: the flag is checked before the shape.
+        self.assertRefused("resume", "resume", lambda: driver.resume(start_record(None), {}), driver)
         self.assertEqual(driver.started, [])
 
     def test_a_mid_turn_message_without_its_flag_writes_nothing(self) -> None:
@@ -231,6 +233,32 @@ class StateAndShapeTest(unittest.TestCase):
             self.assertEqual(driver.started, [])
         with self.assertRaises(DriverInputError):
             StandIn(ALL).resume(start_record(None), {})  # resume names the conversation it resumes
+
+    def test_state_is_checked_under_the_handles_lock_and_the_subclass_asked_outside_it(self) -> None:
+        events = []
+
+        class Recording:  # the gate takes the handle's lock only as a context manager
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                self.inner.acquire()
+                events.append("acquire")
+
+            def __exit__(self, *exc):
+                events.append("release")
+                self.inner.release()
+
+        self.h._lock = Recording(self.h._lock)
+        written = self.driver.written
+
+        def write(handle, item):
+            events.append("write")
+            written.append(json.dumps(item))
+
+        self.driver._send = write
+        self.driver.send(self.h, msg())
+        self.assertEqual(events, ["acquire", "release", "write"])
 
     def test_the_conversation_id_is_set_once(self) -> None:
         self.h.set_engine_session_id("conv-1")

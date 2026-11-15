@@ -40,36 +40,140 @@ def mutated(mutate, raw=None):
     return bad
 
 
+def _fallback(route, **changes):
+    """A whole fallback route copied from ROUTES[route], with connection changes (a None value deletes)."""
+    out = copy.deepcopy(ROUTES[route]["route"])
+    for key, value in changes.items():
+        target = out["connection"] if key.startswith("conn_") else out
+        key = key[5:] if key.startswith("conn_") else key
+        if value is None:
+            target.pop(key, None)
+        else:
+            target[key] = value
+    return out
+
+
+def _with_fallback(*routes):
+    return lambda c: c["default"].update(limits={"on_limit": "fallback", "fallback": list(routes)})
+
+
+def _drop(*path):
+    def mutate(c):
+        target = c
+        for key in path[:-1]:
+            target = target[key]
+        del target[path[-1]]
+    return mutate
+
+
+# Shape defects: the JSON Schema and the loader both refuse each one, the loader with this code. The fallback
+# cases are the route contract's own rules (routes/contract.py validate_request), which the schema states too.
+SHAPE_DEFECTS = [
+    ("version 2", "bad_version", lambda c: c.update(version=2)),
+    ("no version member", "bad_version", _drop("version")),
+    ("an unknown top-level member", "unknown_field", lambda c: c.update(fallback="any_detected")),
+    ("no logins member", "bad_config", _drop("logins")),
+    ("no rules member", "bad_config", _drop("rules")),
+    ("no default member", "bad_route", _drop("default")),
+    ("a hyphenated engine id", "unknown_engine", lambda c: c["default"].update(engine="claude-code")),
+    ("an unknown route member", "bad_route", lambda c: c["default"].update(provider="anthropic")),
+    ("an unknown undetected_rule", "bad_undetected_rule", lambda c: c.update(undetected_rule="fallback")),
+    ("a login kind that is a pool", "bad_login", lambda c: c["logins"][0].update(kind="rotating_pool")),
+    ("a vendor spelled otherwise", "unknown_vendor", lambda c: c["logins"][0].update(vendor="Anthropic")),
+    ("a login id ending in a line break", "bad_login", lambda c: c["logins"][0].update(id="anthropic-sub\n")),
+    ("a login id in upper case", "bad_login", lambda c: c["logins"][0].update(id="Anthropic-Sub")),
+    ("a login with no engines member", "bad_login", _drop("logins", 0, "engines")),
+    ("a login binding one engine twice", "bad_login", lambda c: c["logins"][0].update(engines=["claude_code", "claude_code"])),
+    ("a connection id of 201 characters", "bad_login", lambda c: c["logins"][0].update(connection_id="c" * 201)),
+    ("a connection id ending in a line break", "bad_login", lambda c: c["logins"][0].update(connection_id="claude-main\n")),
+    ("a rule id ending in a line break", "bad_rule", lambda c: c["rules"][0].update(id="review-to-codex\n")),
+    ("a rule id with a space", "bad_rule", lambda c: c["rules"][0].update(id="review codex")),
+    ("an empty condition", "bad_rule", lambda c: c["rules"][0].update(when={})),
+    ("an empty task_kind list", "bad_rule", lambda c: c["rules"][0].update(when={"task_kind": []})),
+    ("an empty tags_all list", "bad_rule", lambda c: c["rules"][2].update(when={"tags_all": []})),
+    ("an empty tag", "bad_rule", lambda c: c["rules"][2].update(when={"tags_all": ["cheap", ""]})),
+    ("an unknown condition beside a known one", "bad_rule", lambda c: c["rules"][0]["when"].update(repo=["x"])),
+    ("an unknown condition alone", "bad_rule", lambda c: c["rules"][0].update(when={"repo": ["x"]})),
+    ("a model with a space", "bad_model", lambda c: c["default"].update(model="two words")),
+    ("a model ending in a line break", "bad_model", lambda c: c["default"].update(model="m\n")),
+    ("a model of 129 characters", "bad_model", lambda c: c["default"].update(model="m" * 129)),
+    ("on_limit fallback with nothing listed", "bad_limits", lambda c: c["default"].update(limits={"on_limit": "fallback", "fallback": []})),
+    ("nine fallbacks", "bad_limits", _with_fallback(*[_fallback("codex")] * 9)),
+    ("a fallback of a profile engine with no profile", "bad_limits", _with_fallback(_fallback("opencode", profile=None))),
+    ("a fallback profile that is not an object", "bad_limits", _with_fallback(_fallback("opencode", profile="anthropic"))),
+    ("a custody key fallback with no credential_env", "bad_limits", _with_fallback(_fallback("opencode", conn_credential_env=None))),
+    ("a custody key fallback with an empty credential_env", "bad_limits", _with_fallback(_fallback("opencode", conn_credential_env=""))),
+    ("a custody key fallback whose credential_env is not a string", "bad_limits", _with_fallback(_fallback(
+        "opencode", conn_credential_env=3))),
+    ("an explicit custody key fallback with no credential_env", "bad_limits", _with_fallback(_fallback(
+        "opencode", conn_key_source="custody", conn_credential_env=None))),
+    ("an api_key_helper on a subscription connection of claude_code", "bad_limits", _with_fallback(_fallback(
+        "claude_code", conn_key_source="api_key_helper"))),
+    ("a passthrough fallback whose method is not a string", "bad_limits", _with_fallback(_fallback(
+        "claude_code", connection={"kind": "passthrough", "id": "bedrock", "method": 3}))),
+    ("a passthrough fallback with an empty method", "bad_limits", _with_fallback(_fallback(
+        "claude_code", connection={"kind": "passthrough", "id": "bedrock", "method": ""}))),
+    ("a fallback key_source that is not one", "bad_limits", _with_fallback(_fallback("opencode", conn_key_source="keychain"))),
+    ("an api_key_helper fallback outside claude_code", "bad_limits", _with_fallback(_fallback(
+        "codex", connection={"kind": "api_key", "id": "chatgpt-main", "key_source": "api_key_helper"}))),
+    ("a passthrough fallback with no method", "bad_limits", _with_fallback(_fallback(
+        "claude_code", connection={"kind": "passthrough", "id": "bedrock"}))),
+    ("a passthrough fallback outside claude_code", "bad_limits", _with_fallback(_fallback(
+        "codex", connection={"kind": "passthrough", "id": "bedrock", "method": "bedrock"}))),
+    ("a fallback connection with no id", "bad_limits", _with_fallback(_fallback("codex", conn_id=None))),
+    ("a fallback with an empty model", "bad_limits", _with_fallback(_fallback("codex", model=""))),
+    ("a fallback engine the route contract does not take", "bad_limits", _with_fallback(_fallback("codex", engine="recursion_loop"))),
+]
+
+
 class SchemaTests(unittest.TestCase):
-    # Shape defects: the JSON Schema and the loader both refuse each one.
-    SHAPE_DEFECTS = {
-        "bad_version": lambda c: c.update(version=2),
-        "unknown_field": lambda c: c.update(fallback="any_detected"),
-        "unknown_engine": lambda c: c["default"].update(engine="claude-code"),
-        "bad_rule": lambda c: c["rules"][0].update(when={}),
-        "bad_login": lambda c: c["logins"][0].update(kind="rotating_pool"),
-        "unknown_vendor": lambda c: c["logins"][0].update(vendor="Anthropic"),
-        "bad_model": lambda c: c["default"].update(model="two words"),
-        "bad_limits": lambda c: c["default"].update(limits={"on_limit": "fallback", "fallback": []}),
-        "bad_undetected_rule": lambda c: c.update(undetected_rule="fallback"),
-        "bad_route": lambda c: c["default"].update(provider="anthropic"),
-    }
+    def test_every_shape_defect_is_refused_by_the_loader_with_its_code(self) -> None:
+        for name, code, mutate in SHAPE_DEFECTS:
+            with self.subTest(name):
+                with self.assertRaises(rc.ConfigError) as cm:
+                    config(mutated(mutate))
+                self.assertEqual(cm.exception.code, code)
 
     @unittest.skipIf(jsonschema is None, "jsonschema not installed")
     def test_json_schema_accepts_example_and_rejects_bad_shapes(self) -> None:
         jsonschema.Draft202012Validator.check_schema(SCHEMA)
         v = jsonschema.Draft202012Validator(SCHEMA)
         self.assertEqual(list(v.iter_errors(CONFIG)), [])
-        with_limits = mutated(lambda c: c["rules"][0]["route"].update(limits={
-            "on_limit": "fallback", "fallback": [copy.deepcopy(ROUTES["claude_code"]["route"])]}))
-        self.assertEqual(list(v.iter_errors(with_limits)), [])
-        config(with_limits)  # and the loader takes it
-        for code, mutate in self.SHAPE_DEFECTS.items():
-            bad = mutated(mutate)
-            self.assertNotEqual(list(v.iter_errors(bad)), [], code)
-            with self.assertRaises(rc.ConfigError, msg=code) as cm:
-                config(bad)
-            self.assertEqual(cm.exception.code, code)
+        for good in (_with_fallback(_fallback("claude_code")), _with_fallback(_fallback("opencode"), _fallback("codex"))):
+            with_limits = mutated(good)
+            self.assertEqual(list(v.iter_errors(with_limits)), [])
+            config(with_limits)  # and the loader takes it
+        for name, code, mutate in SHAPE_DEFECTS:
+            with self.subTest(name):
+                self.assertNotEqual(list(v.iter_errors(mutated(mutate))), [], name)
+
+    def test_a_helper_key_fallback_needs_no_credential_env(self) -> None:
+        # claude_code's api_key connection whose key comes from its own api_key_helper names no credential_env:
+        # the loader takes it on both interpreters, and the schema takes it where jsonschema is installed.
+        helper = {"engine": "claude_code", "model": "m", "connection": {
+            "kind": "api_key", "id": "anthropic-helper", "key_source": "api_key_helper"}}
+        raw = {"version": 1,
+               "logins": [{"id": "anthropic-helper", "vendor": "anthropic", "kind": "api_key",
+                           "connection_id": "anthropic-helper", "engines": ["claude_code"]}],
+               "default": {"engine": "claude_code", "limits": {"on_limit": "fallback", "fallback": [helper]}},
+               "rules": []}
+        routes = {"claude_code": {"route": helper, "deadline_s": 600, "binary": "claude"}}
+        loaded = rc.load_config(raw, routes, {"anthropic-helper": {"provider": "anthropic"}})
+        self.assertEqual(loaded.default.engine, "claude_code")
+        if jsonschema is not None:
+            self.assertEqual(list(jsonschema.Draft202012Validator(SCHEMA).iter_errors(raw)), [])
+
+    def test_values_a_schema_cannot_tell_apart_are_refused_by_the_loader(self) -> None:
+        # JSON Schema counts true and 1.0 equal to the const 1 in some readings and 1.0 always; the loader
+        # takes only the integer 1.
+        for value in (True, 1.0, "1"):
+            with self.assertRaises(rc.ConfigError, msg=repr(value)) as cm:
+                config(mutated(lambda c, v=value: c.update(version=v)))
+            self.assertEqual(cm.exception.code, "bad_version")
+        for meta in ({"provider": 3}, {"provider": None}, {}, "anthropic"):
+            with self.assertRaises(rc.ConfigError, msg=repr(meta)) as cm:
+                config(keys={**KEYS, "anthropic-api": meta})
+            self.assertEqual(cm.exception.code, "key_metadata_invalid")
 
     def test_schema_names_the_codes_own_engines_vendors_and_limits(self) -> None:
         defs = SCHEMA["$defs"]
@@ -82,6 +186,10 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(tuple(defs["limits"]["properties"]["on_limit"]["enum"]), route_limits.ON_LIMIT)
         self.assertEqual(defs["limits"]["properties"]["fallback"]["maxItems"], route_limits.MAX_FALLBACK)
         self.assertEqual(set(defs["fallback_route"]["propertyNames"]["enum"]), set(route_limits._ROUTE_KEYS))
+        self.assertEqual(tuple(defs["route_contract_engine"]["enum"]), contract.ENGINES)
+        self.assertEqual(tuple(defs["fallback_route"]["properties"]["connection"]["properties"]["kind"]["enum"]),
+                         contract.CONNECTION_KINDS)
+        self.assertEqual(defs["fallback_route"]["allOf"][0]["if"]["properties"]["engine"]["enum"], list(contract.PROFILE_ENGINES))
         self.assertEqual(set(SCHEMA["properties"]), set(rc.TOP_LEVEL))
         self.assertEqual(set(defs["login"]["properties"]), set(rc.LOGIN_KEYS))
         self.assertEqual(set(defs["route"]["properties"]), set(rc.ROUTE_KEYS))
@@ -196,6 +304,25 @@ class SchemaTests(unittest.TestCase):
         self.assertIsNone(cfg.default.model)
         self.assertEqual(cfg.rules[0].route.model, "codex-model-b")
         self.assertEqual(cfg.routes["claude_code"]["route"]["model"], "claude-model-a")
+
+    def test_loaded_limits_share_nothing_with_the_callers_objects(self) -> None:
+        # The limits validator copies a route and its connection one level deep; a profile or any nested
+        # connection value would otherwise stay the caller's after validation.
+        opencode = copy.deepcopy(ROUTES["opencode"]["route"])
+        codex = copy.deepcopy(ROUTES["codex"]["route"])
+        codex["connection"]["metadata"] = {"label": "original"}
+        raw = copy.deepcopy(CONFIG)
+        raw["default"]["limits"] = {"on_limit": "fallback", "fallback": [opencode, codex]}
+        raw["rules"][0]["route"]["limits"] = {"on_limit": "ask", "fallback": [copy.deepcopy(opencode)]}
+        cfg = rc.load_config(raw, copy.deepcopy(ROUTES), KEYS)
+        before = (copy.deepcopy(cfg.default.limits), copy.deepcopy(cfg.rules[0].route.limits))
+        opencode["profile"]["provider"] = "changed"
+        codex["connection"]["metadata"]["label"] = "changed"
+        raw["rules"][0]["route"]["limits"]["fallback"][0]["profile"]["provider"] = "changed"
+        raw["default"]["limits"]["fallback"].append(codex)
+        self.assertEqual((cfg.default.limits, cfg.rules[0].route.limits), before)
+        self.assertEqual(cfg.default.limits["fallback"][0]["profile"]["provider"], "anthropic")
+        self.assertEqual(cfg.default.limits["fallback"][1]["connection"]["metadata"]["label"], "original")
 
     def test_the_loaded_config_does_not_share_the_callers_objects(self) -> None:
         routes = copy.deepcopy(ROUTES)
@@ -367,6 +494,30 @@ class RoutingFileTests(unittest.TestCase):
         with self.assertRaises(rc.RoutingUnreadable):
             rc.read_routing_file(self.dir / "folder.json")
 
+    def test_a_file_of_another_user_is_refused(self) -> None:
+        path = self.write(rc.CONFIG_FILE, CONFIG, 0o600)
+        self.assertEqual(rc.read_routing_file(path), CONFIG)
+        with mock.patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(rc.RoutingUnreadable):
+                rc.read_routing_file(path)
+
+    def test_a_present_null_file_is_refused_never_read_as_absent(self) -> None:
+        path = self.write(rc.CONFIG_FILE, "null")
+        with self.assertRaises(rc.ConfigError) as cm:
+            rc.read_routing_file(path)
+        self.assertEqual(cm.exception.code, "bad_config")
+        self.assertIsNone(rc.read_routing_file(self.dir / "absent.json"))
+
+    def test_a_member_named_twice_is_refused(self) -> None:
+        text = json.dumps(CONFIG)[:-1] + ', "default": {"engine": "codex"}}'
+        path = self.write(rc.CONFIG_FILE, text)
+        with self.assertRaises(rc.RoutingUnreadable):
+            rc.read_routing_file(path)
+        nested = json.dumps(CONFIG).replace('"engine": "claude_code", "model": null', '"engine": "claude_code", "engine": "codex"')
+        self.assertNotEqual(nested, json.dumps(CONFIG))
+        with self.assertRaises(rc.RoutingUnreadable):
+            rc.read_routing_file(self.write(rc.CONFIG_FILE, nested))
+
     def test_unparseable_file_is_refused(self) -> None:
         for text in ("{", "\xff", ""):
             path = self.dir / rc.CONFIG_FILE
@@ -387,6 +538,11 @@ class RoutingFileTests(unittest.TestCase):
         raw = {"version": 1, "logins": copy.deepcopy(CONFIG["logins"][:2]), "default": {"engine": "claude_code"},
                "rules": [copy.deepcopy(CONFIG["rules"][0])]}
         self.assertIsNone(rc.load(self.dir, {}))  # routes.json alone: no routing config
+        for text in ("null", "[]", "false", "0", '"routing"'):  # present but not a config: refused, never "absent"
+            self.write(rc.CONFIG_FILE, text)
+            with self.assertRaises(rc.ConfigError, msg=text) as cm:
+                rc.load(self.dir, {})
+            self.assertEqual(cm.exception.code, "bad_config")
         self.write(rc.CONFIG_FILE, raw)
         calls = []
         real = control_adapter.load_routes

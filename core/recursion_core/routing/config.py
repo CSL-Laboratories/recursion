@@ -41,6 +41,7 @@ key, the loader cannot tell (``test_residual_a_mislabelled_catalog_is_not_detect
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -217,7 +218,9 @@ def _route(raw: object, where: str) -> Route:
     limits = None
     if "limits" in raw:
         try:
-            limits = route_limits.validate_limits(raw["limits"])
+            # The validator copies a route and its connection one level deep only; a profile or any other
+            # nested value would still be the caller's. The loaded config owns a copy of all of it.
+            limits = copy.deepcopy(route_limits.validate_limits(raw["limits"]))
         except contract.RouteError as err:
             raise ConfigError("bad_limits", f"{where}.limits: {err.detail}") from None
         except (TypeError, ValueError, AttributeError):  # a value the limits validator could not read
@@ -373,11 +376,13 @@ def _fallbacks_are_logins(default: Route, rules: list, routes: Mapping, logins: 
 
 
 def read_routing_file(path: os.PathLike | str) -> object | None:
-    """The parsed routing file, or None when there is none. Raises ``RoutingUnreadable``.
+    """The parsed routing file, or None when there is NO file. Raises ``RoutingUnreadable`` or ``ConfigError``.
 
     The same three checks ``load_routes`` makes on ``routes.json`` (a regular file, owned by the
     daemon's user, not writable by group or others), made here on the open descriptor itself, which a
-    symlink cannot reach (``O_NOFOLLOW``) and a FIFO cannot block (``O_NONBLOCK``).
+    symlink cannot reach (``O_NOFOLLOW``) and a FIFO cannot block (``O_NONBLOCK``). None means only
+    "absent": a file that holds JSON ``null`` is refused ``bad_config``, never read as routing turned off,
+    and a file that names one member twice is refused as unreadable, never read as "the last one wins".
     """
     if not hasattr(os, "geteuid"):
         raise RoutingUnreadable("the routing file needs an owner check, which this platform lacks")
@@ -394,17 +399,31 @@ def read_routing_file(path: os.PathLike | str) -> object | None:
             raise RoutingUnreadable("routing file must be an operator-owned regular file, not group/other writable")
         with os.fdopen(fd, "rb", closefd=False) as fh:
             text = fh.read().decode("utf-8")
-        return json.loads(text)
+        parsed = json.loads(text, object_pairs_hook=_no_duplicate_members)
     except (OSError, ValueError) as exc:
         raise RoutingUnreadable(f"routing file unreadable: {type(exc).__name__}") from None
     finally:
         os.close(fd)
+    if parsed is None:
+        raise ConfigError("bad_config", "the routing file holds null, not an object; remove the file to turn routing off")
+    return parsed
+
+
+def _no_duplicate_members(pairs: list) -> dict:
+    """A JSON object whose members are all named once; a repeated name raises (``json.loads`` keeps the last)."""
+    out: dict = {}
+    for name, value in pairs:
+        if name in out:
+            raise ValueError("duplicate member")
+        out[name] = value
+    return out
 
 
 def load(config_dir: os.PathLike | str, keys: object) -> Config | None:
     """Read ``routes.json`` (with ``load_routes`` itself) and ``routing.json`` beside it, and validate them.
 
-    None when there is no routing file. Raises ``RoutingUnreadable`` (either file) or ``ConfigError``.
+    None only when there is no routing file. Raises ``RoutingUnreadable`` (either file) or ``ConfigError``
+    (a routing file that is present but holds null or anything else that is not a valid config).
     """
     from recursion_core.daemon.control_adapter import ROUTES_FILE, RoutesUnreadable, load_routes  # Linux only
 

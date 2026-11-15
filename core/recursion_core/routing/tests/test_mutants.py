@@ -95,19 +95,148 @@ MUTANTS = {
         '    if kind == "api_key":\n',
         "    if False:\n",
         {"test_a_key_route_needs_its_key_present_and_opted_in"}),
+    # From the first cross-family read of #371 (two Codex reviews): each guard a removal left green.
+    "M15 the routing file's owner not checked": (
+        CONFIG,
+        "if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:",
+        "if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:",
+        {"test_a_file_of_another_user_is_refused"}),
+    "M16 tags_all read as any of the tags": (
+        ROUTER,
+        "    if rule.tags_all is not None and not rule.tags_all <= tags:\n",
+        "    if rule.tags_all is not None and not (rule.tags_all & tags):\n",
+        {"test_tags_all_needs_every_tag"}),
+    "M17 the default's explicit model ignored": (
+        ROUTER,
+        "eng, model = config.default.engine, model_of(config.default.model, config.default.engine)",
+        "eng, model = config.default.engine, model_of(None, config.default.engine)",
+        {"test_an_explicit_model_wins_over_the_configured_one"}),
+    "M18 an empty condition list accepted": (
+        CONFIG,
+        "return isinstance(value, list) and len(value) > 0 and all(",
+        "return isinstance(value, list) and all(",
+        {"test_every_shape_defect_is_refused_by_the_loader_with_its_code"}),
+    "M19 an unknown condition accepted": (
+        CONFIG,
+        "if not isinstance(when, Mapping) or not when or set(when) - WHEN_KEYS:",
+        "if not isinstance(when, Mapping) or not when:",
+        {"test_every_shape_defect_is_refused_by_the_loader_with_its_code"}),
+    "M20 a connection id of any length accepted": (
+        CONFIG,
+        "return isinstance(value, str) and 0 < len(value) <= 200 and",
+        "return isinstance(value, str) and 0 < len(value) and",
+        {"test_every_shape_defect_is_refused_by_the_loader_with_its_code"}),
+    "M21 a version of true or 1.0 accepted": (
+        CONFIG,
+        'if type(raw.get("version")) is not int or raw["version"] != VERSION:',
+        'if raw.get("version") != VERSION:',
+        {"test_values_a_schema_cannot_tell_apart_are_refused_by_the_loader"}),
+    "M22 a present null routing file read as absent": (
+        CONFIG,
+        "    if parsed is None:\n        raise ConfigError(",
+        "    if parsed is None:\n        return None\n        raise ConfigError(",
+        {"test_a_present_null_file_is_refused_never_read_as_absent",
+         "test_load_reads_routes_json_with_load_routes_and_routing_json_beside_it"}),
+    "M23 loaded limits left shared with the caller": (
+        CONFIG,
+        'limits = copy.deepcopy(route_limits.validate_limits(raw["limits"]))',
+        'limits = route_limits.validate_limits(raw["limits"])',
+        {"test_loaded_limits_share_nothing_with_the_callers_objects"}),
+    "M24 a member named twice read as the last one": (
+        CONFIG,
+        "parsed = json.loads(text, object_pairs_hook=_no_duplicate_members)",
+        "parsed = json.loads(text)",
+        {"test_a_member_named_twice_is_refused"}),
 }
 
+# Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and
+# the 3.12 interpreter have it, the free-threaded one does not).
+SCHEMA = "schema"
+SCHEMA_MUTANTS = {
+    "S1 the top-level members not required": (
+        SCHEMA, '  "required": ["version", "logins", "default", "rules"],\n', "",
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S2 a login's members not required": (
+        SCHEMA, '"required": ["id", "vendor", "kind", "connection_id", "engines"],', '"required": [],',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S3 an unknown condition allowed": (
+        SCHEMA, '"additionalProperties": false,\n          "minProperties": 1,', '"minProperties": 1,',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S4 an empty tags_all allowed": (
+        SCHEMA, '"tags_all": {"type": "array", "minItems": 1,', '"tags_all": {"type": "array", "minItems": 0,',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S5 a login binding one engine twice allowed": (
+        SCHEMA, '"uniqueItems": true,', '"uniqueItems": false,',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S6 a fallback connection's kind and id not required": (
+        SCHEMA, '"required": ["kind", "id"],', '"required": [],',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S7 a line break allowed at the end of an id": (
+        SCHEMA, r'"pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",' + "\n      " + r'"not": {"pattern": "[\\r\\n]"}',
+        r'"pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S8 a profile engine's fallback with no profile allowed": (
+        SCHEMA, '"then": {"required": ["profile"], "properties": {"profile": {"type": "object"}}}', '"then": {}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S9 a custody key fallback with no credential_env allowed": (
+        SCHEMA, '"required": ["credential_env"], ', "",
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    # S10 to S15 answer the second reads of #371 (b3bdb121): each removal had left every lane test green.
+    "S10 an api_key_helper allowed on a subscription connection": (
+        SCHEMA, '"connection": {"properties": {"kind": {"const": "api_key"}}}', '"connection": {"properties": {}}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S11 a credential_env that is not a string allowed": (
+        SCHEMA, '"credential_env": {"type": "string", "minLength": 1}', '"credential_env": {"minLength": 1}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S12 an explicit custody key source exempt from credential_env": (
+        SCHEMA, '"not": {"required": ["key_source"], "properties": {"key_source": {"const": "api_key_helper"}}}',
+        '"not": {"required": ["key_source"]}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S13 a passthrough method that is not a string allowed": (
+        SCHEMA, '"method": {"type": "string", "minLength": 1}', '"method": {"minLength": 1}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S14 an empty passthrough method allowed": (
+        SCHEMA, '"method": {"type": "string", "minLength": 1}', '"method": {"type": "string"}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S15 a helper key fallback made to name a credential_env": (
+        SCHEMA,
+        ',\n            "not": {"required": ["key_source"], "properties": {"key_source": {"const": "api_key_helper"}}}',
+        "",
+        {"test_a_helper_key_fallback_needs_no_credential_env"}),
+}
+
+try:
+    import jsonschema  # noqa: F401 - only whether it is there
+except ImportError:  # pragma: no cover - depends on the interpreter
+    HAVE_JSONSCHEMA = False
+else:
+    HAVE_JSONSCHEMA = True
+
 CHILD = r"""
-import importlib, io, json, sys, unittest
+import importlib, io, json, os, sys, tempfile, unittest
+from pathlib import Path
 job = json.loads(sys.stdin.read())
-module = importlib.import_module(job["module"])
-with open(module.__file__, encoding="utf-8") as fh:
-    source = fh.read()
-assert source.count(job["old"]) == 1, "the mutant's anchor is not in the source exactly once"
-exec(compile(source.replace(job["old"], job["new"]), module.__file__, "exec"), module.__dict__)
+if job["module"] == "schema":
+    from recursion_core.routing import config
+    source = config.SCHEMA_FILE.read_text(encoding="utf-8")
+    assert source.count(job["old"]) == 1, "the mutant's anchor is not in the schema exactly once"
+    fd, name = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(source.replace(job["old"], job["new"]))
+    json.loads(Path(name).read_text(encoding="utf-8"))  # the mutant is still a JSON document
+    config.SCHEMA_FILE = Path(name)
+else:
+    module = importlib.import_module(job["module"])
+    with open(module.__file__, encoding="utf-8") as fh:
+        source = fh.read()
+    assert source.count(job["old"]) == 1, "the mutant's anchor is not in the source exactly once"
+    exec(compile(source.replace(job["old"], job["new"]), module.__file__, "exec"), module.__dict__)
 suite = unittest.defaultTestLoader.loadTestsFromNames(job["tests"])
 result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
-print(json.dumps({"ran": result.testsRun, "failed": sorted({t.id().rsplit(".", 1)[-1] for t, _ in result.failures + result.errors})}))
+if job["module"] == "schema":
+    os.unlink(name)
+failed = {t.id().split(" ")[0].rsplit(".", 1)[-1] for t, _ in result.failures + result.errors}
+print(json.dumps({"ran": result.testsRun, "failed": sorted(failed)}))
 """
 
 
@@ -134,6 +263,15 @@ class MutantTests(unittest.TestCase):
             with self.subTest(name):
                 out = run_child(module, old, new)
                 self.assertTrue(out["failed"], f"{name}: no test failed")
+                self.assertTrue(killers <= set(out["failed"]), f"{name}: failed {out['failed']}, expected {sorted(killers)}")
+
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema not installed")
+    def test_every_schema_mutant_is_caught(self) -> None:
+        anchor = SCHEMA_MUTANTS["S1 the top-level members not required"][1]
+        self.assertEqual(run_child(SCHEMA, anchor, anchor)["failed"], [])  # the schema path's own control
+        for name, (module, old, new, killers) in SCHEMA_MUTANTS.items():
+            with self.subTest(name):
+                out = run_child(module, old, new)
                 self.assertTrue(killers <= set(out["failed"]), f"{name}: failed {out['failed']}, expected {sorted(killers)}")
 
 

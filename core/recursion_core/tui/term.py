@@ -14,19 +14,30 @@
 stderr; stdout carries only the screen or the line-mode transcript.
 
 All three read the app's one event log. Ctrl-C or ``q`` closes the TUI; that sends nothing and stops
-no run. So does the end of input (a terminal that hung up): the TUI closes and exits 0, never spins.
+no run. So does the end of input (a terminal that hung up): the TUI closes and exits 0, never spins; the
+EIO that a hung-up terminal gives on restoring its mode or on the last writes is the expected end, and
+any other error is raised.
+
+The terminal is put in raw input mode, with output processing left as it was: no echo, no line
+editing, no input translation (CR, LF, parity, stripping, break), and no control character acts by
+itself (no signal from Ctrl-C, Ctrl-Z or Ctrl-\\, no Ctrl-S flow control, no Ctrl-V literal), so every
+byte of a paste reaches the decoder as sent. Ctrl-C arrives as the key ``ctrl+c``, which ends the TUI as
+before. A hangup is the EIO a hung-up terminal gives, after the end of input was read or when the
+terminal reports POLLHUP (a ``q`` already read, then the hangup).
 
 Keys come from ``keys.KeyDecoder``: every character of a read, in order, CSI and SS3 keys by name, a
 lone Esc after ``keys.ESC_WAIT_S``, and a bracketed paste (turned on while the TUI runs) as one
-``keys.Paste``. A key that came in one read with other input is marked ``burst`` (an unbracketed paste,
-or typing faster than the client reads); the app does not let such a key confirm a Stop or send the
-command line.
+``keys.Paste``. A key is marked ``burst`` when it came in one read with other input, or with part of
+another key (an unfinished UTF-8 character or sequence). That is a heuristic for an unbracketed paste:
+input that arrives one key per read cannot be told from typing. The app does not let a burst key, nor a
+Stop armed or a command line typed with one, confirm the Stop or send the line on the next key.
 """
 
 from __future__ import annotations
 
 import collections
 import contextlib
+import errno
 import os
 import select
 import shutil
@@ -153,15 +164,44 @@ class Tty:
 
     @contextlib.contextmanager
     def cbreak(self):
+        """Raw input for the life of the block, then the saved mode back. (The name is kept for the
+        callers and test fakes that use it.) Output processing is not touched: the painters' CR LF and
+        colour still reach the screen as before."""
+
         import termios
-        import tty
 
         saved = termios.tcgetattr(self.fd)
+        mode = list(saved)
+        # iflag: every input translation off, as tty.cfmakeraw does: an inherited IGNCR or INLCR would drop
+        # or rewrite a pasted CR or LF (review of a1f16a20, C2).
+        mode[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.IGNPAR | termios.PARMRK | termios.INPCK
+                     | termios.ISTRIP | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON
+                     | termios.IXANY | termios.IXOFF)
+        mode[2] = (mode[2] & ~(termios.CSIZE | termios.PARENB)) | termios.CS8  # cflag
+        mode[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)  # lflag
+        mode[6] = list(mode[6])
+        mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
         try:
-            tty.setcbreak(self.fd)
+            termios.tcsetattr(self.fd, termios.TCSAFLUSH, mode)
             yield
         finally:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+            except termios.error as err:  # a hung-up terminal has no mode to restore: that is its EIO
+                eio = bool(err.args and err.args[0] == errno.EIO)
+                # The hangup may come after the last read (q was already read): ask the terminal itself.
+                if not (eio and (self.eof or self._hung_up())):
+                    raise
+
+    def _hung_up(self) -> bool:
+        """The terminal reports a hangup now (POLLHUP), whether or not a read has seen it yet."""
+
+        poll = getattr(select, "poll", None)
+        if poll is None:
+            return False
+        poller = poll()
+        poller.register(self.fd, select.POLLIN)
+        return any(flags & select.POLLHUP for _, flags in poller.poll(0))
 
     def read_key(self, timeout: float) -> Key | None:
         """The next key, waiting up to ``timeout`` for input; None when there is none (or at the end)."""
@@ -181,13 +221,17 @@ class Tty:
             return None
         try:
             return os.read(self.fd, READ_BYTES)
-        except OSError:  # EIO: the terminal hung up, which is the end of input
+        except OSError as err:
+            if err.errno != errno.EIO:  # only a hangup is the end of input; any other failure is raised
+                raise
             return b""
 
     def _fill(self, timeout: float) -> None:
         """One read, plus the short waits that tell a lone Esc from the start of a sequence."""
 
         decoder, keys = self._decoder, []
+        held_before = decoder.holding  # part of a key held from an earlier read
+        discarded_before = decoder.discarded
         data = self._read(timeout)
         while data is not None:
             if not data:
@@ -199,8 +243,16 @@ class Tty:
                 break
             data = self._read(self.esc_wait_s)
             if data is None:
-                keys += decoder.timeout()
-        burst = len(keys) > 1
+                keys += decoder.timeout()  # a lone ESC becomes esc; a longer unfinished sequence is dropped
+        # Other input in the same read: another key; part of one held before or after it; a sequence that
+        # ended without a key however it ended (dropped by the wait or the end of input, completed as an
+        # unknown sequence, broken by another character); or a paste begun beside it, an unfinished
+        # sequence that became a paste opener included (reviews of a1f16a20, 46b8d7d8 and d69d18aa, C3).
+        # Every sequence held beside a key ends as a key, as one of those sequences or as a paste, and the
+        # wait's loop stops at a paste opener, so a paste begun beside a key is still open here.
+        # A lone Esc, one key split over the wait, and one paste however split, are each one event.
+        units = len(keys) + decoder.discarded - discarded_before
+        burst = units > 1 or bool(keys) and (held_before or decoder.holding or decoder.in_paste)
         self._ready.extend((key, burst) for key in keys)
 
 
@@ -215,10 +267,18 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
     if on_app is not None:
         on_app(app)
 
+    gone = [False]  # the terminal's output answered EIO: it hung up, and nothing more is written to it
+
     def write(text: str) -> None:
-        if text:
+        if not text or gone[0]:
+            return
+        try:
             stdout.write(text)
             stdout.flush()
+        except OSError as err:  # on a terminal, EIO is the hangup itself; every other failure is raised
+            if err.errno != errno.EIO:
+                raise
+            gone[0] = True
 
     if alt_screen:
         painted = [(app.width, app.height)]
@@ -243,22 +303,29 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
                 key = terminal.read_key(0.1)
                 if key:
                     loop.press(key, burst=bool(getattr(terminal, "burst", False)))
-                elif getattr(terminal, "eof", False):
-                    break  # the terminal ended input (R2 finding 10): close below; never read it again
+                elif getattr(terminal, "eof", False) or gone[0]:
+                    break  # the terminal ended (R2 finding 10): close below; never read or paint it again
     except KeyboardInterrupt:
-        pass  # Ctrl-C closes, below, like q: nothing is sent
+        pass  # a SIGINT from outside closes, below, like q: nothing is sent
     finally:
+        # The loop paints nothing once shutdown() returns, even if its thread is still busy; the app
+        # takes no event after close, so close is the last event whatever that thread does next.
         loop.shutdown()
-        if not app.closed:  # closed only after the loop's thread has stopped, so no tick races it
+        if not app.closed:
             app.close()
         write(PASTE_OFF)
         if alt_screen:
             write("\x1b[?25h\x1b[?1049l")
         else:
             write(painter.end(reader.new_lines()))
-    if alt_screen:
-        for line in app.errors:  # the error log survives leaving the alternate screen
-            print(f"error: {line}", file=stderr or sys.stderr)
+    if alt_screen and not gone[0]:
+        err = stderr or sys.stderr
+        try:
+            for line in app.errors:  # the error log survives leaving the alternate screen
+                print(f"error: {line}", file=err)
+        except OSError as exc:  # the same hung-up terminal; anything else is raised
+            if exc.errno != errno.EIO:
+                raise
     return 0
 
 

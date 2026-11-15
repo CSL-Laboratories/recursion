@@ -10,6 +10,10 @@ import unittest
 from recursion_core.tui import term
 from recursion_core.tui.tests.fakes import FakeDriver
 
+# select() on a pipe is POSIX only (Windows refuses it with WinError 10038): the tests that read a real
+# pipe through the terminal driver skip there. The mocked reads beside them run everywhere.
+posix_select = unittest.skipIf(os.name == "nt", "select() on a pipe is POSIX only")
+
 
 class PlainModeTest(unittest.TestCase):
     def test_not_a_tty_runs_line_mode_and_closing_stops_nothing(self) -> None:
@@ -40,6 +44,7 @@ class TtyInputTest(unittest.TestCase):
     preamble allows no wall-clock limit in a test, so this one counts reads instead: a terminal at the
     end of input may be read once, and a read after it reported the end fails the test at once."""
 
+    @posix_select
     def test_tty_buffers_pasted_bytes_and_reports_eof(self) -> None:
         r_fd, w_fd = os.pipe()
         try:
@@ -61,6 +66,7 @@ class TtyInputTest(unittest.TestCase):
                 os.close(w_fd)
             os.close(r_fd)
 
+    @posix_select
     def test_interactive_closes_and_exits_on_terminal_eof(self) -> None:
         eof_r, eof_w = os.pipe()
         os.close(eof_w)

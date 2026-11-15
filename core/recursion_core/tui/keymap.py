@@ -21,6 +21,8 @@ default. A ``[safety]`` table states rules that a binding file can only make str
 
 - ``ctrl+y`` is bound nowhere and ``ctrl+p`` nowhere globally (no YOLO key, no global palette over
   readline's Ctrl+P);
+- ``ctrl+c`` is kept: it ends the TUI from any mode (the terminal is in raw mode, so it arrives as a key),
+  and no binding, nor the leader, can take it;
 - no action approves anything: approvals are answered by number and Enter, never by a key binding;
 - ``esc`` is bound to nothing that sends a request; Esc cancels local UI and never stops or interrupts a run;
 - plugin actions (``plugin.<plugin>.<command>``) are bound only under ``<leader> p``, and only they are;
@@ -45,6 +47,7 @@ PLUGIN_PREFIX = "plugin."
 SAFETY_RULES = ("confirm_stop", "esc_never_sends", "plugins_under_leader_p", "no_key_approves")
 NEVER_BIND = frozenset({"ctrl+y"})
 NEVER_BIND_GLOBAL = frozenset({"ctrl+p"})
+RESERVED = frozenset({"ctrl+c"})  # the app takes it before the keymap: it ends the TUI from any mode
 
 _NAMED = ("enter", "tab", "backspace", "esc", "up", "down", "left", "right", "home", "end", "pageup", "pagedown",
           "insert", "delete", *(f"f{n}" for n in range(1, 13)))
@@ -192,6 +195,7 @@ class Keymap:
     never_bind: frozenset[str] = NEVER_BIND
     notes: list[str] = field(default_factory=list)  # why a binding or the file was not used
     pending: tuple[str, ...] = ()
+    last: tuple[str, ...] = ()  # the sequence that chose the last action ``feed`` returned
 
     @classmethod
     def default(cls) -> Keymap:
@@ -249,6 +253,8 @@ class Keymap:
 
     def _key_refusal(self, context: str, seq: tuple[str, ...]) -> str | None:
         for key in seq:
+            if key in RESERVED:
+                return f"{key} is kept: it ends the TUI from any mode"
             if key in self.never_bind:
                 return f"{key} is bound nowhere ([safety] never_bind)"
             if context == "global" and key in NEVER_BIND_GLOBAL:
@@ -277,7 +283,7 @@ class Keymap:
             self.pending = ()
             return Unbound(seq)
         if seq in table:
-            self.pending = ()
+            self.pending, self.last = (), seq
             return table[seq]
         if any(len(s) > len(seq) and s[:len(seq)] == seq for s in table):
             self.pending = seq
@@ -356,6 +362,8 @@ def _file_refusal(doc: Mapping) -> str | None:
         return f"leader {leader!r} is not a usable key (a named or modified key other than Esc and Enter)"
     if leader in NEVER_BIND or leader in NEVER_BIND_GLOBAL:
         return f"leader {leader!r} is a key bound nowhere"
+    if leader in RESERVED:
+        return f"leader {leader!r} is kept: it ends the TUI from any mode"
     if not isinstance(doc.get("bindings", {}), Mapping):
         return "bindings must be a table of contexts"
     safety = doc.get("safety", {})

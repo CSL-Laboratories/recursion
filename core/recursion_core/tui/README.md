@@ -76,7 +76,7 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
     pattern has a capital), `n`/`N` the next older or newer match, `Tab`, Esc or `q` back to the run list;
   - Esc only cancels local UI (a line, the help, a pending sequence, the pager focus, a Stop
     confirmation); it never sends anything. No key approves anything, there is no `Ctrl+Y`, and no global
-    `Ctrl+P`.
+    `Ctrl+P`. Ctrl-C is not the keymap's: it ends the TUI from any mode, and no binding can take it.
 - Commands (`:` or `/`, and `--plain`): the CLI's `list` (also `runs`), `status RUN`, `stop RUN`,
   `start ...`, `conditions`, and the TUI's own `help` (also `keys`) and `quit`, which send nothing. A
   leading `/` is accepted.
@@ -86,17 +86,35 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   id as the value, `"none"` to remove a default), and `[safety]`, which can only make the fixed rules
   stricter: it may add keys to `never_bind` and restate `confirm_stop`, `esc_never_sends`,
   `plugins_under_leader_p` and `no_key_approves` as `true`. Plugin actions (`plugin.<plugin>.<command>`)
-  are bound only under `<leader> p`; until a plugin host exists, pressing one says so and sends nothing. A
+  are bound only under `<leader> p`; until a plugin host exists, pressing one says so and sends nothing.
+  Neither a binding nor the leader can be `ctrl+c`. A
   file that cannot be read, or that loosens `[safety]`, is not used at all; a refused binding is skipped.
   Either way the reason is shown as an error when the TUI opens.
-- The `:` command line has a cursor: left, right, Home and End move it (it is drawn as `▏` when it is
+- The command line (`:` or `/`, `Ctrl+X n`, and the pager's `/` search) has a cursor: left, right, Home and End move it (it is drawn as `▏` when it is
   not at the end), Backspace deletes before it and Delete at it, Esc leaves the line, Enter sends it.
   Bracketed paste is on while the TUI runs: a paste goes into the command line whole, at the cursor,
   with each line break or tab as a space and every other control or invisible character dropped, so a
   paste never sends the line. A paste on the run list or at a Stop confirmation is refused (the
-  confirmation is cancelled). A key that came in one read with other input (a terminal without
-  bracketed paste, or typing faster than the client reads) cannot confirm a Stop or send the command
-  line: the TUI says so and waits for that key on its own.
+  confirmation is cancelled). A paste keeps at most 65,536 characters and says how many it dropped.
+- Unbracketed paste (a heuristic, not a proof): a key is "burst" when it came in one read with other
+  input: another key, part of another key, a paste begun beside it (an unfinished sequence that turns
+  into a paste opener included), or a sequence that ended without a key (dropped by the Esc wait or the
+  end of input, unknown, overlong, or broken off). A lone Esc, one key whose bytes the wait joins, and one
+  paste however it is split, are each one event and not a burst. A key sequence is burst when any of its
+  keys is. A burst `y`, or any `y` after a Stop armed by a burst `s` or `Ctrl+X k` (either key of it),
+  cancels the Stop; a burst Enter, or the first Enter on a line opened, typed or pasted into with burst
+  input, does not send it (the next Enter on its own does). The TUI says so each time. Input that arrives one key per read cannot be told from
+  typing, so a slow unbracketed paste still acts as keys; bracketed paste is the protection.
+- The terminal is in raw input mode while the TUI runs (output processing unchanged): no input
+  translation (an inherited IGNCR or INLCR is turned off, then restored) and no control character acts
+  by itself, so every byte of a paste, CR, LF and Ctrl-C included, arrives as sent. Ctrl-C arrives as a
+  key and ends the TUI from any mode; Ctrl-Z no longer suspends it.
+- The end: a hangup ends the TUI with exit 0 through restoring the mode and the last writes. The
+  hung-up terminal's EIO is expected there, whether a read saw the end of input or the terminal reports
+  POLLHUP (a `q` already read, then the hangup); any other error is raised. Ending takes the app's state
+  lock, so a state change already under way finishes first and none starts after it; the event log
+  appends the final event and seals itself in one step, so an append another thread had already begun
+  is refused; and once `Loop.shutdown()` returns no frame is painted. The final event is the last.
 - Stop: `s` fixes the target, and `y` sends `run.stop`. `stop RUN` on the command line also works. The
   screen shows the API's own answer: `status=stopped`, or `status=pending` plus an `UNCERTAIN` line.
   Stop needs no input lease and has its own request lane, so it never waits behind a slow read. Keys are

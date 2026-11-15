@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, owned_paths, read_regular,
+from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, held_regular, owned_paths,
                      read_regular_and_stat, replace_regular, unlink_regular, write_exclusive)
 from .unit import MARKER, UNIT_NAME, render_unit
 
@@ -56,8 +56,7 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     if os.path.lexists(paths.unit):
-        current, info = read_regular_and_stat(paths.unit)  # owner and mode of the file read, not looked up again
-        _still_the_file_read(paths.unit, info)
+        current, info = read_regular_and_stat(paths.unit)  # the file read, checked against the path while open
         if current != unit:
             raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
         why = file_untrusted(paths.unit, info)
@@ -78,8 +77,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    current, info = read_regular_and_stat(paths.unit)
-    _still_the_file_read(paths.unit, info)
+    current, info = read_regular_and_stat(paths.unit)  # the file read, checked against the path while open
     if current == unit and not file_untrusted(paths.unit, info):
         return _plan("upgrade", False, paths)
     replace_regular(paths.unit, unit, _UNIT_MODE)
@@ -87,37 +85,24 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
 
 
 def uninstall(roots: Roots) -> Plan:
-    """Remove the unit this installer wrote. Refused while it is enabled, or if another wrote it."""
+    """Remove the unit this installer wrote. Refused while it is enabled, or if another wrote it. The unit
+    is removed while the file read is still held open, after the path was checked to name it."""
 
     paths = owned_paths(roots)
     check_dirs(paths.home, paths.unit_dir)
     if os.path.lexists(paths.enabled):
         raise InstallRefused("unit_enabled", f"run `systemctl --user disable --now {UNIT_NAME}` first")
-    if os.path.lexists(paths.unit):
-        try:
-            first = read_regular(paths.unit).split(b"\n", 1)[0]
-        except InstallRefused as refusal:
-            if refusal.kind != "unit_missing":
-                raise
-            return _plan("uninstall", False, paths)  # removed since the lexists above: nothing is left to remove
-        if first != MARKER.encode():
-            raise InstallRefused("unit_not_ours", f"{paths.unit} was not written by `recursiond install`; it is left as it is")
-    removed = unlink_regular(paths.unit)
-    return _plan("uninstall", removed, paths)
-
-
-def _still_the_file_read(path: str, info: os.stat_result) -> None:
-    """Refuse unless ``path`` still names the file that was read (the same device and inode), so the
-    answer is never about a file that is no longer there: removed meanwhile (a concurrent
-    ``uninstall``) is ``unit_missing``, replaced is ``unit_changed``. Nothing is written either way, and
-    the command run again reads what is there then."""
-
+    if not os.path.lexists(paths.unit):
+        return _plan("uninstall", False, paths)
     try:
-        now = os.lstat(path)
-    except FileNotFoundError:
-        raise InstallRefused("unit_missing", f"{path} was removed while it was read; run the command again") from None
-    if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
-        raise InstallRefused("unit_changed", f"{path} was replaced while it was read; run the command again")
+        with held_regular(paths.unit) as (data, _):  # checked against the path while held; removed while held
+            if data.split(b"\n", 1)[0] != MARKER.encode():
+                raise InstallRefused("unit_not_ours", f"{paths.unit} was not written by `recursiond install`; it is left as it is")
+            return _plan("uninstall", unlink_regular(paths.unit), paths)
+    except InstallRefused as refusal:
+        if refusal.kind != "unit_missing":
+            raise
+        return _plan("uninstall", False, paths)  # removed since the lexists above: nothing is left to remove
 
 
 def leftovers(roots: Roots) -> tuple[str, ...]:

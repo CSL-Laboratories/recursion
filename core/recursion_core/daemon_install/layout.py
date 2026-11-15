@@ -10,6 +10,7 @@ here reads ``os.environ`` or the process's home folder; the caller passes the ro
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import stat
@@ -178,14 +179,26 @@ def read_regular(path: str) -> bytes:
 
 def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
     """``read_regular``, with the ``fstat`` of the descriptor the bytes were read through: the owner
-    and mode of the very file that was read. A second lookup by name could find another file, or
-    none (a concurrent ``uninstall``), and raise where a refusal is due. A file that is gone by the
-    time it is opened is ``unit_missing``, not a file of the wrong type."""
+    and mode of the very file that was read. Before that descriptor is closed the path is looked up
+    again and must still name the file read (``still_names``): while the descriptor is open its inode
+    cannot be given to another file, so the comparison holds (after the close, a file made again at
+    the path could take the freed number). A file not there at the open is ``unit_missing`` (the
+    installer's code, as for every refusal here), not a file of the wrong type."""
+
+    with held_regular(path) as read:
+        return read
+
+
+@contextlib.contextmanager
+def held_regular(path: str):
+    """``read_regular_and_stat``'s read, yielding ``(bytes, fstat)`` with the descriptor still open, after
+    ``still_names`` has passed; what the caller does by name inside the block (``uninstall`` removes the
+    unit) is done to the file it read, up to that one lookup."""
 
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:  # removed since the caller saw it (a concurrent uninstall)
-        raise InstallRefused("unit_missing", f"{path} was removed before it could be read; run the command again") from None
+    except FileNotFoundError:  # not there (a concurrent uninstall removed it since the caller looked)
+        raise InstallRefused("unit_missing", f"{path} is not there; run the command again") from None
     except OSError as exc:
         raise InstallRefused("not_regular", path) from exc
     try:
@@ -201,9 +214,24 @@ def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
             if size > 1 << 20:
                 raise InstallRefused("too_large", path)
             chunks.append(block)
-        return b"".join(chunks), info
+        still_names(path, info)  # while the descriptor is open: the inode is not free to be reused
+        yield b"".join(chunks), info
     finally:
         os.close(fd)
+
+
+def still_names(path: str, info: os.stat_result) -> None:
+    """Refuse unless ``path`` still names the file ``info`` describes (the same device and inode): removed
+    meanwhile (a concurrent ``uninstall``) is ``unit_missing``, replaced is ``unit_changed``; nothing is
+    written either way, and the command run again reads what is there then. Sound only while a
+    descriptor of that file is open, which is why ``held_regular`` calls it before the close."""
+
+    try:
+        now = os.lstat(path)
+    except FileNotFoundError:
+        raise InstallRefused("unit_missing", f"{path} was removed while it was read; run the command again") from None
+    if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+        raise InstallRefused("unit_changed", f"{path} was replaced while it was read; run the command again")
 
 
 def file_untrusted(path: str, info: os.stat_result) -> str:
@@ -235,8 +263,11 @@ def write_exclusive(path: str, data: bytes, mode: int) -> None:
 
 
 def replace_regular(path: str, data: bytes, mode: int) -> None:
-    """Replace a regular file with ``data``. A link at ``path`` is refused, not followed."""
+    """Replace a regular file with ``data``. A link at ``path`` is refused, not followed; a file no longer
+    there (a concurrent ``uninstall``) is ``unit_missing``, not a file of the wrong type."""
 
+    if not os.path.lexists(path):
+        raise InstallRefused("unit_missing", f"{path} is not there; run the command again")
     if os.path.islink(path) or not os.path.isfile(path):
         raise InstallRefused("not_regular", path)
     tmp = _write_temp(path, data, mode)

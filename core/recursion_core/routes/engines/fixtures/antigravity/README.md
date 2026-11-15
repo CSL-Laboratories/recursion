@@ -113,6 +113,8 @@ A permission answer is decided when it claims the ask, against a clock read afte
 a lock never lets a late answer approve. The deadline of a step that starts work is checked once the step
 holds the session's ordering lock.
 
+The ACP drive as a route adapter: `AntigravityAcpAdapter` (and `acp_factory`, `binary` only) runs one turn of `agy acp` per run, with the one-shot adapter's STRICT environment path shared and unchanged. A run needs an absolute `cwd` in the request (`request_invalid` otherwise), with no fallback of any kind; the run's folder is the workspace lane's to decide. Nothing registers it. Its tests: `test_antigravity_acp_adapter.py`.
+
 Codes: every `AcpError` carries a route contract code (`launch_refused`, `auth_failed`, `engine_error`,
 `engine_exited`, `deadline_exceeded`, `protocol_error`, `request_invalid`). `TurnOutcome.code` is None, a
 route contract code, or `cancelled`, which the route contract does not have: a caller on it maps

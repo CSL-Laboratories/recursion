@@ -997,3 +997,71 @@ def _number_is(value, forms) -> bool:
 # common.v1 $defs/turn_id and $defs/delivery_id.
 TURN_ID = re.compile(r"turn-[A-Za-z0-9_-]{1,59}")
 DELIVERY_ID = re.compile(r"dlv-[A-Za-z0-9_-]{1,60}")
+
+
+
+# -- the ACP drive as a route adapter (one turn per run; inert) -------------------------------------------------
+NO_CWD = "cwd"
+
+
+class AntigravityAcpAdapter(AntigravityOneShotAdapter):
+    """One turn of ``agy acp`` per run, through the shared client. NOTHING HERE IS REGISTERED OR LOADED.
+
+    It is the one-shot adapter in every STRICT part, unchanged and shared, not copied: the request's shape and
+    ``deadline_at`` checks, the prepared route home, the daemon-HOME refusal, the output boundary for a keyed
+    route, custody's typed refusals, the updater switch and exactly the method's one key (``_prepare``).
+    What differs is the argv (``agy acp``), the drive (initialize, authenticate with the route's one method,
+    session/new in the request's ``cwd``, one prompt), and the request's ``cwd``.
+
+    THE RUN'S FOLDER IS THE CALLER'S. A run is refused ``request_invalid`` (``cwd``) unless the request names
+    an absolute ``cwd`` holding no NUL. There is NO fallback of any kind: never the daemon's own working
+    directory, never the route home, never the user's home. Nothing here decides what a run's folder is: that
+    is the workspace lane's (#392). The field is read from ``request["cwd"]`` until SPINE names it in the
+    route contract (the Liaison's ruling, Nov 15).
+
+    Every failure path fences the child: a refusal or failure of the client (``AcpError``) and a turn that
+    did not succeed are fenced with their code, and anything else that escapes is fenced by the one-shot
+    adapter's ``run`` before it is raised. The turn's text is the agent's message chunks joined, masked
+    once joined (``mask``), so a selected value split across chunks never reaches the result."""
+
+    def run(self, request: dict, deadline_at: float) -> dict:
+        if isinstance(request, Mapping):
+            rid = request.get("request_id")
+            cwd = request.get("cwd")
+            if isinstance(rid, str) and rid and not (isinstance(cwd, str) and cwd.startswith("/")
+                                                     and "\x00" not in cwd):
+                return c.result(rid, c.REQUEST_INVALID, detail=NO_CWD)
+        return super().run(request, deadline_at)
+
+    def argv(self, request: dict) -> list[str]:
+        route_method(request["route"])
+        return acp_argv(self.executable)
+
+    def drive(self, process: EngineProcess, request: dict, deadline_at: float, events: list[dict], *,
+              redact=()) -> dict:
+        rid = request["request_id"]
+        forms = mask_forms(redact)
+        acp = acp_module()
+        try:
+            session = open_acp(process, self._clock, request["route"], request["cwd"], deadline_at,
+                               drafts=AcpDrafts(redact=redact))
+            outcome = session.prompt(request["prompt"], deadline_at)
+        except acp.AcpError as err:
+            code = err.code if err.code in c.CODES else c.ENGINE_ERROR
+            process.fence(code)
+            return c.result(rid, code, events=events, detail=mask(err.detail, forms))
+        if outcome.code is None:
+            session.close()
+            return c.result(rid, None, text=mask(outcome.text, forms), events=events)
+        code = c.ENGINE_ERROR if outcome.code == CANCELLED or outcome.code not in c.CODES else outcome.code
+        process.fence(code)
+        return c.result(rid, code, events=events, detail=mask(outcome.detail, forms))
+
+
+def acp_factory(launcher, clock, credentials, environ, **options) -> AntigravityAcpAdapter:
+    """S3's ``factory(launcher, clock, credentials, environ, **options)``. ``options`` is at most ``binary``,
+    so a factory-built adapter has no prepared home and refuses every launch, as the one-shot factory does."""
+    unknown = set(options) - {"binary"}
+    if unknown:
+        raise TypeError(f"unknown options: {sorted(unknown)}")
+    return AntigravityAcpAdapter(launcher, clock, credentials, environ, binary=options.get("binary"))

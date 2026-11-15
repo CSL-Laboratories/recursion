@@ -5,8 +5,10 @@ Every function takes ``tx``: the transaction the caller already owns (the dispat
 command, or one the service opened). Nothing here opens a transaction, calls a registry or daemon method,
 or reaches an engine. Values are kept as JSON text and read back as the reader's own copies.
 
-Every record is checked (``records``) before it is written, so a record the schema refuses is never
-committed: the write raises, and the caller's transaction is rolled back.
+Every session, turn, queue item and delivery binding is checked (``records``) before it is written, so one the
+schema refuses is never committed: the write raises, and the caller's transaction is rolled back. A delivery
+row's later changes (its state, written flag and evidence) and the work intents are the lane's own private
+rows, held to their columns' CHECK constraints.
 
 A session is written whole or not at all: ``save(tx, before, after)`` writes the session's row only if its
 revision is still the one ``before`` was read at (in a store whose transactions can overlap, a writer that
@@ -174,7 +176,13 @@ def items(tx, session_id: str, states=None) -> list:
 
 # ------------------------------------------------------------------------------------------ deliveries
 def insert_delivery(tx, binding: dict, item_id) -> None:
-    """The private binding, committed in the same write as the item's 'delivering' (or the turn's dispatch)."""
+    """The private binding, committed in the same write as the item's 'delivering' (or the turn's dispatch).
+    ``item_id`` is the item's id, or None for a turn's own input; a binding that names an item names this one.
+    The binding is checked whole first (a turn's own input is checked with the placeholder item id that
+    ``delivery.begin_input`` uses)."""
+    if 'item_id' in binding and binding['item_id'] != item_id:
+        raise records.RecordError('/item_id', 'this_item')
+    records.check_binding({**binding, 'item_id': 'qi-none' if item_id is None else item_id})
     tx.execute('INSERT INTO sessions_delivery (delivery_id, session_id, item_id, run_id, worker_incarnation, '
                'target_turn_id, how, state, written, evidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)',
                (binding['delivery_id'], binding['session_id'], item_id, binding['run_id'],

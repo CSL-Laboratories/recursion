@@ -11,6 +11,12 @@ lane's own private rows, held to their columns' CHECK constraints.) The tests ru
 own good and bad fixtures, and check what they accept against the schemas themselves with SPINE's
 standard-library reader (``conformance/rules.py``, ``fits``) on every interpreter.
 
+One deliberate difference: a record's own integers (a session's revision, a turn's index, an item's order and
+revision) must be Python ints here, so the float spelling ``1.0`` that JSON Schema counts as an integer is
+refused for them, though the schemas admit it. Every such value is made by this lane, never parsed from outside
+JSON, and the store's INTEGER columns keep ints. Nothing the lane accepts is refused by the schemas. Values
+that do come from outside (a request's integers, a Stop's) are read through ``integer`` and admit ``1.0``.
+
 Two more checks are for values that come from outside and are not records of this lane: the params of a
 request (``check_request``), and a Stop's answer (``stop_confirmed``), which settles a session only when it is
 a well-formed stop.result.v1 answer that confirms the Stop.

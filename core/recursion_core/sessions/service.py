@@ -22,12 +22,15 @@ THE FENCE BETWEEN A LAUNCH AND A STOP. Two passes may run at once (nothing here 
 - a launch or a send that is still ``pending`` when its session is ``stop_pending`` is never attempted: it is
   ``failed`` (``stop_requested``) at its claim, and the Stop settles the turn as one that never started;
 - a Stop settles a session only on a well-formed answer that confirms it (``records.stop_confirmed``). An
-  answer of None (no run of that id is registered) is taken as "nothing of that run runs" only when no launch
-  of that run was pending or attempting when the Stop was CLAIMED, that is, before the Stop looked: such a
-  launch may register its run after the Stop looked, even if it ends before the Stop's answer is read. A launch
-  that had ended before the claim had registered its run, or not, before the Stop looked. Until then the Stop is
-  asked again and the session stays ``stop_pending``, so no replacement turn can open beside a unit that may
-  still appear.
+  answer of None (no run of that id is registered) is taken as "nothing of that run runs" only when, at the
+  moment the Stop was CLAIMED (before it looked), no launch of that run was pending or attempting, and none had
+  returned (``done``). A launch still open may register its run after the Stop looked, even if it ends before
+  the Stop's answer is read. A launch that returned handed its input over, so its run exists: the port may
+  register it after the call returned (``ports.py``), and once registered it is answered (``stopped``,
+  ``ended`` or ``pending``), never None again. So for such a run None means "not registered YET". Only a
+  launch that definitely never started (``failed``) or whose outcome nobody can vouch for
+  (``outcome_unknown``) leaves None meaning "nothing runs". Until then the Stop is asked again and the session
+  stays ``stop_pending``, so no replacement turn can open beside a unit that may still appear.
 
 THE RESTART (``recover``), in one transaction:
 1. every delivery still ``delivering`` becomes ``outcome_unknown``, with its event (queue.item.v1);
@@ -213,33 +216,44 @@ class Sessions:
                     self._ask_stop(tx, session)
 
     def dispatch_queued(self) -> int:
-        """Start the delivery of each session's first queued message where it can go now. Returns how many."""
+        """Start the delivery of each session's first queued message where it can go now. Returns how many.
+
+        Each session is looked at in its own transaction. One that raises (a port, such as a driver's declaration,
+        failing) is logged and changes nothing: its transaction is rolled back, its item stays queued, and the
+        pass goes on with the next session; a later pass tries it again."""
         with self.store.transaction() as tx:
             waiting = store.with_queued_items(tx)
         started = 0
         for session_id in waiting:
-            with self.store.transaction() as tx:
-                session = store.load(tx, session_id)
-                if session is None or store.deliveries(tx, state='delivering', session_id=session_id):
-                    continue
-                queued = store.items(tx, session_id, ('queued',))
-                if not queued:
-                    continue
-                first = queued[0]
-                if first['delivery'] == 'steer' and self.steering_refusal(session) is not None:
-                    log.info('session %s holds its steer %s: steering is not offered on its engine', session_id,
-                             first['item_id'])
-                    continue
-                if session['state'] == 'idle':
-                    try:
-                        self.open_turn(tx, session, first['text'], item=first)
-                    except machine.Refused as refusal:
-                        log.info('session %s keeps its queue: %s', session_id, refusal)
-                        continue
-                    started += 1
-                elif session['state'] == 'live' and first['delivery'] == 'steer':
-                    started += self._steer_now(tx, session, first)
+            try:
+                started += self._dispatch_one(session_id)
+            except Exception:  # noqa: BLE001 - this session keeps its queue; the others still go
+                log.exception('the dispatch of session %s failed; its queue is kept for a later pass', session_id)
         return started
+
+    def _dispatch_one(self, session_id: str) -> int:
+        with self.store.transaction() as tx:
+            session = store.load(tx, session_id)
+            if session is None or store.deliveries(tx, state='delivering', session_id=session_id):
+                return 0
+            queued = store.items(tx, session_id, ('queued',))
+            if not queued:
+                return 0
+            first = queued[0]
+            if first['delivery'] == 'steer' and self.steering_refusal(session) is not None:
+                log.info('session %s holds its steer %s: steering is not offered on its engine', session_id,
+                         first['item_id'])
+                return 0
+            if session['state'] == 'idle':
+                try:
+                    self.open_turn(tx, session, first['text'], item=first)
+                except machine.Refused as refusal:
+                    log.info('session %s keeps its queue: %s', session_id, refusal)
+                    return 0
+                return 1
+            if session['state'] == 'live' and first['delivery'] == 'steer':
+                return int(self._steer_now(tx, session, first))
+            return 0
 
     def run_pending(self) -> int:
         """Carry out every work intent that was pending when the pass began, each once. Returns how many it tried."""
@@ -267,8 +281,8 @@ class Sessions:
                 return 0
             if operation['kind'] == 'stop':
                 # Read in the claim, before the Stop looks: a launch of the run still open now may register it
-                # after the Stop looked, whenever that launch ends.
-                operation['launch_open'] = self._launch_open(tx, operation['payload']['run_id'])
+                # after the Stop looked, whenever that launch ends; one that returned may register it late.
+                operation['may_register'] = self._launch_may_register(tx, operation['payload']['run_id'])
         if operation['kind'] == 'stop':
             self._stop(operation)
         else:
@@ -357,11 +371,11 @@ class Sessions:
         except Exception:  # noqa: BLE001 - a Stop is asked again; it is never taken as done
             log.exception('the Stop of %s failed; it will be asked again', run_id)
             answer = {'code': 'pending', 'run_id': run_id, 'state': 'pending', 'reason': 'confirm_unknown'}
-        # None: no run of that id is registered, so nothing of it runs, unless a launch of it was still open when
-        # this Stop was claimed (read in the claim, before the Stop looked). Any answer but a well-formed
-        # confirmation of this run's Stop is NOT stopped.
+        # None: no run of that id is registered, so nothing of it runs, unless a launch of it was still open, or
+        # had returned, when this Stop was claimed (read in the claim, before the Stop looked). Any answer but a
+        # well-formed confirmation of this run's Stop is NOT stopped.
         if answer is None:
-            code = 'pending' if operation['launch_open'] else 'ended'
+            code = 'pending' if operation['may_register'] else 'ended'
         else:
             code = records.stop_confirmed(answer, run_id) or 'pending'
         with self.store.transaction() as tx:
@@ -382,25 +396,29 @@ class Sessions:
                                             turn['result']))
         self.wake.set()
 
-    def _launch_open(self, tx, run_id: str) -> bool:
-        """Whether a launch of ``run_id`` is pending or attempting: it may still register that run. A launch of a
-        run is committed with the turn that binds the run, before any Stop of it can be asked, so a launch that is
-        not open when a Stop is claimed never opens again."""
+    def _launch_may_register(self, tx, run_id: str) -> bool:
+        """Whether a launch of ``run_id`` is pending or attempting (it may still register that run), or returned
+        (``done``: its run exists, and the port may register it after the call returned). A launch of a run is
+        committed with the turn that binds the run, before any Stop of it can be asked, so a launch that is
+        ``failed`` or ``outcome_unknown`` when a Stop is claimed never opens again."""
         return any(operation['kind'] == 'launch' and operation['payload']['run_id'] == run_id
-                   for state in ('pending', 'attempting') for operation in store.work(tx, state=state))
+                   for state in ('pending', 'attempting', 'done') for operation in store.work(tx, state=state))
 
     # --------------------------------------------------------------- what the engine side reports back
     def accepted(self, facts: dict) -> str:
         """The engine's typed acceptance of an input: ``{delivery_id, session_id, run_id, turn_id, how}``, read from
         an input.accepted draft of the driver. Returns 'delivered', or the refusal's code (``delivery_unknown``
-        for a delivery id this lane never committed; the rule's own codes otherwise). A refusal changes nothing,
-        except that an acceptance for an ``outcome_unknown`` delivery is kept as evidence.
+        for a delivery id this lane never committed, and for facts that are not an object at all; the rule's own
+        codes otherwise). A refusal changes nothing, except that an acceptance for an ``outcome_unknown`` delivery
+        is kept as evidence.
 
         In a store whose transactions can overlap, two calls that change the same rows at once are refused by the
         store (``FakeStore(serial=False)`` raises its own error): the loser raises that error and has changed
         nothing. An acceptance can be repeated with the same facts, so the caller repeats a call that raised; the
         second call answers by the rule (``not_delivering`` when the first one delivered it). The store's
         conflict has no published type the lane could name (questions.md Q12)."""
+        if not isinstance(facts, dict):
+            return 'delivery_unknown'
         with self.store.transaction() as tx:
             row = store.load_delivery(tx, facts.get('delivery_id'))
             if row is None:
@@ -459,8 +477,10 @@ class Sessions:
 class SessionsService:
     """The S13 service of lane SESSIONS: recovery once at start, then passes over the queue and the work intents
     whenever it is woken (after a commit) and at least every ``interval_s``. ``start`` returns at once, after
-    starting the thread; ``ready`` is true once recovery committed; ``stop`` returns only when the thread has
-    joined. Not registered anywhere in this slice."""
+    starting the thread; it does nothing while a loop it started is still running, and after a loop that has
+    left (a crash, kept in ``failure``) it is a fresh start: a new thread, recovery again, and ``failure`` cleared.
+    ``ready`` is true once recovery committed; ``stop`` returns only when the thread has joined. Not registered
+    anywhere in this slice."""
 
     name = 'sessions'
 
@@ -476,9 +496,10 @@ class SessionsService:
 
     def start(self, context) -> None:
         with self._lock:
-            if self._thread is not None:
+            if self._thread is not None and self._thread.is_alive():
                 return
             self._stopping.clear()
+            self.failure = None
             self._thread = threading.Thread(target=self._loop, name='sessions-service', daemon=True)
             self._thread.start()
 

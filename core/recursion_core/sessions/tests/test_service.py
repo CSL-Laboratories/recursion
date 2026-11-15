@@ -210,6 +210,15 @@ class CrashCellTest(unittest.TestCase):
         self.assertEqual(self.lane.sessions.accepted({**acceptance(row), 'delivery_id': 'dlv-never'}),
                          'delivery_unknown')
 
+    def test_an_acceptance_whose_facts_are_not_an_object_is_answered_delivery_unknown(self):
+        """DeepSeek round 3, F4: the docstring promises a code, never a traceback."""
+        session = self.started(engine='codex')
+        self.lane.settle()
+        for facts in (None, [], 'dlv-x', 7):
+            with self.subTest(facts=facts):
+                self.assertEqual(self.lane.sessions.accepted(facts), 'delivery_unknown')
+        self.assertEqual(only_delivery(self.lane, session['session_id'])['state'], 'delivering', 'nothing changed')
+
     # -------------------------------------------------------------------------- a Stop that is pending
     def test_a_restart_with_a_stop_pending_never_starts_a_second_unit(self):
         session = self.started(engine='opencode')
@@ -394,6 +403,84 @@ class FenceTest(unittest.TestCase):
         self.assertEqual(only_delivery(lane, session['session_id'])['state'], 'outcome_unknown')
 
 
+    def test_an_absence_after_a_launch_returned_settles_nothing(self):
+        """DeepSeek round 3, F1: a launch may hand its input over and register its run only after it returned
+        (ports.py). A Stop that then finds no run of it settles nothing: the session stays stop_pending, no
+        replacement opens, and the Stop is asked until the run is there and stopped."""
+        lane = Lane()
+        session = lane.start(prompt='first')['session']
+        sid, run_id = session['session_id'], session['worker']['run_id']
+        late, real_launch = [], lane.units.launch
+
+        def launch(order):
+            real_launch(order)
+            lane.units.registered.discard(order.run_id)        # handed over; the run is registered later
+            late.append(order.run_id)
+
+        lane.units.launch = launch
+        lane.settle()
+        self.assertEqual((work_states(lane), late), ([('launch', 'done')], [run_id]))
+        lane.sessions.request_stop(sid)
+        self.assertEqual(lane.sessions.run_pending(), 1)          # the Stop: no run registered yet
+        held = session_of(lane, sid)
+        self.assertEqual(held['state'], 'stop_pending', 'an absence after a launch returned is not an end')
+        self.assertEqual(held['worker']['run_id'], run_id)
+        replacement = turn_of(lane, held, text='replacement')
+        self.assertEqual((replacement['code'], replacement['detail']), ('busy', 'stop_pending'))
+        lane.units.registered.update(late)                        # the run is registered now
+        self.assertEqual(lane.sessions.run_pending(), 1)          # asked again: there, and stopped
+        settled = session_of(lane, sid)
+        self.assertEqual((settled['state'], settled['worker']), ('idle', None))
+        self.assertEqual(lane.units.stops, [run_id, run_id])
+        self.assertEqual([order.run_id for order in lane.units.launched], [run_id])
+
+    def test_an_open_launch_of_another_run_does_not_hold_this_run_s_stop(self):
+        """DeepSeek round 3, F7 (m08): only a launch of the Stop's own run is read in its claim."""
+        lane = Lane()
+        lane.units.then = [RuntimeError('the pipe broke')]
+        first = lane.start(prompt='first')['session']
+        with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
+            self.assertEqual(lane.sessions.run_pending(), 1)      # the launch: outcome unknown, a Stop asked
+        second = lane.start(prompt='second', command_id='cmd-start-0002')['session']
+        self.assertEqual(work_states(lane), [('launch', 'outcome_unknown'), ('stop', 'pending'), ('launch', 'pending')])
+        seen = []
+        real_stop = lane.units.stop
+
+        def stop(run_id):
+            with lane.store.transaction() as tx:
+                seen.append([(operation['kind'], operation['state']) for operation in store.work(tx)])
+            return real_stop(run_id)
+
+        lane.units.stop = stop
+        self.assertEqual(lane.sessions.run_pending(), 2)          # the Stop first, then the other launch
+        self.assertEqual(seen, [[('launch', 'outcome_unknown'), ('stop', 'attempting'), ('launch', 'pending')]])
+        settled = session_of(lane, first['session_id'])
+        self.assertEqual((settled['state'], settled['worker']), ('idle', None),
+                         "another run's open launch does not keep this Stop pending")
+        self.assertEqual(lane.units.stops, [first['worker']['run_id']])
+        self.assertEqual([order.run_id for order in lane.units.launched], [second['worker']['run_id']])
+
+    def test_a_stop_of_a_run_that_is_not_the_session_s_unit_settles_nothing(self):
+        """DeepSeek round 3, F7 (m09): a confirmed Stop of another run leaves this session as it was."""
+        lane = Lane()
+        session = lane.start(prompt='first')['session']
+        sid, run_id = session['session_id'], session['worker']['run_id']
+        lane.settle()                                             # launched, and its run registered
+        lane.units.stop_answers = [stop_answer(run_id, 'pending')]
+        lane.sessions.request_stop(sid)
+        self.assertEqual(lane.sessions.run_pending(), 1)          # its own Stop: pending
+        other = lane.minter('run-')
+        with lane.store.transaction() as tx:
+            store.insert_work(tx, lane.minter('op-'), sid, 'stop', {'run_id': other})
+        lane.units.stop_answers = [stop_answer(run_id, 'pending'), stop_answer(other, 'stopped')]
+        self.assertEqual(lane.sessions.run_pending(), 2)
+        self.assertEqual(lane.units.stops, [run_id, run_id, other])
+        self.assertEqual(work_states(lane), [('launch', 'done'), ('stop', 'pending'), ('stop', 'done')])
+        held = session_of(lane, sid)
+        self.assertEqual((held['state'], held['worker']['run_id']), ('stop_pending', run_id),
+                         "another run's confirmed Stop settles nothing here")
+
+
 class FreshLaunchTest(unittest.TestCase):
     """A session whose launches never started has no conversation to lose: its next turn launches afresh."""
 
@@ -539,6 +626,30 @@ class DeliveryOrderTest(unittest.TestCase):
         self.assertEqual(self.lane.accept_input(live['session_id']), 'delivered')
         self.lane.settle()
         self.assertEqual([order.text for order in self.lane.units.sent], ['one', 'two'])
+
+    def test_a_driver_that_fails_for_one_session_does_not_end_the_pass_for_the_others(self):
+        """DeepSeek round 3, F5: a port that raises for one session is logged, that session keeps its queue, and the
+        sessions after it in the same pass are still dispatched."""
+        first = self.lane.start(engine='claude_code', command_id='cmd-start-0001')['session']
+        second = self.lane.start(engine='codex', command_id='cmd-start-0002')['session']
+        self.assertLess(first['session_id'], second['session_id'])     # the pass reaches the failing one first
+        items = [self.lane.call('session.queue', {'command_id': f'cmd-queue-000{number}', 'session_id': sid,
+                                                  'text': 'queued'})['item']
+                 for number, sid in enumerate((first['session_id'], second['session_id']), 1)]
+        real = self.lane.drivers.declaration
+
+        def declaration(engine):
+            if engine == 'claude_code':
+                raise RuntimeError('declaration failed')
+            return real(engine)
+
+        self.lane.drivers.declaration = declaration
+        with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
+            self.assertEqual(self.lane.sessions.dispatch_queued(), 1)
+        with self.lane.store.transaction() as tx:
+            self.assertEqual([store.load_item(tx, item['item_id'])['state'] for item in items],
+                             ['queued', 'delivering'])
+        self.assertEqual(session_of(self.lane, first['session_id'])['turns'], [], 'the failed one wrote nothing')
 
     def test_a_launch_order_carries_the_tenant_the_principal_and_the_budget(self):
         answer = self.lane.call('session.start', {'command_id': 'cmd-start-0001', 'tenant': 't9',
@@ -729,6 +840,30 @@ class GuardTest(unittest.TestCase):
         self.assertEqual((answer['code'], answer['detail']), ('conflict', 'stale_revision'))
 
 
+    def test_a_binding_the_schema_refuses_is_never_written(self):
+        """DeepSeek round 3, F2: the store checks a binding before it writes it, as store.py says of every record."""
+        session = self.idle()
+        good = {'delivery_id': 'dlv-a', 'session_id': session['session_id'], 'run_id': 'run-a',
+                'worker_incarnation': 'run-a.1', 'target_turn_id': 'turn-a', 'how': 'new_turn'}
+
+        def write(binding, item_id):
+            with self.lane.store.transaction() as tx:
+                store.insert_delivery(tx, binding, item_id)
+
+        for binding, item_id, rule in (({**good, 'delivery_id': 'nope'}, None, 'pattern'),
+                                       ({**good, 'how': 'sideways'}, None, 'enum'),
+                                       ({**good, 'item_id': 'qi-a', 'run_id': 'run a'}, 'qi-a', 'pattern'),
+                                       ({**good, 'item_id': 'qi-a'}, 'qi-b', 'this_item')):
+            with self.subTest(binding=binding, item_id=item_id):
+                self.assertEqual(self.refused_rule(lambda binding=binding, item_id=item_id: write(binding, item_id)),
+                                 rule)
+        with self.lane.store.transaction() as tx:
+            self.assertEqual(store.deliveries(tx), [])
+        write(good, None)                                          # the control: a whole binding is written
+        with self.lane.store.transaction() as tx:
+            self.assertEqual([row['delivery_id'] for row in store.deliveries(tx)], ['dlv-a'])
+
+
 class ServiceLifecycleTest(unittest.TestCase):
 
     def test_the_service_recovers_then_carries_out_work_when_woken_and_joins_on_stop(self):
@@ -861,6 +996,40 @@ class ServiceLifecycleTest(unittest.TestCase):
             self.assertIsInstance(lane.service.failure, Cut)
         finally:
             lane.service.stop(None)
+
+    def test_a_start_after_the_loop_died_starts_a_fresh_loop(self):
+        """DeepSeek round 3, F3: a start finds the dead loop's thread gone and starts a new one; the old failure is
+        not the new loop's."""
+        lane = Lane()
+        recovered = threading.Event()
+        real_recover = lane.sessions.recover
+
+        def recover():
+            real_recover()
+            recovered.set()
+
+        lane.sessions.recover = recover
+        lane.units.then = ['cut-before']
+        lane.service.interval_s = BOUND_S
+        lane.service.start(None)
+        try:
+            self.assertTrue(recovered.wait(BOUND_S))
+            with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
+                self.assertEqual(lane.start(prompt='first')['code'], 'ok')
+                lane.service._thread.join(BOUND_S)
+            dead = lane.service._thread
+            self.assertFalse(dead.is_alive())
+            self.assertIsInstance(lane.service.failure, Cut)
+            recovered.clear()
+            lane.service.start(None)
+            fresh = lane.service._thread
+            self.assertIsNot(fresh, dead, 'a start after the loop died starts a fresh loop')
+            self.assertIsNone(lane.service.failure, "the old failure is not the new loop's")
+            self.assertTrue(recovered.wait(BOUND_S))
+            self.assertTrue(fresh.is_alive())
+        finally:
+            lane.service.stop(None)
+        self.assertIsNone(lane.service._thread)
 
 
 if __name__ == '__main__':

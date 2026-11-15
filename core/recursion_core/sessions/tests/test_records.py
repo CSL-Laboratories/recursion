@@ -107,6 +107,18 @@ class LaneRulesTest(unittest.TestCase):
             records.check_session_kept(record)
         self.assertEqual((caught.exception.path, caught.exception.rule), ('/active_turn_id', 'not_final'))
 
+    def test_an_interrupted_or_stopped_turn_carries_its_own_word_as_outcome(self):
+        """DeepSeek round 3, F7 (m18): session.v1 $defs/turn ties the outcome of these two states to the state."""
+        record = self.good()
+        ended = next(turn for turn in record['turns'] if turn['state'] == 'ended')
+        for state in ('interrupted', 'stopped'):
+            with self.subTest(state=state):
+                turn = {**ended, 'state': state, 'outcome': state}
+                records.check_turn(turn, '/turns/0')                        # the control
+                with self.assertRaises(records.RecordError) as caught:
+                    records.check_turn({**turn, 'outcome': 'done'}, '/turns/0')
+                self.assertEqual((caught.exception.path, caught.exception.rule), ('/turns/0/outcome', state))
+
     def test_no_id_pattern_matches_a_value_with_a_line_break(self):
         for pattern, value in ((records.SESSION_ID, 'ses-a'), (records.TURN_ID, 'turn-a'), (records.ITEM_ID, 'qi-a'),
                                (records.DELIVERY_ID, 'dlv-a'), (records.RUN_ID, 'run-a'), (records.TOKEN, 'a.b'),

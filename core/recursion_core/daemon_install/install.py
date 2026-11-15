@@ -18,7 +18,8 @@ import sqlite3
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .layout import Owned, Roots, check_dirs, ensure_dir, owned_paths, read_regular, replace_regular, unlink_regular, write_exclusive
+from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, owned_paths, read_regular, replace_regular,
+                     unlink_regular, write_exclusive)
 from .unit import MARKER, UNIT_NAME, render_unit
 
 _UNIT_MODE = 0o644
@@ -87,7 +88,8 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
 
 def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Create the stores, then write the unit. The same bytes already there change nothing; other
-    bytes are refused before any store is made, so a refused install leaves everything as it was."""
+    bytes, and a unit another user could change (another user's, or writable by group or world), are
+    refused before any store is made, so a refused install leaves everything as it was."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
@@ -95,6 +97,9 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     present = os.path.lexists(paths.unit)
     if present and read_regular(paths.unit) != unit:
         raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
+    why = file_untrusted(paths.unit) if present else ""
+    if why:
+        raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
     made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
     if not present:
         ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
@@ -104,14 +109,15 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
 
 def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Make any missing store and rewrite the unit to what ``install`` would write now. A missing
-    unit is refused before anything is made."""
+    unit is refused before anything is made. The same bytes are not written again unless another
+    user could change the file."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    current = read_regular(paths.unit) == unit
+    current = read_regular(paths.unit) == unit and not file_untrusted(paths.unit)
     made = ensure_stores(paths)
     if not current:
         replace_regular(paths.unit, unit, _UNIT_MODE)

@@ -2,8 +2,9 @@
 
 A root is resolved once (links above it are the administrator's, such as ``/home`` pointing at
 ``/var/home``). Under a root, every folder this package creates and every file it writes or removes
-is reached without following a link: a link there is refused (``symlink_refused``), and so is a
-folder there that another user owns or that group or world can write (``folder_untrusted``). Nothing
+is reached without following a link: a link there is refused (``symlink_refused`` at a folder,
+``not_regular`` at a file), and so is a folder there that another user owns or that group or world
+can write (``folder_untrusted``). Nothing
 here reads ``os.environ`` or the process's home folder; the caller passes the roots.
 """
 
@@ -65,12 +66,63 @@ def owned_paths(roots: Roots) -> Owned:
 
 
 def _directory_root(path: object) -> str:
+    """The home, resolved, after checking that no other user can change what it names.
+
+    Each folder from ``/`` to the home is resolved as the kernel does (links followed, at most
+    ``_MAX_LINKS``): each must be root's or ours and not writable by group or world unless sticky,
+    and each link on the way root's or ours (``folder_untrusted``). The home itself must be ours and
+    not writable by group or world at all. The rule ``plugin_security.stores`` holds a store's
+    folders to.
+    """
+
     if type(path) is not str or not os.path.isabs(path):
         raise InstallRefused("relative_path", "a root is an absolute path")
-    real = os.path.realpath(path)
-    if not os.path.isdir(real):
-        raise InstallRefused("root", f"{path} is not a folder")
-    return real
+    trusted = (0, os.geteuid())
+    names = [name for name in path.split("/") if name]
+    current, links = "/", 0
+    _trusted_folder("/", os.lstat("/"), trusted)
+    while names:
+        candidate = os.path.join(current, names.pop(0))
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            raise InstallRefused("root", f"{path} is not a folder") from None
+        except OSError as exc:  # a folder on the way that cannot be searched, an I/O error
+            raise InstallRefused("folder_untrusted", f"{candidate}: {type(exc).__name__}") from None
+        if stat.S_ISLNK(info.st_mode):
+            if info.st_uid not in trusted:
+                raise InstallRefused("folder_untrusted", f"{candidate} is a link another user owns")
+            links += 1
+            if links > _MAX_LINKS:
+                raise InstallRefused("folder_untrusted", f"more than {_MAX_LINKS} links on the way to {path}")
+            try:
+                target = os.readlink(candidate)
+            except OSError as exc:  # removed or replaced since the lstat above
+                raise InstallRefused("folder_untrusted", f"{candidate}: {type(exc).__name__}") from None
+            if target.startswith("/"):
+                current = "/"
+            names[:0] = [part for part in target.split("/") if part]
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise InstallRefused("root", f"{path} is not a folder")
+        _trusted_folder(candidate, info, trusted)
+        current = candidate
+    home = os.lstat(current)
+    if home.st_uid != os.geteuid():
+        raise InstallRefused("folder_untrusted", f"{current} is owned by another user")
+    if home.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise InstallRefused("folder_untrusted", f"{current} can be written by group or world; `chmod go-w` it")
+    return os.path.realpath(path)
+
+
+_MAX_LINKS = 40  # Linux's MAXSYMLINKS
+
+
+def _trusted_folder(path: str, info: os.stat_result, trusted: tuple) -> None:
+    if info.st_uid not in trusted:
+        raise InstallRefused("folder_untrusted", f"{path} is owned by another user")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not info.st_mode & stat.S_ISVTX:
+        raise InstallRefused("folder_untrusted", f"{path} is writable by group or world and not sticky")
 
 
 def ensure_dir(root: str, path: str, *, mode: int = 0o700) -> bool:
@@ -158,6 +210,19 @@ def read_regular(path: str) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def file_untrusted(path: str) -> str:
+    """Why another user could change the file at ``path``: it is another user's, or group or world can
+    write it. ``""`` when only we can. The folder rule above, held for a file this package accepts
+    as it is (the unit ``install`` finds already in place)."""
+
+    info = os.lstat(path)
+    if info.st_uid != os.geteuid():
+        return f"{path} is owned by another user"
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{path} can be written by group or world"
+    return ""
 
 
 def write_exclusive(path: str, data: bytes, mode: int) -> None:

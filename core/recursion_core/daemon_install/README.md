@@ -13,7 +13,7 @@ calls `%h`; never `$HOME`, never `os.environ`):
 | path | install | upgrade | uninstall |
 | --- | --- | --- | --- |
 | `~/.local/state/recursion/plugin-security/breaker.sqlite3` and `revoked.sqlite3` (the breaker store and the revocation store, where the daemon opens them) | creates each missing one through `plugin_security.stores` (0600), before the unit; one already there must pass `stores.open_store` and is left as it is; a refusal keeps the store's code (`breaker_store_untrusted`, `revocation_store_invalid`, ...), and a store that cannot be made at all is `store_not_created` | the same | stay (question 3: deleting them would reset every runtime revocation) |
-| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`, before any store is made | rewrites it; missing refuses `unit_missing`, before any store is made | removes it if its first line is this installer's marker (`unit_not_ours` otherwise); refuses `unit_enabled` while `default.target.wants/` links it |
+| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`, and a unit another user owns or that group or world can write refuses `unit_untrusted`, before any store is made | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing`, before any store is made | removes it if its first line is this installer's marker (`unit_not_ours` otherwise); refuses `unit_enabled` while `default.target.wants/` links it |
 | `~/.config`, `~/.config/systemd`, `~/.config/systemd/user`, and `~/.local`, `~/.local/state`, `~/.local/state/recursion`, `.../plugin-security` | creates the missing ones (0700); existing ones stay as they are | the same | stay: other units share them, and the state folder holds the run registry |
 | anything else in the daemon's state folder (the run registry) | - | - | stays |
 
@@ -30,7 +30,8 @@ temporary name, is fsynced, and is linked (new file) or renamed (replacement) in
 folder is fsynced after it. The unit is read with a non-blocking open of at most 1 MiB, so a FIFO
 or a device in its place is refused (`not_regular`) instead of holding the command. A file-system
 error on the way (a folder the user cannot write, a full disk) is the command's refusal
-`filesystem_error`, naming the error and the path.
+`filesystem_error`, naming the error and the path (the unit's folder when the failing call, an
+`fsync` or a `read` on an open file, names none).
 
 The unit runs `<interpreter> -I -X gil=0 -m recursion_core.daemon`, where `<interpreter>` is the
 Python that ran `recursiond install`, exactly as given (a virtual environment's `bin/python` is not

@@ -266,6 +266,49 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.unit_dir))
         self.assertFalse(os.path.lexists(self.store_dir))  # refused before any store is made
 
+    def test_an_existing_unit_another_user_could_change_is_refused_by_install_and_rewritten_by_upgrade(self) -> None:
+        # Review 3 of #382, DeepSeek L1: the same bytes are not enough. A unit group or world can
+        # write, or another user owns, is refused by install (unit_untrusted, left as it is); upgrade
+        # writes it again, ours and 0644. Owner-only modes are fine: only another user's write counts.
+        install(self.roots, EXEC)
+        for mode in (0o664, 0o646, 0o666, 0o620, 0o602):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.unit, mode)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    install(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_untrusted")
+                self.assertEqual(caught.exception.detail, f"{self.unit} can be written by group or world; "
+                                 "`recursiond upgrade` writes it again, ours and 0644")
+                self.assertEqual(_tree(self.home), before)
+                plan = upgrade(self.roots, EXEC)
+                self.assertEqual((plan.action, plan.changed), ("upgrade", True))
+                self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), 0o644)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+                self.assertFalse(install(self.roots, EXEC).changed)
+                self.assertEqual(sorted(os.listdir(self.unit_dir)), [UNIT_NAME])
+        real_lstat = os.lstat
+
+        def other_owner(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if os.fspath(path) == self.unit:
+                fields = list(info[:10])
+                fields[4] = info.st_uid + 1
+                return os.stat_result(fields)
+            return info
+        with mock.patch("os.lstat", side_effect=other_owner):
+            with self.assertRaises(InstallRefused) as caught:
+                install(self.roots, EXEC)
+            self.assertEqual(caught.exception.kind, "unit_untrusted")
+            self.assertIn(f"{self.unit} is owned by another user", caught.exception.detail)
+            self.assertTrue(upgrade(self.roots, EXEC).changed)
+        for mode in (0o600, 0o644, 0o640, 0o604):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.unit, mode)
+                self.assertFalse(install(self.roots, EXEC).changed)
+                self.assertFalse(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), mode)
+
     def test_uninstall_removes_the_unit_and_nothing_else(self) -> None:
         before = _tree(self.home)
         install(self.roots, EXEC)
@@ -467,11 +510,102 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(caught.exception.kind, "root")
         with self.assertRaises(InstallRefused):
             install("not roots", EXEC)  # type: ignore[arg-type]
-        # A link above the unit's folders is the administrator's (``/home`` -> ``/var/home``).
+        # A link on the way to the home is followed (``/home`` -> ``/var/home``) and held to the rule.
         link = os.path.join(self.case, "home-link")
         os.symlink(self.home, link)
         plan = install(Roots(link), EXEC)
         self.assertEqual(plan.unit, self.unit)
+        a_file = os.path.join(self.case, "a-file")
+        with open(a_file, "wb"):
+            pass
+        with self.assertRaises(InstallRefused) as caught:
+            install(Roots(os.path.join(a_file, "home")), EXEC)
+        self.assertEqual(caught.exception.kind, "root")
+
+    def test_the_home_and_the_folders_above_it_must_be_out_of_other_users_reach(self) -> None:
+        # Review 1 of #401, Codex Sol R4 (for #382): the home itself and every folder above it, not
+        # only the folders below it. Each case refuses folder_untrusted before any file is touched.
+        real_lstat = os.lstat
+
+        def owned_by_other(target):
+            def fake(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if os.fspath(path) == target:
+                    fields = list(info[:10])
+                    fields[4] = info.st_uid + 1
+                    return os.stat_result(fields)
+                return info
+            return mock.patch("os.lstat", side_effect=fake)
+
+        def refused(detail_part):
+            with self.assertRaises(InstallRefused) as caught:
+                install(self.roots, EXEC)
+            self.assertEqual(caught.exception.kind, "folder_untrusted")
+            self.assertIn(detail_part, caught.exception.detail)
+            self.assertFalse(os.path.lexists(self.unit))  # refused before any file is written
+
+        case = os.path.realpath(self.case)
+        for mode in (0o720, 0o702, 0o770):  # the home: group or world write, even sticky
+            with self.subTest(home_mode=oct(mode)):
+                os.chmod(self.home, mode)
+                refused("group or world")
+                os.chmod(self.home, mode | stat.S_ISVTX)
+                refused("group or world")
+        os.chmod(self.home, 0o700)
+        with self.subTest(case="home owned by another user"), owned_by_other(os.path.realpath(self.home)):
+            refused("owned by another user")
+
+        def owned_by(target, uid=None, world_writable=False):
+            def fake(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if os.fspath(path) == target:
+                    fields = list(info[:10])
+                    if uid is not None:
+                        fields[4] = uid
+                    if world_writable:
+                        fields[0] = (info.st_mode | stat.S_IWOTH) & ~stat.S_ISVTX
+                    return os.stat_result(fields)
+                return info
+            return mock.patch("os.lstat", side_effect=fake)
+        # A home root owns passes the walk's folder rule (root's or ours) but is not the user's.
+        with self.subTest(case="home owned by root"), owned_by(os.path.realpath(self.home), uid=0):
+            refused("owned by another user")
+        with self.subTest(case="/ writable by world, not sticky"), owned_by("/", world_writable=True):
+            refused("/ is writable by group or world and not sticky")
+        for mode in (0o720, 0o702):  # a folder above: group or world write, unless sticky
+            with self.subTest(above_mode=oct(mode)):
+                os.chmod(case, mode)
+                refused("not sticky")
+                os.chmod(case, mode | stat.S_ISVTX)
+                self.assertTrue(install(self.roots, EXEC).changed)
+                uninstall(self.roots)
+                os.chmod(case, 0o700)
+        with self.subTest(case="folder above owned by another user"), owned_by_other(case):
+            refused("owned by another user")
+        link = os.path.join(self.case, "home-link")
+        os.symlink(self.home, link)
+        with self.subTest(case="link owned by another user"), owned_by_other(os.path.join(case, "home-link")):
+            with self.assertRaises(InstallRefused) as caught:
+                install(Roots(link), EXEC)
+            self.assertIn("link another user owns", caught.exception.detail)
+        loop = os.path.join(self.case, "loop")
+        os.symlink("loop", loop)
+        with self.assertRaises(InstallRefused) as caught:
+            install(Roots(os.path.join(loop, "home")), EXEC)
+        self.assertIn("more than 40 links", caught.exception.detail)
+        for raised in (OSError(5, "Input/output error"), FileNotFoundError(2, "gone")):
+            with self.subTest(readlink=type(raised).__name__), mock.patch("os.readlink", side_effect=raised):
+                with self.assertRaises(InstallRefused) as caught:
+                    install(Roots(link), EXEC)
+                self.assertEqual(caught.exception.kind, "folder_untrusted")
+        os.chmod(case, 0o600)  # a folder on the way that cannot be searched
+        try:
+            with self.assertRaises(InstallRefused) as caught:
+                install(self.roots, EXEC)
+        finally:
+            os.chmod(case, 0o700)
+        self.assertEqual((caught.exception.kind, caught.exception.detail.endswith("PermissionError")),
+                         ("folder_untrusted", True))
 
     def test_losing_the_race_for_the_unit_is_refused_and_leaves_no_temporary_file(self) -> None:
         install(self.roots, EXEC)

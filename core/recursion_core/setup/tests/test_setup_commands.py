@@ -155,6 +155,40 @@ class CommandTests(unittest.TestCase):
                 with open(self.unit, "rb") as handle:
                     self.assertEqual(handle.read(), before)
 
+    def test_a_file_system_error_that_names_no_path_names_the_unit_folder(self):
+        # Review 3 of #382, DeepSeek L2: an fsync (or a read or write on an open file) fails with an
+        # OSError that carries no file name; the detail still names where it happened.
+        unit_dir = os.path.dirname(self.unit)
+        # Slice 2: install makes the stores first, and their creation fsyncs too (a failure there is
+        # store_not_created); with the stores in place, the unit's own write is what fails here.
+        self.run_action("install")
+        os.unlink(self.unit)
+        with mock.patch("os.fsync", side_effect=OSError(5, "Input/output error")):
+            code, answer = self.run_action("install")
+        self.assertEqual((code, answer["code"], answer["action"]), (1, "filesystem_error", "install"))
+        self.assertEqual(answer["detail"], f"OSError: [Errno 5] Input/output error (in {unit_dir})")
+        self.run_action("install")
+        for action, probe in (("upgrade", None), ("uninstall", _refusing_probe)):
+            with self.subTest(action=action), mock.patch("os.fsync", side_effect=OSError(5, "Input/output error")):
+                code, answer = self.run_action(action, interpreter=PY_NEXT, probe=probe)
+                self.assertEqual((code, answer["code"], answer["action"]), (1, "filesystem_error", action))
+                self.assertIn(f"(in {unit_dir})", answer["detail"])
+        # An error that names its own path is printed as it is, with no folder added.
+        with mock.patch("os.lstat", side_effect=PermissionError(13, "Permission denied", self.home)):
+            code, answer = self.run_action("install")
+        self.assertEqual(answer["detail"], f"PermissionError: [Errno 13] Permission denied: '{self.home}'")
+
+    def test_an_existing_unit_another_user_could_change_is_printed_as_its_refusal(self):
+        # Review 3 of #382, DeepSeek L1, as the command prints it: install refuses, upgrade writes it again.
+        self.run_action("install")
+        os.chmod(self.unit, 0o666)
+        code, answer = self.run_action("install")
+        self.assertEqual((code, answer["code"]), (1, "unit_untrusted"))
+        self.assertIn(self.unit, answer["detail"])
+        code, answer = self.run_action("upgrade")
+        self.assertEqual((code, answer["code"], answer["changed"]), (0, "ok", True))
+        self.assertEqual(os.stat(self.unit).st_mode & 0o777, 0o644)
+
     def test_recursiond_install_end_to_end(self):
         out = io.StringIO()
         with mock.patch.object(entry, "_linux", return_value=True), \

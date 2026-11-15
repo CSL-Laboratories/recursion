@@ -397,6 +397,147 @@ class UnreadableGrantThroughS5Test(unittest.TestCase):
         self.assertIsNone(as_registered.authorize(H.DEVICE, "approval.list", {}))                     # the page
 
 
+class _SwapsReader(type):
+    """Hands back object's own reader when asked for the class's, hiding a custom __getattribute__ (#377 round 6)."""
+
+    def __getattribute__(cls, name):
+        if name == "__getattribute__":
+            return object.__getattribute__
+        return type.__getattribute__(cls, name)
+
+
+class _UnreadableOnTheMetaclass(type):
+    @property
+    def grant(cls):
+        raise AttributeError("the trusted grant context is unavailable")
+
+
+def _custom_reader(kind, principal_id, failure, metaclass=type):
+    """A principal whose class declares ``grant = None`` and whose own ``__getattribute__`` fails reading it."""
+
+    class CustomReader(metaclass=metaclass):
+        grant = None
+        in_run_unit = False
+
+        def __init__(self):
+            self.kind, self.id = kind, principal_id
+
+        def __getattribute__(self, name):
+            if name == "grant":
+                raise failure
+            return object.__getattribute__(self, name)
+
+    return CustomReader()
+
+
+@NEEDS_POSIX
+class RoundFourSeamsTest(unittest.TestCase):
+    """The round-4 reads of #385. Codex GPT-6 Astra 1 and GPT-6.1 Sol 1 (STRICT): object.__getattribute__ skipped a
+    custom __getattribute__, so the declared default stood in for its failed read (the reader now comes with #377's
+    26a5996c). DeepSeek V4.1 Flash F1: a grant declared on the metaclass read as absent (with #377's df0c5f3f), and
+    F2: ScopesService.start raised for a state_dir whose read raised."""
+
+    KINDS = (("plugin", "plugin.alpha"), ("owner", "local"), ("internal", "quota"), ("device", "page"))
+
+    def setUp(self) -> None:
+        base = tempfile.mkdtemp(prefix="scopes-r4-")
+        self.addCleanup(shutil.rmtree, base, True)
+        self.state = os.path.join(base, "state")
+        os.mkdir(self.state, 0o700)
+        store = CredentialStore(os.path.join(self.state, "control", "credentials.json"))
+        _, self.grant = store.mint("plugin", "plugin.alpha", ["read", "run"])    # live grants a fall-through would use
+        self.hooks, self.service = with_service()
+        self.service.start(H.ServiceContext(state_dir=self.state, control_registry=Registry()))
+        self.as_registered = composed()
+
+    def assert_holds_nothing(self, make) -> None:
+        for failure in (AttributeError("context unavailable"), RuntimeError("context unavailable")):
+            for kind, principal_id in self.KINDS:
+                with self.subTest(failure=type(failure).__name__, kind=kind):
+                    who = make(kind, principal_id, failure)
+                    self.assertEqual(self.service._authorizer.held(who), frozenset())
+                    self.assertEqual(self.hooks.authorize(who, "run.list", {}), refused("needs_read"))
+                    self.assertEqual(self.as_registered.authorize(who, "run.list", {}), refused("needs_read"))
+
+    def assert_absence_still_holds(self) -> None:
+        self.assertIsNone(self.hooks.authorize(H.Principal("plugin", "plugin.alpha"), "run.list", {}))
+        self.assertIsNone(self.as_registered.authorize(H.OWNER, "workspace.publish", {}))
+        self.assertIsNone(self.as_registered.authorize(H.Principal("internal", "quota"), "approval.answer", {}))
+        self.assertIsNone(self.as_registered.authorize(H.DEVICE, "approval.list", {}))
+
+    def test_declared_grant_custom_reader_failure_holds_nothing(self) -> None:
+        # Astra 1: directly and through S5, with the service started and as registered.
+        self.assert_holds_nothing(_custom_reader)
+        self.assert_absence_still_holds()
+
+    def test_a_declared_grant_read_failure_in_custom_getattribute_holds_nothing(self) -> None:
+        # Sol 1, with the metaclass that hands back object's reader (#377 round 6), and DeepSeek F1: a grant declared
+        # on the metaclass and unreadable.
+        self.assert_holds_nothing(lambda kind, pid, failure: _custom_reader(kind, pid, failure, _SwapsReader))
+
+        def on_the_metaclass(kind, principal_id, failure):
+            class OnTheMetaclass(metaclass=_UnreadableOnTheMetaclass):
+                in_run_unit = False
+
+                def __init__(self):
+                    self.kind, self.id = kind, principal_id
+
+            return OnTheMetaclass()
+
+        self.assert_holds_nothing(on_the_metaclass)
+        self.assert_absence_still_holds()
+
+    def test_a_reader_that_supplies_the_grant_is_the_grant_used(self) -> None:
+        class Supplies(metaclass=_SwapsReader):
+            grant = None
+            kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+            def __getattribute__(inner, name):
+                if name == "grant":
+                    return self.grant.token_id
+                return object.__getattribute__(inner, name)
+
+        self.assertIsNone(self.hooks.authorize(Supplies(), "run.list", {}))
+        self.assertEqual(self.service._authorizer.held(Supplies()), frozenset({"read", "run"}))
+
+    def test_a_context_whose_reads_raise_is_logged_and_start_returns(self) -> None:
+        class NoPath:
+            def __fspath__(self):
+                raise RuntimeError("no path")
+
+        class RaisingStateDir:
+            control_registry = Registry()
+
+            @property
+            def state_dir(self):
+                raise RuntimeError("no state directory")
+
+        class RaisingRegistry:
+            state_dir = None
+
+            @property
+            def control_registry(self):
+                raise RuntimeError("no registry")
+
+        class RaisingGet:
+            @property
+            def get(self):
+                raise RuntimeError("no reader")
+
+        contexts = {"__fspath__": H.ServiceContext(state_dir=NoPath(), control_registry=Registry()),
+                    "state_dir": RaisingStateDir(), "control_registry": RaisingRegistry(),
+                    "registry.get": H.ServiceContext(state_dir=None, control_registry=RaisingGet())}
+        for where, context in contexts.items():
+            with self.subTest(where=where):
+                hooks, service = with_service()
+                with self.assertLogs("recursion_core.control.scopes", "ERROR"):
+                    service.start(context)
+                self.assertTrue(service.ready)
+                self.assertEqual(hooks.authorize(H.Principal("plugin", "plugin.alpha"), "run.stop",
+                                                 {"run_id": "run-alpha"}), refused("needs_run"))
+                self.assertIsNone(hooks.authorize(H.OWNER, "run.list", {}))
+
+
 @NEEDS_POSIX
 class BearerWithoutGrantTest(unittest.TestCase):
     """Until SPINE's Principal carries ``grant``, a device, session or agent principal holds nothing, live grants

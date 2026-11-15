@@ -109,9 +109,9 @@ class ScopesService:
     """Seam S13 service ``control.scopes``: attaches the credential store and the run records to the authorizer.
 
     ``start`` opens ``CredentialStore(<state_dir>/control/credentials.json)`` and reads run records with
-    the control registry's ``get``. It never raises: a store that cannot be opened (or no state directory)
-    is logged and leaves token principals holding nothing, and the daemon still starts. It is ready once
-    it has attached. ``stop`` detaches, so a call after it holds only what owner, internal and the page hold.
+    the control registry's ``get``. It never raises: a store that cannot be opened, no state directory, or
+    a state directory or registry that cannot be read is logged and leaves token principals holding
+    nothing (or no run record read), and the daemon still starts. It is ready once it has attached. ``stop`` detaches, so a call after it holds only what owner, internal and the page hold.
     """
 
     name = SERVICE_NAME
@@ -122,19 +122,25 @@ class ScopesService:
 
     def start(self, context) -> None:
         store = None
-        state_dir = getattr(context, "state_dir", None)
-        if state_dir is None:
-            log.error("control.scopes: no state directory; no credential is honoured")
-        else:
-            try:
+        try:
+            state_dir = getattr(context, "state_dir", None)
+            if state_dir is None:
+                log.error("control.scopes: no state directory; no credential is honoured")
+            else:
                 store = CredentialStore(os.path.join(os.fspath(state_dir), *CREDENTIALS_PATH))
-            except CredentialStoreError as exc:
-                log.error("control.scopes: the credential store cannot be used (%s); no credential is honoured", exc)
-            except (TypeError, ValueError) as exc:   # a state_dir that is not a path (the read of #385 by DeepSeek, F3)
-                log.error("control.scopes: the state directory is not a path (%s); no credential is honoured",
-                          type(exc).__name__)
-        registry = getattr(context, "control_registry", None)
-        reader = getattr(registry, "get", None)
+        except CredentialStoreError as exc:
+            log.error("control.scopes: the credential store cannot be used (%s); no credential is honoured", exc)
+        except Exception as exc:  # noqa: BLE001 - a state_dir that is not a path, or cannot be read, honours nothing
+            # (the reads of #385 by DeepSeek: round 1 F3, a state_dir of 5; round 4 F2, a raising __fspath__ or
+            # state_dir property)
+            log.error("control.scopes: the state directory is not a usable path (%s); no credential is honoured",
+                      type(exc).__name__)
+        try:
+            reader = getattr(getattr(context, "control_registry", None), "get", None)
+        except Exception as exc:  # noqa: BLE001 - a registry that cannot be read reads no record (round 4, DeepSeek F2)
+            log.error("control.scopes: the control registry cannot be read (%s); no run record is read",
+                      type(exc).__name__)
+            reader = None
         self._authorizer.attach(credentials=store, run_record=reader if callable(reader) else None)
         self.ready = True
 

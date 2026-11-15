@@ -207,20 +207,20 @@ MUTANTS = {
     # The first reads of #399 (05a5d13d): each guard they found unprotected or missing.
     "M34 a null vendor reset read as no deadline": (
         ROUTER,
-        '        until = signal.get("reset_at")\n        if until is None:\n            until = limit.get("retry_at")\n',
-        '        until = signal.get("reset_at", limit.get("retry_at"))\n',
+        '        until = reset_at\n        if until is None:\n            until = retry_at\n',
+        '        until = signal.get("reset_at", retry_at) if isinstance(signal, Mapping) else retry_at\n',
         {"test_wait_uses_breaker_retry_when_vendor_reset_is_null"}),
     "M35 the decided primary not counted as tried": (
         ROUTER,
-        '    attempts.append({"engine": decision["engine"]',
-        '    (lambda _: None)({"engine": decision["engine"]',
+        '    attempts.append((decision["engine"]',
+        '    (lambda _: None)((decision["engine"]',
         {"test_primary_not_reoffered_without_notice"}),
     "M36 the model left out of a tried route's identity": (
         ROUTER,
         '    mine = (route["engine"], route["model"], contract.connection_key(route))\n'
-        '    return mine == (seen.get("engine"), seen.get("model"), seen.get("connection"))\n',
+        '    return mine == seen\n',
         '    mine = (route["engine"], contract.connection_key(route))\n'
-        '    return mine == (seen.get("engine"), seen.get("connection"))\n',
+        '    return mine == (seen[0], seen[2])\n',
         {"test_same_engine_and_connection_other_model_still_allowed"}),
     "M37 a route with no model anywhere routed": (
         ROUTER,
@@ -254,10 +254,10 @@ MUTANTS = {
         {"test_a_snapshot_that_cannot_be_walked_is_malformed"}),
     "M43 a decision that is not decide's answered as no route": (
         ROUTER,
-        '    if not isinstance(decision, Mapping) or "ok" not in decision:\n'
-        '        return {"action": "none", "reason": "no_decision"}\n'
-        '    if not decision["ok"]:\n',
-        '    if not decision.get("ok"):\n',
+        '        if not isinstance(decision, Mapping) or "ok" not in decision:\n'
+        '            return {"action": "none", "reason": "no_decision"}\n'
+        '        if not decision["ok"]:\n',
+        '        if not decision.get("ok"):\n',
         {"test_next_after_limit_takes_decides_answer_only"}),
     "M44 a refusal detail that is not a code word": (
         ROUTER,
@@ -289,13 +289,13 @@ MUTANTS = {
         {"test_a_null_hand_pick_is_refused_alike_everywhere", "test_a_present_null_condition_is_refused_not_read_as_absent"}),
     "M49 a null attempts list raising": (
         ROUTER,
-        'attempts = [a for a in (notice.get("attempts") or ()) if isinstance(a, Mapping)]',
-        'attempts = [a for a in notice.get("attempts", ()) if isinstance(a, Mapping)]',
+        "for a in (tried or ()) if isinstance(a, Mapping)]",
+        "for a in tried if isinstance(a, Mapping)]",
         {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
     "M50 a decision routed in name only used": (
         ROUTER,
-        '        return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide\'s answer\n',
-        "        pass\n",
+        '            return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide\'s answer\n',
+        "            pass\n",
         {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
     "M51 an invalid routes.json limits block used as it is": (
         ROUTER,
@@ -312,11 +312,13 @@ MUTANTS = {
         "    except Exception:  # noqa: BLE001 - a task that cannot be read is refused, never raised through\n",
         "    except ZeroDivisionError:\n",
         {"test_a_task_that_cannot_be_read_is_refused"}),
-    "M54 route_decision of None raising": (
+    # M54, re-pointed in the fourth answer: route_decision's body is now one guard, so removing its isinstance
+    # alone answers None through the guard; the mutant removes the guard instead (None and an unreadable object).
+    "M54 route_decision raising on what it cannot read": (
         ROUTER,
-        '    if not isinstance(decision, Mapping) or not decision.get("ok"):\n        return None\n',
-        '    if not decision.get("ok"):\n        return None\n',
-        {"test_route_decision_of_anything_but_a_routed_decision_is_none"}),
+        "    except Exception:  # noqa: BLE001 - a decision that cannot be read is not a routed decision\n",
+        "    except ZeroDivisionError:\n",
+        {"test_route_decision_of_an_unreadable_or_wrong_typed_decision_is_none"}),
     # The third reads of #399 (1bf3254d): sol 1-2 (its M55-M60 as proposed), DeepSeek N1-N5.
     "M55 reason missing from a routed decision accepted": (
         ROUTER,
@@ -364,16 +366,34 @@ MUTANTS = {
         '        return {"action": "none", "reason": "no_decision"}  # an engine or model decide never gives\n',
         "        pass\n",
         {"test_a_decision_with_an_engine_decide_never_gives_is_no_decision"}),
-    "M64 route_decision of a mapping routed in name only raising": (
+    # M64, re-pointed in the fourth answer: a missing member now answers None through the guard's KeyError as
+    # well, so the mutant removes the type check, which a list reason or model passes through without raising.
+    "M64 route_decision publishing members of a type decide never gives": (
         ROUTER,
-        "        return None  # carries ok without decide's members: not a routed decision\n",
-        "        pass\n",
-        {"test_route_decision_of_anything_but_a_routed_decision_is_none"}),
+        "            return None  # members of a type decide never gives: not a routed decision\n",
+        "            pass\n",
+        {"test_route_decision_of_an_unreadable_or_wrong_typed_decision_is_none"}),
     "M65 a limit result that cannot be read raising": (
         ROUTER,
         "    except Exception:  # noqa: BLE001 - a limit result that cannot be read is not a limit: no blind retry\n",
         "    except ZeroDivisionError:\n",
         {"test_a_limit_result_that_cannot_be_read_is_not_a_limit"}),
+    # The fourth reads of #399 (477fa308): DeepSeek C-D, F and I (A-B are M54 and M64, E is M65's wider test).
+    "M66 next_after_limit raising on a decision it cannot read": (
+        ROUTER,
+        "    except Exception:  # noqa: BLE001 - a decision that cannot be read is not decide's answer\n",
+        "    except ZeroDivisionError:\n",
+        {"test_next_after_limit_answers_no_decision_for_a_decision_it_cannot_read"}),
+    "M67 a missing snapshot called malformed": (
+        ROUTER,
+        '    if not isinstance(detection, Mapping):\n        return None, "detection_unavailable"\n',
+        "",
+        {"test_a_missing_snapshot_is_detection_unavailable"}),
+    "M68 an attempt's structured connection not read as its word": (
+        ROUTER,
+        "    if isinstance(value, Mapping):\n        return f\"{value.get('kind')}:{value.get('id')}\"\n",
+        "",
+        {"test_an_attempt_with_a_structured_connection_counts_as_tried"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

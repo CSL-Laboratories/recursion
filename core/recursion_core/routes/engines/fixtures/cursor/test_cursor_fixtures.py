@@ -397,34 +397,58 @@ class AcpTranscriptTest(unittest.TestCase):
                 self.assertTrue(acp_answer_problems(method, {}, {**answer, "configOptions": [boolean, {}]}))
 
     def test_capabilities_are_checked_field_by_field(self):
-        """Review 3 of #388 (Astra change 3, Sol change 1): AgentCapabilities' supplied fields, and each nested
-        capability object's own fields, one level deep. The fields below are copied from the pinned schema on
-        purpose, so that dropping one from the check's tables fails here."""
+        """Review 3 of #388 (Astra change 3, Sol change 1) and review 4 (Astra change 1, Sol change 1):
+        AgentCapabilities' supplied fields and all their nested capability objects, to the leaves. The fields
+        below are written out from the pinned schema on purpose, so that dropping one from CAPABILITY_TREE
+        fails here."""
         def problems(caps):
             return acp_answer_problems("initialize", {}, {"protocolVersion": 1, "agentCapabilities": caps})
-        flags = {"promptCapabilities": ("image", "audio", "embeddedContext"), "mcpCapabilities": ("http", "sse")}
-        objects = {"sessionCapabilities": ("list", "delete", "additionalDirectories", "systemPrompt", "resume",
-                                           "close"),
-                   "auth": ("logout",)}
+
+        def at(path, value):
+            for key in reversed(path.split(".")):
+                value = {key: value}
+            return value
+        booleans = ("loadSession", "promptCapabilities.image", "promptCapabilities.audio",
+                    "promptCapabilities.embeddedContext", "mcpCapabilities.http", "mcpCapabilities.sse")
+        tops = ("promptCapabilities", "mcpCapabilities", "sessionCapabilities", "auth")
+        nullable = ("sessionCapabilities.list", "sessionCapabilities.delete",
+                    "sessionCapabilities.additionalDirectories", "sessionCapabilities.systemPrompt",
+                    "sessionCapabilities.systemPrompt.mode", "sessionCapabilities.systemPrompt.mode.override",
+                    "sessionCapabilities.resume", "sessionCapabilities.close", "auth.logout")
         good = {"loadSession": False, "promptCapabilities": {"image": True, "audio": False, "embeddedContext": True},
                 "mcpCapabilities": {"http": False, "sse": True}, "auth": {"logout": {}}, "_meta": {"x": 1},
-                "sessionCapabilities": {"list": {}, "delete": None, "additionalDirectories": {}, "systemPrompt": None,
-                                        "resume": {}, "close": None}}
+                "sessionCapabilities": {"list": {}, "delete": None, "additionalDirectories": {},
+                                        "systemPrompt": {"mode": {"override": {}}}, "resume": {}, "close": None}}
         self.assertEqual(problems(good), [])
         self.assertEqual(problems({}), [])
-        breaks = [({"loadSession": value}, "loadSession is not a boolean") for value in (1, 0, "true", None)]
-        for key, fields in flags.items():
-            breaks += [({key: {field: 1}}, f"{key}.{field} is not a boolean") for field in fields]
-            breaks += [({key: {field: "yes"}}, f"{key}.{field} is not a boolean") for field in fields]
-        for key, fields in objects.items():
-            breaks += [({key: {field: True}}, f"{key}.{field} is not an object or null") for field in fields]
-            breaks += [({key: {field: []}}, f"{key}.{field} is not an object or null") for field in fields]
-        for key in [*flags, *objects]:
-            breaks += [({key: value}, f"{key} is not an object") for value in ([], None, True)]
+        for path in nullable:
+            for value in (None, {}, {"_meta": {"x": 1}}):
+                with self.subTest(path=path, value=value):
+                    self.assertEqual(problems(at(path, value)), [])
+        breaks = [(at(path, value), f"{path} is not a boolean") for path in booleans for value in (1, 0, "true", None)]
+        breaks += [(at(path, value), f"{path} is not an object") for path in tops for value in ([], None, True)]
+        breaks += [(at(path, value), f"{path} is not an object or null") for path in nullable
+                   for value in (True, False, [], 1, "x")]
         for caps, expected in breaks:
             with self.subTest(caps=caps):
                 self.assertEqual(problems(caps), [expected])
         self.assertEqual(problems(None), ["agentCapabilities is not an object"])
+
+    def test_system_prompt_mode_and_override_follow_the_pinned_shapes(self):
+        """Review 4 of #388 (Astra change 1, Sol change 1): the reads' own cases, together. ``mode`` and its
+        ``override`` choose between appending to the system prompt and replacing it, so they are behaviour, not
+        description, and are checked as the schema has them: an object or null."""
+        def check(prompt):
+            return acp_answer_problems("initialize", {}, {"protocolVersion": 1, "agentCapabilities": {
+                "sessionCapabilities": {"systemPrompt": prompt}}})
+        for good in ({}, {"mode": None}, {"mode": {}}, {"mode": {"override": None}}, {"mode": {"override": {}}}):
+            with self.subTest(good=good):
+                self.assertEqual(check(good), [])
+        for bad in ({"mode": False}, {"mode": []}, {"mode": 1}, {"mode": {"override": False}},
+                    {"mode": {"override": True}}, {"mode": {"override": []}}, {"mode": {"override": 1}},
+                    {"mode": {"override": 0}}):
+            with self.subTest(bad=bad):
+                self.assertTrue(check(bad))
 
     def test_session_modes_check_every_supplied_field(self):
         """Review 3 of #388 (Sol change 2, Astra change 4): each field of a session mode state, in a session/new
@@ -453,8 +477,8 @@ class AcpTranscriptTest(unittest.TestCase):
 
 # What the shape check holds an ACP v1 body to, at the revision index.json names: each method's required
 # fields with their types; each content variant's required fields; and, where supplied, the optional fields
-# that change what a client does (session modes, config options, and agent capabilities with their nested
-# capability objects, one level deep). Descriptive and extension fields (``_meta``, ``annotations``,
+# that change what a client does (session modes, config options, and agent capabilities with all their
+# nested capability objects, to the leaves). Descriptive and extension fields (``_meta``, ``annotations``,
 # ``mimeType`` where optional, ``title``, ``description``, ``size``) are not checked.
 #
 # ACP v1's closed values.
@@ -469,12 +493,19 @@ AGENT_METHODS = ("session/update", "session/request_permission")
 # ResourceLink; EmbeddedResource requires an object ``resource``).
 CONTENT_TEXT_FIELDS = {"text": ("text",), "image": ("data", "mimeType"), "audio": ("data", "mimeType"),
                        "resource_link": ("name", "uri"), "resource": ()}
-# AgentCapabilities' nested capability objects and their own fields: PromptCapabilities and McpCapabilities
-# hold booleans; SessionCapabilities and AgentAuthCapabilities hold objects or null.
-CAPABILITY_FLAGS = {"promptCapabilities": ("image", "audio", "embeddedContext"), "mcpCapabilities": ("http", "sse")}
-CAPABILITY_OBJECTS = {"sessionCapabilities": ("list", "delete", "additionalDirectories", "systemPrompt", "resume",
-                                              "close"),
-                      "auth": ("logout",)}
+# AgentCapabilities to its leaves, from the pinned schema, with ``_meta`` left out. ``bool`` marks a boolean
+# field; a dict marks a capability object and holds that object's own fields. The four objects at the top may
+# not be null; every object below them may be (the schema's ``anyOf`` with null). Below the first level, only
+# SessionSystemPromptCapabilities (``mode``) and SessionSystemPromptModeCapabilities (``override``) hold
+# anything but ``_meta``.
+CAPABILITY_TREE = {
+    "loadSession": bool,
+    "promptCapabilities": {"image": bool, "audio": bool, "embeddedContext": bool},
+    "mcpCapabilities": {"http": bool, "sse": bool},
+    "sessionCapabilities": {"list": {}, "delete": {}, "additionalDirectories": {},
+                            "systemPrompt": {"mode": {"override": {}}}, "resume": {}, "close": {}},
+    "auth": {"logout": {}},
+}
 
 
 def _text(value) -> bool:
@@ -559,23 +590,27 @@ def select_options_ok(options) -> bool:
 
 
 def capability_problems(caps) -> list:
-    """An initialize answer's AgentCapabilities: ``loadSession`` a boolean, and each nested capability object
-    supplied is an object whose own fields are booleans (prompt, MCP) or objects or null (session, auth)."""
+    """An initialize answer's AgentCapabilities: every supplied field of CAPABILITY_TREE, to its leaves."""
     if not isinstance(caps, dict):
         return ["agentCapabilities is not an object"]
+    return _capability_fields(caps, CAPABILITY_TREE, "")
+
+
+def _capability_fields(value: dict, tree: dict, path: str) -> list:
     out = []
-    if "loadSession" in caps and type(caps["loadSession"]) is not bool:
-        out.append("loadSession is not a boolean")
-    for table, fits, what in ((CAPABILITY_FLAGS, lambda v: type(v) is bool, "a boolean"),
-                              (CAPABILITY_OBJECTS, lambda v: v is None or isinstance(v, dict), "an object or null")):
-        for key, fields in table.items():
-            if key not in caps:
-                continue
-            if not isinstance(caps[key], dict):
-                out.append(f"{key} is not an object")
-                continue
-            out += [f"{key}.{field} is not {what}" for field in fields
-                    if field in caps[key] and not fits(caps[key][field])]
+    for field, shape in tree.items():
+        if field not in value:
+            continue
+        item, name = value[field], path + field
+        if shape is bool:
+            if type(item) is not bool:
+                out.append(f"{name} is not a boolean")
+        elif item is None and path:
+            pass   # a capability object below the top may be null
+        elif not isinstance(item, dict):
+            out.append(f"{name} is not an object" + (" or null" if path else ""))
+        else:
+            out += _capability_fields(item, shape, name + ".")
     return out
 
 

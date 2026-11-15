@@ -44,10 +44,14 @@ class TableTest(unittest.TestCase):
 
     def test_a_schema_keyword_the_checker_does_not_know_is_refused(self) -> None:
         refused = [
-            {"type": "object", "properties": {"run_id": {"type": "string", "pattern": "^run-"}}},
+            {"type": "object", "properties": {"run_id": {"type": "string", "format": "uuid"}}},
             {"type": "object", "properties": {}, "additionalProperties": True},
-            {"type": "object", "properties": {"n": {"type": "number"}}},
-            {"type": "object", "properties": {"x": {"type": "string", "enum": ["a"]}}},
+            {"type": "object", "properties": {"x": {"const": "a"}}},
+            {"type": "object", "properties": {"x": {"type": "date"}}},
+            {"type": "object", "properties": {"x": {"type": "string", "pattern": "^\\d+$"}}},
+            {"type": "object", "properties": {"x": {"type": "string", "pattern": "^(?=a)a$"}}},
+            {"type": "object", "properties": {"x": {"type": "string", "enum": []}}},
+            {"type": "object", "properties": {"x": {"anyOf": []}}},
             {"type": "string"},
             {"type": "object", "oneOf": []},
         ]
@@ -104,6 +108,59 @@ class CheckArgumentsTest(unittest.TestCase):
         for name, values in accepted.items():
             for value in values:
                 self.assertIsNone(check_arguments(by_name[name], value), (name, value))
+
+
+class PublishedKeywordTest(unittest.TestCase):
+    """The keywords the published parameter schemas use beyond the legacy four's."""
+
+    def test_patterns_are_read_as_ecma_262_reads_them(self) -> None:
+        end = {"type": "string", "pattern": "^[a-z]+$"}
+        self.assertIsNone(check_arguments(end, "abc"))
+        self.assertEqual("arguments does not match the pattern ^[a-z]+$", check_arguments(end, "abc\n"))
+        dot = {"type": "string", "pattern": "^a.b$"}
+        self.assertIsNone(check_arguments(dot, "axb"))
+        for terminator in ("\n", "\r", "\u2028", "\u2029"):
+            self.assertIsNotNone(check_arguments(dot, f"a{terminator}b"), repr(terminator))
+        unanchored = {"type": "string", "pattern": "b"}
+        self.assertIsNone(check_arguments(unanchored, "abc"))
+        negated = {"type": "string", "pattern": "^[^$.]+$"}  # inside a class, $ and . are themselves
+        self.assertIsNone(check_arguments(negated, "abc"))
+        self.assertIsNotNone(check_arguments(negated, "a$c"))
+        self.assertIsNotNone(check_arguments(negated, "a.c"))
+
+    def test_not_enum_any_of_items_and_type_lists(self) -> None:
+        no_newline = {"type": "string", "not": {"pattern": "[\\r\\n]"}}
+        self.assertIsNone(check_arguments(no_newline, "one line"))
+        self.assertEqual("arguments is in a form it must not take", check_arguments(no_newline, "two\nlines"))
+        enum = {"enum": ["raw", "transcript"]}
+        self.assertIsNone(check_arguments(enum, "raw"))
+        self.assertEqual('arguments must be one of ["raw","transcript"]', check_arguments(enum, "RAW"))
+        self.assertIsNotNone(check_arguments({"enum": [1]}, True))
+        either = {"type": "object", "anyOf": [{"required": ["text"]}, {"required": ["delivery"]}]}
+        self.assertIsNone(check_arguments(either, {"text": "x"}))
+        self.assertIsNone(check_arguments(either, {"delivery": "steer"}))
+        self.assertEqual("arguments matches none of the allowed forms", check_arguments(either, {}))
+        listed = {"type": "object", "properties": {"x": {"type": "array", "items": {"type": "string", "minLength": 1}}}}
+        self.assertIsNone(check_arguments(listed, {"x": ["a", "b"]}))
+        self.assertEqual("arguments.x[1] must be at least 1 character(s) long", check_arguments(listed, {"x": ["a", ""]}))
+        nullable = {"type": ["string", "null"]}
+        self.assertIsNone(check_arguments(nullable, None))
+        self.assertEqual("arguments must be one of the types string, null", check_arguments(nullable, 1))
+
+    def test_numbers_and_booleans(self) -> None:
+        number = {"type": "number", "minimum": 0}
+        for good in (0, 1.5, 2):
+            self.assertIsNone(check_arguments(number, good), good)
+        for bad in (True, "1", None, -0.5):
+            self.assertIsNotNone(check_arguments(number, bad), bad)
+        self.assertIsNone(check_arguments({"type": "boolean"}, False))
+        self.assertEqual("arguments must be a boolean", check_arguments({"type": "boolean"}, 0))
+
+    def test_escapes_python_reads_differently_are_refused(self) -> None:
+        for pattern in ("\\d", "\\w", "\\s", "\\b", "\\u0041", "(?i)a", "(?<n>a)", "[a", "a\\"):
+            with self.subTest(pattern=pattern), self.assertRaises(SchemaUnsupported):
+                tools.ecma_pattern(pattern)
+        self.assertIsNotNone(tools.ecma_pattern("^[A-Za-z0-9._:-]{1,128}$").search("a.b:c"))
 
 
 if __name__ == "__main__":

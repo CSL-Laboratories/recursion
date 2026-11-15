@@ -22,8 +22,9 @@ One ``LegacySession`` serves one client over one stdio pair (``serve``). What it
     ``-32600`` until ``initialize`` has been answered. ``tools/list`` has one page; a ``cursor`` (this
     server never issues one) is ``-32602``. ``tools/call``: an unknown tool or arguments that break the
     tool's ``inputSchema`` are ``-32602`` and nothing reaches the daemon; otherwise the call runs on a
-    worker thread and its answer is ``control.mcp_tools.call_tool``'s, unchanged: the control API's answer
-    as ``structuredContent``, the same JSON as text, ``isError`` true unless the code is a success code.
+    worker thread and its answer is ``tools.forward``'s, which answers as ``control.mcp_tools.call_tool``
+    does: the control API's answer as ``structuredContent``, the same JSON as text, ``isError`` true
+    unless the code is a success code.
 ``notifications/initialized``
     Recorded; requests after the ``initialize`` answer are served whether or not it has arrived.
 ``notifications/cancelled``
@@ -54,11 +55,9 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, BinaryIO
 
-from recursion_core.control import mcp_tools
-
 from . import jsonrpc
 from .framing import NOT_JSON, NOT_UTF8, TOO_LARGE, Frame, FrameWriter, read_frames
-from .tools import Tool, check_arguments, tool_table
+from .tools import Tool, check_arguments, forward, tool_table
 
 LEGACY_PROTOCOL = "2025-06-18"
 SERVER_NAME = "recursion-control"
@@ -286,7 +285,7 @@ class LegacySession:
     def _run(self, call: _Call, arguments: dict) -> None:
         try:
             try:
-                outcome = mcp_tools.call_tool(self._api, call.tool.name, arguments)
+                outcome = forward(self._api, call.tool, arguments)
             except Exception as exc:  # noqa: BLE001 - an answer is owed; the call's effect is unknown
                 outcome = _unknown_outcome(exc)
             if self._release(call):

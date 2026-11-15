@@ -1,0 +1,27 @@
+{
+  "written_by": "Claude Opus 5.5 (claude-opus-5-5), lane ENGINE-E6",
+  "provenance": "this lane's rule, not a capture: the updater flag on every spawn (vault 20261107-csl712-engine-clis-grounding-01, V38), no credential in argv, argv[0] the vouched executable",
+  "oneshot": {
+    "model": "synthetic-model",
+    "argv": ["agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model"]
+  },
+  "oneshot_pinned": {
+    "binary": "/opt/cursor/bin/agent",
+    "model": "synthetic-model",
+    "argv": ["/opt/cursor/bin/agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model"]
+  },
+  "acp": {
+    "argv": ["agent", "--disable-auto-update", "acp"]
+  },
+  "refused": [
+    {"argv": ["agent", "-p", "--output-format", "stream-json", "--model", "synthetic-model"], "detail": "updater_not_disabled"},
+    {"argv": ["agent", "acp"], "detail": "updater_not_disabled"},
+    {"argv": ["cursor-agent", "--disable-auto-update", "acp"], "detail": "executable_mismatch"},
+    {"argv": ["agent", "--disable-auto-update", "--api-key", "made-up-key", "acp"], "detail": "credential_in_argv:--api-key"},
+    {"argv": ["agent", "--disable-auto-update", "--api-key=made-up-key", "acp"], "detail": "credential_in_argv:--api-key"},
+    {"argv": ["agent", "--disable-auto-update", "--auth-token", "made-up-token", "acp"], "detail": "credential_in_argv:--auth-token"},
+    {"argv": ["agent", "--disable-auto-update", "-H", "Authorization: Bearer made-up", "acp"], "detail": "credential_in_argv:-H"},
+    {"argv": ["agent", "--disable-auto-update", "-HAuthorization: Bearer made-up", "acp"], "detail": "credential_in_argv:-H"},
+    {"argv": ["agent", "--disable-auto-update", "--header=Authorization: Bearer made-up", "acp"], "detail": "credential_in_argv:--header"}
+  ]
+}

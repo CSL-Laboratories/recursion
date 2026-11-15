@@ -40,15 +40,27 @@ bucket fences the whole connection until a bucket-to-model mapping is recorded).
 notifications are not outcomes: Codex sends them for retries too (``willRetry``), and the outcome is the
 turn's own status.
 
-SERVER REQUESTS. Approvals are not forwarded yet (``permission_bridge`` is false until APPROVALS' request
-and wait interface exists): a command or file-change approval is answered with the protocol's typed
-``decline``, at once, on its own id, so no tool runs unapproved and the turn is not left hanging. Every
-other server request is answered with JSON-RPC error -32601.
+APPROVALS (CONTRACT 3430-3431, "forward provider approvals"; 919, "The core draws every approval").
+Given an approvals port (``approvals=``: APPROVALS' ``request(effect, binding) -> approval_id``, a fake
+until that lane's interface lands), the driver declares ``permission_bridge: true`` and turns each
+command or file-change approval request of the server into ONE approval: an approval.v1 ``engine_tool``
+effect (the engine, the session and run, the tool, its cwd, and its input as the engine gave it, the file
+changes included from the item the server announced) and the private binding without its id
+(``run_id``, ``engine``, ``engine_request_id``, ``bound_at``), which the port completes with the
+approval id it mints. The JSON-RPC request id, and the thread, turn and item it names, stay in this
+driver's private table. Only driver.v2's ``approval_answer {approval_id, decision}`` reaches the engine:
+``approve`` is the protocol's ``accept`` (that call, once; never ``acceptForSession``), ``deny`` is
+``decline``. It is written on the request id of that same pending call, once, and only while the server
+still waits for it: an answer after the server resolved the request itself (``serverRequest/resolved``)
+or after the turn ended writes nothing and is refused. A port that raises, or none, means the typed
+``decline`` at once, so no tool runs unapproved and the turn is not left hanging. The deadline is
+APPROVALS' (it writes the deny at ``expires_at`` and sends it as ``approval_answer``). No approval request
+is ever refused -32601. Every other server request is answered with JSON-RPC error -32601.
 
 THE UPDATER. The worker is ``codex -c check_for_update_on_startup=false app-server`` (routes/codex.py's
 override) and this module starts no other process.
 
-Not here yet: ``fork`` (false until SESSIONS asks), approvals through the core queue, ``tool.call`` and
+Not here yet: ``fork`` (false until SESSIONS asks), APPROVALS' real port, ``tool.call`` and
 ``tool.result`` drafts (their input digest is RFC 8785, taken by the core), who owns a live handle
 between turns (DRIVER-CC's S9 drive owner, ``routes/workers.py``).
 """
@@ -58,6 +70,7 @@ from __future__ import annotations
 import datetime
 import json
 import threading
+import time
 from collections.abc import Callable
 
 from recursion_core.routes import contract as c
@@ -70,9 +83,14 @@ DEFAULT_EXECUTABLE = "codex"
 DECLARATION = Declaration(ENGINE, Flags(multi_turn=True, mid_turn_input=True, interrupt=True, resume=True,
                                         fork=False, permission_bridge=False, typed_limits=True, usage=True),
                           input_ack=True)
+BRIDGED = Declaration(ENGINE, Flags(**{**DECLARATION.flags.as_dict(), "permission_bridge": True}), input_ack=True)
 CLIENT_INFO = {"name": "recursion", "version": "0"}
-APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval")
+# server request method -> the tool an approval names
+APPROVAL_REQUESTS = {"item/commandExecution/requestApproval": "commandExecution",
+                     "item/fileChange/requestApproval": "fileChange"}
 DECLINE = {"decision": "decline"}  # CommandExecutionApprovalDecision / FileChangeApprovalDecision, 0.160.0
+ACCEPT = {"decision": "accept"}
+_DECISIONS = {"approve": ACCEPT, "deny": DECLINE}
 _UNKNOWN = {"value": None, "quality": "unknown", "provenance": "unavailable"}
 # event.v1 usage field <- ThreadTokenUsage breakdown field (0.160.0). cacheWriteInputTokens is optional there.
 _USAGE_FIELDS = (("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
@@ -100,6 +118,10 @@ class _Session:
         self.effective: dict = {}                # approvalPolicy and sandbox the server applied
         self.early: list[str] = []               # notifications read during start, parsed with the next line
         self.offset = 0                          # bytes of standard output read so far
+        self.items: dict[str, dict] = {}         # item id -> the command or file-change item the server announced
+        self.bindings: dict[str, dict] = {}      # approval id -> the pending engine request it answers (PRIVATE)
+        self.session_id: str | None = None
+        self.run_id: str | None = None
 
     def reserve(self, record: tuple) -> int:
         with self.lock:
@@ -118,10 +140,14 @@ class CodexDriver(Driver):
     declaration = DECLARATION
 
     def __init__(self, launcher, clock: Callable[[], float], *, binary: str = DEFAULT_EXECUTABLE,
-                 start_timeout_s: float = 60.0, wall_clock: Callable[[], float] | None = None) -> None:
+                 start_timeout_s: float = 60.0, wall_clock: Callable[[], float] | None = None,
+                 approvals=None) -> None:
         self._launcher, self._clock, self._binary = launcher, clock, binary
         self._start_timeout_s = start_timeout_s
-        self._wall = wall_clock
+        self._wall = wall_clock or time.time
+        self._approvals = approvals
+        if approvals is not None:
+            self.declaration = BRIDGED
 
     def argv(self) -> list[str]:
         return [self._binary, *NO_UPDATE_OVERRIDE, "app-server"]
@@ -133,6 +159,7 @@ class CodexDriver(Driver):
         connection_id = f"{conn.get('kind')}:{conn.get('id')}"
         process = self._launcher(self.argv(), env=env, shell=False)
         session = _Session(process, connection_id)
+        session.session_id, session.run_id = request["session_id"], request["run_id"]
         handle._codex = session
         deadline = self._clock() + self._start_timeout_s
         try:
@@ -214,6 +241,9 @@ class CodexDriver(Driver):
         if item["kind"] == "close":
             session.process.close_stdin()
             return
+        if item["kind"] == "approval_answer":
+            self._answer_approval(session, item["approval_id"], item["decision"])
+            return
         turn, delivery = item["turn_id"], item["delivery_id"]
         text = [{"type": "text", "text": item["text"]}]
         with session.lock:
@@ -291,6 +321,18 @@ class CodexDriver(Driver):
         if method == "turn/started":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             return self._adopt_turn(session, turn.get("id"), None)
+        if method == "item/started":
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            if item.get("type") in ("commandExecution", "fileChange") and isinstance(item.get("id"), str):
+                with session.lock:
+                    session.items[item["id"]] = item
+            return []
+        if method == "serverRequest/resolved":
+            with session.lock:
+                for approval_id, bound in list(session.bindings.items()):
+                    if bound["rpc_id"] == params.get("requestId"):
+                        del session.bindings[approval_id]  # the server stopped waiting: no answer is written
+            return []
         if method == "item/completed":
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str) and span is not None:
@@ -382,6 +424,9 @@ class CodexDriver(Driver):
             session.held.pop(core_turn, None)
             usage = session.usage.pop(engine_turn, None)
             seen, session.bucket_limit = session.bucket_limit, None  # a window seen in this turn
+            for approval_id, bound in list(session.bindings.items()):
+                if bound["turn"] == engine_turn:
+                    del session.bindings[approval_id]  # the turn is over: its pending requests are gone
         self.turn_ended(handle, core_turn)
         drafts = [self._usage_draft(session, usage)]
         status = turn.get("status")
@@ -433,10 +478,53 @@ class CodexDriver(Driver):
                                              "reset_at": seen["reset_at"]}}
 
     def _answer_server_request(self, session: _Session, msg: dict) -> None:
-        if msg.get("method") in APPROVAL_REQUESTS:
-            session.write({"id": msg["id"], "result": dict(DECLINE)})
-        else:
+        tool = APPROVAL_REQUESTS.get(msg.get("method"))
+        if tool is None:
             session.write({"id": msg["id"], "error": {"code": -32601, "message": "unsupported"}})
+            return
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        approval_id = self._ask(session, msg["id"], tool, params) if self._approvals is not None else None
+        if approval_id is None:
+            session.write({"id": msg["id"], "result": dict(DECLINE)})
+
+    def _ask(self, session: _Session, rpc_id: object, tool: str, params: dict) -> str | None:
+        """One approval through the port; None when there is none to wait for (then the caller declines)."""
+
+        thread, turn, item_id = params.get("threadId"), params.get("turnId"), params.get("itemId")
+        if thread != session.thread_id or not isinstance(turn, str) or not isinstance(item_id, str):
+            return None
+        with session.lock:
+            item = dict(session.items.get(item_id) or {})
+        tool_input = {k: v for k, v in params.items() if k not in ("threadId", "turnId", "itemId", "startedAtMs")}
+        if tool == "fileChange" and "changes" in item:
+            tool_input["changes"] = item["changes"]
+        if tool == "commandExecution" and "command" not in tool_input and isinstance(item.get("command"), str):
+            tool_input["command"] = item["command"]
+        cwd = params.get("cwd") if isinstance(params.get("cwd"), str) and params.get("cwd") else None
+        effect = {"kind": "engine_tool", "engine": ENGINE, "session_id": session.session_id,
+                  "run_id": session.run_id, "tool": tool, "cwd": cwd, "input": tool_input}
+        binding = {"run_id": session.run_id, "engine": ENGINE, "engine_request_id": json.dumps(rpc_id),
+                   "bound_at": _timestamp_ms(self._wall())}
+        try:
+            approval_id = self._approvals.request(effect, binding)
+        except Exception:  # noqa: BLE001 - any failure of the port: deny now, never leave the engine waiting
+            return None
+        if not isinstance(approval_id, str) or not approval_id:
+            return None
+        with session.lock:
+            if approval_id in session.bindings:
+                return None
+            session.bindings[approval_id] = {"rpc_id": rpc_id, "thread": thread, "turn": turn, "item": item_id}
+        return approval_id
+
+    def _answer_approval(self, session: _Session, approval_id: str, decision: str) -> None:
+        """Write the queue's answer on the request id of that same pending call, once."""
+
+        with session.lock:
+            bound = session.bindings.pop(approval_id, None)
+        if bound is None:  # unknown, answered already, resolved by the server, or of a turn that ended
+            raise DriverStateError(f"{approval_id} names no request this worker is waiting on")
+        session.write({"id": bound["rpc_id"], "result": dict(_DECISIONS[decision])})
 
 
 class _RpcError(Exception):
@@ -475,6 +563,11 @@ def _code_of(error: dict) -> str:
 
 def _accepted(delivery: str, turn: str, how: str) -> dict:
     return {"type": "input.accepted", "payload": {"delivery_id": delivery, "turn_id": turn, "how": how}}
+
+
+def _timestamp_ms(epoch: float) -> str:
+    moment = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
 def _timestamp(epoch: int) -> str | None:

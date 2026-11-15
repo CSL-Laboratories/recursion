@@ -181,11 +181,28 @@ def message(turn_id="turn-1", delivery="dlv-1", text="list the files"):
     return {"kind": "user_message", "turn_id": turn_id, "text": text, "delivery_id": delivery}
 
 
+class FakeApprovals:
+    """APPROVALS' request(effect, binding) -> approval_id, as its brief publishes it (a fake until it lands)."""
+
+    def __init__(self, fail=False, answer=None):
+        self.requests, self.fail, self.answer = [], fail, answer
+
+    def request(self, effect, binding):
+        if self.fail:
+            raise RuntimeError("the approval store is down")
+        approval_id = self.answer if self.answer is not None else f"apr-{len(self.requests) + 1}"
+        self.requests.append((effect, binding, approval_id))
+        return approval_id
+
+
 class Base(unittest.TestCase):
+    approvals = None
+
     def open(self, server=None, esid=None, **kw):
         self.server = server or AppServer(**kw)
         self.launcher = Launcher(self.server)
-        self.driver = cx.CodexDriver(self.launcher, FakeClock())
+        self.driver = cx.CodexDriver(self.launcher, FakeClock(), approvals=self.approvals,
+                                     wall_clock=lambda: 1_763_200_000.0)
         self.handle = self.driver.start(record(esid), {"PATH": "/usr/bin"})
         return self.handle
 
@@ -552,6 +569,179 @@ class ServerRequestTest(Base):
         self.open()
         with self.assertRaises(DriverRefused):
             self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+
+
+SCHEMAS = Path(__file__).resolve().parents[4] / "schemas" / "control" / "v1"
+
+
+def ask_command(rid=77, command="ls", item="it-1"):
+    def note(tid):
+        return {"id": rid, "method": "item/commandExecution/requestApproval", "params": {
+            "threadId": "thr-1", "turnId": tid, "itemId": item, "startedAtMs": 1, "command": command, "cwd": "/w",
+            "reason": "list the files"}}
+    return note
+
+
+def answers(server, rid):
+    return [m for m in server.sent if m.get("id") == rid and "method" not in m]
+
+
+class ApprovalBridgeTest(Base):
+    def setUp(self):
+        self.approvals = FakeApprovals()
+
+    def approve(self, approval_id, decision="approve"):
+        self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": approval_id, "decision": decision})
+
+    def test_the_bridge_is_declared_only_with_a_port(self):
+        self.assertTrue(cx.CodexDriver(Launcher(), FakeClock(), approvals=FakeApprovals()).declaration.flags
+                        .permission_bridge)
+        self.assertFalse(cx.CodexDriver(Launcher(), FakeClock()).declaration.flags.permission_bridge)
+
+    def test_an_approval_request_becomes_one_approval_and_waits_for_the_queue(self):
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(len(self.approvals.requests), 1)
+        effect, binding, approval_id = self.approvals.requests[0]
+        self.assertEqual(effect, {"kind": "engine_tool", "engine": "codex", "session_id": "ses-1", "run_id": "run-1",
+                                  "tool": "commandExecution", "cwd": "/w",
+                                  "input": {"command": "ls", "cwd": "/w", "reason": "list the files"}})
+        self.assertEqual(binding, {"run_id": "run-1", "engine": "codex", "engine_request_id": "77",
+                                   "bound_at": "2025-11-15T09:46:40.000Z"})
+        self.assertEqual(answers(self.server, 77), [])  # nothing until the queue answers
+        self.approve(approval_id)
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "accept"}}])
+
+    def test_a_deny_is_the_protocols_decline(self):
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-1", "deny")
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_an_answer_is_written_once_and_only_for_a_request_waiting(self):
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-1")
+        for approval_id in ("apr-1", "apr-9"):
+            with self.subTest(approval_id=approval_id):
+                with self.assertRaises(DriverStateError):
+                    self.approve(approval_id)
+        self.assertEqual(len(answers(self.server, 77)), 1)
+
+    def test_two_approvals_in_flight_reach_their_own_requests(self):
+        self.open(script={1: [ask_command(70, "ls", "it-1"), ask_command("r-71", "rm x", "it-2")]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-2", "deny")
+        self.approve("apr-1")
+        self.assertEqual(answers(self.server, "r-71"), [{"id": "r-71", "result": {"decision": "decline"}}])
+        self.assertEqual(answers(self.server, 70), [{"id": 70, "result": {"decision": "accept"}}])
+        self.assertEqual(self.approvals.requests[1][1]["engine_request_id"], '"r-71"')
+
+    def test_a_file_change_carries_the_changes_the_server_announced(self):
+        changes = [{"path": "/w/new.txt", "kind": {"type": "add"}, "diff": "hello\n"}]
+        started = lambda tid: {"method": "item/started", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "startedAtMs": 1, "item": {
+                "type": "fileChange", "id": "it-5", "changes": changes, "status": "inProgress"}}}
+        ask = lambda tid: {"id": 80, "method": "item/fileChange/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "itemId": "it-5", "startedAtMs": 1, "reason": None}}
+        self.open(script={1: [started, ask]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        effect = self.approvals.requests[0][0]
+        self.assertEqual((effect["tool"], effect["cwd"], effect["input"]["changes"]), ("fileChange", None, changes))
+
+    def test_after_the_server_resolved_the_request_nothing_is_written(self):
+        resolved = {"method": "serverRequest/resolved", "params": {"threadId": "thr-1", "requestId": 77}}
+        self.open(script={1: [ask_command(), resolved]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        with self.assertRaises(DriverStateError):
+            self.approve("apr-1")
+        self.assertEqual(answers(self.server, 77), [])
+
+    def test_after_the_turn_ended_nothing_is_written(self):
+        self.open(script={1: [ask_command(), done()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        with self.assertRaises(DriverStateError):
+            self.approve("apr-1")
+        self.assertEqual(answers(self.server, 77), [])
+
+    def test_a_port_that_fails_or_gives_no_id_means_decline_at_once(self):
+        for port in (FakeApprovals(fail=True), FakeApprovals(answer=""), FakeApprovals(answer=7)):
+            with self.subTest(port=port.__dict__):
+                self.approvals = port
+                self.open(script={1: [ask_command()]})
+                self.driver.send(self.handle, message())
+                self.drain()
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_a_request_the_driver_cannot_bind_is_declined_without_asking(self):
+        stray = lambda tid: {"id": 90, "method": "item/commandExecution/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "startedAtMs": 1, "itemId": 5}}
+        self.open(script={1: [stray]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(self.approvals.requests, [])
+        self.assertEqual(answers(self.server, 90), [{"id": 90, "result": {"decision": "decline"}}])
+
+    def test_a_request_about_another_thread_is_declined_without_asking(self):
+        other = lambda tid: {"id": 91, "method": "item/commandExecution/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-other", "turnId": tid, "startedAtMs": 1, "itemId": "it-1", "command": "ls"}}
+        self.open(script={1: [other]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(self.approvals.requests, [])
+        self.assertEqual(answers(self.server, 91), [{"id": 91, "result": {"decision": "decline"}}])
+
+    def test_an_approval_id_the_port_gives_twice_binds_only_the_first(self):
+        self.approvals = FakeApprovals(answer="apr-x")
+        self.open(script={1: [ask_command(70, "ls", "it-1"), ask_command(71, "rm x", "it-2")]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(answers(self.server, 71), [{"id": 71, "result": {"decision": "decline"}}])
+        self.approve("apr-x")
+        self.assertEqual(answers(self.server, 70), [{"id": 70, "result": {"decision": "accept"}}])
+
+    def test_a_request_without_its_command_shows_the_command_the_server_announced(self):
+        started = lambda tid: {"method": "item/started", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "startedAtMs": 1, "item": {
+                "type": "commandExecution", "id": "it-3", "command": "ls -la", "commandActions": [], "cwd": "/w",
+                "status": "inProgress"}}}
+        ask = lambda tid: {"id": 81, "method": "item/commandExecution/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "itemId": "it-3", "startedAtMs": 1}}
+        self.open(script={1: [started, ask]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(self.approvals.requests[0][0]["input"], {"command": "ls -la"})
+
+    def test_no_approval_request_is_ever_refused_unsupported(self):
+        self.open(script={1: [ask_command(), ask_command(78, "pwd", "it-2")]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-1")
+        self.approve("apr-2", "deny")
+        self.assertFalse([m for m in self.server.sent if m.get("error", {}).get("code") == -32601])
+
+    def test_effect_and_binding_have_approval_v1_keys(self):
+        path = SCHEMAS / "approval.v1.json"
+        if not path.is_file():
+            self.skipTest("SPINE's approval.v1 (#368) is not in this tree")
+        defs = json.loads(path.read_text(encoding="utf-8"))["$defs"]
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        effect, binding, approval_id = self.approvals.requests[0]
+        shape = defs["engine_tool_effect"]
+        self.assertEqual(set(effect), set(shape["required"]))
+        self.assertLessEqual(set(effect), set(shape["properties"]))
+        self.assertEqual(effect["kind"], shape["properties"]["kind"]["const"])
+        self.assertEqual(set(binding) | {"approval_id"}, set(defs["binding"]["required"]))
+        self.assertTrue(TIMESTAMP.match(binding["bound_at"]))
 
 
 class RegistrationTest(unittest.TestCase):

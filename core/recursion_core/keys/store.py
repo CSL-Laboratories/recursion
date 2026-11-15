@@ -73,19 +73,25 @@ index states are checked against the size limit before anything is changed (``st
 deletes the temp files an interrupted write left in the folder (``Folder.sweep``).
 
 VALUES NO RECORD NAMES. An index lost, emptied or put back no longer names every value the store holds. A save, a
-removal and a recovery change the values of the id they name and of no other, so such a value is never deleted by
-an unrelated write. On the owner-only file it stays in the file; the audit searches for it (``UNBOUND``) and names
-its id; ``remove <id>`` deletes it; and ``add <id>`` is refused (``key_exists``) until it is removed, so no save
-replaces a value it was not given. A file that is not this store's (it names another store, or this store is on a
-keychain) is never changed by it: the audit searches for the values of one it can read and names their ids (one it
-cannot read refuses the audit), and they go only through their own store or with the file. A store whose backend
-is the owner-only file and that has no record takes the file's store id at its next save or removal (the same
-folder is the same store). A store on a keychain never takes it, and never reads the owner-only file to save,
-remove or release a key (only the audit reads it, for values to look for). On a keychain an item is named by the
-store's id, which only the index records: an index LOST leaves the store's items with no name this store knows, so
-it can neither release nor remove them (the keychain's own tool can: they carry ``application recursion``), and the
-audit counts every Recursion item in the keychain that no record of this store names (``unnamed_items``) and is
-incomplete while there is one.
+removal and a recovery change the values of the id they name and of no other, so such a value is never deleted by an
+unrelated write. The store's OWN owner-only file (``_own_file``) is the one in its folder, except while its index pins
+the store to a keychain (then it has none) or has records on the file (then only a file that names the index's store
+id). A value in its own file that no record reaches stays there: the audit searches for it (``UNBOUND``) and names its
+id; ``remove <id>``, for an id no record or intent names, deletes it whatever the host offers now, in one write of the
+file and with no intent (nothing outside the folder changes), and changes nothing else, the index's store id included;
+and ``add <id>`` on the file is refused (``key_exists``) until it is removed, so no save replaces a value it was not
+given. A file that is not the store's own (it names another store, or the store's keys are in a keychain) is never
+changed by it: the audit searches for the values of one it can read (``FOREIGN``) and says the file is not the store's,
+and names one it cannot read as unreadable (the audit is then incomplete); its values go only through their own store or
+with the file. A file of the store's own that it cannot read refuses the audit, as every command refuses it. A store
+whose backend is the owner-only file and that has no record takes the file's store id at its next save (the same folder
+is the same store). A store on a keychain never takes it, and never reads the owner-only file to save or release a key,
+nor to remove one while its index pins it there (only the audit reads it, for values to look for). On a keychain an item
+is named by the store's id, which only the index records: an index LOST leaves the store's items with no name this store
+knows, so it can neither release nor remove them (the keychain's own tool can: they carry ``application recursion``).
+``remove <id>`` of an id a record names deletes every item of the id in the store, whichever save stored it. The audit
+counts every Recursion item in the keychain that neither a record names by its save nor an unfinished operation by its
+id (``unnamed_items``), and is incomplete while there is one.
 """
 from __future__ import annotations
 
@@ -124,6 +130,7 @@ PENDING_FIELDS = ('op', 'started_at')
 OPS = ('add', 'remove')
 RANDOM_ID = re.compile(r'[0-9a-f]{32}')
 UNBOUND = '(a value in the owner-only file that no record of this index reaches)'
+FOREIGN = '(a value in an owner-only file this store does not use)'
 
 
 def _random_id() -> str:
@@ -286,16 +293,26 @@ class KeyStore:
         found = OwnerFile(None).store_of(folder) if name == 'owner_file' else None
         return replace(index, store_id=found or index.store_id or _random_id())
 
-    def _unnamed(self, folder: Folder, index: Index, key_id: str) -> Index:
-        """For ``remove`` of an id no record or intent names: a value of it that the owner-only file still holds (an
-        index lost, emptied or put back no longer names it) is removed; anything else is ``key_unknown``. A store on
-        a keychain asks its keychain nothing here (see VALUES NO RECORD NAMES)."""
-        name = index.backend or self._backend_name(None)
-        if name == 'owner_file':
-            index = replace(self._identity(folder, index, name), backend=name)
-            if key_id in OwnerFile(index.store_id).ids(folder):
-                return index
-        raise KeyStoreError('key_unknown', f'{key_id} is not saved')
+    @staticmethod
+    def _own_file(folder: Folder, index: Index) -> OwnerFile | None:
+        """The store's own owner-only file (see VALUES NO RECORD NAMES): None while the index pins the store to a
+        keychain; while it has records on the file, the file only when it names the index's store id; with no
+        record, the file in the folder, whichever store id it names (the same folder is the same store). Asks no
+        host. A file in its place that the store did not write is refused, as every command refuses it."""
+        if index.live():
+            return OwnerFile(index.store_id) if index.backend == 'owner_file' else None
+        return OwnerFile(OwnerFile(None).store_of(folder))
+
+    def _unnamed(self, folder: Folder, index: Index, key_id: str) -> None:
+        """For ``remove`` of an id no record or intent names: the value of it that the store's own owner-only file
+        holds (an index lost, emptied or put back no longer names it) is deleted, whatever the host offers now, in
+        one write of the file; no intent is recorded (nothing outside the folder changes, and the file is replaced
+        whole) and the index is not changed, so a removal takes no store id. Anything else is ``key_unknown``: a
+        store pinned to a keychain reads no file here and asks its keychain nothing."""
+        own = self._own_file(folder, index)
+        if own is None or key_id not in own.ids(folder):
+            raise KeyStoreError('key_unknown', f'{key_id} is not saved')
+        own.delete(key_id, folder)
 
     def _recover(self, folder: Folder, index: Index, backend, *, but: str | None = None) -> Index:
         """Finish or undo what earlier writes left pending (not ``but``). An entry that still cannot be reached stays."""
@@ -406,7 +423,8 @@ class KeyStore:
             index = self._read_index(folder)
             record = index.keys.get(key_id)
             if record is None and key_id not in index.pending:
-                index = self._unnamed(folder, index, key_id)     # a value of the id no record names, or key_unknown
+                self._unnamed(folder, index, key_id)     # a value only the store's own file holds, or key_unknown
+                return None
             backend = self._removal_backend(index.backend, index.store_id)
             index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
@@ -428,15 +446,17 @@ class KeyStore:
                 raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
             return index
 
-    def values(self) -> tuple:
+    def values(self, *, unreadable: list | None = None) -> tuple:
         """For ``audit`` only, never for an environment: ``({key id: value}, {key id: refusal code})``.
 
         Includes the value of an interrupted add the backend still holds, so that the audit looks for it too. A
         saved key whose value cannot be read (gone, or a keychain that does not answer now) is in the second
-        mapping, with the code, and makes the audit incomplete. A file of the store that is not what it wrote is
-        refused, as every command refuses it. Every value the owner-only file holds is searched for too, under its
-        own id and the ``UNBOUND`` label, when no record of the index reaches it (an index lost or replaced, or a
-        record naming another save).
+        mapping, with the code, and makes the audit incomplete. Every value the owner-only file holds that no record
+        of the index reaches (an index lost or replaced, or a record naming another save) is searched for too, under
+        its own id and a label: ``UNBOUND`` in the store's own file, ``FOREIGN`` in one it does not use (see VALUES
+        NO RECORD NAMES). A file of the store's own that is not what it wrote is refused, as every command refuses
+        it; one it does not use and cannot read is named in ``unreadable`` when a list is given (the audit's), and
+        refused when none is.
         """
         folder = self._folder(create=False)
         if folder is None:
@@ -446,9 +466,18 @@ class KeyStore:
             if index.live() and not held:
                 raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
             found, missing = self._bound_values(folder, index)
-            for kid, value in OwnerFile(index.store_id).values(folder).items():
+            own = self._own_file(folder, index)
+            try:
+                held = OwnerFile(None).values(folder)
+                own_ids = own.ids(folder) if own is not None else frozenset()
+            except KeyStoreError:
+                if own is not None or unreadable is None:
+                    raise
+                unreadable.append(str(self.owner_file()))      # a file the store does not use: named, not refused
+                return found, missing
+            for kid, value in held.items():
                 if found.get(kid) != value:
-                    found[f'{kid} {UNBOUND}'] = value
+                    found[f'{kid} {UNBOUND if kid in own_ids else FOREIGN}'] = value
             return found, missing
 
     def _bound_values(self, folder: Folder, index: Index) -> tuple:
@@ -464,16 +493,17 @@ class KeyStore:
             record = index.keys.get(kid)
             try:
                 found[kid] = backend.get(kid, folder, record)
-            except KeyStoreError as exc:     # a file the store did not write is refused by values()' own read of it
+            except KeyStoreError as exc:     # an unfinished add's value: no saved key's, so nothing to refuse
                 if record is not None:
                     missing[kid] = exc.code
         return found, missing
 
     def unnamed_items(self) -> int | None:
-        """For ``audit`` only: how many items in the Secret Service carry ``application recursion`` and are named by no
-        record or unfinished operation of this index (another store's, or this store's from before its index was lost
-        or emptied: see VALUES NO RECORD NAMES). None when the store does not use the Secret Service. A pin the host
-        no longer offers, or a keychain that cannot be asked, is refused with its code."""
+        """For ``audit`` only: how many items in the Secret Service carry ``application recursion`` and are named
+        neither by a record of this index (by its save) nor by an unfinished operation (by its id): another store's,
+        or this store's from before its index was lost, emptied or put back (see VALUES NO RECORD NAMES). None when
+        the store does not use the Secret Service. A pin the host no longer offers, or a keychain that cannot be
+        asked, is refused with its code."""
         folder = self._folder(create=False)
         if folder is None:
             return self._unnamed_items(Index(None, {}))
@@ -487,7 +517,8 @@ class KeyStore:
         if index.backend == 'owner_file' or self._backend_name(index.backend) != 'secret_service':
             return None
         backend = SecretService(self.system, index.store_id)
-        named = sum(backend.count(kid) for kid in sorted(set(index.keys) | set(index.pending)))
+        named = sum(backend.count(kid, None if kid in index.pending else index.keys[kid])   # a record names its save,
+                    for kid in sorted(set(index.keys) | set(index.pending)))                  # an intent every save
         return max(backend.count() - named, 0)
 
     def owner_file(self) -> Path:

@@ -196,7 +196,7 @@ class UnboundValueAuditTest(TempStoreCase):
         (self.base / 'state' / 'recursion' / 'run.log').write_text(MARKER)
         status, text = run_main(KeyStore(self.root, system=system), 'audit', '--no-journal')
         self.assertEqual(status, 1)
-        self.assertIn(f'FOUND: the value of codex-key {UNBOUND} is in', text)
+        self.assertIn('FOUND: a value of codex-key that no saved key names is in', text)     # r6 F5: the id alone
         self.assertNotIn(MARKER, text)
 
     def test_a_value_no_record_reaches_after_a_restore_is_searched_for(self) -> None:
@@ -214,7 +214,7 @@ class UnboundValueAuditTest(TempStoreCase):
         status, text = run_main(KeyStore(self.root, system=system), 'audit', '--no-journal')
         self.assertEqual(status, 1)
         self.assertIn('not searched for codex-key: its value could not be read (secret_missing)', text)
-        self.assertIn(f'FOUND: the value of codex-key {UNBOUND}', text)
+        self.assertIn('FOUND: a value of codex-key that no saved key names', text)
 
     def test_a_bound_value_is_searched_for_once(self) -> None:
         store = KeyStore(self.root, system=FakeSystem(), clock=fixed_clock)

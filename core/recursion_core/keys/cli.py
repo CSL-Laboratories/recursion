@@ -15,7 +15,8 @@
 ``remove <id> [--yes]``
     Asks on the terminal before it deletes (``--yes`` skips the question; with no terminal it is required),
     then says what it removed and from where. It also clears what an interrupted save left behind, and a value of
-    the id that the owner-only file still holds when no saved key names it.
+    an id no saved key has that the store's own owner-only file still holds, whatever the host offers now (not a
+    file the store does not use: another store's, or one beside a store whose keys are in a keychain).
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the
@@ -396,20 +397,30 @@ def _remove(args, out, err, store, terminal) -> int:
 
 def _audit(args, out, err, store) -> int:
     report = audit_mod.run(store, extra=args.key_paths, journal=not args.key_no_journal)
-    for place, key_id in report.found:
-        print(f'FOUND: the value of {key_id} is in {place}', file=out)
+    for place, label in report.found:
+        key_id, kind = audit_mod.named(label)         # the id alone, whatever reaches the value
+        if kind is None:
+            print(f'FOUND: the value of {key_id} is in {place}', file=out)
+        else:
+            print(f'FOUND: a value of {key_id} that no saved key names is in {place}', file=out)
     for key_id, code in sorted(report.missing.items()):
         print(f'not searched for {key_id}: its value could not be read ({code})', file=out)
     for key_id, op in sorted(report.pending.items()):
         print(f'unfinished {op} of {key_id}: its value may still be in the store; "key remove {key_id}" clears it',
               file=out)
     for key_id in report.unbound:
-        print(f'not named: the owner-only file holds a value of {key_id} that no saved key names', file=out)
+        print(f'not named: the owner-only file holds a value of {key_id} that no saved key names; '
+              f'"key remove {key_id}" deletes it', file=out)
+    for key_id in report.foreign:
+        print(f"not this store's: {store.owner_file()} holds a value of {key_id}, and this store does not use that "
+              "file (it names another store, or this store's keys are in a keychain): no command of this store "
+              'changes it, and the value leaves with the file', file=out)
     if report.unnamed:
         print(f'keychain: {report.unnamed} item(s) in the Secret Service that Recursion saved and no saved key of this '
-              "store names (another store's, or this store's from before its index was lost or emptied); their values "
-              'are not looked for, and this store cannot remove them (they carry the attribute "application '
-              'recursion", by which the keychain\'s own tool finds them)', file=out)
+              "store names (another store's, or this store's from before its index was lost, emptied or put back); "
+              'their values are not looked for. "key remove <id>" deletes every item of this store under an id a '
+              'saved key has, whichever save stored it; the keychain\'s own tool finds the rest by the attribute '
+              '"application recursion"', file=out)
     if report.unnamed_refused:
         print(f'keychain: its items were not counted ({report.unnamed_refused})', file=out)
     for place in report.leftovers:
@@ -420,8 +431,8 @@ def _audit(args, out, err, store) -> int:
     if len(report.unreadable) > 20:
         print(f'unreadable: {len(report.unreadable) - 20} more', file=out)
     findings = len(report.found) + len(report.leftovers)
-    print(f'audit: {report.keys} saved key(s); {report.files} file(s) searched under {", ".join(report.roots)}; '
-          f'journal {report.journal}; {findings} finding(s)', file=out)
+    print(f'audit: {report.keys} saved key(s), {report.values} value(s) looked for; {report.files} file(s) searched '
+          f'under {", ".join(report.roots)}; journal {report.journal}; {findings} finding(s)', file=out)
     if findings:
         return 1
     return 0 if report.complete() else 4

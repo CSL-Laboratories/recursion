@@ -23,8 +23,9 @@ folder names one store, and two stores of one user never share an item), ``recur
 ``recursion_save <the save's id>`` and ``recursion_provider <the record's provider>``. A value is looked up
 with all five, so it is returned only to the record of the save that stored it; ``clear`` and the presence
 check use the first three, so a removal reaches every value ever saved for the id in this store. ``count`` asks
-``search --all`` how many items carry ``application recursion`` (any store's), or this store's items of one id, for
-the audit. Neither the value nor anything derived from it is ever in the helper's arguments or its environment.
+``search --all`` how many items carry ``application recursion`` (any store's), this store's items of one id, or
+the item of one record's save, for the audit. Neither the value nor anything derived from it is ever in the
+helper's arguments or its environment.
 ``lookup`` exits 1 with nothing on its standard error when it finds no unlocked item; anything else that is not
 success is a failure, ``keychain_locked`` when its message says the collection is locked or the unlock prompt
 was dismissed, else ``keychain_failed``. A failure's detail is fixed text: no line a helper printed is ever
@@ -41,10 +42,10 @@ OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "store
 mode checked on every read, temp file, fsync, rename). Any other shape is refused (``owner_file_invalid``). A
 file whose store id is not the index's belongs to another store: it releases nothing to this store's records
 (``secret_missing``), holds nothing this store can remove (a removal or recovery succeeds without touching it),
-and is not written over while this store has records (``owner_file_invalid``); the audit reads it unbound. A
-store whose backend is this file and that has no record takes the file's id as its own at its next save or
-removal, and with it every value the file holds (``KeyStore.add``, ``KeyStore.remove``); a store on a keychain
-never takes it.
+and is not written over while this store has records (``owner_file_invalid``); the audit searches for its values
+as not the store's own. A store whose backend is this file and that has no record takes the file's id as its own
+at its next save, and with it every value the file holds (``KeyStore.add``); a removal takes no id, and a store on
+a keychain never takes it.
 """
 from __future__ import annotations
 
@@ -128,15 +129,16 @@ class SecretService:
             raise _failure('lookup', look)
         return self.count(key_id) > 0
 
-    def count(self, key_id: str | None = None) -> int:
-        """How many items ``search --all`` lists, locked ones too: with ``key_id``, this store's items of that id;
-        without, every item that carries ``application recursion``, whichever store saved it (for the audit's count
-        of the items no record names). A helper that fails raises its typed refusal.
+    def count(self, key_id: str | None = None, record=None) -> int:
+        """How many items ``search --all`` lists, locked ones too: with ``key_id`` and a record, the item that record's
+        save stored; with ``key_id`` alone, this store's items of that id, whichever save stored them; without, every
+        item that carries ``application recursion``, whichever store saved it (for the audit's count of the items no
+        record names). A helper that fails raises its typed refusal.
 
         ``search`` prints the secrets of the unlocked items it lists: its output is read for item lines only
         (``[<id>]``, one per item) and dropped.
         """
-        words = self._attributes(key_id) if key_id is not None else ['application', 'recursion']
+        words = self._item(key_id, record) if key_id is not None else ['application', 'recursion']
         found = self._run([self._tool(), 'search', '--all', *words])
         if found.returncode != 0:
             raise _failure('search', found)

@@ -14,21 +14,25 @@ It fetches each saved value from the pinned backend and searches, as bytes:
 
 It also searches for the value of an interrupted add that the backend still holds, and for every value the
 owner-only file holds that no record of the index reaches (the index lost, replaced, or naming another save), and
-names the id of each such value. Each value is looked for as
-it was saved and as JSON would write it inside a string. Symlinks are not followed and only regular files are
-read (a FIFO cannot block the search). The report names files and key ids only: no value, no part of one, no
+names the id of each such value: one ``remove`` deletes, in the store's own file, or one in a file the store does
+not use (another store's, or one beside a store whose keys are in a keychain), which no command of the store
+changes; such a file that cannot be read is named unreadable. Each value is looked for as it was saved and as JSON
+would write it inside a string. Symlinks are not followed and only regular files are read (a FIFO cannot block the
+search). The report names files and key ids only: no value, no part of one, no
 surrounding text. Two ids that hold one value are both named, once per place.
 
 ITEMS NO RECORD NAMES. On the Secret Service it also counts the items that carry ``application recursion`` and that
-no record or unfinished operation of this store's index names (``KeyStore.unnamed_items``): another store's, or this
-store's from before its index was lost or emptied. Their values cannot be looked for, and this store cannot remove
-them.
+neither a record of this store's index names by its save nor an unfinished operation by its id
+(``KeyStore.unnamed_items``): another store's, or this store's from before its index was lost, emptied or put
+back. Their values are not looked for; ``remove <id>`` deletes every item of this store under an id a record names,
+and the keychain's own tool finds the rest.
 
 COMPLETE OR NOT. The audit is incomplete (``key audit`` exits 4 when it found nothing) when a saved value could
 not be read (gone, or its keychain does not answer now), a file could not be read, an operation is unfinished,
 the journal was asked for and not searched to the end (no ``journalctl``, one that cannot start, or one that
 exits with a failure), or the Secret Service holds an item no record names, or its items could not be counted.
-Only ``--no-journal`` leaves the journal out without making the audit incomplete.
+Only ``--no-journal`` leaves the journal out without making the audit incomplete. The last line counts the saved
+keys (the index's records) and, apart from them, the values looked for.
 """
 from __future__ import annotations
 
@@ -40,7 +44,7 @@ from pathlib import Path
 
 from recursion_core.keys.errors import KeyStoreError
 from recursion_core.keys.files import TEMP_NAME
-from recursion_core.keys.store import UNBOUND, KeyStore
+from recursion_core.keys.store import FOREIGN, UNBOUND, KeyStore
 from recursion_core.keys.system import ToolFailed, ToolMissing
 
 CHUNK = 1 << 16
@@ -60,8 +64,10 @@ class Report:
     journal: str = 'not searched'
     journal_incomplete: bool = False   # asked for and not searched to the end
     pending: dict = field(default_factory=dict)      # key id -> op: an operation left unfinished
-    keys: int = 0
-    unbound: list = field(default_factory=list)      # ids of values in the owner-only file that no record names
+    keys: int = 0                                    # saved keys: the index's records
+    values: int = 0                                  # values looked for: saved keys', unfinished adds', unnamed
+    unbound: list = field(default_factory=list)      # ids of values in the store's own file that no record names
+    foreign: list = field(default_factory=list)      # ids of values in an owner-only file the store does not use
     unnamed: int = 0                                 # Secret Service items Recursion saved that no record names
     unnamed_refused: str | None = None               # why those items could not be counted
 
@@ -96,12 +102,24 @@ def leftovers(store: KeyStore) -> list:
     return [str(store.root / name) for name in sorted(names) if TEMP_NAME.fullmatch(name)]
 
 
+def named(label: str) -> tuple:
+    """A key of ``KeyStore.values()`` as ``(key id, label)``: the label is None for a value a record reaches, else
+    ``UNBOUND`` or ``FOREIGN`` (a value no record names). A line that names an id names the id alone."""
+    for kind in (UNBOUND, FOREIGN):
+        if label.endswith(' ' + kind):
+            return label[:-len(kind) - 1], kind
+    return label, None
+
+
 def run(store: KeyStore, *, extra=(), journal: bool = True) -> Report:
-    values, missing = store.values()
-    pending = {kid: entry.op for kid, entry in store.list().pending.items()}
-    unbound = sorted(label[:-len(UNBOUND) - 1] for label in values if label.endswith(' ' + UNBOUND))
-    report = Report(missing=missing, pending=pending, keys=len(set(values) | set(missing)),
-                    leftovers=leftovers(store), unbound=unbound)
+    unreadable = []
+    values, missing = store.values(unreadable=unreadable)
+    index = store.list()
+    labels = [named(label) for label in values]
+    report = Report(unreadable=unreadable, missing=missing, pending={kid: p.op for kid, p in index.pending.items()},
+                    keys=len(index.keys), values=len(values), leftovers=leftovers(store),
+                    unbound=sorted(kid for kid, kind in labels if kind == UNBOUND),
+                    foreign=sorted(kid for kid, kind in labels if kind == FOREIGN))
     try:
         report.unnamed = store.unnamed_items() or 0
     except KeyStoreError as exc:

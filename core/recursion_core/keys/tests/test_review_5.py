@@ -100,7 +100,8 @@ class ValuesNoRecordNamesTest(TempStoreCase):
                 self.assertEqual(store.values(), (expected, {}))
                 status, text = run_main(store, 'audit', '--no-journal')
                 self.assertEqual(status, 0)
-                self.assertIn('audit: 4 saved key(s)', text)                     # the count no longer drops
+                keys = 2 if shape == 'older' else 1                              # r6 F3: keys and values apart
+                self.assertIn(f'audit: {keys} saved key(s), 4 value(s) looked for; ', text)   # none dropped
                 for kid in ('beta', 'gamma'):
                     self.assertIn(f'not named: the owner-only file holds a value of {kid} that no saved key names',
                                   text)
@@ -131,7 +132,8 @@ class ValuesNoRecordNamesTest(TempStoreCase):
                 self.assertEqual(sorted(secrets(store.root)), ['alpha', 'gamma'])
                 index = store.list()
                 self.assertEqual(index.pending, {})
-                self.assertEqual(index.store_id, json.loads((store.root / 'secrets.json').read_text())['store_id'])
+                file_id = json.loads((store.root / 'secrets.json').read_text())['store_id']
+                self.assertEqual(index.store_id, None if shape == 'lost' else file_id)   # r6 F1: it takes no id
                 status, text = run_main(store, 'remove', 'gamma', '--yes')
                 self.assertEqual(status, 0)
                 self.assertIn('removed a value of gamma that no saved key named', text)

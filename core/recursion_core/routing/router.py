@@ -237,19 +237,26 @@ def route_decision(decision: Mapping) -> dict | None:
     """The control schema's ``route_decision`` (common.v1: chosen, reason, candidates, hand_pick) for a routed
     decision, or None for a refusal. This is what the run record keeps and the ``route.decision`` event
     carries; the start path that stores it is a later slice. Anything else (an object that is not a routed
-    decision, one whose members are missing or of a type ``decide`` never gives, or one that cannot be read)
-    answers None, never an error."""
+    decision, one whose ``ok`` is not exactly True, one whose members are missing or of a type ``decide`` never
+    gives, or one that cannot be read) answers None, never an ``Exception``; a ``BaseException`` such as
+    ``KeyboardInterrupt`` stops the caller."""
     try:
-        if not isinstance(decision, Mapping) or not decision.get("ok"):
+        if not isinstance(decision, Mapping) or decision.get("ok") is not True:
             return None
         if any(key not in decision for key in ("reason", "engine", "model", "connection", "candidates", "hand_pick")):
             return None  # carries ok without decide's members: not a routed decision
         reason, engine, model = decision["reason"], decision["engine"], decision["model"]
         connection, candidates, hand = decision["connection"], decision["candidates"], decision["hand_pick"]
-        if (reason not in REASONS or not isinstance(engine, str) or not isinstance(model, str)
-                or not isinstance(connection, Mapping) or not isinstance(candidates, (list, tuple))
-                or not all(isinstance(c, Mapping) for c in candidates) or not (hand is None or isinstance(hand, Mapping))):
+        if reason not in REASONS or not isinstance(engine, str) or not isinstance(model, str):
             return None  # members of a type decide never gives: not a routed decision
+        if not isinstance(connection, Mapping):
+            return None  # a connection that is not a mapping (a list of pairs would pass dict())
+        if not isinstance(candidates, (list, tuple)):
+            return None  # candidates that are not a list (a generator would be used up and read as [])
+        if not all(isinstance(c, Mapping) for c in candidates):
+            return None  # a candidate that is not a mapping
+        if not (hand is None or isinstance(hand, Mapping)):
+            return None  # a hand pick that is neither null nor a mapping (a list of pairs would pass dict())
         return {
             "chosen": {"engine": engine, "model": model, "connection": dict(connection)},
             "reason": reason,
@@ -397,18 +404,38 @@ def _route_limits(config: Config, decision: Mapping) -> tuple[dict, str]:
     return route_limits.validate_limits(route_limits.DEFAULT_LIMITS), "default"
 
 
+_MISSING = object()   # a member the caller's object does not have
+_ANY = object()       # an attempt that names only its connection: any route on it was tried
+
+
+def _is_time(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _connection_word(value: object) -> object:
-    """An attempt's connection as ``routes.limits.describe`` writes it, ``kind:id``. A ``{kind, id}`` mapping is
-    read as the same word, so a notice built by hand cannot hide a route already tried."""
+    """An attempt's connection as ``routes.limits.describe`` writes it, ``kind:id``; a ``{kind, id}`` mapping is
+    read as the same word."""
     if isinstance(value, Mapping):
         return f"{value.get('kind')}:{value.get('id')}"
     return value
 
 
+def _attempt(entry: object) -> tuple | None:
+    """One ``limit_notice.attempts`` entry, read once: ``(engine, model, connection word)``. An entry as
+    ``describe`` writes it is a mapping; an entry that is a bare ``kind:id`` word names only its connection,
+    and every listed route on that connection counts as tried. So a notice built by hand, in either shape,
+    cannot hide a route already tried. Any other entry is not an attempt."""
+    if isinstance(entry, Mapping):
+        return (entry.get("engine"), entry.get("model"), _connection_word(entry.get("connection")))
+    if isinstance(entry, str):
+        return (_ANY, _ANY, entry)
+    return None
+
+
 def _same_route(route: Mapping, seen: tuple) -> bool:
-    """``seen`` is an attempt read once: ``(engine, model, connection word)``."""
+    """``seen`` is an attempt read once: ``(engine, model, connection word)``, ``_ANY`` matching anything."""
     mine = (route["engine"], route["model"], contract.connection_key(route))
-    return mine == seen
+    return all(theirs is _ANY or ours == theirs for ours, theirs in zip(mine, seen))
 
 
 def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detection: object = None) -> dict:
@@ -416,9 +443,9 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
 
     Four arguments (the brief writes two; the limits are read from the config, so it is passed too):
     ``config``, the Config the decision was made with (for a run in flight, that one, not a reloaded file);
-    ``decision``, ``decide``'s own answer (a ``route_decision``, anything else without ``ok``, or a routed
-    mapping without decide's ``reason``, ``rule``, ``engine``, ``model`` and ``connection`` answers
-    ``no_decision``; a refusal answers ``no_route``); ``limit``, the route result that ended the run (its ``code`` and, when the route
+    ``decision``, ``decide``'s own answer (a ``route_decision``, anything else without ``ok``, an ``ok`` that is
+    neither True nor False, a routed mapping without decide's ``reason``, ``rule``, ``engine``, ``model`` and
+    ``connection``, or one that cannot be read answers ``no_decision``; a refusal answers ``no_route``); ``limit``, the route result that ended the run (its ``code`` and, when the route
     service made one, its ``limit_notice`` with the ``attempts`` already made); ``detection``, optionally a
     snapshot. ``wait`` waits until the limit's ``reset_at``, or the result's ``retry_at`` when the vendor
     gave no reset (``reset_at`` absent or null), as ``routes.limits.notice`` reads it. The answer::
@@ -434,19 +461,28 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     switch is a new run that the caller (SESSIONS) starts; this function starts nothing. A hand pick is
     never switched away from on its own: the user chose that route for this task, so the answer is ask.
     """
+    # The decision, read once inside a guard into plain data: nothing below reads the caller's object again.
+    # A member it does not have reads as _MISSING; the presence check and the type check each answer for
+    # their own rule, so each one is what refuses the decision it is about.
     try:
         if not isinstance(decision, Mapping) or "ok" not in decision:
             return {"action": "none", "reason": "no_decision"}
-        if not decision["ok"]:
+        ok = decision["ok"]
+        if ok is False:
             return {"action": "none", "reason": "no_route"}
         connection = decision.get("connection")
-        if (any(key not in decision for key in ("reason", "rule", "engine", "model"))
+        if (ok is not True or any(key not in decision for key in ("reason", "rule", "engine", "model"))
                 or not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)):
             return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
+        read = {key: decision[key] if key in decision else _MISSING for key in ("engine", "model", "reason", "rule")}
+        conn = ({key: connection[key] if key in connection else _MISSING for key in ("kind", "id")}
+                if isinstance(connection, Mapping) else {"kind": _MISSING, "id": _MISSING})
     except Exception:  # noqa: BLE001 - a decision that cannot be read is not decide's answer
         return {"action": "none", "reason": "no_decision"}
-    if not isinstance(decision["engine"], str) or not isinstance(decision["model"], (str, type(None))):
+    if ((read["engine"] is not _MISSING and not isinstance(read["engine"], str))
+            or (read["model"] is not _MISSING and not isinstance(read["model"], (str, type(None))))):
         return {"action": "none", "reason": "no_decision"}  # an engine or model decide never gives
+    decision = {**read, "connection": conn}
     # The limit result, read once: its code, the vendor's signal, the route service's notice and retry time.
     try:
         if isinstance(limit, Mapping):
@@ -456,8 +492,9 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
             code = signal = notice = retry_at = None
         reset_at = signal.get("reset_at") if isinstance(signal, Mapping) else None
         tried = notice.get("attempts") if isinstance(notice, Mapping) else None
-        attempts = [(a.get("engine"), a.get("model"), _connection_word(a.get("connection")))
-                    for a in (tried or ()) if isinstance(a, Mapping)]
+        if isinstance(tried, str):
+            tried = [tried]  # one bare kind:id word, never its characters
+        attempts = [seen for seen in map(_attempt, tried if isinstance(tried, (list, tuple)) else ()) if seen is not None]
     except Exception:  # noqa: BLE001 - a limit result that cannot be read is not a limit: no blind retry
         return {"action": "none", "reason": "not_a_limit"}
     if code not in route_limits.LIMIT_CODES:
@@ -470,8 +507,8 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
         return {"action": "ask", "reason": "on_limit_ask", "choices": choices}
     if limits["on_limit"] == "wait":
         until = reset_at
-        if until is None:
-            until = retry_at
+        if not _is_time(until):  # absent, null or not a time: the route service's retry time, if it is one
+            until = retry_at if _is_time(retry_at) else None
         return {"action": "wait", "until": until, "choices": choices}
     attempts.append((decision["engine"], decision["model"],
                      f"{decision['connection']['kind']}:{decision['connection']['id']}"))

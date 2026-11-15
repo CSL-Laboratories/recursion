@@ -596,5 +596,84 @@ class ReviewFourRegressionTests(unittest.TestCase):
         self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]), ("ask", "fallback_exhausted", "already_tried"))
 
 
+class ReviewFiveRegressionTests(unittest.TestCase):
+    """The fifth read of #399 (30073846): DeepSeek V4.1 Flash A-G."""
+
+    def setUp(self) -> None:
+        self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        self.d = router.decide(self.cfg, SENTRY, {})
+
+    def test_next_after_limit_reads_each_member_inside_the_guard(self) -> None:  # ds A
+        class FailsOn(dict):
+            def __init__(self, member: str, values) -> None:
+                super().__init__(values)
+                self.member = member
+
+            def __getitem__(self, key):
+                if key == self.member:
+                    raise RuntimeError(key)
+                return super().__getitem__(key)
+        rule = router.decide(self.cfg, SENTRY, {"task_kind": "review"})  # a decision from a rule, which reads its rule
+        for member, decision in (("engine", self.d), ("model", self.d), ("reason", self.d), ("rule", rule)):
+            self.assertEqual(router.next_after_limit(self.cfg, FailsOn(member, decision), LIMIT),
+                             {"action": "none", "reason": "no_decision"}, member)
+
+    def test_a_connection_that_iterates_but_cannot_be_indexed_is_no_decision(self) -> None:  # ds B
+        class Unindexable(Mapping):
+            def __getitem__(self, key):
+                raise RuntimeError("connection getitem")
+
+            def __iter__(self):
+                return iter(("kind", "id"))
+
+            def __len__(self):
+                return 2
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": Unindexable()}, LIMIT),
+                         {"action": "none", "reason": "no_decision"})
+
+    def test_route_decision_refuses_members_dict_would_accept(self) -> None:  # ds C
+        class Row:  # indexable like a candidate, but not a mapping
+            def __getitem__(self, key):
+                return "x"
+        for member, value in (("connection", [("kind", "subscription"), ("id", "claude-main")]),
+                              ("hand_pick", [("engine", "codex"), ("model", "m")]),
+                              ("candidates", (c for c in self.d["candidates"])), ("candidates", [Row()])):
+            self.assertIsNone(router.route_decision({**self.d, member: value}), member)
+
+    def test_a_bare_connection_word_in_attempts_counts_as_tried(self) -> None:  # ds D
+        word = route_limits.describe(CODEX)["connection"]
+        for attempts in ([word], word):  # a list of words, or the one word on its own
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
+            self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]),
+                             ("ask", "fallback_exhausted", "already_tried"), attempts)
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": ["subscription:other"]}})
+        self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
+
+    def test_a_wait_until_is_a_time_or_the_retry_time(self) -> None:  # ds E
+        cfg = with_limits({"on_limit": "wait"})
+        d = router.decide(cfg, SENTRY, {})
+
+        def until(reset_at, retry_at):
+            signal = {"scope": "connection", "model": None, "reset_at": reset_at, "source": "test.typed"}
+            return router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit": signal, "retry_at": retry_at})["until"]
+        self.assertEqual(until(["x"], 7000.0), 7000.0)
+        self.assertEqual(until({"a": 1}, 7000.0), 7000.0)
+        self.assertIsNone(until(True, "soon"))
+        self.assertEqual(until(0.0, 7000.0), 0.0)
+        self.assertEqual(until(5000, 7000.0), 5000)
+
+    def test_ok_must_be_exactly_true_or_false(self) -> None:  # ds F
+        for ok in (1, "yes", None):
+            self.assertIsNone(router.route_decision({**self.d, "ok": ok}), ok)
+            self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": ok}, LIMIT),
+                             {"action": "none", "reason": "no_decision"}, ok)
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": False}, LIMIT), {"action": "none", "reason": "no_route"})
+
+    def test_attempts_that_are_not_a_list_are_no_attempts(self) -> None:  # ds G
+        for notice in ({"attempts": 5}, {"attempts": {"a": 1}}, {"attempts": [5, None]}, ["x"]):
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": notice})
+            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), notice)
+
+
 if __name__ == "__main__":
     unittest.main()

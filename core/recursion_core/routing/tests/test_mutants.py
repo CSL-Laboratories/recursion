@@ -178,8 +178,8 @@ MUTANTS = {
     # The first reads of #399 (05a5d13d): each guard they found unprotected or missing.
     "M34 a null vendor reset read as no deadline": (
         ROUTER,
-        '        until = reset_at\n        if until is None:\n            until = retry_at\n',
-        '        until = signal.get("reset_at", retry_at) if isinstance(signal, Mapping) else retry_at\n',
+        "        if not _is_time(until):  # absent, null or not a time: the route service's retry time, if it is one\n",
+        '        if "reset_at" not in (signal if isinstance(signal, Mapping) else {}):\n',
         {"test_wait_uses_breaker_retry_when_vendor_reset_is_null"}),
     "M35 the decided primary not counted as tried": (
         ROUTER,
@@ -188,10 +188,8 @@ MUTANTS = {
         {"test_primary_not_reoffered_without_notice"}),
     "M36 the model left out of a tried route's identity": (
         ROUTER,
-        '    mine = (route["engine"], route["model"], contract.connection_key(route))\n'
-        '    return mine == seen\n',
-        '    mine = (route["engine"], contract.connection_key(route))\n'
-        '    return mine == (seen[0], seen[2])\n',
+        "    return all(theirs is _ANY or ours == theirs for ours, theirs in zip(mine, seen))\n",
+        "    return all(theirs is _ANY or ours == theirs for n, (ours, theirs) in enumerate(zip(mine, seen)) if n != 1)\n",
         {"test_same_engine_and_connection_other_model_still_allowed"}),
     "M37 a route with no model anywhere routed": (
         ROUTER,
@@ -227,8 +225,10 @@ MUTANTS = {
         ROUTER,
         '        if not isinstance(decision, Mapping) or "ok" not in decision:\n'
         '            return {"action": "none", "reason": "no_decision"}\n'
-        '        if not decision["ok"]:\n',
-        '        if not decision.get("ok"):\n',
+        '        ok = decision["ok"]\n',
+        '        if not isinstance(decision, Mapping):\n'
+        '            return {"action": "none", "reason": "no_decision"}\n'
+        '        ok = decision.get("ok", False)\n',
         {"test_next_after_limit_takes_decides_answer_only"}),
     "M44 a refusal detail that is not a code word": (
         ROUTER,
@@ -260,8 +260,8 @@ MUTANTS = {
         {"test_a_null_hand_pick_is_refused_alike_everywhere", "test_a_present_null_condition_is_refused_not_read_as_absent"}),
     "M49 a null attempts list raising": (
         ROUTER,
-        "for a in (tried or ()) if isinstance(a, Mapping)]",
-        "for a in tried if isinstance(a, Mapping)]",
+        "tried if isinstance(tried, (list, tuple)) else ()",
+        "tried",
         {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
     "M50 a decision routed in name only used": (
         ROUTER,
@@ -354,7 +354,9 @@ MUTANTS = {
         ROUTER,
         "    except Exception:  # noqa: BLE001 - a decision that cannot be read is not decide's answer\n",
         "    except ZeroDivisionError:\n",
-        {"test_next_after_limit_answers_no_decision_for_a_decision_it_cannot_read"}),
+        {"test_next_after_limit_answers_no_decision_for_a_decision_it_cannot_read",
+         "test_next_after_limit_reads_each_member_inside_the_guard",
+         "test_a_connection_that_iterates_but_cannot_be_indexed_is_no_decision"}),
     "M67 a missing snapshot called malformed": (
         ROUTER,
         '    if not isinstance(detection, Mapping):\n        return None, "detection_unavailable"\n',
@@ -365,6 +367,52 @@ MUTANTS = {
         "    if isinstance(value, Mapping):\n        return f\"{value.get('kind')}:{value.get('id')}\"\n",
         "",
         {"test_an_attempt_with_a_structured_connection_counts_as_tried"}),
+    # The fifth read of #399 (30073846): DeepSeek A-G (A and B are pinned by M66's wider killers).
+    "M69 a connection that is not a mapping published": (
+        ROUTER,
+        "            return None  # a connection that is not a mapping (a list of pairs would pass dict())\n",
+        "            pass\n",
+        {"test_route_decision_refuses_members_dict_would_accept"}),
+    "M70 candidates that are not a list published": (
+        ROUTER,
+        "            return None  # candidates that are not a list (a generator would be used up and read as [])\n",
+        "            pass\n",
+        {"test_route_decision_refuses_members_dict_would_accept"}),
+    "M71 a candidate that is not a mapping published": (
+        ROUTER,
+        "            return None  # a candidate that is not a mapping\n",
+        "            pass\n",
+        {"test_route_decision_refuses_members_dict_would_accept"}),
+    "M72 a hand pick that is not a mapping published": (
+        ROUTER,
+        "            return None  # a hand pick that is neither null nor a mapping (a list of pairs would pass dict())\n",
+        "            pass\n",
+        {"test_route_decision_refuses_members_dict_would_accept"}),
+    "M73 a bare connection word in attempts not counted as tried": (
+        ROUTER,
+        "    if isinstance(entry, str):\n        return (_ANY, _ANY, entry)\n",
+        "",
+        {"test_a_bare_connection_word_in_attempts_counts_as_tried"}),
+    "M74 a wait until that is not a time passed through": (
+        ROUTER,
+        "        if not _is_time(until):  # absent",
+        "        if until is None:  # absent",
+        {"test_a_wait_until_is_a_time_or_the_retry_time"}),
+    "M75 route_decision taking ok by truthiness": (
+        ROUTER,
+        'decision.get("ok") is not True:',
+        'not decision.get("ok"):',
+        {"test_ok_must_be_exactly_true_or_false"}),
+    "M76 next_after_limit taking ok by truthiness": (
+        ROUTER,
+        "(ok is not True or any(key not in decision",
+        "(any(key not in decision",
+        {"test_ok_must_be_exactly_true_or_false"}),
+    "M77 one attempts word read as its characters": (
+        ROUTER,
+        "        if isinstance(tried, str):\n            tried = [tried]  # one bare kind:id word, never its characters\n",
+        "",
+        {"test_a_bare_connection_word_in_attempts_counts_as_tried"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

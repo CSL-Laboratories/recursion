@@ -361,6 +361,15 @@ class ControlAPI:
                 # registrant runs again and the stored record is left exactly as it was.
                 stored_launch = rec.get("launch")
                 entry = stored_launch.get("route_entry") if isinstance(stored_launch, dict) else None
+                if entry is not None:
+                    # The stored entry is read as a chosen one is on a new start: it names its engine, and that is
+                    # the engine its record launches. A record may have been written by an earlier composition, or
+                    # by a lane that holds the control registry: an entry of another shape, or of another engine
+                    # than its record, is refused here and is never handed to the comparator, which reads it.
+                    route = entry.get("route") if isinstance(entry, dict) else None
+                    stored_engine = route.get("engine") if isinstance(route, dict) else None
+                    if not isinstance(stored_engine, str) or not stored_engine or stored_engine != rec.get("engine"):
+                        return {"code": "unavailable", "detail": "start_registrant_failed"}
                 if entry is not None and (self._launchable is None or not self._launchable(entry)):
                     return {"code": "unavailable", "detail": "start_registrant_failed"}
                 rec.update(state="starting", cgroup=None, started_at=self._clock())

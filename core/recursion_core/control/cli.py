@@ -126,7 +126,19 @@ def run(argv: list[str], api_factory: Callable[[], object] | None) -> int:
     try:  # seam S2: compose the hooks to learn the registered command families; with none this adds nothing
         from recursion_core.control import hooks
         commands = hooks.compose().commands
-    except Exception as err:  # noqa: BLE001 - a registrant that is present and broken stops the CLI, loudly
+    except Exception as err:  # noqa: BLE001 - a registrant that is present and broken stops a NAMED command, loudly
+        if not argv or not argv[0].strip() or argv[0].startswith("-"):
+            # No command is named (no word at all; an empty or a blank one, which no family can register; or an
+            # option): this is the CLI's own help, or its own usage error. A lane that is installed and broken does
+            # not take those away: they are answered as with no table. The line on stderr comes first. It says
+            # that a registrant is broken, and which one when the failure is one registrant's, so that the help is
+            # never taken for the whole of it.
+            name = getattr(err, "registrant", None)
+            what = f"registrant {name} is broken" if name else "the registrants could not be composed"
+            print(f"{what} (hooks:{type(err).__name__}): registered commands are missing, these are only the CLI's own",
+                  file=sys.stderr)
+            return main(argv, api)
+        # A name that is not one of the five may be that lane's command: it is not called a usage error.
         print(json.dumps({"code": "control_api_unavailable", "detail": f"hooks:{type(err).__name__}"}), file=sys.stdout)
         return EXIT_ERROR
     return main(argv, api, commands=commands)

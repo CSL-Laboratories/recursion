@@ -1274,6 +1274,71 @@ class RoundSixCredentialsTest(unittest.TestCase):
             CredentialStore(self.path)
 
 
+class RoundSevenCredentialsTest(unittest.TestCase):
+    """The round-7 read of #377 by DeepSeek V4.1 Flash: 1, a str subclass whose hash raises still escaped ceiling,
+    check_grant and mint; 2, an OSError at the release of the writers' lock escaped mint untyped."""
+
+    class HashRaises(str):
+        def __hash__(self):
+            raise RuntimeError("the text cannot be hashed")
+
+    def test_a_kind_scope_or_id_that_is_a_str_subclass_is_read_as_its_text(self) -> None:
+        H = self.HashRaises
+        self.assertEqual(creds.ceiling(H("plugin")), CEILING["plugin"])
+        self.assertEqual(creds.check_grant(H("plugin"), [H("read")]), frozenset({"read"}))
+        with self.assertRaises(CredentialRefused) as caught:
+            creds.check_grant(H("owner"), ["read"])
+        self.assertEqual(caught.exception.detail, "kind_not_mintable")
+        with self.assertRaises(CredentialRefused) as caught:
+            creds.check_grant("plugin", [H("manage")])
+        self.assertEqual(caught.exception.detail, "manage_never_granted")
+
+    @NEEDS_POSIX
+    def test_mint_reads_a_str_subclass_kind_id_and_scope_as_their_text(self) -> None:
+        base = tempfile.mkdtemp(prefix="creds-r7-")
+        self.addCleanup(shutil.rmtree, base, True)
+        store = CredentialStore(os.path.join(base, "state", "credentials.json"))
+        H = self.HashRaises
+        token, cred = store.mint(H("plugin"), H("p1"), [H("read")])
+        self.assertEqual((type(cred.kind), type(cred.id)), (str, str))
+        self.assertEqual(store.verify(token, peer="p").scopes, frozenset({"read"}))
+        with self.assertRaises(CredentialRefused) as caught:
+            store.mint("device", H("page"), ["read"])
+        self.assertEqual(caught.exception.detail, "principal_id_reserved")
+
+    @NEEDS_POSIX
+    def test_a_failed_release_of_the_writers_lock_changes_no_answer(self) -> None:
+        base = tempfile.mkdtemp(prefix="creds-r7-")
+        self.addCleanup(shutil.rmtree, base, True)
+        path = os.path.join(base, "state", "credentials.json")
+        store = CredentialStore(path)
+        real_open, real_close = creds.os.open, creds.os.close
+        lock_fds: list[int] = []
+        failed: list[int] = []
+
+        def recording_open(name, flags, *args, **kwargs):
+            fd = real_open(name, flags, *args, **kwargs)
+            if str(name).endswith(".lock"):
+                lock_fds.append(fd)
+            return fd
+
+        def failing_close(fd):
+            if fd in lock_fds and not failed:                # the worst case: the descriptor stays open
+                failed.append(fd)
+                self.addCleanup(real_close, fd)
+                raise OSError(5, "Input/output error")
+            return real_close(fd)
+
+        with mock.patch.object(creds.os, "open", side_effect=recording_open), \
+                mock.patch.object(creds.os, "close", side_effect=failing_close):
+            token, cred = store.mint("device", "d1", ["read"])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(store.verify(token, peer="p").token_id, cred.token_id)
+        again = CredentialStore(path)                        # the lock is free: another store opens and writes
+        self.assertEqual(len(again.grants()), 1)
+        again.mint("device", "d2", ["read"])
+
+
 class PlatformTest(unittest.TestCase):
     def test_without_uids_the_store_refuses_to_open(self) -> None:
         with mock.patch.object(creds.os, "name", "nt"):

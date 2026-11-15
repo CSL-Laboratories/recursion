@@ -6,6 +6,7 @@ Run: PYTHONPATH=core <python> -m unittest recursion_core.routes.engines.fixtures
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -211,6 +212,23 @@ class AcpDraftsTest(unittest.TestCase):
         self.assertEqual(out.code, acp.CANCELLED)
         self.assertEqual([d["type"] for d in ended], ["input.accepted", "result"])
         self.assertEqual(ended[1]["payload"]["code"], "cancelled")
+
+    def test_med1_a_line_that_is_not_utf8_leaves_the_session_able_to_take_the_next_prompt(self) -> None:
+        # DeepSeek's round-2 MED1: on_line refuses a line a surrogateescape reader gives for invalid UTF-8.
+        update = {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fake-session-1", "update": {
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "x" + chr(0xDCFF)}}}}
+        agent = FakeAcpAgent([[("raw", json.dumps(update, ensure_ascii=False)), ("wait_cancel",), ("end", "cancelled")],
+                              [("chunk", "second"), ("end", "end_turn")]])
+        drafts = ag.AcpDrafts()
+        session = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, on_line=drafts.on_line)
+        with self.assertRaises(acp.AcpProtocolError):
+            session.prompt("first", FAR)
+        self.assertEqual(agent.cancels, 1)
+        out = session.prompt("second", FAR)
+        self.assertEqual((out.code, out.text), (None, "second"))
+        spans = [d["payload"] for d in drafts.drafts if d["type"] == "engine.output"]
+        for one, two in zip(spans, spans[1:]):
+            self.assertEqual(one["offset_end"], two["offset_start"])   # the refused line left no partial span
 
     @unittest.skipUnless(schema_check.AVAILABLE, schema_check.SKIP_REASON)
     def test_every_acp_draft_fits_driver_v2(self) -> None:

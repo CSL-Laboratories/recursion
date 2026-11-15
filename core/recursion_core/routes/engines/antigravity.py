@@ -142,6 +142,11 @@ class OneShotProtocolError(Exception):
     pass
 
 
+# The largest step index a tool call's id is made from: 2^63 - 1, so ``step-<index>`` stays within event.v1's
+# 128-character call id.
+MAX_STEP_INDEX = 2**63 - 1
+
+
 class OneShotParser:
     """``agy -p --output-format stream-json``: one stdout line in, event drafts (driver.v2) out.
 
@@ -151,7 +156,8 @@ class OneShotParser:
     * ``init``: the conversation id is kept (the engine's session id).
     * ``step_update`` of a ``tool`` step in state ``DONE`` with ``tool_info``: a ``tool.call`` and a
       ``tool.result`` draft, once per step. The call id is ``step-<step_index>`` (agy gives a tool call no
-      id of its own); the input is ``tool_info.parameters`` when it is an object, else null, and the digest
+      id of its own); a step index outside 0 .. 2^63 - 1 is a protocol error, so the id always fits
+      event.v1. The input is ``tool_info.parameters`` when it is an object, else null, and the digest
       (RFC 8785 then SHA-256) is always of what agy sent (JSON null when it sent none). Parameters with no
       RFC 8785 text (an integer beyond 2^53 - 1, for one) are a protocol error, as is a line nested too
       deeply to read or one that is not UTF-8.
@@ -222,7 +228,13 @@ class OneShotParser:
         info = step.get("tool_info")
         index = step.get("step_index")
         if (step.get("step_type") != "tool" or step.get("state") != "DONE" or not isinstance(info, Mapping)
-                or type(index) is not int or index in self._tool_steps):
+                or type(index) is not int):
+            return []
+        if not 0 <= index <= MAX_STEP_INDEX:
+            # The call id is made from it, and event.v1 caps a call id at 128 characters: a step index no
+            # 64-bit counter gives is the agent's protocol error, not an id the core must refuse.
+            raise OneShotProtocolError("step_index is not a 64-bit count")
+        if index in self._tool_steps:
             return []
         name = info.get("name") if isinstance(info.get("name"), str) and info["name"] else step.get("tool_name")
         if not isinstance(name, str) or not name or "\n" in name or "\r" in name:

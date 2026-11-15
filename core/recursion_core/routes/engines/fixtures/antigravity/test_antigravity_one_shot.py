@@ -504,5 +504,39 @@ class AdapterTest(unittest.TestCase):
             ag.one_shot_factory(Launcher(), clock, lambda *_: "", {}, binary="agy")
 
 
+class ReviewRoundTwoParserTest(unittest.TestCase):
+    """Regressions for the two reads of #396 at ca153c32 that concern the one-shot parser and adapter."""
+
+    def test_med2_a_step_index_no_64_bit_count_gives_is_a_protocol_error(self) -> None:
+        for index in (10**200, 2**63, -1):
+            with self.subTest(index=index), self.assertRaises(ag.OneShotProtocolError):
+                ag.OneShotParser(CONN, MODEL).parse(tool_line({}, index=index))
+        call = of_type(ag.OneShotParser(CONN, MODEL).parse(tool_line({}, index=ag.MAX_STEP_INDEX)), "tool.call")[0]
+        self.assertEqual(call["call_id"], f"step-{2**63 - 1}")
+        self.assertLessEqual(len(call["call_id"]), 128)
+
+    @unittest.skipUnless(schema_check.AVAILABLE, schema_check.SKIP_REASON)
+    def test_med2_the_smallest_and_largest_step_index_fit_driver_v2(self) -> None:
+        for index in (0, ag.MAX_STEP_INDEX):
+            for draft in ag.OneShotParser(CONN, MODEL).parse(tool_line({}, index=index)):
+                self.assertTrue(schema_check.fits("driver.v2.json#/$defs/event_draft", draft), draft)
+
+    def test_med2_through_the_adapter_the_run_is_fenced(self) -> None:
+        clock = Clock()
+        launcher = Launcher([tool_line({}, index=10**200)], clock)
+        res = adapter(launcher, clock).run(request(), clock() + 60)
+        self.assertEqual(res["code"], c.PROTOCOL_ERROR)
+        self.assertEqual(launcher.process.fenced, ["protocol_error"])
+
+    def test_low3_a_prepared_home_that_is_not_an_absolute_path_refuses_and_nothing_starts(self) -> None:
+        for home in ("relative/home", "", None, 5):
+            with self.subTest(home=home):
+                clock = Clock()
+                launcher = Launcher(lines("synthetic-ok.jsonl"), clock)
+                res = adapter(launcher, clock, home=lambda route, method, home=home: home).run(request(), clock() + 60)
+                self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.NOT_PREPARED))
+                self.assertEqual(launcher.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

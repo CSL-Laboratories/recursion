@@ -10,8 +10,11 @@ The client runs it as ``<python> fake_ssh.py <ssh options> -- <host> <command>``
   banner          write a login banner on stdout (a shell that prints), then run the relay
   hello_then_die  answer the hello as the relay does, read one more frame, exit 255 with no answer
   wrong_id        answer the hello, then answer every frame with another id
-  old_relay       answer the hello with relay version 0
+  old_relay       answer the hello with relay version 0, then answer every frame ``ok`` (so that a client
+                  that skipped the version check would fail its test at once instead of hanging)
   misused_key     run the relay as if the client had asked the key for another command
+  stall           answer the hello, then stop reading stdin until killed (a far side that stalls)
+  small_relay     run the real relay with a 256-byte frame limit
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # the repository's core/ folder
@@ -57,7 +61,9 @@ def main() -> int:
     if mode == "misused_key":
         environ["SSH_ORIGINAL_COMMAND"] = "scp -t /tmp"
         return relay_main(relay_args, environ=environ, stdin=stdin, stdout=stdout)
-    if mode in ("hello_then_die", "wrong_id", "old_relay"):
+    if mode == "small_relay":
+        return Relay(environ=environ, key_label=label, max_frame_bytes=256).serve(stdin, stdout)
+    if mode in ("hello_then_die", "wrong_id", "old_relay", "stall"):
         relay = Relay(environ=environ, key_label=label)
         hello = codec.read_message(stdin)
         if hello is None:
@@ -66,6 +72,13 @@ def main() -> int:
         if mode == "old_relay":
             reply["relay"]["version"] = 0
         codec.write_message(stdout, reply)
+        if mode == "stall":
+            # Read nothing more. The client's deadline kills this process; should the client never do so
+            # (a broken client), leave when the parent does, so that no stray process outlives the test.
+            parent = os.getppid()
+            while os.getppid() == parent:
+                threading.Event().wait(0.5)
+            return 0
         while True:
             frame = codec.read_message(stdin)
             if frame is None:
@@ -74,6 +87,11 @@ def main() -> int:
                 return 255
             if mode == "wrong_id":
                 codec.write_message(stdout, {"ok": True, "result": {"code": "ok"}, "id": f"not-{frame.get('id')}"})
+            if mode == "old_relay":
+                answer = {"ok": True, "result": {"code": "ok"}}
+                if "id" in frame:
+                    answer["id"] = frame["id"]
+                codec.write_message(stdout, answer)
     return relay_main(relay_args, environ=environ, stdin=stdin, stdout=stdout)
 
 

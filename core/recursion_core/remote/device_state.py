@@ -12,12 +12,19 @@ the phone door of this lane's later slices keep, so that they are tested before 
   the device's state at that moment (``check_connection``), never against an earlier answer.
 * ``connect`` and ``revoke`` are decided under one lock: a connection is either refused or named by the
   revocation, never admitted and missed.
+* A record the book hands out is a frozen snapshot: changing it is refused, and the book's own state
+  changes only under its lock (a revocation replaces the record).
+* A wrong argument (no grant, an expiry that is not a finite number, a connection id that cannot be a key)
+  is a typed refusal, never a ``TypeError``.
 
-How long a device stays paired is not decided here: the caller gives each device its expiry.
+How long a device stays paired is the owner's open choice (L1 in the lane's questions): the caller gives
+each device a finite expiry, and no default is built in.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import math
 import threading
 import time
 from collections.abc import Callable, Hashable
@@ -38,7 +45,7 @@ class Admission:
 ADMITTED = Admission(True)
 
 
-@dataclass
+@dataclass(frozen=True)
 class DeviceRecord:
     device_id: str
     label: str
@@ -54,6 +61,14 @@ class DeviceRecord:
                 "paired_at": self.paired_at, "expires_at": self.expires_at, "state": state}
 
 
+def _key(conn_id: object) -> bool:
+    try:
+        hash(conn_id)
+    except TypeError:
+        return False
+    return True
+
+
 @dataclass
 class DeviceBook:
     """Paired devices and their live connections, in memory, under one lock. ``clock`` is monotonic."""
@@ -64,7 +79,11 @@ class DeviceBook:
     _connections: dict[Hashable, str] = field(default_factory=dict, init=False, repr=False)
 
     def add(self, grant: PairingGrant, *, expires_at: float) -> DeviceRecord:
-        """Record a redeemed offer as a device. A known id (revoked ones too) is refused."""
+        """Record a redeemed offer as a device and return its frozen record. A known id (revoked too) is refused."""
+        if not isinstance(grant, PairingGrant):
+            raise PairingRefused("grant_invalid", "a device is added from a PairingGrant")
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
+            raise PairingRefused("expiry_invalid", "a device's expiry is a finite number on the book's clock")
         scopes = device_scopes(grant.scopes)
         label = device_label(grant.label)
         with self._lock:
@@ -73,7 +92,7 @@ class DeviceBook:
                 raise PairingRefused("device_exists", "a device id is never reused")
             if not expires_at > now:
                 raise PairingRefused("expiry_invalid", "a device's expiry must be in the future")
-            record = DeviceRecord(grant.device_id, label, scopes, now, expires_at)
+            record = DeviceRecord(grant.device_id, label, scopes, now, float(expires_at))
             self._devices[grant.device_id] = record
             return record
 
@@ -83,6 +102,8 @@ class DeviceBook:
 
     def connect(self, device_id: object, conn_id: Hashable, *, scope: str = "read") -> Admission:
         """Admit a new live connection for ``scope`` and remember it, so that a revocation can name it."""
+        if not _key(conn_id):
+            return Admission(False, "connection_invalid")
         with self._lock:
             decision = self._admit(device_id, scope)
             if decision.ok:
@@ -93,6 +114,8 @@ class DeviceBook:
 
     def check_connection(self, conn_id: Hashable, scope: str) -> Admission:
         """A request on a live connection, decided against the device as it is now."""
+        if not _key(conn_id):
+            return Admission(False, "connection_invalid")
         with self._lock:
             device_id = self._connections.get(conn_id)
             if device_id is None:
@@ -100,17 +123,19 @@ class DeviceBook:
             return self._admit(device_id, scope)
 
     def disconnect(self, conn_id: Hashable) -> None:
+        if not _key(conn_id):
+            return
         with self._lock:
             self._connections.pop(conn_id, None)
 
     def revoke(self, device_id: str) -> tuple[Hashable, ...]:
         """Revoke a device for good and return its live connections, which the caller must close."""
         with self._lock:
-            record = self._devices.get(device_id)
+            record = self._devices.get(device_id) if isinstance(device_id, str) else None
             if record is None:
                 raise PairingRefused("device_unknown")
             if record.revoked_at is None:
-                record.revoked_at = self.clock()
+                self._devices[device_id] = dataclasses.replace(record, revoked_at=self.clock())
             closing = tuple(conn for conn, owner in self._connections.items() if owner == device_id)
             for conn in closing:
                 del self._connections[conn]

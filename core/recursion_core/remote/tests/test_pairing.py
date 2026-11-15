@@ -5,10 +5,13 @@ The clock is moved by hand (``support.FakeClock``); nothing waits on the wall cl
 
 from __future__ import annotations
 
+import hmac
 import secrets
 import threading
 import unittest
+from unittest import mock
 
+from recursion_core.remote import pairing
 from recursion_core.remote.pairing import (CODE_BYTES, EXPIRED, LOCKED, OFFER_TTL_S, OPEN, REDEEMED, AttemptLimiter,
                                            OfferBook, PairingGrant, PairingRefused, device_label, device_scopes,
                                            pairing_link)
@@ -23,7 +26,7 @@ class ScopeTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "scope_refused")
 
     def test_unknown_empty_repeated_and_string_scopes_are_refused(self) -> None:
-        for scopes in (["admin"], [], ["read", "read"], "read", ["Read"]):
+        for scopes in (["admin"], [], ["read", "read"], "read", ["Read"], None, 7, [["read"]], [7]):
             with self.subTest(scopes=scopes), self.assertRaises(PairingRefused) as caught:
                 device_scopes(scopes)
             self.assertEqual(caught.exception.code, "scope_invalid")
@@ -34,7 +37,7 @@ class ScopeTests(unittest.TestCase):
 
     def test_a_label_is_printable_ascii_with_no_control_or_direction_characters(self) -> None:
         self.assertEqual(device_label("Owner's phone"), "Owner's phone")
-        for label in ("", " phone", "phone ", "ph\none", "ph\u202eone", "x" * 65, None):
+        for label in ("phone\n", "phone\r\n","", " phone", "phone ", "ph\none", "ph\u202eone", "x" * 65, None):
             with self.subTest(label=label), self.assertRaises(PairingRefused):
                 device_label(label)
 
@@ -179,6 +182,23 @@ class OfferTests(unittest.TestCase):
             self.book.redeem(offer.offer_id, offer.code, source="phone", scopes=["read", "manage"])  # type: ignore[call-arg]
         self.assertEqual(self.book.state(offer.offer_id), OPEN)
 
+    def test_wrong_arguments_get_typed_refusals(self) -> None:
+        with self.assertRaises(PairingRefused) as caught:
+            self.book.issue(scopes=None, label="phone")  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, "scope_invalid")
+        offer = self.book.issue(scopes=["read"], label="phone")
+        for source in ([], None, 7):
+            with self.subTest(source=source):
+                self.assertEqual(self.refused(offer.offer_id, offer.code, source=source), "source_invalid")
+        self.assertEqual(self.book.state(offer.offer_id), OPEN)
+
+    def test_the_code_is_compared_in_constant_time(self) -> None:
+        offer = self.book.issue(scopes=["read"], label="phone")
+        with mock.patch.object(pairing.hmac, "compare_digest", wraps=hmac.compare_digest) as compare:
+            self.refused(offer.offer_id, "W" * 22)
+            self.book.redeem(offer.offer_id, offer.code, source="phone")
+        self.assertEqual(compare.call_count, 2)
+
 
 class LimiterTests(unittest.TestCase):
     def test_failed_tries_from_one_source_are_limited_in_a_sliding_window(self) -> None:
@@ -222,13 +242,22 @@ class PairingLinkTests(unittest.TestCase):
                          "https://host.tailnet.example/pair#offer=off1&code=c0de_-")
         self.assertEqual(pairing_link("https://host.tailnet.example:8443/", "off1", "code"),
                          "https://host.tailnet.example:8443/pair#offer=off1&code=code")
+        self.assertEqual(pairing_link("https://[2001:db8::1]:8443", "off1", "code"),
+                         "https://[2001:db8::1]:8443/pair#offer=off1&code=code")
 
     def test_anything_but_a_bare_https_origin_is_refused(self) -> None:
         for origin in ("http://host.example", "https://user@host.example", "https://host.example/path",
                        "https://host.example?x=1", "https://host.example#f", "https://", "ftp://host.example",
-                       "https://host.example:99999", "https:\\\\host.example"):
-            with self.subTest(origin=origin), self.assertRaises(PairingRefused):
+                       "https://host.example:99999", "https:\\\\host.example", "https://bad host.example",
+                       "https://host.exa\nmple", "https://host.example\n", "https://host\t.example",
+                       "https://host.example\x7f", "https://[broken", "https://[::g]", "https://[1:2:3]",
+                       "https://[::1::2]", "https://host:",
+                       "https://host.example:0/", "https://host.example:65536", "https://-host.example",
+                       "https://host..example", " https://host.example", None, 7,
+                       "https://" + ".".join(["a" * 63] * 4) + ".example"):  # a host longer than 255 characters
+            with self.subTest(origin=origin), self.assertRaises(PairingRefused) as caught:
                 pairing_link(origin, "off1", "code")
+            self.assertEqual(caught.exception.code, "origin_invalid")
         for offer_id, code in (("off 1", "code"), ("off1", "co&de"), ("off1", "")):
             with self.subTest(offer_id=offer_id, code=code), self.assertRaises(PairingRefused):
                 pairing_link("https://host.example", offer_id, code)

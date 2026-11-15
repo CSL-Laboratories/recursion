@@ -95,17 +95,51 @@ def write_message(stream: BinaryIO, message: Message, *, max_bytes: int = MAX_FR
         flush()
 
 
+def frame_refusal(message: Message, *, max_bytes: int = MAX_FRAME_BYTES) -> str | None:
+    """Why ``message`` cannot be framed again (too large, too deep, a lone surrogate, NaN), or ``None``.
+
+    ``json.loads`` accepts some text ``encode_frame`` refuses: a lone surrogate written as an escape, and NaN
+    or Infinity. Such a frame was readable and cannot be forwarded: it is refused before anything is sent.
+    """
+    try:
+        encode_frame(message, max_bytes=max_bytes)
+    except FrameError as exc:
+        return str(exc)
+    except (ValueError, TypeError) as exc:
+        return f"frame_not_encodable:{type(exc).__name__}"
+    return None
+
+
+def copyable_id(request: object) -> tuple[bool, Any]:
+    """``(True, id)`` when the request carries an ``id`` that can be framed again, else ``(False, None)``."""
+    if not isinstance(request, dict) or "id" not in request:
+        return False, None
+    if frame_refusal({"id": request["id"]}) is not None:
+        return False, None
+    return True, request["id"]
+
+
+def ascii_text(text: str, limit: int = 200) -> str:
+    """Text the relay writes into its own frames: ASCII, other characters escaped, at most ``limit`` long."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")[:limit]
+
+
 def relay_error(code: str, *, delivered: bool | str, detail: str | None = None,
                 request: Message | None = None) -> Message:
-    """An error frame of the relay's own; it carries the request's ``id`` when the request had one."""
+    """An error frame of the relay's own; it carries the request's ``id`` when the request had one.
+
+    The detail is made ASCII and an ``id`` that cannot be framed again is left out, so that the relay's own
+    answer can always be written. An error with no ``id`` answers a frame the relay could not read or copy.
+    """
     if not _is_delivered_value(delivered):
         raise ValueError(f"delivered must be one of {DELIVERED_VALUES!r}")
     error: dict[str, Any] = {"code": code, "layer": RELAY_LAYER, "delivered": delivered}
     if detail:
-        error["detail"] = detail
+        error["detail"] = ascii_text(detail)
     reply: Message = {"ok": False, "error": error}
-    if isinstance(request, dict) and "id" in request:
-        reply["id"] = request["id"]
+    has_id, value = copyable_id(request)
+    if has_id:
+        reply["id"] = value
     return reply
 
 

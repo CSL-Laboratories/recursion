@@ -72,6 +72,7 @@ def principal_refusal(principal: object):
 
 
 _APPROVAL_ID = re.compile(r"apr-[A-Za-z0-9_-]{1,60}")
+_COMMAND_ID = re.compile(r"[A-Za-z0-9._:-]{8,128}")  # common.v1 command_id
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _LOG_ID = re.compile(r"ses-[A-Za-z0-9_-]{1,60}|run:[A-Za-z0-9_-]{1,64}")
 _LIST_PARAMS = ("session_id", "state", "limit", "after")
@@ -85,6 +86,7 @@ def params_refusal(method: str, params: object):
         whole = (type(value) is int and value >= 1) if field == "expected_revision" else (type(value) is str and bool(value))
         if not whole or (field == "answer" and value not in ("approve", "deny")) \
                 or (field == "surface" and value not in SURFACES) \
+                or (field == "command_id" and not _COMMAND_ID.fullmatch(value)) \
                 or (field == "approval_id" and not _APPROVAL_ID.fullmatch(value)) \
                 or (field == "digest" and not _DIGEST.fullmatch(value)):
             return {"code": "request_invalid", "detail": field}

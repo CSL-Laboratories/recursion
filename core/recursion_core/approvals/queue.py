@@ -95,6 +95,8 @@ class ApprovalQueue:
         self._wake = threading.Event()
         self._closing = threading.Event()
         self._worker: threading.Thread | None = None
+        self._generation = None        # the running worker's token; a worker whose token is gone returns
+        self._running = False          # started and not stopped: a surface that subscribes now is offered
         self.ready = False
 
     # -- composition -------------------------------------------------------------------------------------
@@ -116,27 +118,58 @@ class ApprovalQueue:
             self.attach(context.store)
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
-        self.recover()
+        with self._lock:
+            self._running = True  # from here a surface that subscribes is offered what no surface took
+        try:
+            self.recover()
+        except BaseException:
+            with self._lock:
+                self._running = False
+            raise
         self._closing.clear()
-        worker = threading.Thread(target=self._run, name="approvals-deadlines", daemon=True)
+        generation = object()
+        worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines", daemon=True)
+        self._generation = generation
         self._worker = worker
-        worker.start()
+        # Ready before the worker runs: from here only the worker withdraws it (on a failure) and restores it
+        # (after a sweep), so start never overwrites a failure the worker has already reported.
         self.ready = True
+        try:
+            worker.start()
+        except Exception:
+            self.ready = False  # no worker runs; stop lets this one go (it never launched)
+            raise
 
     def stop(self, context=None) -> None:
         """Signal the worker and return only once it has joined. Interrupted, the worker is kept, and a
-        second ``stop`` joins it again."""
+        second ``stop`` joins it again. A worker whose thread never launched (its start failed) has nothing
+        to join and is let go; were it to launch late, its generation is gone and it returns at once."""
         self.ready = False
+        with self._lock:
+            self._running = False
+        self._generation = None
         self._closing.set()
         self._wake.set()
         worker = self._worker
         if worker is not None:
-            worker.join()
+            if worker.ident is not None or worker.is_alive():
+                worker.join()
             self._worker = None
 
     def subscribe_requested(self, fn: Callable[[dict], None]) -> Callable[[], None]:
-        """``fn(record)`` after a request commits (and for each one recovery offers again)."""
-        return self._subscribe(self._requested, fn)
+        """``fn(record)`` after a request commits. Recovery at start offers again every pending request no
+        surface took; a surface that subscribes once the queue has started is offered those at once. So a
+        surface can be offered one request more than once, always under the same approval id."""
+        token = object()
+        with self._lock:
+            self._requested.append((token, fn))
+            running = self._running
+        if running:
+            try:
+                self._offer_unshown(only=fn)
+            except Exception as exc:  # noqa: BLE001 - the subscription stands; the next start offers them
+                log.error("pending approvals could not be offered to a new surface: %s", type(exc).__name__)
+        return self._unsubscriber(self._requested, token)
 
     def subscribe_answered(self, fn: Callable[[dict, object], None]) -> Callable[[], None]:
         """``fn(record, binding)`` after a request is resolved: a driver answers its engine from this."""
@@ -146,7 +179,9 @@ class ApprovalQueue:
         token = object()
         with self._lock:
             where.append((token, fn))
+        return self._unsubscriber(where, token)
 
+    def _unsubscriber(self, where: list, token) -> Callable[[], None]:
         def unsubscribe() -> None:
             with self._lock:
                 where[:] = [item for item in where if item[0] is not token]
@@ -201,10 +236,11 @@ class ApprovalQueue:
         return self.request("engine_tool", effect, session_id=effect.get("session_id"), run_id=effect.get("run_id"),
                             turn_id=turn_id, engine_request_id=binding["engine_request_id"])
 
-    def _offer(self, record: dict) -> bool:
-        """Tell the subscribers of a committed request; remember it as shown only if one took it."""
+    def _offer(self, record: dict, *, only=None) -> bool:
+        """Tell the subscribers of a committed request (or only ``only``); remember it as shown only if one
+        took it."""
         with self._lock:
-            listeners = [fn for _, fn in self._requested]
+            listeners = [fn for _, fn in self._requested] if only is None else [only]
         taken = False
         for fn in listeners:
             taken = _tell(fn, copy.deepcopy(record)) or taken
@@ -232,6 +268,12 @@ class ApprovalQueue:
                     self._done.pop(approval_id, None)
             return None
         if held["state"] != "pending":
+            # Already resolved: this registration will never be resolved again, so it goes now; a waiter
+            # sharing it is woken and reads the same resolved record.
+            with self._lock:
+                if self._done.get(approval_id) is done:
+                    del self._done[approval_id]
+            done.set()
             return held
         if not done.wait(timeout):
             return None
@@ -252,9 +294,12 @@ class ApprovalQueue:
 
     def sweep(self) -> list:
         """Write every expiry that is due now; return the records that expired. A row that cannot be read
-        is set aside (it is not an approval any more) rather than tried again at every turn."""
+        is set aside (it is not an approval any more) rather than tried again at every turn. Any other
+        failure of one row holds back no other row: the rest are expired, then the first failure is raised
+        (the worker withdraws ``ready``, pauses and tries again)."""
         now = self.now()
         expired = []
+        failure = None
         with self._store.transaction() as tx:
             due = rows.due(tx, milliseconds(now))
         for approval_id in due:
@@ -273,13 +318,20 @@ class ApprovalQueue:
                 with self._store.transaction() as tx:
                     rows.set_aside(tx, approval_id)
                 continue
+            except Exception as exc:  # noqa: BLE001 - one row's failure holds back no other deadline
+                log.error("approval %s could not be expired (%s)", approval_id, type(exc).__name__)
+                failure = failure or exc
+                continue
             expired.append(changed)
             self._resolved(changed, binding)
+        if failure is not None:
+            raise failure
         return expired
 
-    def _run(self) -> None:
-        """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, try again."""
-        while not self._closing.is_set():
+    def _run(self, generation=None) -> None:
+        """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, try again.
+        It returns once the queue closes or its generation is no longer the queue's."""
+        while not self._closing.is_set() and self._generation is generation:
             try:
                 with self._store.transaction() as tx:
                     deadline = rows.next_deadline(tx)
@@ -295,10 +347,26 @@ class ApprovalQueue:
                 log.error("the approval deadline worker failed (%s); trying again", type(exc).__name__)
                 self._closing.wait(self._retry)
 
+    def _offer_unshown(self, *, only=None) -> list:
+        """Offer again each pending request no surface has taken, to every subscriber or only to ``only``."""
+        offered = []
+        with self._store.transaction() as tx:
+            never_shown = rows.unshown(tx)
+        for approval_id in never_shown:
+            try:
+                with self._store.transaction() as tx:
+                    held = rows.load(tx, approval_id)
+            except ApprovalRefused:
+                continue
+            if held is not None and held["state"] == "pending":
+                self._offer(held, only=only)
+                offered.append(approval_id)
+        return offered
+
     def recover(self) -> dict:
         """At start: end engine requests whose driver died, retire the bindings of approved ones not yet
         carried out, write due expiries, offer again the requests never shown."""
-        closed, retired, offered = [], [], []
+        closed, retired = [], []
         now = self.now()
         with self._store.transaction() as tx:
             engine = rows.unresolved_engine(tx)
@@ -326,17 +394,7 @@ class ApprovalQueue:
                 continue
             self._resolved(held, binding)
         expired = self.sweep()
-        with self._store.transaction() as tx:
-            never_shown = rows.unshown(tx)
-        for approval_id in never_shown:
-            try:
-                with self._store.transaction() as tx:
-                    held = rows.load(tx, approval_id)
-            except ApprovalRefused:
-                continue
-            if held is not None and held["state"] == "pending":
-                self._offer(held)
-                offered.append(approval_id)
+        offered = self._offer_unshown()
         return {"closed": closed, "retired": retired, "expired": [r["approval_id"] for r in expired],
                 "told": offered, "at": now}
 

@@ -26,7 +26,7 @@ import logging
 
 from recursion_core.approvals.effects import text_of
 from recursion_core.approvals.model import ApprovalRefused, restored
-from recursion_core.approvals.record import milliseconds, summary_of
+from recursion_core.approvals.record import milliseconds, shape_problem, summary_of
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +76,8 @@ def insert(tx, record: dict, binding: dict | None) -> None:
 
 def load(tx, approval_id: str):
     """The record as the core holds it (``restored``), or ``None`` when there is no such row. A row that is
-    there but is not a JSON object is ``record_invalid``: it is not an unknown approval."""
+    there but is not a JSON object of approval.v1's shape is ``record_invalid``: it is not an unknown
+    approval, and nothing (the deadline worker included) reads its members."""
     rows = tx.execute("SELECT record FROM approvals_records WHERE approval_id = ?", (approval_id,))
     if not rows:
         return None
@@ -84,7 +85,7 @@ def load(tx, approval_id: str):
         held = json.loads(rows[0][0])
     except (ValueError, TypeError):
         raise ApprovalRefused("record_invalid") from None
-    if type(held) is not dict:
+    if type(held) is not dict or shape_problem(held) is not None:
         raise ApprovalRefused("record_invalid")
     return restored(held)
 

@@ -17,7 +17,11 @@ Runs outlive a daemon restart (grill Q38), so bindings, faults and trips are kep
 SQLite store (WAL, ``synchronous=FULL``) and survive a restart; losing them would remove
 a refusal. Probe leases stay in memory: a restart only means probing again. Like the
 authority ledger, the daemon never creates the store; ``create_breaker_store`` is the
-installer's step, and a missing store refuses. The same-uid limit in ``authority.py``
+installer's step, and a missing store refuses. The store is opened through
+``stores.open_store``, which also refuses a store, a folder or a ``-wal``, ``-shm`` or
+``-journal`` beside it that is a link, is not ours, or can be written by group or world
+(``breaker_store_untrusted``), and opens with SQLite's ``mode=rw``, so a store removed after
+those checks is refused, never created empty. The same-uid limit in ``authority.py``
 applies: in-process plugin code can rewrite this file (B17).
 This is the domain-neutral half; any consumer's own breakers stay with the consumer.
 """
@@ -33,6 +37,7 @@ import time
 from typing import Callable
 
 from .errors import Refused
+from .stores import open_store
 
 __all__ = ["ConnectionBreaker", "TYPED_LIMITS", "create_breaker_store"]
 
@@ -81,22 +86,19 @@ def create_breaker_store(path: str) -> None:
 class ConnectionBreaker:
     def __init__(self, store_path: str, *, clock: Callable[[], float] = time.monotonic,
                  probe_lease_seconds: float = 300.0) -> None:
-        if not os.path.isfile(store_path):
-            raise Refused("breaker_store_missing")
-        self._db = None
+        # ``open_store`` checks the store, opens it (WAL as created, ``synchronous=FULL``, a 30 s busy
+        # timeout) and checks its magic, refusing with this store's codes. The two codes this class has
+        # always raised are raised again here, unchanged, because the frozen contract test
+        # (tests/test_breaker_contract.py) finds this class's codes in this file's source (lane
+        # INSTALL's question 11). Every other code passes through as raised.
         try:
-            self._db = sqlite3.connect(store_path, isolation_level=None, check_same_thread=False,
-                                       timeout=30)
-            self._db.execute("PRAGMA synchronous=FULL")
-            self._db.execute("PRAGMA busy_timeout=30000")
-            meta = dict(self._db.execute("SELECT k, v FROM meta").fetchall())
-        except sqlite3.Error:
-            if self._db is not None:
-                self._db.close()
-            raise Refused("breaker_store_invalid") from None
-        if meta.get("magic") != _STORE_MAGIC:
-            self._db.close()
-            raise Refused("breaker_store_invalid")
+            self._db = open_store(store_path, _STORE_MAGIC)
+        except Refused as refusal:
+            if refusal.code == "breaker_store_missing":
+                raise Refused("breaker_store_missing", refusal.detail) from None
+            if refusal.code == "breaker_store_invalid":
+                raise Refused("breaker_store_invalid", refusal.detail) from None
+            raise
         self._lock = threading.Lock()
         self._clock = clock
         self._lease_seconds = probe_lease_seconds

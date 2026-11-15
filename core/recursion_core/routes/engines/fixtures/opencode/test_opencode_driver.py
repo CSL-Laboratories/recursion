@@ -12,7 +12,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from recursion_core.routes.driver import Declaration, DriverRefused
+from recursion_core.routes.driver import Declaration, DriverInputError, DriverRefused, DriverStateError
 from recursion_core.routes.engines import opencode as oc
 
 HERE = Path(__file__).resolve().parent
@@ -174,6 +174,63 @@ class ParserStateTests(unittest.TestCase):
         p.feed(finish)
         self.assertEqual((p._finish, p.last_type), ("stop", "step_finish"))
         self.assertEqual(p.end(None)[0]["payload"]["code"], None)  # the stream's own end of the turn
+
+
+class DriverLifecycleTests(unittest.TestCase):
+    """F6, F7 and F8 of #414's first read, and the two survivors of slice 2's mutation pass in this class (#15, #27)."""
+
+    def setUp(self):
+        self.spy = Spy()
+        self.driver = oc.OpenCodeDriver(self.spy, wall=lambda: 1794614400.0, clock=lambda: 100.0)
+        self.handle = self.driver.start(session(), None, ENV)
+
+    def test_a_bad_exit_code_changes_nothing_and_finish_can_be_called_again(self):
+        self.driver.send(self.handle, message())
+        for bad in (True, 1.0, "0", [0]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(DriverInputError):
+                    self.driver.finish(self.handle, bad)
+                self.assertEqual(self.handle.live_turn, "turn-1")
+        self.assertEqual(self.driver.finish(self.handle, 0)[0]["payload"]["code"], None)
+        self.assertIsNone(self.handle.live_turn)
+
+    def test_a_finished_or_unknown_handle_is_a_typed_state_error(self):
+        self.driver.finish(self.handle, 0)
+        with self.assertRaises(DriverStateError):
+            self.driver.finish(self.handle, 0)
+        with self.assertRaises(DriverStateError):
+            self.driver.parse(self.handle, "x\n")
+        with self.assertRaises(DriverStateError):
+            self.driver.send(self.handle, {"kind": "close"})
+        other = type(self.handle)("run-x", None)
+        with self.assertRaises(DriverStateError):
+            self.driver.parse(other, "x\n")
+
+    def test_release_forgets_a_handle_whose_finish_never_comes(self):
+        self.driver.release(self.handle)
+        self.driver.release(self.handle)
+        self.assertEqual(self.driver._workers, {})
+        with self.assertRaises(DriverStateError):
+            self.driver.finish(self.handle, 0)
+
+    def test_the_constructor_refuses_what_it_cannot_use(self):
+        for args, kwargs in (((None,), {}), ((self.spy,), {"binary": "-x"}), ((self.spy,), {"binary": " "}),
+                             ((self.spy,), {"wall": 5}), ((self.spy,), {"clock": None})):
+            with self.subTest(args=args, kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    oc.OpenCodeDriver(*args, **kwargs)
+
+    def test_a_close_after_the_message_ends_the_input_once(self):
+        self.driver.send(self.handle, message())
+        self.driver.send(self.handle, {"kind": "close"})
+        self.assertEqual((self.spy.processes[0].sent, self.spy.processes[0].closes), (["Run the tests."], 1))
+
+    def test_a_line_that_is_not_an_event_after_an_early_step_start_accepts_nothing(self):
+        early = '{"type":"step_start","timestamp":1,"sessionID":"ses_x","part":{"type":"step-start"}}\n'
+        self.driver.parse(self.handle, early)
+        self.driver.send(self.handle, message())                # the step_start above came before the prompt
+        drafts = self.driver.parse(self.handle, "not json\n")
+        self.assertNotIn("input.accepted", [d["type"] for d in drafts])
 
 
 if __name__ == "__main__":

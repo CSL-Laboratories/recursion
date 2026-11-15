@@ -4,7 +4,9 @@ OpenCode is one of the engines the product names (``routes.engines.CATALOGUE``).
 has installed and configured it: Recursion never installs it, never signs it in and never reads its login store.
 This module is the first slice of its driver, the PARSER. It turns the lines that ``opencode run --format json``
 prints into driver.v2 event drafts, each payload exactly event.v1's, and the end of a run into the run's result.
-It starts no process, reads no file and registers nothing; no daemon loads it yet.
+The parser starts no process and reads no file. ``OneShot`` and ``OpenCodeDriver`` (the second slice) drive a
+process the caller's launch path started or the ``spawn`` given to them starts; nothing registers either, and no
+daemon loads this module yet.
 
 THE TWO PACKAGE LINES. OpenCode ships as two npm packages with the same binary name, ``opencode``: ``opencode-ai``
 1.19.x (tag v1.19.5, anomalyco/opencode 810c0eba) and ``@opencode/cli`` 2.x (2.2.6, dc2ffcf8), the one OpenCode's
@@ -79,11 +81,12 @@ call id, a tool name) is refused into ``anomalies``.
 THE RESULT, at ``end(exit_code)``: ``plan_limit`` after a typed 429; else ``auth_failed`` after a typed sign-in
 error (1.x ``ProviderAuthError``, 2.x ``provider.auth``); else, after any other error, ``short_fault`` when its
 envelope's text sounds like a quota and ``engine_error`` otherwise; else ``ok`` (code null) on exit 0, and
-``engine_exited`` on any other exit or none. ``detail`` names the typed error only when it is one of the error
+``engine_exited`` on any other exit, and with no exit status unless the last step finished with reason ``stop``
+(then ``ok``). ``detail`` names the typed error only when it is one of the error
 names OpenCode's source defines (``KNOWN_ERRORS``), and says ``error`` otherwise: never the engine's own words.
 
-What is NOT here: the driver itself (start, send, interrupt, resume), the ``serve`` worker, the permission bridge,
-and any registration (later slices; a registration will state ``default_executable='opencode'``). The guard and the
+What is NOT here: interrupt and resume (the ``serve`` worker, a later slice), the permission bridge, and any
+registration (later slices; a registration will state ``default_executable='opencode'``). The guard and the
 child environment are other lanes' files.
 """
 
@@ -101,7 +104,11 @@ from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 
 from recursion_core.routes import contract as c
-from recursion_core.routes.driver import Declaration, Driver, Flags, check_draft
+from recursion_core.routes.driver import (Declaration, Driver, DriverInputError, DriverStateError, Flags,
+                                          check_draft)
+from recursion_core.subscription_routes import ENGINES as _GUARD_ENGINES
+from recursion_core.subscription_routes import SubscriptionRouteRefused
+from recursion_core.subscription_routes.policy import _looks_like_claude_login   # the guard's own test
 
 ENGINE = "opencode"
 # The command a registration will state as ``default_executable``: argv[0] is the binary option composition gives,
@@ -176,7 +183,8 @@ def build_argv(model: str | None, *, binary: str | None = None) -> list[str]:
     ``binary`` is the binary option composition gives (argv[0] is it, else ``DEFAULT_EXECUTABLE``). 1.19.5 reads a
     piped standard input as the message (run.ts:417-418), so no prompt can be read as an option.
     """
-    if binary is not None and (not isinstance(binary, str) or not binary or _CONTROL.search(binary)):
+    if binary is not None and (not isinstance(binary, str) or not binary.strip() or binary.startswith("-")
+                               or _CONTROL.search(binary)):
         raise ValueError("binary")
     if model is None:   # driver.v2's route: null is the engine's own default model
         return [binary if binary is not None else DEFAULT_EXECUTABLE, "run", "--format", "json"]
@@ -205,12 +213,49 @@ def input_digest(tool_input: object) -> str:
     return hashlib.sha256(canonical_text(tool_input).encode("utf-8")).hexdigest()
 
 
+def held_to_the_guard(model: object, profile: Mapping | None) -> str | None:
+    """The model that goes into argv (``--model``, or None for OpenCode's own default), refused unless the guard's
+    rules accept that very value. The one place a launched model is worked out, for the route path and the driver.
+
+    The guard (``subscription_routes.check_route``) reads ``profile.model``, and argv carries the route's model. So
+    when the profile names a model the two must be the same value (``model_differs_from_profile``); a launched model
+    whose provider is a Claude-subscription provider id or a spelling of a Claude login is refused whatever its
+    source (``claude_subscription_provider``, the guard's own list and test); and on the route path a model the
+    profile does not name must be of the profile's provider (``model_provider_mismatch``, the guard's API-key rule).
+    A model OpenCode cannot take, or one that is not a plain ``str`` (a subclass could answer ``!=`` as it likes),
+    is ``model_malformed``. Each refusal is the guard's own ``SubscriptionRouteRefused``,
+    which the profile adapter answers with a typed ``subscription_route_refused`` before the launcher is called.
+    ``profile`` is None on the driver path, which has no profile (driver.v2's route record).
+    """
+    if model is not None and (type(model) is not str or not model_ok(model)):
+        raise SubscriptionRouteRefused(ENGINE, "model_malformed", "route.model")
+    named = profile.get("model") if profile is not None else None
+    if named is not None and (type(named) is not str or named != model):
+        raise SubscriptionRouteRefused(ENGINE, "model_differs_from_profile")
+    if model is not None:
+        provider = model.split("/", 1)[0].strip().lower()
+        if provider in _GUARD_ENGINES[ENGINE].subscription_providers or _looks_like_claude_login(provider):
+            raise SubscriptionRouteRefused(ENGINE, "claude_subscription_provider", provider)
+        if profile is not None and named is None:
+            stated = profile.get("provider")
+            if not isinstance(stated, str) or provider != stated.strip().lower():
+                raise SubscriptionRouteRefused(ENGINE, "model_provider_mismatch", provider)
+    return model
+
+
 def route_argv(request: dict, *, binary: str | None = None) -> list[str]:
-    """``ProfileRouteAdapter``'s argv hook for one route request. A model OpenCode cannot take is a typed refusal."""
-    try:
-        return build_argv(request["route"]["model"], binary=binary)
-    except ValueError as err:
-        raise c.RouteError(c.REQUEST_INVALID, f"route.{err}") from None
+    """``ProfileRouteAdapter``'s argv hook for one route request: ``build_argv`` on ``held_to_the_guard``'s model.
+
+    The adapter calls it before the guard and the launcher, so each refusal comes back as a typed result with
+    nothing launched. A request without a route mapping is ``RouteError(request_invalid, "route")`` (the route
+    service never sends one).
+    """
+    route = request.get("route") if isinstance(request, Mapping) else None
+    if not isinstance(route, Mapping):
+        raise c.RouteError(c.REQUEST_INVALID, "route")
+    profile = route.get("profile")
+    return build_argv(held_to_the_guard(route.get("model"), profile if isinstance(profile, Mapping) else {}),
+                      binary=binary)
 
 
 class OneShot:
@@ -218,41 +263,71 @@ class OneShot:
 
     ``drive(process, request, deadline_at, events) -> result``: the prompt is written to standard input, which is
     then closed (OpenCode reads it to its end as the message), and stdout is read a line at a time until it ends.
-    ``clock`` is the deadline and breaker clock; a read that would pass ``deadline_at`` raises ``Deadline``, which
-    the adapter fences for this request only. A route whose connection the parser refuses writes nothing.
+    ``clock`` is the deadline and breaker clock: the deadline is checked before the prompt is written and before
+    every read, and a read that would pass it raises ``Deadline``, which the adapter fences for this request only.
+    A chunk from ``read_line`` that is not text, or holds a line break anywhere but at its end, is a protocol error
+    (``_Protocol``, fenced by the adapter). Every other way out once the process has started fences it first
+    (``driver_error``) and lets the same exception leave, ``BaseException`` included. A route whose connection the
+    parser refuses writes nothing and is fenced (``request_invalid``).
     """
 
     def __init__(self, clock: Callable[[], float], *, wall: Callable[[], float] = time.time) -> None:
+        if not callable(clock) or not callable(wall):
+            raise ValueError("clock")
         self._clock, self._wall = clock, wall
 
     def __call__(self, process, request: dict, deadline_at: float, events: list) -> dict:
-        from recursion_core.routes.base import Deadline       # local: base imports nothing of this module
+        from recursion_core.routes.base import Deadline, _Protocol   # local: base imports nothing of this module
         from recursion_core.routes.launch import ReadTimeout
 
-        route = request["route"]
         try:
+            route = request["route"]
             parser = Parser(connection_id=c.connection_key(route), model=route["model"], wall=self._wall,
                             clock=self._clock)
         except ValueError as err:
+            _fence(process, "request_invalid")
             return c.result(request["request_id"], c.REQUEST_INVALID, detail=f"route.{err}")
-        process.send(request["prompt"])
-        process.close_stdin()
-        while True:
-            remaining = deadline_at - self._clock()
-            if remaining <= 0:
+        except BaseException:
+            _fence(process, "driver_error")
+            raise
+        try:
+            if deadline_at - self._clock() <= 0:   # nothing is written once the deadline has passed
                 raise Deadline()
-            try:
-                line = process.read_line(remaining)
-            except ReadTimeout:
-                raise Deadline() from None
-            if line is None:
-                break
-            parser.feed(line if line.endswith("\n") else line + "\n")
-        parser.end(None)   # today's EngineProcess gives no exit status: the stream's last step decides
-        result = parser.route_result(request["request_id"])
-        events.extend(result["events"])
-        result["events"] = events
-        return result
+            process.send(request["prompt"])
+            process.close_stdin()
+            while True:
+                remaining = deadline_at - self._clock()
+                if remaining <= 0:
+                    raise Deadline()
+                try:
+                    line = process.read_line(remaining)
+                except ReadTimeout:
+                    raise Deadline() from None
+                if line is None:
+                    break
+                if type(line) is not str:
+                    raise _Protocol(f"stdout chunk is {type(line).__name__}, not text")
+                if "\n" in line[:-1]:
+                    raise _Protocol("stdout chunk holds more than one line")
+                parser.feed(line if line.endswith("\n") else line + "\n")
+            parser.end(None)   # today's EngineProcess gives no exit status: the stream's last step decides
+            result = parser.route_result(request["request_id"])
+            events.extend(result["events"])
+            result["events"] = events
+            return result
+        except (Deadline, _Protocol, OSError):
+            raise   # the profile adapter fences these and answers with a typed result
+        except BaseException:
+            _fence(process, "driver_error")
+            raise
+
+
+def _fence(process, reason: str) -> None:
+    """Ask the cleanup layer to end the process's tree. A fence that fails does not hide the error being raised."""
+    try:
+        process.fence(reason)
+    except Exception:
+        pass
 
 
 class OpenCodeDriver(Driver):
@@ -271,17 +346,25 @@ class OpenCodeDriver(Driver):
 
     def __init__(self, spawn: Callable[[list, dict], object], *, binary: str | None = None,
                  wall: Callable[[], float] = time.time, clock: Callable[[], float] = time.monotonic) -> None:
+        if not callable(spawn) or not callable(wall) or not callable(clock):
+            raise ValueError("callable")
+        if binary is not None:
+            build_argv(None, binary=binary)   # the binary rule, refused here rather than at the first start
         self._spawn, self._binary, self._wall, self._clock = spawn, binary, wall, clock
         self._workers: dict[int, dict] = {}
 
     def _worker(self, handle) -> dict:
-        return self._workers[id(handle)]
+        worker = self._workers.get(id(handle))   # a worker holds its handle, so no other handle has its id
+        if worker is None:
+            raise DriverStateError("no worker for this handle (finished, released or never started)")
+        return worker
 
     def _start(self, handle, request: dict, env: dict) -> None:
         route = request["route"]
+        model = held_to_the_guard(route["model"], None)
         parser = Parser(connection_id=f"{route['connection']['kind']}:{route['connection']['id']}",
-                        model=route["model"], wall=self._wall, clock=self._clock)
-        argv = build_argv(route["model"], binary=self._binary)
+                        model=model, wall=self._wall, clock=self._clock)
+        argv = build_argv(model, binary=self._binary)
         process = self._spawn(argv, env)
         self._workers[id(handle)] = {"process": process, "parser": parser, "turn": None, "delivery": None,
                                      "accepted": False, "handle": handle}
@@ -308,12 +391,21 @@ class OpenCodeDriver(Driver):
         return drafts
 
     def finish(self, handle, exit_code: int | None) -> list[dict]:
-        """The ``result`` draft once the process has exited; the turn in progress ends with it."""
-        worker = self._workers.pop(id(handle))
+        """The ``result`` draft once the process has exited; the turn in progress ends with it, and the handle is
+        released. An ``exit_code`` that is not an int or None is ``DriverInputError`` with nothing changed."""
+        worker = self._worker(handle)
+        if exit_code is not None and type(exit_code) is not int:
+            raise DriverInputError("exit_code")
         drafts = [check_draft(d) for d in worker["parser"].end(exit_code)]
+        self._workers.pop(id(handle), None)
         if worker["turn"] is not None and handle.live_turn == worker["turn"]:
             self.turn_ended(handle, worker["turn"])
         return drafts
+
+    def release(self, handle) -> None:
+        """Forget a handle whose ``finish`` will never come (a lost run). Its process is the caller's to end: who
+        calls this on Stop and shutdown is lane STOP's and DRIVER-CC's to define. A second call does nothing."""
+        self._workers.pop(id(handle), None)
 
 
 class Parser:

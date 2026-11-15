@@ -41,6 +41,6 @@ Nothing registers it and no other lane imports it yet; this is what a consumer m
 | `Parser.route_result(request_id) -> dict` | the same run as the route contract's result (`recursion.route/v0`), its limit's `reset_at` on the breaker's clock; each `usage` event's `data` holds event.v1's `{value, quality, provenance}` per count. Every call returns fresh copies. `ValueError` for an empty or non-string id; `RuntimeError` until `end` has returned. |
 | `Parser.text`, `.engine_session_id`, `.anomalies` | the answer (model payload), the engine's own session id (first one seen), and what was refused on each line and why; a line listed there may still have given its `engine.output` |
 | `declaration() -> dict` | driver.v2's root record for the one-shot drive |
-| `build_argv(model, *, binary=None) -> list[str]` | `opencode run --format json --model <model>`; argv[0] is `binary` or `opencode`. `ValueError` for a model `model_ok` refuses or a binary that is not a string, is empty or holds a control character. |
+| `build_argv(model, *, binary=None) -> list[str]` | `opencode run --format json --model <model>`; argv[0] is `binary` or `opencode`. `ValueError` for a model `model_ok` refuses or a binary that is not a string, is empty or only white space, starts with `-`, or holds a control character. |
 | `model_ok(model) -> bool`, `input_digest(tool_input) -> str` | the one model rule; the RFC 8785 digest (`ValueError` when the input has no RFC 8785 text) |
 | `ENGINE`, `DEFAULT_EXECUTABLE`, `CHILD_ENV`, `FLAGS`, `KNOWN_ERRORS` | constants; `FLAGS` is read-only |

@@ -18,7 +18,9 @@ from pathlib import Path
 from recursion_core.routes import contract as c
 from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.engines import opencode as oc
+from recursion_core.routes.base import Deadline
 from recursion_core.routes.launch import ReadTimeout
+from recursion_core.subscription_routes import SubscriptionRouteRefused
 from recursion_core.routes.profile_route import profile_adapters
 from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import FakeClock, request
@@ -34,12 +36,15 @@ class RawProcess:
 
     def __init__(self, lines: list, clock: FakeClock) -> None:
         self.lines, self.clock = list(lines), clock
+        self.raise_on_send: BaseException | None = None
         self.sent: list[str] = []
         self.stdin_closed = False
         self.fenced: list[str] = []
 
     def send(self, line: str) -> None:
         assert not self.stdin_closed, "send after close_stdin"
+        if self.raise_on_send is not None:
+            raise self.raise_on_send
         self.sent.append(line)
 
     def close_stdin(self) -> None:
@@ -50,6 +55,8 @@ class RawProcess:
         if not self.lines:
             return None
         line = self.lines.pop(0)
+        if isinstance(line, BaseException):
+            raise line
         if line is HANG:
             self.clock.advance(timeout_s)
             raise ReadTimeout()
@@ -164,13 +171,21 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(self.launcher.processes[0].fenced, ["deadline"])
         self.assertEqual(self.breaker.state("api_key:k1"), "closed")
 
-    def test_an_invalid_model_is_a_typed_refusal(self):
-        for model in ("gpt", "-x/y", "a b/c"):
+    def test_an_invalid_model_is_a_typed_refusal_with_nothing_launched_or_booked(self):
+        for model in ("gpt", "-x/y", "a b/c", "a/b\n", "openai/"):
             with self.subTest(model):
-                with self.assertRaises(c.RouteError) as caught:
-                    oc.route_argv(self.req(model=model))
-                self.assertEqual((caught.exception.code, caught.exception.detail), (c.REQUEST_INVALID, "route.model"))
+                res = self.service.handle(self.req(model=model))
+                self.assertEqual((res["code"], res["detail"], res["breaker_effect"]),
+                                 (c.SUBSCRIPTION_ROUTE_REFUSED, "model_malformed", "none"))
+        self.assertEqual(self.launcher.calls, [])
+        self.assertEqual(self.breaker.state("api_key:k1"), "closed")
+        self.assertEqual(self.run_fixture("synthetic-v1-success.jsonl")["code"], None)   # the connection still runs
         self.assertEqual(oc.route_argv(self.req(), binary="/opt/oc/bin/opencode")[0], "/opt/oc/bin/opencode")
+        for bad in ({}, None, {"route": None}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(c.RouteError) as caught:
+                    oc.route_argv(bad)
+                self.assertEqual((caught.exception.code, caught.exception.detail), (c.REQUEST_INVALID, "route"))
 
     def test_a_connection_the_parser_refuses_writes_nothing(self):
         process = RawProcess([], self.clock)
@@ -178,6 +193,216 @@ class RouteTests(unittest.TestCase):
         res = oc.OneShot(self.clock)(process, req, self.clock() + 60, [])
         self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "route.connection_id"))
         self.assertEqual((process.sent, process.stdin_closed), ([], False))
+        self.assertEqual(process.fenced, ["request_invalid"])      # the process had started: it is ended
+
+
+@unittest.skipIf(os.name == "nt", "the guard's route-home checks are POSIX")
+class LaunchedModelTests(unittest.TestCase):
+    """F1 of #414's first read: the guard is held to the model that is LAUNCHED, whatever its source."""
+
+    setUp, req, run_fixture = RouteTests.setUp, RouteTests.req, RouteTests.run_fixture   # the same route path
+
+    OPENAI = {"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY"}
+
+    def refused(self, cause, **kw):
+        res = self.service.handle(self.req(**kw))
+        self.assertEqual((res["code"], res["detail"], res["breaker_effect"]),
+                         (c.SUBSCRIPTION_ROUTE_REFUSED, cause, "none"))
+        self.assertEqual(self.launcher.calls, [])           # nothing reached the launch boundary
+
+    def test_a_claude_provider_in_the_routes_model_is_refused(self):
+        for model in ("claude-agent/sonnet", "Claude-Agent/sonnet", "CLAUDE-CODE/x", "claude-agent-sdk/x",
+                      "claude_pro/x", "claude/opus", "anthropic-oauth/x"):
+            with self.subTest(model):
+                self.refused("claude_subscription_provider", model=model)
+
+    def test_a_claude_provider_in_both_the_profile_and_the_route_is_refused(self):
+        self.refused("claude_subscription_provider", model="claude-agent/sonnet",
+                     profile=dict(self.OPENAI, model="claude-agent/sonnet"))
+
+    def test_the_route_must_launch_the_model_the_profile_names(self):
+        for profile_model, route_model in (("openai/gpt-5.5", "claude-agent/sonnet"),
+                                           ("openai/gpt-5.5", "openai/gpt-5.4")):
+            with self.subTest((profile_model, route_model)):
+                self.refused("model_differs_from_profile", model=route_model,
+                             profile=dict(self.OPENAI, model=profile_model))
+        # A null model (OpenCode's own default) never reaches the adapter: the route contract refuses it first.
+        res = self.service.handle(self.req(model=None, profile=dict(self.OPENAI, model="openai/gpt-5.5")))
+        self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "route.model"))
+        self.assertEqual(self.launcher.calls, [])
+        self.assertEqual(oc.route_argv(self.req(model=None)), ["opencode", "run", "--format", "json"])
+        with self.assertRaises(SubscriptionRouteRefused) as caught:     # the hook alone refuses it too
+            oc.route_argv(self.req(model=None, profile=dict(self.OPENAI, model="openai/gpt-5.5")))
+        self.assertEqual(caught.exception.cause, "model_differs_from_profile")
+
+    def test_a_model_that_is_not_a_plain_str_is_refused_however_it_compares(self):
+        class Agreeable(str):
+            def __eq__(self, other):
+                return True
+
+            def __ne__(self, other):
+                return False
+
+            __hash__ = str.__hash__
+
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            oc.held_to_the_guard(Agreeable("anthropic/x"), dict(self.OPENAI, model="openai/gpt-5.5"))
+        self.assertEqual(caught.exception.cause, "model_malformed")
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            oc.held_to_the_guard("openai/gpt-5.5", dict(self.OPENAI, model=Agreeable("openai/gpt-5.5")))
+        self.assertEqual(caught.exception.cause, "model_differs_from_profile")
+
+    def test_a_model_the_profile_does_not_name_is_of_the_profiles_provider(self):
+        for model in ("anthropic/claude-x", "google/gemini", "openrouter/claude-agent"):
+            with self.subTest(model):
+                self.refused("model_provider_mismatch", model=model)
+
+    def test_the_value_the_guard_accepted_is_the_value_launched(self):
+        res = self.run_fixture("synthetic-v1-success.jsonl", model="openai/gpt-5.5",
+                               profile=dict(self.OPENAI, model="openai/gpt-5.5"))
+        self.assertEqual(res["code"], None)
+        self.assertEqual([call["argv"][4:] for call in self.launcher.calls], [["--model", "openai/gpt-5.5"]])
+
+    def test_the_driver_path_refuses_a_claude_provider_before_any_spawn(self):
+        spawns = []
+        driver = oc.OpenCodeDriver(lambda argv, env: spawns.append(argv), wall=lambda: 1.0, clock=lambda: 1.0)
+        session = {"session_id": "ses-e3", "run_id": "run-e3",
+                   "route": {"engine": "opencode", "model": "Claude-Agent/sonnet",
+                             "connection": {"kind": "api_key", "id": "k1"}}}
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            driver.start(session, None, {"PATH": "/usr/bin"})
+        self.assertEqual(caught.exception.cause, "claude_subscription_provider")
+        self.assertEqual(spawns, [])
+
+
+@unittest.skipIf(os.name == "nt", "the guard's route-home checks are POSIX")
+class AfterTheLaunchTests(unittest.TestCase):
+    """F2 of #414's first read: once the child has started, every way out fences it first."""
+
+    setUp, req, run_fixture = RouteTests.setUp, RouteTests.req, RouteTests.run_fixture   # the same route path
+
+    def test_a_chunk_that_is_not_one_line_of_text_is_a_typed_protocol_error(self):
+        for chunk in ("a\nb", "a\nb\n", "\n\n", b"x\n", 7, ["x"]):
+            with self.subTest(chunk=chunk):
+                self.setUp()
+                self.launcher.next.append([chunk])
+                res = self.service.handle(self.req())
+                self.assertEqual(res["code"], c.PROTOCOL_ERROR)
+                self.assertEqual(self.launcher.processes[0].fenced, ["protocol_error"])
+
+    def test_any_other_exception_fences_the_child_and_leaves_unchanged(self):
+        for error in (ValueError("v"), TypeError("t"), RuntimeError("r"), KeyError("k"), KeyboardInterrupt(),
+                      SystemExit(3)):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                self.launcher.next.append([error])
+                with self.assertRaises(type(error)) as caught:
+                    self.service.handle(self.req())
+                self.assertIs(caught.exception, error)
+                self.assertEqual(self.launcher.processes[0].fenced, ["driver_error"])
+
+    def test_an_exception_while_writing_the_prompt_fences_too(self):
+        for error, fenced in ((KeyboardInterrupt(), ["driver_error"]), (BrokenPipeError(), ["io_error"])):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                self.launcher.next.append(["x"])
+                launcher = self.launcher
+
+                def spawn(argv, _launcher=launcher, _error=error, **kwargs):
+                    process = Launcher.__call__(_launcher, argv, **kwargs)
+                    process.raise_on_send = _error
+                    return process
+
+                self.service._adapters["opencode"]._launcher = spawn
+                if isinstance(error, OSError):
+                    self.assertEqual(self.service.handle(self.req())["code"], c.ENGINE_ERROR)
+                else:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.service.handle(self.req())
+                self.assertEqual(self.launcher.processes[0].fenced, fenced)
+
+    def test_lines_split_missing_or_repeated_read_as_lines(self):
+        whole = (HERE / "synthetic-v1-success.jsonl").read_text("utf-8").splitlines()
+        res = self.run_fixture(whole + whole)                         # repeated: the same answer twice over
+        self.assertEqual(res["code"], None)
+        res = self.run_fixture([])                                    # nothing at all
+        self.assertEqual((res["code"], res["detail"]), (c.ENGINE_EXITED, "no exit status and no finished step"))
+        res = self.run_fixture([whole[0][:10], whole[0][10:]])       # one line split in two: two bad lines
+        self.assertEqual(res["code"], c.ENGINE_EXITED)
+        self.assertEqual(sum(len(p.fenced) for p in self.launcher.processes), 0)
+
+
+class OneShotTests(unittest.TestCase):
+    """The drive itself, without the route path: the deadline (F4, F10) and the caller's event list."""
+
+    STOP = ('{"type":"step_finish","timestamp":1,"sessionID":"ses_x","part":{"type":"step-finish","reason":"stop",'
+            '"tokens":{"input":1}}}')
+
+    class Chatty:
+        """A process that gives its lines at once, each one moving the clock on by ``step`` seconds."""
+
+        def __init__(self, lines, clock, step=0.0):
+            self.lines, self.clock, self.step = list(lines), clock, step
+            self.sent, self.closed, self.fenced = [], False, []
+
+        def send(self, text):
+            self.sent.append(text)
+
+        def close_stdin(self):
+            self.closed = True
+
+        def read_line(self, timeout_s):
+            self.clock.advance(self.step)
+            return self.lines.pop(0) if self.lines else None
+
+        def fence(self, reason):
+            self.fenced.append(reason)
+
+    def drive(self, lines, step=0.0, deadline=100.0, events=None):
+        clock = FakeClock()
+        process = self.Chatty(lines, clock, step)
+        req = request(engine="opencode", model=MODEL, kind="api_key", conn_id="k1", credential_env="OPENAI_API_KEY",
+                      profile=dict(PROFILE), home="/var/lib/recursion/homes/opencode")
+        events = [] if events is None else events
+        self.process = process
+        result = oc.OneShot(clock, wall=lambda: 1794614400.0)(process, req, clock() + deadline, events)
+        return result, events, process
+
+    def test_an_engine_that_keeps_talking_past_the_deadline_is_stopped_there(self):
+        with self.assertRaises(Deadline):
+            self.drive(["x"] * 20, step=10.0, deadline=35.0)
+        self.assertEqual(len(self.process.lines), 16)        # four reads, the last one ending at 40 s
+
+    def test_nothing_is_written_once_the_deadline_has_passed(self):
+        for deadline in (0.0, -1.0):
+            with self.subTest(deadline=deadline):
+                with self.assertRaises(Deadline):
+                    self.drive([self.STOP], deadline=deadline)
+                self.assertEqual((self.process.sent, self.process.closed), ([], False))
+
+    def test_an_empty_read_is_not_the_end_of_the_output(self):
+        result, _, _ = self.drive(["", self.STOP])
+        self.assertIsNone(result["code"])   # the stopped step after the empty read was read
+
+    def test_the_usage_events_join_the_callers_list(self):
+        mine = {"kind": "usage", "data": {}}
+        result, events, _ = self.drive([self.STOP], events=[mine])
+        self.assertIs(result["events"], events)
+        self.assertIs(events[0], mine)
+        self.assertEqual(len(events), 2)
+
+    def test_a_request_the_drive_cannot_read_fences_the_process(self):
+        clock = FakeClock()
+        process = self.Chatty([], clock)
+        with self.assertRaises(KeyError):
+            oc.OneShot(clock)(process, {"request_id": "r1"}, clock() + 10, [])
+        self.assertEqual((process.fenced, process.sent), (["driver_error"], []))
+
+    def test_the_constructor_refuses_what_it_cannot_call(self):
+        for args, kwargs in (((None,), {}), (("clock",), {}), ((FakeClock(),), {"wall": None})):
+            with self.subTest(args=args, kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    oc.OneShot(*args, **kwargs)
 
 
 if __name__ == "__main__":

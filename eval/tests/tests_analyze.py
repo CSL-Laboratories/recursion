@@ -97,8 +97,8 @@ class CompareTests(unittest.TestCase):
             for i in (1, 2):
                 rows_a.append(trial(t, i, "pass" if n < 6 else "fail", record_id="A"))
                 rows_b.append(trial(t, i, "pass" if n < 4 else "fail", record_id="B"))
-        a = build_record(rows_a, k=2, attempts=2, record_id="A", label="pilot")
-        b = build_record(rows_b, k=2, attempts=2, record_id="B", label="pilot", arm="recursion")
+        a = build_record(rows_a, k=2, attempts=2, record_id="A")
+        b = build_record(rows_b, k=2, attempts=2, record_id="B", arm="recursion")
         return a, b
 
     def test_two_runs_of_one_suite_give_a_paired_task_level_interval(self):
@@ -110,20 +110,20 @@ class CompareTests(unittest.TestCase):
         low, high = result["bootstrap"]
         self.assertLessEqual(low, -0.25)
         self.assertGreaterEqual(high, -0.25)
-        self.assertIn("PILOT", result["claim"])
+        self.assertIn("DEV RUN", result["claim"])
         self.assertIsNotNone(out["full_run_size_estimate"]["tasks_for_10_points"])
 
     def test_different_suites_refused(self):
         a, b = self.pair()
         rows = b["trials"]
-        other = build_record(rows, k=2, attempts=2, record_id="B", label="pilot", manifest_sha="1" * 64)
+        other = build_record(rows, k=2, attempts=2, record_id="B", manifest_sha="1" * 64)
         with self.assertRaises(ValueError):
             analyze.compare(a, other, resamples=1000)
 
     def test_different_k_refused(self):
         a, b = self.pair()
         rows = b["trials"]
-        other = build_record(rows, k=1, attempts=2, record_id="B", label="pilot")
+        other = build_record(rows, k=1, attempts=2, record_id="B")
         with self.assertRaises(ValueError):
             analyze.compare(a, other, resamples=1000)
 

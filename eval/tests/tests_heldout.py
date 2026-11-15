@@ -113,7 +113,7 @@ class GuardTests(unittest.TestCase):
             records = list((out / "pilot-t").glob("*.json"))
             self.assertEqual(len(records), 1)
             record = json.loads(records[0].read_text(encoding="utf-8"))
-            self.assertEqual(record["label"], "pilot")
+            self.assertEqual(record["label"], "shakedown")   # the stand-in on a held-out suite is never a measurement
             self.assertEqual(record["suite"]["split"], "held_out")
             # The same process, now a dev process, is refused the held-out suite.
             heldout._declared = None

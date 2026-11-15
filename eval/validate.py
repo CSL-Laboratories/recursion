@@ -5,7 +5,9 @@ Each check runs in its own scratch runtime (eval/scratch.py), like an attempt. `
 both checks: a task whose result changes between runs is flaky and is not kept (vault
 20261028-recursion-frontier-dr-eval-reliability-02 measured about 13% of tasks flipping on rerun).
 The start tree's tree id is checked too, so a task whose files do not round-trip (attributes, modes)
-is caught here and not at run time.
+is caught here and not at run time; and the commit side is graded only if the start tree with the
+reference solution and the hidden tests IS the pinned commit's tree (``commit_tree``), so a deleted
+test file or a changed mode cannot leave the graded tree different from the commit.
 """
 from __future__ import annotations
 
@@ -38,6 +40,10 @@ def _run(task, side: str, tmp_base: Path, xdg_base: Path) -> tuple:
         if side == "commit":
             task.apply_solution(work)
         task.write_hidden(work)
+        if side == "commit":
+            # The tree the commit side grades must be the pinned commit's own tree (deletions and modes
+            # included), not merely the parent with some files laid over it.
+            tree = gitutil.tree_of_files(work)
         done = arms_mod.run_process(task.command(), cwd=work, env=scratch_mod.environment(scratch), stdin=None,
                                     timeout_s=task.grading_timeout_s)
         return tree, done["exit"], done["timed_out"], done["stdout"] + done["stderr"]
@@ -66,8 +72,15 @@ def validate(task, *, reruns: int = 2, tmp_base: Path = scratch_mod.DEFAULT_TMP_
         if code == NO_TESTS_RAN:
             result.reason = prefix + "the hidden-test command ran no test on the parent"
             return result
-        _, code, timed_out, log = _run(task, "commit", tmp_base, xdg_base)
+        commit_tree, code, timed_out, log = _run(task, "commit", tmp_base, xdg_base)
         result.runs.append(("commit", code, timed_out))
+        if task.commit_tree is not None and commit_tree != task.commit_tree:
+            result.reason = (f"the start tree with the reference solution and hidden tests is {commit_tree}, "
+                             f"not the pinned commit tree {task.commit_tree}")
+            return result
+        if code == NO_TESTS_RAN:
+            result.reason = prefix + "the hidden-test command ran no test on the commit"
+            return result
         if timed_out or code != 0:
             result.reason = prefix + ("hidden tests ran past their limit on the commit" if timed_out
                                       else f"hidden tests fail on the commit (exit {code}): "

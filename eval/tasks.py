@@ -60,6 +60,8 @@ class Task:
     parent_tree: str | None = None    # pinned by the suite manifest
     parent_commit: str | None = None
     commit: str | None = None
+    commit_tree: str | None = None    # the tree of start + solution + hidden; validation checks it
+    modes: dict = field(default_factory=dict)   # path -> mode for solution and hidden files (default 0o644)
 
     def materialize_start(self, dest: Path) -> None:
         """Write the start tree into the empty folder ``dest``."""
@@ -85,10 +87,11 @@ class Task:
                 _remove(path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
+            path.chmod(self.modes.get(name, 0o644))
 
     def apply_solution(self, work: Path) -> None:
         """The reference solution, for validation and for the stand-in engine only."""
-        apply_files(work, self.solution)
+        apply_files(work, self.solution, self.modes)
 
     def command(self) -> list:
         """The hidden-test command with its placeholders filled."""
@@ -130,15 +133,30 @@ def _remove(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def apply_files(work: Path, files: dict) -> None:
+def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
     for name, data in files.items():
         path = work / safe_relpath(name)
         if data is None:
             if path.exists() or path.is_symlink():
                 _remove(path)
             continue
+        if path.is_symlink() or path.is_dir():
+            _remove(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+        path.chmod((modes or {}).get(name, 0o644))
+
+
+def _modes(task_id: str, meta: dict) -> dict:
+    raw = meta.get("modes") or {}
+    if not isinstance(raw, dict):
+        raise TaskError(f"{task_id}: modes must be an object of path -> \"100644\" or \"100755\"")
+    out = {}
+    for name, mode in raw.items():
+        if mode not in ("100644", "100755"):
+            raise TaskError(f"{task_id}: mode {mode!r} for {name!r} is not 100644 or 100755")
+        out[safe_relpath(name)] = int(mode[-3:], 8)
+    return out
 
 
 def _meta(task_id_hint: str, meta: dict) -> dict:
@@ -179,7 +197,8 @@ def load_txtar(path: Path) -> Task:
         solution=solution, sha256=hashlib.sha256(data).hexdigest(), cluster=meta.get("cluster"),
         created_at=meta.get("created_at"), timeout_s=float(meta.get("timeout_s") or DEFAULT_TIMEOUT_S),
         grading_timeout_s=float(meta.get("grading_timeout_s") or DEFAULT_GRADING_TIMEOUT_S),
-        start_files=start, standin=standin, wrong=wrong,
+        start_files=start, standin=standin, wrong=wrong, modes=_modes(meta["id"], meta),
+        commit_tree=meta.get("commit_tree"),
     )
 
 
@@ -218,7 +237,7 @@ def load_dir(path: Path) -> Task:
         hidden=hidden, solution=solution, sha256=dir_digest(path), cluster=meta.get("cluster"),
         created_at=meta.get("created_at"), timeout_s=float(meta.get("timeout_s") or DEFAULT_TIMEOUT_S),
         grading_timeout_s=float(meta.get("grading_timeout_s") or DEFAULT_GRADING_TIMEOUT_S),
-        start_tar=path / "start.tar",
+        start_tar=path / "start.tar", modes=_modes(meta["id"], meta), commit_tree=meta.get("commit_tree"),
     )
 
 

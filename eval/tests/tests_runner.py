@@ -85,7 +85,9 @@ class FirstProofTests(unittest.TestCase):
         self.assertEqual(out["counts"]["dev-10-rotate"]["valid"], [3, 3])
         self.assertIn("dev-10-rotate", out["valid_runs_only"]["not_estimable"])
         self.assertEqual(Fraction(out["valid_runs_only"]["pass_hat_k"]).limit_denominator(100), Fraction(5, 11))
-        self.assertEqual(out["valid_runs_only"]["excluded"]["infra"], 4)
+        # Left out of the valid score: 4 planned infra trials and dev-10's failed replacement; bounds use the 4.
+        self.assertEqual(out["valid_runs_only"]["excluded"]["infra"], 5)
+        self.assertEqual(out["valid_runs_only"]["excluded_planned"]["infra"], 4)
 
     def test_failure_classes_and_false_done(self):
         record = self.records["direct"]

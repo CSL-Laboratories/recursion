@@ -10,17 +10,35 @@ Rules (PROTOCOL.md, "The record"):
 * no aggregate is stored: every score is recomputed from the trials (eval/analyze.py);
 * verdict and tier agree: ``resolved`` has tier ``none``; ``unresolved`` is the arm's failure
   (``agent``) unless the engine reported a typed vendor limit or sign-in failure (``infra``);
-  ``not_graded`` is ``infra``, ``grader`` or ``unknown``.
+  ``not_graded`` is ``infra``, ``grader`` or ``unknown``;
+* a replacement trial replaces one earlier infra or grader failure of the same task, once, within the
+  plan's per-task budget, at the next index after the planned attempts (so no two trials of a task
+  share an index, and no trial replaces itself);
+* a label claims only what the run is: ``dev`` is the dev set and only it; ``screen``, ``pilot`` and
+  ``full`` need k of at least 5 and a real engine, and ``pilot`` and ``full`` a frozen suite;
+* every number is finite: NaN and infinity are refused, in the checks and in the JSON read and written.
+
+``arm.settings_sha256`` is the hash of the settings BOTH arms must share (engine, model, route, effort,
+permission mode, extra engine arguments; eval/arms.py), not of the arm's name or transport, so two arms
+of one comparison carry the same value.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 
 SCHEMA_ID = "recursion-eval-run/1"
 
-LABELS = ("dev", "screen", "pilot", "full")
+# dev: the in-repository dev set. shakedown: any run that is not a measurement (a stand-in run on a
+# held-out suite, a harvest check). screen, pilot, full: measurements (PROTOCOL.md section 7).
+LABELS = ("dev", "shakedown", "screen", "pilot", "full")
+MEASURED_LABELS = ("screen", "pilot", "full")
+FROZEN_LABELS = ("pilot", "full")
+MIN_MEASURED_K = 5
+ORACLE_ENGINES = ("standin",)
+REPLACEABLE_TIERS = ("infra", "grader")
 SPLITS = ("dev", "held_out")
 ARMS = ("direct", "recursion")
 VERDICTS = ("resolved", "unresolved", "not_graded")
@@ -63,7 +81,8 @@ def _is_int(value) -> bool:
 
 
 def _is_number(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool))
+    """A finite int or float; NaN and infinity are not measurements."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _object(errors: _Errors, where: str, value, required: tuple, optional: tuple = ()) -> bool:
@@ -192,7 +211,7 @@ def _trial(errors: _Errors, where: str, trial) -> None:
 
     artifacts = trial["artifacts"]
     akeys = ("patch_sha256", "patch_bytes", "patch_empty", "files_changed", "test_log_sha256",
-             "trajectory_sha256", "trajectory_format", "retained")
+             "trajectory_sha256", "trajectory_format", "retained", "artifact_error")
     if _object(errors, f"{where}.artifacts", artifacts, akeys):
         for key in ("patch_sha256", "test_log_sha256", "trajectory_sha256"):
             _str(errors, f"{where}.artifacts.{key}", artifacts[key], nullable=True, pattern=SHA256)
@@ -201,6 +220,9 @@ def _trial(errors: _Errors, where: str, trial) -> None:
         _bool(errors, f"{where}.artifacts.patch_empty", artifacts["patch_empty"], nullable=True)
         _str(errors, f"{where}.artifacts.trajectory_format", artifacts["trajectory_format"], nullable=True)
         _bool(errors, f"{where}.artifacts.retained", artifacts["retained"])
+        _str(errors, f"{where}.artifacts.artifact_error", artifacts["artifact_error"], nullable=True)
+        if artifacts["retained"] is True and artifacts["artifact_error"] is not None:
+            errors.add(f"{where}.artifacts", "retained artifacts carry no artifact_error")
 
     scratch = trial["scratch"]
     if _object(errors, f"{where}.scratch", scratch, ("tmpdir", "xdg_runtime_dir", "removed")):
@@ -290,11 +312,14 @@ def validate(record) -> list:
         _str(errors, "record.environment.python", env["python"])
         _str(errors, "record.environment.platform", env["platform"])
 
+    _labels(errors, record)
     trials = record["trials"]
     if not isinstance(trials, list):
         errors.add("record.trials", "must be a list")
         return errors.items
-    seen_ids: set = set()
+    # Two trials of one task never share an index: the planned indexes must be exactly 1..attempts and the
+    # replacement indexes exactly the next ones (_replacements), so a shared index fails one of those.
+    by_id: dict = {}
     planned_index: dict = {}
     for i, trial in enumerate(trials):
         where = f"record.trials[{i}]"
@@ -302,20 +327,17 @@ def validate(record) -> list:
         if not isinstance(trial, dict):
             continue
         tid = trial.get("trial_id")
-        if tid in seen_ids:
+        if tid in by_id:
             errors.add(where, f"duplicate trial_id {tid!r}")
-        seen_ids.add(tid)
+        else:
+            by_id[tid] = trial
         task_id = trial.get("task_id")
         if planned_tasks and task_id not in planned_tasks:
             errors.add(where, f"task {task_id!r} is not in the plan")
         attempt = trial.get("attempt")
         if isinstance(attempt, dict) and attempt.get("planned") is True:
             planned_index.setdefault(task_id, []).append(attempt.get("index"))
-    for trial in trials:
-        if isinstance(trial, dict) and isinstance(trial.get("attempt"), dict):
-            ref = trial["attempt"].get("replacement_for")
-            if ref is not None and ref not in seen_ids:
-                errors.add("record.trials", f"{trial.get('trial_id')!r} replaces unknown trial {ref!r}")
+    _replacements(errors, trials, by_id, plan)
     if isinstance(plan, dict) and _is_int(plan.get("attempts_per_task")):
         expected = list(range(1, plan["attempts_per_task"] + 1))
         for task_id in planned_tasks:
@@ -325,6 +347,65 @@ def validate(record) -> list:
     return errors.items
 
 
+def _replacements(errors: _Errors, trials: list, by_id: dict, plan) -> None:
+    """A replacement trial replaces one earlier infra or grader failure of the same task, once, within
+    the plan's per-task budget, at the next index after the planned attempts (PROTOCOL.md section 3)."""
+    attempts = plan.get("attempts_per_task") if isinstance(plan, dict) else None
+    budget = plan.get("replacements_per_task") if isinstance(plan, dict) else None
+    replaced: dict = {}
+    indexes: dict = {}
+    for trial in trials:
+        if not isinstance(trial, dict) or not isinstance(trial.get("attempt"), dict):
+            continue
+        ref = trial["attempt"].get("replacement_for")
+        if ref is None:
+            continue
+        tid, task_id, index = trial.get("trial_id"), trial.get("task_id"), trial["attempt"].get("index")
+        where = f"record.trials[{tid!r}]"
+        indexes.setdefault(task_id, []).append(index)
+        original = by_id.get(ref)   # a trial naming itself fails the index-order rule below
+        if original is None:
+            errors.add(where, f"replaces unknown trial {ref!r}")
+            continue
+        if original.get("task_id") != task_id:
+            errors.add(where, f"replaces {ref!r}, a trial of another task")
+        tier = (original.get("error") or {}).get("tier") if isinstance(original.get("error"), dict) else None
+        if tier not in REPLACEABLE_TIERS:
+            errors.add(where, f"replaces {ref!r} of tier {tier!r}; only infra and grader failures are replaced")
+        if ref in replaced:
+            errors.add(where, f"{ref!r} is already replaced by {replaced[ref]!r}")
+        replaced[ref] = tid
+        before = (original.get("attempt") or {}).get("index") if isinstance(original.get("attempt"), dict) else None
+        if _is_int(index) and _is_int(before) and index <= before:
+            errors.add(where, f"index {index} does not come after the replaced trial's index {before}")
+    if not (_is_int(attempts) and _is_int(budget)):
+        return
+    for task_id, got in indexes.items():
+        if len(got) > budget:
+            errors.add("record.trials", f"task {task_id!r} has {len(got)} replacement trials, the plan allows {budget}")
+        expected = list(range(attempts + 1, attempts + 1 + len(got)))
+        if sorted(i for i in got if _is_int(i)) != expected:
+            errors.add("record.trials", f"task {task_id!r} has replacement indexes {sorted(got, key=str)}, "
+                                        f"expected {expected}")
+
+
+def _labels(errors: _Errors, record: dict) -> None:
+    """What a label may claim (PROTOCOL.md section 7)."""
+    label, suite, plan, arm = record.get("label"), record.get("suite"), record.get("plan"), record.get("arm")
+    if not (isinstance(suite, dict) and isinstance(plan, dict) and isinstance(arm, dict)):
+        return
+    split = suite.get("split")
+    if (label == "dev") != (split == "dev"):
+        errors.add("record.label", f"label {label!r} with split {split!r}: the dev set is labelled dev, and only it")
+    if label in MEASURED_LABELS:
+        if _is_int(plan.get("k")) and plan["k"] < MIN_MEASURED_K:
+            errors.add("record.label", f"a {label} needs k of at least {MIN_MEASURED_K}, the plan has {plan['k']}")
+        if arm.get("engine") in ORACLE_ENGINES:
+            errors.add("record.label", f"a {label} is never made with the stand-in engine (an oracle)")
+    if label in FROZEN_LABELS and suite.get("frozen") is not True:
+        errors.add("record.label", f"a {label} runs a frozen suite")
+
+
 def require_valid(record) -> dict:
     problems = validate(record)
     if problems:
@@ -332,9 +413,22 @@ def require_valid(record) -> dict:
     return record
 
 
+def _refuse_constant(name):
+    raise ValueError(f"non-standard JSON constant {name} (NaN and Infinity are not measurements)")
+
+
+def loads(text: str):
+    return json.loads(text, parse_constant=_refuse_constant)
+
+
+def dumps(record: dict) -> str:
+    """The record's file text: sorted keys, and never NaN or Infinity."""
+    return json.dumps(record, indent=1, sort_keys=True, allow_nan=False) + "\n"
+
+
 def load(path) -> dict:
     with open(path, encoding="utf-8") as handle:
-        return require_valid(json.load(handle))
+        return require_valid(loads(handle.read()))
 
 
 def empty_usage() -> dict:

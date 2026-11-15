@@ -166,6 +166,7 @@ def build_candidate(repo_cfg: dict, commit: str, issues: dict) -> tuple:
     is_test = lambda p: any(r.match(p) for r in tests)  # noqa: E731
     diff = changed(repo, parent, commit)
     hidden_paths = [p for status, p in diff if is_test(p) and status in ("A", "M")]
+    deleted_tests = [p for status, p in diff if is_test(p) and status == "D"]
     sources = [(status, p) for status, p in diff if not is_test(p)]
     if not hidden_paths:
         return None, "changes no test file"
@@ -178,6 +179,11 @@ def build_candidate(repo_cfg: dict, commit: str, issues: dict) -> tuple:
         return None, str(exc)
     hidden = {p: after[p][0] for p in hidden_paths}
     solution = {p: (None if status == "D" else after[p][0]) for status, p in sources}
+    for p in deleted_tests:   # the commit removed it: part of the reference solution, so the trees agree
+        solution[p] = None
+    modes = {p: "100755" for p in [*hidden, *(q for q, d in solution.items() if d is not None)]
+             if after[p][1] == 0o755}
+    commit_tree = _git(repo, "rev-parse", f"{commit}^{{tree}}").decode().strip()
     message = _git(repo, "log", "-1", "--format=%B", commit).decode("utf-8", "replace")
     created = _git(repo, "log", "-1", "--format=%cI", commit).decode().strip()
     task_id = "h-" + hashlib.sha256(f"{repo_cfg['name']}:{commit}".encode()).hexdigest()[:12]
@@ -189,6 +195,8 @@ def build_candidate(repo_cfg: dict, commit: str, issues: dict) -> tuple:
         "timeout_s": repo_cfg.get("timeout_s", task_mod.DEFAULT_TIMEOUT_S),
         "grading_timeout_s": repo_cfg.get("grading_timeout_s", task_mod.DEFAULT_GRADING_TIMEOUT_S),
         "solution_deletes": sorted(p for p, d in solution.items() if d is None),
+        "modes": modes,
+        "commit_tree": commit_tree,
         "source": {"repo": repo_cfg["name"], "commit": commit, "parent": parent},
     }
     issue = issues.get(commit)
@@ -196,7 +204,7 @@ def build_candidate(repo_cfg: dict, commit: str, issues: dict) -> tuple:
     parent_tree = _git(repo, "rev-parse", f"{parent}^{{tree}}").decode().strip()
     return {"meta": meta, "prompt": prompt, "start": start, "hidden": hidden,
             "solution": {p: d for p, d in solution.items() if d is not None},
-            "parent": parent, "commit": commit, "parent_tree": parent_tree}, None
+            "parent": parent, "commit": commit, "parent_tree": parent_tree, "commit_tree": commit_tree}, None
 
 
 def write_task(folder: Path, candidate: dict) -> None:
@@ -256,7 +264,8 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
             folder.rename(final)
             entries.append({"id": task_id, "dir": task_id, "sha256": task_mod.dir_digest(final),
                             "parent_tree": candidate["parent_tree"], "parent_commit": candidate["parent"],
-                            "commit": candidate["commit"], "cluster": repo_cfg["name"]})
+                            "commit": candidate["commit"], "commit_tree": candidate["commit_tree"],
+                            "cluster": repo_cfg["name"]})
             kept += 1
             log(f"kept {task_id} ({repo_cfg['name']} {commit[:12]})")
     if staging.exists():

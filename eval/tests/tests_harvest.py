@@ -152,7 +152,7 @@ class HarvestTests(unittest.TestCase):
 
     def test_harvested_suite_runs_through_the_runner(self):
         suite = heldout.open_suite(self.out, purpose="score")
-        outcome = runner.run(suite, [arms.DirectArm("standin")], k=1, label="pilot", out_dir=self.folder / "records",
+        outcome = runner.run(suite, [arms.DirectArm("standin")], k=1, label="shakedown", out_dir=self.folder / "records",
                              tmp_base=self.tmp, xdg_base=self.xdg, log=lambda _m: None)
         record = json.loads(Path(outcome.records["direct"]).read_text(encoding="utf-8"))
         self.assertEqual({t["grade"]["verdict"] for t in record["trials"]}, {"resolved"})

@@ -9,6 +9,7 @@ the evaluated base it refuses with REFUSAL and the rest of the run goes on.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -25,6 +26,12 @@ from eval import scratch as scratch_mod
 
 STANDIN_SCRIPT = PACKAGE_ROOT / "standin_engine.py"
 ENGINES = ("standin", "claude_code")
+# Claude Code's own flags, as `claude --help` (2.1.318) lists them: --effort and --permission-mode.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
+# Variables an attempt owns; passing them from the runner's environment is refused.
+RESERVED_ENV = ("TMPDIR", "XDG_RUNTIME_DIR", "HOME", "DBUS_SESSION_BUS_ADDRESS", "PATH",
+                "EVAL_STANDIN_PLAN", "EVAL_STANDIN_TRIAL", "EVAL_STANDIN_EFFORT")
 INFRA_RESULT_ERRORS = {
     "rate_limit": "vendor_limit",
     "authentication_failed": "auth_failed",
@@ -70,10 +77,11 @@ class EngineOutcome:
 def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeout_s: float) -> dict:
     """Run argv in its own session and wait for THAT process, at most ``timeout_s``.
 
-    Then every process left in the session is killed (helpers the engine started, and on timeout the
-    engine itself), so pipes close and nothing outlives the attempt inside the session. Waiting on the
-    process rather than on end-of-output means a helper that holds stdout cannot turn a finished run
-    into a timeout. A process that left the session (setsid) is out of reach; PROTOCOL.md names it.
+    Then every process left in the session is killed, whatever process group it moved to (helpers the
+    engine started, and on timeout the engine itself), so pipes close and nothing outlives the attempt
+    inside the session. Waiting on the process rather than on end-of-output means a helper that holds
+    stdout cannot turn a finished run into a timeout. A process that started a session of its own
+    (setsid) is out of reach; PROTOCOL.md names it.
     Times are monotonic.
     """
     started = time.monotonic()
@@ -131,11 +139,48 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     }
 
 
-def _kill_session(pgid: int) -> None:
+def _session_of(pid: int):
+    """The session id of a process, from /proc (None when it is gone)."""
     try:
-        os.killpg(pgid, signal.SIGKILL)
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    try:
+        return int(fields[3]), fields[0]          # (session, state)
+    except (ValueError, IndexError):
+        return None
+
+
+def _session_members(sid: int) -> list:
+    members = []
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            found = _session_of(int(name))
+            if found is not None and found[0] == sid and found[1] not in ("Z", "X"):
+                members.append(int(name))
+    return members
+
+
+def _kill_session(sid: int) -> None:
+    """Kill every live process of session ``sid``, in any process group, then wait (bounded) until each
+    is gone or a zombie. The session is the engine's own (start_new_session), never the runner's."""
+    if sid == os.getsid(0):
+        raise RuntimeError("refusing to kill the runner's own session")
+    try:
+        os.killpg(sid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+    if not os.path.isdir("/proc"):
+        return
+    for pid in _session_members(sid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.monotonic() + 10
+    while _session_members(sid) and time.monotonic() < deadline:
+        time.sleep(0.01)
 
 
 def _count(value):
@@ -170,7 +215,7 @@ def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
             "source": "engine_output",
         })
     cost = result.get("total_cost_usd")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
         usage.update({"cost": float(cost), "cost_unit": "USD", "cost_basis": cost_basis, "source": "engine_output"})
     if result.get("subtype") == "success" and result.get("is_error") is not True:
         return {"has_result": True, "claimed_done": True, "failure": None, "detail": None, "usage": usage}
@@ -190,15 +235,24 @@ class Arm:
     name = "arm"
 
     def __init__(self, engine: str, *, model: str | None = None, route: str | None = None,
-                 effort: str | None = None) -> None:
+                 effort: str | None = None, permission_mode: str | None = None, extra_args=()) -> None:
+        if effort is not None and effort not in EFFORT_LEVELS:
+            raise ArmRefused(f"{self.name} arm: effort {effort!r} is not one of {', '.join(EFFORT_LEVELS)}")
+        if permission_mode is not None and permission_mode not in PERMISSION_MODES:
+            raise ArmRefused(f"{self.name} arm: permission mode {permission_mode!r} is not one of "
+                             f"{', '.join(PERMISSION_MODES)}")
         self.engine = engine
         self.model = model
         self.route = route
         self.effort = effort
+        self.permission_mode = permission_mode
+        self.extra_args = list(extra_args)
 
     def settings(self) -> dict:
-        return {"arm": self.name, "engine": self.engine, "model": self.model, "route": self.route,
-                "effort": self.effort}
+        """The settings BOTH arms of a comparison must share. No arm name, binary path or passed
+        environment: those are how an arm reaches the engine, not what the engine is asked to do."""
+        return {"engine": self.engine, "model": self.model, "route": self.route, "effort": self.effort,
+                "permission_mode": self.permission_mode, "extra_args": list(self.extra_args)}
 
     def settings_sha256(self) -> str:
         return record_mod.sha256_json(self.settings())
@@ -230,27 +284,29 @@ class DirectArm(Arm):
                  cost_basis: str = "reported_not_billed") -> None:
         if engine not in ENGINES:
             raise ArmRefused(f"direct arm: engine {engine!r} is not wired (wired: {', '.join(ENGINES)})")
-        super().__init__(engine, model=model, route=route, effort=effort)
         self.claude = claude or ClaudeCodeSettings()
+        if engine == "standin" and (self.claude.permission_mode or self.claude.extra_args):
+            raise ArmRefused("direct arm (standin): the stand-in engine takes no permission mode or engine arguments")
+        super().__init__(engine, model=model, route=route, effort=effort,
+                         permission_mode=self.claude.permission_mode if engine == "claude_code" else None,
+                         extra_args=self.claude.extra_args if engine == "claude_code" else ())
         self.cost_basis = cost_basis
-
-    def settings(self) -> dict:
-        out = super().settings()
-        if self.engine == "claude_code":
-            out.update({"permission_mode": self.claude.permission_mode, "extra_args": list(self.claude.extra_args),
-                        "binary": self.claude.binary, "pass_env": sorted(self.claude.pass_env)})
-        return out
 
     def argv(self) -> list:
         if self.engine == "standin":
             return [sys.executable, "-I", "-B", str(STANDIN_SCRIPT)]
         argv = [self.claude.binary, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
                 "--verbose", "--model", self.model]
-        if self.claude.permission_mode:
-            argv += ["--permission-mode", self.claude.permission_mode]
-        return argv + list(self.claude.extra_args)
+        if self.effort:
+            argv += ["--effort", self.effort]
+        if self.permission_mode:
+            argv += ["--permission-mode", self.permission_mode]
+        return argv + list(self.extra_args)
 
     def preflight(self) -> None:
+        reserved = sorted(set(self.claude.pass_env) & set(RESERVED_ENV))
+        if reserved:
+            raise ArmRefused(f"direct arm: {', '.join(reserved)} belong to the attempt and cannot be passed in")
         if self.engine == "claude_code":
             if not self.model:
                 raise ArmRefused("direct arm (claude_code): a model is required, the same one the Recursion arm uses")
@@ -275,6 +331,8 @@ class DirectArm(Arm):
             plan_path = scratch.tmpdir / "standin-plan.json"
             plan_path.write_text(json.dumps(task.standin_plan()), encoding="utf-8")
             extra = {"EVAL_STANDIN_PLAN": str(plan_path), "EVAL_STANDIN_TRIAL": str(trial_index)}
+            if self.effort:
+                extra["EVAL_STANDIN_EFFORT"] = self.effort
         else:
             home = Path(self.claude.home) if self.claude.home else None
             extra = {name: os.environ[name] for name in self.claude.pass_env if name in os.environ}
@@ -316,8 +374,10 @@ class RecursionArm(Arm):
     name = "recursion"
 
     def __init__(self, engine: str, *, model: str | None = None, route: str | None = None,
-                 effort: str | None = None, base: Path = REPO_ROOT, probe=probe_base) -> None:
-        super().__init__(engine, model=model, route=route, effort=effort)
+                 effort: str | None = None, permission_mode: str | None = None, extra_args=(),
+                 base: Path = REPO_ROOT, probe=probe_base) -> None:
+        super().__init__(engine, model=model, route=route, effort=effort, permission_mode=permission_mode,
+                         extra_args=extra_args)
         self.base = Path(base)
         self.probe = probe
 

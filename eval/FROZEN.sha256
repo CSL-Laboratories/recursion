@@ -1,5 +1,5 @@
 # SHA-256 of the protocol and the analysis it is scored by (PROTOCOL.md, first paragraph).
 # A change to any of these files is a new protocol version: update this file in the same commit.
-74a4d249b2de577129d884ff22a4a0e63f83e4b3f3a1b1b94a3c9daac65b3631  PROTOCOL.md
-c341a6e954d861f483c250396d3b0c77744c0101ed67346043b7becbb7c42729  analyze.py
+571179702acf6d4176291926cdaf6519fafc0ead3ab21eae873be229ac17abdc  PROTOCOL.md
+02041feca99a5d3d79f9860bd82fecfac1c8a705918414142e1563cf95060d57  analyze.py
 b7412ea588421913b63a1a358b835762d51331da606389559886588df496799f  passk.py

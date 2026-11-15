@@ -64,7 +64,8 @@ def main():
         return 0
     emit(type="system", subtype="init", note=LABEL, version=VERSION, pid=os.getpid(), cwd=os.getcwd(),
          tmpdir=os.environ.get("TMPDIR"), xdg_runtime_dir=os.environ.get("XDG_RUNTIME_DIR"),
-         dbus_session_bus_address_set="DBUS_SESSION_BUS_ADDRESS" in os.environ)
+         dbus_session_bus_address_set="DBUS_SESSION_BUS_ADDRESS" in os.environ,
+         effort=os.environ.get("EVAL_STANDIN_EFFORT"))
     prompt = None
     for line in sys.stdin:
         try:

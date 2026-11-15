@@ -6,7 +6,9 @@ Rules (PROTOCOL.md, "Held-out tasks"):
 2. A process that has declared itself a dev or optimizer process (``declare("dev")`` or
    ``declare("optimize")``) can never open one afterwards, whatever purpose it then claims.
 3. The path is given at run time and is absolute. It may not lie inside the repository, through a
-   symlink or otherwise: there is no default and nothing in the repository points at it.
+   symlink or otherwise: there is no default and nothing in the repository points at it. The same
+   holds for every input the loader reads (the manifest, each task file or folder, every link inside a
+   task folder): each must resolve inside the held-out folder and outside the repository.
 4. Only eval/runner.py calls this module, and only eval/heldout.py calls the suite module's held-out
    loader (eval/tests/tests_heldout.py checks both across every Python file in the repository).
 
@@ -16,6 +18,8 @@ folder away from an engine during a run is the operator's job (PROTOCOL.md says 
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 from pathlib import Path
 
@@ -65,6 +69,44 @@ def check_path(path, *, must_exist: bool = True) -> Path:
     return resolved
 
 
+def _check_source(path: Path, folder: Path, what: str) -> None:
+    """``path``, resolved through every link, lies inside the held-out folder and outside the repository."""
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise HeldOutDenied(f"{what} cannot be opened: {exc}") from None
+    if _inside(resolved, REPO_ROOT.resolve()):
+        raise HeldOutDenied(f"{what} resolves into the repository ({resolved}): held-out tasks never load from it")
+    if not _inside(resolved, folder):
+        raise HeldOutDenied(f"{what} resolves outside the held-out folder ({resolved})")
+
+
+def check_sources(folder: Path, manifest: Path) -> None:
+    """Every input the held-out loader will read: the manifest, each task file or folder, and every link
+    inside a task folder."""
+    _check_source(manifest, folder, "suite.json")
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return  # the loader refuses it with its own message
+    entries = data.get("tasks") if isinstance(data, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        rel = entry.get("file", entry.get("dir"))
+        if not isinstance(rel, str):
+            continue
+        what = f"task {entry.get('id')!r} ({rel})"
+        source = folder / rel
+        _check_source(source, folder, what)
+        if source.is_dir():
+            for dirpath, dirs, files in os.walk(source):
+                for name in dirs + files:
+                    item = Path(dirpath) / name
+                    if item.is_symlink():
+                        _check_source(item, folder, f"{what}: {item.relative_to(source)}")
+
+
 def open_suite(path, *, purpose: str):
     """Open the held-out suite in folder ``path`` (its suite.json) for scoring."""
     if purpose != "score":
@@ -76,4 +118,5 @@ def open_suite(path, *, purpose: str):
     manifest = folder / "suite.json"
     if not manifest.is_file():
         raise HeldOutDenied(f"no suite.json in {folder}")
+    check_sources(folder, manifest)
     return suite_mod._load_held_out(manifest)

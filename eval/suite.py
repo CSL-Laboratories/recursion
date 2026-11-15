@@ -69,6 +69,9 @@ def _parse(manifest_path: Path, *, allow_held_out: bool) -> Suite:
         raise SuiteError(f"{manifest_path}: not JSON: {exc}") from None
     if not isinstance(manifest, dict) or manifest.get("schema") != SCHEMA_ID:
         raise SuiteError(f"{manifest_path}: not a {SCHEMA_ID} manifest")
+    suite_id = manifest.get("id")
+    if not isinstance(suite_id, str) or not task_mod.TASK_ID.match(suite_id):
+        raise SuiteError(f"{manifest_path}: bad suite id {suite_id!r} (it names the results folder)")
     split = manifest.get("split")
     if split not in ("dev", "held_out"):
         raise SuiteError(f"{manifest_path}: split must be dev or held_out")
@@ -91,8 +94,8 @@ def _parse(manifest_path: Path, *, allow_held_out: bool) -> Suite:
             raise SuiteError(f"{manifest_path}: a frozen suite pins its runner")
         if evaluated is None:
             raise SuiteError(f"{manifest_path}: a frozen suite pins the evaluated commit")
-        if any(v is None for v in engines.values()) or not engines:
-            raise SuiteError(f"{manifest_path}: a frozen suite pins every engine version")
+        if not engines or any(not isinstance(v, str) or not v for v in engines.values()):
+            raise SuiteError(f"{manifest_path}: a frozen suite pins every engine version, as a non-empty string")
     entries = manifest.get("tasks")
     if not isinstance(entries, list) or not entries:
         raise SuiteError(f"{manifest_path}: tasks must be a non-empty list")
@@ -122,11 +125,17 @@ def _parse(manifest_path: Path, *, allow_held_out: bool) -> Suite:
         task.parent_tree = entry["parent_tree"]
         task.parent_commit = entry["parent_commit"]
         task.commit = entry["commit"]
+        if "commit_tree" in entry:
+            if not _is_object_id(entry["commit_tree"]):
+                raise SuiteError(f"{manifest_path}: task {task.id!r} has a bad commit_tree")
+            if task.commit_tree is not None and task.commit_tree != entry["commit_tree"]:
+                raise SuiteError(f"{manifest_path}: task {task.id!r}: the manifest's commit_tree differs from the task's")
+            task.commit_tree = entry["commit_tree"]
         if "cluster" in entry:
             task.cluster = entry["cluster"]
         loaded.append(task)
     return Suite(
-        id=str(manifest.get("id")), version=str(manifest.get("version")), split=split, frozen=frozen,
+        id=suite_id, version=str(manifest.get("version")), split=split, frozen=frozen,
         manifest_sha256=hashlib.sha256(raw).hexdigest(), path=manifest_path, runner=runner,
         evaluated_commit=evaluated, engines=engines, arms=arms, tasks=loaded,
     )

@@ -11,24 +11,32 @@ tree and run, both scratch folders removed. Monotonic times throughout.
 One record per suite run of one arm (eval/record.py), every planned trial in it. An arm that refuses
 (eval/arms.py) writes no record and says why; the other arms run. Every score is recomputed from the
 record by eval/analyze.py; the runner stores none.
+
+Before any attempt: the plan and the label are checked (a measurement needs k of at least 5, a held-out
+suite, a real engine and kept artifacts; a pilot or full comparison a frozen suite), and a frozen suite
+must pin the selected engine's version and settings and name the commit actually checked out.
+
+Exit codes of eval/run: 0 every arm ran; 2 refused before any attempt (the message says why);
+3 an arm refused and the others ran; 130 interrupted (the record keeps every trial that ran).
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import platform
 import random
+import re
 import secrets
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from eval import PACKAGE_ROOT, __version__, runner_sha256
+from concurrent.futures import ThreadPoolExecutor
+
+from eval import PACKAGE_ROOT, REPO_ROOT, __version__, runner_sha256
 from eval import arms as arms_mod
 from eval import gitutil, heldout
 from eval import record as record_mod
@@ -40,7 +48,7 @@ DEFAULT_OUT = PACKAGE_ROOT / "results"
 TASKS_ENV = "RECURSION_EVAL_TASKS"
 GRADER_ID = "hidden-tests/1"
 NO_TESTS_RAN = 5          # unittest and pytest both exit 5 when no test ran
-LOG_CAP = 64 * 1024
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 class RunRefused(RuntimeError):
@@ -96,7 +104,7 @@ def blank_trial(trial_id: str, task_id: str, index: int, planned: bool, replacem
         "timing": {"wall_seconds": None, "engine_seconds": None, "grading_seconds": None},
         "artifacts": {"patch_sha256": None, "patch_bytes": None, "patch_empty": None, "files_changed": None,
                       "test_log_sha256": None, "trajectory_sha256": None, "trajectory_format": None,
-                      "retained": False},
+                      "retained": False, "artifact_error": None},
         "scratch": {"tmpdir": None, "xdg_runtime_dir": None, "removed": None},
     }
 
@@ -212,7 +220,12 @@ def run_attempt(ctx: Context, arm, task, index: int, *, planned: bool = True, re
         if tmp is not None:
             trial["scratch"]["removed"] = not Path(tmp).exists() and not Path(xdg).exists()
         if ctx.artifacts is not None and keep:
-            trial["artifacts"]["retained"] = _write_artifacts(ctx.artifacts / trial_id, keep)
+            # Optional storage never costs the trial its row: a failure is recorded, the verdict kept.
+            try:
+                trial["artifacts"]["retained"] = _write_artifacts(ctx.artifacts / trial_id, keep)
+            except OSError as exc:
+                trial["artifacts"]["retained"] = False
+                trial["artifacts"]["artifact_error"] = f"{type(exc).__name__}: {exc}"[:500]
     return trial
 
 
@@ -253,19 +266,90 @@ class Outcome:
     interrupted: bool = False
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def check_plan(suite, arms: list, *, k, attempts, replacements, label: str, artifacts) -> None:
+    """Every plan and label rule, before any arm is asked to do anything (PROTOCOL.md sections 3 and 7)."""
+    if not (_is_int(k) and k >= 1):
+        raise RunRefused(f"k must be a positive integer, got {k!r}")
+    if not (_is_int(attempts) and attempts >= 1):
+        raise RunRefused(f"attempts must be a positive integer, got {attempts!r}")
+    if attempts < k:
+        raise RunRefused(f"attempts ({attempts}) below k ({k}): pass^{k} would be not estimable for every task")
+    if not (_is_int(replacements) and replacements >= 0):
+        raise RunRefused(f"replacements must be a non-negative integer, got {replacements!r}")
+    if label not in record_mod.LABELS:
+        raise RunRefused(f"label must be one of {record_mod.LABELS}")
+    if (label == "dev") != (suite.split == "dev"):
+        raise RunRefused(f"label {label!r} on a {suite.split} suite: the dev set is labelled dev, and only it")
+    if label in record_mod.MEASURED_LABELS:
+        if k < record_mod.MIN_MEASURED_K:
+            raise RunRefused(f"a {label} needs k of at least {record_mod.MIN_MEASURED_K}, got {k}")
+        oracle = [a.name for a in arms if a.engine in record_mod.ORACLE_ENGINES]
+        if oracle:
+            raise RunRefused(f"a {label} is never made with the stand-in engine (an oracle); use label shakedown")
+        if artifacts is None:
+            raise RunRefused(f"a {label} keeps every trial's diff, test log and engine output: give --artifacts")
+    if label in record_mod.FROZEN_LABELS and not suite.frozen:
+        raise RunRefused(f"a {label} runs a frozen suite")
+
+
+def evaluated_commit_matches(commit: str, root: Path = REPO_ROOT) -> str | None:
+    """None when ``commit`` is the checked-out HEAD of ``root`` with nothing changed under core/; else why not."""
+    if not isinstance(commit, str) or not COMMIT.match(commit):
+        return f"the evaluated commit {commit!r} is not a full commit id"
+    try:
+        head = gitutil.git(["rev-parse", "HEAD"], root).decode().strip()
+        dirty = gitutil.git(["status", "--porcelain", "--", "core"], root).decode().strip()
+    except gitutil.GitError as exc:
+        return f"the evaluated checkout cannot be read: {exc}"
+    if head != commit:
+        return f"the suite pins evaluated commit {commit}, the checkout is at {head}"
+    if dirty:
+        return "the evaluated checkout has uncommitted changes under core/"
+    return None
+
+
+def _pinned_settings_problem(suite, arm) -> str | None:
+    pinned = suite.arms.get(arm.engine)
+    if not isinstance(pinned, dict):
+        return f"the frozen suite pins no settings for engine {arm.engine!r} (arms.{arm.engine})"
+    settings = arm.settings()
+    expected = {key: pinned.get(key, [] if key == "extra_args" else None) for key in settings if key != "engine"}
+    actual = {key: value for key, value in settings.items() if key != "engine"}
+    unknown = sorted(set(pinned) - set(actual))
+    if unknown:
+        return f"the frozen suite's arms.{arm.engine} has fields no arm uses: {unknown}"
+    if expected != actual:
+        return f"the arm's settings {actual} differ from the frozen suite's {expected}"
+    return None
+
+
+def _collect(submitted: list, done: dict) -> None:
+    """Keep the result of every submitted attempt that ran; an attempt that never ran gets no row here."""
+    for job, future in submitted:
+        if job in done:
+            continue
+        try:
+            finished = future.done() and not future.cancelled()
+        except Exception:  # noqa: BLE001
+            finished = False
+        if not finished:
+            continue
+        try:
+            done[job] = future.result()
+        except BaseException:  # noqa: BLE001 - an interrupted or failed attempt keeps no row here
+            continue
+
+
 def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements: int = 2, label: str = "dev",
         seed: int = 20261126, jobs: int = 1, out_dir: Path = DEFAULT_OUT, artifacts: Path | None = None,
         tmp_base: Path = scratch_mod.DEFAULT_TMP_BASE, xdg_base: Path = scratch_mod.DEFAULT_XDG_BASE,
         log=print) -> Outcome:
     attempts = attempts if attempts is not None else k
-    if attempts < k:
-        raise RunRefused(f"attempts ({attempts}) below k ({k}): pass^{k} would be not estimable for every task")
-    if label not in record_mod.LABELS:
-        raise RunRefused(f"label must be one of {record_mod.LABELS}")
-    if suite.split == "held_out" and label == "dev":
-        raise RunRefused("a held-out suite is never labelled dev")
-    if suite.split == "dev" and label != "dev":
-        raise RunRefused("a dev suite is labelled dev")
+    check_plan(suite, arms, k=k, attempts=attempts, replacements=replacements, label=label, artifacts=artifacts)
     if suite.split == "held_out" and artifacts is not None:
         heldout.check_path(artifacts, must_exist=False)  # held-out diffs and logs stay out of the repository too
     runner = {"version": __version__, "sha256": runner_sha256()}
@@ -279,12 +363,27 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
             arm.preflight()
             version = arm.engine_version()
             pinned = suite.engines.get(arm.engine)
+            if suite.frozen and not (isinstance(pinned, str) and pinned):
+                raise arms_mod.ArmRefused(f"{arm.name} arm: the frozen suite pins no version for engine {arm.engine!r}")
             if pinned is not None and version != pinned:
                 raise arms_mod.ArmRefused(f"{arm.name} arm: the suite pins {arm.engine} {pinned!r}, found {version!r}")
             ready.append((arm, version))
         except arms_mod.ArmRefused as exc:
             result.refused[arm.name] = str(exc)
             log(str(exc))
+    if ready and suite.frozen:
+        problem = evaluated_commit_matches(suite.evaluated_commit)
+        if problem:
+            raise RunRefused(problem)
+        still = []
+        for arm, version in ready:
+            problem = _pinned_settings_problem(suite, arm)
+            if problem:
+                result.refused[arm.name] = f"{arm.name} arm: {problem}"
+                log(result.refused[arm.name])
+            else:
+                still.append((arm, version))
+        ready = still
     if not ready:
         return result
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -316,20 +415,20 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
     task_ids = [t.id for t in suite.tasks]
     planned_jobs = schedule(task_ids, [arm.name for arm, _ in ready], attempts, seed)
     done: dict = {}
+    submitted: list = []
     executor = ThreadPoolExecutor(max_workers=max(1, jobs))
     try:
-        futures = [(job, executor.submit(run_attempt, contexts[job[0]], by_arm[job[0]], suite.task(job[1]), job[2]))
-                   for job in planned_jobs]
-        for job, future in futures:
+        for job in planned_jobs:
+            submitted.append((job, executor.submit(run_attempt, contexts[job[0]], by_arm[job[0]],
+                                                   suite.task(job[1]), job[2])))
+        for job, future in submitted:
             done[job] = future.result()
         budget = {(a, t): replacements for a in by_arm for t in task_ids}
         next_index = {(a, t): attempts + 1 for a in by_arm for t in task_ids}
-        pending = [done[job] | {"_job": job} for job in planned_jobs
-                   if done[job]["error"]["tier"] in ("infra", "grader")]
+        pending = [(job, done[job]) for job in planned_jobs if done[job]["error"]["tier"] in record_mod.REPLACEABLE_TIERS]
         while pending:
             batch = []
-            for failed in pending:
-                arm_name, task_id, _ = failed["_job"]
+            for (arm_name, task_id, _), failed in pending:
                 key = (arm_name, task_id)
                 if budget[key] <= 0:
                     continue
@@ -337,17 +436,19 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
                 index = next_index[key]
                 next_index[key] += 1
                 job = (arm_name, task_id, index)
-                batch.append((job, executor.submit(run_attempt, contexts[arm_name], by_arm[arm_name],
-                                                   suite.task(task_id), index, planned=False,
-                                                   replacement_for=failed["trial_id"])))
+                future = executor.submit(run_attempt, contexts[arm_name], by_arm[arm_name], suite.task(task_id), index,
+                                         planned=False, replacement_for=failed["trial_id"])
+                batch.append((job, future))
+                submitted.append((job, future))
             pending = []
             for job, future in batch:
                 done[job] = future.result()
-                if done[job]["error"]["tier"] in ("infra", "grader"):
-                    pending.append(done[job] | {"_job": job})
+                if done[job]["error"]["tier"] in record_mod.REPLACEABLE_TIERS:
+                    pending.append((job, done[job]))
     except KeyboardInterrupt:
         result.interrupted = True
         executor.shutdown(wait=True, cancel_futures=True)
+        _collect(submitted, done)
     finally:
         executor.shutdown(wait=True)
     for arm_name, record in records.items():
@@ -364,7 +465,7 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
         target = Path(out_dir) / suite.id
         target.mkdir(parents=True, exist_ok=True)
         path = target / f"{record['record_id']}.json"
-        path.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        path.write_text(record_mod.dumps(record), encoding="utf-8")
         result.records[arm_name] = path
         log(f"record: {path}")
     return result
@@ -398,19 +499,24 @@ def make_arms(names: list, suite, args) -> list:
         raise RunRefused("a frozen suite pins its arm settings; drop --model, --effort and --permission-mode")
     settings = {**pinned, **{k: v for k, v in overrides.items() if v is not None}}
     out = []
-    for name in names:
-        if name == "direct":
-            claude = arms_mod.ClaudeCodeSettings(
-                binary=args.claude_binary, permission_mode=settings.get("permission_mode"),
-                extra_args=list(settings.get("extra_args") or []), home=args.claude_home,
-                pass_env=list(args.pass_env or []))
-            out.append(arms_mod.DirectArm(args.engine, model=settings.get("model"), route=settings.get("route"),
-                                          effort=settings.get("effort"), claude=claude))
-        elif name == "recursion":
-            out.append(arms_mod.RecursionArm(args.engine, model=settings.get("model"), route=settings.get("route"),
-                                             effort=settings.get("effort")))
-        else:
-            raise RunRefused(f"unknown arm {name!r} (arms: direct, recursion)")
+    try:
+        for name in names:
+            if name == "direct":
+                claude = arms_mod.ClaudeCodeSettings(
+                    binary=args.claude_binary, permission_mode=settings.get("permission_mode"),
+                    extra_args=list(settings.get("extra_args") or []), home=args.claude_home,
+                    pass_env=list(args.pass_env or []))
+                out.append(arms_mod.DirectArm(args.engine, model=settings.get("model"), route=settings.get("route"),
+                                              effort=settings.get("effort"), claude=claude))
+            elif name == "recursion":
+                out.append(arms_mod.RecursionArm(args.engine, model=settings.get("model"), route=settings.get("route"),
+                                                 effort=settings.get("effort"),
+                                                 permission_mode=settings.get("permission_mode"),
+                                                 extra_args=list(settings.get("extra_args") or [])))
+            else:
+                raise RunRefused(f"unknown arm {name!r} (arms: direct, recursion)")
+    except arms_mod.ArmRefused as exc:
+        raise RunRefused(str(exc)) from None
     return out
 
 
@@ -426,12 +532,13 @@ def main(argv=None) -> int:
                         help="extra trials per task for infra or grader failures (valid-runs score only)")
     parser.add_argument("--engine", default="standin", choices=arms_mod.ENGINES)
     parser.add_argument("--model")
-    parser.add_argument("--effort")
-    parser.add_argument("--permission-mode")
+    parser.add_argument("--effort", choices=arms_mod.EFFORT_LEVELS)
+    parser.add_argument("--permission-mode", choices=arms_mod.PERMISSION_MODES)
     parser.add_argument("--claude-binary", default="claude")
     parser.add_argument("--claude-home", help="the route home Claude Code is signed in on (the founder's step)")
     parser.add_argument("--pass-env", action="append", help="name of a variable to pass to the engine")
-    parser.add_argument("--label", help="dev, screen, pilot or full (default: dev for the dev suite, else pilot)")
+    parser.add_argument("--label", help="dev, shakedown, screen, pilot or full (default: dev for the dev suite; "
+                                        "shakedown for a held-out suite on the stand-in engine; else pilot)")
     parser.add_argument("--seed", type=int, default=20261126)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
@@ -442,10 +549,10 @@ def main(argv=None) -> int:
     try:
         suite = load_suite(args.suite, args.tasks)
         arms = make_arms([a.strip() for a in args.arms.split(",") if a.strip()], suite, args)
-        label = args.label or ("dev" if suite.split == "dev" else "pilot")
-        outcome = run(suite, arms, k=args.k, attempts=args.attempts, replacements=args.replacements, label=label,
-                      seed=args.seed, jobs=args.jobs, out_dir=args.out, artifacts=args.artifacts,
-                      tmp_base=args.tmp_base, xdg_base=args.xdg_base)
+        default = "dev" if suite.split == "dev" else ("shakedown" if args.engine == "standin" else "pilot")
+        outcome = run(suite, arms, k=args.k, attempts=args.attempts, replacements=args.replacements,
+                      label=args.label or default, seed=args.seed, jobs=args.jobs, out_dir=args.out,
+                      artifacts=args.artifacts, tmp_base=args.tmp_base, xdg_base=args.xdg_base)
     except (RunRefused, heldout.HeldOutDenied, suite_mod.SuiteError, scratch_mod.ScratchError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2

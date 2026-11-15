@@ -14,7 +14,10 @@ Scoring.
 * Valid runs only: a task's trials, planned and replacement, whose tier is ``none`` or ``agent``. A
   task with fewer than k of them is not estimable for pass^k and is named, not scored 0.
 * Bounds: the planned trials the valid score leaves out, scored all failed (the headline) and all
-  passed (the upper bound).
+  passed (the upper bound). The exclusions printed beside the valid score count every trial it leaves
+  out, failed replacements included; the planned-only count is printed beside them.
+* A paired comparison refuses two records that differ in suite, k, planned attempts, shared arm
+  settings, engine version, runner, evaluated commit, protocol or analysis (COMPARABLE).
 * pass@1 is c / n per task averaged over tasks; the first-attempt rate is trial 1 alone.
 * Intervals resample tasks (eval/passk.py). A clustered interval and leave-one-cluster-out appear
   when the tasks come from two or more clusters.
@@ -33,6 +36,11 @@ from eval import record as record_mod
 
 VALID_TIERS = ("none", "agent")
 EXCLUDED_TIERS = ("infra", "grader", "unknown")
+# What two records of one paired comparison must share, besides the suite, k and planned attempts.
+# arm.settings_sha256 hashes the settings both arms share (not the arm's name), so it must match too.
+COMPARABLE = (("arm", "engine"), ("arm", "engine_version"), ("arm", "model"), ("arm", "route"), ("arm", "effort"),
+              ("arm", "settings_sha256"), ("runner", "sha256"), ("runner", "evaluated_commit"),
+              ("protocol", "protocol_sha256"), ("protocol", "analysis_sha256"))
 
 
 def _planned_rows(record: dict) -> dict:
@@ -63,8 +71,18 @@ def valid_counts(record: dict) -> dict:
     return {task_id: passk.Counts(n, c) for task_id, (n, c) in out.items()}
 
 
+def excluded_all(record: dict) -> dict:
+    """Every trial the valid score leaves out, planned and replacement alike, by tier."""
+    by_tier = {tier: 0 for tier in EXCLUDED_TIERS}
+    for trial in record["trials"]:
+        if trial["error"]["tier"] in EXCLUDED_TIERS:
+            by_tier[trial["error"]["tier"]] += 1
+    return by_tier
+
+
 def excluded(record: dict) -> dict:
-    """Planned trials the valid score leaves out, by tier (a planned trial with no row is 'missing')."""
+    """Planned trials the valid score leaves out, by tier (a planned trial with no row is 'missing').
+    These, and only these, are what the bounds score as all failed and all passed."""
     attempts = record["plan"]["attempts_per_task"]
     by_tier = {tier: 0 for tier in EXCLUDED_TIERS}
     by_tier["missing"] = 0
@@ -202,7 +220,8 @@ def summarize(record: dict, *, resamples: int = passk.DEFAULT_RESAMPLES, seed: i
             "pass_at_1": _f(valid_1.value),
             "tasks_counted": valid_k.tasks_counted,
             "not_estimable": list(valid_k.not_estimable),
-            "excluded": excluded(record)["by_tier"],
+            "excluded": excluded_all(record),
+            "excluded_planned": excluded(record)["by_tier"],
         },
         "bounds_pass_hat_k": {"excluded_as_failed": _f(head_k.value), "excluded_as_passed": _f(upper_k.value)},
         "false_done": false_done(record),
@@ -217,6 +236,7 @@ def claim(label: str, interval: tuple, metric: str = "pass^k") -> str:
     lo, hi = interval
     span = f"95% task-level interval {lo * 100:+.1f} to {hi * 100:+.1f} points"
     tag = {"dev": "DEV RUN (stand-in or development tasks; not a measurement)",
+           "shakedown": "SHAKEDOWN (a check of the harness; not a measurement)",
            "screen": "SCREEN (labelled; no superiority wording)",
            "pilot": "PILOT (labelled pilot; not the full comparison)",
            "full": "FULL COMPARISON"}[label]
@@ -242,6 +262,10 @@ def compare(a: dict, b: dict, *, resamples: int = passk.DEFAULT_RESAMPLES, seed:
         raise ValueError(f"the two records use different k ({a['plan']['k']} and {b['plan']['k']})")
     if a["plan"]["attempts_per_task"] != b["plan"]["attempts_per_task"]:
         raise ValueError("the two records planned different attempts per task")
+    differ = [f"{block}.{field}" for block, field in COMPARABLE if a[block][field] != b[block][field]]
+    if differ:
+        raise ValueError("the two records are not comparable: they differ in " + ", ".join(differ)
+                         + " (settings, engine version, runner, evaluated commit, protocol and analysis must match)")
     k = a["plan"]["k"]
     label = a["label"] if a["label"] == b["label"] else min((a["label"], b["label"]), key=record_mod.LABELS.index)
     out = {"a": a["record_id"], "b": b["record_id"], "arm_a": a["arm"], "arm_b": b["arm"], "k": k, "label": label}
@@ -287,7 +311,7 @@ def main(argv=None) -> int:
     out = {"summaries": [summarize(r, resamples=args.resamples, seed=args.seed) for r in loaded]}
     if len(loaded) == 2:
         out["paired"] = compare(loaded[0], loaded[1], resamples=args.resamples, seed=args.seed)
-    json.dump(_round(out), sys.stdout, indent=1, sort_keys=True)
+    json.dump(_round(out), sys.stdout, indent=1, sort_keys=True, allow_nan=False)
     sys.stdout.write("\n")
     return 0
 

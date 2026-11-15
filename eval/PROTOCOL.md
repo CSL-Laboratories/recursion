@@ -1,4 +1,4 @@
-# Evaluation protocol (lane EVAL), version 1
+# Evaluation protocol (lane EVAL), version 2
 
 Written before any measured run. This file, the analysis script `eval/analyze.py` and the calculator
 `eval/passk.py` are hashed in `eval/FROZEN.sha256`; every record carries those hashes, and a test fails
@@ -20,9 +20,13 @@ Two arms, one engine at a time:
   repository through WORKSPACE's `workspace` field, its usage read from EVENTS' usage events.
 
 Both arms use the **same model, the same route (the same signed-in account) and the same effort**, and
-the same permission settings. These settings are fixed in the suite manifest (`arms`), hashed into the
-record (`arm.settings_sha256`) and into the plan (`plan.plan_sha256`). A run whose arm settings differ
-from the other arm's is not a paired comparison.
+the same permission mode and extra engine arguments. These shared settings are fixed in the suite
+manifest (`arms`), hashed into the record (`arm.settings_sha256`, the same value for both arms: the arm's
+name and how it reaches the engine, such as the binary path, passed variable names or route home, are
+not part of it) and into the plan (`plan.plan_sha256`). The direct arm passes effort and permission mode
+to Claude Code with Claude Code's own `--effort` and `--permission-mode` flags. A paired comparison
+refuses two records that differ in these settings, the engine version, the runner, the evaluated
+commit, the protocol or the analysis.
 
 The recursion arm refuses, with a message naming what is missing, until WORKSPACE's `workspace` and
 EVENTS' usage events are both on the evaluated base. A refused arm writes no record; the other arms run.
@@ -39,11 +43,14 @@ is pinned and checked again at every attempt.
 - **Held-out tasks** are harvested (`eval/harvest.py`) from merged commits of public repositories, after a
   not-before date: the parent's tree is the start tree, the linked issue's text (or else the commit
   message without its trailers) is the prompt, the commit's versions of the test files it changed are the
-  hidden tests, the rest of the commit is the reference solution. The harvest script's SHA-256 and the
+  hidden tests, the rest of the commit (test files it deleted included) is the reference solution, and
+  the start tree with the reference solution and the hidden tests must be exactly the commit's own tree
+  (its tree id is pinned and checked, deletions and file modes included). The harvest script's SHA-256 and the
   repository list's SHA-256 (`python -m eval.harvest hashes`) are published before the freeze, and the
   list is never widened after it.
 - Held-out tasks load only from a folder given at run time (`--tasks`), never from the repository, and
-  only for scoring (`eval/heldout.py`). No dev-mode or optimizer-side code path can open them; a test
+  only for scoring (`eval/heldout.py`); every input the loader reads (the manifest, each task file or
+  folder, every link inside a task folder) must resolve inside that folder and outside the repository. No dev-mode or optimizer-side code path can open them; a test
   shows it. Every engine runs as the same operator, so the operator keeps the held-out folder out of an
   engine's reach during a run (on a path no prompt, setting or work tree names); the guard covers the
   repository's code paths, not a curious engine.
@@ -60,14 +67,25 @@ One command runs a pinned suite through each arm (`eval/run`). For every attempt
 2. a fresh copy of the start tree, made into a one-commit repository whose tree must equal the pin
    (otherwise the attempt is an infra failure, `start_tree_mismatch`);
 3. the engine run in it with the prompt, at most the task's time limit, in its own process session; every
-   process left in that session is killed when the engine exits or runs out of time;
+   process left in that session, whatever process group it moved to, is killed when the engine exits or
+   runs out of time; variables passed to the engine can never replace the attempt's TMPDIR,
+   XDG_RUNTIME_DIR, HOME or PATH;
 4. the final diff taken against the start commit (new files included);
 5. the hidden tests written over the work tree (over whatever the engine left at those paths) and run;
    pass means exit 0.
 
 Times are monotonic. The engine's output, the diff and the test log are kept (and hashed into the
-record) when an artifacts folder is given; for a held-out suite that folder may not be inside the
-repository.
+record) when an artifacts folder is given; a measurement (screen, pilot, full) must give one; for a
+held-out suite it may not be inside the repository. A failure to store them never costs the trial its
+row: the record says `retained: false` with the reason.
+
+**Before any attempt.** The plan is checked (k and attempts positive integers, attempts at least k,
+replacements a non-negative integer), and so is the label (section 7). A frozen suite must pin the
+version and the settings of every selected engine, and name as its evaluated commit the commit actually
+checked out, with nothing changed under `core/`.
+
+**Interrupted runs.** A run that is interrupted keeps every trial that ran; only trials that never ran
+are written as `not_run`.
 
 **Order.** Trial index outermost; the tasks shuffled for each index from the run's seed; the arms
 alternating which goes first. No retry is hidden: a trial that ran is in the record.
@@ -77,7 +95,10 @@ indicator); the full comparison runs 10 (O55), which estimates pass^5 far more s
 
 **Replacement trials.** When a planned trial ends with an infra or grader failure, the runner adds one
 replacement trial for that task and arm, at most 2 per task and arm. The planned trial stays in the
-record and counts as a failure in the headline; the replacement counts only in the valid-runs score.
+record and counts as a failure in the headline; the replacement counts only in the valid-runs score. A
+record is valid only if each replacement replaces one earlier infra or grader failure of the same task,
+once, within the plan's budget, at the next index after the planned attempts (a failed replacement may
+itself be replaced, within the budget).
 
 ## 4. The record
 
@@ -108,8 +129,9 @@ be done and whose hidden tests did not pass.
   trials that resolved. Infra, grader, unknown and not-run trials are failures here, as the contract's
   infra rule says.
 - **Valid runs only**, reported beside the headline, declared here before any run: a task's trials,
-  planned and replacement, of tier none or agent. The number left out is reported per tier, with the
-  bounds of scoring them all failed (the headline) and all passed.
+  planned and replacement, of tier none or agent. The trials it leaves out are reported per tier, failed
+  replacements included; the bounds score the planned ones among them all failed (the headline) and all
+  passed.
 - **pass^k** per task is C(c, k) / C(n, k) with that task's own n; the suite value is the unweighted mean
   over tasks. A task with n < k is "not estimable": the headline is then not given at all (the run is
   incomplete), and the valid-runs score is the mean over the estimable tasks with the others named.
@@ -137,9 +159,13 @@ be done and whose hidden tests did not pass.
 
 ## 7. Claims
 
-- Every number is printed with its label: **dev**, **screen**, **pilot** or **full**. A run on the dev set
-  is never a measurement. Pilots stay labelled pilots until the full comparison meets O55, and no
-  per-competitor score is published before it.
+- Every number is printed with its label: **dev**, **shakedown**, **screen**, **pilot** or **full**. The
+  dev set is labelled dev, and only it; a shakedown (for example the stand-in engine on a held-out
+  suite) checks the harness. Neither is ever a measurement. A screen, a pilot and a full comparison need
+  k of at least 5, a held-out suite and a real engine (never the stand-in, which is an oracle); a pilot
+  and a full comparison also a frozen suite. The runner refuses, and the record checks, all of these.
+  Pilots stay labelled pilots until the full comparison meets O55, and no per-competitor score is
+  published before it.
 - If the paired interval contains 0: "no detectable difference", with the interval, and never
   "equivalent"; the most it rules out is a loss larger than the interval's lower end.
 - A difference whose interval excludes 0 in a screen or a pilot is "an observed difference" with no
@@ -159,3 +185,11 @@ be done and whose hidden tests did not pass.
 ## Versions
 
 - 1 (Nov 14, 2026): first version, before any measured run.
+- 2 (Nov 14, 2026, answering the two first reads of #381; still before any measured run): the shakedown
+  label and the label rules enforced; comparisons refuse different shared settings, engine version,
+  runner, evaluated commit, protocol or analysis; the shared-settings hash leaves out the arm's name;
+  effort and permission mode reach Claude Code; the valid-runs exclusions count failed replacements;
+  replacement trials, frozen pins, the evaluated commit and held-out sources are checked; harvested
+  tasks are checked against the commit's own tree; interrupted runs keep every trial that ran; storage
+  failures keep the trial; numbers must be finite. The analysis changed (`analyze.py`); the calculator
+  (`passk.py`) did not.

@@ -74,7 +74,9 @@ def build_record(rows, *, tasks=None, k=2, attempts=3, replacements=2, label="de
     plan = {"k": k, "attempts_per_task": attempts, "replacements_per_task": replacements, "seed": 1,
             "tasks": [{"id": t, "cluster": (clusters or {}).get(t), "task_sha256": SHA, "created_at": None}
                       for t in task_ids]}
-    settings = record_mod.sha256_json({"arm": arm})
+    # The shared settings, the same for both arms (eval/arms.py: no arm name in the hash).
+    settings = record_mod.sha256_json({"engine": "standin", "model": None, "route": None, "effort": None,
+                                       "permission_mode": None, "extra_args": []})
     plan["plan_sha256"] = record_mod.sha256_json(dict(plan, suite_manifest_sha256=manifest_sha,
                                                       arm_settings_sha256=settings))
     return {
@@ -141,11 +143,11 @@ def make_suite(folder: Path, tasks: dict, *, split="dev", suite_id="t", tmp_base
         path = folder / "tasks" / f"{task_id}.txtar"
         path.write_text(text, encoding="utf-8")
         task = task_mod.load_txtar(path)
-        parent, tree, commit = dev.commits_for(task, tmp_base, xdg_base)
+        parent, tree, commit, commit_tree = dev.commits_for(task, tmp_base, xdg_base, with_tree=True)
         if task_id in bad_tree_for:
             tree = "f" * 40
         entries.append({"id": task_id, "file": f"tasks/{task_id}.txtar", "sha256": task.sha256,
-                        "parent_tree": tree, "parent_commit": parent, "commit": commit})
+                        "parent_tree": tree, "parent_commit": parent, "commit": commit, "commit_tree": commit_tree})
     manifest = {"schema": "recursion-eval-suite/1", "id": suite_id, "version": "1", "split": split,
                 "frozen": False, "runner": None, "evaluated_commit": None,
                 "engines": {"standin": "eval-standin/1"}, "arms": {}, "tasks": entries}

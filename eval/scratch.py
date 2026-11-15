@@ -113,16 +113,18 @@ def attempt(attempt_id: str, tmp_base: Path = DEFAULT_TMP_BASE, xdg_base: Path =
 
 
 def environment(scratch: Scratch, *, home: Path | None = None, extra: dict | None = None) -> dict:
-    """A clean environment for a process an attempt starts. Nothing is inherited but PATH."""
-    env = {
+    """A clean environment for a process an attempt starts. Nothing is inherited but PATH.
+
+    ``extra`` is applied FIRST and the attempt's own values after it, so nothing passed in can move
+    TMPDIR, XDG_RUNTIME_DIR, HOME or PATH, or bring in DBUS_SESSION_BUS_ADDRESS."""
+    env = dict(extra or {})
+    env.update({
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "LANG": "C.UTF-8",
         "HOME": str(home if home is not None else scratch.home),
         "TMPDIR": str(scratch.tmpdir),
         "XDG_RUNTIME_DIR": str(scratch.xdg_runtime_dir),
         "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    if extra:
-        env.update(extra)
+    })
     env.pop("DBUS_SESSION_BUS_ADDRESS", None)
     return env

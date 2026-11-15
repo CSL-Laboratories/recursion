@@ -26,8 +26,9 @@ DEVSET = PACKAGE_ROOT / "devset"
 MANIFEST = DEVSET / "suite.json"
 
 
-def commits_for(task, tmp_base: Path, xdg_base: Path) -> tuple:
-    """(parent commit, parent tree, solution commit) of a dev task, made with the fixed identity."""
+def commits_for(task, tmp_base: Path, xdg_base: Path, *, with_tree: bool = False) -> tuple:
+    """(parent commit, parent tree, solution commit[, solution commit's tree]) of a dev task, made with
+    the fixed identity."""
     with scratch_mod.attempt(f"pin-{task.id}-{secrets.token_hex(4)}", tmp_base, xdg_base) as scratch:
         work = scratch.tmpdir / "work"
         work.mkdir()
@@ -38,15 +39,17 @@ def commits_for(task, tmp_base: Path, xdg_base: Path) -> tuple:
         gitutil.git(["add", "-A"], work)
         gitutil.git(["commit", "-q", "--allow-empty", "-m", "reference solution"], work)
         commit = gitutil.git(["rev-parse", "HEAD"], work).decode().strip()
-    return parent, tree, commit
+        commit_tree = gitutil.git(["rev-parse", "HEAD^{tree}"], work).decode().strip()
+    return (parent, tree, commit, commit_tree) if with_tree else (parent, tree, commit)
 
 
 def pin(tmp_base: Path, xdg_base: Path) -> dict:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     for entry in manifest["tasks"]:
         task = task_mod.load_txtar(DEVSET / entry["file"])
-        parent, tree, commit = commits_for(task, tmp_base, xdg_base)
-        entry.update(id=task.id, sha256=task.sha256, parent_tree=tree, parent_commit=parent, commit=commit)
+        parent, tree, commit, commit_tree = commits_for(task, tmp_base, xdg_base, with_tree=True)
+        entry.update(id=task.id, sha256=task.sha256, parent_tree=tree, parent_commit=parent, commit=commit,
+                     commit_tree=commit_tree)
     MANIFEST.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
     return manifest
 
@@ -56,9 +59,9 @@ def check(tmp_base: Path, xdg_base: Path, *, reruns: int = 2, log=print) -> list
     problems = []
     suite = suite_mod.load_dev(MANIFEST)
     for task in suite.tasks:
-        parent, tree, commit = commits_for(task, tmp_base, xdg_base)
-        if (parent, tree, commit) != (task.parent_commit, task.parent_tree, task.commit):
-            problems.append(f"{task.id}: pins differ from the task file (found {parent} {tree} {commit})")
+        found = commits_for(task, tmp_base, xdg_base, with_tree=True)
+        if found != (task.parent_commit, task.parent_tree, task.commit, task.commit_tree):
+            problems.append(f"{task.id}: pins differ from the task file (found {' '.join(found)})")
             continue
         checked = validate_mod.validate(task, reruns=reruns, tmp_base=tmp_base, xdg_base=xdg_base)
         if not checked.ok:

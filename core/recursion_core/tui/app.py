@@ -294,6 +294,8 @@ class TuiApp:
         done(method, params, call_api(self._api, method, params))
 
     def on_answer(self, method: str, params: dict, answer: dict) -> None:
+        if not isinstance(answer, Mapping):  # as call_api says of it; the guard below holds for any answer
+            answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}  # (review 2 of #405, DeepSeek L1)
         code = answer.get("code")  # read before taking the lock: the answer is the caller's object
         with self._lock:
             if self.closed:  # the TUI ended while the answer was read: it changes nothing
@@ -401,7 +403,7 @@ class TuiApp:
 
     def _transcript_page(self, params: dict, answer: dict, code) -> None:
         """One answer to a transcript read. A page is checked first (``sessions.page_problem``): one that is not
-        the answer to the read asked is said and changes nothing, rows or cursor, and is not asked again
+        the answer to the read asked is said, changes nothing, rows or cursor, and is not asked for again
         (review 1 of #405, Sol R2; DeepSeek H1, L2). A right page: each new line logged once (so every
         renderer prints the same rows), its rows kept for the output pane, and the next page asked for while
         the answer says there is more."""
@@ -416,6 +418,13 @@ class TuiApp:
             transcript.cursor = {**transcript.cursor, "epoch": 1}
             self._notice(f"transcript session={field(sid)}: the daemon's epoch is behind the one held; the next "
                          f"read goes on from seq {transcript.cursor['seq']} with epoch 1")
+            return
+        if code == "request_invalid" and answer.get("detail") == "cursor_ahead":
+            # The seq held is past the daemon's log: rule (7) does not bound the last position a gap line names.
+            # The next read goes on from the last line shown, which the daemon has (review 2 of #405, DeepSeek M1).
+            transcript.cursor = {**transcript.cursor, "seq": transcript.printed}
+            self._notice(f"transcript session={field(sid)}: the daemon has no position seq {params['cursor']['seq']}; "
+                         f"the next read goes on from seq {transcript.printed}, the last line shown")
             return
         if code != "ok":
             return
@@ -1287,7 +1296,11 @@ class Loop:
             if item is None:
                 return
             method, params, done = item
-            self._answers.put((done, method, params, call_api(self._api, method, params)))
+            try:
+                answer = call_api(self._api, method, params)
+            except BaseException as err:  # noqa: BLE001 - KeyboardInterrupt, SystemExit: an answer, so in_flight
+                answer = {"code": p.UNAVAILABLE, "detail": type(err).__name__}  # stays true (#405 r2, DeepSeek L3)
+            self._answers.put((done, method, params, answer))
             self._wake.set()
 
     def start(self) -> None:

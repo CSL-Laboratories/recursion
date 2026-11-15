@@ -12,8 +12,10 @@ read, whose cursor is the one the read goes on from (a first read sends epoch 1 
 says; h11 itself reads on from epoch 3, seq 41). The CLI twins of these verbs belong to the verb lanes;
 until they exist the TUI's parity tests compare against those frames.
 
-An answer is checked before anything of it is taken (``page_problem``): an answer that is not the answer to
-the read asked changes nothing (review 1 of #405, GPT-6.1 Sol R2 and DeepSeek H1, L1, L2).
+An ``ok`` answer is checked before anything of it is taken (``page_problem``): a page it refuses changes
+nothing (review 1 of #405, GPT-6.1 Sol R2 and DeepSeek H1, L1, L2). A refused answer is said and leaves the
+cursor as it is, but for two: ``cursor_epoch_ahead`` sets its epoch back to 1, and ``cursor_ahead`` its seq
+back to the last line shown, so the next read can be served (review 2 of #405, DeepSeek M1, L4).
 """
 
 from __future__ import annotations
@@ -55,9 +57,15 @@ def page_problem(asked: Mapping, answer: Mapping) -> str | None:
     ``replay.gap`` whose ``seq`` is the last of the positions it covers (``order``). The answer's cursor
     names the log asked for, at the last position represented, or the asked one for an empty page
     (``cursor``); its epoch is the asked one or later, and ``epoch_advanced`` says exactly whether it is later
-    (``epoch``); ``more`` is true or false (``more``)."""
+    (``epoch``), an empty page included; ``more`` is true or false (``more``). A call whose ``asked`` is not a
+    read's params is ``asked``, and an ``answer`` that is not a mapping is ``answer``: refused, never raised."""
 
-    cursor = asked["cursor"]
+    cursor = asked.get("cursor") if isinstance(asked, Mapping) else None
+    if not (isinstance(cursor, Mapping) and _is_int(cursor.get("seq")) and _is_int(cursor.get("epoch"))
+            and isinstance(cursor.get("session_id"), str)):
+        return "asked"  # not a read's params (review 2 of #405, DeepSeek L2)
+    if not isinstance(answer, Mapping):
+        return "answer"
     if answer.get("projection") != asked.get("projection", "transcript"):
         return "projection"
     lines = answer.get("lines")
@@ -117,6 +125,7 @@ class Transcript:
         self.session_id = session_id
         self.cursor = first_cursor(session_id)
         self.pages = 0  # reads made in a row by the current open, the first included
+        self.printed = 0  # the last position whose line was shown (a gap line shows no content of the log)
 
     def apply(self, answer: Mapping) -> list[dict]:
         """One ``ok`` answer that ``page_problem`` found right: the lines after the cursor, each once, in
@@ -129,6 +138,8 @@ class Transcript:
             if isinstance(line, Mapping) and _is_int(line.get("seq")) and line["seq"] > last:
                 new.append(dict(line))
                 last = line["seq"]
+                if line.get("event_type") != "replay.gap":
+                    self.printed = last
         cursor = answer.get("cursor")
         epoch = self.cursor["epoch"]
         if (isinstance(cursor, Mapping) and cursor.get("session_id") == self.session_id

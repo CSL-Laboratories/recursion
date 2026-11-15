@@ -111,9 +111,11 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   Each page is checked before anything of it is taken (rule (7), as SPINE's `conformance/rules.py` states it
   for a reader): a page in another projection, of another log, with a line out of order or of the wrong
   shape, a cursor that is not its last position, or an epoch that goes back is said as an error and changes
-  nothing, neither rows nor cursor, and is not asked again. If the daemon then answers that the epoch held is
-  ahead of its own, the next read goes on from epoch 1 by its seq. An answer that cannot be read at all is
-  said as an error; it never stops the TUI.
+  nothing, neither rows nor cursor, and that page is not asked for again (a right page that says `more` is
+  followed, up to the 50 reads). If the daemon then answers that the epoch held is ahead of its own, the next
+  read goes on from epoch 1 by its seq; if it answers that the seq held is past its log (a gap line may name
+  any later position), the next read goes on from the last line shown. An answer that cannot be read at all
+  is said as an error; it never stops the TUI, nor does a control API call that raises.
 - The binding file: `$XDG_CONFIG_HOME/recursion/tui-keys.toml` (or `~/.config/...`), or `--keys FILE`;
   `--print-keys` prints the defaults to start from. `version = 1`, an optional `leader`, a table per
   context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action

@@ -53,14 +53,15 @@ class _Refuse(Exception):
 
 
 def _entry_ok(engine: object, entry: object) -> bool:
-    if not isinstance(engine, str) or engine not in ENGINES or not isinstance(entry, Mapping):
+    """One detection entry, already read by ``snapshot`` into ``{"routable", "reason"}``, its words plain text."""
+    if type(engine) is not str or engine not in ENGINES or not isinstance(entry, Mapping):
         return False
     routable, reason = entry.get("routable"), entry.get("reason")
     if not isinstance(routable, bool):
         return False
     if routable:
         return reason is None
-    return isinstance(reason, str) and _CODE.fullmatch(reason) is not None
+    return type(reason) is str and _CODE.fullmatch(reason) is not None
 
 
 def snapshot(detection: object) -> tuple[dict | None, str | None]:
@@ -80,9 +81,14 @@ def snapshot(detection: object) -> tuple[dict | None, str | None]:
         if not isinstance(engines, Mapping):  # the except below gives the same answer; this says it in words
             return None, "detection_malformed"
         for eng, entry in engines.items():
+            # Each entry read once, its engine and reason as plain text: a subclass of str could raise, or answer
+            # anything, when it is hashed, compared or formatted later, outside this guard.
+            eng = _plain(eng)
+            if isinstance(entry, Mapping):
+                entry = {"routable": entry.get("routable"), "reason": _plain(entry.get("reason"))}
             if not _entry_ok(eng, entry):
                 return None, "detection_malformed"
-            out[eng] = {"routable": entry["routable"], "reason": entry.get("reason")}
+            out[eng] = entry
     except Exception:  # noqa: BLE001 - a snapshot that cannot be read is malformed, never partly used
         return None, "detection_malformed"
     return out, None
@@ -108,7 +114,9 @@ def _task(task: object) -> tuple[str | None, frozenset, dict | None]:
     A ``task_kind`` or ``tags`` that is present must be a non-empty string or a list of them: a present
     null is refused, not read as absent. A ``hand_pick`` that is present has exactly ``engine`` and ``model``
     (common.v1, an object: a present null is refused as ``explain_answer`` refuses it), the model a model id
-    or null. A task, or a hand pick, that cannot be read is refused, never raised through.
+    or null. A task, or a hand pick, that cannot be read is refused, never raised through. Every word is read
+    as its plain text, a subclass of ``str`` too (its hash or its comparing could raise, or answer anything,
+    later, outside a guard), and a member that is not present is not read at all.
     """
     if not isinstance(task, Mapping):
         raise _Refuse("bad_task", "task")
@@ -117,22 +125,29 @@ def _task(task: object) -> tuple[str | None, frozenset, dict | None]:
         kind, tags, hand = task.get("task_kind"), task.get("tags"), task.get("hand_pick")
     except Exception:  # noqa: BLE001 - a task that cannot be read is refused, never raised through
         raise _Refuse("bad_task", "task") from None
-    if present["task_kind"] and not (isinstance(kind, str) and kind):
+    kind = _plain(kind) if present["task_kind"] else None
+    if present["task_kind"] and not (type(kind) is str and kind):
         raise _Refuse("bad_task", "task_kind")
-    if present["tags"] and not (isinstance(tags, list) and all(isinstance(t, str) and t for t in tags)):
-        raise _Refuse("bad_task", "tags")
+    words: list | None = []
+    if present["tags"]:
+        try:  # the list copied once, in a guard of its own: a list subclass's iterating could raise
+            words = [_plain(t) for t in tags] if isinstance(tags, list) else None
+        except Exception:  # noqa: BLE001 - tags that cannot be read are refused, never raised through
+            words = None
+        if words is None or not all(type(t) is str and t for t in words):
+            raise _Refuse("bad_task", "tags")
     if not present["hand_pick"]:
-        return kind, frozenset(tags or ()), None
+        return kind, frozenset(words), None
     try:
-        engine, model = hand.get("engine"), hand.get("model")
-        shaped = set(hand) == {"engine", "model"} and isinstance(engine, str) and engine in ENGINES
+        engine, model = _plain(hand.get("engine")), _plain(hand.get("model"))
+        shaped = set(hand) == {"engine", "model"} and type(engine) is str and engine in ENGINES
     except Exception:  # noqa: BLE001 - null, a string or a hand pick that cannot be read: not a hand pick
         shaped = False
     if not shaped:
         raise _Refuse("bad_hand_pick", "hand_pick")
     if model is not None and not _model_ok(model):
         raise _Refuse("bad_hand_pick", "hand_pick_model")
-    return kind, frozenset(tags or ()), {"engine": engine, "model": model}
+    return kind, frozenset(words), {"engine": engine, "model": model}
 
 
 def _matches(rule, kind: str | None, tags: frozenset) -> bool:
@@ -234,13 +249,29 @@ def _decide(config: Config, detection: object, kind: str | None, tags: frozenset
     return refused("default_engine_unavailable", why, eng, None)
 
 
+def _members(value: Mapping, names: tuple) -> dict | None:
+    """``value``'s members read into a plain dict when its keys are exactly ``names``, each a plain ``str``; else
+    None. The keys are type-checked before they are compared, so a key's own comparing never runs."""
+    keys = list(value)
+    if len(keys) != len(names) or not all(type(key) is str for key in keys) or set(keys) != set(names):
+        return None
+    return {name: value[name] for name in names}
+
+
+def _word_or_null(value: object) -> bool:
+    return value is None or type(value) is str
+
+
 def route_decision(decision: Mapping) -> dict | None:
     """The control schema's ``route_decision`` (common.v1: chosen, reason, candidates, hand_pick) for a routed
     decision, or None for a refusal. This is what the run record keeps and the ``route.decision`` event
     carries; the start path that stores it is a later slice. Anything else (an object that is not a routed
     decision, one whose ``ok`` is not exactly True, one whose members are missing or of a type ``decide`` never
     gives, a subclass of ``str`` among them, or one that cannot be read) answers None, never an ``Exception``; a
-    ``BaseException`` such as ``KeyboardInterrupt`` stops the caller."""
+    ``BaseException`` such as ``KeyboardInterrupt`` stops the caller. Every member published is rebuilt from the
+    values read here, each a plain ``str`` or, where ``decide`` gives null, null: a connection of exactly
+    ``kind`` and ``id``, candidate rows of ``engine``, ``model`` and ``skipped``, and a hand pick of exactly
+    ``engine`` and ``model``. So ``json.dumps`` takes every record this answers."""
     try:
         if not isinstance(decision, Mapping) or decision.get("ok") is not True:
             return None
@@ -250,21 +281,31 @@ def route_decision(decision: Mapping) -> dict | None:
         connection, candidates, hand = decision["connection"], decision["candidates"], decision["hand_pick"]
         if type(reason) is not str or reason not in REASONS or type(engine) is not str or type(model) is not str:
             return None  # members of a type decide never gives: not a routed decision
-        # decide's connection always names its kind and id, plain str; next_after_limit refuses one without them.
-        if (not isinstance(connection, Mapping) or type(connection.get("kind")) is not str
-                or type(connection.get("id")) is not str):
-            return None  # a connection that is not a mapping (a list of pairs would pass dict())
+        # decide's connection names exactly its kind and id, plain str; next_after_limit refuses one without them.
+        if not isinstance(connection, Mapping):
+            return None  # not a mapping: one that only iterates and indexes like one is not decide's
+        conn = _members(connection, ("kind", "id"))
+        if conn is None or type(conn["kind"]) is not str or type(conn["id"]) is not str:
+            return None  # a connection without its kind and id, with another member, or not plain words
         if not isinstance(candidates, (list, tuple)):
             return None  # candidates that are not a list (a generator would be used up and read as [])
         if not all(isinstance(c, Mapping) for c in candidates):
             return None  # a candidate that is not a mapping
+        rows = [{"engine": c["engine"], "model": c["model"], "skipped": c["skipped"]} for c in candidates]
+        if not all(type(r["engine"]) is str and _word_or_null(r["model"]) and _word_or_null(r["skipped"])
+                   for r in rows):
+            return None  # a candidate row whose words are not plain (decide gives a null model or skipped, never more)
         if not (hand is None or isinstance(hand, Mapping)):
-            return None  # a hand pick that is neither null nor a mapping (a list of pairs would pass dict())
+            return None  # a hand pick that is neither null nor a mapping (nor one that only iterates and indexes)
+        if hand is not None:
+            hand = _members(hand, ("engine", "model"))
+            if hand is None or type(hand["engine"]) is not str or not _word_or_null(hand["model"]):
+                return None  # a hand pick without exactly its engine and model, or not plain words
         return {
-            "chosen": {"engine": engine, "model": model, "connection": dict(connection)},
+            "chosen": {"engine": engine, "model": model, "connection": conn},
             "reason": reason,
-            "candidates": [{"engine": c["engine"], "model": c["model"], "skipped": c["skipped"]} for c in candidates],
-            "hand_pick": None if hand is None else dict(hand),
+            "candidates": rows,
+            "hand_pick": hand,
         }
     except Exception:  # noqa: BLE001 - a decision that cannot be read is not a routed decision
         return None
@@ -359,16 +400,16 @@ def explain_answer(config: Config, detection: object, params: object) -> dict:
     if not isinstance(params, Mapping):
         return {"code": "request_invalid", "detail": "params"}
     try:
-        names = list(params)
+        names = [_plain(name) for name in params]  # as plain text: compared below, outside this guard
         given = {name: params[name] for name in EXPLAIN_PARAMS if name in params}
     except Exception:  # noqa: BLE001 - params that cannot be read are refused, never raised through
         return {"code": "request_invalid", "detail": "params"}
     for name in names:
-        if name not in EXPLAIN_PARAMS:
-            return {"code": "request_invalid", "detail": name if isinstance(name, str) and _CODE.fullmatch(name) else "params"}
+        if type(name) is not str or name not in EXPLAIN_PARAMS:  # a name that is not a str is never compared
+            return {"code": "request_invalid", "detail": name if type(name) is str and _CODE.fullmatch(name) else "params"}
     hand = given.get("hand_pick")
     try:
-        hand_engine = hand["engine"] if isinstance(hand, Mapping) and set(hand) == {"engine", "model"} else None
+        hand_engine = _plain(hand["engine"]) if isinstance(hand, Mapping) and set(hand) == {"engine", "model"} else None
     except Exception:  # noqa: BLE001 - a hand pick that cannot be read is not a hand pick
         hand_engine = None
     if "hand_pick" in given and hand_engine is None:
@@ -376,7 +417,8 @@ def explain_answer(config: Config, detection: object, params: object) -> dict:
     if "engine" in given:
         if hand is None:
             return {"code": "request_invalid", "detail": "engine_named_not_routed"}
-        if hand_engine != given["engine"]:
+        engine = _plain(given["engine"])
+        if type(engine) is not str or type(hand_engine) is not str or hand_engine != engine:
             return {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"}
     task = {key: given[key] for key in ("task_kind", "tags", "hand_pick") if key in given}
     decision = decide(config, detection, task)
@@ -412,8 +454,9 @@ _ANY = object()       # an attempt that names only its connection: any route on 
 
 
 def _is_time(value: object) -> bool:
-    """A number of seconds a wait can end at: a plain int or float (never a bool or another subclass, whose
-    conversion could raise) whose value is a finite float. NaN and the infinities are not (``contract.vendor_reset``
+    """A finite number of seconds the vendor named (a time already past included: this module has no clock, so
+    it cannot tell): a plain int or float (never a bool or another subclass, whose conversion could raise) whose
+    value is a finite float. NaN and the infinities are not (``contract.vendor_reset``
     refuses them too and strict JSON cannot carry them), nor is an int too large for a float. Never raises."""
     if type(value) is not int and type(value) is not float:
         return False
@@ -476,7 +519,9 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     that cannot be read answers ``no_decision``; a refusal answers ``no_route``); ``limit``, the route result that ended the run (its ``code`` and, when the route
     service made one, its ``limit_notice`` with the ``attempts`` already made); ``detection``, optionally a
     snapshot. ``wait`` waits until the limit's ``reset_at``, or the result's ``retry_at`` when ``reset_at`` is
-    absent, null or not a finite time, else null; ``routes.limits.notice`` keeps the raw value. The answer::
+    absent, null or not a finite time, else null; ``routes.limits.notice`` keeps the raw value. A time already
+    past is passed through as the vendor gave it (``contract.vendor_reset`` would make it None; this module has
+    no clock), so a surface that waits clamps it to now and never sleeps a negative interval. The answer::
 
         {"action": "none", "reason"}                    not a limit (no blind retry), or no route was decided
         {"action": "ask", "reason", "choices"}          show the limit and let the user choose
@@ -489,7 +534,8 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     switch is a new run that the caller (SESSIONS) starts; this function starts nothing. A hand pick is
     never switched away from on its own: the user chose that route for this task, so the answer is ask.
     """
-    # The decision, read once inside a guard into plain data: nothing below reads the caller's object again.
+    # The decision, read inside one guard into plain data (each member once for presence and once for its value):
+    # nothing below reads the caller's object again.
     # A member it does not have reads as _MISSING; the presence check and the type check each answer for
     # their own rule, so each one is what refuses the decision it is about.
     try:
@@ -531,7 +577,11 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
         if isinstance(tried, str):
             tried = [tried]  # one bare kind:id word, never its characters
         attempts = []
-        for entry in (tried if isinstance(tried, (list, tuple)) else ()):
+        try:  # the list copied once, in a guard of its own: one that cannot be read is dropped, like an entry
+            entries = list(tried) if isinstance(tried, (list, tuple)) else []
+        except Exception:  # noqa: BLE001 - a list or tuple subclass whose iterating raises holds no attempt
+            entries = []
+        for entry in entries:
             try:
                 seen = _attempt(entry)
             except Exception:  # noqa: BLE001 - an entry that cannot be read is not an attempt, as other non-attempts

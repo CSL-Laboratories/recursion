@@ -235,9 +235,12 @@ class Authority:
         ``commit_guard``, when given, is a context manager entered once the ledger's write
         transaction has begun, after the signature and every check of this call that needs no
         ledger read, and held until that transaction has committed or rolled back. If entering it
-        raises, or anything after it does, the transaction rolls back and nothing is written. The
-        core passes its commit section with the halt recheck (R4-1), so signature verification
-        never runs under it and a halt never waits for one.
+        raises, or anything raises before ``COMMIT``, the transaction rolls back and nothing is
+        written. Its exit runs after ``COMMIT`` or ``ROLLBACK``: if it raises after a ``COMMIT``,
+        the charge stands and the error reaches the caller, and a retry with the same idempotency
+        key is refused ``effect_replayed``, never charged twice. The core passes its commit
+        section with the halt recheck (R4-1), whose exit only releases the fence; so signature
+        verification never runs under it and a halt never waits for one.
         """
         profile, digest = self._check_profile(envelope)
         now = self._clock()

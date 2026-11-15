@@ -7,18 +7,20 @@ Rust core would be driven, not through Python internals.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import unittest
 from pathlib import Path
 
 from recursion_core.plugin_security import (
-    PROTOCOL, CoreHealth, CoreService, Grant, PluginLoader, Refused, TrustStore, canonical, parse_manifest,
+    PROTOCOL, ApprovalGate, ConnectionBreaker, CoreHealth, CoreService, Grant, PluginLoader, Refused,
+    ReservedEffects, TrustStore, canonical, create_breaker_store, parse_manifest,
 )
 from recursion_core.plugin_security.protocol import CommitFence
 from recursion_core.plugin_security.tests.support import (
-    AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_SOURCE, PLUGIN_TOKEN, FakeGilProbe, World, effect, needs_crypto,
-    profile, scope_of,
+    AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_SOURCE, PLUGIN_TOKEN, Clock, FakeGilProbe, World, authenticate, effect,
+    needs_crypto, profile, scope_of, temp_dir,
 )
 from recursion_core.plugin_security.signing import key_id
 
@@ -539,16 +541,40 @@ def _halt(w: World, mode: str, sibling: dict) -> dict:
     raise AssertionError(mode)
 
 
-class _SignallingFence(CommitFence):
-    """The real fence, with an event set when a drain begins (before it waits)."""
+class _CountingLock:
+    """A real lock that counts attempts to take it, so a test can wait for the Nth (a drain's)."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.draining = threading.Event()
+    def __init__(self, real) -> None:
+        self._real = real
+        self._mutex = threading.Lock()
+        self.attempts = 0
+        self._events: dict[int, threading.Event] = {}
 
-    def drain(self) -> None:
-        self.draining.set()
-        super().drain()
+    def attempt(self, n: int) -> threading.Event:
+        """An event set once the Nth attempt to take the lock has been made."""
+        with self._mutex:
+            event = self._events.setdefault(n, threading.Event())
+            if self.attempts >= n:
+                event.set()
+            return event
+
+    def acquire(self, *args, **kwargs) -> bool:
+        with self._mutex:
+            self.attempts += 1
+            for n, event in self._events.items():
+                if self.attempts >= n:
+                    event.set()
+        return self._real.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._real.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
 
 
 class _NotifyingLock:
@@ -639,8 +665,8 @@ class CommitFenceTests(unittest.TestCase):
         for mode, halt_ok in cases:
             with self.subTest(mode=mode):
                 w = World(self)
-                fence = _SignallingFence()
-                w.core.commit_fence = fence
+                counting = _CountingLock(w.core.commit_fence._lock)  # watch the core's own fence
+                w.core.commit_fence._lock = counting
                 w.load()
                 w.bind()
                 env = profile(w.installer)
@@ -673,8 +699,9 @@ class CommitFenceTests(unittest.TestCase):
                 worker.start()
                 try:
                     self.assertTrue(entered.wait(10.0), "authorizer never reached its commit section")
+                    drain_asked = counting.attempt(counting.attempts + 1)  # the next acquisition is the drain's
                     halter.start()
-                    self.assertTrue(fence.draining.wait(10.0), "the halt never drained the fence")
+                    self.assertTrue(drain_asked.wait(10.0), "the halt never drained the fence")
                     self.assertFalse(answered.wait(0.3), "the halt answered while a commit held the fence")
                 finally:
                     release.set()
@@ -787,12 +814,449 @@ class CommitFenceTests(unittest.TestCase):
         worker.join(10.0)
         self.assertFalse(worker.is_alive())
         self.assertTrue(out["r"]["ok"], out["r"])
-        for wrong in (object(), threading.Lock()):
+
+    # -- a trip that a reset clears while an authorization is in flight (review 1 of #378, R1) ----------
+
+    def test_a_trip_acknowledged_then_reset_still_refuses_an_authorization_in_flight(self) -> None:
+        for where in ("order_in_verification", "uncharged_after_take", "order_waiting_for_the_ledger"):
+            with self.subTest(where=where):
+                w = World(self)
+                w.load()
+                w.bind()
+                order = where != "uncharged_after_take"
+                eff = effect(payload={"where": where}) if order else effect(kind="note.post", amount=0,
+                                                                            payload={"where": where})
+                env = profile(w.installer) if order else None
+                approval = w.approve(eff)
+                paused, release = threading.Event(), threading.Event()
+                holder = None
+                if where == "order_in_verification":
+                    real_verify = w.authority._verify
+
+                    def paused_verify(sig, raw, _p=paused, _r=release, _rv=real_verify):
+                        _p.set()
+                        if not _r.wait(10.0):
+                            raise AssertionError("never released")
+                        return _rv(sig, raw)
+
+                    w.authority._verify = paused_verify
+                elif where == "uncharged_after_take":
+                    real_take = w.gate.take
+
+                    def paused_take(approval_id, value, _p=paused, _r=release, _rt=real_take):
+                        digest = _rt(approval_id, value)
+                        _p.set()
+                        if not _r.wait(10.0):
+                            raise AssertionError("never released")
+                        return digest
+
+                    w.gate.take = paused_take
+                else:
+                    _signal_begin(w, paused)
+                    holder = sqlite3.connect(w.ledger, isolation_level=None, timeout=30)
+                    holder.execute("BEGIN IMMEDIATE")  # another connection holds the ledger's write lock
+                out: dict[str, dict] = {}
+                worker = threading.Thread(target=lambda: out.__setitem__("r", w.authorize(eff, approval, env)))
+                worker.start()
+                try:
+                    self.assertTrue(paused.wait(10.0), "the authorization never paused")
+                    _trip_and_reset(self, w)
+                finally:
+                    release.set()
+                    if holder is not None:
+                        holder.execute("ROLLBACK")
+                        holder.close()
+                    worker.join(40.0)
+                self.assertFalse(worker.is_alive(), "the authorization did not finish")
+                self.assertEqual(_code(out["r"]), "connection_tripped")
+                self.assertEqual(_charges(w), 0)
+
+    def test_a_reset_lets_a_fresh_authorization_through(self) -> None:
+        w = World(self)
+        w.load()
+        w.bind()
+        early = effect(payload={"n": "approved before the trip"})
+        early_approval = w.approve(early)
+        _trip_and_reset(self, w)
+        late = effect(payload={"n": "approved after the reset"})
+        for eff, approval in ((early, early_approval), (late, w.approve(late))):
+            with self.subTest(payload=eff["payload"]["n"]):
+                self.assertTrue(w.authorize(eff, approval, profile(w.installer))["ok"])
+        self.assertEqual(_charges(w), 2)
+
+    def test_another_connections_trip_does_not_refuse_this_authorization(self) -> None:
+        w = World(self)
+        w.load()
+        w.bind()
+        eff = effect()
+        approval = w.approve(eff)
+        paused, release = threading.Event(), threading.Event()
+        real_verify = w.authority._verify
+
+        def paused_verify(sig, raw):
+            paused.set()
+            if not release.wait(10.0):
+                raise AssertionError("never released")
+            return real_verify(sig, raw)
+
+        w.authority._verify = paused_verify
+        out: dict[str, dict] = {}
+        worker = threading.Thread(target=lambda: out.__setitem__("r", w.authorize(eff, approval, profile(w.installer))))
+        worker.start()
+        try:
+            self.assertTrue(paused.wait(10.0))
+            self.assertTrue(w.call(w.host, "breaker.report", connection="conn-b", event_type="plan_limit")["ok"])
+            _trip_and_reset(self, w, "conn-b")
+        finally:
+            release.set()
+            worker.join(10.0)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(out["r"]["ok"], out["r"])
+        self.assertEqual(_charges(w), 1)
+
+    def test_a_reset_while_an_authorization_is_in_flight_refuses_it_too(self) -> None:
+        # The trip was acknowledged before this call began; the reset lands before its first check.
+        # A reset is a change of the trip state, so the call is refused rather than let through on a
+        # state that changed under it (the case it guards: a call racing the trip's acknowledgement).
+        w = World(self)
+        w.load()
+        w.bind()
+        eff = effect()
+        approval = w.approve(eff)
+        self.assertTrue(w.call(w.host, "breaker.report", connection="conn-a", event_type="plan_limit")["ok"])
+        paused, release = threading.Event(), threading.Event()
+        real_healthy = w.health.require_healthy
+        calls = []
+
+        def paused_first_check():
+            calls.append(1)
+            if len(calls) == 1:
+                paused.set()
+                if not release.wait(10.0):
+                    raise AssertionError("never released")
+            return real_healthy()
+
+        w.health.require_healthy = paused_first_check
+        out: dict[str, dict] = {}
+        worker = threading.Thread(target=lambda: out.__setitem__("r", w.authorize(eff, approval, profile(w.installer))))
+        worker.start()
+        try:
+            self.assertTrue(paused.wait(10.0))
+            lease = w.call(w.host, "breaker.probe_begin", connection="conn-a")["result"]["lease"]
+            self.assertTrue(w.call(w.host, "breaker.probe_reset", connection="conn-a", lease=lease,
+                                   probe_ok=True)["result"]["reset"])
+        finally:
+            release.set()
+            worker.join(10.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(_code(out["r"]), "connection_tripped")
+        self.assertEqual(_charges(w), 0)
+
+    # -- the ledger holds the guard until its transaction ends (review 1 of #378, R2) -------------------
+
+    def test_the_guard_is_held_until_the_ledger_commits_or_rolls_back(self) -> None:
+        cases = (("commit", None), ("budget_refusal", Refused), ("sql_error", sqlite3.OperationalError),
+                 ("base_exception", _Interrupt))
+        for case, raised in cases:
+            with self.subTest(case=case):
+                w = World(self)
+                w.load()
+                env = profile(w.installer, total=1_000, max_effect=1_000)
+                real = w.authority._db
+                if case == "budget_refusal":
+                    w.authority.charge(env, **_charge_args(w, "first"))  # spends the whole budget
+                elif case != "commit":
+                    error = sqlite3.OperationalError("injected") if case == "sql_error" else _Interrupt()
+                    w.authority._db = _FailingInsert(real, error)
+                guard = _RecordingGuard(real)
+                try:
+                    if raised is None:
+                        self.assertEqual(w.authority.charge(env, **_charge_args(w, case), commit_guard=guard)
+                                         ["spent_minor"], 1_000)
+                    else:
+                        with self.assertRaises(raised):
+                            w.authority.charge(env, **_charge_args(w, case), commit_guard=guard)
+                finally:
+                    w.authority._db = real
+                self.assertTrue(guard.entered)
+                self.assertFalse(guard.in_transaction_at_exit, "the guard was released with the transaction open")
+                self.assertFalse(real.in_transaction)
+                self.assertEqual(_charges(w), 1 if case in ("commit", "budget_refusal") else 0)
+
+    def test_a_guard_whose_exit_raises_after_commit_leaves_one_charge(self) -> None:
+        # Review 1 of #378 (DeepSeek F2): the guard's exit runs after COMMIT. The charge stands, the
+        # error reaches the caller, and a retry with the same idempotency key is not charged again.
+        w = World(self)
+        w.load()
+        env = profile(w.installer)
+        with self.assertRaises(_Interrupt):
+            w.authority.charge(env, **_charge_args(w, "exit-raises"), commit_guard=_RaisingExitGuard())
+        self.assertFalse(w.authority._db.in_transaction)
+        self.assertEqual(_charges(w), 1)
+        with self.assertRaises(Refused) as again:
+            w.authority.charge(env, **_charge_args(w, "exit-raises"))
+        self.assertEqual(again.exception.code, "effect_replayed")
+        self.assertEqual(_charges(w), 1)
+
+    def test_a_guard_that_refuses_on_entry_writes_nothing(self) -> None:
+        w = World(self)
+        w.load()
+        env = profile(w.installer)
+        with self.assertRaises(Refused) as refused:
+            w.authority.charge(env, **_charge_args(w, "refused"), commit_guard=_RefusingGuard())
+        self.assertEqual(refused.exception.code, "run_faulted")
+        self.assertFalse(w.authority._db.in_transaction)
+        self.assertEqual(_charges(w), 0)
+        self.assertEqual(w.authority.charge(env, **_charge_args(w, "after"))["spent_minor"], 1_000)
+
+
+class _Interrupt(BaseException):
+    """A BaseException that is not KeyboardInterrupt, so no runner treats it as a real interrupt."""
+
+
+class _FailingInsert:
+    """The ledger's connection, failing the charge's INSERT with a given error."""
+
+    def __init__(self, real, error: BaseException) -> None:
+        self._real, self._error = real, error
+
+    def execute(self, sql, params=()):
+        if sql.startswith("INSERT INTO charges"):
+            raise self._error
+        return self._real.execute(sql, params)
+
+    def close(self) -> None:
+        self._real.close()
+
+
+class _RecordingGuard:
+    """A commit guard that records whether the ledger's transaction was still open when it was released."""
+
+    def __init__(self, connection) -> None:
+        self._connection = connection
+        self.entered = False
+        self.in_transaction_at_exit = None
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.in_transaction_at_exit = self._connection.in_transaction
+
+
+class _RaisingExitGuard:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc) -> None:
+        if exc_type is None:
+            raise _Interrupt()
+
+
+class _RefusingGuard:
+    def __enter__(self):
+        raise Refused("run_faulted")
+
+    def __exit__(self, *exc) -> None:  # pragma: no cover - never entered
+        raise AssertionError("exited a guard that was never entered")
+
+
+def _charge_args(w: World, key: str) -> dict:
+    return dict(plugin_id="demo.plugin", artifact_sha256=w.loader.artifact("demo.plugin"), scope=scope_of(),
+                kind="order.submit", provider="fake-provider", model_version="fake-model-1", currency="USD",
+                amount_minor=1_000, idempotency_key=key)
+
+
+def _signal_begin(w: World, event: threading.Event) -> None:
+    """Wrap the ledger's connection so that ``event`` is set when a charge begins its write transaction."""
+    real_db = w.authority._db
+
+    class _Db:
+        def execute(self, sql, params=()):
+            if sql == "BEGIN IMMEDIATE":
+                event.set()
+            return real_db.execute(sql, params)
+
+        def close(self) -> None:
+            real_db.close()
+
+    w.authority._db = _Db()
+
+
+def _trip_and_reset(test: unittest.TestCase, w: World, connection: str = "conn-a") -> None:
+    """Trip a connection through the host, then clear it through one successful leased probe."""
+    trip = w.call(w.host, "breaker.report", connection=connection, event_type="plan_limit")
+    test.assertTrue(trip["ok"] and trip["result"]["tripped"], trip)
+    lease = w.call(w.host, "breaker.probe_begin", connection=connection)
+    test.assertTrue(lease["ok"], lease)
+    reset = w.call(w.host, "breaker.probe_reset", connection=connection, lease=lease["result"]["lease"],
+                   probe_ok=True)
+    test.assertTrue(reset["ok"] and reset["result"]["reset"], reset)
+
+
+def _light_core(test: unittest.TestCase, **overrides) -> CoreService:
+    """A CoreService over real components that need no cryptography (no plugin loaded, no ledger)."""
+    path = os.path.join(temp_dir(test), "breaker.db")
+    create_breaker_store(path)
+    breaker = ConnectionBreaker(path)
+    test.addCleanup(breaker.close)
+    health = CoreHealth()
+    trust = TrustStore({})
+    test.addCleanup(trust.close)
+    loader = PluginLoader(trust, {}, ReservedEffects(frozenset(), ()), health, FakeGilProbe())
+    args = dict(loader=loader, gate=ApprovalGate(lambda *drawn: None, authenticate, Clock()), breaker=breaker,
+                health=health, authority=None, effect_permissions={"order": "order"},
+                authority_required=frozenset({"order"}))
+    args.update(overrides)
+    return CoreService(**args)
+
+
+class CommitFencePrimitiveTests(unittest.TestCase):
+    """The fence's own rules, with no plugin and no signature, so they run on every interpreter."""
+
+    def test_drain_waits_for_a_held_section(self) -> None:
+        fence = CommitFence()
+        trying, done = threading.Event(), threading.Event()
+
+        def drain() -> None:
+            trying.set()
+            fence.drain()
+            done.set()
+
+        with fence:
+            worker = threading.Thread(target=drain)
+            worker.start()
+            self.assertTrue(trying.wait(10.0))
+            self.assertFalse(done.wait(0.3), "a drain returned while a section held the fence")
+        worker.join(10.0)
+        self.assertTrue(done.is_set())
+
+    def test_an_exception_in_a_section_releases_the_fence(self) -> None:
+        fence = CommitFence()
+        with self.assertRaises(ValueError):
+            with fence:
+                raise ValueError("inside the section")
+        drainer = threading.Thread(target=fence.drain)
+        drainer.start()
+        drainer.join(10.0)
+        self.assertFalse(drainer.is_alive(), "the fence stayed held after the section raised")
+
+    def test_a_drain_or_a_second_entry_on_the_holding_thread_is_refused(self) -> None:
+        # Review 1 of #378 (DeepSeek F3): either would wait for itself for ever. The checks run in a
+        # daemon thread, so a fence that hung would fail this test, not hold the runner.
+        fence = CommitFence()
+        seen: list[str] = []
+
+        def inside() -> None:
+            with fence:
+                for name, call in (("drain", fence.drain), ("enter", fence.__enter__)):
+                    try:
+                        call()
+                    except RuntimeError:
+                        seen.append(name)
+            fence.drain()  # once the section has ended, the same thread may drain and enter again
+            with fence:
+                seen.append("again")
+
+        worker = threading.Thread(target=inside, daemon=True)
+        worker.start()
+        worker.join(10.0)
+        self.assertFalse(worker.is_alive(), "the fence waited for itself")
+        self.assertEqual(seen, ["drain", "enter", "again"])
+        drainer = threading.Thread(target=fence.drain, daemon=True)  # released after the section
+        drainer.start()
+        drainer.join(10.0)
+        self.assertFalse(drainer.is_alive())
+
+    def test_trip_changes_count_per_connection_and_only_after_a_position(self) -> None:
+        fence = CommitFence()
+        fence.mark_trip_change("conn-a")
+        started = fence.position()
+        self.assertFalse(fence.trip_changed_since("conn-a", started))  # changed before the call began
+        fence.mark_trip_change("conn-b")
+        self.assertFalse(fence.trip_changed_since("conn-a", started))  # another connection
+        self.assertTrue(fence.trip_changed_since("conn-b", started))
+        fence.mark_trip_change("conn-a")
+        self.assertTrue(fence.trip_changed_since("conn-a", started))
+        self.assertFalse(fence.trip_changed_since("conn-a", fence.position()))
+
+    def test_is_vetoed_reads_under_the_gates_lock(self) -> None:
+        gate = ApprovalGate(lambda *drawn: None, authenticate, Clock())
+        done = threading.Event()
+        answer: list[bool] = []
+        reader = threading.Thread(target=lambda: (answer.append(gate.is_vetoed("0" * 64)), done.set()))
+        with gate._lock:
+            reader.start()
+            self.assertFalse(done.wait(0.3), "is_vetoed answered while the gate's lock was held")
+        reader.join(10.0)
+        self.assertEqual(answer, [False])
+
+    def test_the_core_takes_only_a_commit_fence(self) -> None:
+        shared = CommitFence()
+        self.assertIs(_light_core(self, commit_fence=shared).commit_fence, shared)
+        self.assertIs(type(_light_core(self).commit_fence), CommitFence)
+
+        class Subclass(CommitFence):
+            def drain(self) -> None:  # a fence that would answer at once
+                pass
+
+        for wrong in (object(), threading.Lock(), Subclass()):
             with self.subTest(wrong=type(wrong).__name__):
                 with self.assertRaises(TypeError):
-                    CoreService(loader=w.loader, gate=w.gate, breaker=w.breaker, health=w.health,
-                                authority=w.authority, effect_permissions={}, authority_required=frozenset(),
-                                commit_fence=wrong)
+                    _light_core(self, commit_fence=wrong)
+        core = _light_core(self, commit_fence=shared)
+        for replacement in (CommitFence(), Subclass(), None):  # review 1 of #378 (DeepSeek F7)
+            with self.subTest(replacement=type(replacement).__name__):
+                with self.assertRaises(AttributeError):
+                    core.commit_fence = replacement
+        self.assertIs(core.commit_fence, shared)
+
+    def test_a_report_that_cannot_trip_does_not_wait_for_a_commit_section(self) -> None:
+        # Review 1 of #378 (DeepSeek F5): the core's own timeouts change nothing, so the host's report
+        # of one answers while a commit section holds the fence; a report that trips waits for it.
+        core = _light_core(self)
+        host = core.client_for("host")
+        answers: dict[str, dict] = {}
+
+        def report(event: str) -> None:
+            answers[event] = World.call(host, "breaker.report", connection="conn-a", event_type=event)
+
+        with core.commit_fence:
+            quiet = threading.Thread(target=report, args=("core_timeout",), daemon=True)
+            quiet.start()
+            quiet.join(10.0)
+            self.assertFalse(quiet.is_alive(), "a report that cannot trip waited for the commit section")
+            tripping = threading.Thread(target=report, args=("plan_limit",), daemon=True)
+            tripping.start()
+            tripping.join(0.3)
+            self.assertTrue(tripping.is_alive(), "a report that trips answered while a commit section held the fence")
+        tripping.join(10.0)
+        self.assertFalse(tripping.is_alive())
+        self.assertEqual(answers["core_timeout"]["result"], {"tripped": False})
+        self.assertEqual(answers["plan_limit"]["result"], {"tripped": True})
+
+    def test_a_trip_and_a_reset_through_the_host_mark_the_connection(self) -> None:
+        core = _light_core(self)
+        host = core.client_for("host")
+        started = core.commit_fence.position()
+        for event in ("core_timeout", "core_deadline", "caller_cancelled"):  # never trips: no mark
+            self.assertFalse(World.call(host, "breaker.report", connection="conn-a", event_type=event)
+                             ["result"]["tripped"])
+        self.assertFalse(core.commit_fence.trip_changed_since("conn-a", started))
+        self.assertTrue(World.call(host, "breaker.report", connection="conn-a", event_type="plan_limit")
+                        ["result"]["tripped"])
+        self.assertTrue(core.commit_fence.trip_changed_since("conn-a", started))
+        after_trip = core.commit_fence.position()
+        lease = World.call(host, "breaker.probe_begin", connection="conn-a")["result"]["lease"]
+        self.assertFalse(World.call(host, "breaker.probe_reset", connection="conn-a", lease=lease,
+                                    probe_ok=False)["result"]["reset"])  # a failed probe changes nothing
+        self.assertFalse(core.commit_fence.trip_changed_since("conn-a", after_trip))
+        lease = World.call(host, "breaker.probe_begin", connection="conn-a")["result"]["lease"]
+        self.assertTrue(World.call(host, "breaker.probe_reset", connection="conn-a", lease=lease,
+                                   probe_ok=True)["result"]["reset"])
+        self.assertTrue(core.commit_fence.trip_changed_since("conn-a", after_trip))
+        self.assertFalse(core.commit_fence.trip_changed_since("conn-b", started))
 
 
 if __name__ == "__main__":

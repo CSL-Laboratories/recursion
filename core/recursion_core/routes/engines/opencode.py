@@ -140,7 +140,8 @@ _CONNECTION = re.compile(r"(subscription|api_key|passthrough):.+")
 # by parsedate_tz, which rewrites a year below 100 and skips words it does not know). Fields are separated by spaces
 # only; whitespace may surround the value. Names (weekday, month, zone) are read in any case, as Date.parse reads
 # them. IMF-fixdate, with its usual leniencies: an optional weekday, a day and an hour of one or two digits, optional
-# seconds.
+# seconds. A date without its weekday is read only when _http_date is called directly: from a header, a value that
+# starts with the day is first read as that many seconds (_js_float, as Number.parseFloat reads it in OpenCode).
 _IMF_DATE = re.compile(r"\s*(?:[A-Za-z]+, *)?([0-9]{1,2}) +([A-Za-z]{3}) +([0-9]{4}) +([0-9]{1,2}):([0-9]{2})"
                        r"(?::([0-9]{2}))? +(GMT|UTC|UT|Z|[+-][0-9]{4})\s*", re.IGNORECASE)
 # rfc850-date: weekday, DD-Mon-YY, a time with seconds, a zone; its two-digit year is read by RFC 9110's 50-year rule.
@@ -246,7 +247,8 @@ class Parser:
         # clock, an interruption, a memory error), up to and including the return, all of it is put back, so the line
         # counts as not read and feeding it again gives the same drafts at the same offsets, with no text, usage,
         # error or anomaly counted twice. An interruption that lands in the CALLER after the return finds the line
-        # read: its drafts are the caller's to keep or lose.
+        # read: its drafts are the caller's to keep or lose. A SECOND interruption that lands inside the rollback
+        # below is the one case not put back: no rollback written in Python can guard its own lines.
         start, lines, session, limit = self._offset, self._lines, self.engine_session_id, self._limit
         kept = [(kept_list, len(kept_list)) for kept_list in (self.anomalies, self._text, self._usage, self._errors)]
         try:
@@ -276,7 +278,8 @@ class Parser:
             code, detail = self._result
             return [_draft("result", {"code": code, "detail": detail})]
         except BaseException:
-            # As in feed: an interruption before end() has returned leaves the run open, so end() can be called again.
+            # As in feed: one interruption before end() has returned leaves the run open, so end() can be called
+            # again; a second one that lands on the line below is not put back.
             self._result = None
             raise
 

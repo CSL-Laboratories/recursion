@@ -1215,6 +1215,15 @@ class ReviewOneTests(Shape, unittest.TestCase):
             with self.subTest(text):
                 self.assertEqual(oc._js_float(text), number)
 
+    # round 9
+    def test_r9_the_shape_check_refuses_a_count_past_max_exact(self):
+        (usage,) = typed(parser().feed(line(step({"input": 5}))), "usage")
+        usage["input_tokens"] = known(oc.MAX_EXACT)
+        self.check({"type": "usage", "payload": usage})                  # the last exact count passes
+        usage["input_tokens"] = known(oc.MAX_EXACT + 1)
+        with self.assertRaises(self.failureException):
+            self.check({"type": "usage", "payload": usage})
+
     def test_r8_waits_read_javascripts_digits_spaces_and_infinity(self):
         cases = [({"retry-after": chr(0x661) + chr(0x662) + chr(0x660)}, None),   # NaN to JavaScript, and no date
                  ({"retry-after-ms": "".join(chr(0xFF10 + int(d)) for d in "12000"), "retry-after": "60"},

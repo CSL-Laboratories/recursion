@@ -30,6 +30,7 @@ from recursion_core.loop import done as d
 from recursion_core.loop import instructions as ins
 from recursion_core.loop import permissions as perm
 from recursion_core.loop import protocol as p
+from recursion_core.loop import store as st
 from recursion_core.loop.engine import DEFAULT_MAX_STEPS, Config, Engine, Session
 from recursion_core.loop.providers import anthropic, fake
 from recursion_core.loop.tools import edit, read, search, shell, write
@@ -65,6 +66,8 @@ def _parser() -> argparse.ArgumentParser:
                     help="do not read AGENTS.md and CLAUDE.md into the prompt")
     ap.add_argument("--context-window", type=int, default=None,
                     help="the model's context window in tokens, from the route; without it the loop never compacts")
+    ap.add_argument("--resume", default=None, metavar="ENGINE_SESSION_ID",
+                    help="continue the conversation stored under this id in the engine home")
     ap.add_argument("--fake-script", help="steps for the fake provider (tests and conformance runs)")
     ap.add_argument("--fake-record", help="append each request the fake provider receives to this file")
     return ap
@@ -138,18 +141,24 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"recursion_loop: {exc}") from None
     text, found = ("", []) if args.no_project_instructions else ins.discover(workspace.root)
     redactor = p.Redactor(secrets)
+    try:
+        store = st.ConversationStore(home, args.resume or st.new_id(), redactor.scrub_obj)
+        loaded = store.load() if args.resume else None
+    except (st.StoreError, ToolError) as exc:
+        raise SystemExit(f"recursion_loop: {exc}") from None
     out = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False, buffering=1)
     writer = p.Writer(out, redactor)
     gate = perm.PermissionGate(writer, profile=args.permissions, deadline_s=args.approval_timeout)
     session = Session(provider, registry, workspace, writer, redactor,
                       Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
                              effort=args.effort, acceptance=acceptance, instructions=text,
-                             context_window=args.context_window), gate=gate)
+                             context_window=args.context_window), gate=gate, store=store, loaded=loaded)
     engine = Engine(session, writer)
     writer.write("ready", protocol=p.PROTOCOL_VERSION, engine="recursion_loop", provider=provider.name, model=model,
                  tools=list(registry.names()), permissions=args.permissions,
                  acceptance=acceptance.command if acceptance else None,
-                 instructions=[f.to_wire() for f in found])
+                 instructions=[f.to_wire() for f in found], engine_session_id=store.session_id,
+                 resumed=loaded is not None, unknown_outcomes=list(loaded.repaired) if loaded else [])
 
     def pump() -> None:
         try:
@@ -158,7 +167,10 @@ def main(argv: list[str] | None = None) -> int:
             engine.input_ended()
 
     threading.Thread(target=pump, name="recursion-loop-stdin", daemon=True).start()
-    return engine.serve()
+    try:
+        return engine.serve()
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

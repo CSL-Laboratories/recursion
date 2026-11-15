@@ -11,7 +11,8 @@ one field more than driver.v2's: the loop's request id, which the driver takes f
 binding (``engine_request_id``), so the answer reaches the request it belongs to.
 
 Out (one object per line; standard output carries nothing else, diagnostics go to standard error):
-    ready           once, at start: protocol version, provider, model, tool names
+    ready           once, at start: protocol version, provider, model, tool names, permissions, acceptance,
+                    instruction files, engine_session_id (resume with --resume), resumed, unknown_outcomes
     input_accepted  {delivery_id, turn_id, how: "new_turn"}, written the moment the loop takes a message and
                     before anything is sent to the model; never for a message the loop did not take
     text            {turn_id, text}: one finished block of the model's text

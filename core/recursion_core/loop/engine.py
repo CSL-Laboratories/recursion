@@ -47,6 +47,7 @@ from recursion_core.loop import done as d
 from recursion_core.loop import protocol as p
 from recursion_core.loop.permissions import PermissionGate
 from recursion_core.loop.providers import base as b
+from recursion_core.loop.store import ConversationStore, Loaded
 from recursion_core.loop.tools import registry as r
 from recursion_core.loop.tools.workspace import Workspace
 
@@ -128,10 +129,26 @@ class UsageTotal:
     def model(self) -> str | None:
         return next(iter(self.models)) if len(self.models) == 1 else None
 
+    def to_state(self) -> dict:
+        return {"calls": self.calls, "models": sorted(m for m in self.models if m is not None),
+                "null_model": None in self.models, "sum": self._sum, "known": self._known, "exact": self._exact}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "UsageTotal":
+        total = cls()
+        total.calls = int(state["calls"])
+        total.models = set(state["models"]) | ({None} if state.get("null_model") else set())
+        for name in b.USAGE_FIELDS:
+            total._sum[name] = state["sum"][name]
+            total._known[name] = int(state["known"][name])
+            total._exact[name] = bool(state["exact"][name])
+        return total
+
 
 class Session:
     def __init__(self, provider: b.Provider, registry: r.ToolRegistry, workspace: Workspace, writer: p.Writer,
-                 redactor: p.Redactor, config: Config, gate: PermissionGate | None = None) -> None:
+                 redactor: p.Redactor, config: Config, gate: PermissionGate | None = None,
+                 store: ConversationStore | None = None, loaded: Loaded | None = None) -> None:
         self.provider = provider
         self.registry = registry
         self.workspace = workspace
@@ -149,6 +166,19 @@ class Session:
         self._ceiling = c.ceiling(config.context_window) if config.context_window else None
         self._prompt_tokens: int | None = None  # the provider's count of the last prompt it was sent
         self._counted = 0  # how many messages that count covers
+        self.store = store
+        if loaded is not None:  # a resumed conversation
+            self.messages = list(loaded.messages)
+            self.user_messages = list(loaded.user_messages)
+            if loaded.totals:
+                self.session_usage = UsageTotal.from_state(loaded.totals)
+            if loaded.repaired and store is not None:
+                store.message(self.messages[-1])  # the unknown outcomes are now part of the record
+
+    def _add(self, message: b.Message) -> None:
+        self.messages.append(message)
+        if self.store is not None:
+            self.store.message(message)
 
     # -- one turn ----------------------------------------------------------------------------------------
 
@@ -216,14 +246,18 @@ class Session:
         if done is None:
             return
         self.messages = done.messages
+        if self.store is not None:
+            self.store.replace(self.messages)
         self._prompt_tokens, self._counted = None, 0
         self.writer.write("compaction", turn_id=turn_id, before_tokens=size, replaced=done.replaced, kept=done.kept,
                           summary=done.summary_source, reason=done.reason,
                           after_tokens_estimate=c.estimate(self.messages))
 
     def _turn(self, turn_id: str, text: str, cancel: b.CancelToken, usage: UsageTotal) -> str:
-        self.messages.append(b.Message("user", (b.TextPart(text),)))
+        self._add(b.Message("user", (b.TextPart(text),)))
         self.user_messages.append((turn_id, text))
+        if self.store is not None:
+            self.store.user(turn_id, text)
         steps = 0
         checks = 0
         acceptance = self.config.acceptance
@@ -252,7 +286,7 @@ class Session:
                 return self._end(turn_id, "failed", self._result(exc.code, exc.detail), "provider_error", usage)
             self._count(usage, response, turn_id, len(request.messages), "turn")
             if response.parts:
-                self.messages.append(b.Message("assistant", response.parts))
+                self._add(b.Message("assistant", response.parts))
             for part in response.parts:
                 if isinstance(part, b.TextPart) and part.text:
                     self.writer.write("text", turn_id=turn_id, text=part.text)
@@ -264,7 +298,7 @@ class Session:
             if calls:
                 # Tool calls in a reply that did not stop for them (cut off at the output limit, refused): none
                 # runs, and each gets an error result so the conversation stays valid.
-                self.messages.append(b.Message("user", tuple(
+                self._add(b.Message("user", tuple(
                     b.ToolResult(c.call_id, "not run: the reply ended before this call was complete", True)
                     for c in calls)))
             if stop in (b.END_TURN, b.STOP_SEQUENCE):
@@ -285,7 +319,7 @@ class Session:
                     return self._end(turn_id, "paused", self._result(
                         None, f"the acceptance check failed {checks} times; the last one {status}"),
                         "acceptance_failed", usage)
-                self.messages.append(b.Message("user", (b.TextPart(
+                self._add(b.Message("user", (b.TextPart(
                     self.redactor.scrub(d.feedback(acceptance, ran, checks))),)))
                 continue
             if stop == b.PAUSE:
@@ -317,7 +351,9 @@ class Session:
                               spill=({"ref": outcome.spill_ref, "bytes": outcome.output_bytes}
                                      if outcome.spill_ref else None))
             results.append(b.ToolResult(call.call_id, outcome.model_text, outcome.status != r.OK))
-        self.messages.append(b.Message("user", tuple(results)))
+            if self.store is not None:
+                self.store.result(results[-1])  # journaled as soon as the call is over
+        self._add(b.Message("user", tuple(results)))
 
     def _result(self, code: str | None, detail: str) -> dict:
         detail = self.redactor.scrub(detail)
@@ -330,6 +366,9 @@ class Session:
             self.writer.write("usage", turn_id=turn_id, span="turn", model=usage.model, **usage.to_wire())
             self.writer.write("usage", turn_id=turn_id, span="session_total", model=self.session_usage.model,
                               **self.session_usage.to_wire())
+        if self.store is not None:
+            self.store.totals(self.session_usage.to_state())
+            self.store.sync()
         self.writer.write("turn_ended", turn_id=turn_id, outcome=outcome, result=result, reason=reason)
         return outcome
 

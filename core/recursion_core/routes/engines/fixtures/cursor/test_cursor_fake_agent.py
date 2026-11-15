@@ -171,6 +171,35 @@ class AcpMatchingTest(unittest.TestCase):
         process = self.ready_for_the_prompt(count=4)
         self.refused(process, {**scripted("acp/prompt_turns.jsonl", 4), "id": 101})
 
+    def test_a_boolean_is_never_taken_for_a_number_or_the_reverse(self):
+        """Review 2 of #388, change 2 (both reads): ``protocolVersion: true`` is not 1, ``terminal: 0`` not false."""
+        process = fake_agent.FakeLauncher("acp/load.jsonl")(cursor.acp_argv(), env={})
+        msg = scripted("acp/load.jsonl", 0, 1)
+        self.refused(process, {**msg, "params": {**msg["params"], "protocolVersion": True}})
+        caps = msg["params"]["clientCapabilities"]
+        self.refused(process, {**msg, "params": {**msg["params"], "clientCapabilities": {**caps, "terminal": 0}}})
+        send(process, msg)   # the scripted message is still the one due
+
+    def test_an_answer_with_a_boolean_for_a_number_is_refused(self):
+        """Review 2 of #388, change 2: the answer to the agent's own request is compared the same way."""
+        entries = [{"dir": "agent", "msg": {"jsonrpc": "2.0", "id": 7, "method": "session/request_permission",
+                                            "params": {"sessionId": "s"}}},
+                   {"dir": "client", "msg": {"jsonrpc": "2.0", "id": 7, "result": {"count": 1, "flag": False}}}]
+        process = fake_agent.AcpProcess(entries)
+        self.assertEqual(json.loads(process.read_line(1.0))["id"], 7)
+        self.refused(process, {"jsonrpc": "2.0", "id": 7, "result": {"count": True, "flag": False}})
+        self.refused(process, {"jsonrpc": "2.0", "id": 7, "result": {"count": 1, "flag": 0}})
+        send(process, {"jsonrpc": "2.0", "id": 7, "result": {"count": 1, "flag": False}})
+        self.assertIsNone(process.read_line(1.0))
+
+    def test_same_json_keeps_json_types_apart(self):
+        same = fake_agent.same_json
+        for a, b in ((1, 1), (1, 1.0), (True, True), (None, None), ("a", "a"), ({"k": [1, {"x": False}]}, {"k": [1, {"x": False}]})):
+            self.assertTrue(same(a, b), (a, b))
+        for a, b in ((True, 1), (1, True), (False, 0), (0, False), (None, False), ("1", 1), ({"k": 1}, {"k": True}),
+                     ([1], [True]), ({"a": 1}, {"a": 1, "b": 2}), ([1], [1, 1]), ({}, []), (1.5, 1)):
+            self.assertFalse(same(a, b), (a, b))
+
     def test_a_refused_message_is_not_taken(self):
         process = self.ready_for_the_prompt(count=4)
         self.refused(process, {**scripted("acp/prompt_turns.jsonl", 4), "id": 101})

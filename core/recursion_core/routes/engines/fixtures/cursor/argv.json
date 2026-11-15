@@ -1,14 +1,14 @@
 {
   "written_by": "Claude Opus 5.5 (claude-opus-5-5), lane ENGINE-E6",
-  "provenance": "this lane's rule, not a capture: the updater flag on every spawn (vault 20261107-csl712-engine-clis-grounding-01, V38), no credential in argv, argv[0] the vouched executable",
+  "provenance": "this lane's rule, not a capture: the updater flag first on every spawn (vault 20261107-csl712-engine-clis-grounding-01, V38), no credential in argv, full access only when acknowledged, argv[0] the vouched executable",
   "oneshot": {
     "model": "synthetic-model",
-    "argv": ["agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model"]
+    "argv": ["agent", "--disable-auto-update", "-p", "--output-format", "stream-json", "--model", "synthetic-model"]
   },
   "oneshot_pinned": {
     "binary": "/opt/cursor/bin/agent",
     "model": "synthetic-model",
-    "argv": ["/opt/cursor/bin/agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model"]
+    "argv": ["/opt/cursor/bin/agent", "--disable-auto-update", "-p", "--output-format", "stream-json", "--model", "synthetic-model"]
   },
   "acp": {
     "argv": ["agent", "--disable-auto-update", "acp"]
@@ -28,6 +28,7 @@
     {"argv": ["agent", "--disable-auto-update", "a\u0000b", "acp"], "detail": "argv_invalid"},
     {"argv": ["agent", "--disable-auto-update", "", "acp"], "detail": "argv_invalid"},
     {"argv": ["agent", "acp", "--disable-auto-update"], "detail": "updater_not_disabled"},
+    {"argv": ["agent", "-p", "--disable-auto-update", "--output-format", "stream-json"], "detail": "updater_not_disabled"},
     {"argv": ["agent", "--disable-auto-update", "-vH", "Authorization: Bearer made-up", "acp"], "detail": "credential_in_argv:-H"},
     {"argv": ["agent", "--disable-auto-update", "--force", "acp"], "detail": "full_access_not_acknowledged:--force"},
     {"argv": ["agent", "--disable-auto-update", "--yolo", "acp"], "detail": "full_access_not_acknowledged:--yolo"},
@@ -36,8 +37,8 @@
     {"argv": ["agent", "--disable-auto-update", "--sandbox", "disabled", "acp"], "detail": "full_access_not_acknowledged:--sandbox"}
   ],
   "accepted": [
-    ["agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model", "--", "--api-key=only-the-prompt"],
-    ["agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model", "--", "-HAuthorization: only the prompt"],
+    ["agent", "--disable-auto-update", "-p", "--output-format", "stream-json", "--model", "synthetic-model", "--", "--api-key=only-the-prompt"],
+    ["agent", "--disable-auto-update", "-p", "--output-format", "stream-json", "--model", "synthetic-model", "--", "-HAuthorization: only the prompt"],
     ["agent", "--disable-auto-update", "-p", "--", "--disable-auto-update"]
   ]
 }

@@ -7,7 +7,8 @@ test can hold argv to this lane's rules (``cursor.check_argv``) without running 
 
 * ``OneShotProcess`` replays a one-shot stream fixture (``oneshot/*.jsonl``) line by line, then end of file.
 * ``AcpProcess`` plays one side of an ACP transcript (``acp/*.jsonl``, lines ``{"dir", "msg"}``): each message
-  the client sends must be the transcript's next client message EXACTLY, but for a request's own id: the
+  the client sends must be the transcript's next client message EXACTLY (``same_json``: a boolean is never a
+  number), but for a request's own id: the
   same method, the same params (session, prompt, working directory), request or notification as scripted;
   an answer to the agent's own request must be the scripted answer whole (its id and the option chosen).
   The agent messages after it are then readable. The ids of the client's requests are the client's own: an
@@ -49,6 +50,22 @@ def fixture_header(name: str) -> dict:
     if not _is_header(first):
         raise FakeScriptError(f"{name} has no _fixture header")
     return json.loads(first)
+
+
+def same_json(a, b) -> bool:
+    """JSON equality as JSON means it: a boolean is never a number (in Python ``True == 1``), objects have
+    the same keys, arrays the same length and order. Numbers compare by value (``1`` is ``1.0``)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+        return isinstance(a, (int, float)) and isinstance(b, (int, float)) and a == b
+    if isinstance(a, dict) or isinstance(b, dict):
+        return (isinstance(a, dict) and isinstance(b, dict) and a.keys() == b.keys()
+                and all(same_json(a[k], b[k]) for k in a))
+    if isinstance(a, list) or isinstance(b, list):
+        return (isinstance(a, list) and isinstance(b, list) and len(a) == len(b)
+                and all(same_json(x, y) for x, y in zip(a, b)))
+    return a == b   # only text and null are left here
 
 
 def _is_header(line: str) -> bool:
@@ -118,11 +135,11 @@ class AcpProcess(_Process):
                 raise FakeScriptError(f"{want['method']} must be a {'request' if 'id' in want else 'notification'}")
             # Everything but the request's own id is the script's: method, params (the session, the prompt,
             # the working directory) and the envelope.
-            if {k: v for k, v in got.items() if k != "id"} != {k: v for k, v in want.items() if k != "id"}:
+            if not same_json({k: v for k, v in got.items() if k != "id"}, {k: v for k, v in want.items() if k != "id"}):
                 raise FakeScriptError(f"{want['method']} differs from the transcript: {line!r}")
             if "id" in want:
                 self._ids[want["id"]] = got["id"]
-        elif got != want:
+        elif not same_json(got, want):
             # An answer to the agent's own request: its id, and its whole result or error (the option chosen).
             raise FakeScriptError(f"expected the answer {json.dumps(want)}, got {line!r}")
         self._script.popleft()

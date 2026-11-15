@@ -51,17 +51,17 @@ interpreter has no JSON Schema library, so `test_cursor_fixtures` checks each me
 | `input_digest(value) -> str` | SHA-256 hex of the RFC 8785 text (the core's `control.methods.canonical_text`) | `NoCanonicalText` (a `ValueError`) for a value with no such text |
 | `MAX_INPUT_BYTES`, `MAX_RESULT_BYTES` | 65,536 each | this lane's choice (questions.md Q4): a larger input is drafted with `input` null; a longer result text is cut, `truncated` true |
 | `oneshot_declaration() -> dict` | `{"engine": "cursor", "driver": 2, "flags": {eight, all false}, "input_ack": false}` | |
-| `oneshot_argv(model, *, binary=None) -> list[str]` | `[argv0, "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", model]` | argv0 is `binary` (an absolute path) or `agent` |
+| `oneshot_argv(model, *, binary=None) -> list[str]` | `[argv0, "--disable-auto-update", "-p", "--output-format", "stream-json", "--model", model]` | argv0 is `binary` (a plain absolute path) or `agent`; the updater flag stands first on both drives |
 | `acp_argv(*, binary=None) -> list[str]` | `[argv0, "--disable-auto-update", "acp"]` | |
-| `check_argv(argv, *, binary=None, full_access_acknowledged=False) -> None` | raises `ArgvRefused` | the options are the arguments before the first `--`; a credential option is refused in any spelling (`-vH V` too); `--force`, `-f`, `--yolo`, `--approve-mcps`, `--sandbox disabled` (and `--dangerously-skip-permissions`, `--auto-approve`, not Cursor's) only with `full_access_acknowledged`; the updater flag stands before `acp` |
-| `ArgvRefused` | a `ValueError` with `.code == "launch_refused"` and `.detail` one of `argv_invalid`, `binary_not_absolute`, `model_invalid`, `executable_mismatch`, `credential_in_argv:<option>`, `full_access_not_acknowledged:<option>`, `updater_not_disabled` | |
+| `check_argv(argv, *, binary=None, full_access_acknowledged=False) -> None` | raises `ArgvRefused` | the options are the arguments before the first `--`; a credential option is refused in any spelling (`-vH V` too); `--force`, `-f`, `--yolo`, `--approve-mcps`, `--sandbox disabled` (and `--dangerously-skip-permissions`, `--auto-approve`, not Cursor's) only with `full_access_acknowledged=True` (any value but a bool is `full_access_malformed`); argv[1] must be the updater flag |
+| `ArgvRefused` | a `ValueError` with `.code == "launch_refused"` and `.detail` one of `full_access_malformed`, `argv_invalid`, `binary_not_absolute`, `model_invalid`, `executable_mismatch`, `credential_in_argv:<option>`, `full_access_not_acknowledged:<option>`, `updater_not_disabled` | |
 | `MAX_ARG_BYTES` | 131,071 | Linux's one-argument limit less its NUL |
 | `unattended_switch() -> dict` | `{"engine": "cursor", "switch": "unattended", "state": "off", "refusal": "cursor_unattended_off", "waits_on": "counsel"}` | a copy of a read-only record; nothing reads it yet |
 | `unattended_refusal() -> dict` | `{"code": "cursor_unattended_off", "detail": <text>}` | run.record.v1's `start_error` shape |
 
 `fake_agent.py`: `FakeLauncher(fixture)(argv, *, env, shell=False, **options)` records each launch in
 `.launches` and hands out the process in `.processes`; `fixture_lines(name)` and `fixture_header(name)` read
-a fixture. The ACP process takes only the transcript's own next client message (request ids are the
-client's own), raises `FakeScriptError` for anything else and does not take it, raises `ReadTimeout` while
+a fixture. The ACP process takes only the transcript's own next client message, compared by `same_json` (a
+boolean is never a number; request ids are the client's own), raises `FakeScriptError` for anything else and does not take it, raises `ReadTimeout` while
 the agent waits for the client, and gives end of file when the transcript is done. Neither fake runs,
 times or answers anything a fixture does not hold.

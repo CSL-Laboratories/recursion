@@ -240,6 +240,75 @@ class AcpTranscriptTest(unittest.TestCase):
                          ["the option chosen was not offered"])
         self.assertEqual(acp_answer_problems("session/prompt", {}, {"stopReason": "done"}), ["stopReason not in ACP v1"])
 
+    def test_each_shape_rule_refuses_its_own_break(self):
+        """Review 2 of #388, change 3 (Astra): every rule of the shape check has a case that only it refuses.
+
+        Q01 to Q22 are the read's own proposed cases (review-2-388-gpt-6-astra-evidence/shape_rule_probes.py);
+        the rest cover the content and session-state rules this answer adds. True: a problem is reported.
+        """
+        perm = {"sessionId": "s", "toolCall": {"toolCallId": "c"},
+                "options": [{"optionId": "reject", "name": "Reject", "kind": "reject_once"}]}
+        prompt = lambda *blocks: ("params", ("client", "session/prompt", {"sessionId": "s", "prompt": list(blocks)}))  # noqa: E731
+        chunk = lambda content: ("params", ("agent", "session/update", {"sessionId": "s", "update": {  # noqa: E731
+            "sessionUpdate": "agent_message_chunk", "content": content}}))
+        cases = {
+            "Q01 method side": (("params", ("agent", "initialize", {"protocolVersion": 1})), True),
+            "Q02 params object": (("params", ("client", "session/cancel", [])), True),
+            "Q03 request version": (("params", ("client", "initialize", {"protocolVersion": True})), True),
+            "Q04 auth method": (("params", ("client", "authenticate", {"methodId": False})), True),
+            "Q05 cwd": (("params", ("client", "session/new", {"cwd": "relative", "mcpServers": []})), True),
+            "Q06 mcp list": (("params", ("client", "session/new", {"cwd": "/work", "mcpServers": {}})), True),
+            "Q07 session id": (("params", ("client", "session/cancel", {"sessionId": ""})), True),
+            "Q08 prompt blocks": (("params", ("client", "session/prompt", {"sessionId": "s", "prompt": {}})), True),
+            "Q09 update kind": (("params", ("agent", "session/update", {"sessionId": "s", "update": {
+                "sessionUpdate": "not-an-update"}})), True),
+            "Q10 call title": (("params", ("agent", "session/update", {"sessionId": "s", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "c"}})), True),
+            "Q11 update call id": (("params", ("agent", "session/update", {"sessionId": "s", "update": {
+                "sessionUpdate": "tool_call_update"}})), True),
+            "Q12 chunk content": (("params", ("agent", "session/update", {"sessionId": "s", "update": {
+                "sessionUpdate": "agent_message_chunk"}})), True),
+            "Q13 permission call": (("params", ("agent", "session/request_permission", {**perm, "toolCall": {}})), True),
+            "Q14 permission options": (("params", ("agent", "session/request_permission", {**perm, "options": [
+                {"optionId": "x", "name": "X", "kind": "not-a-kind"}]})), True),
+            "Q15 answer object": (("answer", ("session/load", {}, None)), True),
+            "Q16 answer version": (("answer", ("initialize", {}, {"protocolVersion": True})), True),
+            "Q17 auth methods": (("answer", ("initialize", {}, {"protocolVersion": 1, "authMethods": [{"id": "x"}]})), True),
+            "Q18 new session id": (("answer", ("session/new", {}, {})), True),
+            "Q19 stop reason": (("answer", ("session/prompt", {}, {"stopReason": "not-a-stop"})), True),
+            "Q20 cancelled outcome": (("answer", ("session/request_permission", {}, {"outcome": {"outcome": "cancelled"}})), False),
+            "Q21 selected shape": (("answer", ("session/request_permission", {"options": [{"optionId": "x"}]},
+                                               {"outcome": {"outcome": "unexpected", "optionId": "x"}})), True),
+            "Q22 offered option": (("answer", ("session/request_permission", {"options": [{"optionId": "x"}]},
+                                               {"outcome": {"outcome": "selected", "optionId": "y"}})), True),
+            "empty prompt": (prompt(), True),
+            "text prompt": (prompt({"type": "text", "text": "Hi"}), False),
+            "text content needs its text": (prompt({"type": "text"}), True),
+            "content of no known type": (prompt({"type": "video", "data": "x"}), True),
+            "image needs data and mimeType": (prompt({"type": "image", "data": "x"}), True),
+            "image with both": (prompt({"type": "image", "data": "x", "mimeType": "image/png"}), False),
+            "resource link needs name and uri": (prompt({"type": "resource_link", "name": "n"}), True),
+            "resource link with both": (prompt({"type": "resource_link", "name": "n", "uri": "file:///a"}), False),
+            "resource needs its object": (prompt({"type": "resource", "resource": "x"}), True),
+            "resource with its object": (prompt({"type": "resource", "resource": {"uri": "file:///a"}}), False),
+            "chunk text must be text": (chunk({"type": "text", "text": 7}), True),
+            "chunk text": (chunk({"type": "text", "text": "Hello"}), False),
+            "load modes not an object": (("answer", ("session/load", {}, {"modes": "not-an-object"})), True),
+            "load mode without a name": (("answer", ("session/load", {}, {"modes": {
+                "currentModeId": "agent", "availableModes": [{"id": "agent"}]}})), True),
+            "load modes": (("answer", ("session/load", {}, {"modes": {
+                "currentModeId": "agent", "availableModes": [{"id": "agent", "name": "Agent"}]}})), False),
+            "load modes null": (("answer", ("session/load", {}, {"modes": None})), False),
+            "new config options not a list": (("answer", ("session/new", {}, {"sessionId": "s", "configOptions": {}})), True),
+            "new config options null": (("answer", ("session/new", {}, {"sessionId": "s", "configOptions": None})), False),
+            "capabilities not an object": (("answer", ("initialize", {}, {"protocolVersion": 1, "agentCapabilities": []})), True),
+            "initialize with nothing optional": (("answer", ("initialize", {}, {"protocolVersion": 1})), False),
+        }
+        for name, ((kind, args), expected) in cases.items():
+            with self.subTest(case=name):
+                check = acp_params_problems if kind == "params" else acp_answer_problems
+                self.assertEqual(bool(check(*args)), expected, check(*args))
+
     def test_the_permission_transcript_denies(self):
         """Review 1 of #388 (Sol M25): the denial transcript must stay a denial."""
         entries = dict(self.transcripts())["acp/prompt_turns.jsonl"]
@@ -258,10 +327,40 @@ UPDATES = ("user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "
            "session_info_update", "usage_update", "notice", "compaction_update", "compaction_summary_chunk")
 CLIENT_METHODS = ("initialize", "authenticate", "session/new", "session/load", "session/prompt", "session/cancel")
 AGENT_METHODS = ("session/update", "session/request_permission")
+# ContentBlock's variants and each one's required text fields (TextContent, ImageContent, AudioContent,
+# ResourceLink; EmbeddedResource requires an object ``resource``).
+CONTENT_TEXT_FIELDS = {"text": ("text",), "image": ("data", "mimeType"), "audio": ("data", "mimeType"),
+                       "resource_link": ("name", "uri"), "resource": ()}
 
 
 def _text(value) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def content_problems(block) -> list:
+    """What an ACP v1 ContentBlock lacks: a known type and that type's required fields, as text."""
+    if not isinstance(block, dict) or block.get("type") not in CONTENT_TEXT_FIELDS:
+        return ["content block of no ACP v1 type"]
+    kind = block["type"]
+    if any(not isinstance(block.get(name), str) for name in CONTENT_TEXT_FIELDS[kind]):
+        return [f"{kind} content lacks {'/'.join(CONTENT_TEXT_FIELDS[kind])} as text"]
+    if kind == "resource" and not isinstance(block.get("resource"), dict):
+        return ["resource content lacks its resource object"]
+    return []
+
+
+def session_state_problems(result: dict) -> list:
+    """The optional session state of a session/new or session/load answer: ``modes`` and ``configOptions``."""
+    out = []
+    modes = result.get("modes")
+    if modes is not None and not (isinstance(modes, dict) and isinstance(modes.get("currentModeId"), str)
+                                  and isinstance(modes.get("availableModes"), list)
+                                  and all(isinstance(m, dict) and _text(m.get("id")) and _text(m.get("name"))
+                                          for m in modes["availableModes"])):
+        out.append("modes is not an ACP v1 session mode state")
+    if result.get("configOptions") is not None and not isinstance(result["configOptions"], list):
+        out.append("configOptions is not a list")
+    return out
 
 
 def acp_params_problems(side: str, method: str, params) -> list:
@@ -287,8 +386,10 @@ def acp_params_problems(side: str, method: str, params) -> list:
             out.append("sessionId missing")
     if method == "session/prompt":
         prompt = params.get("prompt")
-        if not (isinstance(prompt, list) and prompt and all(isinstance(b, dict) and _text(b.get("type")) for b in prompt)):
+        if not (isinstance(prompt, list) and prompt):
             out.append("prompt is not a list of content blocks")
+        else:
+            out += [p for block in prompt for p in content_problems(block)]
     elif method == "session/update":
         update = params.get("update")
         kind = update.get("sessionUpdate") if isinstance(update, dict) else None
@@ -298,8 +399,8 @@ def acp_params_problems(side: str, method: str, params) -> list:
             out.append("tool_call lacks toolCallId or title")
         elif kind == "tool_call_update" and not _text(update.get("toolCallId")):
             out.append("tool_call_update lacks toolCallId")
-        elif kind.endswith("_chunk") and not (isinstance(update.get("content"), dict) and _text(update["content"].get("type"))):
-            out.append(f"{kind} lacks content")
+        elif kind.endswith("_chunk"):
+            out += content_problems(update.get("content"))
     elif method == "session/request_permission":
         call, options = params.get("toolCall"), params.get("options")
         if not (isinstance(call, dict) and _text(call.get("toolCallId"))):
@@ -322,9 +423,12 @@ def acp_answer_problems(method: str, params, result) -> list:
         if not (isinstance(methods, list) and all(isinstance(m, dict) and _text(m.get("id")) and _text(m.get("name"))
                                                   for m in methods)):
             return ["authMethods are not ACP v1 auth methods"]
-    elif method == "session/new":
-        if not _text(result.get("sessionId")):
+        if "agentCapabilities" in result and not isinstance(result["agentCapabilities"], dict):
+            return ["agentCapabilities is not an object"]
+    elif method in ("session/new", "session/load"):
+        if method == "session/new" and not _text(result.get("sessionId")):
             return ["sessionId missing"]
+        return session_state_problems(result)
     elif method == "session/prompt":
         if result.get("stopReason") not in STOP_REASONS:
             return ["stopReason not in ACP v1"]

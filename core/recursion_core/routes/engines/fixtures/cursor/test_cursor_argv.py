@@ -33,9 +33,9 @@ class BuildTest(unittest.TestCase):
         cursor.check_argv(cursor.oneshot_argv("m", binary="/opt/c/agent"), binary="/opt/c/agent")
         cursor.check_argv(cursor.acp_argv(binary="/opt/c/agent"), binary="/opt/c/agent")
 
-    def test_every_spawn_disables_the_updater(self):
+    def test_every_spawn_disables_the_updater_first(self):
         for argv in (cursor.oneshot_argv("m"), cursor.acp_argv(), cursor.oneshot_argv("m", binary="/x/agent")):
-            self.assertIn("--disable-auto-update", argv[1:])
+            self.assertEqual(argv[1], "--disable-auto-update")
 
     def test_argv0_is_the_default_command_or_the_given_binary_and_nothing_else(self):
         self.assertEqual(cursor.DEFAULT_EXECUTABLE, "agent")
@@ -67,14 +67,17 @@ class BuildTest(unittest.TestCase):
 
 
 class CheckTest(unittest.TestCase):
-    def test_the_updater_flag_stands_before_the_acp_command(self):
-        """Break-it read of #388, F1: after ``acp`` it is the command's argument, not the global option."""
-        for argv in (["agent", "acp", "--disable-auto-update"], ["agent", "acp", "--disable-auto-update", "x"]):
+    def test_the_updater_flag_stands_first(self):
+        """Break-it read of #388, F1, in its stricter form (questions.md Q18): argv[1], on both drives."""
+        for argv in (["agent", "acp", "--disable-auto-update"], ["agent", "acp", "--disable-auto-update", "x"],
+                     ["agent", "-p", "--model", "m", "--disable-auto-update"],
+                     ["agent", "-p", "--disable-auto-update", "--model", "m"], ["agent"]):
             with self.assertRaises(cursor.ArgvRefused) as caught:
                 cursor.check_argv(argv)
-            self.assertEqual(caught.exception.detail, "updater_not_disabled")
+            self.assertEqual(caught.exception.detail, "updater_not_disabled", argv)
         cursor.check_argv(["agent", "--disable-auto-update", "acp"])
-        cursor.check_argv(["agent", "-p", "--model", "m", "--disable-auto-update"])   # no command: any option place
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--model", "m"])
+        cursor.check_argv(("agent", "--disable-auto-update", "acp"))
 
     def test_a_credential_under_bundled_short_options_is_refused(self):
         """Break-it read of #388, F2: ``-vH V`` is ``-v`` and ``-H V``."""
@@ -102,6 +105,27 @@ class CheckTest(unittest.TestCase):
                 cursor.check_argv(["agent", "--disable-auto-update", *credential, "--force"],
                                   full_access_acknowledged=True)
             self.assertTrue(caught.exception.detail.startswith("credential_in_argv:"), credential)
+
+    def test_only_the_bool_true_acknowledges_full_access(self):
+        """Review 2 of #388, change 1 (both reads): as the existing guards rule, ``"true"``, ``1`` and the like
+        are not an acknowledgement, and a malformed one is refused whatever the argv."""
+        argv = ["agent", "--disable-auto-update", "-p", "--force", "--", "say hi"]
+        cursor.check_argv(argv, full_access_acknowledged=True)
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(argv, full_access_acknowledged=False)
+        self.assertEqual(caught.exception.detail, "full_access_not_acknowledged:--force")
+        for value in (1, 0, "true", "false", "", [True], {"ack": True}, None, 1.0):
+            for target in (argv, cursor.acp_argv()):
+                with self.assertRaises(cursor.ArgvRefused) as caught:
+                    cursor.check_argv(target, full_access_acknowledged=value)
+                self.assertEqual(caught.exception.detail, "full_access_malformed", value)
+
+    def test_the_argument_limit_counts_utf8_bytes(self):
+        """Review 2 of #388, change 4 (Astra) / change 3 (Sol): two-byte characters at the boundary."""
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--", "\u00e9" * 65535])   # 131,070 bytes
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(["agent", "--disable-auto-update", "-p", "--", "\u00e9" * 65536])   # 131,072 bytes
+        self.assertEqual(caught.exception.detail, "argv_invalid")
 
     def test_an_argument_that_cannot_be_passed_is_refused(self):
         """Break-it read of #388, F8: empty, over the one-argument limit, or a line break among the options."""
@@ -141,7 +165,7 @@ class CheckTest(unittest.TestCase):
             self.assertEqual(caught.exception.detail, "argv_invalid")
 
     def test_every_refused_argv_of_the_fixture(self):
-        self.assertEqual(len(ARGV["refused"]), 20)
+        self.assertEqual(len(ARGV["refused"]), 21)
         for case in ARGV["refused"]:
             with self.subTest(argv=case["argv"]):
                 with self.assertRaises(cursor.ArgvRefused) as caught:

@@ -161,18 +161,18 @@ def _executable(binary: object) -> str:
 
 
 def oneshot_argv(model: object, *, binary: object = None) -> list[str]:
-    """The one-shot drive's argv up to the prompt.
+    """The one-shot drive's options, up to the prompt (the driver adds ``--`` and the prompt).
 
-    How the prompt reaches the process (a positional argument or standard input) is not settled without a
-    capture; the driver that adds it is the next slice. No ``--force``, ``--api-key`` or header is added.
+    The updater flag stands first, right after argv[0], on both drives. No ``--force``, ``--api-key`` or
+    header is added.
     """
-    if not isinstance(model, str) or not model or model.startswith("-") or any(c in model for c in "\x00\r\n"):
+    if not isinstance(model, str) or not model or model.startswith("-") or any(ch in model for ch in "\x00\r\n"):
         raise ArgvRefused("model_invalid")
-    return [_executable(binary), "-p", "--output-format", "stream-json", NO_UPDATE, "--model", model]
+    return [_executable(binary), NO_UPDATE, "-p", "--output-format", "stream-json", "--model", model]
 
 
 def acp_argv(*, binary: object = None) -> list[str]:
-    """The long-lived drive: ``agent acp``, the updater flag as a global option before the command."""
+    """The long-lived drive: ``agent acp``, the updater flag first, as a global option before the command."""
     return [_executable(binary), NO_UPDATE, "acp"]
 
 
@@ -182,16 +182,20 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
     The options are the arguments before the first ``--``; what follows it is positional text (the prompt)
     and is never read as an option. In this order:
 
+    * ``full_access_malformed``: ``full_access_acknowledged`` is not a bool; only ``True`` acknowledges, as
+      in the existing launch guards (``"true"``, ``1`` and the like are not an acknowledgement).
     * ``argv_invalid``: not a non-empty list of text; an empty argument; an argument holding a NUL or longer
-      than MAX_ARG_BYTES (neither can be passed); an option holding a CR or LF.
+      than MAX_ARG_BYTES UTF-8 bytes (neither can be passed); an option holding a CR or LF.
     * ``executable_mismatch``: argv[0] is not the vouched executable.
     * ``credential_in_argv:<option>``: an option carries a credential, in any spelling: ``--api-key K``,
       ``--api-key=K``, ``-H V``, ``-HV``, or ``H`` among bundled short options (``-vH V``).
     * ``full_access_not_acknowledged:<option>``: a full-access option (FULL_ACCESS_OPTIONS, ``-f`` alone or
-      bundled, ``--sandbox disabled``) without ``full_access_acknowledged``.
-    * ``updater_not_disabled``: the updater flag is not among the options, or stands after the ``acp``
-      command instead of before it as a global option.
+      bundled, ``--sandbox disabled``) without ``full_access_acknowledged=True``.
+    * ``updater_not_disabled``: argv[1] is not the updater flag. It stands first on both drives, so it is a
+      global option before any command (the break-it read's F1, in its stricter form: questions.md Q18).
     """
+    if not isinstance(full_access_acknowledged, bool):
+        raise ArgvRefused("full_access_malformed")
     if (not isinstance(argv, (list, tuple)) or not argv
             or not all(isinstance(a, str) and a and "\x00" not in a and len(a.encode("utf-8", "surrogatepass"))
                        <= MAX_ARG_BYTES for a in argv)):
@@ -211,7 +215,7 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
         for option in CREDENTIAL_SHORT_OPTIONS:
             if option[1] in letters:
                 raise ArgvRefused(f"credential_in_argv:{option}")
-    if not full_access_acknowledged:
+    if full_access_acknowledged is not True:
         for i, arg in enumerate(options):
             for option in FULL_ACCESS_OPTIONS:
                 if arg == option or arg.startswith(option + "="):
@@ -222,7 +226,7 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
             for option in FULL_ACCESS_SHORT_OPTIONS:
                 if option[1] in letters:
                     raise ArgvRefused(f"full_access_not_acknowledged:{option}")
-    if NO_UPDATE not in options or ("acp" in options and options.index(NO_UPDATE) > options.index("acp")):
+    if len(argv) < 2 or argv[1] != NO_UPDATE:
         raise ArgvRefused("updater_not_disabled")
 
 

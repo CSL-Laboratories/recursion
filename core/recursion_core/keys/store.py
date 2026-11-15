@@ -5,12 +5,12 @@ secure storage, in the OS keychain where there is one and in an owner-only file 
 are never logged, never put in a prompt and never sent to CSL; engine sign-ins stay in each engine's own
 store; any vendor's key can be kept.
 
-TWO PLACES. The INDEX (``index.json``) holds what is safe to show: per key id, the provider, the variable name
-the engine reads it from, when it was saved, which backend holds it, and its spend opt-in and cap; and the
-operations that were started on a backend and not finished. It never holds a value. The VALUE is in the
-BACKEND: the Secret Service, or the owner-only file (``backends.py``). Both files live in one owner-only folder,
-``$XDG_CONFIG_HOME/recursion/keys`` (``~/.config/recursion/keys``), with the checks of ``files.py``. Nothing here
-is in the event database: no key state changes with an event, and no secret sits beside the event log.
+TWO PLACES. The INDEX (``index.json``) holds what is safe to show: per key id, the provider, the variable name the
+engine reads it from, when it was saved, which backend holds it, and its spend opt-in and cap; and the operations that
+were started on a backend and not finished. It never holds a value. The VALUE is in the BACKEND: the Secret Service, the
+macOS Keychain, or the owner-only file (``backends.py``). Both files live in one owner-only folder,
+``$XDG_CONFIG_HOME/recursion/keys`` (``~/.config/recursion/keys``), with the checks of ``files.py``. Nothing here is in
+the event database: no key state changes with an event, and no secret sits beside the event log.
 
 IDENTITY. Nothing about a store depends on how its folder is spelled. The store's id, which names its items in a
 keychain all of the user's stores share, is random and is recorded in the index at the first save; every
@@ -18,7 +18,7 @@ spelling that reaches the folder (``..``, a symlinked parent, a trailing or doub
 another letter case on a file system that ignores case) opens the same index, so it reads the same id, takes the
 same lock and reaches the same values. A relative folder is refused, so the working directory never matters.
 THE BINDING. Each save also gets a random ``save_id``, recorded with its key. The backend stores the value WITH
-the store's id, that save id and the record's provider (a Secret Service item's attributes; the owner-only file's
+the store's id, that save id and the record's provider (a keychain item's attributes; the owner-only file's
 entry and its header), and ``credential`` asks for the value of exactly that record: a value is released only
 when all three match the record being used and the store. So an older index put back, or an edited record, gets
 ``secret_missing``, never another save's value. An index copied in from another store's folder carries that
@@ -93,10 +93,11 @@ it. A store whose backend is the owner-only file and that has no record takes th
 same folder is the same store). A store on a keychain never takes it, and never reads the owner-only file to save or
 release a key, nor to remove one while its index pins it there (only the audit reads it, for values to look for). On a
 keychain an item is named by the store's id, which only the index records: an index LOST leaves the store's items with
-no name this store knows, so it can neither release nor remove them (the keychain's own tool can: they carry
-``application recursion``). ``remove <id>`` of an id a record names deletes every item of the id in the store, whichever
-save stored it. The audit counts every Recursion item in the keychain that neither a record names by its save nor an
-unfinished operation by its id (``unnamed_items``), and is incomplete while there is one.
+no name this store knows, so it can neither release nor remove them (the keychain's own tool can: on the Secret Service
+they carry ``application recursion``, on the macOS Keychain their service is ``recursion.<save id>``). ``remove <id>``
+of an id a record names deletes every item of the id in the store, whichever save stored it. The audit counts every
+Recursion item in the keychain that neither a record names by its save nor an unfinished operation by its id
+(``unnamed_items``), and is incomplete while there is one.
 """
 from __future__ import annotations
 
@@ -130,7 +131,8 @@ INDEX_NAME = 'index.json'
 INDEX_MAX = 1 << 20
 INDEX_VERSION = 1
 FIELDS = ('provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd', 'save_id')
-SHOWN = ('key_id', 'provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd')
+PUBLISHED = ('key_id', 'provider', 'env_name', 'created_at', 'store')    # key.list's answer (methods.v1.json, S1)
+SHOWN = PUBLISHED + ('metered_spend_allowed', 'cap_usd')                 # list --json: the spend opt-in added
 PENDING_FIELDS = ('op', 'started_at')
 OPS = ('add', 'remove')
 RANDOM_ID = re.compile(r'[0-9a-f]{32}')
@@ -162,8 +164,15 @@ class KeyRecord:
     def spend_allowed(self) -> bool:
         return self.metered_spend_allowed is True and self.cap_usd > 0
 
+    def published(self) -> dict:
+        """What ``key.list`` (S1) answers for the key: exactly the fields its published schema names (``PUBLISHED``).
+        No spend field (lane QUOTA reads those through ``spend_policy``) and no save id."""
+        return {name: getattr(self, name) for name in PUBLISHED}
+
     def as_json(self) -> dict:
-        """What ``list --json`` shows: the record without its save id, which is the store's own business."""
+        """What the local ``list --json`` shows the owner: the published fields, then the spend opt-in and cap typed
+        at ``add`` (``SHOWN``). Never the save id, which is the store's own business. It is not ``key.list``'s
+        answer, which is ``published``."""
         return {name: getattr(self, name) for name in SHOWN}
 
 
@@ -507,11 +516,12 @@ class KeyStore:
         return found, missing
 
     def unnamed_items(self) -> int | None:
-        """For ``audit`` only: how many items in the Secret Service carry ``application recursion`` and are named
-        neither by a record of this index (by its save) nor by an unfinished operation (by its id): another store's,
-        or this store's from before its index was lost, emptied or put back (see VALUES NO RECORD NAMES). None when
-        the store does not use the Secret Service. A pin the host no longer offers, or a keychain that cannot be
-        asked, is refused with its code."""
+        """For ``audit`` only: how many items Recursion saved in the keychain (on the Secret Service those that carry
+        ``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<save
+        id>``) are named neither by a record of this index (by its save) nor by an unfinished operation (by its id):
+        another store's, or this store's from before its index was lost, emptied or put back (see VALUES NO RECORD
+        NAMES). None when the store keeps its keys in the owner-only file, or on a keychain whose backend is not
+        built. A pin the host no longer offers, or a keychain that cannot be asked, is refused with its code."""
         folder = self._folder(create=False)
         if folder is None:
             return self._unnamed_items(Index(None, {}))
@@ -522,9 +532,12 @@ class KeyStore:
             return self._unnamed_items(index)
 
     def _unnamed_items(self, index: Index) -> int | None:
-        if index.backend == 'owner_file' or self._backend_name(index.backend) != 'secret_service':
+        if index.backend == 'owner_file':
             return None
-        backend = SecretService(self.system, index.store_id)
+        name = self._backend_name(index.backend)
+        if name not in ('secret_service', 'macos_keychain'):
+            return None
+        backend = self._made(name, index.store_id)
         named = sum(backend.count(kid, None if kid in index.pending else index.keys[kid])   # a record names its save,
                     for kid in sorted(set(index.keys) | set(index.pending)))                  # an intent every save
         return max(backend.count() - named, 0)

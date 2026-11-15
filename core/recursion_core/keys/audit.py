@@ -21,16 +21,18 @@ as JSON would write it inside a string. Symlinks are not followed and only regul
 the search). The report names files and key ids only: no value, no part of one, no surrounding text. Two ids that hold
 one value are both named, once per place.
 
-ITEMS NO RECORD NAMES. On the Secret Service it also counts the items that carry ``application recursion`` and that
+ITEMS NO RECORD NAMES. On a keychain it also counts the items Recursion saved (on the Secret Service those that carry
+``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<save id>``) that
 neither a record of this store's index names by its save nor an unfinished operation by its id
-(``KeyStore.unnamed_items``): another store's, or this store's from before its index was lost, emptied or put
-back. Their values are not looked for; ``remove <id>`` deletes every item of this store under an id a record names,
-and the keychain's own tool finds the rest.
+(``KeyStore.unnamed_items``): another store's, or this store's from before its index was lost, emptied or put back.
+Their values are not looked for; ``remove <id>`` deletes every item of this store under an id a record names, and the
+keychain's own tool finds the rest (``secret-tool`` by that attribute, Keychain Access by the name ``Recursion API key
+<id>``).
 
 COMPLETE OR NOT. The audit is incomplete (``key audit`` exits 4 when it found nothing) when a saved value could
 not be read (gone, or its keychain does not answer now), a file could not be read, an operation is unfinished,
 the journal was asked for and not searched to the end (no ``journalctl``, one that cannot start, or one that
-exits with a failure), or the Secret Service holds an item no record names, or its items could not be counted.
+exits with a failure), or the keychain holds an item no record names, or its items could not be counted.
 Only ``--no-journal`` leaves the journal out without making the audit incomplete. The last line counts the saved
 keys (the index's records) and, apart from them, the values looked for.
 """
@@ -45,7 +47,7 @@ from pathlib import Path
 from recursion_core.keys.errors import KeyStoreError
 from recursion_core.keys.files import TEMP_NAME
 from recursion_core.keys.store import FOREIGN, UNBOUND, KeyStore
-from recursion_core.keys.system import ToolFailed, ToolMissing
+from recursion_core.keys.system import ToolFailed, ToolMissing, detect
 
 CHUNK = 1 << 16
 _NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
@@ -68,8 +70,9 @@ class Report:
     values: int = 0                                  # values looked for: saved keys', unfinished adds', unnamed
     unbound: list = field(default_factory=list)      # ids of values in the store's own file that no record names
     foreign: list = field(default_factory=list)      # ids of values in an owner-only file the store does not use
-    unnamed: int = 0                                 # Secret Service items Recursion saved that no record names
+    unnamed: int = 0                                 # keychain items Recursion saved that no record names
     unnamed_refused: str | None = None               # why those items could not be counted
+    unnamed_in: str | None = None                    # the keychain they were counted in (a store's name)
 
     def complete(self) -> bool:
         return not (self.missing or self.unreadable or self.journal_incomplete or self.pending or self.unnamed
@@ -122,6 +125,8 @@ def run(store: KeyStore, *, extra=(), journal: bool = True) -> Report:
                     foreign=sorted(kid for kid, kind in labels if kind == FOREIGN))
     try:
         report.unnamed = store.unnamed_items() or 0
+        if report.unnamed:
+            report.unnamed_in = index.backend or detect(store.system)
     except KeyStoreError as exc:
         report.unnamed_refused = exc.code
     if not values:

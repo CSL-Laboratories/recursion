@@ -147,3 +147,20 @@ class KeyListTest(TempStoreCase):
         chain.mode = 'locked'
         self.assertEqual(self.dispatch({}, keys)['keys'][0]['store'], 'secret_service')
         self.assertEqual(system.calls, [])
+
+    def test_the_answer_is_each_records_published_fields_and_list_json_adds_only_spend(self) -> None:
+        import json
+
+        from recursion_core.keys.store import PUBLISHED, SHOWN
+
+        keys = self.store()
+        self.add(keys, cap=12.5)
+        record = keys.list().keys['codex-key']
+        item = self.dispatch({}, keys)['keys'][0]
+        self.assertEqual(item, record.published())
+        self.assertEqual(tuple(item), PUBLISHED)
+        local = record.as_json()                          # the local key list --json, round 6's I1
+        self.assertEqual(tuple(local), SHOWN)
+        self.assertEqual({name: local[name] for name in PUBLISHED}, item)
+        self.assertEqual(set(local) - set(item), {'metered_spend_allowed', 'cap_usd'})
+        self.assertNotIn(record.save_id, json.dumps(item) + json.dumps(local))

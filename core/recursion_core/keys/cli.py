@@ -22,7 +22,7 @@
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the
     store's folder. Exit 1 when one was found, 4 when the search was incomplete (a value or a file could not be
-    read, an operation is unfinished, the journal was asked for and not searched to the end, or the Secret Service
+    read, an operation is unfinished, the journal was asked for and not searched to the end, or the keychain
     holds items Recursion saved that no saved key names) and nothing was found, and 3, not 1, when it was refused,
     so that 1 always means a finding.
 
@@ -396,6 +396,15 @@ def _remove(args, out, err, store, terminal) -> int:
     return 0
 
 
+UNNAMED_TEXT = {      # the audit's line on the keychain items no saved key names: where they are, how they are found
+    'secret_service': ('the Secret Service',
+                       'the keychain\'s own tool finds the rest by the attribute "application recursion"'),
+    'macos_keychain': ('the macOS Keychain',
+                       ('Keychain Access finds the rest by the name "Recursion API key <id>" (service '
+                        '"recursion.<save id>")')),
+}
+
+
 def _audit(args, out, err, store) -> int:
     report = audit_mod.run(store, extra=args.key_paths, journal=not args.key_no_journal)
     for place, label in report.found:
@@ -417,11 +426,11 @@ def _audit(args, out, err, store) -> int:
               "file (it names another store, or this store's keys are in a keychain): no command of this store "
               'changes it, and the value leaves with the file', file=out)
     if report.unnamed:
-        print(f'keychain: {report.unnamed} item(s) in the Secret Service that Recursion saved and no saved key of this '
-              "store names (another store's, or this store's from before its index was lost, emptied or put back); "
+        where, finds = UNNAMED_TEXT.get(report.unnamed_in, ('the keychain', "the keychain's own tool finds the rest"))
+        print(f'keychain: {report.unnamed} item(s) in {where} that Recursion saved and no saved key of this store '
+              "names (another store's, or this store's from before its index was lost, emptied or put back); "
               'their values are not looked for. "key remove <id>" deletes every item of this store under an id a '
-              'saved key has, whichever save stored it; the keychain\'s own tool finds the rest by the attribute '
-              '"application recursion"', file=out)
+              f'saved key has, whichever save stored it; {finds}', file=out)
     if report.unnamed_refused:
         print(f'keychain: its items were not counted ({report.unnamed_refused})', file=out)
     for place in report.leftovers:

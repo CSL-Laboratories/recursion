@@ -12,7 +12,7 @@ carries a value.
 
 THE BINDING. A value is stored WITH what authorizes it: the store's id, the save id of the record that saved it
 and that record's provider. ``get`` given a record returns the value only when all three match the record and
-the store; anything else is ``secret_missing``, on both backends. So no index (an older one put back, one copied
+the store; anything else is ``secret_missing``, on every backend. So no index (an older one put back, one copied
 in, one edited) can pair one save's provider and opt-in with another save's value. ``get`` with no record (the
 audit's read of an interrupted add, never a release) returns any value of the id; ``delete`` and ``holds`` act on
 every value of the id. A stored value with no binding beside it is refused, never guessed at.
@@ -38,20 +38,21 @@ when ``lookup`` (which unlocks, prompting if it must) finds nothing AND ``search
 items too, exits 0 and lists none (``presence``). A removal succeeds only then; an add whose helper failed drops
 its intent only then.
 
-MACOS KEYCHAIN. ``/usr/bin/security`` and the login keychain (lane KEYS' questions.md K21, default (d)). Each save
-is its own generic password: service ``recursion.<save id>``, account ``<key id>``, generic attribute (``-G``)
-``<store id>``, comment (``-j``) ``<provider>``, label ``Recursion API key <id>``. A value is looked up with all
-four, so it is returned only to the record of the save that stored it; ``delete`` and ``holds`` match the account
-and the store id, so a removal reaches every save of the id in this store, one item per call, until none is left.
-No save meets another's item (a generic password is unique by account and service), so none replaces a value it
-was not given. The value is written with ``security -i``, which reads its command from standard input: one
-``add-generic-password`` line, the value as hexadecimal (``-X``), nothing of it in the arguments or the
-environment. The exit status of ``-i`` is not documented to report one command's failure, so every save is read
-back by its record and compared; one not kept exactly is taken out again (its own item, no other) and refused
-``keychain_failed``. Exit 44 is "no such item" (``secret_missing``); "User interaction is not allowed" or a locked
-keychain is ``keychain_locked``; a failure's detail is fixed text. Written against Apple's documented interface
-(``security help``) and tested against a stand-in program: it has not run on a Mac. The audit's count of items no
-record names is the Secret Service's alone.
+MACOS KEYCHAIN. ``/usr/bin/security`` and the login keychain (lane KEYS' questions.md K21, default (d)). Each save is
+its own generic password: service ``recursion.<save id>``, account ``<key id>``, generic attribute (``-G``) ``<store
+id>``, comment (``-j``) ``<provider>``, label ``Recursion API key <id>``. A value is looked up with all four, so it is
+returned only to the record of the save that stored it; ``delete`` and ``holds`` match the account and the store id, so
+a removal reaches every save of the id in this store, one item per call, until none is left. No save meets another's
+item (a generic password is unique by account and service), so none replaces a value it was not given. The value is
+written with ``security -i``, which reads its command from standard input: one ``add-generic-password`` line, the value
+as hexadecimal (``-X``), nothing of it in the arguments or the environment. The exit status of ``-i`` is not documented
+to report one command's failure, so every save is read back by its record and compared; one not kept exactly is taken
+out again (its own item, no other) and refused ``keychain_failed``. Exit 44 is "no such item" (``secret_missing``);
+"User interaction is not allowed" or a locked keychain is ``keychain_locked``; a failure's detail is fixed text. Written
+against Apple's documented interface (``security help``) and tested against a stand-in program: it has not run on a Mac.
+``count`` lists the keychain with ``dump-keychain``, which without ``-d`` prints each item's attributes and no password,
+and asks for access to none: the audit's count of the items no record names, as on the Secret Service. A dump that
+fails, or that prints nothing it can read as items, is refused, and the audit is then incomplete.
 
 OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "store_id": <the store's id>,
 "secrets": {id: {"save_id", "provider", "value"}}}``, read and written through ``files.Folder`` (0600, owner and
@@ -287,6 +288,23 @@ class MacKeychain:
         except Exception:  # noqa: BLE001 - a probe that fails cannot tell
             return None
 
+    def count(self, key_id: str | None = None, record=None) -> int:
+        """How many of Recursion's generic passwords ``dump-keychain`` lists: with ``key_id`` and a record, the item
+        that record's save stored; with ``key_id`` alone, this store's items of that id, whichever save stored them;
+        without, every item whose service is ``recursion.<save id>``, whichever store saved it (for the audit's count
+        of the items no record names). Without ``-d`` the dump prints attributes only: no password, and it asks for
+        access to none. A dump that fails, or that prints nothing it can read as items, raises its typed refusal."""
+        done = self._run([self._tool(), 'dump-keychain'])
+        if done.returncode != 0:
+            raise _mac_failure('dump-keychain', done)
+        wanted = {}
+        if key_id is not None:
+            wanted = {'acct': key_id, 'gena': self._store_id}
+            if record is not None:
+                wanted.update(svce=f'recursion.{record.save_id}', icmt=record.provider)
+        return sum(1 for item in _dumped(done.stdout) if MAC_SERVICE.fullmatch(item.get('svce') or '')
+                   and all(item.get(name) == value for name, value in wanted.items()))
+
     def delete(self, key_id: str, folder: Folder) -> None:
         """Remove every item of ``key_id`` in this store, one per call; succeed only when none is verifiably left."""
         for _ in range(self.DELETE_LIMIT):
@@ -307,6 +325,41 @@ def _mac_failure(action: str, done: sysmod.Completed) -> KeyStoreError:
     else:
         code, why = 'keychain_failed', ''
     return KeyStoreError(code, f'security {action} exited {done.returncode}{why}')
+
+
+MAC_SERVICE = re.compile(r'recursion\.[0-9a-f]{32}')       # the service of an item a save wrote: recursion.<save id>
+_DUMP_ATTRIBUTE = re.compile(rb'\s+"([A-Za-z0-9]{4})"<[A-Za-z0-9]+>=(.*)')
+_DUMP_HEX = re.compile(rb'0x((?:[0-9A-Fa-f]{2})+)(?:\s+".*")?')
+
+
+def _dumped(out: bytes) -> list:
+    """The generic passwords in ``security dump-keychain``'s output, each as ``{attribute: text or None}``.
+
+    An item starts at a ``keychain:`` line and its class is on a ``class:`` line (``"genp"`` for a generic
+    password); an attribute line is ``"name"<type>=value``, the value ``"text"``, ``0x<hexadecimal>`` (the text after
+    it) or ``<NULL>``. Output that is not empty and holds no ``keychain:`` line is refused (``keychain_failed``): it
+    is never read as an empty keychain. Nothing of it is repeated in an error."""
+    items, item = [], None
+    for line in out.split(b'\n'):
+        if line.startswith(b'keychain: '):
+            item = {'class': None}
+            items.append(item)
+        elif item is not None and line.startswith(b'class: '):
+            item['class'] = line[len(b'class: '):].strip()
+        elif item is not None:
+            match = _DUMP_ATTRIBUTE.fullmatch(line.rstrip(b'\r'))
+            if match is not None:
+                item[match.group(1).decode('ascii')] = _dumped_value(match.group(2).strip())
+    if out.strip() and not items:
+        raise KeyStoreError('keychain_failed', 'security dump-keychain printed nothing that reads as keychain items')
+    return [item for item in items if item['class'] == b'"genp"']
+
+
+def _dumped_value(raw: bytes) -> str | None:
+    if len(raw) >= 2 and raw.startswith(b'"') and raw.endswith(b'"'):
+        return raw[1:-1].decode('utf-8', 'replace')
+    match = _DUMP_HEX.fullmatch(raw)
+    return bytes.fromhex(match.group(1).decode('ascii')).decode('utf-8', 'replace') if match is not None else None
 
 
 class OwnerFile:

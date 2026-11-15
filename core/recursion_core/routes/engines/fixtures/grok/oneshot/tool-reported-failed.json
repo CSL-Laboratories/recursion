@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand: a tool call that arrives already finished, with status failed (ACP lets a tool_call line carry a terminal status; tool_call_status_wire in headless/reducer/mod.rs at xai-org/grok-build 2bdd1d6a writes pending, in_progress, completed or failed). The parser cannot tell a denial from another failure on this drive, so the result is error, never denied.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "tool_call", "toolCallId": "call_rm", "title": "Shell", "kind": "execute", "status": "failed", "toolName": "run_terminal_cmd", "rawInput": {"command": "rm -rf build"}, "content": [{"type": "content", "content": {"type": "text", "text": "blocked by a deny rule"}}], "locations": []},
+    {"type": "text", "data": "I could not remove the build folder."},
+    {"type": "end", "stopReason": "end_turn", "sessionId": "0f1e2d3c-4b5a-4697-8899-aabbccddeeff", "requestId": "req_15"}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": null,
+    "drafts": ["engine.output", "tool.call", "tool.result", "engine.output", "engine.output", "result"],
+    "text": "I could not remove the build folder."
+  }
+}

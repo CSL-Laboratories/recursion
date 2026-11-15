@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand from notification.rs:344-347 at xai-org/grok-build 2bdd1d6a: incomplete usage with no recorded tokens writes only usage_is_incomplete, with no usage object (headless guide line 200). The parser drafts usage as unknown, never as 0.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "text", "data": "ok"},
+    {"type": "end", "stopReason": "end_turn", "sessionId": "1f0e2d3c-4b5a-4968-8776-655443322110", "requestId": "req_12", "usage_is_incomplete": true}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": null,
+    "drafts": ["engine.output", "engine.output", "usage", "result"],
+    "text": "ok"
+  }
+}

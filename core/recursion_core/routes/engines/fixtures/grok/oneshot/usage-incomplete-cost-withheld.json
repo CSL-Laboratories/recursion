@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand from notification.rs:340-392 at xai-org/grok-build 2bdd1d6a: with usage_is_incomplete the token totals may under-count subagents and every cost field is withheld; cost_is_partial withholds the cost too (headless guide lines 184-200). The counts are made up.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "text", "data": "Done; two subagents helped."},
+    {"type": "end", "stopReason": "end_turn", "sessionId": "c3a9e2d1-6b7f-4a85-9d10-e2f4b6a8c0d2", "requestId": "req_11", "usage": {"input_tokens": 5000, "cache_read_input_tokens": 12000, "cache_creation_input_tokens": 300, "output_tokens": 700, "reasoning_tokens": 90, "total_tokens": 18000}, "num_turns": 3, "usage_is_incomplete": true, "cost_is_partial": true, "modelUsage": {"grok-4.6": {"inputTokens": 4000, "outputTokens": 600, "cacheReadInputTokens": 12000, "cacheCreationInputTokens": 300, "modelCalls": 3, "costIsPartial": true}, "grok-code-fast": {"inputTokens": 1000, "outputTokens": 100, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "modelCalls": 2}}}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": null,
+    "drafts": ["engine.output", "engine.output", "usage", "result"],
+    "text": "Done; two subagents helped."
+  }
+}

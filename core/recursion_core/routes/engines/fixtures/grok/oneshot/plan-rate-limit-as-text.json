@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "provenance": "The one-shot drive's answer to an HTTP 429 on a Grok-plan sign-in, written by hand. headless.rs:1412-1436 at xai-org/grok-build 2bdd1d6a turns ACP error -32003 into user text and the reducer writes it as an error line with no code (AcpLine::Error); the process exits 1. The phrase 'hit the rate limit for your plan' is the mirror's (error.rs:18-19, per vault record 20261109-csl815-grok-route-outcome-recording-01 F4; the string is in the 1.0.77 binary, F8); the rest of the sentence is made up.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "thought", "data": "Planning the change."},
+    {"type": "error", "message": "You've hit the rate limit for your plan. Try again later."}
+  ],
+  "exit_code": 1,
+  "expect": {
+    "code": "short_fault",
+    "drafts": ["engine.output", "engine.output", "result"],
+    "text": ""
+  }
+}

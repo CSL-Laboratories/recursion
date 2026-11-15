@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "provenance": "The message text is the one vault record 20261109-csl713-x7g-grok-cli-auth-mode-switch-01 (section 5.2, case P0) measured from grok 1.0.77 under --output-format json with no sign-in and no network. Its framing here as a streaming-json line is the reducer's (headless/reducer/acp.rs, AcpLine::Error, at xai-org/grok-build 2bdd1d6a) and was not run.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "error", "message": "Not signed in. To authenticate without a browser, run:\n  grok login --device-code\n\nAlternatively, set the XAI_API_KEY environment variable or run `grok login` on a machine with a browser."}
+  ],
+  "exit_code": 1,
+  "expect": {
+    "code": "engine_error",
+    "drafts": ["engine.output", "result"],
+    "text": ""
+  }
+}

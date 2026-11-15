@@ -1,0 +1,18 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand. On the max-turns category headless.rs:1397-1408 at xai-org/grok-build 2bdd1d6a writes max_turns_reached (reducer acp.rs, AcpLine::MaxTurnsReached), then end, and returns an error, so the process exits 1; the guide names max_turn_requests as the stop reason (14-headless-mode.md:239-243).",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "tool_call", "toolCallId": "call_9", "title": "Shell", "kind": "execute", "status": "pending", "toolName": "run_terminal_cmd", "rawInput": {"command": "make test"}, "content": [], "locations": []},
+    {"type": "tool_call_update", "toolCallId": "call_9", "status": "in_progress", "content": [], "rawOutput": null, "locations": []},
+    {"type": "tool_call_update", "toolCallId": "call_9", "status": "completed", "content": [], "rawOutput": {"exit_code": 2, "stdout": "1 failed"}, "locations": []},
+    {"type": "max_turns_reached"},
+    {"type": "end", "stopReason": "max_turn_requests", "sessionId": "9e41b7c3-2a6d-4e58-b0f1-3c7d5a2e8b90", "requestId": "req_3"}
+  ],
+  "exit_code": 1,
+  "expect": {
+    "code": "engine_error",
+    "drafts": ["engine.output", "tool.call", "engine.output", "engine.output", "tool.result", "engine.output", "engine.output", "result"],
+    "text": ""
+  }
+}

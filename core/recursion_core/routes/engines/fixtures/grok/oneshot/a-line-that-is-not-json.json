@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand: a line on standard output that is not JSON (for example a panic message written to the wrong stream), in an otherwise finished run. The parser keeps the raw line in engine.output and ends the run protocol_error.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "text", "data": "fine so far"},
+    "thread 'main' panicked at src/headless.rs:1\n",
+    {"type": "end", "stopReason": "end_turn", "sessionId": "77aa66bb-55cc-44dd-83ee-22ff11009988", "requestId": "req_13"}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": "protocol_error",
+    "drafts": ["engine.output", "engine.output", "engine.output", "result"],
+    "text": "fine so far"
+  }
+}

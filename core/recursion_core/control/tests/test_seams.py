@@ -3320,6 +3320,27 @@ class LifecycleTest(unittest.TestCase):
         again.join(BOUND_S)
         self.assertFalse(again.is_alive(), 'another caller is not left waiting for a lifecycle nobody holds')
 
+    def test_the_two_helpers_that_take_an_ownership_keep_their_own_word(self) -> None:
+        """``take_once`` and ``own_teardown`` are called inside their callers' protected regions, which would by
+        themselves make up for a helper that let an interruption through or forgot to refuse. Their own word is
+        held here, directly: the lock comes back held exactly once however the taking is interrupted, with the
+        interruption kept; and the thread that already owns a teardown is refused, with nothing taken."""
+        for helper in (H.take_once, H.own_teardown):
+            for when in ('before', 'after'):
+                lock, kept = WatchedLock(), []
+                lock.interrupt_next = when
+                with self.subTest(helper=helper.__name__, interrupted=when):
+                    helper(lock, kept)
+                    self.assertEqual(([type(exc) for exc in kept], lock._is_owned()), ([KeyboardInterrupt], True))
+                    lock.release()
+                    self.assertFalse(lock._is_owned(), 'held once: one release frees it')
+        lock = WatchedLock()
+        lock.acquire()
+        with self.assertRaises(H.HookError):
+            H.own_teardown(lock, [])
+        lock.release()
+        self.assertFalse(lock._is_owned(), 'the refusal took nothing')
+
     @quiet
     def test_an_interruption_on_the_way_back_from_taking_the_lifecycle_is_inside_the_protected_region(self) -> None:
         """The third reads of the calls. ``finish_close`` and ``stop_services`` are interrupted as the helper that

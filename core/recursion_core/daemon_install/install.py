@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from .errors import InstallRefused
 from .layout import (Owned, Roots, check_dirs, check_private_dir, ensure_dir, file_untrusted, held_regular,
-                     owned_paths, replace_regular, still_names, unlink_regular, write_exclusive)
+                     owned_paths, replace_regular, still_holds, still_names, unlink_regular, write_exclusive)
 from .unit import MARKER, UNIT_NAME, render_unit
 
 _UNIT_MODE = 0o644
@@ -94,7 +94,8 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     already there change nothing; other bytes, a unit another user could change (another user's, or
     writable by group or world) and a custody root open to anyone else or unusable by its owner are
     refused before anything is made. A unit found is held open until the answer and checked against
-    its path last: one removed or replaced meanwhile is ``unit_missing`` or ``unit_changed``. A refusal
+    its path and its bytes last: one removed, replaced or rewritten in place meanwhile is
+    ``unit_missing`` or ``unit_changed``. A refusal
     after the stores are begun (that, or a store refused after the other was made) leaves what was
     made; each store made is a whole, valid store, and the command run again finds it."""
 
@@ -104,7 +105,8 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     with contextlib.ExitStack() as held:  # a unit found stays open until the answer: its inode is not reused
         present = os.path.lexists(paths.unit)
         if present:
-            current, info = held.enter_context(held_regular(paths.unit))  # checked against the path while open
+            read = held.enter_context(held_regular(paths.unit))  # checked against the path while open
+            current, info = read
             if current != unit:
                 raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
             why = file_untrusted(paths.unit, info)
@@ -115,6 +117,7 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
         if present:
             still_names(paths.unit, info)  # the unit answered for is still the one at its path
+            still_holds(paths.unit, read)  # and still holds the bytes read (not rewritten in place)
         else:
             ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
             write_exclusive(paths.unit, unit, _UNIT_MODE)
@@ -126,20 +129,23 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     ``install`` would write now. A missing unit, and a custody root open to anyone else or unusable by
     its owner, are refused before anything is made. The same bytes are not written again unless
     another user could change the file; a unit kept is held open until the answer and checked
-    against its path last, as in ``install``, whose words on a refusal after the stores apply."""
+    against its path and its bytes last, as in ``install``, whose words on a refusal after the stores
+    apply."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    with held_regular(paths.unit) as (data, info):  # held open until the answer: its inode is not reused
+    with held_regular(paths.unit) as read:  # held open until the answer: its inode is not reused
+        data, info = read
         current = data == unit and not file_untrusted(paths.unit, info)
         check_private_dir(paths.home, paths.homes)  # before anything is made
         made = ensure_stores(paths)
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
         if current:
             still_names(paths.unit, info)  # the unit kept is still the one at its path
+            still_holds(paths.unit, read)  # and still holds the bytes read (not rewritten in place)
         else:
             replace_regular(paths.unit, unit, _UNIT_MODE)
         return _plan("upgrade", not current or _any_created(made) or homes, paths, made)

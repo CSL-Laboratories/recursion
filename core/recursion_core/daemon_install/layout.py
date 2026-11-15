@@ -144,7 +144,11 @@ def ensure_dir(root: str, path: str, *, mode: int = 0o700) -> bool:
     for cur in _folders_below(root, path):
         if _existing_folder(cur):
             continue
-        os.mkdir(cur, mode)
+        try:
+            os.mkdir(cur, mode)
+        except FileExistsError:  # another caller made it since the look above: the same rule holds for it
+            _existing_folder(cur)
+            continue
         created = True
     return created
 
@@ -159,8 +163,8 @@ def check_dirs(root: str, path: str) -> None:
 def check_private_dir(root: str, path: str) -> None:
     """``check_dirs``, and ``path`` itself, if it is there, open to nobody else at all (no bit of
     0o077) and usable by its owner (read, write and search): the route homes' custody root, which
-    ``setup.route_home.check`` holds to the first rule and the launcher's ``private_dir`` needs the
-    second for."""
+    ``setup.route_home.check`` (lane INSTALL's #401, a separate pull request) holds to the first rule
+    and the launcher's ``private_dir`` (``daemon/launcher.py``) needs the second for."""
 
     check_dirs(root, path)
     try:
@@ -228,7 +232,7 @@ def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
     is for ``file_untrusted``; a caller that must compare the path again uses ``held_regular``."""
 
     with held_regular(path) as read:
-        return read
+        return read[0], read[1]
 
 
 @contextlib.contextmanager
@@ -258,9 +262,27 @@ def held_regular(path: str):
                 raise InstallRefused("too_large", path)
             chunks.append(block)
         still_names(path, info)  # while the descriptor is open: the inode is not free to be reused
-        yield b"".join(chunks), info
+        read = _Held((b"".join(chunks), info))
+        read.fd = fd
+        yield read
     finally:
         os.close(fd)
+
+
+class _Held(tuple):
+    """``(bytes, fstat)`` from ``held_regular``, with ``.fd``, the descriptor still open, for ``still_holds``."""
+
+    fd: int
+
+
+def still_holds(path: str, read: _Held) -> None:
+    """Refuse ``unit_changed`` unless the file still held open holds the bytes read from it: its owner can
+    rewrite a file in place (the same inode), which ``still_names`` cannot see. Read again through the
+    held descriptor from the start, one byte past the length read, so an append shows too."""
+
+    data = read[0]
+    if os.pread(read.fd, len(data) + 1, 0) != data:
+        raise InstallRefused("unit_changed", f"{path} was rewritten while it was read; run the command again")
 
 
 def still_names(path: str, info: os.stat_result) -> None:

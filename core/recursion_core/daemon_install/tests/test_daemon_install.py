@@ -299,6 +299,60 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(events[-1], "close", events)
                 self.assertEqual(events[-2], "lstat", events)  # the look at the answer, with the unit still held
 
+    def test_a_unit_rewritten_in_place_while_the_stores_are_made_is_refused(self) -> None:
+        # Review 2 of #410, DeepSeek F1-a: rewritten in place (the same inode, other bytes) the unit passed the
+        # path's identity check and was answered "changed: false". The bytes are read again through the held
+        # descriptor at the answer, one past their length, so an append shows too.
+        module = importlib.import_module("recursion_core.daemon_install.install")
+        real_ensure_stores = module.ensure_stores
+
+        def rewriting(new_bytes):
+            def ensure(paths):
+                with open(self.unit, "r+b") as handle:
+                    handle.truncate(0)
+                    handle.write(new_bytes)
+                return real_ensure_stores(paths)
+            return ensure
+        for name, new_bytes in (("other bytes", b"# rewritten in place\n"),
+                                ("appended", render_unit(EXEC).encode() + b"# appended\n")):
+            for step in (install, upgrade):
+                with self.subTest(change=name, step=step.__name__):
+                    if os.path.lexists(self.unit):
+                        os.unlink(self.unit)
+                    install(self.roots, EXEC)
+                    inode = os.stat(self.unit).st_ino
+                    with self.assertRaises(InstallRefused) as caught, \
+                            mock.patch.object(module, "ensure_stores", side_effect=rewriting(new_bytes)):
+                        step(self.roots, EXEC)
+                    self.assertEqual(caught.exception.kind, "unit_changed")
+                    self.assertIn("was rewritten while it was read", caught.exception.detail)
+                    self.assertEqual(os.stat(self.unit).st_ino, inode)  # the same file: only its bytes moved
+
+    def test_a_folder_another_caller_makes_first_is_used_not_raised(self) -> None:
+        # Review 2 of #410, DeepSeek F8 (older than slice 2): a second installer made a folder between this one's
+        # look and its mkdir, and FileExistsError came out raw. Such a folder is held to the same rule and used.
+        shutil.rmtree(os.path.join(self.home, ".local"))
+        real_mkdir = os.mkdir
+
+        def the_other_caller_first(path, mode=0o777, *args, **kwargs):
+            real_mkdir(path, 0o700)
+            return real_mkdir(path, mode, *args, **kwargs)
+        with mock.patch("os.mkdir", side_effect=the_other_caller_first):
+            plan = install(self.roots, EXEC)
+        self.assertTrue(plan.changed)
+        self.assertEqual(_read(self.unit), render_unit(EXEC))
+        self.assertTrue(os.path.isdir(self.homes))
+
+        def a_writable_one_first(path, mode=0o777, *args, **kwargs):
+            real_mkdir(path, 0o700)
+            os.chmod(path, 0o777)  # made by the other caller, but open to everyone: refused, not used
+            return real_mkdir(path, mode, *args, **kwargs)
+        other = os.path.join(self.case, "other-home")
+        os.mkdir(other, 0o700)
+        with self.assertRaises(InstallRefused) as caught, mock.patch("os.mkdir", side_effect=a_writable_one_first):
+            install(Roots(other), EXEC)
+        self.assertEqual(caught.exception.kind, "folder_untrusted")
+
     def test_a_custody_root_its_owner_cannot_use_is_refused(self) -> None:
         # Review 1 of #410, DeepSeek F3: a custody root at 0000 has no group or world bit and was accepted,
         # yet neither the launcher nor route_home.check can use it. Its owner needs read, write and search.

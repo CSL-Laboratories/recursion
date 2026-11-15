@@ -31,7 +31,10 @@ to the table::
     int; the CLI's own are 0 ok, 1 an API error, 2 a usage error, 3 pending, 4 unknown.
 
 Only a registered name is dispatched. A name nobody registered is rejected by argparse as a usage error,
-as today; it is never treated as a start.
+as today; it is never treated as a start. (That is so when the registrants compose. When one is installed
+and broken, the CLI cannot tell a mistyped name from that lane's command: any name that is not one of its
+own five is answered ``control_api_unavailable``, while its own help and its own usage error for an argv
+that names no command stay what they are, after a line on stderr that names the broken registrant.)
 
 Registration happens once, when the hooks are composed, before any command is parsed; ``freeze()`` then
 closes the table. Two families that claim one name, or a family that claims one of the CLI's five,

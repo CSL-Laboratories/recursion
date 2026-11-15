@@ -761,6 +761,7 @@ class RegistrationTest(unittest.TestCase):
         self.assertIn('ModuleNotFoundError', str(caught.exception))
         self.assertIn('recursion_core.keys.hooks', str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, ModuleNotFoundError)
+        self.assertEqual(caught.exception.registrant, 'recursion_core.keys.hooks', 'and it is told beside the text')
 
     def test_a_hooks_module_that_raises_on_import_fails_composition(self) -> None:
         self.fake.lane('keys', hooks='raise RuntimeError("at import")\n')
@@ -817,6 +818,20 @@ class RegistrationTest(unittest.TestCase):
         with self.assertRaises(H.HookError) as caught:
             H.compose()
         self.assertIn('authorize', str(caught.exception))
+        # An error of the hooks' own keeps its text; the registrant composition stopped at is told beside it.
+        self.assertEqual((caught.exception.registrant, str(caught.exception)),
+                         ('recursion_core.events.hooks', "hook 'authorize' already has a registrant"))
+
+    def test_what_fails_after_the_last_registrant_names_no_registrant(self) -> None:
+        """The check that is made when the tables close is no one registrant's, and neither is an error that no
+        composition raised: each names none. (The CLI's line then says only that the registrants could not be
+        composed.)"""
+        nobodys = H.HookError("method 'session.list' needs the service 'sessions', which nobody registered")
+        self.assertIsNone(nobodys.registrant)
+        with mock.patch.object(H.Hooks, 'freeze', side_effect=nobodys), self.assertRaises(H.HookError) as caught:
+            H.compose()
+        self.assertIs(caught.exception, nobodys)
+        self.assertIsNone(caught.exception.registrant)
 
     def test_two_registrants_for_one_method_fail_composition(self) -> None:
         text = 'def register(hooks):\n    hooks.methods.register("session.list", lambda ctx, params: {"code": "ok"})\n'
@@ -4827,8 +4842,9 @@ class CliSeamTest(unittest.TestCase):
                 self.assertEqual((status, out.getvalue(), client.calls), (base_status, base_out, base_calls))
                 self.assertNotEqual(client.calls, [], 'the command reached the client')
                 compose.assert_not_called()
-        # Anything else needs the families, and then the broken registrant stops it, loudly, before the client.
-        for argv in (['session', 'ses-1'], [], ['--help']):
+        # A NAMED command that is not one of the five needs the families, and then the broken registrant stops it,
+        # loudly, before the client: a registered name, and a name nobody could tell from one.
+        for argv in (['session', 'ses-1'], ['bogus']):
             with self.subTest(argv=argv):
                 client = Client()
                 with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')), \
@@ -4836,6 +4852,45 @@ class CliSeamTest(unittest.TestCase):
                     self.assertEqual(cli.run(argv, lambda: client), cli.EXIT_ERROR)
                 self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
                 self.assertEqual(client.calls, [])
+
+    def test_a_broken_registrant_does_not_take_away_the_clis_own_help_or_its_own_usage_error(self) -> None:
+        """An argv that names no command is the CLI's own business: help, or its own usage error. With a
+        registrant that is installed and broken both are answered exactly as with no table at all, after one line
+        on stderr which says that a registrant is broken, and which, so that the help is never taken for the whole
+        of it. The registrants here are composed, not stood in for: one whose import fails, two that claim one
+        hook (the second is where composition stops), and a failure that is no one registrant's, which names
+        none. (A seventh read; before it help and the usage error were stopped too.)"""
+        claims = 'def register(hooks):\n    hooks.set("authorize", lambda principal, method, params: None)\n'
+        for lanes, what in (({'keys': 'raise RuntimeError("at import")\n'}, 'registrant recursion_core.keys.hooks is broken'),
+                            ({'keys': claims, 'events': claims}, 'registrant recursion_core.events.hooks is broken'),
+                            ({}, 'the registrants could not be composed')):
+            fake = FakeLanes(self)
+            fake.stand_in_for_the_installed()
+            for lane, text in lanes.items():
+                fake.lane(lane, hooks=text)
+            note = f"{what} (hooks:HookError): registered commands are missing, these are only the CLI's own\n"
+            for argv in ([], ['--help'], ['-h'], ['--no-such-option']):
+                with self.subTest(lanes=sorted(lanes), argv=argv):
+                    answers = []
+                    for composed in (False, True):  # the CLI with no table; then the same argv, composed
+                        client, out, err = Client(), io.StringIO(), io.StringIO()
+                        # With no lane installed, what fails is the check made after the last registrant.
+                        fails = mock.patch.object(H.Hooks, 'freeze', side_effect=H.HookError('of no one registrant'))
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            try:
+                                if not composed:
+                                    status = cli.main(argv, client)
+                                else:
+                                    with contextlib.nullcontext() if lanes else fails:
+                                        status = cli.run(argv, lambda: client)
+                            except SystemExit as left:  # argparse prints its help and leaves
+                                status = ('left', left.code)
+                        answers.append((status, out.getvalue(), err.getvalue(), client.calls))
+                    (status, out, err, calls), under_the_broken_one = answers
+                    self.assertEqual(under_the_broken_one, (status, out, note + err, calls))
+                    self.assertEqual(calls, [], 'no command was named, so the client is not asked')
+                    self.assertIn(status, (('left', 0), cli.EXIT_USAGE))
+            self.doCleanups()       # this case's lanes are gone before the next case installs its own
 
 
 class CliImportTest(unittest.TestCase):
@@ -5196,6 +5251,44 @@ class StartPathOnTest(unittest.TestCase):
         # A start for which no registrant chose an entry has nothing to compare, and needs nobody.
         named = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'hand_pick': {'engine': 'none'}}
         self.assertEqual(with_none.call('run.start', named)['code'], 'started')
+
+    def test_a_stored_entry_of_another_shape_is_refused_on_a_relaunch_and_never_reaches_the_comparator(self) -> None:
+        """A seventh read. The comparator the composition gives reads the engine out of an entry, so it is handed
+        only an entry of the shape a new start accepts, and of the engine its record launches. A stored record may
+        hold another (an earlier composition wrote it, or a lane that holds the control registry): its retry is
+        refused as a chosen entry of that kind is on a new start, the record is left as it was, and nothing is
+        launched. It was an exception out of the call, or a launch of one engine under another's entry."""
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}
+        api, registry, starter = self.api(Recorder(fail=1))
+        self.assertEqual(api.call('run.start', request)['code'], 'start_failed')
+        kept = registry.get('run-1')
+        self.assertEqual((kept['engine'], kept['launch']['route_entry']), ('codex', entry('codex')))
+        seen = []
+
+        def reads_the_engine(chosen):       # as the composition's own comparator does, and it has both engines
+            seen.append(chosen)
+            return chosen['route']['engine'] in ('codex', 'claude_code')
+        other = entry('claude_code')        # well formed, and launchable here: but it is not this record's engine
+        stored = [('codex', shape) for shape in ({'route': 'codex'}, {'binary': None}, {'route': ['codex']}, 'codex',
+                                                 {'route': {}}, {'route': {'engine': ''}}, {'route': {'engine': 7}}, 7, other)]
+        # A record whose own engine is not a name agrees with an entry that has none: that is refused all the same.
+        stored += [(None, {'route': {}}), ('', {'route': {'engine': ''}}), (7, {'route': {'engine': 7}})]
+        for engine, shape in stored:
+            with self.subTest(engine=engine, stored=shape):
+                record = copy.deepcopy(kept)
+                record['engine'], record['launch']['route_entry'] = engine, shape
+                self.registry = InMemoryRunRegistry([record])
+                before = self.registry.get('run-1')
+                later, ran = Recorder(), len(self.log)
+                retried, _, _ = self.api(later, comparator=reads_the_engine)
+                self.assertEqual(retried.call('run.start', request), {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+                self.assertEqual((self.registry.get('run-1'), later.calls, seen, len(self.log)), (before, [], [], ran),
+                                 'the record is as it was, nothing was launched, the comparator and the registrants were not asked')
+        # The control: the same record with its entry as it was written is relaunched, and the comparator is asked.
+        self.registry = InMemoryRunRegistry([copy.deepcopy(kept)])
+        retried, _, later = self.api(Recorder(), comparator=reads_the_engine)
+        self.assertEqual(retried.call('run.start', request)['code'], 'started')
+        self.assertEqual((seen, len(later.calls)), ([entry('codex')], 1))
 
     def test_a_failed_start_that_was_stopped_and_an_unconfirmed_one_are_answered_as_the_base_answers_them(self) -> None:
         api, registry, starter = self.api(Recorder(fail=2))

@@ -1974,6 +1974,34 @@ class CompositionCloseRegionTest(RegionWalk, unittest.TestCase):
 
     FILES = (*RegionWalk.FILES, adapter.__file__)
 
+    def setUp(self):
+        """Asked before every test of this class, and so before each walk: a step of the close that must return
+        and keeps failing is taken twice and no more, and the close then ends unfinished
+        (``Composition._close``, ``_close_until_done``). Where that is not so a walk goes round without end and
+        keeps everything it catches: two changed copies of the close did exactly that, were told apart from a
+        sound one only by a tool's limit of time, and took a machine's memory (Nov 15, 2026). So the rule is
+        asked here first, with a step that gives in after a few calls and so always ends, and a close that does
+        not hold it fails every test of the class at once."""
+        super().setUp()
+        composed, store, closed = self.composition()
+        asked = []
+
+        def begin():
+            asked.append(len(asked))
+            if len(asked) <= 6:
+                raise RuntimeError('a step that cannot return')
+        composed.hooks.begin_close = begin       # the first step of the close, which must return
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'a step that cannot return'):
+                composed.close()
+            found = (len(asked), composed._closed, composed._close_step, list(closed))
+        finally:
+            del composed.hooks.begin_close       # the hooks' own again: the close can be asked for again, and ends
+            composed.close()
+        self.assertEqual(found, (2, False, 0, []), 'a step that must return and keeps failing is taken twice and no '
+                         'more; the close is then unfinished and has touched nothing after that step')
+        self.assertEqual((composed._closed, store.closed), (True, True), 'and asked for again, it ends')
+
     def at_the_marker(self) -> bool:
         """Here a region is under a region: the lifecycle's close under the composition's. The marker of that
         INNER region's own function is the same point one level down (3.14 only, and only a trace callback raises

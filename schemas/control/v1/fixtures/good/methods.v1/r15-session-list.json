@@ -1,0 +1,7 @@
+{
+  "method": "session.list",
+  "params": {
+    "state": "live",
+    "limit": 20
+  }
+}

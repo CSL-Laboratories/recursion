@@ -1,0 +1,16 @@
+{
+  "seq": 6,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:06.222Z",
+  "type": "tool.result",
+  "source": "engine",
+  "trust": "untrusted",
+  "payload": {
+    "call_id": "toolu_01H9",
+    "text": null,
+    "output_ref": "spill:0007",
+    "truncated": true
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "tenant": "t1",
+  "prompt": "Summarise the notes added this week.",
+  "command_id": "notes-search.0001",
+  "workspace": {
+    "path": "/home/dev/notes",
+    "mode": "x-nobody-defined-this"
+  },
+  "engine": "codex"
+}

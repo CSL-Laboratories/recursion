@@ -15,7 +15,8 @@ until they exist the TUI's parity tests compare against those frames.
 An ``ok`` answer is checked before anything of it is taken (``page_problem``): a page it refuses changes
 nothing (review 1 of #405, GPT-6.1 Sol R2 and DeepSeek H1, L1, L2). A refused answer is said and leaves the
 cursor as it is, but for two: ``cursor_epoch_ahead`` sets its epoch back to 1, and ``cursor_ahead`` its seq
-back to the last line shown, so the next read can be served (review 2 of #405, DeepSeek M1, L4).
+back to the last line shown, or to the start of the log when that line was the position refused (review 2
+of #405, DeepSeek M1, L4; review 3, F1). A replay.gap line already shown is not shown again (review 3, F3).
 """
 
 from __future__ import annotations
@@ -126,6 +127,7 @@ class Transcript:
         self.cursor = first_cursor(session_id)
         self.pages = 0  # reads made in a row by the current open, the first included
         self.printed = 0  # the last position whose line was shown (a gap line shows no content of the log)
+        self.gap_shown = 0  # the last position a shown replay.gap line stood for (review 3 of #405, DeepSeek F3)
 
     def apply(self, answer: Mapping) -> list[dict]:
         """One ``ok`` answer that ``page_problem`` found right: the lines after the cursor, each once, in
@@ -136,10 +138,14 @@ class Transcript:
         lines = answer.get("lines")
         for line in lines if isinstance(lines, list) else []:
             if isinstance(line, Mapping) and _is_int(line.get("seq")) and line["seq"] > last:
-                new.append(dict(line))
                 last = line["seq"]
                 if line.get("event_type") != "replay.gap":
                     self.printed = last
+                elif last <= self.gap_shown:
+                    continue  # a gap shown already, answered again after the cursor was put back: not twice
+                else:
+                    self.gap_shown = last
+                new.append(dict(line))
         cursor = answer.get("cursor")
         epoch = self.cursor["epoch"]
         if (isinstance(cursor, Mapping) and cursor.get("session_id") == self.session_id

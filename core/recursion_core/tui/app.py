@@ -295,9 +295,13 @@ class TuiApp:
         done(method, params, call_api(self._api, method, params))
 
     def on_answer(self, method: str, params: dict, answer: dict) -> None:
-        if not isinstance(answer, Mapping):  # as call_api says of it; the guard below holds for any answer
-            answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}  # (review 2 of #405, DeepSeek L1)
-        code = answer.get("code")  # read before taking the lock: the answer is the caller's object
+        if not isinstance(answer, Mapping):  # as call_api says of it (review 2 of #405, DeepSeek L1)
+            answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
+        try:
+            code = answer.get("code")  # read before taking the lock: the answer is the caller's object
+        except Exception:  # noqa: BLE001 - one that cannot be read is answered as call_api answers it (#405 r3, F2)
+            answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
+            code = answer["code"]
         with self._lock:
             if self.closed:  # the TUI ended while the answer was read: it changes nothing
                 return
@@ -310,7 +314,11 @@ class TuiApp:
 
     def _apply_answer(self, method: str, params: dict, answer: dict, code) -> None:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
-        self.last, self.last_method = answer, method
+        try:  # what every frame reads again is a plain copy, never the caller's object (review 3 of #405, F2)
+            kept = dict(answer)
+        except Exception:  # noqa: BLE001
+            kept = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
+        self.last, self.last_method = kept, method
         # A Stop answer confirms only the run it was sent for (ADV2-11): one that names another run,
         # or none, changes no run and is shown as a mismatch, never as this run's Stop.
         mismatch = (method == "run.stop" and code in ("stopped", "pending")
@@ -421,11 +429,19 @@ class TuiApp:
                          f"read goes on from seq {transcript.cursor['seq']} with epoch 1")
             return
         if code == "request_invalid" and answer.get("detail") == "cursor_ahead":
-            # The seq held is past the daemon's log: rule (7) does not bound the last position a gap line names.
-            # The next read goes on from the last line shown, which the daemon has (review 2 of #405, DeepSeek M1).
-            transcript.cursor = {**transcript.cursor, "seq": transcript.printed}
-            self._notice(f"transcript session={field(sid)}: the daemon has no position seq {params['cursor']['seq']}; "
-                         f"the next read goes on from seq {transcript.printed}, the last line shown")
+            # The seq held is past the daemon's log: rule (7) does not bound the last position a gap line names,
+            # and a daemon whose log did not persist has fewer positions than were shown. The next read goes on
+            # from the last line shown, or from the start of the log when that was the position refused, so one
+            # position is never refused twice in a row (review 2 of #405, DeepSeek M1; review 3, F1).
+            refused = params["cursor"]["seq"]
+            if transcript.printed < refused:
+                transcript.cursor = {**transcript.cursor, "seq": transcript.printed}
+                then = f"from seq {transcript.printed}, the last line shown"
+            else:
+                transcript.cursor, transcript.printed, transcript.gap_shown = s.first_cursor(sid), 0, 0
+                then = "from the start of its log"
+            self._notice(f"transcript session={field(sid)}: the daemon has no position seq {refused}; the next read "
+                         f"goes on {then}")
             return
         if code != "ok":
             return

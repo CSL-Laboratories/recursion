@@ -25,6 +25,10 @@ STATE_FOLDER = "recursion"
 STORE_FOLDER = "plugin-security"
 BREAKER_FILE = "breaker.sqlite3"
 REVOCATION_FILE = "revoked.sqlite3"
+# The route homes' custody root: daemon/launcher.py makes each route home at <state>/homes/<engine>
+# (its private_dir), and setup.route_home.check refuses a root that is missing or not owner-only, so
+# install makes it, 0700, before the first launch (lane INSTALL's question 15).
+HOMES_FOLDER = "homes"
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,7 @@ class Owned:
     store_dir: str         # <state>/plugin-security
     breaker_store: str     # <store_dir>/breaker.sqlite3
     revocation_store: str  # <store_dir>/revoked.sqlite3
+    homes: str             # <state>/homes, the route homes' custody root (route_home.check's root)
 
 
 def owned_paths(roots: Roots) -> Owned:
@@ -62,6 +67,7 @@ def owned_paths(roots: Roots) -> Owned:
         store_dir=store_dir,
         breaker_store=os.path.join(store_dir, BREAKER_FILE),
         revocation_store=os.path.join(store_dir, REVOCATION_FILE),
+        homes=os.path.join(state, HOMES_FOLDER),
     )
 
 
@@ -147,6 +153,19 @@ def check_dirs(root: str, path: str) -> None:
 
     for cur in _folders_below(root, path):
         _existing_folder(cur)
+
+
+def check_private_dir(root: str, path: str) -> None:
+    """``check_dirs``, and ``path`` itself, if it is there, open to nobody else at all (no bit of
+    0o077): the route homes' custody root, which ``setup.route_home.check`` holds to that rule."""
+
+    check_dirs(root, path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if info.st_mode & 0o077:
+        raise InstallRefused("folder_untrusted", f"{path} is open to group or world; route homes need it owner-only: `chmod 700` it")
 
 
 def _folders_below(root: str, path: str) -> list[str]:

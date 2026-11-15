@@ -199,6 +199,7 @@ class InstallTests(unittest.TestCase):
         self.store_dir = os.path.join(self.state, "plugin-security")
         self.breaker = os.path.join(self.store_dir, "breaker.sqlite3")
         self.revoked = os.path.join(self.store_dir, "revoked.sqlite3")
+        self.homes = os.path.join(self.state, "homes")
 
     def test_install_writes_the_unit_and_install_twice_equals_install_once(self) -> None:
         state_before = _tree(self.state)
@@ -209,7 +210,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(_read(self.unit), render_unit(EXEC))
         self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), 0o644)
         state_after = _tree(self.state)
-        self.assertEqual(set(state_after) - set(state_before), {self.store_dir, self.breaker, self.revoked})
+        self.assertEqual(set(state_after) - set(state_before), {self.store_dir, self.breaker, self.revoked, self.homes})
         self.assertEqual({path: state_after[path] for path in state_before}, state_before)
         once = _tree(self.home)
         again = install(self.roots, EXEC)
@@ -218,6 +219,60 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(_tree(self.home), once)
         self.assertEqual(sorted(os.listdir(self.unit_dir)), [UNIT_NAME])  # no temporary file left
         self.assertEqual(sorted(os.listdir(self.store_dir)), ["breaker.sqlite3", "revoked.sqlite3"])
+
+    def test_install_makes_the_route_homes_custody_root_owner_only_and_uninstall_keeps_it(self) -> None:
+        # Question 15 (default (a)): setup.route_home.check refuses a missing custody root, so install
+        # makes <state>/homes, 0700, before the unit; install or upgrade makes it again if it is gone.
+        self.assertTrue(install(self.roots, EXEC).changed)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.homes).st_mode), 0o700)
+        self.assertEqual(os.listdir(self.homes), [])
+        os.mkdir(os.path.join(self.homes, "claude_code"), 0o700)  # a route home the launcher made
+        self.assertFalse(install(self.roots, EXEC).changed)
+        self.assertFalse(upgrade(self.roots, EXEC).changed)
+        uninstall(self.roots)
+        self.assertEqual(os.listdir(self.homes), ["claude_code"])  # the route homes and their logins stay
+        install(self.roots, EXEC)  # the unit again
+        shutil.rmtree(self.homes)
+        self.assertTrue(install(self.roots, EXEC).changed)  # the unit and the stores are there: only the root
+        self.assertEqual(stat.S_IMODE(os.lstat(self.homes).st_mode), 0o700)
+        shutil.rmtree(self.homes)
+        self.assertTrue(upgrade(self.roots, EXEC).changed)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.homes).st_mode), 0o700)
+
+    def test_a_custody_root_open_to_anyone_else_is_refused_before_anything_is_made(self) -> None:
+        os.mkdir(self.homes, 0o700)
+        for mode in (0o740, 0o720, 0o710, 0o704, 0o702, 0o701):  # each bit alone
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.homes, mode)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    install(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "folder_untrusted")
+                if mode & 0o022:  # a write bit: the rule every folder on the way is held to answers first
+                    expected = f"{self.homes} can be written by group or world; `chmod go-w` it"
+                else:
+                    expected = f"{self.homes} is open to group or world; route homes need it owner-only: `chmod 700` it"
+                self.assertEqual(caught.exception.detail, expected)
+                self.assertEqual(_tree(self.home), before)  # no store, no unit
+        os.chmod(self.homes, 0o700)
+        install(self.roots, EXEC)
+        os.chmod(self.homes, 0o750)
+        before = _tree(self.home)
+        with self.assertRaises(InstallRefused) as caught:
+            upgrade(self.roots, EXEC_NEXT)
+        self.assertEqual(caught.exception.kind, "folder_untrusted")
+        self.assertEqual(_tree(self.home), before)
+        os.rmdir(self.homes)
+        os.symlink(self.store_dir, self.homes)  # a link where the root belongs
+        with self.assertRaises(InstallRefused) as caught:
+            install(self.roots, EXEC)
+        self.assertEqual(caught.exception.kind, "symlink_refused")
+
+    def test_the_custody_root_is_the_launchers_own(self) -> None:
+        self.assertEqual(layout.HOMES_FOLDER, "homes")
+        self.assertEqual(owned_paths(self.roots).homes, os.path.join(self.state, "homes"))
+        launcher = Path(importlib.util.find_spec("recursion_core.daemon.launcher").origin).read_text(encoding="utf-8")
+        self.assertIn("private_dir(self._state / 'homes' / self.engine)", launcher)
 
     def test_a_new_unit_folder_is_owner_only_and_an_existing_one_is_left_as_it_is(self) -> None:
         install(self.roots, EXEC)
@@ -324,7 +379,7 @@ class InstallTests(unittest.TestCase):
         # Left: the unit folders (other units share them), the neighbour, and the stores (question 3).
         self.assertEqual(set(after) - set(before),
                          {os.path.join(self.home, ".config"), os.path.dirname(self.unit_dir), self.unit_dir, neighbour,
-                          self.store_dir, self.breaker, self.revoked})
+                          self.store_dir, self.breaker, self.revoked, self.homes})
         self.assertEqual({path: after[path] for path in before}, before)  # the state folder too
         again = uninstall(self.roots)
         self.assertEqual((again.action, again.changed), ("uninstall", False))

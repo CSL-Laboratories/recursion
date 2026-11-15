@@ -87,8 +87,9 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
     there is not used); with a sequence pending, Esc cancels it and then does that;
   - the keys (`?`): `j`/`k` a row, Page Down/Up or `Ctrl+D`/`Ctrl+U` a page, `g g`/Home the first, `G`/End
     the last, so every entry can be read in full screen (on a short terminal the keys take rows from the run
-    list until three entries show, and with no row at all they say so instead of naming a range); Esc, `q`
-    or `?` closes them.
+    list until three entries show; with no row for an entry the header says so instead of naming a range,
+    and with no row for the header either the prompt row does, on any terminal of two rows or more); Esc,
+    `q` or `?` closes them.
 - Commands (`:` or `/`, and `--plain`): the CLI's `list` (also `runs`), `status RUN`, `stop RUN`,
   `start ...`, `conditions`, and the TUI's own `help` (also `keys`) and `quit`, which send nothing. A
   leading `/` is accepted. `sessions` reads `session.list`; `transcript SESSION` reads that session's
@@ -123,7 +124,9 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   under `<leader> p`; until a plugin host exists, pressing one says so and sends nothing.
   A key name means the key a terminal sends: `ctrl+h` is Backspace, `ctrl+i` is Tab, `ctrl+j` and `ctrl+m`
   are Enter (and `ctrl+alt+` likewise), so a leader written `ctrl+i` is judged as Tab; a name no key arrives
-  as (`ctrl+enter`, `alt+esc`) is refused. Neither a binding nor the leader can be `ctrl+c`. The leader cannot be a key the default bindings of the
+  as (`ctrl+enter`, `alt+esc`) is refused. Alt+Space is written `alt+space`. Two spellings of one key in one
+  table (`ctrl+i` and `tab`) are said, and the second is skipped; a leader that a binding in force uses where
+  a leader is typed makes the file not used. Neither a binding nor the leader can be `ctrl+c`. The leader cannot be a key the default bindings of the
   run list, the pager or `global` use (`tab`, the arrows, Home, End, Page Up/Down, `ctrl+d`, `ctrl+u`, ...),
   and no binding there takes the leader alone, since either would shadow the leader's sequences. A
   file that cannot be read, or that loosens `[safety]`, is not used at all; a refused binding is skipped.

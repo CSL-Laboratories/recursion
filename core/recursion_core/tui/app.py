@@ -59,8 +59,10 @@ class _Output:
         self.label = f"output run={field(run_id)}: "
         # The display rows of each retained line at one width, kept beside the lines, so a frame need not wrap
         # the whole history to count it or show its newest rows (review 2 of #404, Astra 3). They are counted
-        # again only when the width changes.
-        self._width = 0
+        # again when the width changes, and whenever they may be out of step with the lines: -1 means "not
+        # counted", from the start and while a feed adds to them, so a failure part way leaves them to be
+        # counted again, never wrong (review 3 of #404, DeepSeek F1, F2).
+        self._width = -1
         self._rows: collections.deque[int] = collections.deque(maxlen=cap)
 
     def feed(self, text: str | bytes) -> tuple[str, list[str]]:
@@ -84,16 +86,20 @@ class _Output:
             self.partial_cut = False
         self.partial = partial
         self.lines.extend(done)
-        if self._width:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
-            self._rows.extend(len(wrap(line, self._width)) for line in done)
+        if self._width >= 0:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
+            width, self._width = self._width, -1  # "not counted" until they are beside the lines again
+            self._rows.extend(len(wrap(line, width)) for line in done)
+            self._width = width
         return chunk, done
 
     def extend(self, rows: list[str]) -> None:
         """Rows that are display text already (a transcript's), kept as finished lines, counted as they are."""
 
         self.lines.extend(rows)
-        if self._width:
-            self._rows.extend(len(wrap(row, self._width)) for row in rows)
+        if self._width >= 0:  # as feed does: "not counted" until the counts are beside the lines again
+            width, self._width = self._width, -1
+            self._rows.extend(len(wrap(row, width)) for row in rows)
+            self._width = width
 
     def source(self) -> list[str]:
         """Every line kept, the unfinished one last."""
@@ -123,11 +129,13 @@ class _Output:
         return out
 
     def counts(self, width: int) -> list[int]:
-        """The display rows of each line ``source()`` gives, at ``width``."""
+        """The display rows of each line ``source()`` gives, at ``width``. The kept counts are counted again at
+        another width, or when they are not as many as the lines; a new count is kept only once it is whole
+        (review 3 of #404, DeepSeek F1)."""
 
-        if width != self._width:
-            self._width = width
-            self._rows = collections.deque((len(wrap(line, width)) for line in self.lines), maxlen=self.lines.maxlen)
+        if width != self._width or len(self._rows) != len(self.lines):
+            rows = [len(wrap(line, width)) for line in self.lines]
+            self._rows, self._width = collections.deque(rows, maxlen=self.lines.maxlen), width
         out = list(self._rows)
         if self.partial:  # at most PARTIAL_CAP characters, so it is counted each time
             out.append(len(wrap(self.partial, width)))
@@ -177,6 +185,7 @@ class TuiApp:
         self.search = ""  # the pager's last search
         self.help_lines: list[str] = []
         self.help_scroll = 0  # the first help row shown in full screen
+        self._keys_row = True  # the last frame had a row for the open keys (review 3 of #404, DeepSeek F6)
         self._out_rows = 10  # rows the output pane had in the last frame (a half page is half of it)
         # Burst input seen since the line was opened, or on any key of the sequence that armed a Stop
         # (review of #372, R1): the next Enter or y does not act on it, however it arrives itself.
@@ -185,8 +194,9 @@ class TuiApp:
         self._stop_keys: tuple[str, ...] = ("s",)  # the sequence that armed the Stop, for its notice
         self.notice = ""
         self.closed = False
-        # Held while the app's state changes, and by close(); never while reading a caller's answer or
-        # logging engine output, so close() cannot wait on a stalled thread (reviews of a1f16a20, C4).
+        # Held while the app's state changes, by frame() (review 2 of #404, DeepSeek L5) and by close(); never
+        # while reading a caller's answer or logging engine output, so close() cannot wait on a stalled thread
+        # (reviews of a1f16a20, C4).
         self._lock = threading.RLock()
         self._state = "live"
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
@@ -1020,6 +1030,7 @@ class TuiApp:
                                 f"engine={field(run.get('engine'))} tenant={field(run.get('tenant'))}{att}",
                              "selected" if rid == self.selected else None))
             rows.extend((5, "", None) for _ in range(run_rows - len(self.runs[start:start + run_rows])))
+        self._keys_row = rem >= 2  # a row for the header and one for an entry; else the prompt says so
         if rem and self.mode == "help":  # the keys, in the output pane's place, until Esc, q or ?
             self._out_rows = rem - 1
             every = self._help_rows()
@@ -1172,6 +1183,8 @@ class TuiApp:
                 return f"search older lines: {shown}"
             return f"recursion: {'/' if self.line_kind == '/' else ''}{shown}"
         if self.mode == "help":
+            if not self._keys_row:
+                return "recursion: keys open, no room to show them here (the transcript has them); Esc, q or ? closes"
             return "recursion: keys shown; j/k and Page Up/Down scroll; Esc, q or ? closes"
         if self.focus == "output":
             return self._hints("output pager", (("pager.down", "pager.up", "line"), ("pager.half_down", "pager.half_up",

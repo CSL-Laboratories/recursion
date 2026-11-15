@@ -33,8 +33,15 @@ Every refusal is ``Refused(code, detail)`` with ``code`` one of, for the store's
     P_exists      create only: something is already at the path or at one of its side files
 
 Not refusals: a magic that is not in ``KINDS`` is a programming error (``ValueError``); and a create
-function lets the factory's own ``OSError`` or ``sqlite3.Error`` through unchanged (a full disk, a
-folder the owner cannot write, a umask that takes the owner's write bit). A store another lane adds
+function lets ``OSError`` through from the factory (a full disk, a folder the owner cannot write, a
+umask that takes the owner's write bit) and from its own cleanup and folder operations, and
+``sqlite3.Error`` from the factory. Before the exclusive link succeeds, a create puts nothing at the
+path, although a failed cleanup can leave a temporary file. Once the link has succeeded, a later
+cleanup or folder-sync failure can leave the checked store in place (if the sync failed, whether its
+folder entry is on disk is not known): such an error does not mean that nothing changed, and a
+repeated create can refuse ``P_exists``. A caller checks an existing store (``open_store``) before
+using it. Temporary files are removed on the way out, which cannot be promised when the removal
+itself fails or the process is killed. A store another lane adds
 gets its entry in ``KINDS`` here.
 
 What the checks rely on, and what they do not cover. No other user may be able to change what the
@@ -99,6 +106,10 @@ def _absolute(path: object, prefix: str) -> str:
         raise Refused(f"{prefix}_untrusted", "the path is not absolute")
     if "\0" in text:  # no file has one; os.lstat would raise ValueError, not a refusal
         raise Refused(f"{prefix}_untrusted", "the path has a NUL character in it")
+    try:
+        os.fsencode(text)  # a lone surrogate no file name can hold would make os.lstat raise
+    except UnicodeEncodeError:
+        raise Refused(f"{prefix}_untrusted", "the path cannot be written as a file name") from None
     return text
 
 
@@ -159,7 +170,12 @@ def _check_ancestors(folder: str, prefix: str) -> None:
             links += 1
             if links > _MAX_LINKS:
                 raise Refused(f"{prefix}_untrusted", f"more than {_MAX_LINKS} links above the store's folder")
-            target = os.readlink(candidate)
+            try:
+                target = os.readlink(candidate)
+            except FileNotFoundError:  # removed since the lstat above
+                raise Refused(f"{prefix}_missing", candidate) from None
+            except OSError as exc:  # replaced by something that is not a link, or unreadable
+                raise Refused(f"{prefix}_invalid", f"{candidate}: {type(exc).__name__}") from None
             if target.startswith("/"):
                 current = "/"
             names[:0] = [part for part in target.split("/") if part]
@@ -264,12 +280,16 @@ def _create(path, magic: str, factory) -> None:
     factory's own (``create_ledger``'s ``malformed_public_key`` for an anchor that is not a public
     key) is ``P_invalid`` with that code as its detail. The new store must leave no side file and
     then pass ``open_store`` under its temporary name before it is linked into place, exclusively,
-    as the last step; the folder is then fsynced. So a failure this call returns leaves nothing at
-    ``path`` (a later create can try again) and no temporary file; the factory's ``OSError`` or
-    ``sqlite3.Error`` is not translated. A process killed part-way can leave its
-    ``.<name>.<hex>.tmp``, which nothing opens as a store and no later create needs. The new store
-    has the factory's mode, 0600: a umask can only take bits away, and one that takes the owner's
-    own makes the factory fail.
+    as the last step; the temporary name is then removed and the folder fsynced. A failure before the
+    link leaves nothing at ``path`` (a later create can try again); the factory's ``OSError`` or
+    ``sqlite3.Error`` is not translated. After the link, only the temporary name's removal and the
+    folder's fsync remain: if either fails, its ``OSError`` comes through with the checked store in
+    place (and, for a failed removal, the temporary name still linked to it; for a failed fsync, its
+    folder entry not known to be on disk). The store is not removed: a later ``open_store`` checks it
+    as any store, and a later create refuses ``P_exists``. A failed removal before the link can
+    leave a temporary file too, and a process killed part-way can leave its ``.<name>.<hex>.tmp``,
+    which nothing opens as a store and no later create needs. The new store has the factory's mode,
+    0600: a umask can only take bits away, and one that takes the owner's own makes the factory fail.
     """
     prefix = _prefix(magic)
     path = _absolute(path, prefix)

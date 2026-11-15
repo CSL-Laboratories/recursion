@@ -239,6 +239,18 @@ class OpenStoreTests(_StoreCase):
                 self.assertRefused(prefix + "_untrusted", create, bad)
         self.assertEqual(os.listdir(self.dir), [])
 
+    def test_a_path_no_file_name_can_hold_is_refused_untrusted(self):
+        # A lone surrogate: os.lstat would raise UnicodeEncodeError (review 1 of #401, Codex Astra R3).
+        lone = chr(0xD800)
+        for prefix, magic, create in KINDS:
+            with self.subTest(store=prefix):
+                bad = self.path("bad" + lone + ".sqlite3")
+                error = self.assertRefused(prefix + "_untrusted", stores.check_store, bad, magic)
+                self.assertIn("file name", error.detail)
+                self.assertRefused(prefix + "_untrusted", stores.open_store, bad, magic)
+                self.assertRefused(prefix + "_untrusted", create, bad)
+        self.assertEqual(os.listdir(self.dir), [])
+
     def test_a_file_that_is_not_this_store_is_invalid(self):
         garbage = self.path("garbage.sqlite3")
         with open(garbage, "wb") as handle:
@@ -439,6 +451,36 @@ class CreateStoreTests(_StoreCase):
             stores.create_revocation_store(self.path())
         self.assertEqual(order, ["link", "fsync folder"])
 
+    def test_a_folder_fsync_that_fails_after_the_link_leaves_a_whole_store_in_place(self):
+        # The one failure after the link (review 1 of #401, Codex Astra C1): the store stays, opens as
+        # any store, and a later create refuses it as existing rather than replacing it.
+        with mock.patch("os.fsync", side_effect=OSError(5, "Input/output error")):
+            with self.assertRaises(OSError):
+                stores.create_breaker_store(self.path())
+        self.assertEqual(os.listdir(self.dir), ["store.sqlite3"])
+        stores.open_store(self.path(), stores.BREAKER_MAGIC).close()
+        self.assertRefused("breaker_store_exists", stores.create_breaker_store, self.path())
+
+    def test_a_temporary_name_that_cannot_be_removed_after_the_link_is_reported_as_it_is(self):
+        # The other failure after the link (review 2, Codex Astra C1): the raw OSError, the store in
+        # place, the temporary name still linked to it, and a retry refused as existing.
+        real_unlink = os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)).endswith(".tmp"):
+                raise OSError(5, "Input/output error")
+            return real_unlink(path, *args, **kwargs)
+        with mock.patch("os.unlink", side_effect=unlink):
+            with self.assertRaises(OSError) as caught:
+                stores.create_breaker_store(self.path())
+        self.assertNotIsInstance(caught.exception, Refused)
+        names = sorted(os.listdir(self.dir))
+        self.assertEqual(names[1:], ["store.sqlite3"])
+        self.assertTrue(names[0].startswith(".store.sqlite3.") and names[0].endswith(".tmp"))
+        self.assertEqual(os.stat(self.path()).st_ino, os.stat(os.path.join(self.dir, names[0])).st_ino)
+        stores.open_store(self.path(), stores.BREAKER_MAGIC).close()
+        self.assertRefused("breaker_store_exists", stores.create_breaker_store, self.path())
+
     def test_a_new_store_is_checked_by_the_open_before_it_is_linked_into_place(self):
         # Checked under its temporary name, so a store that fails never reaches the path and a later
         # create can try again (review 1, DeepSeek F7).
@@ -547,6 +589,39 @@ class AncestorTests(_StoreCase):
         os.chmod(self.b, 0o777)
         with self.subTest(case="target of the inner link open to writers"):
             self.refused_both_ways(paths[2])
+
+    def test_the_root_folder_itself_is_held_to_the_rule(self):
+        # "/" reporting world write without the sticky bit is refused (review 2, Codex Astra C3).
+        def world_writable_root(path, *args, **kwargs):
+            info = _real_lstat(path, *args, **kwargs)
+            if os.fspath(path) == "/":
+                fields = list(info[:10])
+                fields[0] = (info.st_mode | stat.S_IWOTH) & ~stat.S_ISVTX
+                return os.stat_result(fields)
+            return info
+        with mock.patch("os.lstat", side_effect=world_writable_root):
+            error = self.refused_both_ways(self.store)
+        self.assertEqual(error.detail, "/ is writable by group or world and not sticky")
+
+    def test_a_folder_above_that_cannot_be_looked_up_is_invalid(self):
+        # An lstat failure other than "missing" above the store's folder (review 2, Codex Astra C3).
+        def failing(path, *args, **kwargs):
+            if os.fspath(path) == self.base:
+                raise OSError(5, "Input/output error")
+            return _real_lstat(path, *args, **kwargs)
+        with mock.patch("os.lstat", side_effect=failing):
+            error = self.refused_both_ways(self.store, code="breaker_store_invalid")
+        self.assertEqual(error.detail, f"{self.base}: OSError")
+
+    def test_a_link_above_that_fails_to_read_is_a_refusal_not_an_error(self):
+        # Gone between its lstat and its readlink, or unreadable (review 1 of #401, Codex Astra R3).
+        link = os.path.join(self.base, "read-link")
+        os.symlink(self.a, link)
+        store = os.path.join(link, "b", "plugin-security", "store.sqlite3")
+        for raised, code in ((FileNotFoundError(2, "gone"), "breaker_store_missing"),
+                             (OSError(5, "Input/output error"), "breaker_store_invalid")):
+            with self.subTest(raised=type(raised).__name__), mock.patch("os.readlink", side_effect=raised):
+                self.refused_both_ways(store, code=code)
 
     def test_a_link_above_another_user_owns_is_refused(self):
         link = os.path.join(self.base, "link")

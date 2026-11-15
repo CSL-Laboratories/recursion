@@ -4,6 +4,7 @@ child's environment, the route result for each stream, the billing check, the de
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 
@@ -59,6 +60,12 @@ def line(**fields):
     return json.dumps(fields)
 
 
+def init(source="login"):
+    """A system/init line: since the first break-it read of #412 (F5) a run with no init is refused at its
+    result, so a test whose run must succeed gives one."""
+    return line(type="system", subtype="init", apiKeySource=source, model="m")
+
+
 def adapter(launcher, clock=lambda: 0.0, binary=None, parent=PARENT):
     return cursor.CursorAdapter(launcher, clock, credentials, parent, binary=binary)
 
@@ -101,7 +108,7 @@ class RunTest(unittest.TestCase):
 
     def test_a_prompt_that_looks_like_an_option_is_only_the_prompt(self):
         for prompt in ("-p", "--api-key=made-up", "-HAuthorization: x", "--disable-auto-update", "--"):
-            launcher = LinesLauncher([line(type="result", subtype="success", is_error=False, result="ok")])
+            launcher = LinesLauncher([init(), line(type="result", subtype="success", is_error=False, result="ok")])
             result = adapter(launcher).run(request(prompt), 10.0)
             self.assertEqual(result["code"], None, prompt)
             self.assertEqual(launcher.launches[0]["argv"][-2:], ["--", prompt])
@@ -166,14 +173,14 @@ class RefusedBeforeLaunchTest(unittest.TestCase):
         for prompt in (HiddenSurrogate("say " + chr(0xD800)), LyingLength("x" * (cursor.MAX_PROMPT_BYTES + 1))):
             with self.subTest(prompt=type(prompt).__name__):
                 self.refused(request(prompt), c.REQUEST_INVALID, "exactly a str")
-        launcher = LinesLauncher([line(type="result", subtype="success", is_error=False, result="ok")])
+        launcher = LinesLauncher([init(), line(type="result", subtype="success", is_error=False, result="ok")])
         self.assertEqual(adapter(launcher).run(request(str("say hi")), 10.0)["code"], None)
 
     def test_the_limit_is_linuxs_one_argument_limit_less_its_nul(self):
         self.assertEqual(cursor.MAX_PROMPT_BYTES, 131072 - 1)   # MAX_ARG_STRLEN, 32 pages of 4 KiB
 
     def test_a_prompt_at_the_limit_is_launched(self):
-        launcher = LinesLauncher([line(type="result", subtype="success", is_error=False, result="ok")])
+        launcher = LinesLauncher([init(), line(type="result", subtype="success", is_error=False, result="ok")])
         result = adapter(launcher).run(request("x" * cursor.MAX_PROMPT_BYTES), 10.0)
         self.assertEqual((result["code"], len(launcher.launches)), (None, 1))
 
@@ -210,9 +217,12 @@ class StreamOutcomeTest(unittest.TestCase):
         launcher = LinesLauncher([line(type="result", subtype="success")])
         result = adapter(launcher).run(request(), 10.0)
         self.assertEqual((result["code"], launcher.processes[0].fenced), (c.PROTOCOL_ERROR, ["protocol_error"]))
+        self.assertEqual(result["detail"], "result line not understood")   # the parser's own detail (F6)
+        launcher = LinesLauncher([init(), line(type="result", subtype="success", is_error=False, result=3)])
+        self.assertEqual(adapter(launcher).run(request(), 10.0)["detail"], "result answer is not text")
 
     def test_unknown_lines_are_passed_over(self):
-        launcher = LinesLauncher([line(type="thinking"), line(type="tool_call", subtype="started", call_id="c1",
+        launcher = LinesLauncher([init(), line(type="thinking"), line(type="tool_call", subtype="started", call_id="c1",
                                                               tool_call={"readToolCall": {"args": {"path": "a"}}}),
                                   line(type="result", subtype="success", is_error=False, result="done")])
         self.assertEqual(adapter(launcher).run(request(), 10.0)["text"], "done")
@@ -247,6 +257,41 @@ class BillingCheckTest(unittest.TestCase):
                                   line(type="result", subtype="success", is_error=False, result="ok")])
         self.assertEqual(adapter(launcher).run(request(), 10.0)["code"], None)
 
+    def test_a_run_that_reports_no_init_is_stopped_and_asks(self):
+        """The first break-it read of #412, F5: with no system/init the run's meter is not known."""
+        for kind in ("subscription", "api_key"):
+            for last in (line(type="result", subtype="success", is_error=False, result="ok"),
+                         line(type="result", subtype="error", is_error=True)):
+                with self.subTest(kind=kind, last=last):
+                    launcher = LinesLauncher([replay("Say hello in one sentence."), last])
+                    result = adapter(launcher).run(request(kind=kind), 10.0)
+                    self.assertEqual((result["code"], result["text"]), (c.ROUTE_CHOICE_REQUIRED, ""))
+                    self.assertIn("reported no system/init", result["detail"])
+                    self.assertEqual(launcher.processes[0].fenced, ["billing_unknown"])
+
+    def test_the_route_is_read_once_for_the_child_and_the_check(self):
+        """The first break-it read of #412, F4: a request whose route reads differently the second time
+        cannot build one child and check its run against another route."""
+
+        class Flipping(dict):
+            def __init__(self, first, later):
+                super().__init__(first)
+                self.later, self.reads = later, 0
+
+            def __getitem__(self, key):
+                if key != "route":
+                    return super().__getitem__(key)
+                self.reads += 1
+                return super().__getitem__(key) if self.reads == 1 else self.later
+
+        flipping = Flipping(request(kind="api_key"), request()["route"])
+        launcher = fake_agent.FakeLauncher("oneshot/hello.jsonl")   # its init reports the sign-in
+        result = adapter(launcher).run(flipping, 10.0)
+        self.assertEqual(flipping.reads, 1)
+        self.assertEqual(launcher.launches[0]["env"]["CURSOR_API_KEY"], KEY)
+        self.assertEqual(result["code"], c.ROUTE_CHOICE_REQUIRED)
+        self.assertIn("api_key route's run reported apiKeySource login", result["detail"])
+
 
 class DeadlineTest(unittest.TestCase):
     def test_a_read_that_times_out_is_the_deadline_and_fences(self):
@@ -259,6 +304,235 @@ class DeadlineTest(unittest.TestCase):
         result = adapter(launcher, clock=lambda: 11.0).run(request(), 10.0)
         self.assertEqual(result["code"], c.DEADLINE_EXCEEDED)
         self.assertEqual(len(fake_agent.fixture_lines("oneshot/hello.jsonl")), len(launcher.processes[0]._out))
+
+    def test_a_deadline_reached_exactly_reads_nothing(self):
+        """The first break-it read of #412, F6 (M14): no time left is the deadline, not one more read."""
+        launcher = fake_agent.FakeLauncher("oneshot/hello.jsonl")
+        result = adapter(launcher, clock=lambda: 10.0).run(request(), 10.0)
+        self.assertEqual((result["code"], launcher.processes[0].fenced), (c.DEADLINE_EXCEEDED, ["deadline"]))
+        self.assertEqual(len(fake_agent.fixture_lines("oneshot/hello.jsonl")), len(launcher.processes[0]._out))
+
+
+SOURCES = {"input.accepted": "cursor.user", "tool.call": "cursor.tool_call.started",
+           "tool.result": "cursor.tool_call.completed", "result": "cursor.result"}
+
+
+def expected_events(fixture, request_id="r1"):
+    """The route events a whole run of ``fixture`` must carry, written here and not taken from the module: the
+    fixture's expected drafts in order, the input's ids named from the request id, a nested value (a tool's
+    input) not copied."""
+    want = json.loads((fake_agent.HERE / fixture.replace(".jsonl", ".expected.json")).read_text(encoding="utf-8"))
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:40]
+    out = []
+    for draft in want["drafts"]:
+        data = {k: (None if isinstance(v, (dict, list)) else v) for k, v in draft["payload"].items()}
+        if draft["type"] == "input.accepted":
+            data.update(delivery_id="dlv-" + digest, turn_id="turn-" + digest)
+        out.append({"kind": draft["type"], "source": SOURCES[draft["type"]], "data": data})
+    return out
+
+
+def replay(text):
+    return line(type="user", message={"role": "user", "content": [{"type": "text", "text": text}]})
+
+
+class EventsTest(unittest.TestCase):
+    """The first break-it read of #412, F1: every draft the parser gives reaches the route result, in order,
+    the replay of the input included (``input.accepted``)."""
+
+    def test_a_whole_tool_stream_reaches_the_result_in_order(self):
+        result = adapter(fake_agent.FakeLauncher("oneshot/tools.jsonl")).run(
+            request("Read README.md and write NOTES.md with a summary.", kind="api_key"), 10.0)
+        self.assertEqual(result["code"], None)
+        self.assertEqual(result["events"], expected_events("oneshot/tools.jsonl"))
+        self.assertEqual([e["kind"] for e in result["events"]],
+                         ["input.accepted"] + ["tool.call", "tool.result"] * 5 + ["result"])
+        self.assertIsNone(result["events"][1]["data"]["input"])   # nested model payload: the digest only
+        self.assertEqual(len(result["events"][1]["data"]["input_digest"]), 64)
+
+    def test_the_input_is_accepted_from_its_replay_on_each_outcome(self):
+        for fixture, req in (("oneshot/hello.jsonl", request()),
+                             ("oneshot/error.jsonl", request("Summarise the repository.")),
+                             ("oneshot/partial.jsonl", request("Count to two."))):
+            with self.subTest(fixture=fixture):
+                result = adapter(fake_agent.FakeLauncher(fixture)).run(req, 10.0)
+                self.assertEqual(result["events"], expected_events(fixture))
+        self.assertEqual(cursor.input_ids("r1"), (expected_events("oneshot/hello.jsonl")[0]["data"]["delivery_id"],
+                                                  expected_events("oneshot/hello.jsonl")[0]["data"]["turn_id"]))
+
+    def test_a_run_that_ends_early_keeps_the_events_it_had(self):
+        before = [init(), replay("hi"), line(type="tool_call", subtype="started", call_id="c1",
+                                             tool_call={"readToolCall": {"args": {"path": "a"}}})]
+        result = adapter(LinesLauncher(before)).run(request("hi"), 10.0)   # end of file before a result
+        self.assertEqual((result["code"], [e["kind"] for e in result["events"]]),
+                         (c.ENGINE_EXITED, ["input.accepted", "tool.call"]))
+        result = adapter(LinesLauncher(before, hang=True)).run(request("hi"), 10.0)   # the deadline
+        self.assertEqual((result["code"], [e["kind"] for e in result["events"]]),
+                         (c.DEADLINE_EXCEEDED, ["input.accepted", "tool.call"]))
+        result = adapter(LinesLauncher(before + ["not json"])).run(request("hi"), 10.0)   # a protocol error
+        self.assertEqual((result["code"], [e["kind"] for e in result["events"]]),
+                         (c.PROTOCOL_ERROR, ["input.accepted", "tool.call"]))
+
+    def test_lines_missing_repeated_or_out_of_order(self):
+        ok = line(type="result", subtype="success", is_error=False, result="ok")
+        started = line(type="tool_call", subtype="started", call_id="c1",
+                       tool_call={"readToolCall": {"args": {"path": "a"}}})
+        done = line(type="tool_call", subtype="completed", call_id="c1",
+                    tool_call={"readToolCall": {"args": {"path": "a"}, "result": {"success": {"content": "x"}}}})
+        cases = (
+            ([init(), ok], ["result"]),                                    # no replay: nothing accepted
+            ([init(), replay("other"), ok], ["result"]),                   # a replay of another text
+            ([init(), replay("hi"), replay("hi"), ok], ["input.accepted", "result"]),   # replayed twice
+            ([init(), done, started, ok], ["tool.call", "result"]),        # completed before started
+            ([init(), started, started, done, done, ok], ["tool.call", "tool.result", "result"]),
+            ([init(), ok, replay("hi"), started], ["result"]),             # lines after the result: not read
+        )
+        for lines, kinds in cases:
+            with self.subTest(kinds=kinds):
+                result = adapter(LinesLauncher(lines)).run(request("hi"), 10.0)
+                self.assertEqual((result["code"], [e["kind"] for e in result["events"]]), (None, kinds))
+
+
+class RaisingProcess(fake_agent.OneShotProcess):
+    """Gives ``lines``, then raises ``error`` from ``read_line``; its fence raises ``fence_error`` if given."""
+
+    def __init__(self, lines, error, fence_error=None):
+        super().__init__(lines)
+        self.error, self.fence_error = error, fence_error
+
+    def read_line(self, timeout_s):
+        if self._out:
+            return super().read_line(timeout_s)
+        raise self.error
+
+    def fence(self, reason):
+        super().fence(reason)
+        if self.fence_error is not None:
+            raise self.fence_error
+
+
+def launched(process, **kwargs):
+    return adapter(lambda argv, *, env, shell=False, **options: process, **kwargs)
+
+
+class FencingTest(unittest.TestCase):
+    """The first break-it read of #412, F2 (STRICT, fencing): once the child has started, every way out of
+    the drive fences it first, and the original exception is what leaves."""
+
+    def test_every_kind_of_exception_after_the_launch_fences_the_child(self):
+        for error in (TypeError("x"), MemoryError(), KeyboardInterrupt(), RuntimeError("x"), ValueError("x"),
+                      SystemExit(3), AssertionError("x"), KeyError("x"), RecursionError("x")):
+            with self.subTest(error=type(error).__name__):
+                process = RaisingProcess([init(), replay("Say hello in one sentence.")], error)
+                with self.assertRaises(type(error)) as caught:
+                    launched(process).run(request(), 10.0)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(process.fenced, [cursor.DRIVER_FENCE])
+
+    def test_a_line_that_is_not_text_fences_the_child(self):
+        for value in (b'{"type": "result"}', 3, ["x"]):
+            with self.subTest(value=value):
+                process = fake_agent.OneShotProcess([value])
+                with self.assertRaises(TypeError):
+                    launched(process).run(request(), 10.0)
+                self.assertEqual(process.fenced, [cursor.DRIVER_FENCE])
+
+    def test_an_exception_from_the_clock_or_stdin_fences_the_child(self):
+        def clock():
+            raise RuntimeError("clock")
+        process = fake_agent.OneShotProcess([init()])
+        with self.assertRaises(RuntimeError):
+            launched(process, clock=clock).run(request(), 10.0)
+        self.assertEqual(process.fenced, [cursor.DRIVER_FENCE])
+        process = fake_agent.OneShotProcess([init()])
+        process.close_stdin = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            launched(process).run(request(), 10.0)
+        self.assertEqual(process.fenced, [cursor.DRIVER_FENCE])
+
+    def test_a_fence_that_fails_does_not_replace_the_error(self):
+        error = MemoryError()
+        process = RaisingProcess([], error, fence_error=RuntimeError("fence"))
+        with self.assertRaises(MemoryError) as caught:
+            launched(process).run(request(), 10.0)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(process.fenced, [cursor.DRIVER_FENCE])
+        self.assertIn("fencing the child also failed: RuntimeError", caught.exception.__notes__)
+
+    def test_the_typed_ways_out_are_fenced_once_by_the_route_boundary(self):
+        for error, code, reason in ((BrokenPipeError(), c.ENGINE_ERROR, "io_error"),
+                                    (ReadTimeout(), c.DEADLINE_EXCEEDED, "deadline")):
+            with self.subTest(error=type(error).__name__):
+                process = RaisingProcess([init()], error)
+                self.assertEqual(launched(process).run(request(), 10.0)["code"], code)
+                self.assertEqual(process.fenced, [reason])
+
+
+class LaunchBoundaryTest(unittest.TestCase):
+    """The first break-it read of #412, F3 (STRICT, guard): ``check_argv`` holds the exact argv handed to the
+    launch, before anything starts."""
+
+    def test_a_changed_argv_is_refused_at_the_launch(self):
+        class Changed(cursor.CursorAdapter):
+            def argv(self, request):
+                return self.change(super().argv(request))
+
+        changes = ((lambda a: a[:3] + ["--force"] + a[3:], "full_access_not_acknowledged:--force"),
+                   (lambda a: a[:3] + ["--api-key", "made-up"] + a[3:], "credential_in_argv:--api-key"),
+                   (lambda a: [a[0]] + a[2:], "updater_not_disabled"),
+                   (lambda a: ["/usr/bin/other"] + a[1:], "executable_mismatch"),
+                   (lambda a: a[:-1] + ["x" * cursor.MAX_ARG_BYTES] * 9, "argv_invalid"),
+                   (lambda a: tuple(a[:3]) + ("--api-key", "made-up"), "credential_in_argv:--api-key"))
+        for change, detail in changes:
+            with self.subTest(detail=detail):
+                launcher = fake_agent.FakeLauncher("oneshot/hello.jsonl")
+                made = Changed(launcher, lambda: 0.0, credentials, PARENT)
+                made.change = change
+                result = made.run(request(), 10.0)
+                self.assertEqual((result["code"], result["detail"], launcher.launches),
+                                 (c.LAUNCH_REFUSED, detail, []))
+
+    def test_a_request_id_or_deadline_the_drive_cannot_read_launches_nothing(self):
+        """Found by the lane's own attack on this answer: both started a child, then failed in the drive."""
+        for req, deadline, detail in ((dict(request(), request_id=7), 10.0, "request_id: not text"),
+                                      (dict(request(), request_id=""), 10.0, "request_id: not text"),
+                                      (request(), "10", "deadline_at: not a finite number"),
+                                      (request(), None, "deadline_at: not a finite number"),
+                                      (request(), True, "deadline_at: not a finite number"),
+                                      (request(), float("nan"), "deadline_at: not a finite number"),
+                                      (request(), float("inf"), "deadline_at: not a finite number")):
+            with self.subTest(detail=detail, deadline=deadline):
+                launcher = fake_agent.FakeLauncher("oneshot/hello.jsonl")
+                result = adapter(launcher).run(req, deadline)
+                self.assertEqual((result["code"], result["detail"], launcher.launches),
+                                 (c.REQUEST_INVALID, detail, []))
+        self.assertEqual(adapter(fake_agent.FakeLauncher("oneshot/hello.jsonl")).run(request(), 10)["code"], None)
+
+    def test_a_model_over_the_bounds_is_refused_not_launched(self):
+        for size in (140000, 1100000):
+            with self.subTest(size=size):
+                launcher = fake_agent.FakeLauncher("oneshot/hello.jsonl")
+                result = adapter(launcher).run(request(model="m" * size), 10.0)
+                self.assertEqual((result["code"], result["detail"], launcher.launches),
+                                 (c.LAUNCH_REFUSED, "argv_invalid", []))
+
+    def test_the_launch_gets_the_very_argv_that_was_checked(self):
+        seen = []
+        checked = cursor.check_argv
+
+        def spy(argv, **kwargs):
+            seen.append(("checked", argv))
+            return checked(argv, **kwargs)
+
+        def launcher(argv, *, env, shell=False, **options):
+            seen.append(("launched", argv))
+            return fake_agent.OneShotProcess(fake_agent.fixture_lines("oneshot/hello.jsonl"))
+
+        cursor.check_argv = spy
+        self.addCleanup(setattr, cursor, "check_argv", checked)
+        self.assertEqual(adapter(launcher).run(request(), 10.0)["code"], None)
+        self.assertEqual([step for step, _ in seen], ["checked", "launched"])
+        self.assertIs(seen[0][1], seen[1][1])
 
 
 if __name__ == "__main__":

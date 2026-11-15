@@ -1,9 +1,12 @@
 # Written by Claude Opus 5.5 (claude-opus-5-5), builder lane ENGINE-E6, for Lucas.
-"""Cursor CLI (engine ``cursor``): the stream-json parser, the drives' argv, and the unattended switch.
+"""Cursor CLI (engine ``cursor``): the stream-json parser, the drives' argv, the unattended switch, and the
+one-shot driver.
 
-Lane ENGINE-E6, first slice (the Liaison's start note of Nov 14, 2026): fixtures, parser, and the switch
-written as data that is off. Nothing here starts a process, reads a file or the environment, reads a
-login store, or is registered anywhere: no factory is in the engine table, no daemon loads this module.
+Lane ENGINE-E6 (the Liaison's start notes of Nov 14 and 15, 2026). Slice 1: fixtures, the parser, the argv
+guard, and the switch written as data that is off. Slice 2: the one-shot driver, ``CursorAdapter``. The
+parser, the guard and the switch start nothing and read no file, environment or login store. The driver
+starts the engine only through the launcher composition hands it, and reads only the parent mapping it is
+handed. Nothing is registered anywhere: no factory is in the engine table, no daemon loads this module.
 
 SOURCES. Cursor publishes no schema for its stream. The shapes below are from its own pages, retrieved
 2026-11-15 about 01:05 UTC (Nov 14, about 5:05 PM PST): https://cursor.com/docs/cli/reference/output-format
@@ -51,13 +54,15 @@ as text that UTF-8 can write; any other success line is a ``protocol_error``, ne
 
 The parser serves ONE worker and one reader of its output, in order, and holds no lock. ``parse`` is not
 atomic: an exception that escapes it (a ``MemoryError``, an interrupt) may leave its line half recorded,
-so a driver that catches one discards the parser with the turn.
+so the driver discards the parser with the turn: ``CursorAdapter`` fences the child and lets the exception
+leave.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -66,7 +71,7 @@ from types import MappingProxyType
 # ``rfc8785/v1`` for ``input_digest``. The control package does not import ``routes``.
 from recursion_core.control.methods import NoCanonicalText, canonical_text
 from recursion_core.routes import contract as c
-from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol
+from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol, scalar
 from recursion_core.routes.launch import ReadTimeout, child_env
 
 ENGINE = "cursor"
@@ -363,8 +368,8 @@ class StreamParser:
     other than assistant text),
     ``model`` and ``api_key_source`` (from the first system/init; None when absent or not one of the three
     documented sources), ``result_seen``, ``result_code`` (None on success and before a result),
-    ``final_text`` (the answer of a successful result, else None), and ``counts`` (``COUNTS``, every name
-    always present).
+    ``final_text`` (the answer of a successful result, else None), ``init_seen`` (whether a system/init of
+    this conversation came, whatever its key source), and ``counts`` (``COUNTS``, every name always present).
     """
 
     def __init__(self) -> None:
@@ -379,6 +384,10 @@ class StreamParser:
         self._input: tuple[str, str, str] | None = None   # (delivery_id, turn_id, text), until replayed
         self._wrote = False
         self._calls: dict[str, tuple[str, str, bool]] = {}   # call_id -> (tool key, tool name, completed)
+
+    @property
+    def init_seen(self) -> bool:
+        return self._init_seen
 
     # -- the one input ---------------------------------------------------------------------------------
     def wrote(self, delivery_id: object, turn_id: object, text: object) -> None:
@@ -570,10 +579,42 @@ MAX_PROMPT_BYTES = MAX_ARG_BYTES   # the prompt is one argument
 _EXPECTED_KEY_SOURCE = {"subscription": "login", "api_key": "env"}
 # Lines the one-shot driver does not run past: its own process's stdout is the engine's stream and nothing else.
 _FATAL_COUNTS = ("not_json", "no_session", "other_session")
+# The stream line each draft is read from, named as a route event's ``source``.
+_EVENT_SOURCES = {"input.accepted": "cursor.user", "tool.call": "cursor.tool_call.started",
+                  "tool.result": "cursor.tool_call.completed", "result": "cursor.result"}
+# What a child is fenced for when the driver ends by anything the route boundary does not type
+# (routes/base.py types Deadline, _Protocol and OSError, and fences the child for each itself).
+DRIVER_FENCE = "driver_error"
+
+
+def input_ids(request_id: str) -> tuple[str, str]:
+    """The delivery id and the turn id of the one input, named from the request id.
+
+    Today's route request carries neither id, and event.v1 needs both (``dlv-``, ``turn-``). The run
+    record's own ids take their place when the driver is wired to it (lane SESSIONS); until then one
+    request always names the same pair.
+    """
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:40]
+    return f"dlv-{digest}", f"turn-{digest}"
+
+
+def route_event(draft: dict) -> dict:
+    """A driver.v2 draft as a route result's event, in the order the stream gave it: the draft's type is the
+    event's kind, the line it was read from is its source, and only the payload's scalar fields are copied
+    (``routes.base.scalar``). A tool's ``input`` is nested model payload and is not copied; its
+    ``input_digest`` is."""
+    return c.event(draft["type"], _EVENT_SOURCES[draft["type"]],
+                   {name: scalar(value) for name, value in draft["payload"].items()})
 
 
 class CursorAdapter(RouteAdapter):
-    """Cursor's one-shot drive on today's one-turn path. Its own factory; registered nowhere yet."""
+    """Cursor's one-shot drive on today's one-turn path. Its own factory; registered nowhere yet.
+
+    Every launch goes through ``check_argv``, over the exact argv handed to composition's launcher. Once the
+    child has started, every way out of the drive fences it: the route boundary fences for a deadline, a
+    protocol error and an OSError; this driver fences for anything else, ``BaseException`` included, and the
+    original exception is what leaves.
+    """
 
     engine = ENGINE
 
@@ -581,9 +622,37 @@ class CursorAdapter(RouteAdapter):
         super().__init__(*args, **kwargs)
         _executable(binary)   # an option that is not an absolute path fails composition, not a run
         self._binary = binary
+        self._launch = self._launcher          # composition's launcher
+        self._launcher = self._checked_launch  # the one way to it (the first break-it read of #412, F3)
 
     def declaration(self) -> dict:
         return oneshot_declaration()
+
+    def run(self, request: dict, deadline_at: float) -> dict:
+        """One plain copy of the request's route and connection, taken once, so the argv, the child's
+        environment and the billing check all read the same route (the first break-it read of #412, F4)."""
+        route = request["route"]
+        connection = route["connection"]
+        copy = dict(request)
+        copy["route"] = dict(route)
+        copy["route"]["connection"] = dict(connection)
+        # Two inputs the drive reads only after the child has started: refused before it starts instead.
+        rid = copy.get("request_id")
+        if type(rid) is not str or not rid:
+            return c.result("", c.REQUEST_INVALID, detail="request_id: not text")
+        if type(deadline_at) not in (int, float) or not math.isfinite(deadline_at):
+            return c.result(rid, c.REQUEST_INVALID, detail="deadline_at: not a finite number")
+        return super().run(copy, deadline_at)
+
+    def _checked_launch(self, argv, *, env, shell=False, **options):
+        """The launch boundary. ``check_argv`` holds the exact argv this launch is handed, before anything
+        starts; a refusal is the launcher's own typed refusal (``launch_refused``, the rule as detail), so the
+        route boundary answers it as a refusal before launch."""
+        try:
+            check_argv(argv, binary=self._binary)
+        except ArgvRefused as err:
+            raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
+        return self._launch(argv, env=env, shell=shell, **options)
 
     def argv(self, request: dict) -> list[str]:
         prompt = request["prompt"]
@@ -597,7 +666,7 @@ class CursorAdapter(RouteAdapter):
             options = oneshot_argv(request["route"]["model"], binary=self._binary)
         except ArgvRefused as err:
             raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
-        return [*options, "--", prompt]   # check_argv holds it (the tests check every launched argv with it)
+        return [*options, "--", prompt]   # checked whole at the launch boundary, ``_checked_launch``
 
     def env(self, request: dict) -> dict[str, str]:
         kind = request["route"]["connection"]["kind"]
@@ -608,9 +677,25 @@ class CursorAdapter(RouteAdapter):
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for cursor")
 
     def drive(self, process, request, deadline_at, events):
+        try:
+            return self._drive(process, request, deadline_at, events)
+        except (Deadline, _Protocol, OSError):
+            raise   # the route boundary fences the child for each of these and types the result
+        except BaseException as err:
+            # Any other way out (a TypeError, a MemoryError, an interrupt, a defect): the child is fenced first
+            # and the original exception leaves. A fence that fails too does not replace it; it is noted on it.
+            try:
+                process.fence(DRIVER_FENCE)
+            except BaseException as fence_err:
+                err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
+            raise
+
+    def _drive(self, process, request, deadline_at, events):
         rid, kind = request["request_id"], request["route"]["connection"]["kind"]
+        expected = _EXPECTED_KEY_SOURCE[kind]   # env() refused every other kind before the launch
+        parser = StreamParser()   # one per run; discarded with the turn, whatever ends it
+        parser.wrote(*input_ids(rid), request["prompt"])
         process.close_stdin()   # the prompt is in argv; nothing is written to the child
-        parser = StreamParser()
         while True:
             remaining = deadline_at - self._clock()
             if remaining <= 0:
@@ -623,26 +708,32 @@ class CursorAdapter(RouteAdapter):
                 return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before result")
             before = [parser.counts[name] for name in _FATAL_COUNTS]
             drafts = parser.parse(line)
-            for name, count in zip(_FATAL_COUNTS, before):
+            for name, count in zip(_FATAL_COUNTS, before, strict=True):
                 if parser.counts[name] != count:
                     raise _Protocol(f"stdout line: {name}")
             # The parser keeps the first init's key source and never changes it. A source Cursor does not
-            # document is not refused (the parser keeps it as None): the child's environment and argv already
-            # carry no other credential, so this check is a second line only.
-            if parser.api_key_source is not None:
-                expected = _EXPECTED_KEY_SOURCE.get(kind)
-                if parser.api_key_source != expected:
-                    # The run reports a key source the route did not pick: it would bill another meter.
-                    process.fence("billing_mismatch")
-                    return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
-                        f"the {kind} route's run reported apiKeySource {parser.api_key_source}, not {expected}: "
-                        "it would bill another meter; choose the route that matches, or cancel"))
+            # document is kept as None and not refused. The child's environment carries HOME for both kinds
+            # (routes.launch's allowlist), where Cursor's sign-in store may live, so an API-key route's child
+            # could still bill the sign-in: this check is what refuses such a run, and a run that reports no
+            # init at all is refused at its result (its meter is not known).
+            if parser.api_key_source is not None and parser.api_key_source != expected:
+                # The run reports a key source the route did not pick: it would bill another meter.
+                process.fence("billing_mismatch")
+                return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
+                    f"the {kind} route's run reported apiKeySource {parser.api_key_source}, not {expected}: "
+                    "it would bill another meter; choose the route that matches, or cancel"))
             for draft in drafts:
+                events.append(route_event(draft))
                 if draft["type"] != "result":
                     continue
                 code = draft["payload"]["code"]
-                if code is None:
-                    return c.result(rid, None, text=parser.final_text or "", events=events)
                 if code == "protocol_error":
                     raise _Protocol(draft["payload"]["detail"])
+                if not parser.init_seen:
+                    process.fence("billing_unknown")
+                    return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
+                        f"the {kind} route's run reported no system/init, so which meter it billed is not known; "
+                        "choose the route again, or cancel"))
+                if code is None:
+                    return c.result(rid, None, text=parser.final_text or "", events=events)
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=draft["payload"]["detail"])

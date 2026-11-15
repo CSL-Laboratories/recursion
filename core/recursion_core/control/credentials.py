@@ -152,13 +152,15 @@ class CredentialStoreUncertain(CredentialStoreError):
 def ceiling(kind: object) -> frozenset[str]:
     """The most a principal of ``kind`` may hold; nothing for a kind that is not known."""
 
-    return CEILING.get(kind, frozenset()) if isinstance(kind, str) else frozenset()
+    kind = _text(kind)   # its text: no hash of a str subclass runs (round 7 of #377, DeepSeek 1)
+    return CEILING.get(kind, frozenset()) if kind is not None else frozenset()
 
 
 def check_grant(kind: object, scopes: object) -> frozenset[str]:
     """``scopes`` as a frozenset, if a credential of ``kind`` may be minted with them; else ``CredentialRefused``."""
 
-    if not isinstance(kind, str) or kind not in KINDS:
+    kind = _text(kind)   # its text: no hash or comparison of a str subclass runs (round 7, DeepSeek 1)
+    if kind is None or kind not in KINDS:
         raise CredentialRefused("kind_unknown")
     if kind not in MINTABLE:
         raise CredentialRefused("kind_not_mintable")
@@ -166,7 +168,7 @@ def check_grant(kind: object, scopes: object) -> frozenset[str]:
         raise CredentialRefused("scopes_invalid")
     if not all(isinstance(s, str) for s in scopes):   # before hashing: a list may hold an unhashable value
         raise CredentialRefused("scopes_invalid")
-    wanted = frozenset(scopes)
+    wanted = frozenset(_text(s) for s in scopes)   # each read as its text (round 7, DeepSeek 1)
     if len(wanted) != len(scopes) or not wanted <= ALL_SCOPES:
         raise CredentialRefused("scopes_invalid")
     if "manage" in wanted and "manage" not in CEILING[kind]:
@@ -449,7 +451,16 @@ class CredentialStore:
                     raise CredentialStoreError(f"the store's lock cannot be taken ({type(exc).__name__})") from None
             yield
         finally:
-            os.close(fd)   # releases the lock
+            # The lock is let go explicitly, then its descriptor closed. Neither failing changes the answer: what
+            # the caller did under the lock is done (a mint that is written returns its token), and a close that
+            # fails cannot leave the lock held for the rest of the process (round 7 of #377, DeepSeek 2: the
+            # OSError escaped mint and revoke untyped, and every later writer here was refused).
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            try:
+                os.close(fd)
+            except OSError as exc:
+                log.warning("the store's lock could not be released cleanly (%s)", type(exc).__name__)
 
     def _sweep_temps(self) -> None:
         """Remove the temporary files a killed writer left (the read of #377 by DeepSeek V4.1 Flash, F13). Called
@@ -558,6 +569,7 @@ class CredentialStore:
         is not a whole second in the future.
         """
 
+        kind, principal_id = _text(kind), _text(principal_id)   # their text (round 7 of #377, DeepSeek 1)
         granted = check_grant(kind, scopes if isinstance(scopes, (set, frozenset, list, tuple)) else None)
         if not isinstance(principal_id, str) or _LABEL.fullmatch(principal_id) is None:
             raise CredentialRefused("principal_id_invalid")

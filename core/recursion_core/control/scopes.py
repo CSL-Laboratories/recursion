@@ -35,8 +35,10 @@ recovery Stop never passes here.
      union of its identity's live grants;
    - any other device, session or agent principal with no ``grant`` holds nothing;
    - a principal whose ``grant`` cannot be read holds nothing, whatever its kind: an unreadable grant is
-     not an absent one, so it never falls through to a plugin's identity grants. A grant is absent only
-     when nothing named ``grant`` is declared on the principal, its class or its metaclass. A declared one
+     not an absent one, so it never falls through to a plugin's identity grants. A grant is absent when
+     nothing named ``grant`` is declared on the principal, its class, its bases or its metaclass (each
+     class's own dictionary is read, so no metaclass can hide a declaration), or when the declared one
+     reads ``None`` (SPINE's ``Principal`` default, the same answer for every kind). A declared one
      is read by the reader Python itself selects, the ``__getattribute__`` found in the dictionaries of the
      principal's class and its bases (no metaclass can answer in its place), never a ``__getattr__``
      fallback; if that read raises, even ``AttributeError``, it is unreadable. An unset ``__slots__`` grant
@@ -242,7 +244,11 @@ class Authorizer:
 
         kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
         try:
-            declared = (inspect.getattr_static(principal, "grant", _ABSENT) is not _ABSENT
+            # Each class's own dictionary first, read past any metaclass: a metaclass answering __dict__ hid a
+            # declaration from getattr_static (round 7, Sol 1); then the instance and the metaclass as before.
+            declared = (_special(type(principal), "grant") is not _ABSENT
+                        or _special(type(type(principal)), "grant") is not _ABSENT
+                        or inspect.getattr_static(principal, "grant", _ABSENT) is not _ABSENT
                         or inspect.getattr_static(type(principal), "grant", _ABSENT) is not _ABSENT)
             if declared:
                 # Declared on the principal, its class or its metaclass: read with the type's own reader, a

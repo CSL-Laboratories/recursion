@@ -810,6 +810,40 @@ class RoundSixScopesTest(unittest.TestCase):
         self.assertEqual(asked, [str, str])
 
 
+class RoundSevenScopesTest(unittest.TestCase):
+    """The round-7 read of #377 by Codex GPT-6.1 Sol, 1 (STRICT): a metaclass answering __dict__ hid a declared
+    grant from getattr_static, so its reader's AttributeError read as an absent grant."""
+
+    def test_declared_context_cannot_be_hidden_by_metaclass_dictionary_lookup(self) -> None:
+        # Sol's test, as written in its proposed-regression-test.diff.
+        class RejectIdentity:
+            def held(self, *args):
+                raise AssertionError("declared unreadable context reached identity store")
+
+        class Meta(type):
+            def __getattribute__(cls, name):
+                if name == "__dict__":
+                    return {}
+                return type.__getattribute__(cls, name)
+
+        class Hidden(metaclass=Meta):
+            kind, id = "plugin", "synthetic"
+            grant = None
+
+            def __getattribute__(self, name):
+                if name == "grant":
+                    raise AttributeError("synthetic context unavailable")
+                return object.__getattribute__(self, name)
+
+        class Child(Hidden):
+            pass
+
+        auth = Authorizer(scope_of=lambda _: None, credentials=RejectIdentity())
+        for principal in (Hidden(), Child()):
+            with self.subTest(inherited=type(principal) is Child):
+                self.assertEqual(auth.held(principal), frozenset())
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

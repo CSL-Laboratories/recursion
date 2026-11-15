@@ -40,12 +40,14 @@ class RelayForwardsTests(unittest.TestCase):
     def test_a_frame_reaches_the_socket_unchanged_and_its_answer_keeps_the_id(self) -> None:
         daemon = support.SocketDaemon(self)
         relay = Relay(environ=daemon.environ)
-        request = {"op": "control", "method": "run.stop", "params": {"run_id": "r-1", "command_id": "cmd-7f3a"},
-                   "id": 41}
+        # A keyed method of the pinned method table, its params exactly as methods.v1 allows them.
+        params = {"command_id": "cmd-4f1c2a9b7e3d5f60a8b1c2d3", "session_id": "ses-remote-1",
+                  "expected_turn_id": "turn-7"}
+        request = {"op": "control", "method": "session.interrupt", "params": params, "id": 41}
         reply = relay.handle(request)
         self.assertEqual(daemon.seen, [request])
         self.assertEqual(reply["id"], 41)
-        self.assertEqual(reply["result"]["params"], {"run_id": "r-1", "command_id": "cmd-7f3a"})
+        self.assertEqual(reply["result"]["params"], params)
 
     def test_each_frame_gets_a_connection_of_its_own(self) -> None:
         daemon = support.SocketDaemon(self)
@@ -134,6 +136,26 @@ class RelayRefusesTests(unittest.TestCase):
         with self.assertRaises(InsecureSocketPath):
             Relay(environ=daemon.environ)
 
+    def test_a_socket_directory_of_any_mode_but_0700_is_refused(self) -> None:
+        daemon = support.SocketDaemon(self)
+        self.addCleanup(os.chmod, daemon.directory, 0o700)
+        for mode in (0o500, 0o600, 0o300, 0o100, 0o1700):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(daemon.directory, mode)
+                with self.assertRaises(InsecureSocketPath):
+                    Relay(environ=daemon.environ)
+        os.chmod(daemon.directory, 0o700)
+        self.assertEqual(Relay(environ=daemon.environ).handle({"op": "ping"}), {"ok": True, "op": "pong"})
+
+    def test_a_file_where_the_socket_directory_should_be_is_refused(self) -> None:
+        runtime = support.scratch_dir(self)
+        path = os.path.join(runtime, "recursion")
+        with open(path, "w", encoding="utf-8"):
+            pass
+        os.chmod(path, 0o700)
+        with self.assertRaises(InsecureSocketPath):
+            Relay(environ={"XDG_RUNTIME_DIR": runtime})
+
     def test_a_symlinked_socket_directory_is_refused(self) -> None:
         daemon = support.SocketDaemon(self)
         elsewhere = support.scratch_dir(self)
@@ -189,6 +211,43 @@ class RelayRefusesTests(unittest.TestCase):
         self.assertEqual(reply["error"]["delivered"], "unknown")
         self.assertEqual(reply["error"]["detail"], "request:ConnectionResetError")
 
+    def test_a_frame_that_cannot_be_framed_again_is_refused_unsent(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ)
+        # json.loads accepts NaN, Infinity and a lone surrogate written as an escape; encode_frame does not.
+        for body in (b'{"op":"control","method":"run.list","params":{"x":NaN},"id":1}',
+                     b'{"op":"control","method":"run.list","params":{"x":-Infinity},"id":1}',
+                     b'{"op":"control","method":"run.list","params":{"x":"\\ud800"},"id":1}'):
+            with self.subTest(body=body):
+                reply = relay.handle(codec.read_message(io.BytesIO(HEADER.pack(len(body)) + body)))
+                self.assertEqual((reply["error"]["code"], reply["error"]["delivered"], reply["id"]),
+                                 ("bad_frame", False, 1))
+        self.assertEqual(daemon.seen, [])
+
+    def test_the_relays_own_answers_can_always_be_written(self) -> None:
+        daemon = support.SocketDaemon(self)
+        out = io.BytesIO()
+        bodies = (b'{"op":"relay_\\ud800x","id":1}', b'{"op":"relay_hello","relay_version":1,"id":"\\udfff"}',
+                  b'{"op":"control","method":"run.list","params":{},"id":"\\ud800"}')
+        stream = b"".join(HEADER.pack(len(body)) + body for body in bodies)
+        self.assertEqual(Relay(environ=daemon.environ).serve(io.BytesIO(stream), out), EXIT_OK)
+        unknown_op, hello, control = read_all(out.getvalue())
+        self.assertEqual((unknown_op["error"]["code"], unknown_op["error"]["detail"], unknown_op["id"]),
+                         ("unknown_relay_op", "relay_\\ud800x", 1))
+        self.assertTrue(unknown_op["error"]["detail"].isascii())
+        self.assertNotIn("id", hello)  # an id that cannot be framed again is left out
+        self.assertEqual(hello["relay"]["version"], 1)
+        self.assertEqual((control["error"]["code"], control["error"]["delivered"]), ("bad_frame", False))
+        self.assertNotIn("id", control)
+        self.assertEqual(daemon.seen, [])
+
+    def test_bad_constructor_arguments_are_refused(self) -> None:
+        daemon = support.SocketDaemon(self)
+        for kwargs in ({"timeout_s": "x"}, {"timeout_s": 0}, {"timeout_s": True}, {"max_frame_bytes": 0},
+                       {"max_frame_bytes": 1.5}, {"connect": 7}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                Relay(environ=daemon.environ, **kwargs)
+
     def test_a_request_too_large_for_a_frame_is_refused_before_connecting(self) -> None:
         daemon = support.SocketDaemon(self)
         connects: list[str] = []
@@ -241,6 +300,16 @@ class RelayStreamTests(unittest.TestCase):
         self.assertEqual(code, EXIT_STREAM)
         self.assertEqual(read_all(out.getvalue())[0]["error"]["detail"], "frame_not_json")
 
+    def test_a_relay_answer_too_large_for_the_frame_is_not_delivered(self) -> None:
+        daemon = support.SocketDaemon(self)
+        out = io.BytesIO()
+        hello = {"op": "relay_hello", "relay_version": 1, "id": "i" * 400}  # fits 512 bytes; its answer does not
+        code = Relay(environ=daemon.environ, max_frame_bytes=512).serve(io.BytesIO(frames(hello)), out)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(read_all(out.getvalue()),
+                         [codec.relay_error("response_too_large", delivered=False, request=hello)])
+        self.assertEqual(daemon.seen, [])
+
     def test_an_answer_too_large_for_the_relays_frame_is_reported_as_delivered(self) -> None:
         daemon = support.SocketDaemon(self, handler=lambda message, conn: {"ok": True, "result": {"code": "ok",
                                                                                                     "blob": "y" * 2048}})
@@ -282,11 +351,13 @@ class RelayMainTests(unittest.TestCase):
 
     def test_a_bad_key_label_is_refused(self) -> None:
         daemon = support.SocketDaemon(self)
-        out = io.BytesIO()
-        code = main(["relay", "--key-label", "lap top;"], environ=daemon.environ, stdin=io.BytesIO(), stdout=out,
-                    stderr=io.StringIO())
-        self.assertEqual(code, EXIT_REFUSED)
-        self.assertEqual(out.getvalue(), b"")
+        for label in ("lap top;", "laptop\n", "-laptop", "x" * 65):
+            with self.subTest(label=label):
+                out = io.BytesIO()
+                code = main(["relay", "--key-label", label], environ=daemon.environ, stdin=io.BytesIO(),
+                            stdout=out, stderr=io.StringIO())
+                self.assertEqual(code, EXIT_REFUSED)
+                self.assertEqual(out.getvalue(), b"")
 
     def test_a_usage_error_writes_nothing_on_stdout(self) -> None:
         out, err = io.BytesIO(), io.StringIO()

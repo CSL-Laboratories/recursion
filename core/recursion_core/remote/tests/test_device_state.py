@@ -5,6 +5,7 @@ The clock is moved by hand (``support.FakeClock``); nothing waits on the wall cl
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import unittest
 
@@ -84,6 +85,34 @@ class DeviceTests(unittest.TestCase):
     def test_an_expiry_in_the_past_is_refused(self) -> None:
         with self.assertRaises(PairingRefused):
             self.book.add(grant("dev_two"), expires_at=self.clock.now)
+
+    def test_a_returned_record_cannot_widen_scopes_or_undo_a_revocation(self) -> None:
+        record = self.book.add(grant("dev_two", scopes=("read",)), expires_at=self.clock.now + 60)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.scopes = ("read", "run", "approve")  # type: ignore[misc]
+        self.assertEqual(self.book.admit("dev_two", "run").code, "scope_refused")
+        self.book.revoke("dev_two")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.revoked_at = None  # type: ignore[misc]
+        self.assertEqual(self.book.admit("dev_two", "read").code, "device_revoked")
+        self.assertIsNone(record.revoked_at)  # the snapshot handed out earlier; the book's own record changed
+
+    def test_a_connection_id_is_admitted_once(self) -> None:
+        self.assertTrue(self.book.connect("dev_one", "conn-a").ok)
+        self.assertEqual(self.book.connect("dev_one", "conn-a").code, "connection_exists")
+
+    def test_wrong_arguments_get_typed_refusals(self) -> None:
+        for bad_grant in (None, {"device_id": "dev_x"}):
+            with self.subTest(grant=bad_grant), self.assertRaises(PairingRefused) as caught:
+                self.book.add(bad_grant, expires_at=self.clock.now + 60)  # type: ignore[arg-type]
+            self.assertEqual(caught.exception.code, "grant_invalid")
+        for expiry in (None, "soon", True, float("inf"), float("nan")):
+            with self.subTest(expiry=expiry), self.assertRaises(PairingRefused) as caught:
+                self.book.add(grant("dev_two"), expires_at=expiry)  # type: ignore[arg-type]
+            self.assertEqual(caught.exception.code, "expiry_invalid")
+        self.assertEqual(self.book.connect("dev_one", []).code, "connection_invalid")  # type: ignore[arg-type]
+        self.assertEqual(self.book.check_connection([], "read").code, "connection_invalid")  # type: ignore[arg-type]
+        self.book.disconnect([])  # type: ignore[arg-type]
 
     def test_the_list_shows_state_and_no_secret(self) -> None:
         self.book.add(grant("dev_two", scopes=("read",), label="tablet"), expires_at=self.clock.now + 10)

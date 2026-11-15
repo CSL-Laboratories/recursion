@@ -10,14 +10,16 @@ What it checks:
 
 * The socket path is an absolute AF_UNIX path. A network-shaped address (``host:port``, a URL, an IP, a
   tuple) raises ``RemoteBindRefused`` (``control_transport.unix.refuse_remote_bind``), at start.
-* The socket's directory, when it exists, is a real directory owned by this uid with no group or other
-  bit (0700); anything else is refused at start and again before every connection. The relay never
-  creates or repairs it: a wrong directory means the wrong place. A missing one means the daemon is not
-  running, and each request is answered "not delivered".
+* The socket's directory, when it exists, is a real directory owned by this uid with mode exactly 0700;
+  anything else is refused at start and again before every connection. The relay never creates or
+  repairs it: a wrong directory means the wrong place. A missing one means the daemon is not running, and
+  each request is answered "not delivered".
 * The socket server's uid is this uid (``UnixControlClient``'s SO_PEERCRED check).
 * Under a forced command, sshd puts the client's own command in ``SSH_ORIGINAL_COMMAND``; anything but
   ``recursiond relay`` is refused, so that a key kept for the relay cannot be used for a shell, scp or
   anything else through it.
+* A frame that was readable but cannot be framed again (too large, a lone surrogate, NaN or Infinity,
+  all of which ``json.loads`` accepts) is refused ``bad_frame``, not delivered, before anything is sent.
 
 One connection per frame, as the CLI makes one connection per call (``control.client.SocketAPI``): the
 relay holds no slot of the socket between requests, and a ``run.stop`` arriving while the socket's
@@ -25,8 +27,9 @@ ordinary slots are taken is served on its reserved Stop slot exactly as a local 
 handled in order, one at a time, per SSH session; the client opens another session for a Stop
 (``ssh_transport.RelayAPI``), so a Stop never waits behind a slow call in the same session.
 
-Command ids pass through untouched: the frame's ``id`` and everything in ``params`` (``command_id``
-included) reach the socket exactly as the client sent them, and the reply keeps the request's ``id``.
+Command ids pass through untouched: the frame and everything in its ``params`` (a keyed method's
+``command_id`` included) reach the socket exactly as the client sent them. A reply from the daemon is
+passed back unchanged, except that an error claiming the relay's own layer is rewritten (``codec``).
 
 The relay's label (``relay_hello``: SSH or plain stdio, the key label the owner wrote into the forced
 command, the client address sshd reports) is evidence for the operator, never authority. Any same-uid
@@ -50,22 +53,23 @@ from recursion_core.control.client import DEFAULT_TIMEOUT_S, socket_path as defa
 from recursion_core.control_transport.errors import (FrameError, InsecureSocketPath, PeerNotAdmitted,
                                                      PlatformNotSupported, RemoteBindRefused, TransportBusy,
                                                      TransportRefused)
-from recursion_core.control_transport.framing import MAX_FRAME_BYTES, encode_frame
+from recursion_core.control_transport.framing import MAX_FRAME_BYTES
 from recursion_core.control_transport.unix import UnixControlClient, refuse_remote_bind, require_unix_transport
 
 from .codec import (BUSY_MESSAGE, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_OP_PREFIX, RELAY_VERSION, UNAVAILABLE,
-                    Message, daemon_reply, read_message, relay_error, write_message)
+                    Message, copyable_id, daemon_reply, frame_refusal, read_message, relay_error, write_message)
 
 # What the client asks sshd to run; under a forced command it arrives as SSH_ORIGINAL_COMMAND.
 RELAY_COMMAND = "recursiond relay"
 EXIT_OK, EXIT_ERROR, EXIT_REFUSED, EXIT_STREAM = 0, 1, 2, 3
-_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SOCKET_DIRECTORY_MODE = 0o700
+_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 Connect = Callable[..., Any]
 
 
 def check_socket_directory(directory: str, *, uid: int | None = None) -> None:
-    """Refuse a socket directory that is not a real 0700 directory owned by ``uid`` (this uid).
+    """Refuse a socket directory that is not a real directory, owned by ``uid`` (this uid), of mode 0700.
 
     ``FileNotFoundError`` when it does not exist. It is checked, never created or repaired.
     """
@@ -75,7 +79,7 @@ def check_socket_directory(directory: str, *, uid: int | None = None) -> None:
     owner = os.geteuid() if uid is None else uid
     if info.st_uid != owner:
         raise InsecureSocketPath(f"{directory} is owned by uid {info.st_uid}, not {owner}")
-    if info.st_mode & 0o077:
+    if stat.S_IMODE(info.st_mode) != SOCKET_DIRECTORY_MODE:
         raise InsecureSocketPath(f"{directory} has mode {stat.S_IMODE(info.st_mode):04o}, want 0700")
 
 
@@ -83,7 +87,7 @@ def check_key_label(label: object) -> str | None:
     """The owner's name for the key, from the forced command: letters, digits, ``.``, ``_``, ``-``."""
     if label is None:
         return None
-    if not isinstance(label, str) or not _LABEL.match(label):
+    if not isinstance(label, str) or not _LABEL.fullmatch(label):
         raise ValueError("a key label is 1 to 64 letters, digits, '.', '_' or '-', starting with a letter or digit")
     return label
 
@@ -97,6 +101,12 @@ def _client_address(environ: Mapping[str, str]) -> str | None:
         return str(ipaddress.ip_address(fields[0]))
     except ValueError:
         return None
+
+
+def _positive_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
 
 
 class Relay:
@@ -121,6 +131,11 @@ class Relay:
         path = default_socket_path(environ) if socket_path is None else socket_path
         self.socket_path = refuse_remote_bind(path)  # a network-shaped address is refused here, before anything
         require_unix_transport()
+        if not callable(connect):
+            raise ValueError("connect must make a client")
+        self._timeout_s = _positive_number(timeout_s, "timeout_s")
+        if type(max_frame_bytes) is not int or max_frame_bytes < 1:
+            raise ValueError("max_frame_bytes must be a positive integer")
         self.directory = os.path.dirname(self.socket_path)
         self._uid = os.geteuid() if uid is None else uid
         try:
@@ -131,7 +146,6 @@ class Relay:
         self.client_address = _client_address(environ)
         self.transport = "ssh" if self.client_address is not None else "stdio"
         self._connect = connect
-        self._timeout_s = timeout_s
         self._max_frame_bytes = max_frame_bytes
 
     def hello(self, request: Message | None = None) -> Message:
@@ -146,49 +160,54 @@ class Relay:
                 "client_address": self.client_address,
             },
         }
-        if isinstance(request, dict) and "id" in request:
-            reply["id"] = request["id"]
+        has_id, value = copyable_id(request)
+        if has_id:
+            reply["id"] = value
         return reply
 
     def handle(self, request: Message) -> Message:
         """One frame in, one frame out. Never raises: anything unexpected is "delivery unknown"."""
+        return self._handle(request)[0]
+
+    def _handle(self, request: Message) -> tuple[Message, bool]:
+        """The answer, and whether the request may have reached the daemon (the socket was connected)."""
         try:
             op = request.get("op")
             if isinstance(op, str) and op.startswith(RELAY_OP_PREFIX):
                 if op == HELLO_OP:
-                    return self.hello(request)
-                return relay_error("unknown_relay_op", delivered=False, detail=op[:64], request=request)
+                    return self.hello(request), False
+                return relay_error("unknown_relay_op", delivered=False, detail=op[:64], request=request), False
             return self._forward(request)
         except Exception as exc:  # noqa: BLE001 - a relay that fails must still answer, and truthfully
             return relay_error("relay_internal_error", delivered="unknown", detail=type(exc).__name__,
-                               request=request)
+                               request=request), True
 
-    def _forward(self, request: Message) -> Message:
-        try:
-            encode_frame(request, max_bytes=self._max_frame_bytes)
-        except FrameError as exc:
-            return relay_error("bad_frame", delivered=False, detail=str(exc), request=request)
+    def _forward(self, request: Message) -> tuple[Message, bool]:
+        refusal = frame_refusal(request, max_bytes=self._max_frame_bytes)
+        if refusal is not None:
+            return relay_error("bad_frame", delivered=False, detail=refusal, request=request), False
         try:
             check_socket_directory(self.directory, uid=self._uid)
             client = self._connect(self.socket_path, timeout_s=self._timeout_s)
         except (OSError, TransportRefused) as exc:
             # Nothing was written: the daemon is not running, its directory is wrong, or the peer is not ours.
-            return relay_error(UNAVAILABLE, delivered=False, detail=f"connect:{type(exc).__name__}", request=request)
+            return relay_error(UNAVAILABLE, delivered=False, detail=f"connect:{type(exc).__name__}",
+                               request=request), False
         try:
             reply = client.request(request)
         except TransportBusy:
-            return dict(BUSY_MESSAGE)  # exactly the socket's frame, so the far client reads "not delivered, busy"
+            return dict(BUSY_MESSAGE), False  # exactly the socket's frame: "not delivered, busy"
         except PeerNotAdmitted:
-            return dict(NOT_ADMITTED_MESSAGE)
+            return dict(NOT_ADMITTED_MESSAGE), False
         except (OSError, TransportRefused) as exc:
             # The frame may have been written and acted on: never report it as not delivered.
             return relay_error(UNAVAILABLE, delivered="unknown", detail=f"request:{type(exc).__name__}",
-                               request=request)
+                               request=request), True
         finally:
             client.close()
         if not isinstance(reply, dict):
-            return relay_error(UNAVAILABLE, delivered="unknown", detail="request:invalid_reply", request=request)
-        return daemon_reply(reply)
+            return relay_error(UNAVAILABLE, delivered="unknown", detail="request:invalid_reply", request=request), True
+        return daemon_reply(reply), True
 
     def serve(self, stdin: BinaryIO, stdout: BinaryIO) -> int:
         """Relay frames until stdin ends (``EXIT_OK``) or the stream breaks (``EXIT_STREAM``)."""
@@ -203,12 +222,13 @@ class Relay:
                 return EXIT_STREAM
             if request is None:
                 return EXIT_OK
-            reply = self.handle(request)
+            reply, reached = self._handle(request)
             try:
                 write_message(stdout, reply, max_bytes=self._max_frame_bytes)
-            except FrameError:
-                # The daemon answered (so the request was carried out) and the answer does not fit a frame.
-                if not self._write_quietly(stdout, relay_error("response_too_large", delivered=True,
+            except (FrameError, ValueError) as exc:
+                # The answer cannot be framed. If the daemon had the request, it may have carried it out.
+                code = "response_too_large" if isinstance(exc, FrameError) else "response_not_encodable"
+                if not self._write_quietly(stdout, relay_error(code, delivered=True if reached else False,
                                                                request=request)):
                     return EXIT_STREAM
             except OSError:
@@ -218,7 +238,7 @@ class Relay:
     def _write_quietly(stdout: BinaryIO, message: Message) -> bool:
         try:
             write_message(stdout, message)
-        except (OSError, FrameError):
+        except (OSError, ValueError):
             return False
         return True
 

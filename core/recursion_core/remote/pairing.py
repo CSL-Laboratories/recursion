@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import re
 import secrets
 import threading
@@ -35,7 +36,6 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
 
 DEVICE_SCOPES = ("read", "run", "approve")
 MANAGE = "manage"
@@ -46,7 +46,14 @@ MAX_OPEN_OFFERS = 8
 
 OPEN, REDEEMED, EXPIRED, LOCKED, CANCELLED = "open", "redeemed", "expired", "locked", "cancelled"
 # Printable ASCII, no leading or trailing space: no control or bidirectional characters in a label.
-_LABEL = re.compile(r"^[!-~](?:[ -~]{0,62}[!-~])?$")
+_LABEL = re.compile(r"[!-~](?:[ -~]{0,62}[!-~])?")
+# The pairing origin, whole: https://, a DNS name (labels of letters, digits and inner hyphens) or a
+# bracketed IPv6 address, an optional port of 1 to 5 digits, an optional final slash. Nothing else: no
+# user, path, query, fragment, whitespace or control character.
+_DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_ORIGIN = re.compile(rf"https://(?P<host>{_DNS_LABEL}(?:\.{_DNS_LABEL})*|\[(?P<ipv6>[0-9A-Fa-f:.]+)\])"
+                     r"(?::(?P<port>[0-9]{1,5}))?/?")
+_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 class PairingRefused(Exception):
@@ -61,7 +68,10 @@ def device_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
     """A paired device's scopes, checked and in canonical order; ``manage`` is ``scope_refused``."""
     if isinstance(scopes, (str, bytes)):
         raise PairingRefused("scope_invalid", "scopes are a list of words, not one string")
-    items = tuple(scopes)
+    try:
+        items = tuple(scopes)
+    except TypeError:
+        raise PairingRefused("scope_invalid", "scopes are a list of words") from None
     if not items:
         raise PairingRefused("scope_invalid", "a device needs at least one scope")
     for scope in items:
@@ -76,7 +86,7 @@ def device_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
 
 def device_label(label: object) -> str:
     """A device's name as the owner typed it: 1 to 64 printable ASCII characters, no edge spaces."""
-    if not isinstance(label, str) or not _LABEL.match(label):
+    if not isinstance(label, str) or not _LABEL.fullmatch(label):
         raise PairingRefused("label_invalid", "a label is 1 to 64 printable ASCII characters")
     return label
 
@@ -93,21 +103,26 @@ def pairing_link(origin: str, offer_id: str, code: str) -> str:
     """What the QR code carries: the overlay's HTTPS origin, then the offer id and the code in the fragment.
 
     The fragment is never sent in a request line, so neither the overlay's proxy nor a server log sees
-    the code. The origin must be ``https://host[:port]`` with nothing else. The ``/pair`` path is
-    provisional: the phone door that answers it is a later slice.
+    the code. The origin must be ``https://host[:port]`` with nothing else: a DNS name or a bracketed IPv6
+    address, and a port from 1 to 65535 when one is given. The ``/pair`` path is provisional: the phone door
+    that answers it is a later slice.
     """
-    parts = urlsplit(origin)
-    if (parts.scheme != "https" or not parts.hostname or parts.username is not None or parts.password is not None
-            or parts.path not in ("", "/") or parts.query or parts.fragment or "\\" in origin):
+    match = _ORIGIN.fullmatch(origin) if isinstance(origin, str) else None
+    if match is None or len(match.group("host")) > 255:
         raise PairingRefused("origin_invalid", "the pairing origin is https://host[:port] and nothing else")
-    try:
-        parts.port  # noqa: B018 - raises ValueError for a port that is not a number in range
-    except ValueError:
-        raise PairingRefused("origin_invalid", "the pairing origin has a bad port") from None
+    if match.group("ipv6") is not None:
+        try:
+            ipaddress.IPv6Address(match.group("ipv6"))
+        except ValueError:
+            raise PairingRefused("origin_invalid", "the bracketed address is not an IPv6 address") from None
+    port = match.group("port")
+    if port is not None and not 1 <= int(port) <= 65535:
+        raise PairingRefused("origin_invalid", "a port is 1 to 65535")
     for value in (offer_id, code):
-        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        if not isinstance(value, str) or not _TOKEN.fullmatch(value):
             raise PairingRefused("offer_invalid", "offer ids and codes are URL-safe base64")
-    return f"https://{parts.netloc}/pair#offer={offer_id}&code={code}"
+    authority = match.group("host") + (f":{port}" if port is not None else "")
+    return f"https://{authority}/pair#offer={offer_id}&code={code}"
 
 
 @dataclass(frozen=True)
@@ -220,7 +235,12 @@ class OfferBook:
             return IssuedOffer(offer_id, code, checked, name, now + self.ttl_s)
 
     def redeem(self, offer_id: object, code: object, *, source: str) -> PairingGrant:
-        """Redeem an offer once. Every refusal but the rate limit counts as a failed try from ``source``."""
+        """Redeem an offer once. Every refusal but the rate limit counts as a failed try from ``source``.
+
+        ``source`` is the door's name for where the try came from (the overlay peer's address, say): a string.
+        """
+        if not isinstance(source, str):
+            raise PairingRefused("source_invalid", "a source is a string")
         with self._lock:
             now = self.clock()
             if not self.limiter.allow(source, now):

@@ -2,31 +2,40 @@
 
 ``RelayAPI(target).call(method, params)`` has the shape of ``ControlAPI.call`` and gives the answers the
 CLI's socket client gives (``control.client.SocketAPI``), so the CLI, the TUI and the desktop app can use
-either one unchanged. Underneath, ``SshRelayClient`` runs ``ssh ... -- <host> recursiond relay`` and
-speaks the relay's frames (``codec``) on the child's stdin and stdout.
+either one unchanged. It sends the socket client's own frame, ``{"op": "control", "method", "params"}``,
+with nothing added. Underneath, ``SshRelayClient`` runs ``ssh ... -- <host> recursiond relay`` and speaks
+the relay's frames (``codec``) on the child's stdin and stdout.
 
 Delivery is reported as the socket client reports it, with one more hop to account for:
 
 * ``delivered: false``: nothing reached the daemon. ssh could not start or log in, the host key is not
-  the pinned one, the relay did not answer its hello, the daemon was not running behind the relay, or
-  the socket was busy or did not admit the relay. Details begin ``connect:`` (before any request was
-  written), ``relay:`` (the relay's own answer) or are the socket's own words (``busy``,
+  the pinned one, the relay did not answer its hello, the request could not be written whole in time,
+  the daemon was not running behind the relay, or the socket was busy or did not admit the relay.
+  Details begin ``connect:`` (before any request was written), ``request:`` (the request was not written
+  whole), ``relay:`` (the relay's own answer) or are the socket's own words (``busy``,
   ``daemon:scope_refused``).
-* ``delivered: "unknown"``: the request was written and no complete answer came back (the SSH link or
-  the relay died, or the answer did not arrive in time). It may have been carried out: read the run's
-  status before retrying.
+* ``delivered: "unknown"``: the request was written whole and no complete answer came back (the SSH link
+  or the relay died, or the answer did not arrive in time). It may have been carried out: read the run's
+  status before retrying. Nothing is ever resent.
 * Otherwise the daemon's answer, verbatim.
 
-The host key is pinned, not trusted on first use: ``SshTarget.known_hosts`` names one known_hosts file
-that must accept exactly one key for the host, and that key's fingerprint must be the one the caller
-expects (``host_key_fingerprint``); ssh then runs with ``StrictHostKeyChecking=yes`` against that file
-only. No config file is read unless the caller names one (``-F none``), and agent and X11 forwarding,
-port forwarding, a TTY, connection sharing and local commands are all off. The relay's hello gives a
-label (``SshRelayClient.label``) for the operator to see; it is evidence, not authority.
+The request's deadline covers writing it and waiting for the answer. A write that does not finish in
+time ends the session (the ssh child is killed), and the request was not delivered: the relay acts only
+on whole frames. ``close()`` ends a session at once, also while a request is blocked in it.
+
+The host key is pinned, not trusted on first use. ``SshTarget.known_hosts`` names one known_hosts file
+that must accept exactly one key for the host, the expected one (``host_key_fingerprint``), and must hold
+no certificate authority for it, since ssh would accept any host certificate that authority signed. ssh
+then runs against that file only, with ``StrictHostKeyChecking=yes`` and ``-F none``: no configuration
+file is read, so nothing can add a key source (``KnownHostsCommand``) or change the name looked up
+(``HostKeyAlias``). Agent and X11 forwarding, port forwarding, a TTY, connection sharing and local
+commands are all off. The relay's hello gives a label (``SshRelayClient.label``) for the operator to see;
+it is evidence, not authority.
 
 A Stop never waits behind another call: ``RelayAPI`` opens a fresh SSH session for each call, as the
 socket client makes one connection per call. With ``persistent=True`` ordinary calls share one session
-(for a surface that polls), and ``run.stop`` still gets a session of its own.
+(for a surface that polls), and ``run.stop`` still gets a session of its own, without waiting for the
+shared one.
 """
 
 from __future__ import annotations
@@ -34,22 +43,22 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import itertools
 import queue
 import re
 import struct
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from recursion_core.control.client import DEFAULT_TIMEOUT_S as SOCKET_TIMEOUT_S
-from recursion_core.control_transport.errors import FrameError, PeerNotAdmitted, TransportBusy, TransportRefused
+from recursion_core.control_transport.errors import PeerNotAdmitted, TransportBusy, TransportRefused
 from recursion_core.control_transport.framing import MAX_FRAME_BYTES, encode_frame
 
-from .codec import (BUSY_MESSAGE, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_VERSION, UNAVAILABLE, Message, read_message,
-                    relay_error_of)
+from .codec import (BUSY_MESSAGE, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_VERSION, UNAVAILABLE, Message, frame_refusal,
+                    read_message, relay_error_of)
 from .relay import RELAY_COMMAND
 
 HELLO_TIMEOUT_S = 30.0
@@ -59,7 +68,8 @@ CLOSE_GRACE_S = 5.0
 STDERR_TAIL_BYTES = 4096
 STOP_METHOD = "run.stop"
 
-# Every option is given on the command line, which ssh reads before any config file, so these win.
+# Every option is given on the command line, which ssh reads before any config file, so these win; and no
+# config file is read at all (-F none).
 HARDENED_OPTIONS = (
     "BatchMode=yes",
     "StrictHostKeyChecking=yes",
@@ -80,12 +90,12 @@ HARDENED_OPTIONS = (
     "LogLevel=ERROR",
 )
 
-_HOST = re.compile(r"^[A-Za-z0-9_.:%-]{1,253}$")
-_USER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+_HOST = re.compile(r"[A-Za-z0-9_.:%-]{1,253}")
+_USER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 # Absolute, POSIX or Windows. No whitespace (ssh splits a UserKnownHostsFile value on it), no '%' or '~'
-# (ssh expands them), no quotes.
-_PATH = re.compile(r"^(?:/|[A-Za-z]:[\\/])[A-Za-z0-9._/\\+-]{1,1023}$")
-_FINGERPRINT = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
+# (ssh expands them), no quotes. Every pattern is matched against the whole string.
+_PATH = re.compile(r"(?:/|[A-Za-z]:[\\/])[A-Za-z0-9._/\\+-]{1,1023}")
+_FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 
 
 class RelayRefused(TransportRefused):
@@ -93,7 +103,7 @@ class RelayRefused(TransportRefused):
 
 
 class HostKeyNotPinned(RelayRefused, ValueError):
-    """The known_hosts file does not accept exactly the expected key for this host; ssh is not started."""
+    """The known_hosts file does not trust exactly the expected key for this host; ssh is not started."""
 
 
 class RelayNotDelivered(RelayRefused, ConnectionError):
@@ -109,7 +119,7 @@ class RelayHandshakeFailed(RelayNotDelivered):
 
 
 class RelayDeliveryUnknown(RelayRefused, ConnectionError):
-    """The request was written and no complete answer came back; it may have been carried out."""
+    """The request was written whole and no complete answer came back; it may have been carried out."""
 
     def __init__(self, detail: str) -> None:
         super().__init__(detail)
@@ -120,9 +130,9 @@ class RelayDeliveryUnknown(RelayRefused, ConnectionError):
 class SshTarget:
     """Where the relay is and how its host key is pinned. Every field is checked; nothing has a hidden default.
 
-    ``known_hosts`` is a file of the operator's own, kept for this host, that must accept exactly one key
-    for it: ``host_key_fingerprint`` (``SHA256:...``, as ``ssh-keygen -lf`` prints it on the host).
-    ``ssh_config`` is ``"none"`` (read no config file) or an absolute path.
+    ``known_hosts`` is a file of the operator's own, kept for this host, that must trust exactly one key
+    for it: ``host_key_fingerprint`` (``SHA256:...``, as ``ssh-keygen -lf`` prints it on the host). No ssh
+    configuration file is read (``-F none``); a named configuration is not supported in this slice.
     """
 
     host: str
@@ -131,12 +141,11 @@ class SshTarget:
     user: str | None = None
     port: int | None = None
     identity_file: str | None = None
-    ssh_config: str = "none"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.host, str) or self.host.startswith("-") or not _HOST.match(self.host):
+        if not isinstance(self.host, str) or self.host.startswith("-") or not _HOST.fullmatch(self.host):
             raise ValueError("host must be a host name or address, with no option, user or space in it")
-        if self.user is not None and (not isinstance(self.user, str) or not _USER.match(self.user)):
+        if self.user is not None and (not isinstance(self.user, str) or not _USER.fullmatch(self.user)):
             raise ValueError("user must be a plain login name")
         if self.port is not None and (type(self.port) is not int or not 1 <= self.port <= 65535):
             raise ValueError("port must be an integer from 1 to 65535")
@@ -144,17 +153,15 @@ class SshTarget:
             value = getattr(self, name)
             if value is None and name == "identity_file":
                 continue
-            if not isinstance(value, str) or not _PATH.match(value):
+            if not isinstance(value, str) or not _PATH.fullmatch(value):
                 raise ValueError(f"{name} must be an absolute path without spaces, '%', '~' or quotes")
-        if self.ssh_config != "none" and (not isinstance(self.ssh_config, str) or not _PATH.match(self.ssh_config)):
-            raise ValueError("ssh_config must be 'none' or an absolute path")
-        if not isinstance(self.host_key_fingerprint, str) or not _FINGERPRINT.match(self.host_key_fingerprint):
+        if not isinstance(self.host_key_fingerprint, str) or not _FINGERPRINT.fullmatch(self.host_key_fingerprint):
             raise ValueError("host_key_fingerprint must be SHA256:<43 base64 characters>")
 
 
 def ssh_argv(target: SshTarget, *, ssh: Sequence[str] = ("ssh",)) -> list[str]:
-    """The exact command line: hardened options, then ``--``, the host and the relay command."""
-    argv = [*ssh, "-T", "-e", "none", "-F", target.ssh_config, "-o", f"UserKnownHostsFile={target.known_hosts}"]
+    """The exact command line: no config file, hardened options, then ``--``, the host and the relay command."""
+    argv = [*ssh, "-T", "-e", "none", "-F", "none", "-o", f"UserKnownHostsFile={target.known_hosts}"]
     for option in HARDENED_OPTIONS:
         argv += ["-o", option]
     if target.identity_file is not None:
@@ -207,8 +214,10 @@ def _pattern_matches(pattern: str, name: str) -> bool:
 def pinned_fingerprints(path: str, host: str, port: int | None = None) -> frozenset[str]:
     """The fingerprints ssh would accept for ``host`` from the known_hosts file at ``path`` (and no other).
 
-    Plain, wildcard and hashed (``|1|``) host patterns and ``!`` negation are read as ssh reads them. A
-    key on any ``@revoked`` line is revoked for every host. ``@cert-authority`` lines pin no key here.
+    Plain, wildcard and hashed (``|1|``) host patterns and ``!`` negation are read as ssh reads them. A key
+    on any ``@revoked`` line is revoked for every host. A ``@cert-authority`` line that matches the host is
+    refused (``HostKeyNotPinned``): ssh would accept any host certificate it signed, which no fingerprint
+    here can name. A line with a marker ssh does not define is refused too.
     """
     name = known_host_name(host, port)
     pins: set[str] = set()
@@ -219,16 +228,15 @@ def pinned_fingerprints(path: str, host: str, port: int | None = None) -> frozen
             if not fields or fields[0].startswith("#"):
                 continue
             marker = fields.pop(0) if fields[0].startswith("@") else None
+            if marker not in (None, "@revoked", "@cert-authority"):
+                raise HostKeyNotPinned(f"{path} holds a line with the unknown marker {marker!r}")
             if len(fields) < 3:
                 continue
             patterns, key_type, blob = fields[0], fields[1], fields[2]
             fingerprint = key_fingerprint(key_type, blob)
-            if fingerprint is None:
-                continue
             if marker == "@revoked":
-                revoked.add(fingerprint)
-                continue
-            if marker is not None:
+                if fingerprint is not None:
+                    revoked.add(fingerprint)
                 continue
             matched = negated = False
             for pattern in patterns.split(","):
@@ -236,18 +244,37 @@ def pinned_fingerprints(path: str, host: str, port: int | None = None) -> frozen
                     negated = negated or _pattern_matches(pattern[1:], name)
                 else:
                     matched = matched or _pattern_matches(pattern, name)
-            if matched and not negated:
+            if not matched or negated:
+                continue
+            if marker == "@cert-authority":
+                raise HostKeyNotPinned(f"{path} trusts a certificate authority for {name}; pin one host key instead")
+            if fingerprint is not None:
                 pins.add(fingerprint)
     return frozenset(pins - revoked)
+
+
+def _kill(proc: Any) -> None:
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _positive(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
 
 
 class SshRelayClient:
     """One SSH session to a relay: ``request(message) -> reply`` and ``close()`` (a ``TransportClient``).
 
     The session is up once the relay has answered its hello; any failure before that is
-    ``RelayHandshakeFailed`` (not delivered). A failure of the stream after a request was written closes
-    the session for good, and is ``RelayDeliveryUnknown``. ``spawn`` (``subprocess.Popen``) and ``ssh``
-    (the argv prefix) are injectable, so tests run a fake ssh and never a real one.
+    ``RelayHandshakeFailed`` (not delivered). A failure of the stream after a request was written whole
+    closes the session for good, and is ``RelayDeliveryUnknown``. When the caller's message carries an
+    ``id``, the answer must carry the same one, except for the relay's own refusal of a frame it could not
+    read or copy, which carries none. ``spawn`` (``subprocess.Popen``) and ``ssh`` (the argv prefix) are
+    injectable, so tests run a fake ssh and never a real one.
     """
 
     def __init__(
@@ -261,6 +288,8 @@ class SshRelayClient:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_frame_bytes: int = MAX_FRAME_BYTES,
     ) -> None:
+        hello_timeout_s = _positive(hello_timeout_s, "hello_timeout_s")
+        self._timeout_s = _positive(timeout_s, "timeout_s")
         pins = pinned_fingerprints(target.known_hosts, target.host, target.port)
         if pins != {target.host_key_fingerprint}:
             raise HostKeyNotPinned(
@@ -269,10 +298,11 @@ class SshRelayClient:
             )
         self.target = target
         self.label: dict[str, Any] | None = None
-        self._timeout_s = timeout_s
         self._max_frame_bytes = max_frame_bytes
         self._lock = threading.Lock()
-        self._replies: queue.Queue[tuple[str, Any]] = queue.Queue()
+        # At most one answer and the end of the stream are ever waiting; more means the far side is out of step.
+        self._replies: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=2)
+        self._out_of_step = threading.Event()
         self._stderr_tail = bytearray()
         self._stderr_lock = threading.Lock()
         self.argv = ssh_argv(target, ssh=ssh)
@@ -305,15 +335,17 @@ class SshRelayClient:
         """What ssh (or the relay) last wrote on stderr, printable ASCII only: for the operator, never parsed."""
         with self._stderr_lock:
             text = bytes(self._stderr_tail).decode("ascii", "replace")
-        return "".join(c if c.isprintable() or c == "\n" else "?" for c in text)
+        return "".join(c if c == "\n" or (c.isascii() and c.isprintable()) else "?" for c in text)
 
     def _handshake(self, timeout_s: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
+        sent = self._send(encode_frame({"op": HELLO_OP, "relay_version": RELAY_VERSION}), deadline)
+        if sent == "write_timeout":
+            raise RelayHandshakeFailed("hello_timeout")
+        if sent is not True:
+            raise RelayHandshakeFailed(self._ended(sent))
         try:
-            self._write(encode_frame({"op": HELLO_OP, "relay_version": RELAY_VERSION}))
-        except OSError as exc:
-            raise RelayHandshakeFailed(self._ended(f"write:{type(exc).__name__}")) from None
-        try:
-            kind, value = self._replies.get(timeout=timeout_s)
+            kind, value = self._replies.get(timeout=max(0.0, deadline - time.monotonic()))
         except queue.Empty:
             raise RelayHandshakeFailed("hello_timeout") from None
         if kind != "frame":
@@ -336,22 +368,22 @@ class SshRelayClient:
         with self._lock:
             if self._proc is None:
                 raise RelayNotDelivered("session_closed")
-            if not self._replies.empty():
+            if self._out_of_step.is_set() or not self._replies.empty():
                 # Something arrived with no request outstanding: the session ended (or is out of step).
                 self._close_locked()
                 raise RelayNotDelivered("session_ended")
-            try:
-                frame = encode_frame(message, max_bytes=self._max_frame_bytes)
-            except FrameError as exc:
-                raise RelayNotDelivered(f"request:{exc}") from None  # nothing written; the session is intact
-            try:
-                self._write(frame)
-            except OSError as exc:
-                # ssh has stopped reading: the relay runs only whole frames, so this one was not carried out.
+            refusal = frame_refusal(message, max_bytes=self._max_frame_bytes)
+            if refusal is not None:
+                raise RelayNotDelivered(f"request:{refusal}")  # nothing written; the session is intact
+            deadline = time.monotonic() + self._timeout_s
+            sent = self._send(encode_frame(message, max_bytes=self._max_frame_bytes), deadline)
+            if sent is not True:
+                # Not written whole (ssh stopped reading, or the deadline passed): the relay acts only on
+                # whole frames, so this request was not carried out.
                 self._close_locked()
-                raise RelayNotDelivered(f"request:write:{type(exc).__name__}") from None
+                raise RelayNotDelivered(f"request:{sent}")
             try:
-                kind, value = self._replies.get(timeout=self._timeout_s)
+                kind, value = self._replies.get(timeout=max(0.0, deadline - time.monotonic()))
             except queue.Empty:
                 self._close_locked()
                 raise RelayDeliveryUnknown("request:timeout") from None
@@ -363,23 +395,37 @@ class SshRelayClient:
                 raise TransportBusy("busy: the daemon's socket was at its connection cap; request not delivered")
             if reply == NOT_ADMITTED_MESSAGE:
                 raise PeerNotAdmitted("scope_refused: the daemon did not admit the relay; request not delivered")
+            error = relay_error_of(reply)
+            if error is not None and "id" not in reply:
+                return self._relay_refusal(error, reply)  # the relay's own; it could not copy an id
             if "id" in message and reply.get("id") != message["id"]:
                 self._close_locked()
                 raise RelayDeliveryUnknown("request:reply_id_mismatch")
-            error = relay_error_of(reply)
             if error is not None:
-                detail = f"relay:{error.get('detail') or error.get('code')}"
-                if error.get("code") == "bad_frame":
-                    self._close_locked()  # the relay ends its session after a frame it could not read
-                if error["delivered"] is False:
-                    raise RelayNotDelivered(detail)
-                if error["delivered"] == "unknown":
-                    raise RelayDeliveryUnknown(detail)
+                return self._relay_refusal(error, reply)
             return reply
 
+    def _relay_refusal(self, error: dict[str, Any], reply: Message) -> Message:
+        detail = f"relay:{error.get('detail') or error.get('code')}"
+        if error.get("code") == "bad_frame":
+            self._close_locked()  # the relay may end its session after a frame it could not read
+        if error["delivered"] is False:
+            raise RelayNotDelivered(detail)
+        if error["delivered"] == "unknown":
+            raise RelayDeliveryUnknown(detail)
+        return reply  # delivered: the daemon had it; RelayAPI reads the rest
+
     def close(self) -> None:
-        with self._lock:
+        """End the session. A request blocked in it is ended too: its ssh child is killed first."""
+        if not self._lock.acquire(blocking=False):
+            proc = self._proc
+            if proc is not None:
+                _kill(proc)
+            self._lock.acquire()
+        try:
             self._close_locked()
+        finally:
+            self._lock.release()
 
     def __enter__(self) -> SshRelayClient:
         return self
@@ -388,17 +434,42 @@ class SshRelayClient:
         self.close()
 
     # -- the child process ------------------------------------------------------------------------
-    def _write(self, frame: bytes) -> None:
+    def _send(self, frame: bytes, deadline: float) -> bool | str:
+        """Write ``frame`` whole by ``deadline``: ``True``, or why not (``write_timeout``, ``write:<error>``).
+
+        The write runs in a thread of its own, so that a far side that stops reading cannot hold the caller
+        past the deadline; at the deadline the ssh child is killed, which ends the write.
+        """
         proc = self._proc
         if proc is None:
-            raise BrokenPipeError("session closed")
-        data = memoryview(frame)
-        while data:
-            written = proc.stdin.write(data)
-            if written is None or written <= 0:
-                raise BrokenPipeError("ssh took no bytes")
-            data = data[written:]
-        proc.stdin.flush()
+            return "write:session_closed"
+        outcome: list[bool | str] = []
+        done = threading.Event()
+
+        def write() -> None:
+            try:
+                data = memoryview(frame)
+                while data:
+                    written = proc.stdin.write(data)
+                    if written is None or written <= 0:
+                        raise BrokenPipeError("ssh took no bytes")
+                    data = data[written:]
+                proc.stdin.flush()
+                outcome.append(True)
+            except (OSError, ValueError) as exc:
+                outcome.append(f"write:{type(exc).__name__}")
+            finally:
+                done.set()
+
+        writer = threading.Thread(target=write, name="remote-ssh-writer", daemon=True)
+        writer.start()
+        if not done.wait(max(0.0, deadline - time.monotonic())):
+            _kill(proc)
+            done.wait(CLOSE_GRACE_S)
+            writer.join(CLOSE_GRACE_S)
+            return True if outcome and outcome[0] is True else "write_timeout"
+        writer.join()
+        return outcome[0]
 
     def _close_locked(self) -> int | None:
         """End the session: close ssh's stdin (the relay sees end of input), wait, kill if it lingers."""
@@ -407,12 +478,12 @@ class SshRelayClient:
             return None
         try:
             proc.stdin.close()
-        except OSError:
+        except (OSError, ValueError):
             pass
         try:
             code = proc.wait(timeout=CLOSE_GRACE_S)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _kill(proc)
             code = proc.wait()
         for thread in (self._reader, self._drain):
             if thread is not threading.current_thread():
@@ -424,18 +495,27 @@ class SshRelayClient:
                 pass
         return code
 
+    def _put(self, item: tuple[str, Any]) -> bool:
+        try:
+            self._replies.put_nowait(item)
+        except queue.Full:
+            self._out_of_step.set()  # more frames than requests: stop reading; the next request ends the session
+            return False
+        return True
+
     def _read_replies(self, stdout: Any) -> None:
         try:
             while True:
                 message = read_message(stdout, max_bytes=self._max_frame_bytes)
                 if message is None:
-                    self._replies.put(("eof", "eof"))
+                    self._put(("eof", "eof"))
                     return
-                self._replies.put(("frame", message))
-        except FrameError as exc:
-            self._replies.put(("error", str(exc)))
+                if not self._put(("frame", message)):
+                    return
+        except TransportRefused as exc:  # FrameError: a frame that could not be read
+            self._put(("error", str(exc)))
         except (OSError, ValueError) as exc:
-            self._replies.put(("error", type(exc).__name__))
+            self._put(("error", type(exc).__name__))
 
     def _drain_stderr(self, stderr: Any) -> None:
         try:
@@ -459,7 +539,8 @@ class RelayAPI:
     """``call(method, params) -> dict`` over the relay, answering as ``control.client.SocketAPI`` does.
 
     ``connect()`` makes one session (default: ``SshRelayClient(target, **client_options)``). Each call
-    gets a fresh session, unless ``persistent`` is set; ``run.stop`` always gets a fresh one.
+    gets a fresh session, unless ``persistent`` is set; ``run.stop`` always gets a fresh one, and does not
+    wait for the shared session.
     """
 
     def __init__(self, target: SshTarget | None = None, *, persistent: bool = False,
@@ -468,13 +549,14 @@ class RelayAPI:
             if target is None:
                 raise ValueError("RelayAPI needs a target or a connect function")
             connect = lambda: SshRelayClient(target, **client_options)  # noqa: E731 - one-line factory
+        elif not callable(connect):
+            raise TypeError("connect must be a function that opens a session")
         self.target = target
         self.label: dict[str, Any] | None = None
         self._connect = connect
         self._persistent = persistent
         self._session: Any = None
         self._lock = threading.Lock()
-        self._ids = itertools.count(1)
 
     def call(self, method: str, params: dict | None = None) -> dict:
         if self._persistent and method != STOP_METHOD:
@@ -517,7 +599,7 @@ class RelayAPI:
         return client
 
     def _ask(self, client: Any, method: str, params: dict | None) -> dict:
-        message = {"op": "control", "method": method, "params": dict(params or {}), "id": next(self._ids)}
+        message = {"op": "control", "method": method, "params": dict(params or {})}  # SocketAPI's own frame
         try:
             reply = client.request(message)
         except TransportBusy:

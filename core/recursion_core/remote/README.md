@@ -25,7 +25,10 @@ not prove scopes, device tokens or anything the phone page will need: the socket
 
 A frame is exactly the control socket's frame: a 4-byte big-endian length, then that many bytes of
 UTF-8 JSON holding one object, at most 1 MiB. The relay forwards each frame unchanged, on a fresh
-connection to the socket, and writes the socket's reply back unchanged. It adds no field to a frame.
+connection to the socket, and adds no field to it. It writes the socket's reply back unchanged, except
+that a reply claiming the relay's own layer is rewritten (below). A frame that was readable but cannot
+be framed again (a lone surrogate or NaN, which JSON readers accept) is refused `bad_frame`, unsent.
+`RelayAPI` sends the socket client's own frame, `{"op": "control", "method", "params"}`, with no `id`.
 
 The relay's own frames:
 
@@ -53,7 +56,12 @@ same-uid process can claim anything in a frame, so the relay puts no label into 
 | `delivered: false`, `detail: "relay:connect:..."` | the relay could not reach the daemon's socket (not running, wrong directory, foreign uid) |
 | `delivered: false`, `detail: "busy"` or `"daemon:scope_refused"` | the socket's own refusals, as locally |
 | `delivered: false`, `detail: "request:frame_too_large"` | the request does not fit a frame; nothing was written |
-| `delivered: "unknown"` | the request was written and no complete answer came back: read the run's status before retrying |
+| `delivered: false`, `detail: "request:write_timeout"` or `"request:write:..."` | the request could not be written whole before its deadline (the far side stopped reading) or ssh stopped reading; the relay acts only on whole frames |
+| `delivered: false`, `detail: "relay:..."` | the relay refused the frame itself (`relay:frame_too_large`, `relay:frame_not_encodable:...`) |
+| `delivered: "unknown"` | the request was written whole and no complete answer came back: read the run's status before retrying |
+
+The request's deadline covers both writing it and waiting for the answer, and `close()` ends a session
+at once, also while a request is blocked in it.
 
 A Stop never waits behind another call: each call gets a fresh SSH session, as the socket client
 makes one connection per call. With `persistent=True` ordinary calls share one session and `run.stop`
@@ -77,7 +85,7 @@ restrict,command="/usr/bin/env PYTHONPATH=/path/to/recursion/core /usr/bin/pytho
 * `-P` keeps the login's working directory off Python's import path.
 * `--key-label` is the owner's own name for this key; it shows up in the relay's hello.
 * sshd's login session sets `XDG_RUNTIME_DIR` to `/run/user/<uid>`, where the daemon's socket is. The
-  relay refuses a socket directory that is not a real 0700 directory owned by the owner.
+  relay refuses a socket directory that is not a real directory owned by the owner with mode exactly 0700.
 * A login shell that prints anything on stdout breaks the stream; the client reports it as
   `connect:stream:...` before any request is sent.
 * Tailscale SSH does not run `authorized_keys` forced commands; use OpenSSH (over the overlay if you like).
@@ -97,9 +105,11 @@ api = RelayAPI(SshTarget(host="far.example", user="owner",
 api.call("run.list")
 ```
 
-ssh runs with `-F none` (no config file), `BatchMode=yes`, `StrictHostKeyChecking=yes` against that
-file only, no agent or X11 forwarding, no port forwarding, no TTY, no connection sharing and no local
-commands. The client refuses to start ssh unless that file accepts exactly the expected key for the host.
+ssh always runs with `-F none` (no config file, so nothing can add a key source with `KnownHostsCommand`
+or change the name looked up with `HostKeyAlias`; a named configuration is not supported in this slice),
+`BatchMode=yes`, `StrictHostKeyChecking=yes` against that file only, no agent or X11 forwarding, no port
+forwarding, no TTY, no connection sharing and no local commands. The client refuses to start ssh unless
+that file trusts exactly the expected key for the host and no certificate authority for it.
 
 ## Pairing-state models
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import unittest
+from collections.abc import Mapping
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.engines import cursor
@@ -246,10 +247,18 @@ class BillingCheckTest(unittest.TestCase):
         result = adapter(fake_agent.FakeLauncher("oneshot/tools.jsonl")).run(request(kind="api_key"), 10.0)
         self.assertEqual(result["code"], None)
 
-    def test_a_source_cursor_does_not_document_is_not_refused(self):
-        launcher = LinesLauncher([line(type="system", subtype="init", apiKeySource="keychain", model="m"),
-                                  line(type="result", subtype="success", is_error=False, result="ok")])
-        self.assertEqual(adapter(launcher).run(request(), 10.0)["code"], None)
+    def test_a_source_cursor_does_not_document_or_none_is_refused(self):
+        """The second break-it read of #412, R3: the README says a run whose init reports a source other than
+        the route's is refused; a source Cursor does not document, or none at all, is a meter not known."""
+        for kind in ("subscription", "api_key"):
+            for fields in ({"apiKeySource": "keychain"}, {"apiKeySource": None}, {}, {"apiKeySource": 3}):
+                with self.subTest(kind=kind, fields=fields):
+                    launcher = LinesLauncher([line(type="system", subtype="init", model="m", **fields),
+                                              line(type="result", subtype="success", is_error=False, result="ok")])
+                    result = adapter(launcher).run(request(kind=kind), 10.0)
+                    self.assertEqual((result["code"], result["text"]), (c.ROUTE_CHOICE_REQUIRED, ""))
+                    self.assertIn("no apiKeySource Cursor documents", result["detail"])
+                    self.assertEqual(launcher.processes[0].fenced, ["billing_unknown"])
 
     def test_the_check_happens_once_at_the_first_init(self):
         launcher = LinesLauncher([line(type="system", subtype="init", apiKeySource="login", model="m"),
@@ -495,6 +504,11 @@ class LaunchBoundaryTest(unittest.TestCase):
     def test_a_request_id_or_deadline_the_drive_cannot_read_launches_nothing(self):
         """Found by the lane's own attack on this answer: both started a child, then failed in the drive."""
         for req, deadline, detail in ((dict(request(), request_id=7), 10.0, "request_id: not text"),
+                                      (dict(request(), request_id="r" + chr(0xD800)), 10.0, "request_id: not text"),
+                                      (dict(request(), request_id="r" + chr(0xDCFF) + "x"), 10.0,
+                                       "request_id: not text"),
+                                      (request(), 10 ** 400, "deadline_at: not a finite number"),
+                                      (request(), -(10 ** 400), "deadline_at: not a finite number"),
                                       (dict(request(), request_id=""), 10.0, "request_id: not text"),
                                       (request(), "10", "deadline_at: not a finite number"),
                                       (request(), None, "deadline_at: not a finite number"),
@@ -507,6 +521,93 @@ class LaunchBoundaryTest(unittest.TestCase):
                 self.assertEqual((result["code"], result["detail"], launcher.launches),
                                  (c.REQUEST_INVALID, detail, []))
         self.assertEqual(adapter(fake_agent.FakeLauncher("oneshot/hello.jsonl")).run(request(), 10)["code"], None)
+
+    def test_every_request_field_the_run_reads_with_an_unusable_value_starts_no_child(self):
+        """The second break-it read of #412, R1, as a rule of ``run``: everything taken from the request is
+        worked out before the launch. Each field the run reads, given a value of the right type that cannot be
+        used (text UTF-8 cannot write, empty, too long, an option, a huge int, NaN, inf) or missing, is refused
+        with a typed code, nothing escapes, and no child starts."""
+        bad = chr(0xD800)
+        cases = [
+            (("request_id",), "r" + bad), (("request_id",), ""),
+            (("prompt",), "a" + bad), (("prompt",), ""), (("prompt",), "a\x00"),
+            (("prompt",), "x" * (cursor.MAX_PROMPT_BYTES + 1)),
+            (("route", "model"), "m" + bad), (("route", "model"), ""), (("route", "model"), "-m"),
+            (("route", "model"), "a\nb"), (("route", "model"), "m" * 200000),
+            (("route", "connection", "kind"), "api_key" + bad), (("route", "connection", "kind"), ""),
+            (("route", "connection", "kind"), "API_KEY"),
+            (("route", "connection", "credential_env"), "CURSOR_API_KEY" + bad),
+            (("route", "connection", "credential_env"), ""),
+            (("route", "connection", "credential_env"), "OPENAI_API_KEY"),
+            (("route", "connection", "id"), "x" + bad), (("route", "connection", "id"), ""),
+        ]
+        missing = [("request_id",), ("prompt",), ("route",), ("route", "model"), ("route", "connection"),
+                   ("route", "connection", "kind"), ("route", "connection", "credential_env"),
+                   ("route", "connection", "id")]
+
+        def edited(path, value=None, drop=False):
+            req = json.loads(json.dumps(request(kind="api_key")))
+            target = req
+            for key in path[:-1]:
+                target = target[key]
+            if drop:
+                del target[path[-1]]
+            else:
+                target[path[-1]] = value
+            return req
+
+        runs = [(f"{'.'.join(p)}={v!r:.24}", edited(p, v), 10.0) for p, v in cases]
+        runs += [(f"{'.'.join(p)} missing", edited(p, drop=True), 10.0) for p in missing]
+        runs += [(f"deadline_at={d!r}", request(kind="api_key"), d)
+                 for d in (10 ** 400, -(10 ** 400), float("nan"), float("inf"), float("-inf"), True, "10", None)]
+        for label, req, deadline in runs:
+            with self.subTest(label):
+                launcher = fake_agent.FakeLauncher("oneshot/tools.jsonl")
+                result = adapter(launcher).run(req, deadline)
+                self.assertIn(result["code"], (c.REQUEST_INVALID, c.LAUNCH_REFUSED))
+                self.assertEqual(launcher.launches, [])
+        # The fields the run does not read reach nothing, whatever they hold.
+        req = dict(request(), contract=object(), tenant="t" + bad, deadline_s=float("nan"))
+        req["route"] = dict(req["route"], engine="not-cursor")
+        self.assertEqual(adapter(fake_agent.FakeLauncher("oneshot/hello.jsonl")).run(req, 10.0)["code"], None)
+
+    def test_an_empty_prompt_is_the_prompts_own_refusal(self):
+        """The second break-it read of #412, R4: every prompt defect answers ``request_invalid``."""
+        launcher = fake_agent.FakeLauncher("oneshot/hello.jsonl")
+        result = adapter(launcher).run(request(""), 10.0)
+        self.assertEqual((result["code"], result["detail"], launcher.launches),
+                         (c.REQUEST_INVALID, "prompt: empty", []))
+
+    def test_nothing_reads_the_request_after_the_launch(self):
+        """The second break-it read of #412, R1: the drive is handed what was worked out before the launch, not
+        the request; the caller's request can be emptied once the child starts and the run is the same."""
+        seen = []
+
+        class Watching(cursor.CursorAdapter):
+            def drive(self, process, request, deadline_at, events):
+                seen.append(request)
+                return super().drive(process, request, deadline_at, events)
+
+        req = request()
+
+        def launcher(argv, *, env, shell=False, **options):
+            req.clear()
+            return fake_agent.OneShotProcess(fake_agent.fixture_lines("oneshot/hello.jsonl"))
+
+        result = Watching(launcher, lambda: 0.0, credentials, PARENT).run(req, 10.0)
+        self.assertEqual((result["code"], [e["kind"] for e in result["events"]]), (None, ["input.accepted", "result"]))
+        self.assertNotIsInstance(seen[0], Mapping)
+        with self.assertRaises(KeyError):
+            seen[0]["prompt"]
+
+    def test_only_a_closure_holds_compositions_launcher(self):
+        """The second break-it read of #412, R8: no attribute of the adapter is the raw launcher."""
+        launcher = fake_agent.FakeLauncher("oneshot/hello.jsonl")
+        made = adapter(launcher)
+        self.assertFalse([name for name, value in vars(made).items() if value is launcher])
+        with self.assertRaises(c.RouteError):
+            made._launcher(["agent", "--disable-auto-update", "-p", "--force"], env={})
+        self.assertEqual(launcher.launches, [])
 
     def test_a_model_over_the_bounds_is_refused_not_launched(self):
         for size in (140000, 1100000):

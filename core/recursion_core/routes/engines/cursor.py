@@ -607,13 +607,47 @@ def route_event(draft: dict) -> dict:
                    {name: scalar(value) for name, value in draft["payload"].items()})
 
 
+def _text(value: object) -> bool:
+    """Text a request field may hold: exactly a ``str``, not empty, and writable as UTF-8 (no lone surrogate)."""
+    return type(value) is str and bool(value) and not _has_surrogate(value)
+
+
+def _field(mapping: Mapping, name: str, path: str) -> object:
+    try:
+        return mapping[name]
+    except KeyError:
+        raise c.RouteError(c.REQUEST_INVALID, f"{path}: missing") from None
+
+
+class _Prepared:
+    """Everything a run takes from its request, worked out before the launch (the second break-it read of
+    #412, R1). The route boundary reads only ``request_id`` from it; the drive reads its plain values, inside
+    the fence. After the launch nothing reads the request."""
+
+    __slots__ = ("request_id", "argv", "env", "kind", "expected", "delivery_id", "turn_id", "prompt")
+
+    def __init__(self, **values: object) -> None:
+        for name, value in values.items():
+            setattr(self, name, value)
+
+    def __getitem__(self, key: str) -> object:
+        if key != "request_id":   # routes/base.py reads the request id and nothing else
+            raise KeyError(key)
+        return self.request_id
+
+
 class CursorAdapter(RouteAdapter):
     """Cursor's one-shot drive on today's one-turn path. Its own factory; registered nowhere yet.
 
-    Every launch goes through ``check_argv``, over the exact argv handed to composition's launcher. Once the
-    child has started, every way out of the drive fences it: the route boundary fences for a deadline, a
-    protocol error and an OSError; this driver fences for anything else, ``BaseException`` included, and the
-    original exception is what leaves.
+    THE RULE OF ``run`` (the second break-it read of #412, R1): everything that reads the request, and
+    everything that can raise from a request value (each encode, hash, conversion, lookup and format), is done
+    before the launch, into one ``_Prepared``; a value that cannot be used is refused with a typed code and
+    no child is started. After the launch the only code that runs is the drive, inside the fence.
+
+    Every launch goes through ``check_argv``, over the exact argv handed to composition's launcher, which
+    only a closure holds. Once the child has started, every way out of the drive fences it: the route
+    boundary fences for a deadline, a protocol error and an OSError; this driver fences for anything else,
+    ``BaseException`` included, and the original exception is what leaves.
     """
 
     engine = ENGINE
@@ -622,59 +656,95 @@ class CursorAdapter(RouteAdapter):
         super().__init__(*args, **kwargs)
         _executable(binary)   # an option that is not an absolute path fails composition, not a run
         self._binary = binary
-        self._launch = self._launcher          # composition's launcher
-        self._launcher = self._checked_launch  # the one way to it (the first break-it read of #412, F3)
+        launch = self._launcher   # composition's launcher, held by the closure below and nowhere else
+
+        def checked_launch(argv, *, env, shell=False, **options):
+            """The launch boundary. ``check_argv`` holds the exact argv this launch is handed, before anything
+            starts; a refusal is the launcher's own typed refusal (``launch_refused``, the rule as detail), so
+            the route boundary answers it as a refusal before launch (the first break-it read of #412, F3)."""
+            try:
+                check_argv(argv, binary=binary)
+            except ArgvRefused as err:
+                raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
+            return launch(argv, env=env, shell=shell, **options)
+
+        self._launcher = checked_launch
 
     def declaration(self) -> dict:
         return oneshot_declaration()
 
     def run(self, request: dict, deadline_at: float) -> dict:
-        """One plain copy of the request's route and connection, taken once, so the argv, the child's
-        environment and the billing check all read the same route (the first break-it read of #412, F4)."""
-        route = request["route"]
-        connection = route["connection"]
+        try:
+            prepared, deadline = self._prepare(request, deadline_at)
+        except c.RouteError as err:
+            return c.result(_request_id(request), err.code, detail=err.detail)
+        return super().run(prepared, deadline)
+
+    def _prepare(self, request: object, deadline_at: object) -> tuple[_Prepared, float]:
+        if not isinstance(request, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "request: not an object")
+        # One plain copy of the route and connection, each read once (the first break-it read of #412, F4).
+        route = _field(request, "route", "route")
+        if not isinstance(route, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "route: not an object")
+        connection = _field(route, "connection", "route.connection")
+        if not isinstance(connection, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "route.connection: not an object")
         copy = dict(request)
         copy["route"] = dict(route)
         copy["route"]["connection"] = dict(connection)
-        # Two inputs the drive reads only after the child has started: refused before it starts instead.
         rid = copy.get("request_id")
-        if type(rid) is not str or not rid:
-            return c.result("", c.REQUEST_INVALID, detail="request_id: not text")
-        if type(deadline_at) not in (int, float) or not math.isfinite(deadline_at):
-            return c.result(rid, c.REQUEST_INVALID, detail="deadline_at: not a finite number")
-        return super().run(copy, deadline_at)
-
-    def _checked_launch(self, argv, *, env, shell=False, **options):
-        """The launch boundary. ``check_argv`` holds the exact argv this launch is handed, before anything
-        starts; a refusal is the launcher's own typed refusal (``launch_refused``, the rule as detail), so the
-        route boundary answers it as a refusal before launch."""
+        if not _text(rid):
+            raise c.RouteError(c.REQUEST_INVALID, "request_id: not text")
         try:
-            check_argv(argv, binary=self._binary)
-        except ArgvRefused as err:
-            raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
-        return self._launch(argv, env=env, shell=shell, **options)
+            deadline = float(deadline_at) if type(deadline_at) in (int, float) else math.nan
+        except OverflowError:   # an int past the float range (R2)
+            deadline = math.nan
+        if not math.isfinite(deadline):
+            raise c.RouteError(c.REQUEST_INVALID, "deadline_at: not a finite number")
+        argv = self._argv_for(copy)
+        env = self._env_for(copy)
+        kind = copy["route"]["connection"]["kind"]   # env() refused every kind but these two
+        delivery_id, turn_id = input_ids(rid)
+        return _Prepared(request_id=rid, argv=argv, env=env, kind=kind, expected=_EXPECTED_KEY_SOURCE[kind],
+                         delivery_id=delivery_id, turn_id=turn_id, prompt=copy["prompt"]), deadline
 
-    def argv(self, request: dict) -> list[str]:
-        prompt = request["prompt"]
+    def argv(self, request: object) -> list[str]:
+        return request.argv if isinstance(request, _Prepared) else self._argv_for(request)
+
+    def env(self, request: object) -> dict[str, str]:
+        return request.env if isinstance(request, _Prepared) else self._env_for(request)
+
+    def _argv_for(self, request: dict) -> list[str]:
+        prompt = request.get("prompt")
         if type(prompt) is not str:   # a subclass could show these checks one text and execve another (F8-1)
             raise c.RouteError(c.REQUEST_INVALID, "prompt: not exactly a str")
+        if not prompt:
+            raise c.RouteError(c.REQUEST_INVALID, "prompt: empty")
         if "\x00" in prompt or _has_surrogate(prompt):
             raise c.RouteError(c.REQUEST_INVALID, "prompt: a NUL or a lone surrogate cannot be passed in argv")
         if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
             raise c.RouteError(c.REQUEST_INVALID, f"prompt: over {MAX_PROMPT_BYTES} bytes, the argv limit")
         try:
-            options = oneshot_argv(request["route"]["model"], binary=self._binary)
+            options = oneshot_argv(request["route"].get("model"), binary=self._binary)
         except ArgvRefused as err:
             raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
-        return [*options, "--", prompt]   # checked whole at the launch boundary, ``_checked_launch``
+        return [*options, "--", prompt]   # checked whole at the launch boundary
 
-    def env(self, request: dict) -> dict[str, str]:
-        kind = request["route"]["connection"]["kind"]
+    def _env_for(self, request: dict) -> dict[str, str]:
+        connection = request["route"]["connection"]
+        kind = connection.get("kind")
         if kind == "subscription":
             return child_env(self._parent_env)
         if kind == "api_key":
+            # The two values custody is asked with must be text it can be asked with (R1's rule).
+            if not _text(connection.get("credential_env")):
+                raise c.RouteError(c.REQUEST_INVALID, "route.connection.credential_env: not text")
+            if not _text(connection.get("id")):
+                raise c.RouteError(c.REQUEST_INVALID, "route.connection.id: not text")
             return child_env(self._parent_env, credential=self.credential(request, CURSOR_API_KEY_ENV))
-        raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for cursor")
+        shown = kind if _text(kind) else "that is not text"
+        raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {shown} not supported for cursor")
 
     def drive(self, process, request, deadline_at, events):
         try:
@@ -690,11 +760,10 @@ class CursorAdapter(RouteAdapter):
                 err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
             raise
 
-    def _drive(self, process, request, deadline_at, events):
-        rid, kind = request["request_id"], request["route"]["connection"]["kind"]
-        expected = _EXPECTED_KEY_SOURCE[kind]   # env() refused every other kind before the launch
+    def _drive(self, process, prepared, deadline_at, events):
+        rid, kind, expected = prepared.request_id, prepared.kind, prepared.expected
         parser = StreamParser()   # one per run; discarded with the turn, whatever ends it
-        parser.wrote(*input_ids(rid), request["prompt"])
+        parser.wrote(prepared.delivery_id, prepared.turn_id, prepared.prompt)
         process.close_stdin()   # the prompt is in argv; nothing is written to the child
         while True:
             remaining = deadline_at - self._clock()
@@ -711,12 +780,19 @@ class CursorAdapter(RouteAdapter):
             for name, count in zip(_FATAL_COUNTS, before, strict=True):
                 if parser.counts[name] != count:
                     raise _Protocol(f"stdout line: {name}")
-            # The parser keeps the first init's key source and never changes it. A source Cursor does not
-            # document is kept as None and not refused. The child's environment carries HOME for both kinds
+            # The billing check, at the first system/init. The child's environment carries HOME for both kinds
             # (routes.launch's allowlist), where Cursor's sign-in store may live, so an API-key route's child
-            # could still bill the sign-in: this check is what refuses such a run, and a run that reports no
-            # init at all is refused at its result (its meter is not known).
-            if parser.api_key_source is not None and parser.api_key_source != expected:
+            # could still bill the sign-in: this check is what refuses such a run. The source must be the one
+            # the route picked: another documented source is a mismatch, and a source that is absent or one
+            # Cursor does not document is a meter not known (the second break-it read of #412, R3). A run with
+            # no init that gives a result is refused at that result; one that ends with no result is
+            # engine_exited, and one whose result line is not understood is a protocol error, as before.
+            if parser.init_seen and parser.api_key_source != expected:
+                if parser.api_key_source is None:
+                    process.fence("billing_unknown")
+                    return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
+                        f"the {kind} route's run reported no apiKeySource Cursor documents, so which meter it "
+                        "billed is not known; choose the route again, or cancel"))
                 # The run reports a key source the route did not pick: it would bill another meter.
                 process.fence("billing_mismatch")
                 return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
@@ -737,3 +813,13 @@ class CursorAdapter(RouteAdapter):
                 if code is None:
                     return c.result(rid, None, text=parser.final_text or "", events=events)
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=draft["payload"]["detail"])
+
+
+def _request_id(request: object) -> str:
+    """The request id to answer a refusal before the launch with: the request's own when it is usable text,
+    else empty. Never raises."""
+    try:
+        rid = request["request_id"]   # type: ignore[index]
+    except Exception:
+        return ""
+    return rid if _text(rid) else ""

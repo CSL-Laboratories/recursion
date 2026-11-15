@@ -88,6 +88,8 @@ def snapshot(detection: object) -> tuple[dict | None, str | None]:
                 entry = {"routable": entry.get("routable"), "reason": _plain(entry.get("reason"))}
             if not _entry_ok(eng, entry):
                 return None, "detection_malformed"
+            if eng in out:  # two keys that read as one engine: which entry is meant cannot be told
+                return None, "detection_malformed"
             out[eng] = entry
     except Exception:  # noqa: BLE001 - a snapshot that cannot be read is malformed, never partly used
         return None, "detection_malformed"
@@ -116,7 +118,9 @@ def _task(task: object) -> tuple[str | None, frozenset, dict | None]:
     (common.v1, an object: a present null is refused as ``explain_answer`` refuses it), the model a model id
     or null. A task, or a hand pick, that cannot be read is refused, never raised through. Every word is read
     as its plain text, a subclass of ``str`` too (its hash or its comparing could raise, or answer anything,
-    later, outside a guard), and a member that is not present is not read at all.
+    later, outside a guard). A member that is not present is taken as absent, but it is still read (with ``get``,
+    inside the same guard as the presence checks), so a task whose reading raises is refused ``bad_task:task``
+    even when the member it raises on is not there.
     """
     if not isinstance(task, Mapping):
         raise _Refuse("bad_task", "task")

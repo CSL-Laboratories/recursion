@@ -595,6 +595,18 @@ MUTANTS = {
         "        except Exception:  # noqa: BLE001 - a list or tuple subclass whose iterating raises holds no attempt\n",
         "        except ZeroDivisionError:\n",
         {"test_an_unreadable_attempts_entry_is_dropped_not_the_limit"}),
+    # Round 8 (5feab1b1), as ruling 7 has it: what F1's corrected sentence says, and F2's rule.
+    "M107 an absent task member left unread, against what the sentence says": (
+        ROUTER,
+        'kind, tags, hand = task.get("task_kind"), task.get("tags"), task.get("hand_pick")',
+        'kind, tags, hand = (task.get(name) if present[name] else None for name in ("task_kind", "tags", "hand_pick"))',
+        {"test_a_task_whose_reading_raises_is_refused_even_for_an_absent_member"}),
+    "M108 two keys that read as one engine, the last one kept": (
+        ROUTER,
+        "            if eng in out:  # two keys that read as one engine: which entry is meant cannot be told\n"
+        '                return None, "detection_malformed"\n',
+        "",
+        {"test_two_keys_that_read_as_one_engine_make_the_snapshot_unusable"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

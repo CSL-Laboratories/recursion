@@ -185,6 +185,29 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
 See [AGENTS.md#review-loop](AGENTS.md#review-loop). The stuck-thread author
 fallback lives in [When Claude can't fix a review thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
 
+## Sign-off (Developer Certificate of Origin)
+
+Recursion is licensed under the Apache License 2.0 (`LICENSE`, `NOTICE`), applied
+once its copyright holder is named. From the commit that applies the licence on,
+every commit must carry a sign-off line naming the person who submits it:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+`git commit -s` adds it from your Git name and e-mail. By signing off you certify
+the Developer Certificate of Origin, version 1.1
+(<https://developercertificate.org/>): that you wrote the change, or otherwise have
+the right to submit it under the project's licence, and that you understand the
+change and your sign-off are public and kept for good. Use your real name or the
+name you are known by, and one identity per person.
+
+A sign-off is a person's certification. An automated agent or bot does not add one;
+a commit an agent prepares is signed off by the person who submits it, and that
+person makes the certification. A pull request with a commit that lacks a sign-off
+is not merged. Commits made before the licence was applied carry no sign-off; they
+are not re-signed.
+
 ## Run a gate
 
 From the repository root, with Python 3.11+ and Git, run the gate named by your task. The

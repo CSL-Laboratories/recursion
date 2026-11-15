@@ -190,6 +190,69 @@ class ParserTest(unittest.TestCase):
                         self.assertTrue(schema_check.fits("driver.v2.json#/$defs/event_draft", draft), draft)
 
 
+def tool_line(parameters=None, *, name="test_tool", omit=False, index=1) -> str:
+    info = {"name": name, "output": "ok"}
+    if not omit:
+        info["parameters"] = parameters
+    return json.dumps({"event": "step_update", "step_update": {"step_index": index, "step_type": "tool",
+                                                               "state": "DONE", "tool_info": info}})
+
+
+class ReviewRoundOneParserTest(unittest.TestCase):
+    """Regressions for the two reads of #396 at e8c3a695 that concern the one-shot parser."""
+
+    def test_r5_input_that_is_not_an_object_is_carried_as_null_with_its_own_digest(self) -> None:
+        for value in (["synthetic", 1], "text", 7, None):
+            with self.subTest(value=value):
+                call = of_type(ag.OneShotParser(CONN, MODEL).parse(tool_line(value)), "tool.call")[0]
+                self.assertIsNone(call["input"])
+                self.assertEqual(call["input_digest"], ag.input_digest(value))
+        call = of_type(ag.OneShotParser(CONN, MODEL).parse(tool_line(omit=True)), "tool.call")[0]
+        self.assertIsNone(call["input"])
+        self.assertEqual(call["input_digest"], ag.input_digest(None))
+        self.assertNotEqual(call["input_digest"], ag.input_digest({}))
+
+    def test_r6_parameters_with_no_canonical_text_are_a_protocol_error(self) -> None:
+        with self.assertRaises(ag.OneShotProtocolError):
+            ag.OneShotParser(CONN, MODEL).parse(tool_line({"large": 9007199254740992}))
+
+    def test_f2_a_line_nested_too_deeply_is_a_protocol_error(self) -> None:
+        with self.assertRaises(ag.OneShotProtocolError):
+            ag.OneShotParser(CONN, MODEL).parse("[" * 100_000 + "]" * 100_000)
+
+    def test_f3_a_line_that_is_not_utf8_is_a_protocol_error(self) -> None:
+        with self.assertRaises(ag.OneShotProtocolError):
+            ag.OneShotParser(CONN, MODEL).parse('{"event":"init","x":"\udcff"}')
+
+    def test_a_tool_name_with_a_line_break_gives_no_draft(self) -> None:                     # M12
+        for name in ("bad\nname", "bad\rname"):
+            with self.subTest(name=name):
+                drafts = ag.OneShotParser(CONN, MODEL).parse(tool_line({}, name=name))
+                self.assertEqual(of_type(drafts, "tool.call"), [])
+
+    def test_a_negative_token_count_is_unknown(self) -> None:                                # M13
+        line = json.dumps({"event": "result", "result": {"status": "SUCCESS", "num_turns": 1,
+                                                         "usage": {"input_tokens": -1, "output_tokens": True}}})
+        usage = of_type(ag.OneShotParser(CONN, MODEL).parse(line), "usage")[0]
+        unknown = {"value": None, "quality": "unknown", "provenance": "unavailable"}
+        self.assertEqual(usage["input_tokens"], unknown)
+        self.assertEqual(usage["output_tokens"], unknown)
+
+    def test_the_canonical_text_refuses_more_than_sixty_four_levels(self) -> None:           # M14
+        value = None
+        for _ in range(64):
+            value = [value]
+        ag.canonical_text(value)
+        with self.assertRaises(ag.NoCanonicalText):
+            ag.canonical_text([value])
+
+    def test_a_model_that_is_empty_or_looks_like_a_flag_is_refused(self) -> None:             # DeepSeek :125
+        for model in ("", "-rf", "--yolo", None):
+            with self.subTest(model=model), self.assertRaises(c.RouteError) as ctx:
+                ag.one_shot_argv("agy", model)
+            self.assertEqual(ctx.exception.code, c.REQUEST_INVALID)
+
+
 class CanonicalTextTest(unittest.TestCase):
     """The RFC 8785 copy agrees with SPINE's rules on the cases its docstring names."""
 
@@ -405,6 +468,30 @@ class AdapterTest(unittest.TestCase):
         res = adapter(launcher, clock).run(request(), clock() + 60)
         self.assertEqual(res["code"], c.PROTOCOL_ERROR)
         self.assertEqual(launcher.process.fenced, ["protocol_error"])
+
+    def test_r6_f2_f3_an_unreadable_line_is_a_protocol_error_and_the_run_is_fenced(self) -> None:
+        for line in (tool_line({"large": 9007199254740992}), "[" * 100_000 + "]" * 100_000,
+                     '{"event":"init","x":"\udcff"}'):
+            with self.subTest(line=line[:40]):
+                clock = Clock()
+                launcher = Launcher([line], clock)
+                res = adapter(launcher, clock).run(request(), clock() + 60)
+                self.assertEqual(res["code"], c.PROTOCOL_ERROR)
+                self.assertEqual(launcher.process.fenced, ["protocol_error"])
+
+    def test_f13_a_request_that_is_not_contract_shaped_is_refused_before_anything_starts(self) -> None:
+        good = request()
+        no_model = dict(good, route={k: v for k, v in good["route"].items() if k != "model"})
+        no_conn_id = dict(good, route=dict(good["route"], connection={"kind": "api_key",
+                                                                      "credential_env": "GEMINI_API_KEY"}))
+        cases = ["not a request", {}, dict(good, request_id=""), dict(good, prompt=""), dict(good, route="a route"),
+                 dict(good, route=dict(good["route"], connection="x")), no_model, no_conn_id]
+        for req in cases:
+            with self.subTest(req=str(req)[:60]):
+                launcher, clock = self.launcher("synthetic-ok.jsonl")
+                res = adapter(launcher, clock).run(req, clock() + 60)
+                self.assertEqual(res["code"], c.REQUEST_INVALID)
+                self.assertEqual(launcher.calls, [])
 
     def test_the_factory_takes_only_the_binary_option(self) -> None:
         clock = Clock()

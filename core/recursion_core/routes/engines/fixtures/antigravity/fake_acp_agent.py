@@ -91,6 +91,7 @@ class FakeAcpAgent:
         with self._cond:
             if self._dead or self.stdin_closed:
                 raise BrokenPipeError("the fake agent's input is closed")
+            line.encode("utf-8")   # as a real pipe in text mode: a line that is not UTF-8 cannot be written
             message = json.loads(line)
             self.received.append(message)
             self._handle(message)

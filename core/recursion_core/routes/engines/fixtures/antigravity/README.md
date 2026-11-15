@@ -31,6 +31,48 @@ root:
 `unittest discover -s core` does not find them (it needs an `__init__.py` in every folder on the way); the
 hosted gate does (it runs every `core/**/test_*.py` by path).
 
+## The shared ACP client's interface (for ENGINE-E4, E6, E7 and E9)
+
+A prototype: it is importable today only as
+`recursion_core.routes.engines.fixtures.antigravity.acp`, and moves to `routes.acp` unchanged. Its rules are
+in the module's docstring; its surface is this:
+
+```
+PROTOCOL_VERSION = 1; SCHEMA_PIN (repository, tag v1.18.0, commit 13b76582, schema 1.32.0, both sha256s)
+INITIALIZE AUTHENTICATE SESSION_NEW SESSION_LOAD SESSION_PROMPT SESSION_CANCEL     (sent)
+SESSION_UPDATE REQUEST_PERMISSION REFUSED_CLIENT_METHODS (fs/*, terminal/*, elicitation/*: answered -32601)
+STOP_REASONS OPTION_KINDS METHOD_NOT_FOUND AUTH_REQUIRED CANCELLED APPROVE DENY
+
+class EngineHooks: limit(method, RpcError) -> limit signal | None
+    asked about an error answer to a prompt only; called with no lock held (it may call the connection);
+    one that raises counts as "no limit". The default maps nothing.
+
+class AcpConnection(*, hooks=NO_HOOKS, clock=None, permission_timeout_s=None)   # no I/O, no thread
+    initialize() / authenticate(method_id) / new_session(cwd) / load_session(session_id, cwd)
+    prompt(text, deadline_at) -> (rpc_id, line)
+    cancel() -> [lines]; answer_permission(token, 'approve'|'deny') -> line | None; expire(now) -> [lines]
+    feed(line) -> Fed(updates, asks, replies, ended); end_of_output(); deadline(); release(rpc_id)
+    next_deadline(); ask(token); pending_result(rpc_id); turn_in_progress
+    counters: stray_responses, stray_updates, late_answers, hook_failures
+
+class AcpSession(process, clock, *, hooks, permission_timeout_s, on_line, on_update, on_ask)
+    open(method_id, cwd, deadline_at, *, load_session_id=None) -> session id      (raises AcpError)
+    prompt(text, deadline_at) -> TurnOutcome; cancel(); answer_permission(token, decision) -> bool; close()
+    input_lost: True once a write to the agent failed
+
+TurnOutcome(turn, code, stop_reason, cancel_requested, cancel_confirmed, late_stop_reason, error, limit,
+            detail, text)
+PermissionAsk(token, turn, tool_call, options, deadline_at, answer, answered_by, option_id)
+AcpError(code, detail) > AcpRefused > AcpUnsupported; AcpProtocolError; AcpStateError; RpcError(code, message, data)
+```
+
+Codes: every `AcpError` carries a route contract code (`launch_refused`, `auth_failed`, `engine_error`,
+`engine_exited`, `deadline_exceeded`, `protocol_error`). `TurnOutcome.code` is None, a route contract code,
+or `cancelled`, which the route contract does not have: a caller on it maps `cancelled` itself. ACP's
+`unsupported` here is not driver.v2's refusal record (that needs `call` and `flag`): a driver wraps it.
+`PermissionAsk.token` is the client's own id, not an approval.v1 id; the approval queue's binding is not
+here. `close()` only ends the agent's input: no fencing, joining or restarting of a worker is offered.
+
 ## The ACP pin
 
 `agentclientprotocol/agent-client-protocol`, tag `v1.18.0`, commit

@@ -17,9 +17,9 @@ page (read Nov 14, 2026, through a fetch tool that summarises), the same four T3
     oauth-business   Gemini Enterprise: a browser sign-in with a GCP project and location
     agent-platform   Agent Platform / Vertex AI: GOOGLE_API_KEY, or Application Default Credentials with
                      a GCP project and location
-    oauth-personal   a personal Google account: HELD. It refuses here, always, before anything is started
-                     (``PERSONAL_ACCOUNT_ENABLED`` is a constant, not an option: no caller, route or
-                     configuration can turn it on; a code change can, on Lucas's word after counsel).
+    oauth-personal   a personal Google account: HELD. ``route_method`` refuses it unconditionally, before
+                     anything is started: no flag, constant, caller, route or configuration is read for it,
+                     so turning it on is an edit of that function, on Lucas's word after counsel.
 
 None of the four has been run by this lane: every one is UNVERIFIED until Lucas's attended run.
 
@@ -79,17 +79,18 @@ PERSONAL_ACCOUNT_METHOD = Method("oauth-personal", "Google account", ("subscript
 METHODS = {m.id: m for m in (GEMINI_API_KEY_METHOD, ENTERPRISE_METHOD, AGENT_PLATFORM_METHOD,
                              PERSONAL_ACCOUNT_METHOD)}
 # Held on Lucas's word (PRODUCT.md 3603-3604): "personal-account sign-in waits on Lucas's lawyer."
-PERSONAL_ACCOUNT_ENABLED = False
 PERSONAL_ACCOUNT_OFF = "antigravity_personal_account_off"
 
 
 def route_method(route: Mapping) -> Method:
     """The one method a route names, checked against its connection. ``RouteError`` before anything starts."""
+    if not isinstance(route, Mapping):
+        raise c.RouteError(c.REQUEST_INVALID, "route")
     name = route.get("auth_method")
     if not isinstance(name, str) or name not in METHODS:
         raise c.RouteError(c.REQUEST_INVALID, f"route.auth_method: {name!r} is not an Antigravity method")
     method = METHODS[name]
-    if method is PERSONAL_ACCOUNT_METHOD and not PERSONAL_ACCOUNT_ENABLED:
+    if method is PERSONAL_ACCOUNT_METHOD:   # held: unconditional, read from nothing
         raise c.RouteError(c.LAUNCH_REFUSED, PERSONAL_ACCOUNT_OFF)
     conn = route.get("connection")
     kind = conn.get("kind") if isinstance(conn, Mapping) else None
@@ -150,7 +151,10 @@ class OneShotParser:
     * ``init``: the conversation id is kept (the engine's session id).
     * ``step_update`` of a ``tool`` step in state ``DONE`` with ``tool_info``: a ``tool.call`` and a
       ``tool.result`` draft, once per step. The call id is ``step-<step_index>`` (agy gives a tool call no
-      id of its own); the input is ``tool_info.parameters``, its digest RFC 8785 then SHA-256.
+      id of its own); the input is ``tool_info.parameters`` when it is an object, else null, and the digest
+      (RFC 8785 then SHA-256) is always of what agy sent (JSON null when it sent none). Parameters with no
+      RFC 8785 text (an integer beyond 2^53 - 1, for one) are a protocol error, as is a line nested too
+      deeply to read or one that is not UTF-8.
     * ``result``: a ``usage`` draft from ``result.usage`` (span ``turn`` for one turn, else
       ``session_total``, which is never summed) and a ``result`` draft. Per-step usage is not drafted, so
       nothing is counted twice.
@@ -168,13 +172,13 @@ class OneShotParser:
 
     def parse(self, line: str) -> list[dict]:
         raw = line + "\n"
-        start, self.offset = self.offset, self.offset + len(raw.encode("utf-8"))
+        start, self.offset = self.offset, self.offset + _utf8_length(raw, OneShotProtocolError)
         drafts = [{"type": "engine.output",
                    "payload": {"stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}}]
         try:
             message = json.loads(line)
-        except ValueError:
-            raise OneShotProtocolError("stdout line is not JSON") from None
+        except (ValueError, RecursionError):
+            raise OneShotProtocolError("stdout line is not JSON (or is nested too deeply to read)") from None
         if not isinstance(message, dict):
             raise OneShotProtocolError("stdout line is not a JSON object")
         if self.result is not None:
@@ -223,10 +227,16 @@ class OneShotParser:
         name = info.get("name") if isinstance(info.get("name"), str) and info["name"] else step.get("tool_name")
         if not isinstance(name, str) or not name or "\n" in name or "\r" in name:
             return []
-        self._tool_steps.add(index)
         call_id = f"step-{index}"
-        params = info.get("parameters")
-        params = dict(params) if isinstance(params, Mapping) else {}
+        # The input as agy gave it: an object is carried; any other value is carried as null with ITS digest;
+        # none at all is null with the digest of JSON null. Nothing is invented in its place.
+        raw_params = info.get("parameters") if "parameters" in info else None
+        try:
+            digest = input_digest(raw_params)
+        except NoCanonicalText:
+            raise OneShotProtocolError("tool parameters have no RFC 8785 text") from None
+        params = dict(raw_params) if isinstance(raw_params, Mapping) else None
+        self._tool_steps.add(index)
         error = info.get("error")
         if isinstance(error, Mapping):
             status = "error"
@@ -236,7 +246,7 @@ class OneShotParser:
             text = info.get("output") if isinstance(info.get("output"), str) else ""
         return [
             {"type": "tool.call", "payload": {"call_id": call_id, "name": name[:256],
-                                              "input_digest": input_digest(params), "input": params}},
+                                              "input_digest": digest, "input": params}},
             {"type": "tool.result", "payload": {"call_id": call_id, "status": status, "text": text,
                                                 "output_ref": None, "truncated": False}},
         ]
@@ -260,6 +270,15 @@ class OneShotParser:
             "cache_write_tokens": _measure(None),
             "cost_usd": {"value": None, "quality": "unknown", "provenance": "unavailable"},
         }
+
+
+def _utf8_length(raw: str, error: type) -> int:
+    """The line's length in the stdout file. A line that cannot be written as UTF-8 (a lone surrogate, which a
+    reader produces from bytes that were not UTF-8) is the agent's protocol error, not the parser's crash."""
+    try:
+        return len(raw.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise error("stdout line is not UTF-8") from None
 
 
 def _count(value: object) -> bool:
@@ -376,6 +395,25 @@ class AntigravityOneShotAdapter(RouteAdapter):
     def executable(self) -> str:
         return self._binary if self._binary is not None else DEFAULT_EXECUTABLE
 
+    def run(self, request: dict, deadline_at: float) -> dict:
+        """A request that is not the route contract's shape is refused ``request_invalid``, before anything
+        starts, even when the caller did not validate it first."""
+        rid = request.get("request_id") if isinstance(request, Mapping) else None
+        rid = rid if isinstance(rid, str) and rid else ""
+        if not isinstance(request, Mapping) or not rid:
+            return c.result(rid, c.REQUEST_INVALID, detail="request_id")
+        for name in ("prompt",):
+            if not isinstance(request.get(name), str) or not request[name]:
+                return c.result(rid, c.REQUEST_INVALID, detail=name)
+        route = request.get("route")
+        if not isinstance(route, Mapping):
+            return c.result(rid, c.REQUEST_INVALID, detail="route")
+        if not isinstance(route.get("connection"), Mapping) or not isinstance(route["connection"].get("id"), str):
+            return c.result(rid, c.REQUEST_INVALID, detail="route.connection")
+        if not isinstance(route.get("model"), str):
+            return c.result(rid, c.REQUEST_INVALID, detail="route.model")
+        return super().run(request, deadline_at)
+
     def argv(self, request: dict) -> list[str]:
         route_method(request["route"])
         return one_shot_argv(self.executable, request["route"]["model"])
@@ -459,7 +497,10 @@ def acp_hooks():
 def open_acp(process: EngineProcess, clock, route: Mapping, cwd: str, deadline_at: float, **session_options):
     """Check the route's one method, then initialize, authenticate with it and open a session.
 
-    The personal account refuses before anything is written to ``process``."""
+    The personal account refuses before anything is written to ``process``. The hooks are Antigravity's own:
+    a caller cannot replace them (``hooks=`` is refused), so no caller can make one of agy's errors a limit."""
+    if "hooks" in session_options:
+        raise TypeError("open_acp: the hooks are Antigravity's own and cannot be passed")
     method = route_method(route)
     acp = acp_module()
     session = acp.AcpSession(process, clock, hooks=acp_hooks(), **session_options)
@@ -479,12 +520,16 @@ class AcpDrafts:
         self.drafts: list[dict] = []
 
     def on_line(self, line: str) -> None:
+        if not isinstance(line, str):
+            raise TypeError("on_line takes the line as a str")
         raw = line + "\n"
-        start, self.offset = self.offset, self.offset + len(raw.encode("utf-8"))
+        start, self.offset = self.offset, self.offset + _utf8_length(raw, acp_module().AcpProtocolError)
         self.drafts.append({"type": "engine.output", "payload": {
             "stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
 
     def ended(self, outcome, turn_id: str | None = None, delivery_id: str | None = None) -> list[dict]:
+        if not isinstance(outcome, acp_module().TurnOutcome):
+            raise TypeError("ended takes the TurnOutcome the session gave")
         out = []
         if outcome.stop_reason is not None and turn_id is not None and delivery_id is not None:
             out.append({"type": "input.accepted",

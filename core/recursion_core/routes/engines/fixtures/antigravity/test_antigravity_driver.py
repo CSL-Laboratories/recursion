@@ -31,14 +31,21 @@ class MethodTest(unittest.TestCase):
     def test_the_four_methods_are_the_agents_documented_ids(self) -> None:
         self.assertEqual(set(ag.METHODS), set(ANTIGRAVITY_METHODS))
 
-    def test_the_personal_account_switch_is_off_and_is_not_an_option(self) -> None:
-        self.assertIs(ag.PERSONAL_ACCOUNT_ENABLED, False)
+    def test_the_personal_account_refuses_unconditionally(self) -> None:
         with self.assertRaises(c.RouteError) as ctx:
             ag.route_method(route("oauth-personal", "subscription", None))
         self.assertEqual((ctx.exception.code, ctx.exception.detail), (c.LAUNCH_REFUSED, ag.PERSONAL_ACCOUNT_OFF))
         import inspect
         for fn in (ag.route_method, ag.open_acp, ag.AntigravityOneShotAdapter.__init__, ag.one_shot_factory):
             self.assertNotIn("personal", " ".join(inspect.signature(fn).parameters))
+
+    def test_f8_no_module_attribute_an_importer_sets_turns_it_on(self) -> None:
+        for name in ("PERSONAL_ACCOUNT_ENABLED", "PERSONAL_ACCOUNT_ALLOWED", "ENABLED"):
+            setattr(ag, name, True)
+            self.addCleanup(delattr, ag, name)
+        with self.assertRaises(c.RouteError) as ctx:
+            ag.route_method(route("oauth-personal", "subscription", None))
+        self.assertEqual(ctx.exception.detail, ag.PERSONAL_ACCOUNT_OFF)
 
     def test_an_api_key_route_must_name_the_methods_own_key(self) -> None:
         for method, cred in (("gemini-api-key", "GOOGLE_API_KEY"), ("agent-platform", "GEMINI_API_KEY"),
@@ -82,6 +89,18 @@ class RegistrationTest(unittest.TestCase):
     def test_antigravity_is_a_catalogue_name_with_no_factory(self) -> None:
         self.assertIn(ag.ENGINE, CATALOGUE)
         self.assertNotIn(ag.ENGINE, EngineTable())
+
+    def test_r7_through_the_shared_hooks_a_composition_has_no_antigravity_factory(self) -> None:
+        """SPINE's own composition (shared ``Hooks()``, every installed registrant, frozen tables): this slice
+        registers nothing, and no registrant SPINE's fixed list names is this lane's. START forbids calling the
+        engine table's register even on a test table, so the factory's S3 shape is shown by calling it."""
+        from recursion_core.control import hooks as spine_hooks
+        composed = spine_hooks.compose()
+        self.assertNotIn(ag.ENGINE, composed.engines)
+        self.assertNotIn(ag.ENGINE, composed.engines.names())
+        self.assertFalse(any("antigravity" in name or "engine_e5" in name for name in spine_hooks.REGISTRANTS))
+        made = ag.one_shot_factory(lambda *a, **k: None, lambda: 0.0, lambda *_: "", {})
+        self.assertEqual(made.executable, ag.DEFAULT_EXECUTABLE)
 
     def test_argv0_obeys_the_default_executable_promise_on_both_drives(self) -> None:
         self.assertEqual(ag.DEFAULT_EXECUTABLE, "agy")
@@ -129,6 +148,24 @@ class AcpGlueTest(unittest.TestCase):
         with self.assertRaises(acp.AcpRefused):
             ag.open_acp(agent, agent.clock, route("oauth-business", "subscription", None), CWD, FAR)
         self.assertEqual(agent.authenticated, [])
+
+    def test_f12_the_glue_refuses_what_it_cannot_take_with_a_typed_error(self) -> None:
+        agent = FakeAcpAgent()
+        with self.assertRaises(TypeError) as ctx:
+            ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, hooks=acp.EngineHooks())
+        self.assertIn("Antigravity's own", str(ctx.exception))
+        self.assertEqual(agent.received, [])
+        drafts = ag.AcpDrafts()
+        with self.assertRaises(TypeError) as ctx:
+            drafts.ended(None)
+        self.assertIn("TurnOutcome", str(ctx.exception))
+        for bad in (5, b"bytes", None):
+            with self.subTest(bad=bad), self.assertRaises(TypeError) as ctx:
+                drafts.on_line(bad)
+            self.assertEqual(str(ctx.exception), "on_line takes the line as a str")
+        with self.assertRaises(acp.AcpProtocolError):
+            drafts.on_line('{"x":"\udcff"}')
+        self.assertEqual(drafts.drafts, [])
 
     def test_antigravity_maps_no_acp_error_to_a_plan_limit(self) -> None:
         agent = FakeAcpAgent([[("error", 429, "Usage limit reached")]])

@@ -40,13 +40,26 @@ TURNS. A user_message that begins a turn makes it the turn in progress from the 
 before the write, so a second message sent meanwhile is a mid-turn input. The subclass calls
 ``turn_ended(handle, turn_id)`` when the engine's end-of-turn sign arrives.
 
+ORDER AND LOCKS. A handle has two locks. Its STATE lock guards the gate's bookkeeping and is never held
+while the subclass runs, so a reader thread in ``parse`` can always record an acceptance or a turn's end.
+Its WRITE lock is held by ``send`` and ``interrupt`` from the state check through the subclass's write, so
+a handle's inputs reach the engine in the order the gate reserved them: a message reserved first is
+written first, and nothing is written after a close. A subclass therefore never needs an ordering lock of
+its own, and must not call ``send`` or ``interrupt`` from inside ``_send`` or ``_interrupt`` (the write
+lock is not reentrant). ``parse`` never takes the write lock.
+
+SHAPES. ``start`` checks the whole start record, the nested route and workspace included (common.v1), and
+``parse`` checks every draft's payload values and their relations (event.v1), all against lane SPINE's
+schemas as pinned at #368 ``c77aa2e0``, in plain code (the core has no schema validator).
+
 Who owns a live handle between turns, how Stop and shutdown see it, and when it is released are this
 lane's to define with lane STOP, in ``routes/workers.py`` (a later slice). Nothing here starts a thread or
-holds a lock while calling the subclass.
+holds the state lock while calling the subclass.
 """
 
 from __future__ import annotations
 
+import datetime
 import math
 import re
 import threading
@@ -68,6 +81,12 @@ _LOG = re.compile(r"ses-[A-Za-z0-9_-]{1,60}|run:[A-Za-z0-9_-]{1,64}")
 _TURN = re.compile(r"turn-[A-Za-z0-9_-]{1,59}")
 _DELIVERY = re.compile(r"dlv-[A-Za-z0-9_-]{1,60}")
 _APPROVAL = re.compile(r"apr-[A-Za-z0-9_-]{1,60}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_TOKEN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_CODE_WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_CONNECTION_ID = re.compile(r"(subscription|api_key|passthrough):.+", re.S)
+_TIMESTAMP = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+                        r"\.[0-9]{3}Z")
 
 # The event types a driver may draft, and the keys of each payload (event.v1; every key is required and no
 # other is allowed). A driver never drafts an approval request, turn.started or turn.ended: the core writes
@@ -184,7 +203,8 @@ class Handle:
         self.run_id = run_id
         self._engine_session_id = engine_session_id
         self.ignored_acceptances = 0
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()         # the state lock: never held while the subclass runs
+        self._write_lock = threading.Lock()   # orders this handle's writes; held across check and write
         self._live_turn: str | None = None
         self._turns: list[str] = []          # every turn a user_message began, in order
         self._deliveries: set[str] = set()   # every delivery id written, accepted or not
@@ -242,25 +262,27 @@ class Driver:
     def send(self, handle: Handle, item: object) -> None:
         item = check_input(item)
         kind = item["kind"]
-        with handle._lock:
-            if handle._closed:
-                raise DriverStateError("the worker's input is closed")
-            if kind == "approval_answer":
-                self._need("send", "permission_bridge")
-            elif kind == "close":
-                handle._closed = True  # before the write: nothing is sent after a close
-            else:
-                self._reserve(handle, item)
-        self._send(handle, item)
+        with handle._write_lock:  # the write happens in the order of the reservation (ORDER AND LOCKS)
+            with handle._lock:
+                if handle._closed:
+                    raise DriverStateError("the worker's input is closed")
+                if kind == "approval_answer":
+                    self._need("send", "permission_bridge")
+                elif kind == "close":
+                    handle._closed = True  # before the write: nothing is sent after a close
+                else:
+                    self._reserve(handle, item)
+            self._send(handle, item)
 
     def interrupt(self, handle: Handle, turn_id: object) -> None:
         self._need("interrupt", "interrupt")
         if not isinstance(turn_id, str) or not _TURN.fullmatch(turn_id):
             raise DriverInputError("turn_id")
-        with handle._lock:
-            if handle._live_turn != turn_id:
-                raise DriverStateError(f"{turn_id} is not the turn in progress")
-        self._interrupt(handle, turn_id)
+        with handle._write_lock:
+            with handle._lock:
+                if handle._live_turn != turn_id:
+                    raise DriverStateError(f"{turn_id} is not the turn in progress")
+            self._interrupt(handle, turn_id)
 
     def fork(self, engine_session_id: object, at: object) -> str:
         self._need("fork", "fork")
@@ -338,23 +360,93 @@ class Driver:
 
 
 # -- shape checks --------------------------------------------------------------------------------------
+# Each check follows lane SPINE's schemas as pinned at #368 c77aa2e0 (driver.v2, event.v1, common.v1). The
+# field names in DriverInputError are dotted paths, for example "route.connection.id".
+
+def _text(value: object, field: str, *, lo: int = 1, hi: int | None = None, no_newline: bool = False) -> str:
+    """A string of lo..hi characters; with no_newline, one that holds no CR or LF (common.v1's ``not``)."""
+    if not isinstance(value, str) or len(value) < lo or (hi is not None and len(value) > hi):
+        raise DriverInputError(field)
+    if no_newline and ("\r" in value or "\n" in value):
+        raise DriverInputError(field)
+    return value
+
+
+def _matches(value: object, pattern: re.Pattern, field: str) -> str:
+    """A string the pattern matches whole, with no CR or LF anywhere (every common.v1 id says so)."""
+    if not isinstance(value, str) or "\r" in value or "\n" in value or not pattern.fullmatch(value):
+        raise DriverInputError(field)
+    return value
+
+
+def _count(value: object, field: str) -> int:
+    """A JSON integer of 0 or more; a bool is not one. No ceiling: event.v1 sets none."""
+    if type(value) is bool or not isinstance(value, int) or value < 0:
+        raise DriverInputError(field)
+    return value
+
+
+def _timestamp(value: object, field: str) -> str:
+    """common.v1's timestamp: the millisecond RFC 3339 spelling with Z, and a real calendar instant."""
+    _matches(value, _TIMESTAMP, field)
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        raise DriverInputError(field) from None
+    return value
+
+
+def check_route_record(route: object, field: str = "route") -> dict:
+    """common.v1's route: engine, model (null for the engine's default) and connection {kind, id}. A copy."""
+    if not isinstance(route, Mapping) or set(route) != {"engine", "model", "connection"}:
+        raise DriverInputError(field)
+    _matches(route["engine"], _ENGINE, f"{field}.engine")
+    if route["model"] is not None:
+        _text(route["model"], f"{field}.model")
+    conn = route["connection"]
+    if not isinstance(conn, Mapping) or set(conn) != {"kind", "id"}:
+        raise DriverInputError(f"{field}.connection")
+    if conn["kind"] not in ("subscription", "api_key", "passthrough"):
+        raise DriverInputError(f"{field}.connection.kind")
+    _text(conn["id"], f"{field}.connection.id", hi=200, no_newline=True)
+    return {"engine": route["engine"], "model": route["model"], "connection": dict(conn)}
+
+
+def check_workspace(workspace: object, field: str = "workspace") -> dict | None:
+    """common.v1's workspace, or None. direct: worktree_path is null; worktree: base_ref and worktree_path set."""
+    if workspace is None:
+        return None
+    keys = {"path", "mode", "base_ref", "worktree_path"}
+    if not isinstance(workspace, Mapping) or set(workspace) != keys:
+        raise DriverInputError(field)
+    _text(workspace["path"], f"{field}.path")
+    mode = workspace["mode"]
+    if mode not in ("direct", "worktree"):
+        raise DriverInputError(f"{field}.mode")
+    for name in ("base_ref", "worktree_path"):
+        if workspace[name] is not None:
+            _text(workspace[name], f"{field}.{name}")
+        elif mode == "worktree":
+            raise DriverInputError(f"{field}.{name}")
+    if mode == "direct" and workspace["worktree_path"] is not None:
+        raise DriverInputError(f"{field}.worktree_path")
+    return dict(workspace)
+
+
 def check_start(request: object) -> dict:
-    """driver.v2's start record: session_id, run_id, workspace, route, engine_session_id. A copy."""
+    """driver.v2's start record: session_id, run_id, workspace, route, engine_session_id. A copy, nested too."""
     keys = {"session_id", "run_id", "workspace", "route", "engine_session_id"}
     if not isinstance(request, Mapping) or set(request) != keys:
         raise DriverInputError("start")
-    if not isinstance(request["session_id"], str) or not _LOG.fullmatch(request["session_id"]):
-        raise DriverInputError("session_id")
-    if not isinstance(request["run_id"], str) or not _RUN.fullmatch(request["run_id"]):
-        raise DriverInputError("run_id")
-    if request["workspace"] is not None and not isinstance(request["workspace"], Mapping):
-        raise DriverInputError("workspace")
-    if not isinstance(request["route"], Mapping):
-        raise DriverInputError("route")
+    _matches(request["session_id"], _LOG, "session_id")
+    _matches(request["run_id"], _RUN, "run_id")
+    workspace = check_workspace(request["workspace"])
+    route = check_route_record(request["route"])
     esid = request["engine_session_id"]
-    if esid is not None and (not isinstance(esid, str) or not 1 <= len(esid) <= 256):
-        raise DriverInputError("engine_session_id")
-    return dict(request)
+    if esid is not None:
+        _text(esid, "engine_session_id", hi=256)
+    return {"session_id": request["session_id"], "run_id": request["run_id"], "workspace": workspace,
+            "route": route, "engine_session_id": esid}
 
 
 def check_env(env: object) -> dict[str, str]:
@@ -374,38 +466,110 @@ def check_input(item: object) -> dict:
     if set(item) != expected:
         raise DriverInputError(kind)
     if kind == "user_message":
-        if not isinstance(item["turn_id"], str) or not _TURN.fullmatch(item["turn_id"]):
-            raise DriverInputError("turn_id")
-        if not isinstance(item["text"], str) or not item["text"]:
-            raise DriverInputError("text")
-        if not isinstance(item["delivery_id"], str) or not _DELIVERY.fullmatch(item["delivery_id"]):
-            raise DriverInputError("delivery_id")
+        _matches(item["turn_id"], _TURN, "turn_id")
+        _text(item["text"], "text")
+        _matches(item["delivery_id"], _DELIVERY, "delivery_id")
     elif kind == "approval_answer":
-        if not isinstance(item["approval_id"], str) or not _APPROVAL.fullmatch(item["approval_id"]):
-            raise DriverInputError("approval_id")
+        _matches(item["approval_id"], _APPROVAL, "approval_id")
         if item["decision"] not in ("approve", "deny"):
             raise DriverInputError("decision")
     return dict(item)
 
 
+def _check_engine_output(p: Mapping, f: str) -> None:
+    if p["stream"] not in ("stdout", "stderr"):
+        raise DriverInputError(f"{f}.stream")
+    if not isinstance(p["text"], str):
+        raise DriverInputError(f"{f}.text")
+    _count(p["offset_start"], f"{f}.offset_start")
+    _count(p["offset_end"], f"{f}.offset_end")
+
+
+def _check_tool_call(p: Mapping, f: str) -> None:
+    _text(p["call_id"], f"{f}.call_id", hi=128, no_newline=True)
+    _text(p["name"], f"{f}.name", hi=256, no_newline=True)
+    _matches(p["input_digest"], _SHA256, f"{f}.input_digest")
+    if p["input"] is not None and not isinstance(p["input"], Mapping):
+        raise DriverInputError(f"{f}.input")
+
+
+def _check_tool_result(p: Mapping, f: str) -> None:
+    _text(p["call_id"], f"{f}.call_id", hi=128, no_newline=True)
+    if p["status"] not in ("ok", "error", "denied", "cancelled"):
+        raise DriverInputError(f"{f}.status")
+    if p["text"] is not None and not isinstance(p["text"], str):
+        raise DriverInputError(f"{f}.text")
+    if p["output_ref"] is not None:
+        _matches(p["output_ref"], _TOKEN, f"{f}.output_ref")
+    if (p["text"] is None) == (p["output_ref"] is None):  # exactly one of the two carries the output
+        raise DriverInputError(f"{f}.output")
+    if type(p["truncated"]) is not bool:
+        raise DriverInputError(f"{f}.truncated")
+
+
+def _connection_id(value: object, field: str) -> None:
+    _matches(value, _CONNECTION_ID, field)
+    if len(value) > 256:
+        raise DriverInputError(field)
+
+
+def _optional_text(value: object, field: str) -> None:
+    if value is not None:
+        _text(value, field)
+
+
+def _check_usage(p: Mapping, f: str) -> None:
+    _connection_id(p["connection_id"], f"{f}.connection_id")
+    _optional_text(p["model"], f"{f}.model")
+    _optional_text(p["bucket"], f"{f}.bucket")
+    if p["span"] not in ("call", "turn", "session_total"):
+        raise DriverInputError(f"{f}.span")
+    for name in _TOKEN_FIELDS:
+        check_measurement(p[name], integer=True, field=f"{f}.{name}")
+    check_measurement(p["cost_usd"], integer=False, field=f"{f}.cost_usd")
+
+
+def _check_limit(p: Mapping, f: str) -> None:
+    _connection_id(p["connection_id"], f"{f}.connection_id")
+    if p["scope"] not in ("connection", "model"):
+        raise DriverInputError(f"{f}.scope")
+    if p["kind"] not in ("plan_limit", "short_fault", "spend_cap"):
+        raise DriverInputError(f"{f}.kind")
+    _optional_text(p["model"], f"{f}.model")
+    if (p["scope"] == "model") != (p["model"] is not None):  # model is a string exactly when scope is model
+        raise DriverInputError(f"{f}.model")
+    _optional_text(p["bucket"], f"{f}.bucket")
+    if p["reset_at"] is not None:
+        _timestamp(p["reset_at"], f"{f}.reset_at")
+
+
+def _check_result(p: Mapping, f: str) -> None:
+    if p["code"] is not None:
+        _matches(p["code"], _CODE_WORD, f"{f}.code")
+    if not isinstance(p["detail"], str):
+        raise DriverInputError(f"{f}.detail")
+
+
+def _check_input_accepted(p: Mapping, f: str) -> None:
+    _matches(p["delivery_id"], _DELIVERY, f"{f}.delivery_id")
+    _matches(p["turn_id"], _TURN, f"{f}.turn_id")
+    if p["how"] not in ("new_turn", "mid_turn"):
+        raise DriverInputError(f"{f}.how")
+
+
+_PAYLOAD_CHECKS = {"engine.output": _check_engine_output, "tool.call": _check_tool_call,
+                   "tool.result": _check_tool_result, "usage": _check_usage, "limit": _check_limit,
+                   "result": _check_result, "input.accepted": _check_input_accepted}
+
+
 def check_draft(draft: object) -> dict:
-    """One event draft: a type a driver may draft and a payload with exactly that type's keys."""
+    """One event draft: a type a driver may draft, and a payload that is that type's event.v1 payload."""
     if not isinstance(draft, Mapping) or set(draft) != {"type", "payload"} or draft["type"] not in DRAFT_KEYS:
         raise DriverInputError("draft.type")
     payload = draft["payload"]
     if not isinstance(payload, Mapping) or set(payload) != DRAFT_KEYS[draft["type"]]:
         raise DriverInputError(f"draft.{draft['type']}")
-    if draft["type"] == "input.accepted":
-        if not isinstance(payload["delivery_id"], str) or not _DELIVERY.fullmatch(payload["delivery_id"]):
-            raise DriverInputError("draft.input.accepted.delivery_id")
-        if not isinstance(payload["turn_id"], str) or not _TURN.fullmatch(payload["turn_id"]):
-            raise DriverInputError("draft.input.accepted.turn_id")
-        if payload["how"] not in ("new_turn", "mid_turn"):
-            raise DriverInputError("draft.input.accepted.how")
-    elif draft["type"] == "usage":
-        for name in _TOKEN_FIELDS:
-            check_measurement(payload[name], integer=True, field=f"draft.usage.{name}")
-        check_measurement(payload["cost_usd"], integer=False, field="draft.usage.cost_usd")
+    _PAYLOAD_CHECKS[draft["type"]](payload, f"draft.{draft['type']}")
     return {"type": draft["type"], "payload": dict(payload)}
 
 
@@ -421,5 +585,7 @@ def check_measurement(value: object, *, integer: bool, field: str) -> None:
     if quality not in ("known", "lower_bound") or provenance not in ("observed", "modelled", "inferred"):
         raise DriverInputError(field)
     kinds = (int,) if integer else (int, float)
-    if type(number) is bool or not isinstance(number, kinds) or number < 0 or not math.isfinite(number):
+    if type(number) is bool or not isinstance(number, kinds) or number < 0:
+        raise DriverInputError(field)
+    if isinstance(number, float) and not math.isfinite(number):  # an int is never converted: no overflow
         raise DriverInputError(field)

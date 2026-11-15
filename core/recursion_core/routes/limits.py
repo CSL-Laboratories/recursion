@@ -45,6 +45,7 @@ def validate_limits(limits: object, *, engines: object = None) -> dict:
     the same engines a primary route may.
     """
 
+    engines = c.registered_snapshot(engines)  # one read of a one-shot iterable serves every fallback
     if not isinstance(limits, Mapping) or set(limits) - {"on_limit", "fallback"}:
         raise c.RouteError(c.REQUEST_INVALID, "route.limits")
     on_limit = limits.get("on_limit", "ask")

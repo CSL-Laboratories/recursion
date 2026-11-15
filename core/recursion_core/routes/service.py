@@ -22,7 +22,7 @@ class RouteService:
         # What the composition registered (seam S3): its engine table when given, otherwise the engines this
         # service has an adapter for, which the daemon builds from that same table. validate_request asks
         # for the names at each call (contract.engine_names); a bad name fails here, at composition.
-        self._engines = engines if engines is not None else tuple(self._adapters)
+        self._engines = c.registered_snapshot(engines) if engines is not None else tuple(self._adapters)
         c.engine_names(self._engines)
         # The user's default limit behaviour; a request's own route.limits overrides it. Default: ask.
         self._limits = lim.validate_limits(limits if limits is not None else lim.DEFAULT_LIMITS, engines=self._engines)

@@ -114,13 +114,25 @@ def engine_names(registered: object = None) -> tuple[str, ...]:
     names = list(BASE_ENGINES)
     if registered is None:
         return tuple(names)
-    source = registered.names() if callable(getattr(registered, "names", None)) else registered
+    source = registered.names() if _is_table(registered) else registered
     for name in source:
         if not isinstance(name, str) or not _ENGINE_NAME.fullmatch(name):
             raise ValueError(f"registered engine name {name!r}")
         if name not in names:
             names.append(name)
     return tuple(names)
+
+
+def _is_table(registered: object) -> bool:
+    return callable(getattr(registered, "names", None))
+
+
+def registered_snapshot(registered: object) -> object:
+    """What a caller registered, safe to read more than once: a table as it is (asked at each call), any
+    other iterable read once into a tuple, so a one-shot iterator is not used up by a first check."""
+    if registered is None or _is_table(registered):
+        return registered
+    return tuple(registered)
 
 
 class RouteError(Exception):
@@ -138,6 +150,7 @@ def validate_request(request: object, *, engines: object = None) -> dict:
     ``engines`` is what the composition registered (see ``engine_names``); None means nothing registered.
     """
 
+    engines = registered_snapshot(engines)  # the same names for the route and for every fallback in it
     if not isinstance(request, Mapping):
         raise RouteError(REQUEST_INVALID, "request is not an object")
     if request.get("contract") != CONTRACT_VERSION:

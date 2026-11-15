@@ -18,7 +18,8 @@ ALL = Flags(**{name: True for name in d.FLAGS})
 
 def start_record(esid=None, run_id="run-1"):
     return {"session_id": "ses-1", "run_id": run_id, "workspace": None,
-            "route": {"engine": "claude_code", "model": "m"}, "engine_session_id": esid}
+            "route": {"engine": "claude_code", "model": "m", "connection": {"kind": "subscription", "id": "login-A"}},
+            "engine_session_id": esid}
 
 
 def msg(turn="turn-1", delivery="dlv-1", text="hello"):

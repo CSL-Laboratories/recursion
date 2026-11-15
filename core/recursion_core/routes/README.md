@@ -46,6 +46,17 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   their keys, and an `input.accepted` only when it matches a delivery this worker wrote, with the turn and
   the `how` of that write; anything else is dropped and counted. `one_turn(engine)` declares today's path,
   `RouteAdapter.run`, with every flag false. No engine has a driver yet (later slices: Claude Code's).
+  A handle's writes reach the engine in the order the gate reserved them, close and interrupt included: a
+  per-handle write lock is held from the state check through the subclass's write, while the state lock
+  stays free for the reader in `parse`. `start` checks the nested route and workspace (common.v1) before
+  the subclass starts anything, and `parse` checks every payload value and relation of event.v1 (enums,
+  identifiers, digests, timestamps as real instants, `text` xor `output_ref`, `model` exactly when a limit's
+  scope is `model`), against #368 as pinned at `c77aa2e0`, in plain code. The calls, for the engine lanes:
+  `start(start_record, env) -> Handle`, `resume(start_record, env) -> Handle`, `send(handle, input)`,
+  `interrupt(handle, turn_id)`, `fork(engine_session_id, at) -> engine_session_id`,
+  `parse(handle, line) -> [draft]`; a subclass implements `_start`, `_send`, `_interrupt`, `_fork` and
+  `_parse`, calls `turn_ended(handle, turn_id)` at the engine's end-of-turn sign and
+  `handle.set_engine_session_id(id)` when the engine reports its conversation id.
 - `host.py`: `platform_supported()`, the one place in this package that reads `os` (`os.name` and whether
   `os.geteuid` exists, the same test as `child_env` and `subscription_routes`). The adapter modules still
   never import `os`.
@@ -58,7 +69,9 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   `platform_unsupported` before it builds an argv or an environment, asks for a credential or calls the
   launcher. The profile routes keep their own refusal, `subscription_route_refused` with the same detail,
   from `subscription_routes`. Route tests that run an adapter through a fake launcher carry
-  `fakes.runs_adapter` and are skipped on such a host; `tests/test_r3_finding_7.py` asserts the refusal there.
+  `fakes.runs_adapter`, which for the test's duration lets the shared boundary's host check pass, so their
+  protocol and environment assertions run on Windows too, against fakes; `tests/test_r3_finding_7.py`
+  asserts the refusal itself with the real host check.
 - Only a typed limit signal opens a connection; it fences every tenant on that connection and no other
   connection. Text inside the model's payload (assistant/user content, Codex agent messages) is never
   inspected. Vague quota-sounding error text is a `short_fault`: one model, one tenant, 60 s (grill Q23).

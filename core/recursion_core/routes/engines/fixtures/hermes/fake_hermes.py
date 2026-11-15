@@ -3,8 +3,10 @@
 Called with exactly the one-shot arguments (``chat --query-file - --format stream-json``), it reads the
 prompt from standard input, replays the synthetic stream named by ``FAKE_HERMES_STREAM`` byte for byte on
 stdout, writes Hermes's ``session_id:`` line on stderr and exits with ``FAKE_HERMES_EXIT`` (default 0).
-Called with anything else, it does what Hermes does with an invocation it refuses in stream-json mode:
-an ``init`` line, a failed ``result`` line with exit code 2, and exit 2, without reading stdin.
+Called with anything else, it refuses, without reading stdin. That is this fake's rule, not upstream's:
+it accepts only the argv this lane chose, and upstream Hermes also accepts ``-q <prompt>`` with
+``--format stream-json``. The refusal is shaped like Hermes's own failed start in stream-json mode: an
+``init`` line, a failed ``result`` line with exit code 2, and exit 2.
 When ``FAKE_HERMES_SEEN`` names a file, it writes there the arguments it got and the prompt it read.
 """
 from __future__ import annotations

@@ -81,8 +81,8 @@ def cases() -> list[tuple[str, int, str, list[str]]]:
         line(text('done'), 600),
         line(result(SID, 0, 'done', input_tokens=3000, output_tokens=120, cache_read=2048, cache_write=512), 700)]))
     out.append(('s03-tools-without-ids.jsonl', 0, 'calls with no tool_call_id: one pairs by name; two open '
-                'calls of one name leave a result that pairs with nothing; args that are not an object '
-                'carry no input', [
+                'calls of one name leave a result that pairs with nothing; a call whose args are not an '
+                'object has no input to digest, so its line stays raw and its result pairs with nothing', [
         line(init(), 0),
         line(tool_use('terminal', None, {'command': 'ls'}), 10),
         line(tool_result('terminal', 'a\nb'), 30),
@@ -123,6 +123,10 @@ def cases() -> list[tuple[str, int, str, list[str]]]:
         line({'type': 'reasoning', 'text': 'hmm'}, 1),
         '{"type": "text", "text": NaN, "timestamp": 1794700000002}\n',
         '{"type": "text", "text": "a", "text": "b", "timestamp": 1794700000003}\n',
+        # An escaped lone surrogate (json.dumps writes the escape, so the line itself is ASCII).
+        json.dumps({'type': 'text', 'text': 'x' + chr(0xD800), 'timestamp': T0 + 3}) + '\n',
+        '{"type": "result", "session_id": "s", "exit_code": 0, "text": "x", "tokens": {"output": 1}, '
+        '"duration_ms": 1e999, "timestamp": 1794700000003}\n',
         line({'type': 'tool_use'}, 4),
         line(text(''), 5),
         line(init('m', ''), 6),
@@ -137,7 +141,8 @@ def cases() -> list[tuple[str, int, str, list[str]]]:
         line(init(), 0), line(text('par'), 10), '{"type": "text", "te']))
     big = {'blob': 'b' * 70000}
     out.append(('s12-ids-and-inputs.jsonl', 0, 'call ids that are not valid call ids or use this parser\'s '
-                'prefixes; an input with no RFC 8785 text; an input too large to carry', [
+                'prefixes; an input with no RFC 8785 text (its line stays raw); an input too large to carry '
+                '(its digest is still the input\'s)', [
         line(init(), 0),
         line(tool_use('t', 'i' * 200, {'n': 1}), 10),
         line(tool_result('t', 'r1', call_id='i' * 200), 11),
@@ -152,6 +157,19 @@ def cases() -> list[tuple[str, int, str, list[str]]]:
     out.append(('s13-text-outside-ascii.jsonl', 0, 'text outside ASCII, for byte offsets', [
         line(init(), 0), line(text('héllo ✓ 日本'), 5),
         line(result(SID, 0, 'héllo ✓ 日本', output_tokens=7), 9)]))
+    out.append(('s14-ambiguous-group-drains.jsonl', 0, 'id-less calls of one name: a result while two are '
+                'open puts the group in doubt, a call started meanwhile joins it, no result in it pairs, '
+                'and once all have ended the next call pairs again', [
+        line(init(), 0),
+        line(tool_use('web_search', None, {'query': 'a'}), 10),
+        line(tool_use('web_search', None, {'query': 'b'}), 11),
+        line(tool_result('web_search', 'one of a or b'), 20),
+        line(tool_use('web_search', None, {'query': 'c'}), 21),
+        line(tool_result('web_search', 'another'), 30),
+        line(tool_result('web_search', 'the last of the three'), 31),
+        line(tool_use('web_search', None, {'query': 'd'}), 40),
+        line(tool_result('web_search', 'd'), 50),
+        line(result(SID, 0, 'ok', output_tokens=9), 60)]))
     return out
 
 

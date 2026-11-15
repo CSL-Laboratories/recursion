@@ -59,7 +59,8 @@ class FakeHermesTest(unittest.TestCase):
         stderr = [d['payload'] for d in drafts if d['type'] == 'engine.output' and d['payload']['stream'] == 'stderr']
         self.assertEqual(''.join(p['text'] for p in stderr), done.stderr.decode('utf-8'))
 
-    def test_a_prompt_on_the_command_line_is_refused_by_the_fake_as_hermes_refuses_it(self):
+    def test_the_fake_accepts_only_the_lanes_argv_so_a_prompt_on_the_command_line_is_refused(self):
+        # Upstream accepts ``-q <prompt>``; the fake refuses it to hold the lane's own argv in place.
         done, seen = launch(['chat', '-q', 'hello', '--format', 'stream-json'], 'hello')
         self.assertEqual(done.returncode, 2)
         self.assertEqual(seen['prompt'], '', 'stdin was not read')

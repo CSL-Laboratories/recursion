@@ -18,7 +18,7 @@
    "stream": "streams/s03-tools-without-ids.jsonl",
    "exit_status": 0,
    "synthetic": true,
-   "what": "calls with no tool_call_id: one pairs by name; two open calls of one name leave a result that pairs with nothing; args that are not an object carry no input"
+   "what": "calls with no tool_call_id: one pairs by name; two open calls of one name leave a result that pairs with nothing; a call whose args are not an object has no input to digest, so its line stays raw and its result pairs with nothing"
   },
   {
    "stream": "streams/s04-failed.jsonl",
@@ -72,13 +72,19 @@
    "stream": "streams/s12-ids-and-inputs.jsonl",
    "exit_status": 0,
    "synthetic": true,
-   "what": "call ids that are not valid call ids or use this parser's prefixes; an input with no RFC 8785 text; an input too large to carry"
+   "what": "call ids that are not valid call ids or use this parser's prefixes; an input with no RFC 8785 text (its line stays raw); an input too large to carry (its digest is still the input's)"
   },
   {
    "stream": "streams/s13-text-outside-ascii.jsonl",
    "exit_status": 0,
    "synthetic": true,
    "what": "text outside ASCII, for byte offsets"
+  },
+  {
+   "stream": "streams/s14-ambiguous-group-drains.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "id-less calls of one name: a result while two are open puts the group in doubt, a call started meanwhile joins it, no result in it pairs, and once all have ended the next call pairs again"
   }
  ]
 }

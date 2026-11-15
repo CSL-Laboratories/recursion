@@ -151,6 +151,23 @@ class FixtureIndexTest(unittest.TestCase):
                 self.assertEqual({d['type'] for d in after} - {'engine.output'}, set(),
                                  'after the result only raw lines')
 
+    def test_every_typed_call_carries_the_digest_of_the_input_on_its_own_line(self):
+        """A semantic check the schemas cannot make: the digest is of the input the engine wrote."""
+        checked = 0
+        for path in sorted((HERE / 'streams').iterdir()):
+            parser = HermesStreamParser(CONNECTION)
+            for line in lines_of(path.name):
+                for draft in parser.parse(line):
+                    if draft['type'] != 'tool.call':
+                        continue
+                    record = json.loads(line)
+                    with self.subTest(stream=path.name, call=draft['payload']['call_id']):
+                        self.assertIsInstance(record.get('input'), dict)
+                        self.assertEqual(draft['payload']['input_digest'], hermes.input_digest(record['input']))
+                        self.assertIn(draft['payload']['input'], (record['input'], None))
+                    checked += 1
+        self.assertGreaterEqual(checked, 14)   # every typed call of the fourteen streams
+
     def test_stdout_offsets_tile_each_stream_without_gap_or_overlap(self):
         for path in sorted((HERE / 'streams').iterdir()):
             with self.subTest(stream=path.name):
@@ -263,23 +280,24 @@ class StreamTest(unittest.TestCase):
                 self.assertIs(of_type(parser.parse(line), 'tool.result')[0]['truncated'], cut)
 
     def test_s03_calls_without_ids_pair_only_when_one_call_of_that_name_is_open(self):
+        lines = lines_of('s03-tools-without-ids.jsonl')
         parser, drafts = run('s03-tools-without-ids.jsonl', 0)
         calls, results = of_type(drafts, 'tool.call'), of_type(drafts, 'tool.result')
         self.assertEqual([(c['call_id'], c['name']) for c in calls],
-                         [('e9n-1', 'terminal'), ('e9n-2', 'web_search'), ('e9n-3', 'web_search'), ('e9n-5', 'patch')])
+                         [('e9n-1', 'terminal'), ('e9n-2', 'web_search'), ('e9n-3', 'web_search')])
         self.assertEqual([(r['call_id'], r['status']) for r in results],
                          [('e9n-1', 'ok'), ('e9n-4', 'ok'), ('e9n-5', 'error')])
         self.assertNotIn(results[1]['call_id'], {c['call_id'] for c in calls}, 'an ambiguous result pairs with nothing')
-        patch = calls[3]
-        self.assertIsNone(patch['input'], 'args that are not an object carry no input')
-        self.assertEqual(patch['input_digest'], digest_of('null'))
+        self.assertEqual([o['text'] for o in of_type(drafts, 'engine.output')], [lines[6]],
+                         'the call whose args are not an object has no input to digest: its line stays raw')
+        self.assertNotIn(results[2]['call_id'], {c['call_id'] for c in calls}, 'its result pairs with nothing')
         usage = of_type(drafts, 'usage')[0]
         self.assertEqual(usage['input_tokens'], UNKNOWN, 'a 0 is not known to be 0')
         self.assertEqual(usage['output_tokens'], known(40))
 
-    def test_a_result_with_no_id_pairs_with_the_one_open_call_of_its_name_even_after_others_closed(self):
+    def test_serial_id_less_calls_each_pair_and_a_result_with_none_open_pairs_with_nothing(self):
         parser = HermesStreamParser(CONNECTION)
-        use = json.dumps({'type': 'tool_use', 'name': 'n'}) + '\n'
+        use = json.dumps({'type': 'tool_use', 'name': 'n', 'input': {}}) + '\n'
         done = json.dumps({'type': 'tool_result', 'name': 'n', 'output': '', 'duration_ms': 0, 'is_error': False}) + '\n'
         ids = [of_type(parser.parse(line), kind)[0]['call_id'] for line, kind in
                ((use, 'tool.call'), (done, 'tool.result'), (use, 'tool.call'), (done, 'tool.result'), (done, 'tool.result'))]
@@ -330,7 +348,8 @@ class StreamTest(unittest.TestCase):
     def test_s10_lines_that_are_not_the_protocol_are_kept_raw_and_nothing_is_typed_after_the_result(self):
         lines = lines_of('s10-not-the-protocol.jsonl')
         parser, drafts = run('s10-not-the-protocol.jsonl', 0)
-        raw = [i for i, line in enumerate(lines) if i not in (7, 9)]   # the first init and the first result
+        self.assertIn('"duration_ms": 1e999', lines[6], 'a result holding a number too large for a double')
+        raw = [i for i, line in enumerate(lines) if i not in (9, 11)]   # the first init and the first result
         self.assertEqual(parser.raw_lines, len(raw))
         outputs = of_type(drafts, 'engine.output')
         self.assertEqual([o['text'] for o in outputs], [lines[i] for i in raw])
@@ -366,17 +385,60 @@ class StreamTest(unittest.TestCase):
                 self.assertEqual(call['call_id'], 'e9h-' + digest_of(engine_id)[:32])
                 self.assertEqual(result['call_id'], call['call_id'])
 
-    def test_s12_an_input_with_no_canonical_text_or_too_large_is_not_carried(self):
+    def test_s12_an_input_with_no_canonical_text_is_raw_and_one_too_large_keeps_its_digest(self):
+        lines = lines_of('s12-ids-and-inputs.jsonl')
         parser, drafts = run('s12-ids-and-inputs.jsonl', 0)
         by_id = {c['call_id']: c for c in of_type(drafts, 'tool.call')}
-        big_int, big = by_id['call-big-int'], by_id['call-big']
-        self.assertIsNone(big_int['input'])
-        self.assertEqual(big_int['input_digest'], digest_of('null'), 'no RFC 8785 text: the digest is of what is carried')
+        self.assertNotIn('call-big-int', by_id, 'no RFC 8785 text: no truthful digest, so no tool.call')
+        self.assertEqual([o['text'] for o in of_type(drafts, 'engine.output')], [lines[7]])
+        big = by_id['call-big']
         self.assertIsNone(big['input'])
         self.assertEqual(big['input_digest'], digest_of('{"blob":"' + 'b' * 70000 + '"}'),
                          'too large to carry: the digest is still of the input')
-        self.assertEqual(parser.uncarried_inputs, 2)
+        self.assertEqual(parser.uncarried_inputs, 1)
         self.assertEqual(of_type(drafts, 'usage'), [], 'every count was 0: no usage draft')
+
+    def test_s14_an_ambiguous_group_pairs_nothing_until_it_drains_then_pairing_starts_afresh(self):
+        parser, drafts = run('s14-ambiguous-group-drains.jsonl', 0)
+        calls = [c['call_id'] for c in of_type(drafts, 'tool.call')]
+        results = [r['call_id'] for r in of_type(drafts, 'tool.result')]
+        self.assertEqual(calls, ['e9n-1', 'e9n-2', 'e9n-4', 'e9n-7'])
+        self.assertEqual(results, ['e9n-3', 'e9n-5', 'e9n-6', 'e9n-7'])
+        self.assertEqual(set(results[:3]) & set(calls), set(), 'no result in the doubtful group pairs')
+
+    def test_two_parallel_calls_then_a_serial_one_pairs_once_both_have_ended(self):
+        parser = HermesStreamParser(CONNECTION)
+        use = json.dumps({'type': 'tool_use', 'name': 'n', 'input': {}}) + '\n'
+        done = json.dumps({'type': 'tool_result', 'name': 'n', 'output': '', 'is_error': False}) + '\n'
+        ids = [parser.parse(line)[0]['payload']['call_id'] for line in (use, use, done, done, use, done)]
+        self.assertEqual(ids, ['e9n-1', 'e9n-2', 'e9n-3', 'e9n-4', 'e9n-5', 'e9n-5'])
+
+    def test_an_id_less_call_whose_line_stayed_raw_still_keeps_its_result_from_another_call(self):
+        parser = HermesStreamParser(CONNECTION)
+        raw_call = json.dumps({'type': 'tool_use', 'name': 'n'}) + '\n'               # no input: raw
+        typed_call = json.dumps({'type': 'tool_use', 'name': 'n', 'input': {}}) + '\n'
+        done = json.dumps({'type': 'tool_result', 'name': 'n', 'output': '', 'is_error': False}) + '\n'
+        self.assertEqual([d['type'] for d in parser.parse(raw_call)], ['engine.output'])
+        typed = parser.parse(typed_call)[0]['payload']['call_id']
+        first, second = (parser.parse(done)[0]['payload']['call_id'] for _ in range(2))
+        self.assertNotIn(typed, (first, second), 'two calls were open: neither result may be guessed')
+        alone = HermesStreamParser(CONNECTION)
+        alone.parse(raw_call)
+        self.assertEqual(alone.parse(done)[0]['payload']['call_id'], 'e9n-1', 'a fresh id: the raw call has no tool.call')
+        self.assertEqual(alone.parse(typed_call)[0]['payload']['call_id'], 'e9n-2')
+        self.assertEqual(alone.parse(done)[0]['payload']['call_id'], 'e9n-2', 'drained: pairing starts afresh')
+
+    def test_a_call_with_no_truthful_digest_is_raw_whatever_its_id(self):
+        cases = [{'tool_call_id': 'c'}, {'tool_call_id': 'c', 'input': None}, {'tool_call_id': 'c', 'input': [1, 2]},
+                 {'tool_call_id': 'c', 'input': 'text'}, {'tool_call_id': 'c', 'input': {'n': 9007199254740993}},
+                 {'input': {'n': 2 ** 64}}]
+        for extra in cases:
+            parser = HermesStreamParser(CONNECTION)
+            line = json.dumps({'type': 'tool_use', 'name': 't', **extra}) + '\n'
+            with self.subTest(record=extra):
+                self.assertEqual(parser.parse(line), [{'type': 'engine.output', 'payload': {
+                    'stream': 'stdout', 'text': line, 'offset_start': 0, 'offset_end': len(line)}}])
+                self.assertEqual(parser.uncarried_inputs, 0)
 
     def test_an_input_at_the_carry_limit_is_carried(self):
         parser = HermesStreamParser(CONNECTION)
@@ -421,11 +483,12 @@ class StreamTest(unittest.TestCase):
             {'type': 'system', 'subtype': 'init', 'model': ''},
             {'type': 'system', 'subtype': 'other', 'model': '', 'session_id': ''},
             {'type': 'text', 'text': 7},
-            {'type': 'tool_use', 'name': ''},
-            {'type': 'tool_use', 'name': 'x\ny'},
-            {'type': 'tool_use', 'name': 'n' * 257},
-            {'type': 'tool_use', 'name': 't', 'tool_call_id': 5},
-            {'type': 'tool_use', 'name': 't', 'tool_call_id': ''},
+            {'type': 'tool_use', 'name': '', 'input': {}},          # each carries an input, so only its own
+            {'type': 'tool_use', 'name': 'x\ny', 'input': {}},      # rule can make it raw
+            {'type': 'tool_use', 'name': 'n' * 257, 'input': {}},
+            {'type': 'tool_use', 'name': 7, 'input': {}},
+            {'type': 'tool_use', 'name': 't', 'tool_call_id': 5, 'input': {}},
+            {'type': 'tool_use', 'name': 't', 'tool_call_id': '', 'input': {}},
             {'type': 'tool_result', 'name': 't', 'output': 'o', 'is_error': 'no'},
             {'type': 'tool_result', 'name': 't', 'output': None, 'is_error': False},
             {'type': 'tool_result', 'name': 't', 'tool_call_id': 3, 'output': '', 'is_error': False},
@@ -453,14 +516,116 @@ class StreamTest(unittest.TestCase):
                 self.assertEqual([d['type'] for d in parser.parse(line)], ['engine.output'])
                 self.assertFalse(parser.result_seen)
 
-    def test_an_input_that_is_present_but_not_an_object_is_not_carried(self):
-        for value in ([1, 2], 'text', 3, True):
+    def test_a_number_too_large_for_a_double_anywhere_makes_the_line_raw(self):
+        for spelling in ('1e999', '-1e999', '1' + '0' * 400 + '.0'):
             parser = HermesStreamParser(CONNECTION)
-            line = json.dumps({'type': 'tool_use', 'name': 't', 'tool_call_id': 'c', 'input': value}) + '\n'
-            with self.subTest(input=value):
-                call = of_type(parser.parse(line), 'tool.call')[0]
-                self.assertIsNone(call['input'])
-                self.assertEqual(call['input_digest'], digest_of('null'))
+            line = ('{"type": "result", "session_id": "s", "exit_code": 0, "text": "", "tokens": {"output": 1}, '
+                    f'"duration_ms": {spelling}}}\n')
+            with self.subTest(spelling=spelling[:8]):
+                self.assertEqual([d['type'] for d in parser.parse(line)], ['engine.output'])
+                self.assertFalse(parser.result_seen)
+
+    def test_a_lone_surrogate_anywhere_makes_the_line_raw_and_changes_no_state(self):
+        lone = 'x' + chr(0xD800)
+        records = [
+            {'type': 'text', 'text': lone},
+            {'type': 'tool_use', 'name': lone, 'input': {}},
+            {'type': 'tool_use', 'name': 't', 'input': {lone: 1}},
+            {'type': 'tool_use', 'name': 't', 'input': {'k': [lone]}},
+            {'type': 'tool_result', 'name': 't', 'output': lone, 'is_error': False},
+            {'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': lone, 'tokens': {'output': 1}},
+            {'type': 'system', 'subtype': 'init', 'model': lone, 'session_id': 's'},
+            {'type': 'system', 'subtype': 'init', 'model': 'm', 'session_id': lone},
+            {'type': 'text', 'text': 'x', 'extra': {'deep': [{'k': chr(0xDFFF)}]}},
+        ]
+        for record in records:
+            parser = HermesStreamParser(CONNECTION)
+            line = json.dumps(record) + '\n'   # the escape keeps the line itself ASCII
+            with self.subTest(record=record):
+                self.assertEqual(parser.parse(line), [{'type': 'engine.output', 'payload': {
+                    'stream': 'stdout', 'text': line, 'offset_start': 0, 'offset_end': len(line)}}])
+                self.assertFalse(parser.result_seen)
+                self.assertIsNone(parser.model)
+                self.assertIsNone(parser.engine_session_id)
+                self.assertEqual(parser.parse(json.dumps({'type': 'tool_use', 'name': 't', 'input': {}}) + '\n')[0]
+                                 ['payload']['call_id'], 'e9n-1', 'no call was opened or id minted by the raw line')
+                self.assertEqual(parser.parse(json.dumps({'type': 'tool_result', 'name': 't', 'output': '',
+                                                          'is_error': False}) + '\n')[0]['payload']['call_id'], 'e9n-1')
+
+    def test_a_valid_surrogate_pair_is_one_character_and_is_kept(self):
+        parser = HermesStreamParser(CONNECTION)
+        line = json.dumps({'type': 'text', 'text': chr(0x1F600)}) + '\n'   # written as a pair of escapes
+        self.assertIn('\\ud83d\\ude00', line)
+        self.assertEqual(parser.parse(line)[0]['payload']['text'], chr(0x1F600))
+
+    def test_an_input_is_carried_only_within_the_events_depth_budget_and_its_digest_kept_beyond(self):
+        for depth, carried in ((hermes.INPUT_CARRY_DEPTH, True), (hermes.INPUT_CARRY_DEPTH + 1, False), (64, False)):
+            value = 0
+            for _ in range(depth):
+                value = {'n': value}
+            parser = HermesStreamParser(CONNECTION)
+            with self.subTest(depth=depth):
+                call = of_type(parser.parse(json.dumps({'type': 'tool_use', 'name': 't', 'tool_call_id': 'c',
+                                                        'input': value}) + '\n'), 'tool.call')[0]
+                self.assertIs(call['input'] is not None, carried)
+                self.assertEqual(call['input_digest'], hermes.input_digest(value))
+        self.assertEqual(hermes.INPUT_CARRY_DEPTH, 62)
+        array = []
+        for _ in range(63):
+            array = [array]
+        call = of_type(HermesStreamParser(CONNECTION).parse(json.dumps(
+            {'type': 'tool_use', 'name': 't', 'tool_call_id': 'c', 'input': {'a': array}}) + '\n'), 'tool.call')[0]
+        self.assertIsNone(call['input'], 'arrays count as levels too')
+
+    def test_an_empty_object_at_the_bottom_adds_no_level_as_the_event_store_counts(self):
+        # The store refuses a value more than 64 levels into the event; the input is 2 levels in. An empty
+        # object 62 levels into the input sits at 64: stored. One level more is refused.
+        for wraps, carried in ((hermes.INPUT_CARRY_DEPTH, True), (hermes.INPUT_CARRY_DEPTH + 1, False)):
+            value = {}
+            for _ in range(wraps):
+                value = {'n': value}
+            call = of_type(HermesStreamParser(CONNECTION).parse(json.dumps(
+                {'type': 'tool_use', 'name': 't', 'tool_call_id': 'c', 'input': value}) + '\n'), 'tool.call')[0]
+            with self.subTest(wraps=wraps):
+                self.assertIs(call['input'] is not None, carried)
+                self.assertEqual(call['input_digest'], hermes.input_digest(value))
+
+    def test_the_carry_limit_counts_utf8_bytes_not_characters(self):
+        value = {'k': 'é' * 33000}   # 66 008 bytes of text, 33 008 characters
+        parser = HermesStreamParser(CONNECTION)
+        call = of_type(parser.parse(json.dumps({'type': 'tool_use', 'name': 't', 'tool_call_id': 'c', 'input': value})
+                                    + '\n'), 'tool.call')[0]
+        self.assertIsNone(call['input'])
+        self.assertEqual(call['input_digest'], hermes.input_digest(value))
+
+    def test_an_engine_id_in_this_parsers_hashed_namespace_cannot_collide_with_a_hashed_id(self):
+        long_id = 'x' * 129
+        hashed = 'e9h-' + digest_of(long_id)[:32]
+        parser = HermesStreamParser(CONNECTION)
+        use = lambda cid: json.dumps({'type': 'tool_use', 'name': 't', 'tool_call_id': cid, 'input': {}}) + '\n'  # noqa: E731
+        done = lambda cid: json.dumps({'type': 'tool_result', 'name': 't', 'tool_call_id': cid, 'output': cid[:3],  # noqa: E731
+                                       'is_error': False}) + '\n'
+        first = parser.parse(use(long_id))[0]['payload']['call_id']
+        second = parser.parse(use(hashed))[0]['payload']['call_id']
+        self.assertEqual(first, hashed)
+        self.assertNotEqual(first, second)
+        self.assertEqual(parser.parse(done(long_id))[0]['payload']['call_id'], first)
+        self.assertEqual(parser.parse(done(hashed))[0]['payload']['call_id'], second)
+
+    def test_a_tool_result_with_a_bad_name_or_an_empty_id_is_raw(self):
+        records = [{'name': name} for name in ('', 'x\ny', 'x\ry', 'n' * 257, 7)] + [{'name': 't', 'tool_call_id': ''}]
+        for extra in records:
+            parser = HermesStreamParser(CONNECTION)
+            line = json.dumps({'type': 'tool_result', 'output': '', 'is_error': False, **extra}) + '\n'
+            with self.subTest(record=extra):
+                self.assertEqual([d['type'] for d in parser.parse(line)], ['engine.output'])
+
+    def test_a_model_longer_than_256_characters_is_not_kept(self):
+        for model, kept in (('m' * 256, True), ('m' * 257, False)):
+            parser = HermesStreamParser(CONNECTION)
+            parser.parse(json.dumps({'type': 'system', 'subtype': 'init', 'model': model, 'session_id': ''}) + '\n')
+            with self.subTest(length=len(model)):
+                self.assertEqual(parser.model, model if kept else None)
 
     def test_a_count_is_known_only_when_it_is_a_positive_whole_number(self):
         for value, expected in ((5, known(5)), (0, UNKNOWN), (-1, UNKNOWN), (2.0, UNKNOWN), (True, UNKNOWN),
@@ -493,9 +658,9 @@ class StreamTest(unittest.TestCase):
         nested = {'v': 0}
         for _ in range(80):
             nested = {'v': nested}
-        call = of_type(parser.parse(json.dumps({'type': 'tool_use', 'name': 't', 'tool_call_id': 'd',
-                                                'input': nested}) + '\n'), 'tool.call')[0]
-        self.assertIsNone(call['input'], 'deeper than RFC 8785 text is made for here: not carried')
+        self.assertEqual([d['type'] for d in parser.parse(json.dumps({'type': 'tool_use', 'name': 't', 'tool_call_id': 'd',
+                                                                     'input': nested}) + '\n')], ['engine.output'],
+                         'deeper than RFC 8785 text is made for here: no digest, so the line stays raw')
         self.assertEqual(of_type(parser.parse(deep + '\n'), 'tool.call')[0]['input'], {'a': [[[[[[]]]]]]})
 
 

@@ -3,7 +3,7 @@
 The parser in `routes/engines/hermes.py` reads the JSONL stream of
 `hermes chat --query-file - --format stream-json`. The files here test it.
 
-- `streams/*.jsonl`: thirteen stdout streams. **Every one is synthetic**: written by hand
+- `streams/*.jsonl`: fourteen stdout streams. **Every one is synthetic**: written by hand
   (by `generate_streams.py`) in the shapes the pinned upstream emitter writes
   (`hermes_cli/stream_json.py` at NousResearch/hermes-agent
   `2f7e62bad99052055d1db9213b81eaab26174bc4`), not captured from a real Hermes. `cases.json`

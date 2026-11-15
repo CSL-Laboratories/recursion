@@ -29,14 +29,19 @@ THE MAPPING (what each line becomes):
 
     system/init   no draft; the model and the session id are kept
     text          engine.output (stdout): the delta's text, with the line's byte span
-    tool_use      tool.call: the engine's call id (or one of ours, below), the name, the input when it
-                  is an object, and the SHA-256 of the input under RFC 8785
+    tool_use      tool.call, only when the record carries an ``input`` object that has RFC 8785 text:
+                  the engine's call id (or one of ours, below), the name, the SHA-256 of that text,
+                  and the input itself when it is small and shallow enough to carry (else null, the
+                  digest still the input's). A call whose input is absent, not an object, or has no
+                  RFC 8785 text has no truthful digest: its line stays raw (an id-less one still
+                  counts as an open call of its name, below)
     tool_result   tool.result: status "error" when is_error, else "ok"; the output as text;
                   truncated when the output is longer than the 5000 characters the emitter keeps
     result        a usage draft (when any count is known), then a result draft (once)
     anything else engine.output (stdout) of the raw line, untrusted, so nothing read is lost: a line
-                  that is not one JSON object, holds NaN or Infinity or a key twice, has an unknown
-                  type, does not have its type's shape, or comes after the result
+                  that is not one JSON object, holds NaN, Infinity, a number too large for a double, a
+                  key twice, or a lone UTF-16 surrogate anywhere, has an unknown type, does not have
+                  its type's shape, or comes after the result
 
 NO LIMIT IS TYPED. The stream carries no typed limit field: the result record has an exit code and an
 error string only. On this path the exit code is 0 (completed), 1 (failed, unfinished, or the start
@@ -51,10 +56,14 @@ short fault at best, and that is the breaker's call, not the parser's.
 CALL IDS. driver.v2 pairs a tool.result with its tool.call by ``call_id`` (1 to 128 characters, no line
 break). Hermes names a call when the agent gave it an id. A valid engine id is used as it is. An engine
 id that is not a valid call id is replaced by ``e9h-`` and 32 hex digits of its SHA-256, so its result
-still pairs. A call with no id gets ``e9n-<n>`` from this parser's own counter, and a result with no id
-takes the oldest open id-less call of the same name only when it is the ONLY one open under that name;
-otherwise (none open, or several) the result gets an id of its own and pairs with nothing, because a
-guess would pair the wrong output with a call.
+still pairs. A call with no id gets ``e9n-<n>`` from this parser's own counter. A result with no id
+pairs with the open id-less call of its name only when that call is the ONLY one open under that name
+and no result of that name has arrived while several were open. Otherwise the result gets an id of its
+own and pairs with nothing, because a guess would pair the wrong output with a call: once a result
+arrives while several calls of a name are open, which call it ended is unknown, so every result of that
+name pairs with nothing until all the calls open then, and any started meanwhile, have ended. Then
+pairing starts afresh. An id-less call whose line stayed raw is counted as open too, so that its result
+is never paired with another call.
 
 OFFSETS. ``parse`` takes each line exactly as it was read, newline included; ``offset_start`` and
 ``offset_end`` are byte offsets (UTF-8) into that stream, the end exclusive. stdout and stderr are
@@ -70,6 +79,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 
 from recursion_core.routes.contract import ENGINE_ERROR, ENGINE_EXITED
@@ -102,11 +112,17 @@ DECLARATION = {
 
 TOOL_OUTPUT_CAP = 5000            # characters the pinned emitter keeps of a tool's output
 INPUT_CARRY_LIMIT = 65536         # bytes of RFC 8785 text above which a tool's input is not carried
+# The deepest level inside a tool's input at which it is still carried. The event store refuses a value
+# sitting more than 64 levels deep in an event (lane EVENTS' events/db.py, MAX_DEPTH and _check_value, at
+# #373), and the input sits 2 levels down (the event, its payload). The digest of a deeper input is still
+# taken, up to RFC 8785's own depth.
+INPUT_CARRY_DEPTH = 62
 ENGINE_SESSION_ID_LIMIT = 256     # driver.v2 handle.engine_session_id
 _CALL_ID = re.compile(r'[^\r\n]{1,128}')
 _NAME = re.compile(r'[^\r\n]{1,256}')
 _MODEL = re.compile(r'[^\r\n]{1,256}')
 _CONNECTION = re.compile(r'(subscription|api_key|passthrough):[^\r\n]+')
+_SURROGATE = re.compile('[%s-%s]' % (chr(0xD800), chr(0xDFFF)))   # a lone surrogate after JSON decoding
 _TOKEN_KEYS = (('input_tokens', 'input'), ('output_tokens', 'output'),
                ('cache_read_tokens', 'cache_read'), ('cache_write_tokens', 'cache_write'))
 _EXIT_MEANING = {
@@ -135,10 +151,6 @@ def one_shot_argv(binary: str | None = None) -> list[str]:
     return [executable, *ONE_SHOT_ARGS]
 
 
-def _reject_constant(name: str):
-    raise ValueError(f'{name} is not JSON')
-
-
 def _no_duplicate_keys(pairs: list) -> dict:
     out = {}
     for key, value in pairs:
@@ -149,12 +161,52 @@ def _no_duplicate_keys(pairs: list) -> dict:
 
 
 def _load_object(text: str):
-    """One JSON object, strictly: no NaN or Infinity, no key twice. None when the text is not that."""
+    """One JSON object, strictly: no NaN or Infinity, no number too large for a double, no key twice,
+    and no lone surrogate in any string or key. None when the text is not that."""
     try:
-        value = json.loads(text, parse_constant=_reject_constant, object_pairs_hook=_no_duplicate_keys)
+        value = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except (ValueError, RecursionError):
         return None
-    return value if isinstance(value, dict) else None
+    return value if isinstance(value, dict) and _scalar_values_are_sound(value) else None
+
+
+def _scalar_values_are_sound(value) -> bool:
+    """Every string and key a sequence of Unicode scalar values (``json`` decodes an escaped lone
+    surrogate into one, which no UTF-8 store can hold), and every float finite (``json`` decodes
+    ``NaN``, ``Infinity`` and an overflowing ``1e999`` into floats that are not). Walked without
+    recursion."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if _SURROGATE.search(item):
+                return False
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                return False
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                if _SURROGATE.search(key):
+                    return False
+                stack.append(child)
+        elif isinstance(item, list):
+            stack.extend(item)
+    return True
+
+
+def _depth(value) -> int:
+    """The deepest level any value inside ``value`` sits at, ``value`` itself at 0, as the event store
+    counts it (each member one level below its object or array; an empty one adds nothing). Walked
+    without recursion."""
+    deepest, stack = 0, [(value, 0)]
+    while stack:
+        item, level = stack.pop()
+        deepest = max(deepest, level)
+        if isinstance(item, dict):
+            stack.extend((child, level + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, level + 1) for child in item)
+    return deepest
 
 
 def _count(value) -> dict:
@@ -186,12 +238,15 @@ class HermesStreamParser:
         self.engine_session_id: str | None = None
         self.exit_code: int | None = None     # the result record's, once it has been read
         self.raw_lines = 0                    # lines given back as raw engine.output
-        self.uncarried_inputs = 0             # tool inputs not carried (too large, or no RFC 8785 text)
+        self.uncarried_inputs = 0             # typed calls whose input was too large or too deep to carry
         self._offsets = {'stdout': 0, 'stderr': 0}
         self._init_seen = False
         self._result_seen = False
         self._minted = 0
-        self._open_unnamed: dict[str, list[str]] = {}   # tool name -> our ids of open calls with no engine id
+        # tool name -> the open calls with no engine id: our id, or None for a call whose line stayed raw
+        self._open_unnamed: dict[str, list[str | None]] = {}
+        # names whose open id-less calls can no longer be told apart (a result came while several were open)
+        self._ambiguous: set[str] = set()
 
     # -- the calls ----------------------------------------------------------------------------------
     def parse(self, line: str) -> list[dict]:
@@ -264,29 +319,32 @@ class HermesStreamParser:
         engine_id = record.get('tool_call_id')
         if engine_id is not None and not (isinstance(engine_id, str) and engine_id):
             return None
-        if engine_id is None:
-            call_id = self._mint()
-            self._open_unnamed.setdefault(name, []).append(call_id)
-        else:
-            call_id = _call_id(engine_id)
+        text = None
         tool_input = record.get('input')
-        carried, digest = None, None
         if isinstance(tool_input, dict):
             canonical_text, no_text = _canonical()
             try:
                 text = canonical_text(tool_input)
             except (no_text, RecursionError):
                 text = None
-            if text is not None:
-                digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
-                if len(text.encode('utf-8')) <= INPUT_CARRY_LIMIT:
-                    carried = tool_input
-            if carried is None:
-                self.uncarried_inputs += 1
-        if digest is None:
-            digest = input_digest(None)   # what is carried: no input
+        if text is None:
+            # No truthful digest: the input is absent, not an object, or has no RFC 8785 text. The line
+            # stays raw. An id-less call is still open under its name, so its result is never paired with
+            # another call of that name.
+            if engine_id is None:
+                self._open_unnamed.setdefault(name, []).append(None)
+            return None
+        data = text.encode('utf-8')
+        carried = tool_input if len(data) <= INPUT_CARRY_LIMIT and _depth(tool_input) <= INPUT_CARRY_DEPTH else None
+        if carried is None:
+            self.uncarried_inputs += 1
+        if engine_id is None:
+            call_id = self._mint()
+            self._open_unnamed.setdefault(name, []).append(call_id)
+        else:
+            call_id = _call_id(engine_id)
         return [{'type': 'tool.call', 'payload': {
-            'call_id': call_id, 'name': name, 'input_digest': digest, 'input': carried}}]
+            'call_id': call_id, 'name': name, 'input_digest': hashlib.sha256(data).hexdigest(), 'input': carried}}]
 
     def _tool_result(self, record: dict):
         name, output, is_error = record.get('name'), record.get('output'), record.get('is_error')
@@ -299,8 +357,7 @@ class HermesStreamParser:
         if engine_id is not None:
             call_id = _call_id(engine_id)
         else:
-            open_calls = self._open_unnamed.get(name, [])
-            call_id = open_calls.pop(0) if len(open_calls) == 1 else self._mint()
+            call_id = self._end_unnamed(name)
         return [{'type': 'tool.result', 'payload': {
             'call_id': call_id, 'status': 'error' if is_error else 'ok', 'text': output,
             'output_ref': None, 'truncated': len(output) > TOOL_OUTPUT_CAP}}]
@@ -358,6 +415,24 @@ class HermesStreamParser:
     def _mint(self) -> str:
         self._minted += 1
         return f'e9n-{self._minted}'
+
+    def _end_unnamed(self, name: str) -> str:
+        """The call id for an id-less result of ``name``: its call's, only when that call is beyond doubt."""
+        open_calls = self._open_unnamed.get(name, [])
+        if len(open_calls) == 1 and name not in self._ambiguous:
+            ended = open_calls.pop()
+            call_id = ended if ended is not None else self._mint()   # a raw call has no tool.call to pair
+        elif open_calls:
+            # Several open (or a group already in doubt): one of them ended, which one is unknown.
+            self._ambiguous.add(name)
+            open_calls.pop()
+            call_id = self._mint()
+        else:
+            call_id = self._mint()
+        if not open_calls:
+            self._open_unnamed.pop(name, None)
+            self._ambiguous.discard(name)
+        return call_id
 
 
 def _call_id(engine_id: str) -> str:

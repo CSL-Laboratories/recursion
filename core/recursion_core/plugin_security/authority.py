@@ -238,9 +238,13 @@ class Authority:
         raises, or anything raises before ``COMMIT``, the transaction rolls back and nothing is
         written. Its exit runs after ``COMMIT`` or ``ROLLBACK``: if it raises after a ``COMMIT``,
         the charge stands and the error reaches the caller, and a retry with the same idempotency
-        key is refused ``effect_replayed``, never charged twice. The core passes its commit
-        section with the halt recheck (R4-1), whose exit only releases the fence; so signature
-        verification never runs under it and a halt never waits for one.
+        key is refused ``effect_replayed``, never charged twice. If its exit raises on the way out
+        of a refusal or an error, its error reaches the caller in their place, with the refusal or
+        error as its context, and nothing is written. If its exit swallows a refusal or an error,
+        ``charge`` raises it all the same: a guard can refuse a charge, never turn a refusal into a
+        success. The core passes its commit section with the halt recheck (R4-1), whose exit only
+        releases the fence; so signature verification never runs under it and a halt never waits
+        for one.
         """
         profile, digest = self._check_profile(envelope)
         now = self._clock()
@@ -266,6 +270,7 @@ class Authority:
             raise Refused("budget_max_effect_exceeded")
         if type(idempotency_key) is not str or not _ID.fullmatch(idempotency_key):
             raise Refused("idempotency_key_invalid")
+        failure: BaseException | None = None
         with self._lock, contextlib.ExitStack() as guarded:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -287,9 +292,12 @@ class Authority:
                 self._db.execute("INSERT INTO charges VALUES (?, ?, ?)",
                                  (idempotency_key, profile["profile_id"], amount_minor))
                 self._db.execute("COMMIT")
-            except BaseException:
+            except BaseException as error:
+                failure = error
                 self._db.execute("ROLLBACK")
                 raise
+        if failure is not None:  # only a guard whose exit swallowed it gets here: nothing was written
+            raise failure
         return {"profile_id": profile["profile_id"], "spent_minor": spent + amount_minor,
                 "remaining_minor": profile["budgets"]["total_minor"] - spent - amount_minor}
 

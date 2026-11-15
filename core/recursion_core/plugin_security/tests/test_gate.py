@@ -1009,6 +1009,51 @@ class CommitFenceTests(unittest.TestCase):
         self.assertEqual(_charges(w), 0)
         self.assertEqual(w.authority.charge(env, **_charge_args(w, "after"))["spent_minor"], 1_000)
 
+    def test_a_guard_whose_exit_swallows_a_refusal_cannot_make_it_a_charge(self) -> None:
+        # Review 2 of #378 (DeepSeek F1): a guard whose exit returns true swallowed the refusal the ledger
+        # raised again after its rollback, and charge returned a success for a charge it never wrote.
+        # The refusal or error stands, whatever the guard's exit returns.
+        cases = (("budget_total_exceeded", Refused), ("effect_replayed", Refused),
+                 ("sql_error", sqlite3.OperationalError), ("base_exception", _Interrupt))
+        for case, raised in cases:
+            with self.subTest(case=case):
+                w = World(self)
+                w.load()
+                env = profile(w.installer, total=1_000, max_effect=1_000)
+                real = w.authority._db
+                if case == "budget_total_exceeded":
+                    w.authority.charge(env, **_charge_args(w, "first"))  # spends the whole budget
+                elif case == "effect_replayed":
+                    w.authority.charge(env, **_charge_args(w, case))  # the same key, charged once already
+                else:
+                    error = sqlite3.OperationalError("injected") if case == "sql_error" else _Interrupt()
+                    w.authority._db = _FailingInsert(real, error)
+                guard = _SwallowingGuard()
+                try:
+                    with self.assertRaises(raised) as caught:
+                        w.authority.charge(env, **_charge_args(w, case), commit_guard=guard)
+                finally:
+                    w.authority._db = real
+                if raised is Refused:
+                    self.assertEqual(caught.exception.code, case)
+                self.assertIs(guard.swallowed, raised, "the guard's exit did not see the refusal")
+                self.assertFalse(real.in_transaction)
+                self.assertEqual(_charges(w), 1 if raised is Refused else 0)
+
+    def test_a_guard_whose_exit_raises_on_a_refusal_reports_its_error_with_the_refusal_as_context(self) -> None:
+        # Review 2 of #378 (DeepSeek, section 6): the guard's error takes the refusal's place, with the
+        # refusal as its context, and nothing is written. Either way the call is not authorized.
+        w = World(self)
+        w.load()
+        env = profile(w.installer, total=1_000, max_effect=1_000)
+        w.authority.charge(env, **_charge_args(w, "first"))
+        with self.assertRaises(_Interrupt) as caught:
+            w.authority.charge(env, **_charge_args(w, "second"), commit_guard=_RaisingOnRefusalGuard())
+        self.assertIsInstance(caught.exception.__context__, Refused)
+        self.assertEqual(caught.exception.__context__.code, "budget_total_exceeded")
+        self.assertFalse(w.authority._db.in_transaction)
+        self.assertEqual(_charges(w), 1)
+
 
 class _Interrupt(BaseException):
     """A BaseException that is not KeyboardInterrupt, so no runner treats it as a real interrupt."""
@@ -1051,6 +1096,29 @@ class _RaisingExitGuard:
 
     def __exit__(self, exc_type, *exc) -> None:
         if exc_type is None:
+            raise _Interrupt()
+
+
+class _SwallowingGuard:
+    """A commit guard whose exit swallows whatever left the ledger's transaction, and records its type."""
+
+    def __init__(self) -> None:
+        self.swallowed = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc) -> bool:
+        self.swallowed = exc_type
+        return True
+
+
+class _RaisingOnRefusalGuard:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc) -> None:
+        if exc_type is not None:
             raise _Interrupt()
 
 
@@ -1180,6 +1248,68 @@ class CommitFencePrimitiveTests(unittest.TestCase):
         fence.mark_trip_change("conn-a")
         self.assertTrue(fence.trip_changed_since("conn-a", started))
         self.assertFalse(fence.trip_changed_since("conn-a", fence.position()))
+
+    def test_marks_from_many_threads_are_each_counted(self) -> None:
+        # Review 2 of #378 (DeepSeek F2, Astra's N17): without the marks lock a free-threaded build loses
+        # increments, and a lost mark is a trip that trip_changed_since does not see.
+        fence = CommitFence()
+        threads, marks = 8, 4_000
+        start = threading.Barrier(threads)
+        unseen: list[str] = []
+
+        def mark(connection: str) -> None:
+            start.wait(10.0)
+            for _ in range(marks):
+                before = fence.position()
+                fence.mark_trip_change(connection)
+                if not fence.trip_changed_since(connection, before):
+                    unseen.append(connection)
+
+        workers = [threading.Thread(target=mark, args=("conn-%d" % n,), daemon=True) for n in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(60.0)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(fence.position(), threads * marks)
+        self.assertEqual(unseen, [])
+
+    def test_a_thread_waiting_to_enter_does_not_take_the_holders_place(self) -> None:
+        # Review 2 of #378 (DeepSeek F3): the holder's slot is set only once the fence is taken. Set
+        # before, a thread blocked on entry would own the slot, and the holder's own drain would wait
+        # for itself for ever. Daemon threads, so a hang fails this test and does not hold the runner.
+        fence = CommitFence()
+        counting = _CountingLock(fence._lock)
+        fence._lock = counting
+        seen: list[str] = []
+        holding, entered = threading.Event(), threading.Event()
+
+        def holder() -> None:
+            with fence:
+                holding.set()
+                if not counting.attempt(2).wait(10.0):  # the second attempt: the blocker waits for the fence
+                    seen.append("no blocker")
+                    return
+                try:
+                    fence.drain()
+                    seen.append("drained")
+                except RuntimeError:
+                    seen.append("refused")
+
+        def blocker() -> None:
+            with fence:
+                entered.set()
+
+        first = threading.Thread(target=holder, daemon=True)
+        first.start()
+        self.assertTrue(holding.wait(10.0))
+        second = threading.Thread(target=blocker, daemon=True)
+        second.start()
+        first.join(10.0)
+        self.assertFalse(first.is_alive(), "the holder's own drain waited for itself")
+        self.assertEqual(seen, ["refused"])
+        second.join(10.0)
+        self.assertTrue(entered.is_set(), "the waiting thread never entered once the holder left")
 
     def test_is_vetoed_reads_under_the_gates_lock(self) -> None:
         gate = ApprovalGate(lambda *drawn: None, authenticate, Clock())

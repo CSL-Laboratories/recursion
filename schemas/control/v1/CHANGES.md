@@ -20,12 +20,24 @@ Nothing is frozen yet.
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |
 | `event.v1.json` | 1.0-draft.7 |
-| `approval.v1.json` | 1.0-draft.8 |
+| `approval.v1.json` | 1.0-draft.9 |
 | `driver.v2.json` | 1.0-draft.4 |
 | `mcp.task.v1.json` | 1.0-draft.6 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## After two reads of the fifth read's answer (Nov 14, 2026)
+
+`approval` draft 9; every other schema keeps its draft. Both reads of `5aface43` found the four fifth-read
+corrections in place and required one more, the same in both: a fresh `approval.open` or
+`approval.answer` read a restored record's members before anything checked them. No schema changes
+shape, and the method table gains no code.
+
+| What changed | What it breaks |
+|---|---|
+| After a kept receipt is replayed and before either fresh operation reads the retained record, its published shape is validated. A restored record that is not the shape of an approval is refused `record_invalid` (the core's own refusal, `Refused` in `conformance/rules.py`, not an answer of either method), keeps no receipt and changes neither record, binding nor receipts. A replay of a kept receipt stays historical and is answered as before | A core that answered `ok` to a fresh answer on a restored record without its effect or its lines, approved it and kept the receipt, or raised its host's own error on one without its state |
+| `conformance/tests.py`: two tests, both reads' own regressions among them | |
 
 ## After two reads of the fourth read's answer (Nov 14, 2026)
 

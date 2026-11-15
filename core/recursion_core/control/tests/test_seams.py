@@ -55,6 +55,7 @@ import importlib
 import importlib.util
 import inspect
 import io
+import itertools
 import json
 import logging
 import os
@@ -1578,6 +1579,15 @@ class EngineTableTest(unittest.TestCase):
         with self.assertRaises(engines.EngineTableError):
             table.register('hermes', 'not a function')
 
+    def test_the_table_says_which_engines_a_lane_registered(self) -> None:
+        table, factory = engines.EngineTable(), lambda *a, **k: None
+        self.assertEqual(table.registered(), (), 'a new table: its two factories are nobody\'s registration')
+        table.register('pi', factory)
+        self.assertEqual(table.registered(), ('pi',))
+        table.register('codex', CodexAdapter, replace=True)
+        self.assertEqual(table.registered(), ('codex', 'pi'), 'a seeded factory replaced, by itself even, is a registration')
+        self.assertEqual(engines.EngineTable().registered(), (), 'and another table knows nothing of it')
+
     def test_two_compositions_do_not_share_a_table(self) -> None:
         one, two = H.bare(), H.bare()
         self.assertIsNot(one.engines, two.engines)
@@ -1757,35 +1767,95 @@ class AdmissionTest(unittest.TestCase):
             register(made)
             made.freeze()
             self.assertTrue(made.gate.enabled)
-        made = H.Hooks()
-        made.set('authorize', lambda principal, method, params: None)
-        made.freeze()
-        self.assertFalse(made.gate.enabled, 'a hook that holds no resource does not need the gate')
 
-    def test_a_hook_asked_on_a_runs_own_thread_turns_the_gate_on_by_itself_and_the_other_single_hooks_do_not(self) -> None:
-        """A drive owner, a launch check, a working directory or a credential source with nothing beside it: it
-        is asked on a run's own thread under a lifetime reference, which counts only where the gate is on. The
-        three single hooks that are asked inside a client's call leave the gate off when they are registered
-        alone. That is the gate's text, held here so that a change of it is a decision and not an accident."""
-        self.assertEqual(sorted(H.ON_A_RUNS_THREAD), ['credentials', 'drive_owner', 'launch_check', 'working_directory'])
-        for name in H.ON_A_RUNS_THREAD:
-            with self.subTest(hook=name):
-                made = H.Hooks()
-                made.set(name, lambda *args: None)
+    # Every way there is to register something into the hooks, each as a lane would do it and nothing else.
+    REGISTRATIONS = {
+        **{f'the single hook {name}': (lambda made, name=name: made.set(name, lambda *args: None)) for name in H.SINGLE},
+        'a start registrant': lambda made: made.start_registrant('routing', (), (), lambda principal, request: {}),
+        'a service': lambda made: made.service(Service('events')),
+        'the change marker': lambda made: made.enable_changes(),
+        'a method handler': lambda made: made.methods.register('session.list', lambda ctx, params: {'code': 'ok'}),
+        'a command family': lambda made: made.commands.register(('x',), lambda sub: None, lambda args, client: 0),
+        'an engine factory': lambda made: made.engines.register('pi', lambda *a, **k: None),
+        'a seeded engine factory, replaced': lambda made: made.engines.register('codex', lambda *a, **k: None, replace=True),
+        'a seeded engine factory, replaced by itself': lambda made: made.engines.register('claude_code', ClaudeCodeAdapter, replace=True),
+    }
+
+    def test_the_gate_is_on_when_anything_at_all_is_registered_and_off_only_for_the_bare_composition(self) -> None:
+        """ONE RULE, with no exemption (``Hooks.anything_registered``). Three rounds of reads each found another
+        set of hooks that left the gate off. This holds the rule for every way of registering there is, each
+        alone and each pair: with any of them the gate is on, admits a call, and once closing has begun admits
+        none and does no work that was to be done while it is open. With nothing registered it is off, and a
+        call is admitted and the work is done after closing has begun, as before the seams.
+
+        The list of ways is held against the code, so that one which is added later and forgotten here fails
+        this test: every name of ``SINGLE``; every method of ``Hooks`` that registers (each asks whether the
+        hooks are frozen); every table the hooks carry; and in each table every method that refuses once the
+        table is closed, which is one, ``register``."""
+        kinds = self.REGISTRATIONS
+        self.assertEqual(len(kinds), 16)
+        self.assertEqual([name for name in H.SINGLE if f'the single hook {name}' not in kinds], [])
+        registering = sorted(name for name, function in vars(H.Hooks).items()
+                             if inspect.isfunction(function) and 'self._open(' in inspect.getsource(function) and name != '_open')
+        self.assertEqual(registering, ['enable_changes', 'service', 'set', 'start_registrant'], 'the methods of Hooks that register')
+        looked_at = H.Hooks()
+        looked_at.engines                 # the engine table is made on first use
+        tables = {name: value for name, value in vars(looked_at).items() if callable(getattr(value, 'register', None))}
+        self.assertEqual(sorted(tables), ['_engines', 'commands', 'methods'], 'the tables a lane registers into')
+        for name, table in tables.items():
+            refusing = sorted(method for method, function in vars(type(table)).items()
+                              if inspect.isfunction(function) and 'if self._frozen' in inspect.getsource(function))
+            self.assertEqual(refusing, ['register'], f'{name}: the methods that refuse once the table is closed')
+        self.assertEqual((looked_at.methods.registered(), looked_at.commands.names(), looked_at.engines.registered()), ((), (), ()))
+        for made, what in ((H.Hooks(), 'nothing registered'), (looked_at, 'tables that were only looked at')):
+            done = []
+            made.freeze()
+            self.assertEqual((made.anything_registered(), made.gate.enabled), (False, False), what)
+            made.begin_close()
+            self.assertEqual((made.gate.enter(), made.gate.while_open(lambda: done.append(1)), done), (True, True, [1]),
+                             f'{what}: a call is admitted and the work is done, as before the seams')
+        for names in itertools.chain(itertools.combinations(kinds, 1), itertools.combinations(kinds, 2)):
+            with self.subTest(registered=names):
+                made, done = H.Hooks(), []
+                for name in names:
+                    kinds[name](made)
                 made.freeze()
-                self.assertTrue(made.gate.enabled)
+                self.assertEqual((made.anything_registered(), made.gate.enabled), (True, True))
                 self.assertTrue(made.gate.enter())
                 made.gate.leave()
                 made.begin_close()
-                self.assertFalse(made.gate.enter(), 'once closing has begun nothing is admitted, with that hook alone')
-        others = [name for name in H.SINGLE if name not in H.ON_A_RUNS_THREAD and name != 'event_store']
-        self.assertEqual(others, ['authorize', 'read_result', 'page_methods'], 'every single hook is on one side or the other of this test')
-        for name in others:
-            with self.subTest(hook=name):
-                made = H.Hooks()
-                made.set(name, lambda *args: None)
-                made.freeze()
-                self.assertFalse(made.gate.enabled)
+                self.assertEqual((made.gate.enter(), made.gate.while_open(lambda: done.append(1)), done), (False, False, []),
+                                 'once closing has begun nothing is admitted and nothing is done while_open')
+
+    @quiet
+    def test_an_interrupted_rollback_changes_the_admitted_count_once(self) -> None:
+        """Asked for by both round-4 reads of the scopes lane's draft (#385), which stands on these files. A call
+        is admitted and then interrupted, so ``enter`` steps back out of the count. Stepping back is interrupted
+        too, inside ``notify_all``, and the region goes round again. The count it steps back from is the one it
+        read the first time round (``back``), so the second time takes nothing more away: 0, and not -1."""
+        gate = H.Admission()
+        gate.enabled = True
+        first, second = KeyboardInterrupt('while taking the gate'), KeyboardInterrupt('while waking the drain')
+        take, notify, counts = H.take_once, gate._changed.notify_all, []
+
+        def interrupted_take(lock, errors):
+            take(lock, errors)
+            errors.append(first)
+
+        def interrupted_notify():
+            counts.append(gate._admitted)
+            if len(counts) == 1:
+                raise second
+            notify()
+        with mock.patch.object(H, 'take_once', interrupted_take), mock.patch.object(gate._changed, 'notify_all', interrupted_notify):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                gate.enter()
+        self.assertIs(caught.exception, first)
+        self.assertEqual(counts, [0, 0], 'going round again takes no second admission away')
+        self.assertEqual((gate.admitted, gate._lock._is_owned()), (0, False))
+        self.assertTrue(gate.enter(), 'and the gate still admits')
+        gate.leave()
+        self.assertEqual(gate.admitted, 0)
 
     def test_while_open_does_its_work_with_the_gate_held_open_and_a_close_that_begins_then_waits_for_it(self) -> None:
         """To ask whether the gate is closed and then to act is two steps, and a close can begin between them.

@@ -478,9 +478,9 @@ class RouteStarter:
                 self.results[run_id] = result
 
     def _composition_closing(self):
-        """The composition is closing with something registered into it that the gate guards (the gate is on and
-        shut): a handler, a service, an event store, or a drive owner, alone or not. With nothing registered
-        this is never true, so everything that asks it is then what it was before the seams."""
+        """The composition is closing and something was registered into it (the gate is on and shut): anything
+        at all, alone or not (``Hooks.anything_registered``). With nothing registered this is never true, so
+        everything that asks it is then what it was before the seams."""
         gate = self._hooks.gate if self._hooks is not None else None
         return gate is not None and gate.enabled and gate.closed
 

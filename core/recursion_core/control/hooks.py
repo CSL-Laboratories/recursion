@@ -197,10 +197,6 @@ REGISTRANTS = (
 
 SINGLE = ('authorize', 'working_directory', 'credentials', 'read_result', 'drive_owner', 'launch_check',
           'page_methods', 'event_store')
-# The single hooks that are asked on a run's own thread (S4, S7, S9, S10). The start that made the thread may have
-# answered already, so each is asked under a lifetime reference of its own (S13), and any one of them, registered,
-# turns the gate on: without the gate that reference counts nothing.
-ON_A_RUNS_THREAD = ('working_directory', 'credentials', 'drive_owner', 'launch_check')
 # The launch snapshot: the keys of the stored ``launch`` object, and the ones a start registrant may set.
 # ``owner`` is not among them: the server derives it from the principal.
 LAUNCH_KEYS = ('route_entry', 'route_decision', 'workspace', 'containment_level', 'session_id', 'turn_id',
@@ -558,19 +554,21 @@ class Admission:
     their resources alive. A timeout is never taken as permission to tear them down. Neither is an
     interruption of the wait: it is kept, the wait goes on, and it is raised once every call has left.
 
-    The gate does nothing until it is ``enabled``, which composition does when a lane has registered a
-    handler, a service, an event store, or one of the four hooks that are asked on a run's own thread
-    (``ON_A_RUNS_THREAD``): a drive owner, a launch check, a working directory or a credential source. With
-    none of these registered a call is never refused and closing waits for nothing, as today.
+    ONE RULE says when the gate is on. It does nothing until it is ``enabled``, and composition enables it
+    when ANYTHING AT ALL was registered (``Hooks.anything_registered``): a single hook, a start registrant,
+    a service, the change marker, a method handler, a command family or an engine factory. It is off only
+    for the bare composition, where a call is never refused and closing waits for nothing, as today. No
+    registration is exempt, and none has to be argued about: not one whose code is asked on a client's
+    thread and not on a run's own, and not one that brings no code into the daemon at all (a command
+    family is the CLI's; the change marker is this module's own).
 
-    Each of those four turns it on by itself, with no service beside it: it is asked under a lifetime
-    reference (S13), and what S13 and S9 say of closing holds for every one that is registered. Closing
-    waits for the hook and for a hand-over, a run or a launch is refused once closing has begun, a credential
-    source is not asked after it, and a settling fences nothing once the gate is shut (its fence is made
-    with the gate held open, ``while_open``: a close that is asked for while a fence is being made waits
-    for it). Without the gate the reference would count nothing and none of that would hold. The other three
-    single hooks (``authorize``, ``read_result``, ``page_methods``) are asked inside a client's call and
-    bring nothing that closing has to wait for: registered with nothing else they leave the gate off.
+    So with any one thing registered, and nothing beside it, what S13 and S9 say of closing holds: closing
+    waits for a call that is inside (a handler, an authorizer, a result reader, a start registrant, the
+    page's provider) and for a hook on a run's own thread (S13) and a hand-over (S9); a call, a run or a
+    launch is refused once closing has begun, and the hook is not asked after it; and a settling fences
+    nothing once the gate is shut (its fence is made with the gate held open, ``while_open``: a close that
+    is asked for while a fence is being made waits for it). Without the gate a reference would count
+    nothing and none of that would hold.
     """
 
     def __init__(self) -> None:
@@ -900,11 +898,20 @@ class Hooks:
         if self._engines is not None:
             self._engines.freeze()
         self.methods.service_ready = self.service_ready
-        # The gate guards what a lane brought: a handler, a service, a store, or a hook that is asked on a run's
-        # own thread, which closing waits for whether or not its lane registered a service. With none of them it
-        # stays off.
-        self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single
-                                 or any(name in self._single for name in ON_A_RUNS_THREAD))
+        # ONE RULE: the gate is on when anything at all was registered into this composition, and off only for the
+        # bare one (``Admission``). No registration is exempt.
+        self.gate.enabled = self.anything_registered()
+
+    def anything_registered(self) -> bool:
+        """Whether anything at all was registered into these hooks, by any of the ways there are: a single hook
+        (``set``), a start registrant, a service, the change marker, a method handler, a command family, or an
+        engine factory (one added, or a seeded one replaced). False only for the bare composition. Each table
+        is asked what was registered into it. The engine table is made on first use: one that nobody asked for
+        has nothing registered in it, and it is not made here."""
+        engines = self._engines
+        return bool(self._single or self._start or self._services or self.changes is not None
+                    or self.methods.registered() or self.commands.names()
+                    or (engines is not None and engines.registered()))
 
     # -- S5 ---------------------------------------------------------------------------------------
     def authorize(self, principal: Principal, method, params) -> dict | None:

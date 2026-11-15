@@ -654,9 +654,11 @@ class EngineSeamTest(Composed):
 
     def test_a_credential_source_registered_alone_is_waited_for_and_is_not_asked_once_closing_has_begun(self):
         """The fifth reads. The same with ``credentials`` as the only hook a lane registered: no store, no
-        service, no handler. The gate is on all the same (``ON_A_RUNS_THREAD``): the composition's close waits
-        for the source while it is inside, and after it the lookup refuses the launch before the source is
-        asked. (With the gate off the close went past the source, and the source was asked again afterwards.)"""
+        service, no handler. The gate is on all the same (``Admission`` in ``control/hooks.py``): the
+        composition's close waits for the source while it is inside, and after it the lookup refuses the launch
+        before the source is asked. (With the gate off the close went past the source, and the source was asked
+        again afterwards.) The engine factory that is replaced here only hands the test the lookup. It is a
+        registration too: that the source by itself turns the gate on is held in the control-side file."""
         built, ended = [], mock.Mock(closed=False)  # no store here: this says the close has ended, as a store's flag does
         source, entered, leave, seen = held_hook(ended, 'the-secret')
         self.addCleanup(leave.set)
@@ -669,7 +671,7 @@ class EngineSeamTest(Composed):
             made.engines.register('claude_code', factory, replace=True)    # only so that the test gets the lookup
             made.set('credentials', source)
         made = hooks_of(register)
-        self.assertEqual((sorted(made._single), made.gate.enabled), (['credentials'], True), 'the source alone: the gate is on')
+        self.assertEqual((sorted(made._single), made.gate.enabled), (['credentials'], True), 'the source is the only hook: the gate is on')
         daemon, composed = self.boot(made)
         lookup, = built
         got = []
@@ -1738,7 +1740,7 @@ class RunThreadLifetimeTest(unittest.TestCase):
 
     def test_a_launch_hook_registered_alone_is_waited_for_and_its_launch_then_starts_nothing(self):
         """The fifth reads. A lane can register ``launch_check`` or ``working_directory`` and nothing else: no
-        service, no handler, no store, no owner. The gate is on all the same (``ON_A_RUNS_THREAD``), so what S13
+        service, no handler, no store, no owner. The gate is on all the same (``Admission``), so what S13
         says holds for that hook too: a close waits for a launch that is inside it, and that launch, when the
         hook returns, prepares and starts nothing. (With the gate off the close went past it, the daemon closed
         its registry under the hook, and the launch went on into a closed daemon.)"""
@@ -1796,6 +1798,81 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 self.assertEqual(asked, ['launch_check'] if hook == 'launch_check' else ['launch_check', 'working_directory'])
                 manager.prepare.assert_not_called()
                 self.assertFalse((state / 'runs').exists(), 'nothing of the unit was made')
+
+
+class ClientSideHookAloneTest(Composed):
+    """The sixth reads. S13 for what a lane registers that is asked inside a client's call: the authorizer, the
+    result reader and the page's list of methods, registered with nothing else, alone or with one another; and a
+    lane's part of a start (S6), which no read had named and which stood the same way. The gate was off for them,
+    so a close went past a call that was inside one, and the daemon closed its registry under it; and the page's
+    provider was asked again after the close. The gate is on now whenever anything at all is registered
+    (``Hooks.anything_registered``; every way of registering, alone and in pairs, is held in the control-side
+    file)."""
+
+    def test_a_close_waits_for_a_client_side_hook_that_is_inside_with_nothing_else_registered(self):
+        for names in (('authorize',), ('read_result',), ('page_methods',), ('authorize', 'read_result'),
+                      ('authorize', 'page_methods'), ('read_result', 'page_methods')):
+            with self.subTest(registered=names):
+                target = 'page_methods' if 'page_methods' in names else names[0]
+                ended = mock.Mock(closed=False)     # no store here: this says the close has ended, as a store's flag does
+                held, entered, leave, seen = held_hook(ended, frozenset({'route.list'}) if target == 'page_methods' else None)
+                self.addCleanup(leave.set)
+                made = hooks_of(**{name: held if name == target else (lambda *args: None) for name in names})
+                self.assertEqual((sorted(made._single), made.gate.enabled), (sorted(names), True))
+                daemon, composed = self.boot(made)
+                control = composed.control
+                if target == 'read_result':     # a run with no result of its own, so that its status asks the reader
+                    control.registry.put({'run_id': 'run-read', 'tenant': 't1', 'engine': 'claude_code', 'state': 'starting',
+                                          'cgroup': None, 'started_at': 1, 'stop': None, 'start_key': None})
+                call = {'authorize': lambda: control.call('run.list'),
+                        'read_result': lambda: control.call('run.status', {'run_id': 'run-read'}),
+                        'page_methods': lambda: self.page(composed, 'POST', '/v1/control', {'method': 'route.list'})}[target]
+                answers = []
+                caller = threading.Thread(target=lambda: answers.append(call()), daemon=True)
+                caller.start()
+                self.open.remove((daemon, composed))
+
+                def close(composed=composed, daemon=daemon, ended=ended):
+                    composed.close()
+                    daemon.close()      # as the daemon's main does, right after the composition's close
+                    ended.closed = True
+                close_waits(self, made, ended, close, entered, leave)
+                caller.join(HELD_BOUND_S)
+                self.assertEqual((seen, len(answers)), ([False], 1),
+                                 'neither the composition nor the daemon had closed while the hook was inside, and the call was answered')
+
+    def test_a_close_waits_for_a_start_registrant_that_is_inside_with_nothing_else_registered(self):
+        ended = mock.Mock(closed=False)     # no store here: this says the close has ended, as a store's flag does
+        held, entered, leave, seen = held_hook(ended, H.Refusal('workspace_busy'))   # it refuses, so no run is made
+        self.addCleanup(leave.set)
+        made = hooks_of(lambda made: made.start_registrant('workspace', (), (), held))
+        self.assertEqual((made.start_on, sorted(made._single), made.gate.enabled), (True, [], True))
+        daemon, composed = self.boot(made)
+        answers = []
+        caller = threading.Thread(target=lambda: answers.append(composed.control.call('run.start', self.request())), daemon=True)
+        caller.start()
+        self.open.remove((daemon, composed))
+
+        def close():
+            composed.close()
+            daemon.close()      # as the daemon's main does, right after the composition's close
+            ended.closed = True
+        close_waits(self, made, ended, close, entered, leave)
+        caller.join(HELD_BOUND_S)
+        self.assertEqual((seen, answers), ([False], [{'code': 'workspace_busy'}]),
+                         'neither the composition nor the daemon had closed while the registrant was inside, and its refusal was the answer')
+
+    def test_after_a_close_a_page_provider_registered_alone_is_not_asked_and_a_call_is_refused(self):
+        asked = []
+        made = hooks_of(page_methods=lambda: asked.append('the provider') or frozenset({'route.list'}))
+        daemon, composed = self.boot(made)
+        self.assertEqual(self.page(composed, 'POST', '/v1/control', {'method': 'route.list'})[0], 200)
+        self.assertEqual(asked, ['the provider'])
+        composed.close()
+        self.assertEqual(self.page(composed, 'POST', '/v1/control', {'method': 'route.list'}),
+                         (200, {'code': 'unavailable', 'detail': 'daemon_closing'}))
+        self.assertEqual(composed.control.call('run.list'), {'code': 'unavailable', 'detail': 'daemon_closing'})
+        self.assertEqual(asked, ['the provider'], 'after the close no lane code runs for the page')
 
 
 class WatchedLock:

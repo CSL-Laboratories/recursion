@@ -103,27 +103,33 @@ def _task(task: object) -> tuple[str | None, frozenset, dict | None]:
     """The task read once: ``(task_kind, tags, hand_pick)``, or ``_Refuse`` with a code-word reason.
 
     A ``task_kind`` or ``tags`` that is present must be a non-empty string or a list of them: a present
-    null is refused, not read as absent. A ``hand_pick`` has exactly ``engine`` and ``model`` (common.v1),
-    the model a model id or null; a null ``hand_pick`` is no hand pick.
+    null is refused, not read as absent. A ``hand_pick`` that is present has exactly ``engine`` and ``model``
+    (common.v1, an object: a present null is refused as ``explain_answer`` refuses it), the model a model id
+    or null. A task, or a hand pick, that cannot be read is refused, never raised through.
     """
     if not isinstance(task, Mapping):
         raise _Refuse("bad_task", "task")
-    kind = task.get("task_kind")
-    if "task_kind" in task and not (isinstance(kind, str) and kind):
+    try:
+        present = {name: name in task for name in ("task_kind", "tags", "hand_pick")}
+        kind, tags, hand = task.get("task_kind"), task.get("tags"), task.get("hand_pick")
+    except Exception:  # noqa: BLE001 - a task that cannot be read is refused, never raised through
+        raise _Refuse("bad_task", "task") from None
+    if present["task_kind"] and not (isinstance(kind, str) and kind):
         raise _Refuse("bad_task", "task_kind")
-    tags = task.get("tags")
-    if "tags" in task and not (isinstance(tags, list) and all(isinstance(t, str) and t for t in tags)):
+    if present["tags"] and not (isinstance(tags, list) and all(isinstance(t, str) and t for t in tags)):
         raise _Refuse("bad_task", "tags")
-    hand = task.get("hand_pick")
-    if hand is None:
+    if not present["hand_pick"]:
         return kind, frozenset(tags or ()), None
-    if (not isinstance(hand, Mapping) or set(hand) != {"engine", "model"} or not isinstance(hand["engine"], str)
-            or hand["engine"] not in ENGINES):
+    try:
+        engine, model = hand.get("engine"), hand.get("model")
+        shaped = set(hand) == {"engine", "model"} and isinstance(engine, str) and engine in ENGINES
+    except Exception:  # noqa: BLE001 - null, a string or a hand pick that cannot be read: not a hand pick
+        shaped = False
+    if not shaped:
         raise _Refuse("bad_hand_pick", "hand_pick")
-    model = hand["model"]
     if model is not None and not _model_ok(model):
         raise _Refuse("bad_hand_pick", "hand_pick_model")
-    return kind, frozenset(tags or ()), {"engine": hand["engine"], "model": model}
+    return kind, frozenset(tags or ()), {"engine": engine, "model": model}
 
 
 def _matches(rule, kind: str | None, tags: frozenset) -> bool:
@@ -229,7 +235,7 @@ def route_decision(decision: Mapping) -> dict | None:
     """The control schema's ``route_decision`` (common.v1: chosen, reason, candidates, hand_pick) for a routed
     decision, or None for a refusal. This is what the run record keeps and the ``route.decision`` event
     carries; the start path that stores it is a later slice."""
-    if not decision.get("ok"):
+    if not isinstance(decision, Mapping) or not decision.get("ok"):
         return None
     return {
         "chosen": {"engine": decision["engine"], "model": decision["model"],
@@ -378,8 +384,9 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
 
     Four arguments (the brief writes two; the limits are read from the config, so it is passed too):
     ``config``, the Config the decision was made with (for a run in flight, that one, not a reloaded file);
-    ``decision``, ``decide``'s own answer (a ``route_decision`` or anything else without ``ok`` answers
-    ``no_decision``); ``limit``, the route result that ended the run (its ``code`` and, when the route
+    ``decision``, ``decide``'s own answer (a ``route_decision``, anything else without ``ok``, or a routed
+    mapping without decide's ``reason``, ``rule``, ``engine``, ``model`` and ``connection`` answers
+    ``no_decision``; a refusal answers ``no_route``); ``limit``, the route result that ended the run (its ``code`` and, when the route
     service made one, its ``limit_notice`` with the ``attempts`` already made); ``detection``, optionally a
     snapshot. ``wait`` waits until the limit's ``reset_at``, or the result's ``retry_at`` when the vendor
     gave no reset (``reset_at`` absent or null), as ``routes.limits.notice`` reads it. The answer::
@@ -399,6 +406,10 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
         return {"action": "none", "reason": "no_decision"}
     if not decision["ok"]:
         return {"action": "none", "reason": "no_route"}
+    connection = decision.get("connection")
+    if (any(key not in decision for key in ("reason", "rule", "engine", "model"))
+            or not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)):
+        return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
     code = limit.get("code") if isinstance(limit, Mapping) else None
     if code not in route_limits.LIMIT_CODES:
         return {"action": "none", "reason": "not_a_limit"}
@@ -415,7 +426,7 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
             until = limit.get("retry_at")
         return {"action": "wait", "until": until, "choices": choices}
     notice = limit.get("limit_notice") if isinstance(limit.get("limit_notice"), Mapping) else {}
-    attempts = [a for a in notice.get("attempts", ()) if isinstance(a, Mapping)]
+    attempts = [a for a in (notice.get("attempts") or ()) if isinstance(a, Mapping)]
     attempts.append({"engine": decision["engine"], "model": decision["model"],
                      "connection": f"{decision['connection']['kind']}:{decision['connection']['id']}"})
     entries, err = snapshot(detection) if detection is not None else (None, None)

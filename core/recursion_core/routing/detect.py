@@ -96,7 +96,9 @@ def _engine_reason(engine: str, entry: object, *, route_refusal, breaker_state, 
 
 def detect(config: Config, *, route_refusal: Callable | None = None, breaker_state: Callable | None = None,
            key_state: Callable | None = None, active: Iterable[str] | None = None) -> dict:
-    """The detection snapshot for ``config``'s machine. A source that raises makes its engine unroutable.
+    """The detection snapshot for ``config``'s machine. A source that raises an ``Exception`` makes its engine
+    unroutable (``detection_source_failed``); a ``BaseException`` such as ``KeyboardInterrupt`` is not caught
+    and stops the caller.
 
     A source left out (None) is not consulted, except the key state: a key route with no key source is
     ``key_state_unknown``, never routable, because spending needs a positive opt-in.

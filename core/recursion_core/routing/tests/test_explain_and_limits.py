@@ -343,10 +343,96 @@ class ReviewRegressionTests(unittest.TestCase):
         d = router.decide(config(), {"engines": Hostile()}, {})
         self.assertEqual((d["ok"], d["reason"]), (False, "detection_malformed"))
 
-    def test_small_interface_gaps(self) -> None:  # ds F10
+    def test_small_interface_gaps(self) -> None:  # ds F10; second reads: sol C2, C3
         self.assertEqual(routing.EXPLAIN_PARAMS, ("session_id", "engine", "hand_pick", "task_kind", "tags"))
-        with self.assertRaises(TypeError):
-            detect.detect(config(), active="codex")
+        self.assertIn("EXPLAIN_PARAMS", routing.__all__)
+        for active in ("codex", b"codex"):
+            with self.assertRaises(TypeError):
+                detect.detect(config(), active=active)
+
+    def test_a_rule_without_model_is_skipped_or_refused(self) -> None:  # second reads: sol C1
+        routes = copy.deepcopy(ROUTES)
+        del routes["codex"]["route"]["model"]
+        raw = copy.deepcopy(CONFIG)
+        del raw["rules"][0]["route"]["model"]
+        out = router.explain(config(raw, routes=routes), SENTRY, {"task_kind": "review"})
+        self.assertEqual((out["decision"]["ok"], out["decision"]["engine"]), (True, "claude_code"))
+        self.assertEqual((out["rules"][0]["outcome"], out["rules"][0]["reason"]), ("skipped", "route_no_model"))
+        raw["undetected_rule"] = "refuse"
+        d = router.decide(config(raw, routes=routes), SENTRY, {"task_kind": "review"})
+        self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "rule_engine_unavailable", "route_no_model"))
+        raw["rules"][0]["route"]["model"] = "explicit-model"
+        d = router.decide(config(raw, routes=routes), SENTRY, {"task_kind": "review"})
+        self.assertEqual((d["ok"], d["model"]), (True, "explicit-model"))
+
+
+class ReviewTwoRegressionTests(unittest.TestCase):
+    """The second reads of #399 (d857ebb5): DeepSeek V4.1 Flash R1-R7."""
+
+    def test_a_null_hand_pick_is_refused_alike_everywhere(self) -> None:  # ds R1
+        cfg = config()
+        task = {"task_kind": "review", "hand_pick": None}
+        d = router.decide(cfg, SENTRY, task)
+        self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_hand_pick", "hand_pick"))
+        self.assertEqual(router.explain(cfg, SENTRY, task)["decision"], d)
+        self.assertEqual(router.explain_answer(cfg, SENTRY, task), {"code": "request_invalid", "detail": "hand_pick"})
+
+    def test_a_null_attempts_list_and_a_decision_in_name_only(self) -> None:  # ds R2
+        cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        d = router.decide(cfg, SENTRY, {})
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": {"attempts": None}})
+        self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
+        for partial in ({"ok": True}, {"ok": True, "reason": "config", "engine": "codex"},
+                        {**d, "connection": None}, {**d, "connection": {"kind": "subscription"}},
+                        {k: v for k, v in d.items() if k != "rule"}):
+            self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, partial)
+        refused = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "pi", "model": None}})
+        self.assertEqual(router.next_after_limit(cfg, refused, LIMIT), {"action": "none", "reason": "no_route"})
+
+    def test_an_invalid_routes_json_limits_block_falls_back_to_ask(self) -> None:  # ds R3
+        for bad in ({"on_limit": "sometimes"}, {"on_limit": "ask", "x": 1}, []):
+            with self.subTest(bad):
+                routes = copy.deepcopy(ROUTES)
+                routes["claude_code"]["route"]["limits"] = bad
+                cfg = config(routes=routes)
+                d = router.decide(cfg, SENTRY, {})
+                self.assertEqual(router.next_after_limit(cfg, d, LIMIT),
+                                 {"action": "ask", "reason": "on_limit_ask", "choices": []})
+
+    def test_an_exhausted_list_names_each_listed_route_once_in_order(self) -> None:  # ds R4
+        pi = copy.deepcopy(ROUTES["pi"]["route"])
+        order = [CODEX, OPENCODE, pi]
+        cfg = with_limits({"on_limit": "fallback", "fallback": order})
+        d = router.decide(cfg, SENTRY, {})
+        notice = {"attempts": [route_limits.describe(r) for r in order]}
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": notice})
+        self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
+        self.assertEqual(out["skipped"], [{"place": n, **route_limits.describe(r), "skipped": "already_tried"}
+                                          for n, r in enumerate(order, 1)])
+
+    def test_a_task_that_cannot_be_read_is_refused(self) -> None:  # ds R5
+        class Hostile(dict):
+            def __init__(self, broken: str) -> None:
+                super().__init__(task_kind="review")
+                self.broken = broken
+
+            def __contains__(self, key):
+                if self.broken == "contains":
+                    raise RuntimeError("contains")
+                return super().__contains__(key)
+
+            def get(self, key, default=None):
+                if self.broken == "get":
+                    raise RuntimeError("get")
+                return super().get(key, default)
+        for broken in ("contains", "get"):
+            d = router.decide(config(), SENTRY, Hostile(broken))
+            self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_task", "task"), broken)
+            self.assertEqual(router.explain(config(), SENTRY, Hostile(broken))["decision"], d)
+
+    def test_route_decision_of_anything_but_a_routed_decision_is_none(self) -> None:  # ds R7
+        for value in (None, 5, "x", {}, {"ok": False}):
+            self.assertIsNone(router.route_decision(value), value)
 
 
 if __name__ == "__main__":

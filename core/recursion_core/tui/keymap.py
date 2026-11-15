@@ -76,7 +76,8 @@ _MODIFIER_SETS = ("ctrl+", "alt+", "shift+", "alt+shift+", "ctrl+shift+", "ctrl+
 _SAME_BYTE = {"h": "backspace", "i": "tab", "j": "enter", "m": "enter"}
 _CTRL = {"ctrl+space", "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_", *(f"ctrl+{chr(c)}" for c in range(ord("a"), ord("z") + 1))}
 ALIASES = {**{f"ctrl+{c}": key for c, key in _SAME_BYTE.items()},
-           **{f"ctrl+alt+{c}": f"alt+{key}" for c, key in _SAME_BYTE.items()}}
+           **{f"ctrl+alt+{c}": f"alt+{key}" for c, key in _SAME_BYTE.items()},
+           "alt+space": "alt+ "}  # ESC and a space; a file cannot write the space (review 3 of #404, DeepSeek F5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,8 @@ def show_sequence(seq: Iterable[str], leader: str = LEADER) -> str:
         if len(key) == 1:
             return key
         mods, _, base = key.rpartition("+") if not key.endswith("++") else (key[:-2], "+", "+")
+        if base == " ":
+            base = "Space"  # alt+ is written alt+space, and shown Alt+Space
         if len(base) > 1:
             base = {"pageup": "PageUp", "pagedown": "PageDown"}.get(base, base.capitalize())
         elif mods.startswith("ctrl") and base.isalpha():
@@ -236,7 +239,8 @@ class Unbound:
 class Keymap:
     """Bindings by context, after the defaults, the binding file and the safety rules, and one client's
     matching state (``pending``, ``last``). That state belongs to one client's keys: a client takes its own
-    with ``for_client()``, so several clients can share one set of bindings."""
+    with ``for_client()``, so several clients can share one set of bindings. ``never_bind`` holds keys as a
+    terminal sends them: a name given for one (``ctrl+i``) is kept as that key (``tab``)."""
 
     leader: str = LEADER
     bindings: dict[str, dict[tuple[str, ...], str]] = field(default_factory=dict)
@@ -244,6 +248,10 @@ class Keymap:
     notes: list[str] = field(default_factory=list)  # why a binding or the file was not used
     pending: tuple[str, ...] = ()
     last: tuple[str, ...] = ()  # the sequence that chose the last action ``feed`` returned
+
+    def __post_init__(self) -> None:
+        # However a consumer spelled them (review 3 of #404, DeepSeek F4).
+        self.never_bind = frozenset(key_name(k) or k for k in self.never_bind)
 
     @classmethod
     def default(cls) -> Keymap:
@@ -393,6 +401,12 @@ def load(text: str, base: Keymap | None = None) -> Keymap:
         km.notes.append(f"binding file not used: {problem}")
         return km
     leader = key_name(doc.get("leader", km.leader))  # as a terminal sends it: ctrl+i is tab (Astra 4)
+    held = {key for context in LEADER_CONTEXTS for seq in km.bindings.get(context, {})
+            for key in (seq[1:] if seq[0] == km.leader else seq)}
+    if leader != km.leader and leader in held:  # a binding in force would shadow the leader's sequences
+        km.notes.append(f"binding file not used: leader {doc['leader']!r} is a key the bindings in force use "
+                        f"where a leader is typed; choose one they do not (review 3 of #404, DeepSeek F3)")
+        return km
     if leader != km.leader:
         # Every binding moves with the leader, base's as well as the defaults': a sequence that starts with the
         # old leader where a leader can be typed starts with the new one; the rest stay (review 2 of #404,
@@ -416,13 +430,24 @@ def load(text: str, base: Keymap | None = None) -> Keymap:
         if not isinstance(table, Mapping):
             km.notes.append(f"bindings.{context} skipped: not a table")
             continue
+        given: dict[tuple[str, ...], str] = {}  # this table's keys as a terminal sends them, and how each was written
         for seq_text, action in table.items():
             if not isinstance(action, str):
                 km.notes.append(f"bindings.{context} {seq_text!r} skipped: the action is not a string")
                 continue
+            try:
+                seq = parse_sequence(seq_text, km.leader)
+            except ValueError:
+                seq = None  # bind() says why
+            if seq in given:  # two spellings of one key (ctrl+i and tab): the second is said, not taken
+                km.notes.append(f"bindings.{context} {seq_text!r} = {action!r} skipped: the same keys as "
+                                f"{given[seq]!r} above (review 3 of #404, DeepSeek F3)")
+                continue
             refused = km.bind(context, seq_text, action)
             if refused:
                 km.notes.append(f"bindings.{context} {seq_text!r} = {action!r} skipped: {refused}")
+            elif seq is not None:
+                given[seq] = seq_text
     return km
 
 

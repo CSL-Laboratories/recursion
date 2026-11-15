@@ -16,7 +16,8 @@
     Asks on the terminal before it deletes (``--yes`` skips the question; with no terminal it is required),
     then says what it removed and from where. It also clears what an interrupted save left behind, and a value of
     an id no saved key has that the store's own owner-only file still holds, whatever the host offers now (not a
-    file the store does not use: another store's, or one beside a store whose keys are in a keychain).
+    file the store does not use: another store's while the store has keys in the file, or any while its keys are
+    in a keychain; with no saved key at all, the file in its folder is its own).
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the

@@ -33,15 +33,15 @@ THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <
 {<id>: {"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. Anything else is refused ``index_invalid``. A
 listing says what the index holds; it does not say that a keychain is reachable or unlocked now.
 
-PINNING. The first save records the backend the host offered then (``system.detect``) in the index. Every
-later operation that touches a value asks again and refuses when the answer differs: ``keychain_unavailable``
-when a keychain was pinned and the host now offers only the file, ``backend_changed`` otherwise. A locked or
-failing keychain is refused with its own code and is never answered from the file. A key pinned to a keychain
-is removed only where that keychain answers, since its removal must reach the value. One exception: a key pinned
-to the owner-only file is REMOVED whatever the host offers now, the file being in the store's own folder, so that
-once a keychain appears the keys can be removed and added again into it; a file in its place that the store did
-not write (a folder, a symlink, a FIFO, another shape) is refused, as every command refuses it. The pin is released
-when nothing is left in the index.
+PINNING. The first save records the backend the host offered then (``system.detect``) in the index. Every later
+operation that touches a value asks again and refuses when the answer differs: ``keychain_unavailable`` when a keychain
+was pinned and the host now offers only the file, ``backend_changed`` otherwise. A locked or failing keychain is refused
+with its own code and is never answered from the file. A key pinned to a keychain is removed only where that keychain
+answers, since its removal must reach the value. One exception: a key pinned to the owner-only file is REMOVED whatever
+the host offers now, the file being in the store's own folder, so that once a keychain appears the keys can be removed
+and added again into it; a file in its place that the store did not write (a folder, a symlink, a FIFO, another shape)
+is refused, as every command that reads the file refuses it (``list`` reads only the index). The pin is released when
+nothing is left in the index.
 
 SPEND. Every key has ``metered_spend_allowed`` and ``cap_usd``, typed when it is added; with no opt-in the cap
 is 0. ``credentials()`` hands a key out only when both say spend is allowed (opt-in and a cap above 0):
@@ -76,22 +76,27 @@ VALUES NO RECORD NAMES. An index lost, emptied or put back no longer names every
 removal and a recovery change the values of the id they name and of no other, so such a value is never deleted by an
 unrelated write. The store's OWN owner-only file (``_own_file``) is the one in its folder, except while its index pins
 the store to a keychain (then it has none) or has records on the file (then only a file that names the index's store
-id). A value in its own file that no record reaches stays there: the audit searches for it (``UNBOUND``) and names its
-id; ``remove <id>``, for an id no record or intent names, deletes it whatever the host offers now, in one write of the
-file and with no intent (nothing outside the folder changes), and changes nothing else, the index's store id included;
-and ``add <id>`` on the file is refused (``key_exists``) until it is removed, so no save replaces a value it was not
-given. A file that is not the store's own (it names another store, or the store's keys are in a keychain) is never
-changed by it: the audit searches for the values of one it can read (``FOREIGN``) and says the file is not the store's,
-and names one it cannot read as unreadable (the audit is then incomplete); its values go only through their own store or
-with the file. A file of the store's own that it cannot read refuses the audit, as every command refuses it. A store
-whose backend is the owner-only file and that has no record takes the file's store id at its next save (the same folder
-is the same store). A store on a keychain never takes it, and never reads the owner-only file to save or release a key,
-nor to remove one while its index pins it there (only the audit reads it, for values to look for). On a keychain an item
-is named by the store's id, which only the index records: an index LOST leaves the store's items with no name this store
-knows, so it can neither release nor remove them (the keychain's own tool can: they carry ``application recursion``).
-``remove <id>`` of an id a record names deletes every item of the id in the store, whichever save stored it. The audit
-counts every Recursion item in the keychain that neither a record names by its save nor an unfinished operation by its
-id (``unnamed_items``), and is incomplete while there is one.
+id). With no record, the file in the folder is the store's own whichever store it names, whatever the host offers, even
+beside an index that kept its id: the same folder is the same store, as a save takes that file's id (below). A value in
+its own file that no record reaches stays there: the audit searches for it (``UNBOUND``) and names its id; ``remove
+<id>``, for an id no record or intent names, deletes it whatever the host offers now, in one write of the file and with
+no intent (nothing outside the folder changes), and changes nothing else, the index's store id included; and ``add
+<id>`` on the file is refused (``key_exists``) until it is removed, so no save replaces a value it was not given. A file
+that is not the store's own (one naming another store while the index has records on the file, or any while the index
+pins the store to a keychain) is never changed by it: the audit searches for the values of one it can read (``FOREIGN``)
+and says the file is not the store's, and names one it cannot read as unreadable (the audit is then incomplete); its
+values go only through their own store or with the file. A file of the store's own that it cannot read refuses the
+audit, as every command that reads the file refuses it (``list`` reads only the index, and a save into a keychain never
+reads the file): a value with no binding beside it is refused, never guessed at. With no record that is the folder's
+file on any host; a save into the keychain (the file is then one the store does not use) or moving the file away ends
+it. A store whose backend is the owner-only file and that has no record takes the file's store id at its next save (the
+same folder is the same store). A store on a keychain never takes it, and never reads the owner-only file to save or
+release a key, nor to remove one while its index pins it there (only the audit reads it, for values to look for). On a
+keychain an item is named by the store's id, which only the index records: an index LOST leaves the store's items with
+no name this store knows, so it can neither release nor remove them (the keychain's own tool can: they carry
+``application recursion``). ``remove <id>`` of an id a record names deletes every item of the id in the store, whichever
+save stored it. The audit counts every Recursion item in the keychain that neither a record names by its save nor an
+unfinished operation by its id (``unnamed_items``), and is incomplete while there is one.
 """
 from __future__ import annotations
 
@@ -300,7 +305,8 @@ class KeyStore:
         """The store's own owner-only file (see VALUES NO RECORD NAMES): None while the index pins the store to a
         keychain; while it has records on the file, the file only when it names the index's store id; with no
         record, the file in the folder, whichever store id it names (the same folder is the same store). Asks no
-        host. A file in its place that the store did not write is refused, as every command refuses it."""
+        host. A file in its place that the store did not write is refused, as every command that reads the file
+        refuses it."""
         if index.live():
             return OwnerFile(index.store_id) if index.backend == 'owner_file' else None
         return OwnerFile(OwnerFile(None).store_of(folder))
@@ -456,9 +462,9 @@ class KeyStore:
         mapping, with the code, and makes the audit incomplete. Every value the owner-only file holds that no record
         of the index reaches (an index lost or replaced, or a record naming another save) is searched for too, under
         its own id and a label: ``UNBOUND`` in the store's own file, ``FOREIGN`` in one it does not use (see VALUES
-        NO RECORD NAMES). A file of the store's own that is not what it wrote is refused, as every command refuses
-        it; one it does not use and cannot read is named in ``unreadable`` when a list is given (the audit's), and
-        refused when none is.
+        NO RECORD NAMES). A file of the store's own that is not what it wrote is refused, as every command that
+        reads the file refuses it; one it does not use and cannot read is named in ``unreadable`` when a list is
+        given (the audit's), and refused when none is.
         """
         folder = self._folder(create=False)
         if folder is None:

@@ -10,6 +10,7 @@ between two transactions it leaves what was committed.
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import pathlib
@@ -41,20 +42,23 @@ def declaration(engine: str, *, input_ack: bool = False, **on) -> dict:
     return {'engine': engine, 'driver': 2, 'flags': flags(**on), 'input_ack': input_ack}
 
 
-# The drivers the tests use. 'one_turn' is today's path (every flag false); 'worker' keeps a worker that takes
-# another message and input mid-turn; 'resumer' runs one turn per run and resumes the engine's session.
+# The drivers the tests use. 'one_turn' is today's path (every flag false, no typed acceptance, so no steering);
+# 'worker' keeps a worker that takes another message and input mid-turn; 'resumer' runs one turn per run and
+# resumes the engine's session. The last two declare a typed acceptance of input (input_ack), so steering is
+# offered on them: mid-turn on 'worker', as the next turn on 'resumer' (the table's fallback). A test that needs
+# an engine with no typed acceptance sets ``input_ack`` false on its own copy.
 DECLARATIONS = {
     'one_turn': declaration('claude_code'),
     'worker': declaration('codex', input_ack=True, multi_turn=True, mid_turn_input=True, resume=True, interrupt=True),
-    'resumer': declaration('opencode', resume=True),
+    'resumer': declaration('opencode', input_ack=True, resume=True),
 }
 ENGINE_OF = {'one_turn': 'claude_code', 'worker': 'codex', 'resumer': 'opencode'}
 
 
 class FakeDrivers:
     def __init__(self, by_engine: dict | None = None) -> None:
-        self.by_engine = {ENGINE_OF[name]: found for name, found in DECLARATIONS.items()} if by_engine is None \
-            else dict(by_engine)
+        self.by_engine = {ENGINE_OF[name]: copy.deepcopy(found) for name, found in DECLARATIONS.items()} \
+            if by_engine is None else dict(by_engine)
 
     def declaration(self, engine):
         return self.by_engine.get(engine)
@@ -80,8 +84,9 @@ class FakeRoutes:
 class FakeUnits:
     """Records every call. ``then`` is a list of what the next calls do, in order: 'ok', a ``UnitRefused``, an
     ``Exception`` (an outcome nobody can vouch for), ``'cut-before'`` (the process ends before the write) or
-    ``'cut-after'`` (the write happened and the process ends before anything records it). Stops answer from
-    ``stop_answers`` in order; with none left a Stop answers 'stopped'."""
+    ``'cut-after'`` (the write happened, a launched run is registered, and the process ends before anything in
+    the lane records it). Stops answer from ``stop_answers`` in order; with none left a Stop answers 'stopped'
+    for a registered run and None for a run id that was never registered."""
 
     def __init__(self) -> None:
         self.launched: list = []
@@ -97,21 +102,20 @@ class FakeUnits:
         with self.lock:
             return self.then.pop(0) if self.then else 'ok'
 
-    def _do(self, record: list, order) -> None:
+    def _do(self, record: list, order, effect=None) -> None:
         what = self._next()
         if what == 'cut-before':
             raise Cut()
-        if isinstance(what, (UnitRefused,)):
-            raise what
-        if isinstance(what, Exception):
+        if isinstance(what, Exception):        # a UnitRefused, or an outcome nobody can vouch for
             raise what
         record.append(order)
+        if effect is not None:
+            effect()                           # the outside effect exists before the process can end
         if what == 'cut-after':
             raise Cut()
 
     def launch(self, order) -> None:
-        self._do(self.launched, order)
-        self.registered.add(order.run_id)
+        self._do(self.launched, order, lambda: self.registered.add(order.run_id))
 
     def send(self, order) -> None:
         self._do(self.sent, order)

@@ -2,8 +2,11 @@
 """The queue, and the rule by which a message reaches an engine (queue.item.v1, #368, draft 7).
 
 This is the durable form of ``conformance/rules.py``'s ``DeliveryModel``: the same happenings, the same
-refusals, the same end states, kept in the lane's tables through the caller's transaction. The tests walk
-every vector of ``schemas/control/v1/vectors/queue.delivery`` through it.
+refusals and the same end states, kept in the lane's tables through the caller's transaction, with three
+differences that the model does not need: ``begin`` also refuses (``binding``) a delivery id that was used
+before, a quarantine appends its ``effect.outcome_unknown`` event, and the evidence kept for a late acceptance
+is its five acceptance members (delivery, log, run, turn, how), not every key the driver sent. The tests walk
+every vector of ``schemas/control/v1/vectors/queue.delivery`` through it and compare every event in full.
 
 THE RULE, in short (queue.item.v1 says it in full):
 

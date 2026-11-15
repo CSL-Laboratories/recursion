@@ -4,10 +4,22 @@
 The records are SPINE's, published in #368: ``session.v1`` (a session and its turns), ``queue.item.v1``
 (one queued message) and the private ``delivery_binding`` beside a queue item. The checks here state the
 same rules as those schemas, by hand, because the daemon's interpreter has no JSON Schema library and
-nothing under ``core/`` may import one. They are run by the store before EVERY write: a bug in this lane
-cannot commit a record the schema refuses. The tests run these checks over #368's own good and bad
-fixtures, and on an interpreter that has ``jsonschema`` they validate this lane's records against the
-schemas themselves.
+nothing under ``core/`` may import one. The store runs them before every write of a session, a turn, a queue
+item or a binding: a bug in this lane cannot commit one of those records that the schema refuses. (The
+delivery row's later changes, its state, its written flag and its evidence, and the work intents are this
+lane's own private rows, held to their columns' CHECK constraints.) The tests run these checks over #368's
+own good and bad fixtures, and check what they accept against the schemas themselves with SPINE's
+standard-library reader (``conformance/rules.py``, ``fits``) on every interpreter.
+
+One deliberate difference: a record's own integers (a session's revision, a turn's index, an item's order and
+revision) must be Python ints here, so the float spelling ``1.0`` that JSON Schema counts as an integer is
+refused for them, though the schemas admit it. Every such value is made by this lane, never parsed from outside
+JSON, and the store's INTEGER columns keep ints. Nothing the lane accepts is refused by the schemas. Values
+that do come from outside (a request's integers, a Stop's) are read through ``integer`` and admit ``1.0``.
+
+Two more checks are for values that come from outside and are not records of this lane: the params of a
+request (``check_request``), and a Stop's answer (``stop_confirmed``), which settles a session only when it is
+a well-formed stop.result.v1 answer that confirms the Stop.
 
 A check raises ``RecordError(path, rule)``; it never repairs a record.
 """
@@ -83,7 +95,10 @@ def _no_newline(value: str) -> bool:
 
 
 def _matches(pattern, value) -> bool:
-    return isinstance(value, str) and pattern.fullmatch(value) is not None and _no_newline(value)
+    """The whole of ``value`` matches ``pattern``. Every pattern above is made of character classes that hold
+    neither CR nor LF, and ``fullmatch`` (unlike ``$``) never ends a match before a final newline, so no value
+    with a line break matches; the tests hold this for every pattern."""
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
 def _need(ok: bool, path: str, rule: str) -> None:
@@ -159,6 +174,162 @@ def check_workspace(value, path: str = '/workspace') -> None:
 def check_budget(value, path: str = '/budget') -> None:
     _exact_keys(value, ('cap_usd',), path)
     _need(_is_number(value['cap_usd']) and value['cap_usd'] >= 0, f'{path}/cap_usd', 'minimum')
+
+
+# ------------------------------------------------------------------------------------ a request's params
+CONTAINMENT_LEVELS = ('host_integrated', 'engine_user', 'contained')
+
+
+def _non_empty_text(value) -> bool:
+    return _is_text(value) and len(value) >= 1
+
+
+def integer(value):
+    """``value`` as an int when it is a JSON Schema integer (an int that is not a bool, or a float with no
+    fraction, as a JSON parser gives ``1.0``), else None. A request's integers are read through this."""
+    if _is_int(value):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _hand_pick(value) -> bool:
+    return (isinstance(value, dict) and set(value) == {'engine', 'model'} and _matches(ENGINE_NAME, value['engine'])
+            and _nullable(_non_empty_text, value['model']))
+
+
+def _workspace_request(value) -> bool:
+    if value is None:
+        return True                                   # the published params allow an explicit null workspace
+    return (isinstance(value, dict) and 'path' in value and set(value) <= {'path', 'mode', 'base_ref'}
+            and _non_empty_text(value['path']) and value.get('mode', 'direct') in ('direct', 'worktree')
+            and ('base_ref' not in value or _non_empty_text(value['base_ref'])))
+
+
+def _budget(value) -> bool:
+    try:
+        check_budget(value)
+    except RecordError:
+        return False
+    return True
+
+
+_FIELD = {
+    'command_id': lambda value: _matches(COMMAND_ID, value),
+    'tenant': _non_empty_text,
+    'engine': lambda value: _matches(ENGINE_NAME, value),
+    'hand_pick': _hand_pick,
+    'workspace': _workspace_request,
+    'prompt': _non_empty_text,
+    'parent_session_id': lambda value: _matches(SESSION_ID, value),
+    'containment_level': lambda value: value in CONTAINMENT_LEVELS,
+    'budget': _budget,
+    'session_id': lambda value: _matches(SESSION_ID, value),
+    'text': _non_empty_text,
+    'expected_revision': lambda value: integer(value) is not None and value >= 1,
+    'expected_turn_id': lambda value: _matches(TURN_ID, value),
+    'item_id': lambda value: _matches(ITEM_ID, value),
+    'delivery': lambda value: value in DELIVERIES,
+    'state': lambda value: value in SESSION_STATES,
+    'limit': lambda value: integer(value) is not None and 1 <= value <= 1000,
+    'after': lambda value: _matches(SESSION_ID, value),
+}
+
+# The params of each method this lane answers (methods.v1.json, $defs/params.<method>): the required fields,
+# then the optional ones, in the published order. A field that is present is checked even when it is null: only
+# ``workspace`` admits null.
+PARAMS = {
+    'session.start': (('command_id', 'tenant'),
+                      ('engine', 'hand_pick', 'workspace', 'prompt', 'parent_session_id', 'containment_level',
+                       'budget')),
+    'session.turn': (('command_id', 'session_id', 'text', 'expected_revision'), ()),
+    'session.queue': (('command_id', 'session_id', 'text'), ()),
+    'session.steer': (('command_id', 'session_id', 'text', 'expected_turn_id'), ()),
+    'queue.update': (('command_id', 'item_id', 'expected_revision'), ('text', 'delivery')),
+    'queue.cancel': (('command_id', 'item_id', 'expected_revision'), ()),
+    'session.status': (('session_id',), ()),
+    'session.list': ((), ('tenant', 'state', 'parent_session_id', 'limit', 'after')),
+}
+
+
+def check_request(method: str, params) -> None:
+    """Raise ``RecordError('/<field>', rule)`` unless ``params`` are the published params of ``method``: an object
+    with every required field, no field the method does not take, and every field that is present of its
+    published shape (a null is a value, refused where the schema does not admit it). The first problem found
+    is named: a missing field, then a field the method does not take, then a value, in the published order."""
+    _need(isinstance(params, dict), '', 'object')
+    required, optional = PARAMS[method]
+    for field in sorted(required):
+        _need(field in params, f'/{field}', 'required')
+    unknown = sorted(set(params) - set(required) - set(optional))
+    _need(not unknown, f'/{unknown[0]}' if unknown else '', 'additionalProperties')
+    for field in required + optional:
+        if field in params:
+            _need(_FIELD[field](params[field]), f'/{field}', 'shape')
+    if method == 'queue.update':
+        _need('text' in params or 'delivery' in params, '/text', 'required')     # anyOf: text, delivery, or both
+
+
+# --------------------------------------------------------------------------------------------- a Stop's answer
+STOP_KEYS = ('code', 'run_id', 'state', 'reason', 'repeat', 'recorded', 'attestation', 'containment_level',
+             'claim', 'fence')
+STOP_CLAIMS = {'stopped': ('cgroup_empty_whole_run_unverified', 'cgroup_removed_whole_run_unverified'),
+               'ended': ('ended_before_stop_removal_unverified',)}
+
+
+def _check_attestation(value) -> None:
+    _exact_keys(value, ('proof', 'cgroup', 'cgroup_identity', 'time'), '/attestation')
+    _need(value['proof'] in ('empty', 'removed'), '/attestation/proof', 'enum')    # any other proof: NOT stopped
+    _need(_non_empty_text(value['cgroup']), '/attestation/cgroup', 'minLength')
+    identity = value['cgroup_identity']
+    if identity is not None:
+        _exact_keys(identity, ('st_dev', 'st_ino'), '/attestation/cgroup_identity')
+        for key in ('st_dev', 'st_ino'):
+            _need(integer(identity[key]) is not None and identity[key] >= 0, f'/attestation/cgroup_identity/{key}',
+                  'minimum')
+    _need(value['proof'] != 'removed' or identity is not None, '/attestation/cgroup_identity', 'removed')
+    _need(_instant(value['time']), '/attestation/time', 'timestamp')
+
+
+def _check_stop(answer, run_id: str) -> None:
+    _need(isinstance(answer, dict), '', 'object')
+    for key in ('code', 'run_id', 'state'):
+        _need(key in answer, f'/{key}', 'required')
+    extra = sorted(set(answer) - set(STOP_KEYS))
+    _need(not extra, f'/{extra[0]}' if extra else '', 'additionalProperties')
+    code = answer['code']
+    _need(code in ('stopped', 'ended'), '/code', 'confirms')        # 'pending', or a word this lane does not know
+    _need(answer['state'] == code, '/state', 'the_same_word')
+    _need(_matches(RUN_ID, answer['run_id']) and answer['run_id'] == run_id, '/run_id', 'this_run')
+    _need('reason' not in answer, '/reason', code)
+    _need(answer.get('recorded', False) is False, '/recorded', 'const')
+    _need(answer.get('containment_level', CONTAINMENT_LEVELS[0]) in CONTAINMENT_LEVELS, '/containment_level', 'enum')
+    _need(answer.get('claim', STOP_CLAIMS[code][0]) in STOP_CLAIMS[code], '/claim', code)
+    if 'fence' in answer:
+        fence = answer['fence']
+        _exact_keys(fence, ('state', 'incarnation'), '/fence')
+        _need(fence['state'] in ('fenced', 'dispatched'), '/fence/state', 'enum')
+        _need(integer(fence['incarnation']) is not None and fence['incarnation'] >= 0, '/fence/incarnation',
+              'minimum')
+    if code == 'stopped':
+        _need(isinstance(answer.get('repeat'), bool), '/repeat', 'stopped')
+        if 'attestation' in answer:
+            _check_attestation(answer['attestation'])
+    else:
+        _need('repeat' not in answer and 'attestation' not in answer, '/repeat', 'ended')
+
+
+def stop_confirmed(answer, run_id: str):
+    """'stopped' or 'ended' when ``answer`` is a stop.result.v1 answer (#368, draft 2) for ``run_id`` that confirms
+    the Stop; None for every other answer: 'pending', another run's, one with a member missing or of the wrong
+    shape, a contradiction (code 'stopped' with state 'pending'), or a code, a proof or a member this lane does
+    not know. As the schema says, a client that meets what it does not know treats the run as NOT stopped."""
+    try:
+        _check_stop(answer, run_id)
+    except RecordError:
+        return None
+    return answer['code']
 
 
 # --------------------------------------------------------------------------------------------- a turn

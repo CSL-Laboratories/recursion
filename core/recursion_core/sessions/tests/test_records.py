@@ -12,7 +12,7 @@ from __future__ import annotations
 import unittest
 
 from recursion_core.sessions import records
-from recursion_core.sessions.tests.support import SCHEMAS, load_json
+from recursion_core.sessions.tests.support import SCHEMAS, load_json, published_rules, stop_answer
 
 CHECKS = {
     'session.v1.json': records.check_session,
@@ -92,11 +92,123 @@ class LaneRulesTest(unittest.TestCase):
             records.check_session(record)
         self.assertEqual(caught.exception.path, '/created_at')
 
+    def test_a_turn_id_used_twice_is_refused(self):
+        record = self.good()
+        record['turns'][1]['turn_id'] = record['turns'][0]['turn_id']
+        with self.assertRaises(records.RecordError) as caught:
+            records.check_session_kept(record)
+        self.assertEqual(caught.exception.rule, 'unique_turn_id')
+
+    def test_an_active_turn_that_is_already_final_is_refused(self):
+        record = self.good()
+        ended = next(turn for turn in record['turns'] if turn['state'] == 'ended')
+        record['active_turn_id'] = ended['turn_id']
+        with self.assertRaises(records.RecordError) as caught:
+            records.check_session_kept(record)
+        self.assertEqual((caught.exception.path, caught.exception.rule), ('/active_turn_id', 'not_final'))
+
+    def test_an_interrupted_or_stopped_turn_carries_its_own_word_as_outcome(self):
+        """DeepSeek round 3, F7 (m18): session.v1 $defs/turn ties the outcome of these two states to the state."""
+        record = self.good()
+        ended = next(turn for turn in record['turns'] if turn['state'] == 'ended')
+        for state in ('interrupted', 'stopped'):
+            with self.subTest(state=state):
+                turn = {**ended, 'state': state, 'outcome': state}
+                records.check_turn(turn, '/turns/0')                        # the control
+                with self.assertRaises(records.RecordError) as caught:
+                    records.check_turn({**turn, 'outcome': 'done'}, '/turns/0')
+                self.assertEqual((caught.exception.path, caught.exception.rule), ('/turns/0/outcome', state))
+
+    def test_no_id_pattern_matches_a_value_with_a_line_break(self):
+        for pattern, value in ((records.SESSION_ID, 'ses-a'), (records.TURN_ID, 'turn-a'), (records.ITEM_ID, 'qi-a'),
+                               (records.DELIVERY_ID, 'dlv-a'), (records.RUN_ID, 'run-a'), (records.TOKEN, 'a.b'),
+                               (records.COMMAND_ID, 'cmd-00001'), (records.CODE_WORD, 'code'),
+                               (records.ENGINE_NAME, 'codex'), (records.TIMESTAMP, '2026-11-14T09:00:00.000Z')):
+            self.assertTrue(records._matches(pattern, value), value)
+            for broken in (value + '\n', value + '\r', '\n' + value, value[:2] + '\n' + value[2:]):
+                with self.subTest(value=broken):
+                    self.assertFalse(records._matches(pattern, broken))
+
     def test_minted_ids_fit_their_patterns(self):
         for prefix, pattern in (('ses-', records.SESSION_ID), ('turn-', records.TURN_ID), ('qi-', records.ITEM_ID),
                                 ('dlv-', records.DELIVERY_ID), ('run-', records.RUN_ID)):
             self.assertTrue(pattern.fullmatch(records.mint(prefix)), prefix)
         self.assertTrue(records.TIMESTAMP.fullmatch(records.timestamp()))
+
+
+class StopAnswerTest(unittest.TestCase):
+    """A Stop settles a session only on a well-formed stop.result.v1 answer (#368, draft 2) that confirms the Stop of
+    THIS run (``records.stop_confirmed``). What the hand-written check accepts is checked against the schema itself
+    by SPINE's standard-library reader, on every interpreter: an answer settles exactly when the schema admits it,
+    its code is 'stopped' or 'ended' and it names the run."""
+
+    RUN = 'run-0001'
+    SEEN = {'proof': 'empty', 'cgroup': '/sys/fs/cgroup/made-up.scope', 'cgroup_identity': None,
+            'time': '2026-11-14T09:00:00.000Z'}
+
+    def answers(self):
+        stopped, ended, pending = (stop_answer(self.RUN, code) for code in ('stopped', 'ended', 'pending'))
+        seen = self.SEEN
+        return [
+            stopped, ended, pending, {key: value for key, value in ended.items() if key != 'claim'},
+            {**stopped, 'repeat': True}, {**stopped, 'attestation': seen},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1, 'st_ino': 2}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed'}},
+            {**stopped, 'attestation': {**seen, 'proof': 'future_proof'}},
+            {**stopped, 'attestation': {**seen, 'time': '2026-02-31T00:00:00.000Z'}},
+            {**stopped, 'attestation': {**seen, 'cgroup': ''}},
+            {**stopped, 'attestation': {**seen, 'extra': 1}},
+            {**stopped, 'attestation': {key: value for key, value in seen.items() if key != 'time'}},
+            {**stopped, 'attestation': {**seen, 'cgroup_identity': {'st_dev': -1, 'st_ino': 2}}},
+            {**stopped, 'attestation': {**seen, 'cgroup_identity': {'st_dev': 1}}},
+            {**stopped, 'attestation': {**seen, 'cgroup_identity': {'st_dev': True, 'st_ino': 2}}},
+            {**stopped, 'state': 'pending'}, {**ended, 'state': 'stopped'},
+            {key: value for key, value in stopped.items() if key != 'repeat'}, {**stopped, 'repeat': 'no'},
+            {**stopped, 'reason': 'cgroup_populated'}, {**ended, 'reason': 'cgroup_populated'},
+            {**stopped, 'run_id': 'run-other'}, {**stopped, 'run_id': 'bad id'},
+            {**stopped, 'code': 'gone', 'state': 'gone'},
+            {key: value for key, value in stopped.items() if key != 'state'},
+            {**stopped, 'recorded': False}, {**stopped, 'recorded': True},
+            {**stopped, 'claim': 'cgroup_empty_whole_run_unverified'},
+            {**stopped, 'claim': 'cgroup_removed_whole_run_unverified'},
+            {**stopped, 'claim': 'ended_before_stop_removal_unverified'},
+            {**ended, 'claim': 'cgroup_empty_whole_run_unverified'}, {**ended, 'repeat': False},
+            {**ended, 'attestation': seen}, {**stopped, 'containment_level': 'contained'},
+            {**stopped, 'containment_level': 'standard'}, {**stopped, 'fence': {'state': 'fenced', 'incarnation': 1}},
+            {**stopped, 'fence': {'state': 'dispatched', 'incarnation': 0}},
+            {**stopped, 'fence': {'state': 'open', 'incarnation': 1}}, {**stopped, 'fence': {'state': 'fenced'}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': -1}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': 1, 'more': 2}}, {**stopped, 'colour': 'red'},
+            # a JSON Schema integer may be written 1.0; a boolean, a fraction, a string or null is not one
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': 1.0}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': True}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': False}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': 1.5}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': '1'}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': None}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1.0, 'st_ino': 2}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1, 'st_ino': 2.0}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1.5, 'st_ino': 2}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1, 'st_ino': '2'}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': -1.0, 'st_ino': 2}}},
+            {'code': 'stopped', 'run_id': self.RUN}, 'stopped', [], 7,
+        ]
+
+    def test_an_answer_settles_exactly_when_it_is_a_well_formed_confirmation_of_this_run(self):
+        rules = published_rules()
+        self.assertIsNotNone(rules, "SPINE's conformance/rules.py (#368) is not in the tree")
+        outcomes = {True: 0, False: 0}
+        for answer in self.answers():
+            confirms = (isinstance(answer, dict) and rules.fits('stop.result.v1.json', answer)
+                        and answer['code'] in ('stopped', 'ended') and answer['run_id'] == self.RUN)
+            outcomes[confirms] += 1
+            with self.subTest(answer=answer):
+                self.assertEqual(records.stop_confirmed(answer, self.RUN), answer['code'] if confirms else None)
+        self.assertGreaterEqual(min(outcomes.values()), 10, outcomes)
+
+    def test_a_confirmation_of_another_run_settles_nothing(self):
+        self.assertIsNone(records.stop_confirmed(stop_answer('run-0002', 'stopped'), self.RUN))
+        self.assertEqual(records.stop_confirmed(stop_answer(self.RUN, 'ended'), self.RUN), 'ended')
 
 
 if __name__ == '__main__':

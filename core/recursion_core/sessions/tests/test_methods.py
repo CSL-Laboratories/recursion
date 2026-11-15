@@ -4,8 +4,10 @@ own with the lane installed (``support.Lane``), and the shared ``FakeStore``.
 
 What is tested is the published order of checks (methods.v1, rule 3): the receipt first, then the revision or
 turn, then ``busy``; that a returned answer is kept and replayed for its id, and a ``NotAccepted`` one is not;
-that two commands with one id at once run the handler once; and that every answer has the shape the published
-method table gives it (on an interpreter with ``jsonschema``, through SPINE's conformance client).
+that two commands with one id at once run the handler once; that every request is checked whole against its
+published params before anything else; and that every answer has the shape the published method table gives
+it: on every interpreter through SPINE's standard-library reader (``conformance/rules.py``, ``fits``), and on
+one with ``jsonschema`` through SPINE's conformance client too.
 """
 from __future__ import annotations
 
@@ -15,6 +17,17 @@ import unittest
 from recursion_core.control import hooks as H
 from recursion_core.sessions import store
 from recursion_core.sessions.tests.support import BOUND_S, SCHEMAS, Lane, published_rules, wire_client
+
+# Values tried in every field of every method; which of them a field admits is decided by SPINE's reader.
+SHAPE_VALUES = (None, '', 'x', 'line\n', 'Bad Engine', 'codex', 'contained', 'standard', 'steer', 'now', 'idle',
+                'asleep', 'ses-shape', 'qi-shape', 'turn-shape', 'cmd-shape-value1', 'short', 0, -1, 1, 1.0, 1.5, 1000,
+                1001, True, [], {}, {'engine': 'codex', 'model': None}, {'engine': 'codex', 'model': 'm'},
+                {'engine': 'codex'}, {'engine': 'codex', 'model': None, 'extra': True},
+                {'engine': 'Codex', 'model': None},
+                {'engine': 'codex', 'model': ''}, {'path': '/x'}, {'path': ''}, {'path': '/x', 'mode': 'copy'},
+                {'path': '/x', 'mode': 'worktree', 'base_ref': 'main'}, {'path': '/x', 'base_ref': ''},
+                {'path': '/x', 'other': 1}, {'cap_usd': 1}, {'cap_usd': 1.5}, {'cap_usd': -1}, {'cap_usd': True},
+                {'cap_usd': 1, 'more': 2})
 
 
 class MethodsTest(unittest.TestCase):
@@ -111,9 +124,13 @@ class MethodsTest(unittest.TestCase):
 
     def test_a_start_the_slice_does_not_honour_is_refused_and_leaves_no_receipt(self):
         cases = [({'parent_session_id': 'ses-parent'}, 'unsupported'), ({'workspace': {'path': '/x'}}, 'unsupported'),
-                 ({'containment_level': 'standard'}, 'unsupported'), ({'engine': 'pi'}, 'unavailable'),
+                 ({'containment_level': 'contained'}, 'unsupported'), ({'engine': 'pi'}, 'unavailable'),
                  ({'budget': {'cap_usd': -1}}, 'request_invalid'), ({'prompt': ''}, 'request_invalid'),
-                 ({'colour': 'red'}, 'request_invalid')]
+                 ({'colour': 'red'}, 'request_invalid'), ({'containment_level': 'standard'}, 'request_invalid'),
+                 ({'parent_session_id': None}, 'request_invalid'), ({'containment_level': None}, 'request_invalid'),
+                 ({'hand_pick': None}, 'request_invalid'), ({'hand_pick': {}}, 'request_invalid'),
+                 ({'hand_pick': {'engine': 'codex', 'model': None, 'extra': True}}, 'request_invalid'),
+                 ({'engine': 'bad engine'}, 'request_invalid')]
         for number, (change, code) in enumerate(cases):
             with self.subTest(change=change):
                 params = {'command_id': f'cmd-refused-{number:04d}', 'tenant': 't1', 'engine': 'claude_code', **change}
@@ -217,7 +234,7 @@ class MethodsTest(unittest.TestCase):
 
     # ------------------------------------------------------------------------------- steer and queue
     def test_a_steer_aimed_at_a_turn_that_is_no_longer_the_active_one_is_a_conflict(self):
-        live = self.start(prompt='first')['session']
+        live = self.start(engine='codex', prompt='first')['session']
         ended_turn = live['active_turn_id']
         self.finish(live['session_id'])
         answer = self.call('session.steer', {'command_id': 'cmd-steer-old-1', 'session_id': live['session_id'],
@@ -225,6 +242,99 @@ class MethodsTest(unittest.TestCase):
         self.assertEqual(answer, {'code': 'conflict', 'detail': 'stale_turn', 'session_id': live['session_id']})
         with self.lane.store.transaction() as tx:
             self.assertEqual(store.items(tx, live['session_id']), [])
+
+    def test_no_steer_is_admitted_on_an_engine_that_gives_no_typed_acceptance(self):
+        """Questions.md Q7 is Lucas's: until he answers, steering is not offered where the driver declares no
+        input_ack, neither into the turn in progress nor as the next turn, and an edit cannot turn a queued
+        message into a steer there. Nothing is written and no receipt is kept."""
+        for engine in ('codex', 'opencode', 'claude_code'):     # mid-turn, next turn, today's one-turn path
+            with self.subTest(engine=engine):
+                self.lane = Lane()
+                self.lane.drivers.by_engine[engine]['input_ack'] = False
+                live = self.start(engine=engine, prompt='first', command_id=f'cmd-noack-{engine}')['session']
+                steer = self.call('session.steer', {'command_id': 'cmd-noack-steer1', 'session_id': live['session_id'],
+                                                    'text': 'held', 'expected_turn_id': live['active_turn_id']})
+                self.assertEqual(steer, {'code': 'unsupported', 'detail': 'not_implemented',
+                                         'session_id': live['session_id']})
+                item = self.call('session.queue', {'command_id': 'cmd-noack-queue1', 'session_id': live['session_id'],
+                                                   'text': 'later'})['item']
+                edit = self.call('queue.update', {'command_id': 'cmd-noack-edit01', 'item_id': item['item_id'],
+                                                  'expected_revision': 1, 'delivery': 'steer'})
+                self.assertEqual(edit, {'code': 'unsupported', 'detail': 'not_implemented', 'item_id': item['item_id']})
+                with self.lane.store.transaction() as tx:
+                    self.assertEqual([(found['delivery'], found['revision']) for found in
+                                      store.items(tx, live['session_id'])], [('next_turn', 1)])
+                self.assertEqual(sorted(method for _, method, _ in self.receipts()), ['session.queue', 'session.start'])
+        self.lane = Lane()
+        live = self.lane.start(engine='opencode', prompt='first', command_id='cmd-noack-gone01')['session']
+        self.lane.drivers.by_engine.pop('opencode')
+        gone = self.call('session.steer', {'command_id': 'cmd-noack-steer2', 'session_id': live['session_id'],
+                                           'text': 'held', 'expected_turn_id': live['active_turn_id']})
+        self.assertEqual(gone, {'code': 'unavailable', 'detail': 'driver_absent', 'session_id': live['session_id']})
+
+    def test_every_supplied_field_must_have_its_published_shape(self):
+        """Every field of every method this slice answers, with every value of ``SHAPE_VALUES``: a value the
+        published params refuse (a null included, where the schema does not admit null) is ``request_invalid``
+        naming the field, with no receipt, no session and no item written; a value they admit is never
+        ``request_invalid``. SPINE's reader decides which is which, on every interpreter."""
+        session = self.start()['session']
+        sid = session['session_id']
+        item = self.call('session.queue', {'command_id': 'cmd-shape-item1', 'session_id': sid, 'text': 'q'})['item']
+        base = {
+            'session.start': {'command_id': 'cmd-shape-start', 'tenant': 't1', 'engine': 'claude_code'},
+            'session.turn': {'command_id': 'cmd-shape-turn1', 'session_id': sid, 'text': 'x', 'expected_revision': 1},
+            'session.queue': {'command_id': 'cmd-shape-queue', 'session_id': sid, 'text': 'x'},
+            'session.steer': {'command_id': 'cmd-shape-steer', 'session_id': sid, 'text': 'x',
+                              'expected_turn_id': 'turn-shape'},
+            'queue.update': {'command_id': 'cmd-shape-edit1', 'item_id': item['item_id'], 'expected_revision': 1,
+                             'text': 'y'},
+            'queue.cancel': {'command_id': 'cmd-shape-cancel', 'item_id': item['item_id'], 'expected_revision': 9},
+            'session.status': {'session_id': sid},
+            'session.list': {},
+        }
+        fields = {
+            'session.start': ('command_id', 'tenant', 'engine', 'hand_pick', 'workspace', 'prompt',
+                              'parent_session_id', 'containment_level', 'budget'),
+            'session.turn': ('command_id', 'session_id', 'text', 'expected_revision'),
+            'session.queue': ('command_id', 'session_id', 'text'),
+            'session.steer': ('command_id', 'session_id', 'text', 'expected_turn_id'),
+            'queue.update': ('command_id', 'item_id', 'expected_revision', 'text', 'delivery'),
+            'queue.cancel': ('command_id', 'item_id', 'expected_revision'),
+            'session.status': ('session_id',),
+            'session.list': ('tenant', 'state', 'parent_session_id', 'limit', 'after'),
+        }
+        tried = {True: 0, False: 0}
+        for method, params in base.items():
+            for field in fields[method]:
+                for value in SHAPE_VALUES:
+                    # A fresh command id for each case: the dispatcher reads the receipt of an id BEFORE the
+                    # handler, so an id that an earlier case committed would be answered from its receipt.
+                    fresh = {'command_id': f'cmd-shape-{sum(tried.values()):06d}'} if 'command_id' in params else {}
+                    request = {**params, **fresh, field: value}
+                    admitted = self.rules.fits(f'methods.v1.json#/$defs/params.{method}', request)
+                    tried[admitted] += 1
+                    with self.subTest(method=method, field=field, value=value):
+                        before = (len(self.receipts()), self.counts())
+                        answer = self.call(method, request)
+                        if admitted:
+                            self.assertNotEqual(answer['code'], 'request_invalid', answer)
+                        else:
+                            self.assertEqual(answer, {'code': 'request_invalid', 'detail': field})
+                            self.assertEqual((len(self.receipts()), self.counts()), before)
+        self.assertGreater(min(tried.values()), 100, tried)
+
+    def counts(self):
+        with self.lane.store.transaction() as tx:
+            sessions = store.page(tx, limit=1000)[0]
+            return len(sessions), sum(len(store.items(tx, found['session_id'])) for found in sessions)
+
+    def test_a_whole_number_written_as_a_float_is_the_integer_it_names(self):
+        session = self.start()['session']
+        answer = self.call('session.turn', {'command_id': 'cmd-float-0001', 'session_id': session['session_id'],
+                                            'text': 'x', 'expected_revision': 3.0})
+        self.assertEqual(answer, {'code': 'conflict', 'detail': 'stale_revision', 'current_revision': 1,
+                                  'session_id': session['session_id']})
+        self.assertEqual(len(self.call('session.list', {'limit': 1.0})['sessions']), 1)
 
     def test_a_steer_and_a_queued_message_are_queued_in_order(self):
         live = self.start(engine='codex', prompt='first')['session']
@@ -287,7 +397,9 @@ class MethodsTest(unittest.TestCase):
                 ('session.queue', {'command_id': 'cmd-bad-00003', 'session_id': session['session_id'], 'text': 7},
                  'text'),
                 ('session.list', {'limit': 0}, 'limit'),
-                ('session.list', {'state': 'asleep'}, 'state')):
+                ('session.list', {'state': 'asleep'}, 'state'),
+                ('session.list', [], 'params'),
+                ('session.status', 'ses-x', 'params')):
             with self.subTest(method=method, field=field):
                 self.assertEqual(self.call(method, params), {'code': 'request_invalid', 'detail': field})
         self.assertEqual(list(self.receipts()), [('t1', 'session.start', 'cmd-start-0001')])

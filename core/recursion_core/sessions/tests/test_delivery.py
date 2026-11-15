@@ -6,8 +6,9 @@ each step is made in a transaction of its own, through ``delivery.step``, exactl
 reads the step: an acceptance is read from its input.accepted event and from nothing else, a write into a turn
 from its steer.sent event. After each step the stored item must be the vector's item, a refusal must carry the
 vector's code and change nothing (not the item, not its binding, not the record of the write), and kept
-evidence must be the vector's. The event the step appended, when the vector shows one, must have the vector's
-type and payload.
+evidence must be the vector's. The event the step appended, when the vector shows one that the rule writes,
+must be the vector's in full: log, run, turn, type, source, trust and payload. Five events are filed
+differently, each named in ``ENVELOPE_EXCEPTIONS`` with its reason; a named one that stops occurring fails too.
 """
 from __future__ import annotations
 
@@ -18,6 +19,23 @@ from recursion_core.sessions import delivery, machine, records, store, tables
 from recursion_core.sessions.tests.support import SCHEMAS, FakeStore, load_json
 
 VECTORS = SCHEMAS / 'vectors' / 'queue.delivery'
+ENVELOPE = ('session_id', 'run_id', 'turn_id', 'type', 'source', 'trust', 'payload')
+WRITTEN_BY_THE_RULE = ('steer.queued', 'steer.sent', 'effect.outcome_unknown', 'input.accepted')
+
+# The events this lane files otherwise than the vector shows them: (vector, step) -> {member: (the vector's value,
+# this lane's value)}. Reported to SPINE (questions.md Q8); the vectors are SPINE's and are not edited here.
+# - d02, d03, d04, d12: an effect.outcome_unknown is filed under the turn the delivery's BINDING aims at
+#   (turn-000d), where the vector files it under the turn before (turn-000c). The binding is what the effect was
+#   aimed at, so this lane keeps its turn.
+# - d07 step 1: the walk's session is idle (it has no unit and no turn in progress), so a queue edit is filed
+#   with no run and no turn; the vector's log is of a live session. And the core writes it ('core'), where the
+#   vector shows the client's own write ('client'); event.v1 admits both.
+_UNKNOWN_TURN = {'turn_id': ('turn-000c', 'turn-000d')}
+ENVELOPE_EXCEPTIONS = {
+    ('d02', 2): _UNKNOWN_TURN, ('d03', 3): _UNKNOWN_TURN, ('d04', 3): _UNKNOWN_TURN, ('d12', 4): _UNKNOWN_TURN,
+    ('d07', 1): {'run_id': ('run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7', None), 'turn_id': ('turn-000c', None),
+                 'source': ('client', 'core')},
+}
 
 
 def facts_of(step: dict) -> dict:
@@ -50,6 +68,7 @@ class VectorTest(unittest.TestCase):
 
     def walk(self, name: str) -> None:
         vector = load_json(VECTORS / name)
+        met = set()
         db = FakeStore()
         tables.declare(db)
         item = vector['item']
@@ -82,18 +101,18 @@ class VectorTest(unittest.TestCase):
                 appended = db.events[events_before:]
                 shown = step.get('event')
                 # A refused write's steer.sent is what the step OBSERVED, not something the rule wrote.
-                if (shown is not None and 'refused' not in step
-                        and shown['type'] in ('steer.queued', 'steer.sent', 'effect.outcome_unknown')):
-                    self.assertEqual([(event['type'], event['payload']) for event in appended],
-                                     [(shown['type'], shown['payload'])])
-                if shown is not None and shown['type'] == 'input.accepted' and 'refused' not in step:
-                    self.assertEqual(len(appended), 1)
-                    self.assertEqual({key: appended[0][key] for key in ('session_id', 'run_id', 'turn_id', 'type',
-                                                                         'source', 'trust', 'payload')},
-                                     {key: shown[key] for key in ('session_id', 'run_id', 'turn_id', 'type',
-                                                                  'source', 'trust', 'payload')})
+                if shown is not None and 'refused' not in step and shown['type'] in WRITTEN_BY_THE_RULE:
+                    self.assertEqual(len(appended), 1, appended)
+                    ours = {key: appended[0][key] for key in ENVELOPE}
+                    theirs = {key: shown[key] for key in ENVELOPE}
+                    for key, (their_value, our_value) in ENVELOPE_EXCEPTIONS.get((name[:3], number), {}).items():
+                        self.assertEqual((theirs.pop(key), ours.pop(key)), (their_value, our_value), key)
+                        met.add((name[:3], number))
+                    self.assertEqual(ours, theirs)
                 if refused is not None:
                     self.assertEqual(appended, [], 'a refusal appended an event')
+        named = {key for key in ENVELOPE_EXCEPTIONS if key[0] == name[:3]}
+        self.assertEqual(met, named, 'a named exception no longer occurs')
 
     def test_there_are_fourteen_vectors(self):
         self.assertEqual(len([name for name in os.listdir(VECTORS) if name.endswith('.json')]), 14)
@@ -131,7 +150,8 @@ class DeliveryRuleTest(unittest.TestCase):
     def test_a_turn_input_is_bound_new_turn_only_and_never_twice(self):
         with self.db.transaction() as tx:
             delivery.begin_input(tx, self.binding())
-        for change in ({'how': 'mid_turn'}, {'delivery_id': 'dlv-0001'}, {'target_turn_id': None}):
+        for change in ({'how': 'mid_turn', 'delivery_id': 'dlv-0009'}, {'delivery_id': 'dlv-0001'},
+                       {'target_turn_id': None, 'delivery_id': 'dlv-0010'}):
             with self.subTest(change=change), self.db.transaction() as tx:
                 with self.assertRaises(delivery.Refused) as caught:
                     delivery.begin_input(tx, self.binding(**change))

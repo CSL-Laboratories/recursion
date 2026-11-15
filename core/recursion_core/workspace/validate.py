@@ -33,22 +33,55 @@ check cannot move the run, because the run never works through the link, only in
 to when it was checked. The provider that makes the run's folder at launch (seam S4) checks again then.
 
 GIT. ``git_work_tree(folder)`` answers the top of the git work tree a folder is in, or None. It reads the file
-system the way git's own discovery reads it (``setup.c`` in git 2.43: ``setup_git_directory_gently_1``,
-``read_gitfile_gently``, ``is_git_directory``, ``validate_headref``) and runs no git. From the folder upwards,
-never across a mount (git's default), each folder is asked two things in turn:
+system the way git 2.43 reads it to find a repository (``setup.c``: ``setup_git_directory_gently_1``,
+``read_gitfile_gently``, ``is_git_directory``, ``validate_headref``, ``check_repository_format_gently``,
+``setup_explicit_git_dir``) and runs no git. From the folder as it really is, upwards, never across a mount
+(git's default), each folder is asked two things in turn:
 
 - its ``.git``, links followed. A FILE there must be a gitfile git accepts: at most 1 MiB, ``gitdir: <path>``
   (a relative path is the file's folder's), naming a git directory. One git refuses ends the search with None,
-  because git refuses the folder too; it does not go on to a repository further up. A git DIRECTORY there
-  makes this folder the top. Anything else (nothing, a dangling link, a folder that is no git directory, a
-  pipe) is passed over, as git passes it over.
-- the folder itself: a git directory (a bare repository, or the ``.git`` folder of one) is in no work tree,
-  so the answer is None.
+  because git refuses the folder too; it does not go on to a repository further up. A git DIRECTORY there is
+  the repository found. Anything else (nothing, a dangling link, a folder that is no git directory, a pipe) is
+  passed over, as git passes it over.
+- the folder itself: a git directory (a bare repository, or the ``.git`` folder of one) is the repository found.
+
+The first repository found decides; the search goes no further up. Its own configuration decides the answer:
+
+- ``core.worktree`` names the top: an absolute name as it really is, a relative one from the git directory as
+  it really is. The folder is in the work tree when it is that top or inside it, and in none otherwise.
+  ``core.bare`` true as well: no work tree (git warns).
+- else ``core.bare`` true: no work tree.
+- else the folder whose ``.git`` was found is the top, and a folder inside a git directory is in no work tree.
+
+git takes the two settings from the ``config`` in the repository's common directory, and only when that file
+gives ``core.repositoryformatversion`` as 0 or more. A linked worktree's git directory has a common directory of
+its own, and git ignores the two settings there, unless ``extensions.worktreeConfig`` is on. Then the
+worktree's ``config.worktree`` may override them. git reads no global, system or included file to find a
+repository, and neither does this. git refuses the repository (the answer is None) when:
+
+- a config file it reads cannot be read, or breaks its syntax (sections, ``"subsections"``, quoting, the four
+  escapes, comments, continued lines, a byte-order mark);
+- a value is one git does not take. A boolean is true, yes, on, false, no, off, empty, or a number as
+  ``strtoimax`` reads one in base 0, with a unit k, m or g, within an int. ``core.worktree`` needs a value;
+- the version is above 1, or names at version 0 an extension only version 1 knows;
+- ``extensions.objectFormat`` is not ``sha1`` or ``sha256``.
+
+Four things git refuses later, when it reads the whole configuration or opens the repository, are not read
+here. The provider's own git meets them at launch:
+
+- an extension git 2.43 does not know is not held against a repository (a newer git may know it:
+  ``refStorage``);
+- the values of other keys;
+- the files an ``include`` names;
+- the owner check (``safe.directory``).
+
+A config file over 16 MiB, or one that is not a regular file, is refused here: git would read the first and
+wait on a pipe.
 
 A git directory has a ``HEAD`` git accepts (a link into ``refs/``, or a file that begins ``ref:`` and, after
-git's own spaces, ``refs/``, or one that begins with an object id), and in its common directory (the folder its
-``commondir`` file names, which a linked worktree's git directory has; else itself) an ``objects`` and a
-``refs`` that may be entered. A file is read without waiting, so a pipe where git expects a file answers at
+git's own spaces, ``refs/``, or one that begins with an object id). In its common directory (the folder its
+``commondir`` file names, which a linked worktree's git directory has; else itself) it has an ``objects`` and
+a ``refs`` that may be entered. A file is read without waiting, so a pipe where git expects a file answers at
 once. ``valid_base_ref(text)`` says whether a base given in a request is a revision this lane passes to git: a
 ref name as git's own rules allow one, or a commit id, with ``~N`` and ``^N`` steps.
 """
@@ -198,14 +231,326 @@ def _gitfile(marker: Path) -> Path | None:
     return folder if _is_git_directory(folder) else None
 
 
+# ---------------------------------------------------------------- the repository's own configuration
+_CONFIG_MAX = 1 << 24                           # this lane's limit on a config file (git has none)
+_C_SPACE = b' \t\n\v\f\r'                        # the C library's isspace, which strtoimax skips
+_INT_MAX = (1 << 31) - 1
+_UNITS = {b'': 1, b'k': 1 << 10, b'm': 1 << 20, b'g': 1 << 30}
+_DIGITS = {2: b'01', 8: b'01234567', 10: b'0123456789', 16: b'0123456789abcdefABCDEF'}
+_ALPHA = frozenset(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+_KEY = _ALPHA | frozenset(b'0123456789-')       # git's iskeychar
+_ESCAPES = {ord('t'): ord('\t'), ord('b'): ord('\b'), ord('n'): ord('\n'), ord('\\'): ord('\\'), ord('"'): ord('"')}
+_LF = ord('\n')
+
+
+def _int(value: bytes | None) -> int | None:
+    """git's ``git_parse_int``: ``strtoimax`` in base 0 (``0x`` hexadecimal, ``0b`` binary as this C library
+    reads it, a leading ``0`` octal), then nothing or a unit ``k``, ``m``, ``g``, within an int; else None."""
+    if not value:
+        return None
+    text = value.lstrip(_C_SPACE)
+    sign = -1 if text[:1] == b'-' else 1
+    if text[:1] in (b'-', b'+'):
+        text = text[1:]
+    base = 10
+    if text[:1] == b'0':                       # a 0x or 0b with no digit after it is refused either way
+        base = 8
+        if text[1:2] in (b'x', b'X'):
+            base, text = 16, text[2:]
+        elif text[1:2] in (b'b', b'B'):
+            base, text = 2, text[2:]
+    end = 0
+    while end < len(text) and text[end] in _DIGITS[base]:
+        end += 1
+    factor = _UNITS.get(text[end:].lower())
+    if not end or factor is None:
+        return None
+    number = sign * int(text[:end], base)
+    return None if abs(number) > _INT_MAX // factor else number * factor
+
+
+def _bool(value: bytes | None) -> bool | None:
+    """git's ``git_config_bool``; None where git refuses the value."""
+    if value is None:
+        return True
+    if not value:
+        return False
+    if value.lower() in (b'true', b'yes', b'on'):
+        return True
+    if value.lower() in (b'false', b'no', b'off'):
+        return False
+    number = _int(value)
+    return None if number is None else number != 0
+
+
+def _lower(char: int) -> int:
+    return char + 32 if 65 <= char <= 90 else char
+
+
+class _Source:
+    """git's ``get_next_char``: a byte at a time, a CR before an LF dropped, the end read as an LF (``eof``)."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data, self.at, self.eof = data, 0, False
+
+    def next(self) -> int:
+        if self.at >= len(self.data):
+            self.eof = True
+            return _LF
+        char = self.data[self.at]
+        self.at += 1
+        if char == ord('\r') and self.data[self.at:self.at + 1] == b'\n':
+            self.at += 1
+            return _LF
+        return char
+
+
+def _subsection(source: _Source, name: bytearray, char: int) -> bytes | None:
+    """git's ``get_extended_base_var``: after the section's name and a space, ``"<subsection>"]``."""
+    while True:
+        if char == _LF:
+            return None
+        char = source.next()
+        if char not in _GIT_SPACE:
+            break
+    if char != ord('"'):
+        return None
+    name.append(ord('.'))
+    while True:
+        char = source.next()
+        if char == _LF:
+            return None
+        if char == ord('"'):
+            break
+        if char == ord('\\'):
+            char = source.next()
+            if char == _LF:
+                return None
+        name.append(char)
+    return bytes(name) if source.next() == ord(']') else None
+
+
+def _section(source: _Source) -> bytes | None:
+    """git's ``get_base_var``: after ``[``, the section's name lower-cased, and its subsection as written."""
+    name = bytearray()
+    while True:
+        char = source.next()
+        if source.eof:
+            return None
+        if char == ord(']'):
+            return bytes(name)
+        if char in _GIT_SPACE:
+            return _subsection(source, name, char)
+        if char not in _KEY and char != ord('.'):
+            return None
+        name.append(_lower(char))
+
+
+def _value(source: _Source) -> bytes | None:
+    """git's ``parse_value``: after ``=``, to the end of the line."""
+    value, quoted, comment, trim = bytearray(), False, False, 0
+    while True:
+        char = source.next()
+        if char == _LF:
+            if quoted:
+                return None
+            if trim:
+                del value[trim:]
+            return bytes(value)
+        if comment:
+            continue
+        if char in _GIT_SPACE and not quoted:
+            if not trim:
+                trim = len(value)
+            if value:
+                value.append(char)
+            continue
+        if char in b';#' and not quoted:
+            comment = True
+            continue
+        trim = 0
+        if char == ord('\\'):
+            char = source.next()
+            if char == _LF:
+                continue
+            if char not in _ESCAPES:
+                return None
+            value.append(_ESCAPES[char])
+        elif char == ord('"'):
+            quoted = not quoted
+        else:
+            value.append(char)
+
+
+def _entry(source: _Source, name: bytearray) -> tuple | None:
+    """git's ``get_value``: the rest of a key, and ``= value`` or nothing (the value None)."""
+    while True:
+        char = source.next()
+        if char not in _KEY:
+            break
+        name.append(_lower(char))
+    while char in b' \t':
+        char = source.next()
+    value = None
+    if char != _LF:
+        value = _value(source) if char == ord('=') else None
+        if value is None:
+            return None
+        value = value.split(b'\0')[0]                 # git hands its callback a C string
+    return bytes(name).split(b'\0')[0], value
+
+
+def _entries(data: bytes) -> list | None:
+    """git's ``git_parse_source``: a config file's ``(name, value)`` entries in order, or None where git refuses
+    the file. A name is ``section.key`` (``section.subsection.key``), lower-cased but for the subsection."""
+    if data[:1] == b'\xef':
+        if data[:3] != b'\xef\xbb\xbf':               # a byte-order mark, whole or not at all
+            return None
+        data = data[3:]
+    source, entries, stem, comment = _Source(data), [], b'', False
+    while True:
+        char = source.next()
+        if char == _LF:
+            if source.eof:
+                return entries
+            comment = False
+        elif comment or char in _GIT_SPACE:
+            continue
+        elif char in b'#;':
+            comment = True
+        elif char == ord('['):
+            section = _section(source)
+            if not section:
+                return None
+            stem = section + b'.'
+        elif char in _ALPHA:
+            entry = _entry(source, bytearray(stem + bytes((_lower(char),))))
+            if entry is None:
+                return None
+            entries.append(entry)
+        else:
+            return None
+
+
+def _config(path: Path) -> list | None:
+    """The entries of the config file at ``path``: none when there is no file, None where it is refused (it
+    cannot be read, it is not a regular file, it is over ``_CONFIG_MAX``, git would not parse it)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except (OSError, ValueError):
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks, size = [], 0
+        while size <= _CONFIG_MAX:
+            chunk = os.read(fd, _CONFIG_MAX + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return None if size > _CONFIG_MAX else _entries(b''.join(chunks))
+
+
+def _core(name: bytes, value: bytes | None, settings: tuple) -> tuple | None:
+    """git's ``read_worktree_config``: ``core.bare`` and ``core.worktree`` into ``(bare, worktree)``."""
+    bare, worktree = settings
+    if name == b'core.bare':
+        bare = _bool(value)
+        if bare is None:
+            return None
+    elif name == b'core.worktree':
+        if value is None:
+            return None
+        worktree = value
+    return bare, worktree
+
+
+def _settings(gitdir: Path) -> tuple | None:
+    """git's ``check_repository_format_gently``: the ``(bare, worktree)`` the repository's configuration gives
+    discovery, each None when not given, or None where git refuses the repository. See the module's text."""
+    common = _common_dir(gitdir)
+    entries = None if common is None else _config(common / 'config')
+    if entries is None:
+        return None
+    version, per_worktree, newer, settings = -1, False, False, (None, None)
+    for name, value in entries:
+        if name == b'core.repositoryformatversion':
+            version = _int(value)
+            if version is None:
+                return None
+        elif name in (b'extensions.preciousobjects', b'extensions.worktreeconfig'):
+            flag = _bool(value)
+            if flag is None:
+                return None
+            per_worktree = flag if name == b'extensions.worktreeconfig' else per_worktree
+        elif name == b'extensions.partialclone' and value is None:
+            return None
+        elif name == b'extensions.objectformat' and value not in (b'sha1', b'sha256'):
+            return None
+        elif name in (b'extensions.objectformat', b'extensions.noop-v1'):
+            newer = True
+        else:
+            settings = _core(name, value, settings)
+            if settings is None:
+                return None
+    if version < 0:
+        return None, None
+    if version > 1 or (version == 0 and newer):
+        return None
+    if not per_worktree:
+        return (None, None) if os.path.exists(gitdir / 'commondir') else settings
+    entries = _config(gitdir / 'config.worktree')
+    if entries is None:
+        return None
+    for name, value in entries:
+        settings = _core(name, value, settings)
+        if settings is None:
+            return None
+    return settings
+
+
+def _named_top(gitdir: Path, value: bytes) -> Path | None:
+    """The folder ``core.worktree`` names, as git resolves it (see the module's text); None where git could not."""
+    name = os.fsdecode(value)
+    if not name:                                  # git: "cannot chdir to ''"
+        return None
+    if not name.startswith('/'):
+        name = os.path.join(gitdir, name)         # resolved below as git's chdir resolves it: links first
+    try:
+        return Path(os.path.realpath(name, strict=True))
+    except (OSError, ValueError):
+        return None
+
+
+def _top(gitdir: Path, found: Path | None, folder: Path) -> Path | None:
+    """The answer once ``gitdir`` is found: ``found`` is the folder whose ``.git`` it is, None when ``folder`` is
+    inside the git directory itself."""
+    settings = _settings(gitdir)
+    if settings is None:
+        return None
+    bare, worktree = settings
+    if worktree is not None and not bare:
+        top = _named_top(gitdir, worktree)
+        return top if top is not None and _inside(folder, top) else None
+    return None if bare or found is None else found
+
+
 def git_work_tree(folder) -> Path | None:
     """The top of the git work tree ``folder`` is in, or None, as git's own discovery finds it. See the
     module's text. It reads the file system and runs nothing."""
-    current = Path(folder)
     try:
-        device = os.stat(current).st_dev
+        start = Path(os.path.realpath(folder, strict=True))
+        device = os.stat(start).st_dev
     except (OSError, ValueError):
         return None
+    current = start
     while True:
         marker = current / '.git'
         try:
@@ -213,11 +558,12 @@ def git_work_tree(folder) -> Path | None:
         except (OSError, ValueError):
             kind = None
         if kind is not None and stat.S_ISREG(kind):
-            return current if _gitfile(marker) is not None else None
+            gitdir = _gitfile(marker)
+            return None if gitdir is None else _top(gitdir, current, start)
         if kind is not None and _is_git_directory(marker):
-            return current
+            return _top(marker, current, start)
         if _is_git_directory(current):
-            return None
+            return _top(current, None, start)
         parent = current.parent
         if parent == current:
             return None

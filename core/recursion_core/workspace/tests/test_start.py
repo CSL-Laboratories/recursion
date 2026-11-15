@@ -95,6 +95,38 @@ class NormalizerTest(unittest.TestCase):
         self.assertEqual(self.ask({'path': str(marker), 'mode': 'worktree'}),
                          H.Refusal('workspace_invalid', 'not_a_repository'))
 
+    def test_a_repository_git_finds_no_work_tree_in_is_direct(self) -> None:
+        refused = H.Refusal('workspace_invalid', 'not_a_repository')
+        stored = self.root / 'stored-bare'
+        (stored / '.git').mkdir(parents=True)
+        repos.git(stored / '.git', 'init', '-q', '--bare')       # a bare repository kept as a .git folder
+        configured = self.root / 'configured-bare'
+        repos.make_repo(configured)
+        repos.git(configured, 'config', 'core.bare', 'true')
+        elsewhere = self.root / 'named-elsewhere'
+        repos.make_repo(elsewhere)
+        (self.root / 'actual').mkdir()
+        repos.git(elsewhere, 'config', 'core.worktree', str(self.root / 'actual'))
+        for folder in (stored, configured, elsewhere):
+            self.assertEqual(self.ask({'path': str(folder)}), self.launch('direct', folder), folder.name)
+            self.assertEqual(self.ask({'path': str(folder), 'mode': 'worktree'}), refused, folder.name)
+
+    def test_a_configured_work_tree_is_the_top_a_folders_place_is_taken_from(self) -> None:
+        container = self.root / 'container'
+        repos.make_repo(container)
+        actual = container / 'actual project'
+        for sub in ('pkg', 'sub dir'):
+            (actual / sub).mkdir(parents=True)
+        repos.git(container, 'config', 'core.worktree', str(actual))
+        for value in ({'path': str(actual)}, {'path': str(actual), 'mode': 'worktree'}):
+            self.assertEqual(self.ask(value), self.launch('worktree', actual), value)
+        self.assertEqual(self.ask({'path': str(actual / 'pkg')}), self.launch('worktree', actual / 'pkg'))
+        self.assertEqual(self.ask({'path': str(actual / 'sub dir')}), H.Refusal('workspace_invalid', 'not_unit_safe'))
+        self.assertEqual(self.ask({'path': str(actual), 'mode': 'direct'}), H.Refusal('workspace_invalid', 'not_unit_safe'))
+        self.assertEqual(self.ask({'path': str(container)}), self.launch('direct', container))
+        self.assertEqual(self.ask({'path': str(container), 'mode': 'worktree'}),
+                         H.Refusal('workspace_invalid', 'not_a_repository'))
+
     def test_direct_mode_reads_no_git_metadata(self) -> None:
         def no_git(folder):
             raise AssertionError('direct mode read git metadata')

@@ -30,8 +30,10 @@ unit-safe word. So a repository named ``my project`` may be worked on in worktre
 where the launcher would refuse it after the record exists.
 
 IT IS PURE. It creates no folder, worktree or branch, writes no file and appends no event: it reads the file
-system (``stat``, ``realpath``, and in a mode other than direct the ``.git`` files and folders
-``validate.git_work_tree`` reads, the way git's own discovery reads them) and runs no git. A retried start
+system (``stat``, ``realpath``, and in a mode other than direct the ``.git`` files and folders and the
+repository's own config files ``validate.git_work_tree`` reads, the way git's own discovery reads them) and
+runs no git. A repository's ``core.worktree`` names the top the run's worktree is made from, so a folder's place
+in its repository is its place under that top. A retried start
 never reaches it: the seam matches a retry on the client's raw request before any normaliser runs, so a
 worktree made for a failed start is found again by the provider, not here.
 

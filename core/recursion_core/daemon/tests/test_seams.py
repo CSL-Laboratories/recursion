@@ -1397,12 +1397,12 @@ class RunThreadLifetimeTest(unittest.TestCase):
         is released, its run gets the engine-error result, and nothing of the run is settled: closing leaves a
         run alive."""
         store = FakeStore()
-        entered, leave, settled = threading.Event(), threading.Event(), []
+        entered, leave, settled, process = threading.Event(), threading.Event(), [], mock.Mock()
         self.addCleanup(leave.set)
 
         class Owner:
             def run(self, ctx, request, service, record_result, fault_run, settle, release):
-                ctx.process = mock.Mock()              # it launched an engine
+                ctx.process = process                  # it launched an engine
                 entered.set()
                 leave.wait(HELD_BOUND_S)
                 raise RuntimeError('lost the worker')
@@ -1416,6 +1416,98 @@ class RunThreadLifetimeTest(unittest.TestCase):
         close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), entered, leave)
         self.assertTrue(until(lambda: not starter.active('run-1')), 'released')
         self.assertEqual(settled, [], 'nothing of the run was settled while the composition closed')
+        # The third reads: its descriptors are closed all the same, and nothing is fenced. The unit is left alive.
+        process.close.assert_called_once_with()
+        process.fence.assert_not_called()
+
+    @quiet
+    def test_an_owner_that_fails_once_the_daemon_has_said_closed_has_its_descriptors_closed_and_nothing_fenced(self):
+        """The same on the daemon's own closed flag, with nothing of the composition closing: the descriptors
+        are closed, nothing is settled or fenced, and the run is released, also when closing them fails."""
+        for failing in (False, True):
+            store, settled, process = FakeStore(), [], mock.Mock()
+            if failing:
+                process.close.side_effect = OSError('a descriptor was closed already')
+
+            class Owner:
+                def run(self, ctx, request, service, record_result, fault_run, settle, release):
+                    ctx.process = process
+                    raise RuntimeError('lost the worker')
+            made = self.made(store, drive_owner=lambda ctx, request: Owner())
+            starter, service = self.starter(made, HELD_BOUND_S)
+            starter._daemon.closed = True
+            starter._settle = lambda ctx: settled.append(ctx.run_id)
+            uncaught = []
+            with self.subTest(closing_the_descriptors_fails=failing):
+                with mock.patch.object(threading, 'excepthook', lambda args: uncaught.append(args.exc_type)):
+                    with self.assertRaises(adapter.StartRefused):
+                        starter(dict(DriveOwnerSeamTest.PARAMS))
+                    self.assertTrue(until(lambda: not starter.active('run-1')), 'released')
+                    self.assertTrue(until(lambda: uncaught or not failing))
+                self.assertEqual((settled, uncaught), ([], [OSError] if failing else []), 'a failure to close them is not swallowed')
+                process.close.assert_called_once_with()
+                process.fence.assert_not_called()
+
+    @quiet
+    def test_a_settling_that_is_under_way_when_closing_begins_fences_nothing(self):
+        """The third reads. An accepted owner failed while nothing was closing, so what it launched is being
+        settled: the engine is given a moment to exit, then its tree is fenced. Closing begins in that moment.
+        The close waits for the settling (it is inside the hand-over), and the settling fences nothing: not on
+        its next time round, and not after its moment has run out. The descriptors are closed either way."""
+        for when in ('its next time round', 'after its moment has run out'):
+            store, process = FakeStore(), mock.Mock()
+            inside, leave, asked = threading.Event(), threading.Event(), []
+            self.addCleanup(leave.set)
+
+            class Owner:
+                def run(self, ctx, request, service, record_result, fault_run, settle, release):
+                    ctx.process = process
+                    raise RuntimeError('lost the worker')
+
+            def reconcile(run_id, asked=asked, inside=inside, leave=leave):
+                asked.append(run_id)
+                inside.set()
+                leave.wait(HELD_BOUND_S)
+                return mock.Mock(state='running')
+            made = self.made(store, drive_owner=lambda ctx, request: Owner())
+            folder = tempfile.mkdtemp(prefix='rc-seams-settle-')
+            self.addCleanup(shutil.rmtree, folder, True)
+            starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False, reconcile=reconcile),
+                                           folder, hooks=made, start_timeout_s=0, exit_grace_s=HELD_BOUND_S)
+            # The settling's clock, for the second case: its moment has run out as soon as it has asked once, so it
+            # leaves its rounds by the clock and stands just before the fence. (Waits elsewhere keep the real clock.)
+            clock = (lambda asked=asked: 10 * HELD_BOUND_S if asked else 0.0) if when == 'after its moment has run out' else adapter.time.monotonic
+            with self.subTest(closing_is_seen=when), mock.patch.object(adapter.time, 'monotonic', clock):
+                with self.assertRaises(adapter.StartRefused):
+                    starter(dict(DriveOwnerSeamTest.PARAMS))
+                close_waits(self, made, store, lambda: (made.begin_close(), made.finish_close(H.ServiceContext())), inside, leave)
+                process.fence.assert_not_called()
+                process.close.assert_called_once_with()
+                self.assertEqual(len(asked), 1, 'it did not go on asking after closing had begun')
+            self.assertTrue(until(lambda: not starter.active('run-1')), 'released')
+
+    def test_with_nothing_registered_a_settling_fences_as_it_always_did_while_a_close_runs(self):
+        """The other side of the last test. With hooks nobody registered into the gate is off, and a settling is
+        what it was before the seams: a close of the composition, which shuts that gate all the same, does not
+        keep it from fencing. Only the daemon's own closed flag does, as before."""
+        for daemon_closed, fenced in ((False, [mock.call('result_recorded')]), (True, [])):
+            bare = hooks_of()
+            folder = tempfile.mkdtemp(prefix='rc-seams-settle-')
+            self.addCleanup(shutil.rmtree, folder, True)
+            reconcile = mock.Mock(return_value=mock.Mock(state='running'))
+            starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=daemon_closed, reconcile=reconcile),
+                                           folder, hooks=bare, exit_grace_s=HELD_BOUND_S)
+            ctx = launcher.RunContext('run-1')
+            ctx.process = mock.Mock()
+            bare.begin_close()
+            self.assertEqual((bare.gate.enabled, bare.gate.closed), (False, True))
+            # The settling's clock: its moment has run out once it has asked about the run, or at once when the
+            # daemon has said closed and it never asks.
+            clock = lambda: 10 * HELD_BOUND_S if reconcile.call_count else 0.0   # noqa: E731
+            with self.subTest(the_daemon_has_said_closed=daemon_closed), mock.patch.object(adapter.time, 'monotonic', clock), \
+                    mock.patch.object(adapter.time, 'sleep', lambda seconds: None):
+                starter._settle(ctx)
+            self.assertEqual((ctx.process.fence.call_args_list, ctx.process.close.call_count), (fenced, 1))
 
     def test_once_closing_has_begun_a_run_is_refused_before_its_chooser_is_asked(self):
         store, asked = FakeStore(), []
@@ -2170,6 +2262,47 @@ class ServicesSeamTest(Composed):
                 self.assertEqual((len(calls), set(shut), store.closed, counts), (taken, {True}, True, ['plugins']))
                 composed.close()                        # it is closed: a later close does nothing, and raises nothing
                 self.assertEqual((len(calls), counts), (taken, ['plugins']))
+
+    def test_an_interruption_on_the_way_back_from_taking_the_close_is_inside_the_protected_region(self):
+        """The third reads. The composition's close is interrupted as the helper that takes its ownership is
+        entered (nothing is taken yet), at its return (it is taken), and at the first line after it. Each time
+        the whole close is done before the interruption is raised, and the ownership is free: a later close
+        returns, on this thread and on another. Before, the interruption escaped with the ownership held and the
+        gate open, and the daemon went on to close its registry under whatever was still inside."""
+        import inspect
+        import sys
+        method = adapter.Composition.close
+        lines, start = inspect.getsourcelines(method)
+        target = start + next(index for index, line in enumerate(lines) if line.strip() == 'while not self._closed:')
+        for where in ('the call of the taking', 'the return of the taking', 'the first line after it'):
+            made, store, composed, counts = self.about_to_close()
+            fired = []
+
+            def trace(frame, event, arg, where=where, fired=fired):
+                taking = frame.f_code is H.own_teardown.__code__ and frame.f_back.f_code is method.__code__
+                if not fired and ((where == 'the call of the taking' and event == 'call' and taking)
+                                  or (where == 'the return of the taking' and event == 'return' and taking)
+                                  or (where == 'the first line after it' and event == 'line'
+                                      and frame.f_code is method.__code__ and frame.f_lineno == target)):
+                    fired.append(where)
+                    raise KeyboardInterrupt(where)
+                return trace
+            with self.subTest(interrupted_at=where):
+                before = sys.gettrace()
+                sys.settrace(trace)
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        composed.close()
+                finally:
+                    sys.settrace(before)
+                self.assertEqual((fired, composed._closing._is_owned(), made.gate.closed, store.closed, counts),
+                                 ([where], False, True, True, ['plugins']))
+                composed.close()
+                later = []
+                other = threading.Thread(target=lambda: later.append(composed.close()), daemon=True)
+                other.start()
+                other.join(HELD_BOUND_S)
+                self.assertEqual((later, counts), ([None], ['plugins']), 'a later close returns, and closes nothing again')
 
     def test_an_interruption_between_two_steps_of_the_close_does_not_end_it(self):
         """Not every interruption lands inside a step. One that lands between two of them is kept too, and the

@@ -984,5 +984,69 @@ class ReviewSevenRegressionTests(unittest.TestCase):
             self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), attempts)
 
 
+class _NothingPresent(Mapping):
+    """A task that says every member is absent, and raises if one is read all the same."""
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def __contains__(self, key):
+        return False
+
+    def __getitem__(self, key):
+        raise RuntimeError(f"getitem {key}")
+
+    def get(self, key, default=None):
+        raise RuntimeError(f"get {key}")
+
+
+class _Engines(Mapping):
+    """A detection's engines that answer their pairs as given, so two keys may spell one engine."""
+
+    def __init__(self, pairs):
+        self.pairs = list(pairs)
+
+    def __iter__(self):
+        return iter([key for key, _ in self.pairs])
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def items(self):
+        return list(self.pairs)
+
+
+class ReviewEightRegressionTests(unittest.TestCase):
+    """The eighth read of #399 (5feab1b1): DeepSeek V4.1 Flash F1-F2, as the Liaison's ruling 7 has them (F3 is
+    answered in the lane's report)."""
+
+    def test_a_task_whose_reading_raises_is_refused_even_for_an_absent_member(self) -> None:  # ds F1
+        cfg = config()
+        decision = router.decide(cfg, SENTRY, _NothingPresent())
+        self.assertEqual((decision["ok"], decision["code"], decision["reason"]), (False, "bad_task", "task"))
+        self.assertEqual(router.explain(cfg, SENTRY, _NothingPresent())["decision"], decision)
+        self.assertTrue(router.decide(cfg, SENTRY, {})["ok"])  # the same task as a plain dict routes
+
+    def test_two_keys_that_read_as_one_engine_make_the_snapshot_unusable(self) -> None:  # ds F2
+        cfg = config()
+        refused = {"routable": False, "reason": "signed_out"}
+        routable = {"routable": True, "reason": None}
+        claude = ("claude_code", {"routable": True, "reason": None})
+        for pairs in ((("codex", refused), (_EvilHashStr("codex"), routable), claude),
+                      ((_EvilHashStr("codex"), routable), ("codex", refused), claude),
+                      (("codex", routable), ("codex", refused), claude)):
+            detection = {"engines": _Engines(pairs)}
+            with self.subTest(order=[(type(key).__name__, entry["routable"]) for key, entry in pairs[:2]]):
+                self.assertEqual(router.snapshot(detection), (None, "detection_malformed"))
+                decision = router.decide(cfg, detection, {"task_kind": "review"})
+                self.assertEqual((decision["ok"], decision["reason"]), (False, "detection_malformed"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -161,7 +161,7 @@ class FixtureTests(Shape, unittest.TestCase):
         on_disk = sorted(p.name for p in HERE.glob("*.jsonl"))
         self.assertEqual(on_disk, sorted(ENTRIES))
         for name, entry in ENTRIES.items():
-            self.assertIn(entry["synthetic"], (True, False), name)
+            self.assertIsInstance(entry["synthetic"], bool, name)   # a JSON true or false, not 1 or "yes"
             # A hand-written file is named synthetic-; a run Lucas captures will be named captured-.
             self.assertTrue(name.startswith("synthetic-" if entry["synthetic"] else "captured-"), name)
             self.assertIn(entry["package"], INDEX["sources"], name)
@@ -280,8 +280,8 @@ class UsageTests(Shape, unittest.TestCase):
     def test_the_route_result_carries_one_usage_event_per_call(self):
         p, _ = replay("synthetic-v1-tool-use.jsonl")
         events = [e for e in p.route_result("r1")["events"] if e["kind"] == "usage"]
-        self.assertEqual([e["data"]["input_tokens"] for e in events], [900, 1000])
-        self.assertEqual([e["data"]["cache_read_tokens"] for e in events], [None, 900])
+        self.assertEqual([e["data"]["input_tokens"] for e in events], [known(900), known(1000)])
+        self.assertEqual([e["data"]["cache_read_tokens"] for e in events], [UNKNOWN, known(900)])
 
 
 class LimitTests(Shape, unittest.TestCase):
@@ -364,6 +364,11 @@ class LimitTests(Shape, unittest.TestCase):
                  ({"retry-after": "sat, 14 nov 2026 00:05:00 gmt"}, "2026-11-14T00:05:00.000Z"),   # any case
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00"}, None),      # no zone: local time to Date.parse
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ"}, None),  # a zone Date.parse refuses
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ GMT"}, None),     # an unknown zone cannot hide
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ +0000"}, None),   # behind an allowed last word
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 GMT (UTC)"}, None),   # nor before a comment
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05 GMT"}, "2026-11-14T00:05:00.000Z"),       # no seconds
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 -2500"}, "2026-11-15T01:05:00.000Z"),  # as JS reads it
                  ({"retry-after": "Sat, 32 Nov 2026 00:05:00 GMT"}, None),  # impossible dates and times are
                  ({"retry-after": "Mon, 31 Nov 2026 00:05:00 GMT"}, None),  # refused, not rolled forward
                  ({"retry-after": "Sat, 31 Feb 2027 00:05:00 GMT"}, None),
@@ -840,6 +845,87 @@ class ReviewOneTests(Shape, unittest.TestCase):
         self.assertEqual(typed(drafts, "limit")[0]["reset_at"], "2026-11-14T00:00:01.000Z")
         self.assertEqual(len(p._errors), 1)
         self.assertEqual(p.end(1)[0]["payload"], {"code": c.PLAN_LIMIT, "detail": "status 429 with a reset"})
+
+    # Round 2 (Codex GPT-6.1 Sol C1-C2, DeepSeek V4.1 Flash N1-N4)
+    def clock_down_once(self):
+        calls = []
+
+        def once():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("clock down")
+            return WALL
+        return once
+
+    def test_c2_a_failed_read_installs_no_session_id(self):
+        p = oc.Parser(connection_id=CONN, model=MODEL, wall=lambda: WALL, clock=self.clock_down_once())
+        error = {"type": "error", "sessionID": "ses_unread", "error": {"name": "APIError", "data": {
+            "message": "x", "statusCode": 429, "isRetryable": True, "responseHeaders": {"retry-after": "1"}}}}
+        with self.assertRaises(OSError):
+            p.feed(line(error))
+        self.assertEqual((p.engine_session_id, p.anomalies), (None, []))
+        p.feed(line({"type": "step_start", "sessionID": "ses_next"}))
+        self.assertEqual((p.engine_session_id, p.anomalies), ("ses_next", []))
+
+    def test_c2_a_failed_reads_anomaly_is_not_kept_nor_counted_twice(self):
+        p = oc.Parser(connection_id=CONN, model=MODEL, wall=self.clock_down_once(), clock=lambda: CLOCK)
+        error = line({"type": "error", "sessionID": "ses_" + chr(0) + "bad", "error": {"name": "APIError", "data": {
+            "message": "x", "statusCode": 429, "isRetryable": True}}})
+        with self.assertRaises(OSError):
+            p.feed(error)
+        self.assertEqual(p.anomalies, [])
+        p.feed(error)
+        self.assertEqual(p.anomalies, ["line 1: session_id_invalid"])
+
+    def test_c2_a_retried_line_is_counted_once(self):
+        p = oc.Parser(connection_id=CONN, model=MODEL, wall=self.clock_down_once(), clock=lambda: CLOCK)
+        error = line({"type": "error", "sessionID": "ses_valid", "error": {"name": "APIError", "data": {
+            "message": "x", "statusCode": 429, "isRetryable": True}}})
+        with self.assertRaises(OSError):
+            p.feed(error)
+        p.feed(error)
+        p.feed(line({"type": "step_start", "sessionID": "bad" + chr(0) + "session"}))
+        self.assertEqual(p.anomalies, ["line 2: session_id_invalid"])
+
+    def test_n2_each_route_result_is_its_own_copy(self):
+        p, _ = replay("synthetic-v1-limit-429.jsonl")
+        p.route_result("r1")["limit"]["reset_at"] = -1
+        self.assertEqual(p.route_result("r1")["limit"]["reset_at"], CLOCK + 120)
+        p, _ = replay("synthetic-v1-tool-use.jsonl")     # two usage events
+        first = p.route_result("r1")
+        first["events"][0]["data"]["input_tokens"]["value"] = -999
+        first["events"].append("x")
+        second = p.route_result("r1")
+        self.assertEqual([e["data"]["input_tokens"] for e in second["events"]], [known(900), known(1000)])
+
+    def test_n4_the_route_contracts_usage_event_keeps_each_counts_quality(self):
+        p, _ = replay("synthetic-v2-success.jsonl")
+        (event,) = [e for e in p.route_result("r1")["events"] if e["kind"] == "usage"]
+        self.assertEqual(event["data"]["output_tokens"], {"value": 12, "quality": "lower_bound",
+                                                          "provenance": "observed"})
+        self.assertEqual(event["data"]["cache_read_tokens"], UNKNOWN)
+        self.assertEqual(event["data"]["cost_usd"], known(0.002, "modelled"))
+
+    def test_the_wall_clock_is_read_once_for_an_http_date_and_not_for_other_errors(self):
+        calls = []
+
+        def advancing():
+            calls.append(1)
+            return WALL + 7 * (len(calls) - 1)   # 7 s later at each reading
+
+        p = oc.Parser(connection_id=CONN, model=MODEL, wall=advancing, clock=lambda: CLOCK)
+        p.feed(line(v1_error({"message": "x", "statusCode": 500, "isRetryable": True})))
+        self.assertEqual(calls, [])
+        (limit,) = typed(p.feed(line(v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                                               "responseHeaders": {"retry-after": "Sat, 14 Nov 2026 01:00:00 GMT"}}))),
+                         "limit")
+        self.assertEqual((limit["reset_at"], len(calls)), ("2026-11-14T01:00:00.000Z", 1))   # the vendor's instant
+
+    def test_clocks_that_cannot_be_called_are_refused_at_construction(self):
+        for kwargs in ({"wall": None}, {"clock": "100"}):
+            with self.subTest(kwargs):
+                with self.assertRaises(ValueError):
+                    oc.Parser(connection_id=CONN, model=MODEL, **kwargs)
 
     # NITs
     def test_the_flags_cannot_be_changed_from_outside(self):

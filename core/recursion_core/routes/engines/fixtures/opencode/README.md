@@ -6,8 +6,9 @@ What `opencode run --format json` prints, for the parser in `routes/engines/open
 captured from a real run. `index.json` lists each file with `"synthetic": true`, the package line it stands for,
 the exit status it would end with, what it shows, and the drafts the parser must give for it; its `sources` list
 cites the source lines each shape was read from. No OpenCode binary ran, nothing was signed in and no login store
-was read. A run Lucas captures himself will get its own entry with `"synthetic": false` and a file name starting
-`captured-` (the test admits that pair and no other).
+was read. No captured fixture may be listed yet: the test refuses an entry with `"synthetic": false` until the
+first capture lands in a reviewed change of its own. That change will name the file `captured-...` (the only name
+the test admits for such an entry) and drop the test's no-capture-yet line.
 
 | File | What it is |
 |---|---|
@@ -37,7 +38,7 @@ Nothing registers it and no other lane imports it yet; this is what a consumer m
 | `Parser(*, connection_id, model, wall=time.time, clock=time.monotonic)` | one run's stdout. `connection_id` is `<kind>:<id>` (`ValueError` otherwise); `model` is `None` or passes `model_ok`. `wall` reads Unix seconds and dates event.v1's `reset_at`; `clock` is the breaker's clock and dates the route contract's limit. Not shared between threads. |
 | `Parser.feed(line) -> list[dict]` | the drafts for ONE line (bytes, bytearray, memoryview or str; a str is encoded as UTF-8). Offsets count the bytes given, from 0 for each parser; a reader that restarts keeps its own offset. `ValueError` for two lines at once, `TypeError` for another type, `RuntimeError` after `end`. If an injected clock raises, the line counts as unread. |
 | `Parser.end(exit_code) -> list[dict]` | the `result` draft. `exit_code` is the process's status, or `None` when none was read (`engine_exited`). `ValueError` for a non-int; `RuntimeError` the second time. |
-| `Parser.route_result(request_id) -> dict` | the same run as the route contract's result (`recursion.route/v0`), its limit's `reset_at` on the breaker's clock. `ValueError` for an empty or non-string id; `RuntimeError` before `end`. |
+| `Parser.route_result(request_id) -> dict` | the same run as the route contract's result (`recursion.route/v0`), its limit's `reset_at` on the breaker's clock; each `usage` event's `data` holds event.v1's `{value, quality, provenance}` per count. Every call returns fresh copies. `ValueError` for an empty or non-string id; `RuntimeError` before `end`. |
 | `Parser.text`, `.engine_session_id`, `.anomalies` | the answer (model payload), the engine's own session id (first one seen), and the lines that were not read and why |
 | `declaration() -> dict` | driver.v2's root record for the one-shot drive |
 | `build_argv(model, *, binary=None) -> list[str]` | `opencode run --format json --model <model>`; argv[0] is `binary` or `opencode`. `ValueError` for a model `model_ok` refuses or a binary with a control character. |

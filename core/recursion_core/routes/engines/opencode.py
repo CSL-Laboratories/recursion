@@ -85,6 +85,7 @@ child environment are other lanes' files.
 from __future__ import annotations
 
 import calendar
+import copy
 import hashlib
 import json
 import math
@@ -132,6 +133,7 @@ _LAST_EPOCH = 253402300798.0   # 9999-12-31T23:59:58Z: rounded up, still in the 
 
 _CONNECTION = re.compile(r"(subscription|api_key|passthrough):.+")
 _ZONE = re.compile(r"GMT|UTC|UT|Z|[+-][0-9]{4}", re.IGNORECASE)   # Date.parse reads zone names in any case
+_ZONE_AFTER_TIME = re.compile(r"[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\s+(\S+)\s*$")   # the one word after the time
 _SURROGATE = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + "]")
 REPLACEMENT = chr(0xFFFD)
 _JS_FLOAT = re.compile(r"\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
@@ -192,6 +194,8 @@ class Parser:
             raise ValueError("connection_id")
         if model is not None and not model_ok(model):
             raise ValueError("model")
+        if not callable(wall) or not callable(clock):   # refused here, not mid-stream at the first 429
+            raise ValueError("clock")
         self._connection, self._model, self._wall, self._clock = connection_id, model, wall, clock
         self._offset = 0
         self._lines = 0
@@ -219,6 +223,7 @@ class Parser:
         if not raw:
             return []
         start, lines = self._offset, self._lines
+        session, anomalies = self.engine_session_id, len(self.anomalies)
         self._offset += len(raw)
         self._lines += 1
         drafts = [_draft("engine.output", {"stream": "stdout", "text": raw.decode("utf-8", errors="replace"),
@@ -228,9 +233,11 @@ class Parser:
             if event is not None:
                 drafts.extend(self._typed(event))
         except BaseException:
-            # Only an injected clock can raise here, and it is read before any state changes: the line counts as
-            # not read, so feeding it again gives the same drafts at the same offsets.
-            self._offset, self._lines = start, lines
+            # Only an injected clock can raise here. Everything the line had changed is put back (the offsets, the
+            # line count, the session id, its anomalies; an error and a limit are kept only after the clocks were
+            # read), so the line counts as not read and feeding it again gives the same drafts at the same offsets.
+            self._offset, self._lines, self.engine_session_id = start, lines, session
+            del self.anomalies[anomalies:]
             raise
         return drafts
 
@@ -256,9 +263,10 @@ class Parser:
         if not isinstance(request_id, str) or not request_id:   # as contract.validate_request takes it in
             raise ValueError("request_id")
         code, detail = self._result
-        # ``self._limit`` is set only by a typed 429, which always makes the code plan_limit.
-        return c.result(request_id, code, text=self.text, limit=self._limit, events=list(self._usage),
-                        detail=detail)
+        # ``self._limit`` is set only by a typed 429, which always makes the code plan_limit. Each result gets its
+        # own copies: a caller that annotates one cannot change the parser's record or another caller's result.
+        return c.result(request_id, code, text=self.text, limit=copy.deepcopy(self._limit),
+                        events=copy.deepcopy(self._usage), detail=detail)
 
     # -- one line -----------------------------------------------------------------------------------------
     def _load(self, raw: bytes) -> dict | None:
@@ -361,9 +369,11 @@ class Parser:
             "cache_write_tokens": _count(cache.get("write")),
             "cost_usd": _cost(part.get("cost")),
         }
+        # The route contract's events are free-form; each count keeps its quality there too, so a lower bound or an
+        # unknown never reads as an exact number to a consumer of route_result().
         self._usage.append(c.event("usage", "opencode.step_finish", {
-            name: payload[name]["value"] for name in ("input_tokens", "output_tokens", "reasoning_tokens",
-                                                      "cache_read_tokens", "cache_write_tokens", "cost_usd")}))
+            name: dict(payload[name]) for name in ("input_tokens", "output_tokens", "reasoning_tokens",
+                                                   "cache_read_tokens", "cache_write_tokens", "cost_usd")}))
         return [_draft("usage", payload)]
 
     def _error(self, error: object) -> list[dict]:
@@ -371,12 +381,12 @@ class Parser:
             data = error.get("data") if isinstance(error.get("data"), dict) else {}
             tag, status, message = error["name"], data.get("statusCode"), data.get("message")
             auth = tag == "ProviderAuthError"
-            wait = _retry_after_s(data.get("responseHeaders"), self._wall)
+            wait_of = lambda now: _retry_after_s(data.get("responseHeaders"), now)   # noqa: E731
             source = "opencode.error.data.statusCode"
         elif isinstance(error, dict) and isinstance(error.get("type"), str):      # 2.x session error
             tag, status, message = error["type"], error.get("status"), error.get("message")
             auth = tag == "provider.auth"
-            wait = _positive_finite(error.get("retryAfterMs"), scale=1000.0)
+            wait_of = lambda now: _positive_finite(error.get("retryAfterMs"), scale=1000.0)   # noqa: E731
             source = "opencode.error.status"
         else:
             self._anomaly("error_shape")
@@ -385,7 +395,9 @@ class Parser:
         status = status if type(status) is int else None
         limit = reset_at = None
         if status == LIMIT_STATUS:   # both clocks are read before anything is kept (see ``feed``)
-            reset_at = _timestamp(self._wall() + wait) if wait is not None else None
+            now = self._wall()     # read once: an HTTP date's wait and the reset share this one reading
+            wait = wait_of(now)
+            reset_at = _timestamp(now + wait) if wait is not None else None
             if reset_at is None:
                 wait = None   # a wait too far off to write is not known: the event and the breaker agree
             limit = c.limit_signal("connection", source, reset_at=self._clock() + wait if wait is not None else None)
@@ -470,15 +482,17 @@ def _js_float(text: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def _retry_after_s(headers: object, wall: Callable[[], float]) -> float | None:
+def _retry_after_s(headers: object, now: float) -> float | None:
     """The wait 1.x response headers ask for, in seconds, read the way OpenCode reads them (retry.ts:47-75).
 
-    ``retry-after-ms`` when it holds a number (then nothing else is read, as in OpenCode, even when that number is
-    not a usable wait), else ``retry-after`` as seconds, else as an HTTP date. A wait that is not a positive number
-    is None. Header names are matched in any case. An HTTP date counts only when its last word is the zone ``GMT``,
-    ``UT``, ``UTC``, ``Z`` or a numeric offset (``parsedate_tz`` reads an unknown zone, and no zone, as offset 0;
-    ``Date.parse`` refuses the first and reads the second in the machine's own zone), and only with a real calendar
-    day and time (``Date.parse`` refuses "32 Nov" or "25:00", which ``calendar.timegm`` would roll forward).
+    ``now`` is the wall clock's reading for this line. ``retry-after-ms`` when it holds a number (then nothing else
+    is read, as in OpenCode, even when that number is not a usable wait), else ``retry-after`` as seconds, else as
+    an HTTP date. A wait that is not a positive number is None. Header names are matched in any case. An HTTP date
+    counts only when the ONE word after its time, and the last word of the value, is the zone ``GMT``, ``UT``,
+    ``UTC``, ``Z`` or a numeric offset (``parsedate_tz`` reads an unknown zone, no zone, and a zone with a word
+    between it and the time as offset 0; ``Date.parse`` refuses the first and the third and reads the second in the
+    machine's own zone), and only with a real calendar day and time (``Date.parse`` refuses "32 Nov" or "25:00",
+    which ``calendar.timegm`` would roll forward).
     """
     if not isinstance(headers, Mapping):
         return None
@@ -496,7 +510,8 @@ def _retry_after_s(headers: object, wall: Callable[[], float]) -> float | None:
         return number if number > 0 else None
     try:
         parts = parsedate_tz(after)
-        if parts is None or not _ZONE.fullmatch(after.split()[-1]):
+        zone = _ZONE_AFTER_TIME.search(after)
+        if parts is None or zone is None or not _ZONE.fullmatch(zone.group(1)):
             return None
         year, month, day, hour, minute, second = parts[:6]
         # parsedate_tz has already refused a month it does not name.
@@ -506,7 +521,7 @@ def _retry_after_s(headers: object, wall: Callable[[], float]) -> float | None:
         moment = calendar.timegm(parts[:6] + (0, 0, 0)) - parts[9]
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    wait = moment - wall()
+    wait = moment - now
     return wait if wait > 0 else None
 
 

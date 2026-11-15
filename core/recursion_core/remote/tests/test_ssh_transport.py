@@ -15,6 +15,7 @@ import json
 import os
 import queue
 import subprocess
+import sys
 import threading
 import types
 import unittest
@@ -320,8 +321,84 @@ class StuckOnHello(PipeProc):
         return taken
 
 
+class PublishesWhenReleased(PipeProc):
+    """Takes every byte of a request, then holds that write until ``resume`` (a kill does not release it);
+    released, the write returns and the flush fails, so the writer then publishes "every byte sent" together
+    with a flush error. The test chooses the moment of that publication."""
+
+    def __init__(self, **options) -> None:
+        super().__init__(**options)
+        self.resume = threading.Event()
+
+    def write(self, data):
+        taken = super().write(data)
+        if self.requests:
+            self.resume.wait()
+        return taken
+
+    def flush(self) -> None:
+        if self.requests:
+            raise BrokenPipeError("the pipe closed after the write")
+
+
 class SessionEdgeTests(unittest.TestCase):
     REQUEST = {"op": "control", "method": "run.stop", "params": {"run_id": "r"}, "id": 1}
+
+    def classify_with_publication_at(self, position: int):
+        """Send a request whose writer is held past the deadline, and release it at the ``position``-th line
+        ``_send`` runs after the kill (so before, between or after the classifier's reads of the outcome).
+        Returns the request's outcome and whether that line was reached before ``_send`` returned."""
+        proc = PublishesWhenReleased()
+        client = SshRelayClient(self.target, spawn=lambda argv, **kwargs: proc, timeout_s=0.05)
+        self.addCleanup(client.close)
+        self.addCleanup(proc.resume.set)
+        code = ssh_transport.SshRelayClient._send.__code__
+        seen = {"lines": 0, "fired": False, "published": None}
+
+        def local(frame, event, arg):
+            if event == "line" and proc._killed.is_set() and not seen["fired"]:
+                seen["lines"] += 1
+                if seen["lines"] == position:
+                    seen["fired"] = True
+                    proc.resume.set()
+                    seen["published"] = frame.f_locals["done"].wait(support.WATCHDOG_S)
+            return local
+
+        def calls(frame, event, arg):
+            return local if frame.f_code is code else None
+
+        def classify():
+            sys.settrace(calls)  # this thread only
+            try:
+                return client.request(self.REQUEST)
+            finally:
+                sys.settrace(None)
+
+        with mock.patch.object(ssh_transport, "CLOSE_GRACE_S", 0.05):
+            # Under a watchdog: without the deadline's kill the held write would never be released.
+            outcome = self.bounded(classify, SHORT_WATCHDOG_S)
+        if seen["fired"]:
+            self.assertTrue(seen["published"], "the writer did not publish when released")
+        return outcome, seen["fired"]
+
+    def test_an_outcome_published_at_any_point_of_the_classification_is_never_unsent(self) -> None:
+        # The whole frame reached the far side, then the flush failed. Wherever that outcome is published while
+        # the request is being classified, it is never "not delivered": read whole it is a full write, and
+        # not yet published it is unknown. A classifier that read the two halves at different moments would
+        # combine "not every byte" from before with the flush error from after.
+        outcomes = []
+        for position in range(1, 40):
+            outcome, fired = self.classify_with_publication_at(position)
+            outcomes.append(outcome)
+            if not fired:  # past the classifier's last line: the writer was still holding when it decided
+                break
+        else:
+            self.fail("the classifier never finished")
+        self.assertGreaterEqual(len(outcomes), 4)  # the kill's grace, the join and the classifier's own lines
+        for position, outcome in enumerate(outcomes, 1):
+            with self.subTest(position=position):
+                self.assertIsInstance(outcome, RelayDeliveryUnknown)
+        self.assertEqual(outcomes[-1].detail, "request:write_unknown")  # unfinished writer: unknown
 
     def setUp(self) -> None:
         directory = support.scratch_dir(self)

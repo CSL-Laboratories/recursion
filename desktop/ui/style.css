@@ -1,0 +1,134 @@
+/* The desktop window's styles.
+   Core tokens (--core-*) belong to the core and style the bars and the approval region. Theme tokens
+   (--theme-*) are set only on the workspace element ([data-theme-scope]) and are read only inside it, so a
+   theme cannot restyle, cover or hide the approval region. */
+
+:root {
+  --core-bg: #101418;
+  --core-fg: #f2f4f7;
+  --core-muted: #b8c0cc;
+  --core-accent: #7cc4ff;
+  --core-warn: #ffcc66;
+  --core-border: #3a4450;
+  --core-font: system-ui, sans-serif;
+  --core-mono: ui-monospace, monospace;
+}
+
+body {
+  margin: 0;
+  background: var(--core-bg);
+  color: var(--core-fg);
+  font: 15px/1.45 var(--core-font);
+  padding-bottom: 14rem;
+}
+
+.core-bar {
+  background: var(--core-bg);
+  color: var(--core-fg);
+  border-bottom: 1px solid var(--core-border);
+  padding: 0.5rem 1rem;
+}
+
+.core-bar h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.beta {
+  color: var(--core-warn);
+  border: 1px solid var(--core-warn);
+  padding: 0 0.3rem;
+  font-size: 0.8rem;
+}
+
+[data-theme-scope] {
+  --theme-bg: var(--core-bg);
+  --theme-fg: var(--core-fg);
+  --theme-muted: var(--core-muted);
+  --theme-accent: var(--core-accent);
+  --theme-border: var(--core-border);
+  background: var(--theme-bg);
+  color: var(--theme-fg);
+  padding: 1rem;
+}
+
+[data-theme-scope] .note,
+[data-theme-scope] .empty {
+  color: var(--theme-muted);
+}
+
+[data-theme-scope] button {
+  color: var(--theme-fg);
+  background: transparent;
+  border: 1px solid var(--theme-accent);
+}
+
+[data-theme-scope] table.runs td,
+[data-theme-scope] table.runs th {
+  border-bottom: 1px solid var(--theme-border);
+  padding: 0.2rem 0.6rem;
+  text-align: left;
+}
+
+[data-theme-scope] .transcript .text {
+  white-space: pre-wrap;
+  font-family: var(--core-mono);
+}
+
+[data-theme-scope] label {
+  display: block;
+  margin: 0.4rem 0;
+}
+
+.conditions strong {
+  margin-right: 0.3rem;
+}
+
+.tag {
+  border: 1px solid currentColor;
+  padding: 0 0.25rem;
+  margin-right: 0.4rem;
+  font-size: 0.8rem;
+}
+
+#core-approval {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2147483647;
+  max-height: 13rem;
+  overflow: auto;
+  background: var(--core-bg);
+  color: var(--core-fg);
+  border-top: 3px solid var(--core-warn);
+  padding: 0.5rem 1rem;
+  font: 15px/1.45 var(--core-font);
+}
+
+#core-approval h2 {
+  font-size: 1rem;
+  margin: 0 0 0.3rem;
+  color: var(--core-warn);
+}
+
+#core-approval .text {
+  font-family: var(--core-mono);
+  white-space: pre-wrap;
+}
+
+#core-approval [data-trust="untrusted"] .tag {
+  color: var(--core-warn);
+}
+
+#core-approval button {
+  color: var(--core-fg);
+  background: var(--core-bg);
+  border: 1px solid var(--core-accent);
+  margin-right: 0.5rem;
+}
+
+footer.core-bar {
+  border-top: 1px solid var(--core-border);
+  border-bottom: none;
+}

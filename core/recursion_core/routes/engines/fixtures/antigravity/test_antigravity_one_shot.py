@@ -795,12 +795,12 @@ class ReviewRoundFiveAdapterTest(unittest.TestCase):
                     self.assertEqual(res["detail"], ag.ROUTE_HOME_IS_DAEMON_HOME)
                     self.assertEqual(launcher.calls, [])
 
-    def test_h1_a_daemon_whose_home_is_the_root_refuses_the_root_only(self) -> None:
-        res, launcher = self.run_with("/", dict(PARENT, HOME="/"))
-        self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.ROUTE_HOME_IS_DAEMON_HOME))
-        self.assertEqual(launcher.calls, [])
-        res, launcher = self.run_with("/var/tmp/route-homes/antigravity-oauth-business", dict(PARENT, HOME="/"))
-        self.assertIsNone(res["code"])
+    def test_h1_a_daemon_whose_home_is_the_root_refuses_every_route_home(self) -> None:     # round 6
+        for home in ("/", "/root", "/etc", "/var/tmp/route-homes/antigravity-oauth-business"):
+            with self.subTest(home=home):
+                res, launcher = self.run_with(home, dict(PARENT, HOME="/"))
+                self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.ROUTE_HOME_IS_DAEMON_HOME))
+                self.assertEqual(launcher.calls, [])
 
 
 KEY5 = "r5-made-up-custody-value-2c9"   # invented here; no real key, custody or auth file is read
@@ -1027,6 +1027,96 @@ class ReviewRoundFiveMaskTest(unittest.TestCase):
                     drafts.ended(out, turn, delivery)
                 self.assertEqual(drafts.drafts, [])
         self.assertEqual(len(ag.AcpDrafts().ended(out, "turn-" + "a" * 59, "dlv-" + "a" * 60)), 2)
+
+
+class ReviewRoundSixTest(unittest.TestCase):
+    """Regressions for the round-6 reads of #396 at c44c0b49 (Sol R6-1; DeepSeek MED, MED STRICT, LOW F3, LOW
+    F4). Each fails on that head."""
+
+    def test_r6_a_line_built_to_peel_one_escape_layer_at_a_time_costs_bounded_work(self) -> None:
+        from unittest import mock
+        key = "r6-made-up-custody-value-742c"
+        line = json.dumps({"event": "result", "result": {"status": "SUCCESS",
+                                                         "response": chr(92) + "u005c" * 3200 + "u0041"}})
+        calls = []
+        real = ag._decode
+        with mock.patch.object(ag, "_decode", lambda text: calls.append(len(text)) or real(text)):
+            masked = ag.mask(line, ag.mask_forms((key,)))
+        self.assertLessEqual(len(calls), ag.MASK_DEPTH * ag.MASK_ROUNDS)
+        self.assertLessEqual(len(calls), ag.MASK_DEPTH + 1)          # one round: the layers are never all read
+        self.assertEqual(masked, "*" * len(line.encode("utf-8")))  # kept nothing: fails closed
+        with self.assertRaises(ag.OneShotProtocolError):
+            ag.OneShotParser(CONN, MODEL, redact=(key,)).parse(line)
+
+    def test_r6_masking_stops_after_its_rounds_and_keeps_nothing(self) -> None:
+        from unittest import mock
+        # each round masks one more "a*" (the fill completes it): 21 rounds would be needed; MASK_ROUNDS run
+        text = "a" * 20 + "b" + chr(92) + "n"
+        calls = []
+        real = ag._decode
+        with mock.patch.object(ag, "_decode", lambda s: calls.append(1) or real(s)):
+            masked = ag.mask(text, ag.mask_forms(("a*", "b")))
+        self.assertLessEqual(len(calls), ag.MASK_ROUNDS)
+        self.assertEqual(masked, "*" * len(text))
+
+    def test_r6_nesting_a_serializer_writes_is_still_read_and_masked(self) -> None:   # guard
+        key = "r6-made-up-custody-value-742c"
+        inner = {"k": key}
+        for _ in range(4):
+            inner = json.dumps(inner)
+        line = json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": inner}})
+        masked = ag.mask(line, ag.mask_forms((key,)))
+        self.assertNotIn(key, json.dumps(json.loads(masked), ensure_ascii=False))
+        value = json.loads(masked)["result"]["response"]
+        for _ in range(4):
+            value = json.loads(value)
+        self.assertEqual(set(value), {"k"})
+        self.assertNotIn(key, value["k"])
+
+    def test_r6_a_run_whose_line_is_read_past_the_deadline_never_returns_success(self) -> None:
+        clock = Clock()
+        deadline = clock() + 10
+
+        class Slow(FakeProcess):
+            def read_line(self, timeout_s):
+                line = super().read_line(timeout_s)
+                clock.now = deadline + 1          # the line's reading and masking took the rest of the time
+                return line
+
+        made = ag.AntigravityOneShotAdapter(None, clock, lambda *a: "made-up", PARENT, prepared_home=prepared,
+                                            output_boundary=lambda values: lambda *a, **k: process)
+        process = Slow([json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "hi"}})], clock)
+        res = made.run(request(), deadline)
+        self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
+        self.assertEqual(process.fenced, ["deadline"])
+
+    def test_r6_a_parent_environment_with_no_usable_home_refuses_before_custody(self) -> None:
+        asked = []
+        parents = {"no HOME": {k: v for k, v in PARENT.items() if k != "HOME"}, "empty": dict(PARENT, HOME=""),
+                   "relative": dict(PARENT, HOME="home/operator"), "a NUL": dict(PARENT, HOME="/home/op" + chr(0)),
+                   "not a str": dict(PARENT, HOME=b"/home/operator")}
+        for name, parent in parents.items():
+            with self.subTest(parent=name):
+                clock = Clock()
+                launcher = Launcher(lines("synthetic-ok.jsonl"), clock)
+                made = ag.AntigravityOneShotAdapter(launcher, clock, lambda *a: asked.append(a) or "made-up", parent,
+                                                    prepared_home=prepared, output_boundary=FakeBoundary(launcher))
+                res = made.run(request(), clock() + 60)
+                self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.DAEMON_HOME_UNKNOWN))
+                self.assertEqual(launcher.calls, [])
+        self.assertEqual(asked, [])
+
+    def test_r6_a_custody_callback_that_raises_oserror_is_a_refused_launch(self) -> None:
+        def custody(*args):
+            raise OSError("synthetic: the keychain is locked")
+
+        clock = Clock()
+        launcher = Launcher(lines("synthetic-ok.jsonl"), clock)
+        made = ag.AntigravityOneShotAdapter(launcher, clock, custody, PARENT, prepared_home=prepared,
+                                            output_boundary=FakeBoundary(launcher))
+        res = made.run(request(), clock() + 60)
+        self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.CREDENTIAL_UNAVAILABLE))
+        self.assertEqual(launcher.calls, [])
 
 if __name__ == "__main__":
     unittest.main()

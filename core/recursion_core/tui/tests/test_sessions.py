@@ -8,7 +8,7 @@ the same lines. The request frames are SPINE's recorded ones until the verb lane
 from __future__ import annotations
 
 import io
-import time
+import threading
 import unittest
 from unittest import mock
 
@@ -123,20 +123,33 @@ class TranscriptTest(unittest.TestCase):
         daemon, apps = FakeDaemon(), []
         rows = expected_rows(VECTOR)
 
+        shown_all = threading.Event()  # set when the log holds every line (review 1 of #405, Sol's later point)
+
+        def watch(app: TuiApp) -> None:
+            apps.append(app)
+            emit = app._emit
+
+            def emitted(*args, **kwargs):
+                event = emit(*args, **kwargs)
+                if len(shown(app)) == len(VECTOR) or any("transcript" in e or "events.read" in e for e in app.errors):
+                    shown_all.set()
+                return event
+
+            app._emit = emitted
+
         class WaitingTerminal(FakeTerminal):
             def read_key(self, timeout: float):
                 if self.keys and self.keys[0] == "WAIT":  # until the whole transcript is in the log
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline and not (apps and len(shown(apps[0])) == len(VECTOR)):
-                        time.sleep(0.01)
+                    shown_all.wait()
                     self.keys.pop(0)
                 return super().read_key(timeout)
 
         keys = [":", *f"transcript {SID}", "enter", "WAIT", "q"]
         out = TtyOut()
         code = term.interactive(daemon, out, {"NO_COLOR": "1"}, WaitingTerminal(keys), alt_screen=False,
-                                on_app=apps.append)
+                                on_app=watch)
         self.assertEqual(code, 0)
+        self.assertEqual([e for e in apps[0].errors if "transcript" in e or "events.read" in e], [])
         said = [line[len(LABEL):] for line in finished_lines(out.getvalue()) if line.startswith(LABEL)]
         self.assertEqual(said, rows)
 
@@ -157,7 +170,7 @@ class TranscriptTest(unittest.TestCase):
         for i in range(450):
             daemon.append("engine.output", f"line {i}\n")
         app, _ = new_app(daemon)
-        with mock.patch.object(s, "MAX_PAGES", 1):
+        with mock.patch.object(s, "MAX_PAGES", 2):  # the first read counts (review 1 of #405, DeepSeek L5)
             app.command(f"transcript {SID}")
         self.assertEqual(len([m for m, _ in daemon.calls if m == "events.read"]), 2)
         self.assertIn(f"more lines after seq 400; the command transcript {SID} reads on", app.notice)

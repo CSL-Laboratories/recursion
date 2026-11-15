@@ -32,7 +32,7 @@ class ServedRecordsTest(unittest.TestCase):
         self.assertEqual([m["name"] for m in answer["methods"]], [r["name"] for r in table["methods"]])
         self.assertEqual(answer["table_version"], table["table_version"])
         built = {m["name"] for m in answer["methods"] if m["implemented"]}
-        self.assertEqual(built, {"run.list", "session.list", "events.read"})
+        self.assertEqual(built, {"session.list", "events.read"}, "run.list is not served: no override makes it built")
         self.assertEqual(daemon.call("events.follow", {}), {"code": "unsupported", "detail": "not_implemented"})
         self.assertEqual(daemon.call("session.nap", {})["code"], "method_unknown")
 

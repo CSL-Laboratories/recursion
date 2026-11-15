@@ -94,9 +94,12 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   leading `/` is accepted. `sessions` reads `session.list`; `transcript SESSION` reads that session's
   transcript.
 - Sessions and transcripts (build step 4). `sessions` (or `Ctrl+X s`) reads `session.list` with SPINE's
-  recorded request (`state: "live"`, `limit: 20`) and logs one row per session in the record's own words.
+  recorded request (`state: "live"`, `limit: 20`) and logs one row per session in the record's own words;
+  in full screen the output pane shows that list (or "no sessions listed", or what the daemon answered
+  instead), and the pager pages and searches it.
   `transcript SESSION` reads `events.read` with `projection: "transcript"` from the start (epoch 1, seq 0),
-  follows `more` page by page (at most 50 pages in a row, then it says how to read on), and logs each line
+  follows `more` page by page (at most 50 reads in a row, the first included; then it says how to read on),
+  and logs each line
   once, in seq order, as the projection gives it: its text, sanitized as engine output is (engine lines are
   logged as untrusted text), and a `replay.gap` line like any other. The TUI never projects or parses an
   event, and a line never makes it send anything. Full screen shows the lines in the output pane (the
@@ -104,6 +107,12 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   so all three print the same rows. The same command again reads on from the cursor, after a daemon restart
   too (the answer's newer epoch is said and kept). Attaching a run returns the pane to the run's output.
   Until the verb lanes' CLI twins exist, the parity tests compare these requests with SPINE's recorded ones.
+  Each page is checked before anything of it is taken (rule (7), as SPINE's `conformance/rules.py` states it
+  for a reader): a page in another projection, of another log, with a line out of order or of the wrong
+  shape, a cursor that is not its last position, or an epoch that goes back is said as an error and changes
+  nothing, neither rows nor cursor, and is not asked again. If the daemon then answers that the epoch held is
+  ahead of its own, the next read goes on from epoch 1 by its seq. An answer that cannot be read at all is
+  said as an error; it never stops the TUI.
 - The binding file: `$XDG_CONFIG_HOME/recursion/tui-keys.toml` (or `~/.config/...`), or `--keys FILE`;
   `--print-keys` prints the defaults to start from. `version = 1`, an optional `leader`, a table per
   context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action

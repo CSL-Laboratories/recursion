@@ -14,7 +14,14 @@ vector ``vectors/transcript.projection/g01-a-log-and-its-lines.json``. Reading a
 - a first read uses epoch 1 and seq 0; an older epoch goes on by its seq and answers the current epoch
   with ``epoch_advanced`` true; a future epoch is ``request_invalid``/``cursor_epoch_ahead``; a seq past
   the high-water mark is ``request_invalid``/``cursor_ahead``; an unknown log is ``session_unknown``;
-- with no ``projection`` the answer is the transcript; ``raw`` is not served here (the TUI never asks).
+- with no ``projection`` the answer is the transcript; ``raw`` is not served here (the TUI never asks);
+- a request outside the schema's params (a ``limit`` that is not an integer from 1 to 1000, a cursor whose
+  epoch, seq or log is not an integer, an integer and a string) is ``request_invalid`` and nothing else.
+
+``methods.list`` says ``implemented`` only of what this fake serves (review 1 of #405, Sol R3): the session
+and event reads, the session, queue, approval and workspace answers it holds, and ``methods.list`` itself.
+The run verbs are not served (SPINE's one ``run.list`` record names a next page that no record answers), so
+they are listed as not implemented and answer ``unsupported``, as the real daemon's would.
 
 ``events.follow`` answers at once (a test does not wait): new lines if there are any, else an empty page
 with ``timed_out``. ``restart()`` is a daemon restart: the epoch goes up and the log stays. ``forget()``
@@ -66,7 +73,6 @@ class FakeDaemon:
         self.table_version = table["table_version"]
         self.beta = {row["name"]: bool(row.get("beta")) for row in table["methods"]}
         self.table = [row["name"] for row in table["methods"]]
-        self.implemented = frozenset(self.table) if implemented is None else implemented
         self._answers = {
             "session.list": sessions,
             "approval.list": exchange("h10-approval-list-returns-summaries")["answer"],
@@ -80,6 +86,9 @@ class FakeDaemon:
             "queue.cancel": exchange("h30-queue-cancel-ok")["answer"],
             "workspace.diff": exchange("h36-workspace-diff-ok")["answer"],
         }
+        served = frozenset({"methods.list", "events.read", "events.follow", *self._answers}) & frozenset(self.table)
+        # Only what is served is implemented; an override can narrow it, never widen it (Sol R3).
+        self.implemented = served if implemented is None else served & frozenset(implemented)
 
     # -- what a test does to the daemon ----------------------------------------------------------
     @property
@@ -127,8 +136,13 @@ class FakeDaemon:
 
     def _read(self, params: dict, *, follow: bool) -> dict:
         cursor = params.get("cursor")
-        if not isinstance(cursor, dict) or not {"epoch", "session_id", "seq"} <= set(cursor):
-            return {"code": "request_invalid", "detail": "cursor"}
+        if (not isinstance(cursor, dict) or not {"epoch", "session_id", "seq"} <= set(cursor)
+                or type(cursor["epoch"]) is not int or cursor["epoch"] < 1 or type(cursor["seq"]) is not int
+                or cursor["seq"] < 0 or not isinstance(cursor["session_id"], str)):
+            return {"code": "request_invalid", "detail": "cursor"}  # DeepSeek L4: refused, never a raise
+        limit = params.get("limit", 200)
+        if type(limit) is not int or not 1 <= limit <= 1000:  # params.events.read: an integer, 1 to 1000
+            return {"code": "request_invalid", "detail": "limit"}
         if cursor["session_id"] != self.session_id:
             return {"code": "session_unknown", "detail": str(cursor["session_id"])}
         if cursor["epoch"] > self.epoch:
@@ -136,9 +150,10 @@ class FakeDaemon:
         if cursor["seq"] > self.high_water:
             return {"code": "request_invalid", "detail": "cursor_ahead"}
         projection = params.get("projection", "transcript")
-        if projection != "transcript":
-            return {"code": "unsupported", "detail": "projection_not_served_by_the_fake"}
-        limit = int(params.get("limit", 200))
+        if projection not in ("raw", "transcript"):
+            return {"code": "request_invalid", "detail": "projection"}
+        if projection != "transcript":  # raw is not served here; not_implemented is the schema's only detail
+            return {"code": "unsupported", "detail": "not_implemented"}
         page: list[dict] = []
         pending_gap: list[int] = []
         for line in self.lines:

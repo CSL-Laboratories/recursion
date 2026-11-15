@@ -36,7 +36,7 @@ def commits_for(task, tmp_base: Path, xdg_base: Path, *, with_tree: bool = False
         parent, tree = gitutil.snapshot(work)
         task.apply_solution(work)
         task.write_hidden(work)
-        gitutil.git(["add", "-A"], work)
+        gitutil.stage_task_files(work)
         gitutil.git(["commit", "-q", "--allow-empty", "-m", "reference solution"], work)
         commit = gitutil.git(["rev-parse", "HEAD"], work).decode().strip()
         commit_tree = gitutil.git(["rev-parse", "HEAD^{tree}"], work).decode().strip()

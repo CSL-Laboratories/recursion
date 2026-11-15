@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"recursion_loop: {exc}") from None
     redactor = p.Redactor(secrets)
     out = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False, buffering=1)
-    writer = p.Writer(out, redactor)
+    writer = p.Writer(out, redactor, seal_after="closed")  # nothing follows closed on standard output
     session = Session(provider, registry, workspace, writer, redactor,
                       Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
                              effort=args.effort))

@@ -27,7 +27,9 @@ LF. A provider refuses a reply that breaks them with ``ProtocolError``; the data
 values with ``ValueError``. A tool input nested more than ``MAX_INPUT_DEPTH`` objects or arrays deep is kept as
 input that did not parse (``input_error`` is ``INPUT_TOO_DEEP``) and its raw text is dropped: no tool takes one,
 walking it could reach Python's recursion limit wherever the loop scrubs, checks or writes it, and text that was
-never decoded and scrubbed could still spell a secret with JSON escapes.
+never decoded and scrubbed could still spell a secret with JSON escapes. So is an input holding NaN or an
+infinity (``INPUT_NOT_FINITE``): Python's decoder takes them, but JSON cannot write them. Text parts and tool
+results hold text; the dataclasses refuse anything else.
 """
 
 from __future__ import annotations
@@ -126,11 +128,17 @@ class ToolSpec:
 class TextPart:
     text: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValueError("a text part's text is text")
+
 
 MAX_CALL_ID = 128
 MAX_TOOL_NAME = 256
 MAX_INPUT_DEPTH = 64
 INPUT_TOO_DEEP = f"input is nested more than {MAX_INPUT_DEPTH} levels deep"
+INPUT_NOT_FINITE = "input holds a number JSON cannot write (NaN or an infinity)"
+REFUSED_INPUT = (INPUT_TOO_DEEP, INPUT_NOT_FINITE)  # input errors whose raw text is dropped and whose reason is shown
 
 
 def nests_deeper(value: Any, limit: int) -> bool:
@@ -149,6 +157,22 @@ def nests_deeper(value: Any, limit: int) -> bool:
         if depth >= limit:
             return True
         stack.extend((child, depth + 1) for child in children)
+    return False
+
+
+def holds_nonfinite(value: Any) -> bool:
+    """Whether ``value`` holds a float that is NaN or infinite, which JSON cannot write. Walked without recursion;
+    call it on a value already known not to nest too deep (``nests_deeper``)."""
+
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            return True
+        if isinstance(item, Mapping):
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
     return False
 
 
@@ -186,6 +210,10 @@ class ToolResult:
     call_id: str
     text: str
     is_error: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValueError("a tool result's text is text")
 
 
 @dataclass(frozen=True)

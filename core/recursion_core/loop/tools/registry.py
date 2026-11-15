@@ -281,11 +281,11 @@ class ToolRegistry:
                                 ctx)
         if call.input is None:
             # The documented answer to input that is not JSON: hand the raw text back, built with the JSON
-            # library so quotes in it are escaped, and do not run the tool. Input refused for its depth had its
-            # raw text dropped (it was never decoded and scrubbed); the answer says why beside it.
+            # library so quotes in it are escaped, and do not run the tool. Input refused for its depth or for a
+            # number JSON cannot write had its raw text dropped; the answer says why beside it.
             answer = {"INVALID_JSON": call.raw_input}
-            if call.input_error == b.INPUT_TOO_DEEP:
-                answer["error"] = f"{b.INPUT_TOO_DEEP}; the tool did not run"
+            if call.input_error in b.REFUSED_INPUT:
+                answer["error"] = f"{call.input_error}; the tool did not run"
             return self._finish(call, ToolOutput(json.dumps(answer, ensure_ascii=False), ERROR), ctx)
         if not isinstance(call.input, Mapping):
             return self._finish(call, ToolOutput("invalid input: the input must be a JSON object", ERROR), ctx)

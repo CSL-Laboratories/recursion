@@ -5,8 +5,9 @@ once, by cancelling the running turn's token, which closes the provider's connec
 or, for a message read but not started yet, by marking it so that it starts interrupted (no model call). Its
 answer is written under the lock a turn's ``turn_ended`` is written under, with the turn no longer running: one
 answered ``delivered: true`` comes before that turn's end, and one read after the end is ``delivered: false``.
-A turn whose interrupt was delivered ends ``interrupted`` (a limit's or a failure's own line still written)
-unless the model had already finished it (``candidate_done``) or the loop failed (``loop_error``).
+A turn whose interrupt was delivered ends ``interrupted``, keeping the result and reason it would have had (a
+limit's line is still written, a failure's code stays in the result), unless the model had already finished it
+(``candidate_done``) or the loop failed (``loop_error``).
 The main thread takes one message at a time: it writes ``input_accepted`` for it, then runs the turn:
 
     the user's text is added; then, until the turn ends:
@@ -37,7 +38,8 @@ before they join the conversation, and so are the model's text (all its text par
 split across two of them is caught) and tool inputs before the reply is kept. A vendor block that holds one (a
 signed thinking block) or a tool call whose id or name holds one cannot be changed without breaking it, so the
 reply is refused and the turn fails with ``provider_protocol``; so is a reply holding a part of a kind a reply
-cannot carry (a tool result), or one nested deeper than the loop can walk. A tool input nested more than
+cannot carry (a tool result), two tool calls of one id, or one nested deeper than the loop can walk. A tool
+input holding NaN or an infinity, or nested more than
 ``MAX_INPUT_DEPTH`` levels deep is kept as input that did not parse, its raw text dropped: the call gets an
 error result.
 
@@ -240,11 +242,16 @@ class Session:
 
         scrub = self.redactor.scrub
         kept: list[b.Part] = []
+        ids: set[str] = set()
         for part in parts:
             if not isinstance(part, (b.TextPart, b.ToolCall, b.OpaquePart)):
                 raise _NotKept(f"the reply holds a {type(part).__name__} part, which a reply cannot carry")
             if isinstance(part, b.ToolCall) and (self.redactor.holds(part.call_id) or self.redactor.holds(part.name)):
                 raise _NotKept(SECRET_INSIDE)  # an id pairs the call with its result, a name picks the tool
+            if isinstance(part, b.ToolCall):
+                if part.call_id in ids:
+                    raise _NotKept("two tool calls of the reply share one id")  # their results could not be told apart
+                ids.add(part.call_id)
             if isinstance(part, b.ToolCall) and part.input is not None and not isinstance(part.input, Mapping):
                 # A provider bug: the input is not an object. Kept as input that did not parse, so the call gets
                 # an error result and the turn goes on; its raw text, never decoded and scrubbed here, is dropped.
@@ -253,6 +260,10 @@ class Session:
                 # Kept as input that did not parse too, its raw text dropped: no tool takes one so deep, and
                 # scrubbing, checking or writing it could reach Python's recursion limit.
                 part = b.ToolCall(part.call_id, part.name, None, "", b.INPUT_TOO_DEEP)
+            elif isinstance(part, b.ToolCall) and b.holds_nonfinite(part.input):
+                # JSON cannot write NaN or an infinity, so the tool_call line could not be JSON: kept as input that
+                # did not parse, its raw text dropped.
+                part = b.ToolCall(part.call_id, part.name, None, "", b.INPUT_NOT_FINITE)
             elif isinstance(part, b.ToolCall):
                 clean = self.redactor.scrub_obj(dict(part.input)) if part.input is not None else None
                 raw = scrub(part.raw_input)
@@ -299,12 +310,12 @@ class Session:
 
         def write() -> None:
             # Decided where the end is written (under the Engine's lock): a delivered interrupt is not lost to a
-            # limit or a failure that came first.
-            final, res, why = outcome, result, reason
+            # limit or a failure that came first, and neither is what they were (the result and reason stay).
+            final = outcome
             if final not in KEEPS_OUTCOME and self._cancel is not None and self._cancel.cancelled:
-                final, res, why = "interrupted", None, "interrupted"
+                final = "interrupted"
             ended[0] = final
-            self.writer.write("turn_ended", turn_id=turn_id, outcome=final, result=res, reason=why)
+            self.writer.write("turn_ended", turn_id=turn_id, outcome=final, result=result, reason=reason)
 
         self.ending(write)
         return ended[0]

@@ -23,7 +23,8 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
                     comes before the turn's turn_ended, which is interrupted unless the model had already
                     finished the turn (candidate_done) or the loop failed (loop_error)
     protocol_error  {code, detail}
-    closed          once, when the loop exits after close or the end of its input
+    closed          once, when the loop exits after close or the end of its input; in the process nothing
+                    follows it on standard output (an Engine driven in-process still answers a line fed later)
 
 Where a line shares a name with an event.v1 payload, its fields are that payload's fields as far as the loop
 knows them; the driver (routes/engines/recursion_loop.py, the lane's third pull request) maps the rest:
@@ -194,10 +195,12 @@ class Redactor:
 class Writer:
     """Writes one JSON object per line, whole, under a lock (the input thread writes too)."""
 
-    def __init__(self, stream: IO[str], redactor: Redactor) -> None:
+    def __init__(self, stream: IO[str], redactor: Redactor, *, seal_after: str | None = None) -> None:
         self._stream = stream
         self._redactor = redactor
         self._lock = threading.Lock()
+        self._seal_after = seal_after  # once a line of this type is written, nothing more is (the process: closed)
+        self._sealed = False
 
     def write(self, line_type: str, /, **fields: Any) -> None:
         # Positional-only: a line may carry a field called "kind" (limit lines do).
@@ -205,10 +208,15 @@ class Writer:
         doc.update(fields)
         # Every string (keys included) is scrubbed before serialising, so a secret holding a character JSON
         # escapes cannot slip through in its escaped form; numbers, booleans and null cannot carry one.
-        line = json.dumps(self._redactor.scrub_obj(doc), ensure_ascii=False, separators=(",", ":"))
+        # allow_nan=False: a NaN or an infinity would make the line something other than JSON; it raises instead.
+        line = json.dumps(self._redactor.scrub_obj(doc), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         with self._lock:
+            if self._sealed:
+                return
             self._stream.write(line + "\n")
             self._stream.flush()
+            if line_type == self._seal_after:
+                self._sealed = True
 
 
 READ_CHUNK = 64 * 1024

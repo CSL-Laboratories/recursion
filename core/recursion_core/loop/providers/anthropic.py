@@ -34,9 +34,11 @@ parts as one text (a key split across two text blocks is found in their join), t
 (a fragment that could be the start of the key is held back until the next fragment, in this block or the next
 text block, or the end of the message). A thinking or other vendor block that holds it is refused
 (``ProtocolError``), since changing it would break its signature, and so is a tool call whose id or name holds
-it. A stream nested deeper than this client reads, a block whose text is not text, and a reply longer than
-``MAX_REPLY_CHARS`` are refused with ``ProtocolError`` too; a tool input nested more than ``MAX_INPUT_DEPTH``
-levels deep is kept as input that did not parse, its raw text dropped.
+it. A stream nested deeper than this client reads, NaN or an infinity anywhere in it (JSON has neither), a block
+whose type or text is not text, two tool calls of one id, and a reply longer than ``MAX_REPLY_CHARS`` (what its
+blocks start with counted as well as their deltas) are refused with ``ProtocolError`` too; a tool input nested
+more than ``MAX_INPUT_DEPTH`` levels deep is kept as input that did not parse, its raw text dropped, and so is
+a block-start input that is not an object.
 
 A call that fails or is interrupted after the stream began still reports what it measured: the exception's
 ``usage`` holds the counts the stream had given (an output count is a lower bound until ``message_stop``) and
@@ -120,6 +122,12 @@ def _default_connection(scheme: str, host: str, port: int, timeout: float) -> ht
     if scheme == "https":
         return http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl.create_default_context())
     return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def _no_constant(name: str) -> Any:
+    """For json.loads: NaN, Infinity and -Infinity are not JSON, though Python's decoder takes them."""
+
+    raise ValueError(f"{name} is not a JSON number")
 
 
 def _timestamp(epoch: float) -> str | None:
@@ -362,7 +370,7 @@ class AnthropicProvider:
             raw = b""
         vendor_type, message = None, ""
         try:
-            doc = json.loads(raw.decode("utf-8"))
+            doc = json.loads(raw.decode("utf-8"), parse_constant=_no_constant)
             err = doc.get("error") if isinstance(doc, dict) else None
             if isinstance(err, dict):
                 vendor_type = err.get("type") if isinstance(err.get("type"), str) else None
@@ -409,7 +417,7 @@ class AnthropicProvider:
                 for event in iter_events(read):
                     cancel.raise_if_cancelled()
                     try:
-                        data = json.loads(event.data)
+                        data = json.loads(event.data, parse_constant=_no_constant)
                     except ValueError:
                         raise b.ProtocolError(f"event {event.event!r} is not JSON", request_id=request_id) from None
                     if not isinstance(data, dict):
@@ -493,6 +501,7 @@ class _StreamState:
             index, block = data.get("index"), data.get("content_block")
             if not isinstance(index, int) or not isinstance(block, dict) or index in self.blocks:
                 raise self._protocol("content_block_start")
+            self._grow_start(block)
             self.blocks[index] = {"block": dict(block), "text": [], "json": [], "thinking": [], "signature": []}
             self.order.append(index)
             return None
@@ -551,9 +560,23 @@ class _StreamState:
         if self.size > MAX_REPLY_CHARS:
             raise self._protocol(f"the reply is longer than {MAX_REPLY_CHARS} characters")
 
+    def _grow_start(self, block: dict) -> None:
+        """What a block starts with (its text, thinking, signature, opaque data or tool input) counts toward the
+        reply's bound as its deltas do; its type, id and name are bounded on their own."""
+
+        for key, value in block.items():
+            if key in ("type", "id", "name"):
+                continue
+            if isinstance(value, str):
+                self._grow(value)
+            elif isinstance(value, (dict, list)):
+                self._grow(json.dumps(value, ensure_ascii=False))
+
     def _finish_block(self, entry: dict, provider: AnthropicProvider) -> b.Part:
         block = entry["block"]
         btype = block.get("type")
+        if not isinstance(btype, str) or not btype:
+            raise self._protocol("a content block's type is not text")
         # The text a block starts with is the vendor's JSON, whatever it is: anything but text is refused.
         for key in {"text": ("text",), "thinking": ("thinking", "signature")}.get(btype, ()):
             if block.get(key) is not None and not isinstance(block.get(key), str):
@@ -571,14 +594,16 @@ class _StreamState:
             raw = provider._scrub("".join(entry["json"]))
             if not raw.strip():
                 start = block.get("input")
+                if start is not None and not isinstance(start, dict):
+                    return b.ToolCall(call_id, name, None, "", "input is not a JSON object")
                 if isinstance(start, dict) and b.nests_deeper(start, b.MAX_INPUT_DEPTH):
                     return b.ToolCall(call_id, name, None, "", b.INPUT_TOO_DEEP)
                 return b.ToolCall(call_id, name, provider._scrub_obj(dict(start)) if isinstance(start, dict) else {},
                                   raw)
             try:
-                parsed = json.loads(raw)
+                parsed = json.loads(raw, parse_constant=_no_constant)
             except ValueError as exc:
-                return b.ToolCall(call_id, name, None, raw, f"input is not valid JSON: {exc.msg}")
+                return b.ToolCall(call_id, name, None, raw, f"input is not valid JSON: {getattr(exc, 'msg', exc)}")
             except RecursionError:  # nested deeper than the decoder goes
                 return b.ToolCall(call_id, name, None, "", b.INPUT_TOO_DEEP)
             # Raw text that was never decoded and scrubbed could spell the key with JSON escapes: dropped.
@@ -643,5 +668,8 @@ class _StreamState:
             cost_usd=b.unknown(),  # the API reports tokens, not dollars
         )
         parts = tuple(self.done[i] for i in sorted(self.order))
+        ids = [part.call_id for part in parts if isinstance(part, b.ToolCall)]
+        if len(ids) != len(set(ids)):
+            raise self._protocol("two tool_use blocks share one id")
         return b.TurnResponse(parts, stop, usage, served_model=self.model, vendor_stop_reason=vendor,
                               request_id=self.request_id)

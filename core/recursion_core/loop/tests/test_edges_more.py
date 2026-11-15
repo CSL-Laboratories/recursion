@@ -157,8 +157,9 @@ class DeliveredInterrupts(unittest.TestCase):
 
     def test_a_failure_after_a_delivered_interrupt_still_ends_interrupted(self) -> None:
         lines = self._run(b.ServerError("the vendor failed"))
-        self.assertEqual((lines.of("turn_ended")[0]["outcome"], lines.of("turn_ended")[0]["result"]),
-                         ("interrupted", None))
+        # Round 5 (DeepSeek F2): the failure's result stays on the interrupted line, so its code is not lost.
+        self.assertEqual((lines.of("turn_ended")[0]["outcome"], lines.of("turn_ended")[0]["result"]["code"]),
+                         ("interrupted", b.ServerError.code))
 
     def test_a_turn_the_model_had_finished_stays_done(self) -> None:
         session, provider, lines = _session(self, [{"text": "answer"}])

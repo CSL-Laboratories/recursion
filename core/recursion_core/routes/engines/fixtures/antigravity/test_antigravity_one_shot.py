@@ -538,5 +538,60 @@ class ReviewRoundTwoParserTest(unittest.TestCase):
                 self.assertEqual(launcher.calls, [])
 
 
+def step_line(step_index, *, present=True) -> str:
+    step = {"step_type": "tool", "state": "DONE", "tool_info": {"name": "t", "parameters": {}, "output": "ok"}}
+    if present:
+        step["step_index"] = step_index
+    return json.dumps({"event": "step_update", "step_update": step})
+
+
+class ReviewRoundThreeParserTest(unittest.TestCase):
+    """Regressions for the two reads of #396 at 6fe2b50d that concern the one-shot parser and adapter."""
+
+    def test_ds_med3_a_prompt_that_is_not_utf8_is_refused_before_anything_starts(self) -> None:
+        clock = Clock()
+        launcher = Launcher(lines("synthetic-ok.jsonl"), clock)
+        req = dict(request(), prompt="a" + chr(0xD800) + "b")
+        res = adapter(launcher, clock).run(req, clock() + 60)
+        self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "prompt is not UTF-8"))
+        self.assertEqual(launcher.calls, [])
+        with self.assertRaises(c.RouteError) as ctx:          # the stdin helper keeps the same rule
+            ag.one_shot_stdin("a" + chr(0xD800) + "b")
+        self.assertEqual(ctx.exception.code, c.REQUEST_INVALID)
+        self.assertEqual(ag.one_shot_stdin("caf" + chr(0xE9)), '{"event":"user","message":{"content":"caf' + chr(0xE9)
+                         + '"}}')                             # other text is written as it is
+
+    def test_ds_a_done_tool_step_whose_index_is_not_an_integer_is_a_protocol_error(self) -> None:
+        for index in (True, 1.0, "1", None):
+            with self.subTest(index=index), self.assertRaises(ag.OneShotProtocolError):
+                ag.OneShotParser(CONN, MODEL).parse(step_line(index))
+        with self.assertRaises(ag.OneShotProtocolError):
+            ag.OneShotParser(CONN, MODEL).parse(step_line(None, present=False))
+        clock = Clock()
+        launcher = Launcher([step_line(1.0)], clock)
+        res = adapter(launcher, clock).run(request(), clock() + 60)
+        self.assertEqual(res["code"], c.PROTOCOL_ERROR)
+        self.assertEqual(launcher.process.fenced, ["protocol_error"])
+        active = json.dumps({"event": "step_update", "step_update": {"step_type": "tool", "state": "ACTIVE"}})
+        self.assertEqual(of_type(ag.OneShotParser(CONN, MODEL).parse(active), "tool.call"), [])   # not DONE: skipped
+
+    @unittest.skipUnless(schema_check.AVAILABLE, schema_check.SKIP_REASON)
+    def test_a_refused_index_leaves_the_parser_able_to_draft_the_next_step(self) -> None:
+        parser = ag.OneShotParser(CONN, MODEL)
+        with self.assertRaises(ag.OneShotProtocolError):
+            parser.parse(tool_line({}, index=2**63))
+        drafts = parser.parse(tool_line({}, index=2**63 - 1))
+        self.assertTrue(any(d["type"] == "tool.call" for d in drafts))
+        for draft in drafts:
+            self.assertTrue(schema_check.fits("driver.v2.json#/$defs/event_draft", draft), draft)
+
+    def test_a_route_home_given_as_bytes_is_refused_before_launch(self) -> None:
+        clock = Clock()
+        launcher = Launcher([], clock)
+        res = adapter(launcher, clock, home=lambda *args: b"/var/tmp/synthetic").run(request(), clock() + 10)
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertEqual(launcher.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

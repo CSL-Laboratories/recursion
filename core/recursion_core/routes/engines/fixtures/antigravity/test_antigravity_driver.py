@@ -168,6 +168,13 @@ class AcpGlueTest(unittest.TestCase):
             drafts.on_line('{"x":"\udcff"}')
         self.assertEqual(drafts.drafts, [])
 
+    def test_the_acp_argv_takes_agy_or_an_absolute_path_only(self) -> None:
+        self.assertEqual(ag.acp_argv("agy"), ["agy", "acp"])
+        self.assertEqual(ag.acp_argv("/opt/antigravity/bin/agy"), ["/opt/antigravity/bin/agy", "acp"])
+        for bad in (None, "", "-x", "relative/agy", "/opt/a" + chr(0) + "gy", b"/opt/agy"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ag.acp_argv(bad)
+
     def test_antigravity_maps_no_acp_error_to_a_plan_limit(self) -> None:
         agent = FakeAcpAgent([[("error", 429, "Usage limit reached")]])
         session = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR)

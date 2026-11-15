@@ -129,8 +129,17 @@ def one_shot_argv(executable: str, model: str) -> list[str]:
 
 
 def one_shot_stdin(prompt: str) -> str:
-    """The one stdin line: a ``user`` event whose content is the prompt (headless page, stdin messages)."""
-    return json.dumps({"event": "user", "message": {"content": prompt}}, separators=(",", ":"), ensure_ascii=False)
+    """The one stdin line: a ``user`` event whose content is the prompt (headless page, stdin messages).
+
+    A prompt that cannot be written as UTF-8 (a lone surrogate) is refused ``request_invalid``: the line could
+    never reach agy's stdin. The adapter refuses it before anything starts; this is the same rule for any
+    other caller."""
+    line = json.dumps({"event": "user", "message": {"content": prompt}}, separators=(",", ":"), ensure_ascii=False)
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        raise c.RouteError(c.REQUEST_INVALID, "prompt is not UTF-8") from None
+    return line
 
 
 # The result statuses Google's headless page lists. SUCCESS is the only success.
@@ -156,8 +165,9 @@ class OneShotParser:
     * ``init``: the conversation id is kept (the engine's session id).
     * ``step_update`` of a ``tool`` step in state ``DONE`` with ``tool_info``: a ``tool.call`` and a
       ``tool.result`` draft, once per step. The call id is ``step-<step_index>`` (agy gives a tool call no
-      id of its own); a step index outside 0 .. 2^63 - 1 is a protocol error, so the id always fits
-      event.v1. The input is ``tool_info.parameters`` when it is an object, else null, and the digest
+      id of its own); a step index that is missing, not an integer, or outside 0 .. 2^63 - 1 is a protocol
+      error, so no tool call vanishes and the id always fits event.v1. The input is
+      ``tool_info.parameters`` when it is an object, else null, and the digest
       (RFC 8785 then SHA-256) is always of what agy sent (JSON null when it sent none). Parameters with no
       RFC 8785 text (an integer beyond 2^53 - 1, for one) are a protocol error, as is a line nested too
       deeply to read or one that is not UTF-8.
@@ -227,12 +237,12 @@ class OneShotParser:
     def _tool(self, step: Mapping) -> list[dict]:
         info = step.get("tool_info")
         index = step.get("step_index")
-        if (step.get("step_type") != "tool" or step.get("state") != "DONE" or not isinstance(info, Mapping)
-                or type(index) is not int):
+        if step.get("step_type") != "tool" or step.get("state") != "DONE" or not isinstance(info, Mapping):
             return []
-        if not 0 <= index <= MAX_STEP_INDEX:
+        if type(index) is not int or not 0 <= index <= MAX_STEP_INDEX:
             # The call id is made from it, and event.v1 caps a call id at 128 characters: a step index no
-            # 64-bit counter gives is the agent's protocol error, not an id the core must refuse.
+            # 64-bit counter gives (missing, not an integer, or out of range) is the agent's protocol error,
+            # never a tool call dropped without a trace or an id the core must refuse.
             raise OneShotProtocolError("step_index is not a 64-bit count")
         if index in self._tool_steps:
             return []
@@ -417,6 +427,10 @@ class AntigravityOneShotAdapter(RouteAdapter):
         for name in ("prompt",):
             if not isinstance(request.get(name), str) or not request[name]:
                 return c.result(rid, c.REQUEST_INVALID, detail=name)
+        try:
+            request["prompt"].encode("utf-8")
+        except UnicodeEncodeError:   # a lone surrogate: agy's stdin takes UTF-8, so it could never be sent
+            return c.result(rid, c.REQUEST_INVALID, detail="prompt is not UTF-8")
         route = request.get("route")
         if not isinstance(route, Mapping):
             return c.result(rid, c.REQUEST_INVALID, detail="route")
@@ -492,6 +506,11 @@ def one_shot_factory(launcher, clock, credentials, environ, **options) -> Antigr
 
 # -- the ACP drive (agy acp) through the shared client --------------------------------------------------------
 def acp_argv(executable: str) -> list[str]:
+    """``<executable> acp``. The executable is ``agy`` or an absolute path (the ``binary`` option), never
+    empty, a flag or a string with a NUL in it."""
+    if (not isinstance(executable, str) or "\x00" in executable
+            or (executable != DEFAULT_EXECUTABLE and not executable.startswith("/"))):
+        raise ValueError("the ACP executable must be agy or an absolute path")
     return [executable, *ACP_ARGS]
 
 

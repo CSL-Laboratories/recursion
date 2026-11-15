@@ -87,16 +87,20 @@ WHAT THE CLIENT DOES, in the order of a run:
    authenticate, session/new, session/load) do not reach the hook: they raise ``AcpError``.
 10. The agent going away ends the run however it is noticed: the end of its stdout, a read of its stdout
     that fails (``OSError``), or a write to its stdin that fails, on any thread (a reply, a cancel, a
-    permission answer). A turn in progress ends ``engine_exited`` (an outcome it already had stays); an
-    open in progress raises ``AcpError(engine_exited)``. A write that fails on the pumping thread ends the
-    turn before the next read; one that fails on another thread is noticed at the pump's next line or wake.
+    permission answer, the prompt itself). A write fails when ``send`` raises ANYTHING: after that the
+    agent may hold part of a line, so nothing more is written (an interruption is still raised). A turn in
+    progress ends ``engine_exited`` (an outcome it already had stays); an open in progress raises
+    ``AcpError(engine_exited)``. A write that fails on the pumping thread ends the turn before the next
+    read; one that fails on another thread is noticed when the pump's current read returns, before
+    anything that line says is taken.
     A line that is not a JSON-RPC 2.0 object (including one too deeply nested to read) is a protocol error.
 11. Recursion's deadline is checked when a step that starts work holds the ordering lock, and again after
     each read: an answer read after the deadline never makes a success. A deadline is a finite number of
     the clock's seconds; anything else is refused (``AcpInvalid``).
 12. A failure while a turn's lines are handled (a protocol error, or ``on_line``, ``on_update`` or
-    ``on_ask`` raising) is raised to the caller of ``prompt`` and ABANDONS the turn (item 4), so the
-    session stays able to take the next one. When ``on_line`` raises, the connection still reads the line.
+    ``on_ask`` raising, an interruption included) is raised to the caller of ``prompt`` and ABANDONS the
+    turn (item 4), so the session stays able to take the next one. When ``on_line`` raises, even an
+    interruption, the connection still reads the line before it is raised.
 
 CODES. ``TurnOutcome.code`` is None (succeeded), a route contract code, or ``cancelled``, which is not one
 of the route contract's CODES: a caller on the route contract maps it (the one-shot adapter reports
@@ -246,16 +250,26 @@ def _limit_signal(value: object) -> dict | None:
         return None
     if scope == "model" and not (isinstance(model, str) and model):
         return None
-    if reset_at is not None and (isinstance(reset_at, bool) or not isinstance(reset_at, (int, float))
-                                 or not math.isfinite(reset_at)):
+    if reset_at is not None and not _finite_number(reset_at):
         return None
     return dict(value)
 
 
+def _finite_number(value: object) -> bool:
+    """An int or a float (never a bool) that is a finite float: NaN, an infinity and an integer too large for a
+    float (``math.isfinite`` raises OverflowError for it) are not."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _check_deadline(deadline_at: object) -> None:
-    """A deadline is a finite number of the clock's seconds: NaN, an infinity, a bool or None is refused."""
-    if (isinstance(deadline_at, bool) or not isinstance(deadline_at, (int, float))
-            or not math.isfinite(deadline_at)):
+    """A deadline is a finite number of the clock's seconds: NaN, an infinity, an integer too large for a float,
+    a bool or None is refused."""
+    if not _finite_number(deadline_at):
         raise AcpInvalid("deadline_at must be a finite number of the clock's seconds")
 
 
@@ -336,8 +350,7 @@ class AcpConnection:
     def __init__(self, *, hooks: EngineHooks = NO_HOOKS, clock: Callable[[], float] | None = None,
                  permission_timeout_s: float | None = None) -> None:
         if permission_timeout_s is not None and (
-                isinstance(permission_timeout_s, bool) or not isinstance(permission_timeout_s, (int, float))
-                or not math.isfinite(permission_timeout_s) or not permission_timeout_s > 0):
+                not _finite_number(permission_timeout_s) or not permission_timeout_s > 0):
             raise AcpInvalid("permission_timeout_s must be a finite number of seconds above zero")
         self._hooks = hooks
         self._clock = clock
@@ -860,17 +873,24 @@ class AcpSession:
 
     # -- writing ------------------------------------------------------------------------------------------
     def _write(self, lines) -> bool:
-        """Write ``lines`` in order. False when the agent's input is gone (it is never raised); once a write
-        has failed nothing more is tried, and the pump ends the turn in progress engine_exited."""
+        """Write ``lines`` in order. False when the agent's input is gone; once a write has failed nothing more
+        is tried, and the pump ends the turn in progress engine_exited.
+
+        ANY failure of ``send`` loses the input, not only an ``OSError``: after a write that raised, the agent
+        may hold part of a line, so nothing more can be written to it safely. An ``Exception`` is not raised
+        (False); an interruption (a ``BaseException`` that is not an ``Exception``) is raised, with the input
+        already marked lost."""
         with self._order:
             if self.input_lost:
                 return False
             for line in lines:
                 try:
                     self.process.send(line)
-                except OSError:
+                except BaseException as error:
                     self.input_lost = True
-                    return False
+                    if isinstance(error, Exception):
+                        return False
+                    raise
             return True
 
     def _step(self, make) -> tuple[int, bool]:
@@ -970,9 +990,16 @@ class AcpSession:
     def _prompt(self, text: str, deadline_at: float) -> TurnOutcome:
         self._drain(deadline_at)
         # A prompt that could not be written is seen by the pump's first round (the input is lost): the turn
-        # ends engine_exited there, as for any failed write.
-        rpc_id, _written = self._step(self._starting(deadline_at, "before the prompt was sent",
-                                                     lambda: self.connection.prompt(text, deadline_at)))
+        # ends engine_exited there, as for any failed write. When the write was interrupted instead, the turn
+        # it began ends here with the agent's input, before the interruption is raised: no turn is left in
+        # progress with nothing to end it.
+        try:
+            rpc_id, _written = self._step(self._starting(deadline_at, "before the prompt was sent",
+                                                         lambda: self.connection.prompt(text, deadline_at)))
+        except BaseException:
+            if self.input_lost:
+                self.connection.input_closed()
+            raise
         try:
             while True:
                 outcome = self._pump_one(deadline_at)
@@ -997,20 +1024,24 @@ class AcpSession:
                 raise AcpError(c.ENGINE_EXITED, "the agent went away before it answered an abandoned turn")
 
     def cancel(self) -> None:
-        """Ask the agent to cancel the turn in progress. Safe from any thread; never raises for a gone agent."""
+        """Ask the agent to cancel the turn in progress. Safe from any thread; never raises for a gone agent
+        (an interruption during the write is still raised)."""
         with self._order:
             self._write(self.connection.cancel())
 
     def answer_permission(self, token: str, decision: str) -> bool:
-        """The caller's answer to an ask. True only when it is the one the agent was sent: False when the ask
-        was already answered (deadline, cancel, or an earlier answer), when its deadline had passed (the
-        deadline's deny is sent instead), or when the agent's input is gone."""
+        """The caller's answer to an ask. True only when the agent was sent the option the caller's decision
+        names (``allow_once`` for approve, ``reject_once`` for deny). False when the ask was already answered
+        (deadline, cancel, or an earlier answer), when its deadline had passed (the deadline's deny is sent
+        instead), when the agent did not offer the option the decision needs (it is sent the ``cancelled``
+        outcome, which runs nothing; ``ask.option_id`` is None), or when the agent's input is gone."""
         with self._order:
             line = self.connection.answer_permission(token, decision)
             if line is None:
                 return False
             written = self._write([line])
-            return written and self.connection.ask(token).answered_by == "caller"
+            ask = self.connection.ask(token)
+            return written and ask.answered_by == "caller" and ask.option_id is not None
 
     def close(self) -> None:
         """End the agent's input. The agent finishes and exits."""
@@ -1030,6 +1061,10 @@ class AcpSession:
         expired = conn.expire(now)
         if expired:
             self._write(expired)
+            if self.input_lost:
+                # The deadline's deny could not be written: nothing more is read for this turn.
+                outcome = conn.input_closed()
+                return outcome if outcome is not None else False
         if now >= deadline_at:
             outcome = conn.deadline()
             if outcome is not None:
@@ -1061,9 +1096,19 @@ class AcpSession:
         if self._on_line is not None:
             try:
                 self._on_line(line)
-            except Exception as error:
+            except BaseException as error:
+                # An interruption too: the line is already read from the agent, so the connection must still
+                # see it, or an answer it carries is lost and the abandoned turn could never end. Then the
+                # interruption is raised, never swallowed.
                 self._line_refused(line, error)
                 raise
+        if self.input_lost:
+            # A write failed while this line was read (on another thread, or the cancel just above): nothing
+            # the line says can make a success. An outcome the turn already had (its deadline) stays.
+            gone = conn.input_closed()
+            if abandoned is not None:
+                return abandoned
+            return gone if gone is not None else False
         fed = conn.feed(line)
         if fed.replies:
             self._write(fed.replies)
@@ -1081,11 +1126,11 @@ class AcpSession:
             return fed.ended
         return True  # a write of this round that failed is seen at the top of the next one, before any read
 
-    def _line_refused(self, line: str, error: Exception) -> None:
-        """``on_line`` raised: the caller could not take this line. The turn in progress is abandoned (typed by
-        the error); ``prompt``, which the error then reaches, asks the agent to stop it. The connection still
-        reads the line, so an answer to the abandoned prompt that it carries still ends the turn's wait and
-        the session can take the next one."""
+    def _line_refused(self, line: str, error: BaseException) -> None:
+        """``on_line`` raised (an ``Exception`` or an interruption): the caller could not take this line. The
+        turn in progress is abandoned (typed by the error); ``prompt``, which the error then reaches, asks the
+        agent to stop it. The connection still reads the line, so an answer to the abandoned prompt that it
+        carries still ends the turn's wait and the session can take the next one."""
         conn = self.connection
         conn.abandon(error.code if isinstance(error, AcpError) else c.ENGINE_ERROR,
                      f"on_line raised {type(error).__name__}")

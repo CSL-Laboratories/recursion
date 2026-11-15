@@ -61,8 +61,11 @@ class AcpConnection(*, hooks=NO_HOOKS, clock=None, permission_timeout_s=None)   
 
 class AcpSession(process, clock, *, hooks, permission_timeout_s, on_line, on_update, on_ask)
     open(method_id, cwd, deadline_at, *, load_session_id=None) -> session id
-    prompt(text, deadline_at) -> TurnOutcome; cancel(); answer_permission(token, decision) -> bool; close()
-    input_lost: True once a write to the agent failed
+    prompt(text, deadline_at) -> TurnOutcome; cancel(); close()
+    answer_permission(token, decision) -> bool    True only when the agent was sent the option the decision
+        names (allow_once / reject_once); False when that option was not offered (it was sent `cancelled`,
+        ask.option_id is None), the ask was already answered or late, or the input is gone
+    input_lost: True once a write to the agent failed (send raised anything)
     One caller reads the output at a time: open or prompt while another runs raises AcpStateError at once.
 
 TurnOutcome(turn, code, stop_reason, cancel_requested, cancel_confirmed, late_stop_reason, error, limit,
@@ -76,10 +79,15 @@ What each call raises: an argument the caller got wrong is `AcpInvalid` (`reques
 anything is written (`open` checks all of its arguments first); a call the state does not allow is
 `AcpStateError` (`request_invalid`, or `engine_exited` once the agent is gone); a failure of the run is an
 `AcpError` with its code. So one `except AcpError` catches every refusal and failure of the client.
-`answer_permission` raises `KeyError` for a token this connection never issued. A failure while a turn's
-lines are handled (a protocol error, or `on_line`, `on_update` or `on_ask` raising) is raised by `prompt`
-and abandons the turn: the agent is asked to cancel it, and the next `prompt` first reads to the agent's
-answer to the abandoned prompt (those lines go to `on_line` only), so a long-lived worker keeps working.
+`answer_permission` raises `KeyError` for a token this connection never issued. A deadline, a permission
+timeout or a limit's `reset_at` must be a finite float-sized number: NaN, an infinity, or an integer too
+large for a float is refused (`AcpInvalid`), or counts as a bad hook answer. A failure while a turn's lines
+are handled (a protocol error, or `on_line`, `on_update` or `on_ask` raising, an interruption included) is
+raised by `prompt` and abandons the turn: the agent is asked to cancel it, and the next `prompt` first reads
+to the agent's answer to the abandoned prompt (those lines go to `on_line` only), so a long-lived worker
+keeps working. A line `on_line` raised on, even with an interruption, is still read by the connection. A
+write that fails, on any thread and whatever `send` raised, loses the agent's input: the turn ends
+`engine_exited` before anything more is read or taken, and every later call is refused `engine_exited`.
 A permission answer is decided when it claims the ask, against a clock read after the claim, so a wait for
 a lock never lets a late answer approve. The deadline of a step that starts work is checked once the step
 holds the session's ordering lock.

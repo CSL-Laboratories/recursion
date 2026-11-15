@@ -135,7 +135,10 @@ class ApprovalQueue:
             try:
                 worker.start()
             except BaseException:
-                self.ready = False  # failed or interrupted: no worker is known to run; stop deals with this one
+                # Failed or interrupted. The thread may have launched all the same (an interruption that lands
+                # once it has): it is withdrawn as stop withdraws it, so it can never publish ready, and it is
+                # kept for stop to join.
+                self._withdraw()
                 raise
         except BaseException:
             with self._lock:
@@ -155,22 +158,30 @@ class ApprovalQueue:
         """Signal the worker and return only once it has joined. Interrupted, the worker is kept, and a
         second ``stop`` joins it again. A worker whose thread never launched (its start failed) has nothing
         to join and is let go; were it to launch late, its generation is gone and it returns at once."""
-        with self._lock:
-            self.ready = False
-            self._running = False
-            self._closing.set()  # with ready, under the lock: a sweep that ends now cannot publish ready again
-        self._generation = None
-        self._wake.set()
+        self._withdraw()
         worker = self._worker
         if worker is not None:
             if worker.ident is not None or worker.is_alive():
                 worker.join()
             self._worker = None
 
+    def _withdraw(self) -> None:
+        """Withdraw ``ready`` and signal the worker to return. ``ready`` and the closing signal change together
+        under the lock, so a sweep that ends now cannot publish ready again; then the worker's generation goes
+        and it is woken."""
+        with self._lock:
+            self.ready = False
+            self._running = False
+            self._closing.set()
+        self._generation = None
+        self._wake.set()
+
     def subscribe_requested(self, fn: Callable[[dict], None]) -> Callable[[], None]:
         """``fn(record)`` after a request commits. Recovery at start offers again every pending request no
-        surface took; a surface that subscribes once the queue has started is offered those at once. So a
-        surface can be offered one request more than once, always under the same approval id."""
+        surface took; a surface that subscribes once the queue has started is offered those at once, and one
+        that subscribes while a start runs is offered them once that start has launched its worker (nothing
+        before, and nothing at all if the start fails). So a surface can be offered one request more than
+        once, always under the same approval id."""
         token = object()
         with self._lock:
             self._requested.append((token, fn))
@@ -255,9 +266,15 @@ class ApprovalQueue:
 
     def _offer(self, record: dict, *, only=None) -> bool:
         """Tell the subscribers of a committed request (or only ``only``); remember it as shown only if one
-        took it."""
+        took it. A surface that subscribed while a start runs is not told here until that start has launched
+        its worker: recovery's own offering, and a request committed meanwhile, leave it out, and ``start``
+        offers it what no surface took once the worker runs."""
         with self._lock:
-            listeners = [fn for _, fn in self._requested] if only is None else [only]
+            if only is None:
+                waiting = {token for token, _ in self._late or ()}
+                listeners = [fn for token, fn in self._requested if token not in waiting]
+            else:
+                listeners = [only]
         taken = False
         for fn in listeners:
             taken = _tell(fn, copy.deepcopy(record)) or taken

@@ -242,7 +242,7 @@ def forward(api: Any, tool: Tool, arguments: dict) -> dict:
     """Send one call to the control API; the ``tools/call`` result, as control/mcp_tools.call_tool makes it."""
 
     answer = api.call(tool.method, arguments or {})
-    if not isinstance(answer, dict):  # the caller answers this as an outcome it does not know
-        raise TypeError("the control API answered something that is not an object")
+    # An answer that is not an object raises here (it has no .get), and the session answers that call
+    # as an outcome it does not know.
     return {"content": [{"type": "text", "text": json.dumps(answer, sort_keys=True)}],
             "structuredContent": answer, "isError": answer.get("code") not in SUCCESS_CODES}

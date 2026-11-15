@@ -245,6 +245,21 @@ class AnswerTest(SessionCase):
             "content": [{"type": "text", "text": json.dumps(want, sort_keys=True)}],
             "structuredContent": want, "isError": True}}, answer)
 
+    def test_an_answer_that_is_not_an_object_is_an_outcome_not_known(self) -> None:
+        for odd in ("stopped", ["stopped"], None, 3):
+            class Odd:
+                def call(self, method, params=None, odd=odd):
+                    return odd
+
+            with self.subTest(answer=odd):
+                session, writer = self.session(Odd())
+                self.feed(session, call(2, *STOP))
+                result = writer.next()["result"]
+                session.close()
+                self.assertEqual(("control_api_unavailable", "unknown", True),
+                                 (result["structuredContent"]["code"], result["structuredContent"]["delivered"],
+                                  result["isError"]))
+
     def test_an_answer_json_cannot_hold_becomes_an_internal_error(self) -> None:
         class NotJson:
             def call(self, method, params=None):

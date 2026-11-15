@@ -459,7 +459,8 @@ class FakeLanes:
                 delattr(sys.modules[parent], leaf)
         for name, module in self._real.items():     # the real ones: the same objects, where they were
             sys.modules[name] = module
-            parent, _, leaf = name.rpartition('.')
+        for name, module in self._real.items():     # then each as its parent's attribute: a child may have been set
+            parent, _, leaf = name.rpartition('.')  # aside before its parent, and the parent has to be back first
             if parent in sys.modules:
                 setattr(sys.modules[parent], leaf, module)
         self._mounted, self._names, self._real = [], [], {}
@@ -544,6 +545,49 @@ class RegistrationTest(unittest.TestCase):
         self.assertIs(sys.modules.get('recursion_core.control.scopes'), real)
         self.assertIn('grok', H.compose().engines.names())
 
+    def test_a_real_package_and_its_registrant_are_put_back_whole_whichever_was_set_aside_first(self) -> None:
+        """The fifth reads. A lane's real registrant sits in the lane's real PACKAGE. The stand-ins set the
+        registrant aside first; a test's fake package of the same name then sets the package aside. Afterwards
+        both are back, the same objects, and the package has its registrant as its attribute again: the
+        package is put back before its registrant is hung on it."""
+        engine = 'def register(hooks):\n    hooks.engines.register(%r, lambda *a, **k: None)\n'
+        names = ('recursion_core.events', 'recursion_core.events.hooks')
+        core = importlib.import_module('recursion_core')
+        root = tempfile.mkdtemp(prefix='seam-real-lane-')
+        package = pathlib.Path(root, 'events')
+        package.mkdir()
+        (package / '__init__.py').write_text('REAL = True\n', encoding='utf-8')
+        (package / 'hooks.py').write_text('REAL = True\n\n\n' + engine % 'grok', encoding='utf-8')
+        before = {name: sys.modules.pop(name, None) for name in names}
+        attribute = core.__dict__.pop('events', None)
+
+        def unmount() -> None:
+            core.__path__.remove(root)
+            for name in names:
+                sys.modules.pop(name, None)
+                if before[name] is not None:
+                    sys.modules[name] = before[name]
+            core.__dict__.pop('events', None)
+            if attribute is not None:
+                core.events = attribute
+            shutil.rmtree(root, True)
+            importlib.invalidate_caches()
+        core.__path__.insert(0, root)       # it plays the lane's real package, whatever this tree has under that name
+        self.addCleanup(unmount)
+        importlib.invalidate_caches()
+        real, registrant = (importlib.import_module(name) for name in names)
+        self.assertIs(real.hooks, registrant)
+        calls: list = []
+        fake = FakeLanes(mock.Mock(addCleanup=calls.append))
+        self.addCleanup(lambda: [call() for call in calls])
+        fake.stand_in_for_the_installed()               # the registrant is set aside: a stand-in in the real package
+        fake.lane('events', hooks=engine % 'pi')        # then the package: a whole fake package in its place
+        self.assertEqual(H.compose().engines.names(), ('claude_code', 'codex', 'pi'))
+        calls.pop()()
+        self.assertEqual([sys.modules.get(name) is module for name, module in zip(names, (real, registrant))], [True, True])
+        self.assertIs(getattr(real, 'hooks', None), registrant, 'the real package has its registrant as its attribute again')
+        self.assertIs(core.events, real)
+
     def test_nothing_is_installed_today_and_the_hooks_compose_with_their_defaults(self) -> None:
         composed = H.compose()
         self.assertFalse(composed.start_on)
@@ -583,6 +627,10 @@ class RegistrationTest(unittest.TestCase):
                                  'no importer is brought in under another name')
             if isinstance(node, ast.Attribute):
                 self.assertNotIn(node.attr, {'import_module', '__import__', 'exec', 'eval', 'reload', '__builtins__'})
+            if isinstance(node, ast.Attribute) and node.attr == 'find_spec':    # the fifth reads: not kept under a name
+                call = parents.get(node)
+                self.assertTrue(isinstance(call, ast.Call) and call.func is node,
+                                'find_spec is called where it is named, and never kept under another name')
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'find_spec':
                 self.assertEqual(ast.unparse(node.func), 'importlib.util.find_spec', 'find_spec is called under its own name')
             if isinstance(node, ast.Name):
@@ -635,6 +683,8 @@ class RegistrationTest(unittest.TestCase):
             'an importer reached through the table of modules': "import sys\n_load = sys.modules['builtins'].__import__\n",
             'find_spec on a module taken from the table of modules':
                 "import sys\n_specs = sys.modules['importlib.util']\n\n\ndef _find(name):\n    return _specs.find_spec(name)\n",
+            'find_spec taken from the table of modules and kept under a local name':
+                "import sys\n\n\ndef _find(name):\n    _spec = sys.modules['importlib.util'].find_spec\n    return _spec(name)\n",
             # The third read's three spellings stay refused.
             'an importer imported from importlib': 'from importlib import import_module as _load\n',
             'a find_spec that is not literal': 'def _find(name):\n    return importlib.util.find_spec(name)\n',
@@ -3035,6 +3085,212 @@ class WorkerService:
             self._thread.join(BOUND_S)
             if self._thread.is_alive():
                 raise AssertionError('the test worker did not stop within BOUND_S')
+
+
+class OwnershipRegionTest(unittest.TestCase):
+    """Every traceable point of each protected region, interrupted there once (the comment OWNERSHIP in
+    ``control/hooks.py``). Three reads in a row found the point just past the last repair; this walks them all,
+    so that the next one is found here.
+
+    For each of the four regions a run with no interruption is traced, counting what executes in the module's own
+    code between the region's entry and its return: the region itself, the helpers that take an ownership and
+    raise what was kept, and for the lifecycle the whole teardown under it, the gate's close and drain included.
+    Then the region is run once for each point counted, with a KeyboardInterrupt raised exactly there. Each time:
+
+    - the interruption is raised to the caller, the same object: never swallowed;
+    - this thread owns nothing when the call ends, and another thread can take the lock;
+    - the work is finished, or nothing of it was done and the call can simply be made again. The second happens
+      only where the interruption landed before the region was entered, which is asserted: those points are the
+      first ones of the run, with none in between that finished the work;
+    - a second call, uninterrupted, returns and leaves the work done.
+
+    The points are walked twice. Once by EVENT (every call, line and return), on every interpreter. Once by
+    INSTRUCTION (every bytecode instruction), where the interpreter delivers an exception raised at an instruction
+    event at all of them; that is measured here first, on a small function, and where it is not so the walk by
+    instruction is skipped and says how many it would have lost. (Measured on Nov 14, 2026: 3.12.3 delivers all;
+    free-threaded 3.14.8 drops about one in four.) The first traced run of a function sees no instruction events
+    on either, so every count is taken on a later run.
+
+    WHAT PURE PYTHON CANNOT PROTECT, and this test therefore does not visit: a second interruption that lands
+    while the first is being put away (the instructions of the ``except`` clause and the way back to the top of
+    the loop execute only after an interruption); and whatever the lock's own acquire and release do inside
+    themselves (one call into C each, for ``threading.RLock``). The release CALL is inside the region and is
+    walked like every other point."""
+
+    EVENTS, INSTRUCTIONS = ('call', 'line', 'return'), ('opcode',)
+
+    def traced(self, run, kinds, codes=None, at=None, cut=None) -> int:
+        """Run with every point of ``kinds`` counted, in ``control/hooks.py`` or in the given code objects;
+        ``cut`` is raised at point number ``at``. How many were counted."""
+        counted = [0]
+
+        def points(frame, event, arg):
+            if event in kinds:
+                counted[0] += 1
+                if counted[0] - 1 == at:
+                    raise cut
+            return points
+
+        def calls(frame, event, arg):
+            if event == 'call' and (frame.f_code in codes if codes is not None else frame.f_code.co_filename == H.__file__):
+                if kinds == self.INSTRUCTIONS:
+                    frame.f_trace_opcodes = True
+                    frame.f_trace_lines = False
+                return points(frame, event, arg)
+            return None
+        before = sys.gettrace()
+        sys.settrace(calls)
+        try:
+            run()
+        finally:
+            sys.settrace(before)
+        return counted[0]
+
+    def lost_at_instructions(self) -> tuple:
+        """``(how many instruction events a small function has, at how many of them an exception raised from the
+        event did not reach the function)`` on this interpreter."""
+        def helper(box):
+            box.append('h')
+
+        def subject(box):
+            while True:
+                try:
+                    helper(box)
+                    box.append('b')
+                    break
+                except BaseException as exc:  # noqa: BLE001 - the probe's own
+                    box.append(exc)
+            return len(box)
+        codes = (subject.__code__, helper.__code__)
+        self.traced(lambda: subject([]), self.INSTRUCTIONS, codes)        # the first run sees none
+        total = self.traced(lambda: subject([]), self.INSTRUCTIONS, codes)
+        lost = 0
+        for at in range(total):
+            box, cut = [], KeyboardInterrupt(at)
+            try:
+                self.traced(lambda: subject(box), self.INSTRUCTIONS, codes, at, cut)
+                lost += cut not in box
+            except KeyboardInterrupt:
+                pass
+        return total, lost
+
+    def lifecycle(self):
+        """Hooks with a store open and a service started, cheap enough to make a few hundred times."""
+        class Store:
+            closed = False
+
+            def close(inner) -> None:
+                inner.closed = True
+        made, store = H.Hooks(), Store()
+        made.service(Service('events', []))
+        made.set('event_store', lambda state_dir: store)
+        made.freeze()
+        made.open_store('/state')
+        made.start_services(H.ServiceContext())
+        return made, store
+
+    def draining(self):
+        """A gate that is closed with one call inside, which leaves as soon as the drain waits for it."""
+        gate = H.Admission()
+        gate.enabled = True
+        gate.enter()
+        gate.close()
+
+        def waiting(timeout=None):      # the call leaves, as another thread's would: the test's own stand-in
+            gate._admitted = 0
+            return True
+        gate._changed.wait = waiting
+        return gate
+
+    REGIONS = {
+        'Admission.close': (lambda self: self.gate(), lambda gate: gate.close(), lambda gate: gate._lock, lambda gate: gate.closed),
+        'Admission.drain': (lambda self: self.draining(), lambda gate: gate.drain(), lambda gate: gate._lock,
+                            lambda gate: gate.admitted == 0),
+        'Hooks.stop_services': (lambda self: self.lifecycle(), lambda pair: pair[0].stop_services(H.ServiceContext()),
+                                lambda pair: pair[0]._lifecycle, lambda pair: pair[0]._started == []),
+        'Hooks.finish_close': (lambda self: self.lifecycle(), lambda pair: pair[0].finish_close(H.ServiceContext()),
+                               lambda pair: pair[0]._lifecycle,
+                               lambda pair: pair[1].closed and pair[0]._started == [] and pair[0].gate.closed),
+    }
+
+    def gate(self):
+        gate = H.Admission()
+        gate.enabled = True
+        return gate
+
+    def walk(self, region, kinds) -> None:
+        make, call, lock_of, finished = self.REGIONS[region]
+        counts = []
+        for _ in range(3):                  # the first run of a function sees no instruction events
+            subject = make(self)            # made before the tracing starts, as in every run below
+            counts.append(self.traced(lambda: call(subject), kinds))
+        total = counts[-1]
+        self.assertEqual(counts[1], total, 'the count is the same from one run to the next')
+        self.assertGreater(total, 8, 'the walk saw the region')
+        unfinished = []
+        for at in range(total):
+            subject = make(self)
+            lock, cut, raised = lock_of(subject), KeyboardInterrupt(f'{region}, point {at}'), None
+            try:
+                self.traced(lambda: call(subject), kinds, None, at, cut)
+            except BaseException as exc:  # noqa: BLE001 - what the region raised is what is looked at
+                raised = exc
+            with self.subTest(region=region, by=kinds[-1], point=at):
+                self.assertIs(raised, cut, 'the interruption reaches the caller, the same object')
+                self.assertFalse(lock._is_owned(), 'this thread owns nothing when the call ends')
+                taken: list = []
+                other = threading.Thread(target=lambda: taken.append(lock.acquire(timeout=BOUND_S) and (lock.release() or True)),
+                                         daemon=True)
+                other.start()
+                other.join(BOUND_S)
+                self.assertEqual(taken, [True], 'another thread can take the lock')
+                if not finished(subject):
+                    unfinished.append(at)
+                call(subject)               # uninterrupted: it returns, and the work is done
+                self.assertEqual((finished(subject), lock._is_owned()), (True, False))
+        # The work was left undone only by an interruption that landed before the region was entered: on the
+        # first points of the run, with none in between that finished it.
+        self.assertEqual(unfinished, list(range(len(unfinished))), 'only the first points leave the work to be done again')
+        self.assertLess(len(unfinished), total // 2, 'and they are few: once entered, the region always finishes')
+
+    def by_instruction(self, region) -> None:
+        total, lost = self.lost_at_instructions()
+        if lost:
+            self.skipTest(f'this interpreter does not deliver an exception raised at an instruction event at {lost} of '
+                          f'{total} instructions of a small function; the walk by event covers this region')
+        self.walk(region, self.INSTRUCTIONS)
+
+    @quiet
+    def test_the_gates_close_at_every_event(self) -> None:
+        self.walk('Admission.close', self.EVENTS)
+
+    @quiet
+    def test_the_gates_drain_at_every_event(self) -> None:
+        self.walk('Admission.drain', self.EVENTS)
+
+    @quiet
+    def test_stopping_the_services_at_every_event(self) -> None:
+        self.walk('Hooks.stop_services', self.EVENTS)
+
+    @quiet
+    def test_the_close_of_the_lifecycle_at_every_event(self) -> None:
+        self.walk('Hooks.finish_close', self.EVENTS)
+
+    @quiet
+    def test_the_gates_close_at_every_instruction(self) -> None:
+        self.by_instruction('Admission.close')
+
+    @quiet
+    def test_the_gates_drain_at_every_instruction(self) -> None:
+        self.by_instruction('Admission.drain')
+
+    @quiet
+    def test_stopping_the_services_at_every_instruction(self) -> None:
+        self.by_instruction('Hooks.stop_services')
+
+    @quiet
+    def test_the_close_of_the_lifecycle_at_every_instruction(self) -> None:
+        self.by_instruction('Hooks.finish_close')
 
 
 class LifecycleTest(unittest.TestCase):

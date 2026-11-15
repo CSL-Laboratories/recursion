@@ -1,0 +1,14 @@
+{
+  "seq": 27,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": null,
+  "turn_id": null,
+  "time": "2026-11-13T07:34:27.999Z",
+  "type": "fork",
+  "source": "x-nobody-defined-this",
+  "trust": "trusted",
+  "payload": {
+    "child_session_id": "ses-2c4e6a8b0d1f3a5c",
+    "at_turn_id": "turn-000b"
+  }
+}

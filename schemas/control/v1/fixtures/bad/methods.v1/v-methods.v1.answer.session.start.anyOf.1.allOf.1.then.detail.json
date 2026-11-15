@@ -1,0 +1,20 @@
+{
+  "method": "session.start",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "tenant": "t1",
+    "workspace": {
+      "path": "/home/dev/projects/atlas",
+      "mode": "worktree"
+    },
+    "hand_pick": {
+      "engine": "claude_code",
+      "model": null
+    },
+    "prompt": "Fix the failing test."
+  },
+  "answer": {
+    "code": "unsupported",
+    "detail": "multi_turn"
+  }
+}

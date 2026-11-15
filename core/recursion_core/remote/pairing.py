@@ -237,8 +237,11 @@ class OfferBook:
                 if offer.wrong >= self.max_wrong:
                     offer.state = LOCKED
                 self._fail(source, now, "pairing_code_invalid")
+            # The device id is drawn before the offer is marked redeemed, inside the window a racing redemption
+            # would use; tests/test_pairing.py stands in that window through ``random_bytes``.
+            device_id = "dev_" + _urlsafe(self.random_bytes(12))
             offer.state, offer.redeemed_at = REDEEMED, now
-            return PairingGrant(offer.offer_id, "dev_" + _urlsafe(self.random_bytes(12)), offer.label, offer.scopes, now)
+            return PairingGrant(offer.offer_id, device_id, offer.label, offer.scopes, now)
 
     def cancel(self, offer_id: str) -> bool:
         """End an open offer; ``False`` when it was not open."""

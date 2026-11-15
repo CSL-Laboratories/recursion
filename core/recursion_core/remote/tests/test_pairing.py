@@ -5,6 +5,7 @@ The clock is moved by hand (``support.FakeClock``); nothing waits on the wall cl
 
 from __future__ import annotations
 
+import secrets
 import threading
 import unittest
 
@@ -118,6 +119,34 @@ class OfferTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "pairing_busy")
         self.clock.now += OFFER_TTL_S  # expired offers no longer count as open
         self.assertEqual(self.book.issue(scopes=["read"], label="later").scopes, ("read",))
+
+    def test_a_redemption_in_the_middle_of_another_waits_and_is_refused(self) -> None:
+        done, outcome = threading.Event(), []
+
+        def second() -> None:
+            try:
+                outcome.append(book.redeem(offer.offer_id, offer.code, source="second"))
+            except PairingRefused as exc:
+                outcome.append(exc.code)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=second)
+        armed = [True]
+
+        def random_bytes(n: int) -> bytes:
+            if n == 12 and armed[0]:  # the first redemption, after its checks, before it marks the offer
+                armed[0] = False
+                worker.start()
+                self.assertFalse(done.wait(0.2), "a second redemption finished inside the first")  # not yet
+            return secrets.token_bytes(n)
+
+        book = OfferBook(clock=self.clock, random_bytes=random_bytes)
+        offer = book.issue(scopes=["read"], label="phone")
+        grant = book.redeem(offer.offer_id, offer.code, source="first")
+        worker.join(support.WATCHDOG_S)
+        self.assertIsInstance(grant, PairingGrant)
+        self.assertEqual(outcome, ["pairing_code_used"])
 
     def test_racing_redemptions_of_one_offer_give_exactly_one_grant(self) -> None:
         offer = self.book.issue(scopes=["read", "run"], label="phone")

@@ -2,20 +2,39 @@
 
 One stdio worker per request: ``initialize`` / ``initialized``, ``account/rateLimits/read``,
 ``thread/start``, ``turn/start``, then notifications until ``turn/completed``; stdin is closed at the
-end. Method names other than ``account/rateLimits/read`` and ``account/rateLimits/updated``, and every
-field name below, are unverified against the vendor's source and marked so.
+end.
+
+Verified against the installed protocol (lane DRIVER-CX, Nov 14, 2026): every method this adapter sends
+or handles, and every field it sends or reads, is in the schema that ``codex-cli 0.160.0`` generates for
+itself (``codex app-server generate-json-schema``), recorded in
+``routes/engines/fixtures/codex/app-server-0.160.0.json`` and checked by
+``routes/tests/test_codex_protocol.py``: the methods ``initialize``, ``initialized``,
+``account/rateLimits/read``, ``thread/start``, ``turn/start``, ``account/rateLimits/updated``,
+``item/completed`` and ``turn/completed``; ``clientInfo.name`` and ``.version``; the snapshot's
+``limitId``, ``primary`` and ``secondary`` and a window's ``usedPercent`` and ``resetsAt``; ``model``,
+``thread.id``, ``threadId`` and a text input's ``type`` and ``text``; a turn's ``status`` (``completed``,
+``interrupted``, ``failed``, ``inProgress``) and ``error.codexErrorInfo``, whose values include
+``usageLimitExceeded`` and ``unauthorized``; an item's ``type`` (``agentMessage``) and ``text``. Three
+things the schema does not settle stay unverified and are marked where they are used: the name of the
+credential-wide bucket (``limitId`` is free text), where a JSON-RPC error carries ``codexErrorInfo``
+(the schema types ``error.data`` as any value), and the unit of ``resetsAt`` (an integer; read as Unix
+seconds).
 
 Typed limit signals:
 
 * ``account/rateLimits/read`` result and ``account/rateLimits/updated`` notifications: a window whose
-  ``usedPercent`` is at least 100 is a limit, with its ``resetsAt`` (fields unverified; ``resetsAt``
-  is translated from Unix epoch onto the breaker clock). Codex's default bucket (``limitId``
-  ``codex``) is credential-wide. Any other ``limitId`` is the breaker model key itself: the requested
-  route model is not used, so a notice for one bucket does not fence a different model. An
-  ``api_key`` route that is told this read needs ChatGPT auth ignores that one error and continues
-  the turn; a subscription route does not.
-* a JSON-RPC error, or a failed turn, whose typed ``codexErrorInfo`` is ``usageLimitExceeded``
-  (unverified name).
+  ``usedPercent`` is at least 100 is a limit, with its ``resetsAt`` (translated from Unix epoch onto
+  the breaker clock). Codex's default bucket (``limitId`` ``codex``) is credential-wide. Any other
+  ``limitId`` is the breaker model key itself: the requested route model is not used, so a notice for
+  one bucket does not fence a different model.
+* R3 finding 4 (Lucas, D0, Nov 12: "take the stricter, fail-closed option that the reviewer's test
+  already encodes"): an ``api_key`` route ignores exactly one error of the rate-limit read, the one whose
+  message is ``CHATGPT_AUTH_REQUIRED`` byte for byte and which carries no typed ``codexErrorInfo``;
+  that text is in the installed binary (the fixture's ``binary_literals``). Every other error of that
+  read is classified as on any route: ``usageLimitExceeded`` is ``plan_limit``, ``unauthorized`` is
+  ``auth_failed``, EOF is ``engine_exited``. Nothing is written after an EOF. The ignored error is
+  recorded as a fixed event, never with its text, because an upstream message can echo the key.
+* a JSON-RPC error, or a failed turn, whose typed ``codexErrorInfo`` is ``usageLimitExceeded``.
 
 Agent message text is model payload and is never inspected. Free error text that only sounds like a
 quota is a SHORT_FAULT (grill Q23).
@@ -45,9 +64,14 @@ CODEX_API_KEY_ENV = ("CODEX_API_KEY", "OPENAI_API_KEY")
 # TUI's update check (codex-rs/tui/src/updates.rs:28, :153); no app-server source references the update
 # check. A process-tree check on a real binary has not been run (hard rule 8).
 NO_UPDATE_OVERRIDE = ("-c", "check_for_update_on_startup=false")
-DEFAULT_LIMIT_ID = "codex"  # name of the credential-wide bucket (unverified)
-_LIMIT_ERRORS = ("usageLimitExceeded",)  # codexErrorInfo values (unverified)
-_AUTH_ERRORS = ("unauthorized",)  # codexErrorInfo values (unverified)
+DEFAULT_LIMIT_ID = "codex"  # name of the credential-wide bucket (unverified: limitId is free text in 0.160.0)
+_LIMIT_ERRORS = ("usageLimitExceeded",)  # CodexErrorInfo values (verified, 0.160.0)
+_AUTH_ERRORS = ("unauthorized",)  # CodexErrorInfo values (verified, 0.160.0)
+# The one rate-limit read error an api_key route may ignore (R3 finding 4). Found byte for byte in the
+# installed codex-cli 0.160.0 binary; its sibling for a session with no Codex login at all,
+# "codex account authentication required to read rate limits", is NOT ignored.
+CHATGPT_AUTH_REQUIRED = "chatgpt authentication required to read rate limits"
+IGNORED_READ_EVENT = {"ignored": "chatgpt_auth_required"}  # fixed: no vendor text reaches an event
 
 
 def daemon_config() -> dict:
@@ -92,11 +116,11 @@ class CodexAdapter(RouteAdapter):
             except _RpcError as err:
                 # ChatGPT auth is required for this read. An API-key session is rejected with wording
                 # that sounds like a quota ("rate limits"), which would short-fault every such request
-                # before a turn. Ignore that one error on an api_key route and continue.
-                if kind != "api_key":
+                # before a turn. Ignore that one exact error on an api_key route and continue; any
+                # other error, typed or not, and EOF, are classified below (R3 finding 4).
+                if kind != "api_key" or not _chatgpt_auth_required(err.error):
                     raise
-                events.append(c.event("usage", "codex.account/rateLimits/read", {
-                    "ignored": scalar(err.error.get("message"))}))
+                events.append(c.event("usage", "codex.account/rateLimits/read", dict(IGNORED_READ_EVENT)))
                 limits = None
             limit = _exhausted(limits.get("rateLimits") if isinstance(limits, dict) else None,
                                "codex.account/rateLimits/read", events, self.vendor_reset)
@@ -195,11 +219,27 @@ def _exhausted(snapshot: object, source: str, events: list, translate) -> dict |
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
-def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+def _error_info(error: dict) -> object:
+    """The typed ``codexErrorInfo`` of an error, or None. In a turn error the field is typed (0.160.0's
+    ``TurnError``); in a JSON-RPC error the schema types ``data`` as any value, so both places are read
+    (unverified). A tagged variant such as ``{"responseStreamDisconnected": {...}}`` reads as its tag."""
+
     data = error.get("data") if isinstance(error.get("data"), dict) else {}
     info = error.get("codexErrorInfo", data.get("codexErrorInfo"))
-    if isinstance(info, dict):  # a tagged variant: {"usageLimitExceeded": {...}} (shape unverified)
+    if isinstance(info, dict):
         info = next(iter(info), None)
+    return info
+
+
+def _chatgpt_auth_required(error: dict) -> bool:
+    """Exactly the rate-limit read's ChatGPT-auth error: that message and no typed info. (An EOF is never
+    it: the EOF error is this module's own, with its own message.)"""
+
+    return _error_info(error) is None and error.get("message") == CHATGPT_AUTH_REQUIRED
+
+
+def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+    info = _error_info(error)
     if info in _AUTH_ERRORS:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=str(info))
     if info in _LIMIT_ERRORS:

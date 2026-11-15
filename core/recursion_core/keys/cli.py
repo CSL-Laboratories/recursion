@@ -14,13 +14,15 @@
     operation. Never a value.
 ``remove <id> [--yes]``
     Asks on the terminal before it deletes (``--yes`` skips the question; with no terminal it is required),
-    then says what it removed and from where. It also clears what an interrupted save left behind.
+    then says what it removed and from where. It also clears what an interrupted save left behind, and a value of
+    the id that the owner-only file still holds when no saved key names it.
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the
     store's folder. Exit 1 when one was found, 4 when the search was incomplete (a value or a file could not be
-    read, an operation is unfinished, or the journal was asked for and not searched to the end) and nothing was
-    found, and 3, not 1, when it was refused, so that 1 always means a finding.
+    read, an operation is unfinished, the journal was asked for and not searched to the end, or the Secret Service
+    holds items Recursion saved that no saved key names) and nothing was found, and 3, not 1, when it was refused,
+    so that 1 always means a finding.
 
 Exit statuses: 0 done, 1 refused (``refused: <code>: <detail>`` on standard error; 3 for ``audit``), 2 a usage
 error, which includes a command line holding words the command does not take (``value_from_argv``; they are not
@@ -384,7 +386,8 @@ def _remove(args, out, err, store, terminal) -> int:
             raise KeyStoreError('not_confirmed', f'{args.key_id} was not removed')
     record = store.remove(args.key_id)
     if record is None:
-        print(f'removed what an interrupted save of {args.key_id} left behind', file=out)
+        print(f'removed a value of {args.key_id} that no saved key named (an interrupted save, or an index lost, '
+              'emptied or put back)', file=out)
     else:
         print(f'removed {record.key_id} ({record.provider}, {record.env_name}) from {STORE_TEXT[record.store]}',
               file=out)
@@ -400,6 +403,15 @@ def _audit(args, out, err, store) -> int:
     for key_id, op in sorted(report.pending.items()):
         print(f'unfinished {op} of {key_id}: its value may still be in the store; "key remove {key_id}" clears it',
               file=out)
+    for key_id in report.unbound:
+        print(f'not named: the owner-only file holds a value of {key_id} that no saved key names', file=out)
+    if report.unnamed:
+        print(f'keychain: {report.unnamed} item(s) in the Secret Service that Recursion saved and no saved key of this '
+              "store names (another store's, or this store's from before its index was lost or emptied); their values "
+              'are not looked for, and this store cannot remove them (they carry the attribute "application '
+              'recursion", by which the keychain\'s own tool finds them)', file=out)
+    if report.unnamed_refused:
+        print(f'keychain: its items were not counted ({report.unnamed_refused})', file=out)
     for place in report.leftovers:
         print(f'FOUND: a temp file an interrupted save left behind, which may hold part of a key: {place} (the next '
               '"key add" or "key remove" deletes it)', file=out)

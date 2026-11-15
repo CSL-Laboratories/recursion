@@ -69,14 +69,16 @@ class LostIndexRecoveryTest(TempStoreCase):
         store = self.owner_store()
         self.add(store)
         old_id = file_store_id(self.root)
+        kept = json.loads((self.root / 'secrets.json').read_text())['secrets']
         os.unlink(self.root / 'index.json')
         found, missing = store.values()
         self.assertEqual((found, missing), ({f'codex-key {UNBOUND}': MARKER}, {}))
         record = self.add(store, key_id='fresh', value=OTHER)
         self.assertEqual(store.list().store_id, old_id)                  # the folder's own store id, adopted
         self.assertEqual(store.credential('fresh', 'CODEX_API_KEY'), OTHER)
-        self.assertEqual(json.loads((self.root / 'secrets.json').read_text())['secrets'],
-                         {'fresh': {'save_id': record.save_id, 'provider': 'openai', 'value': OTHER}})
+        self.assertEqual(json.loads((self.root / 'secrets.json').read_text())['secrets'],   # the earlier value
+                         {**kept, 'fresh': {'save_id': record.save_id, 'provider': 'openai',     # stays (r5 H1)
+                                            'value': OTHER}})
         self.assertEqual(store.list().pending, {})
 
     def test_a_replaced_index_can_be_listed_audited_and_cleared(self) -> None:
@@ -98,7 +100,8 @@ class LostIndexRecoveryTest(TempStoreCase):
         self.assertEqual(store.remove('theirs').key_id, 'theirs')        # the record can always be removed
         self.add(store, key_id='fresh', value=OTHER)                      # an empty store adopts the file's id
         self.assertEqual(store.credential('fresh', 'CODEX_API_KEY'), OTHER)
-        self.assertEqual(sorted(json.loads((self.root / 'secrets.json').read_text())['secrets']), ['fresh'])
+        self.assertEqual(sorted(json.loads((self.root / 'secrets.json').read_text())['secrets']),
+                         ['codex-key', 'fresh'])                       # this store's earlier value stays (r5 H1)
 
     def test_an_unfinished_operation_over_another_stores_file_is_cleared(self) -> None:
         store = self.owner_store()
@@ -119,7 +122,7 @@ class LostIndexRecoveryTest(TempStoreCase):
         with open_folder(self.root, create=False) as folder:
             foreign = OwnerFile('f' * 32)
             self.assertIs(foreign.holds('codex-key', folder), False)
-            foreign.delete('codex-key', folder, frozenset())             # touches nothing
+            foreign.delete('codex-key', folder)                          # touches nothing
             self.assertEqual(OwnerFile(store.list().store_id).get('codex-key', folder, record), MARKER)
             self.assertEqual(foreign.get('codex-key', folder), MARKER)   # the audit's unbound read
             self.assertEqual(foreign.values(folder), {'codex-key': MARKER})

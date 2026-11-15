@@ -23,9 +23,10 @@ entry and its header), and ``credential`` asks for the value of exactly that rec
 when all three match the record being used and the store. So an older index put back, or an edited record, gets
 ``secret_missing``, never another save's value. An index copied in from another store's folder carries that
 store's id: on a keychain it reaches that store's own values through that store's own records, and on the
-owner-only file it reaches nothing (the file names another store). A copy of the whole folder is a second store
-over the same values (questions.md K18). A removal deletes every value saved for the id in the store, whichever
-save stored it.
+owner-only file it reaches nothing (the file names another store). A copy of the whole folder carries the store's
+id too: on a keychain both indexes name one set of items, so a removal through either deletes the value the other's
+record names (questions.md K18); on the owner-only file the copy has a file of its own, and the two part at their
+first write. A removal deletes every value saved for the id in the store, whichever save stored it.
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
 {"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending":
@@ -37,8 +38,10 @@ later operation that touches a value asks again and refuses when the answer diff
 when a keychain was pinned and the host now offers only the file, ``backend_changed`` otherwise. A locked or
 failing keychain is refused with its own code and is never answered from the file. A key pinned to a keychain
 is removed only where that keychain answers, since its removal must reach the value. One exception: a key pinned
-to the owner-only file can always be REMOVED, the file being always reachable, so that once a keychain appears
-the keys can be removed and added again into it. The pin is released when nothing is left in the index.
+to the owner-only file is REMOVED whatever the host offers now, the file being in the store's own folder, so that
+once a keychain appears the keys can be removed and added again into it; a file in its place that the store did
+not write (a folder, a symlink, a FIFO, another shape) is refused, as every command refuses it. The pin is released
+when nothing is left in the index.
 
 SPEND. Every key has ``metered_spend_allowed`` and ``cap_usd``, typed when it is added; with no opt-in the cap
 is 0. ``credentials()`` hands a key out only when both say spend is allowed (opt-in and a cap above 0):
@@ -68,6 +71,21 @@ was saved: ``list`` shows it, ``credential`` refuses that id (``operation_pendin
 recovers it (deletes the orphaned value, or finishes the removal), and ``remove <id>`` clears it on request. Both
 index states are checked against the size limit before anything is changed (``store_full``). Every write first
 deletes the temp files an interrupted write left in the folder (``Folder.sweep``).
+
+VALUES NO RECORD NAMES. An index lost, emptied or put back no longer names every value the store holds. A save, a
+removal and a recovery change the values of the id they name and of no other, so such a value is never deleted by
+an unrelated write. On the owner-only file it stays in the file; the audit searches for it (``UNBOUND``) and names
+its id; ``remove <id>`` deletes it; and ``add <id>`` is refused (``key_exists``) until it is removed, so no save
+replaces a value it was not given. A file that is not this store's (it names another store, or this store is on a
+keychain) is never changed by it: the audit searches for the values of one it can read and names their ids (one it
+cannot read refuses the audit), and they go only through their own store or with the file. A store whose backend
+is the owner-only file and that has no record takes the file's store id at its next save or removal (the same
+folder is the same store). A store on a keychain never takes it, and never reads the owner-only file to save,
+remove or release a key (only the audit reads it, for values to look for). On a keychain an item is named by the
+store's id, which only the index records: an index LOST leaves the store's items with no name this store knows, so
+it can neither release nor remove them (the keychain's own tool can: they carry ``application recursion``), and the
+audit counts every Recursion item in the keychain that no record of this store names (``unnamed_items``) and is
+incomplete while there is one.
 """
 from __future__ import annotations
 
@@ -230,6 +248,10 @@ class KeyStore:
     def _backend(self, pinned: str | None, store_id: str | None):
         """The backend object to use now, for the store named ``store_id``. With a pin, the host must still offer
         the pinned backend."""
+        return self._made(self._backend_name(pinned), store_id)
+
+    def _backend_name(self, pinned: str | None) -> str:
+        """The backend to use now: the pinned one, which the host must still offer, or the one the host offers."""
         offered = detect(self.system)
         if pinned is not None and offered != pinned:
             if pinned != 'owner_file' and offered == 'owner_file':
@@ -239,7 +261,9 @@ class KeyStore:
             raise KeyStoreError('backend_changed',
                                 f'keys were saved in {STORE_TEXT[pinned]}, but this host now offers {STORE_TEXT[offered]}; '
                                 'they are removed only where that keychain answers, then added again here')
-        name = pinned or offered
+        return pinned or offered
+
+    def _made(self, name: str, store_id: str | None):
         if name == 'owner_file':
             return OwnerFile(store_id)
         if name == 'secret_service':
@@ -249,8 +273,29 @@ class KeyStore:
                             'that has a keychain')
 
     def _removal_backend(self, pinned: str | None, store_id: str | None):
-        """The backend a removal uses: the owner-only file is always reachable, whatever the host offers now."""
+        """The backend a removal uses: the owner-only file is in the store's folder, whatever the host offers now."""
         return OwnerFile(store_id) if pinned == 'owner_file' else self._backend(pinned, store_id)
+
+    @staticmethod
+    def _identity(folder: Folder, index: Index, name: str) -> Index:
+        """The store's id when its index has no record (lost, emptied or replaced). A store whose backend is the
+        owner-only file takes the id that file names: the same folder is the same store. A store on a keychain never
+        takes it, so no file can merge two keychain namespaces. Only a folder with neither mints an id."""
+        if index.live():
+            return index
+        found = OwnerFile(None).store_of(folder) if name == 'owner_file' else None
+        return replace(index, store_id=found or index.store_id or _random_id())
+
+    def _unnamed(self, folder: Folder, index: Index, key_id: str) -> Index:
+        """For ``remove`` of an id no record or intent names: a value of it that the owner-only file still holds (an
+        index lost, emptied or put back no longer names it) is removed; anything else is ``key_unknown``. A store on
+        a keychain asks its keychain nothing here (see VALUES NO RECORD NAMES)."""
+        name = index.backend or self._backend_name(None)
+        if name == 'owner_file':
+            index = replace(self._identity(folder, index, name), backend=name)
+            if key_id in OwnerFile(index.store_id).ids(folder):
+                return index
+        raise KeyStoreError('key_unknown', f'{key_id} is not saved')
 
     def _recover(self, folder: Folder, index: Index, backend, *, but: str | None = None) -> Index:
         """Finish or undo what earlier writes left pending (not ``but``). An entry that still cannot be reached stays."""
@@ -264,7 +309,7 @@ class KeyStore:
                 del pending[kid]                 # the add finished; only its intent was left behind
                 continue
             try:
-                backend.delete(kid, folder, frozenset(k for k in keys if k != kid))
+                backend.delete(kid, folder)
             except KeyStoreError:
                 continue                         # still unreachable: the intent stays, and list shows it
             keys.pop(kid, None)                  # an unfinished remove is finished; an orphaned add is undone
@@ -301,17 +346,19 @@ class KeyStore:
         with self._folder(create=True) as folder, folder.locked():
             folder.sweep()
             index = self._read_index(folder)
-            if not index.live():
-                # A store with no record takes the id of the owner-only file already in its folder (an index lost,
-                # replaced or emptied): the same folder is the same store. Only a folder with neither mints one.
-                index = replace(index, store_id=OwnerFile(None).store_of(folder) or index.store_id or _random_id())
-            backend = self._backend(index.backend, index.store_id)   # None while the index is empty: a first save pins
+            name = self._backend_name(index.backend)     # no pin while the index is empty: a first save pins
+            index = self._identity(folder, index, name)
+            backend = self._made(name, index.store_id)
             index = self._recover(folder, index, backend)
             if key_id in index.keys:
                 raise KeyStoreError('key_exists', f'{key_id} is already saved; remove it first')
             if key_id in index.pending:
                 raise KeyStoreError('operation_pending', f'an earlier operation on {key_id} is not finished and its '
                                     'backend could not be reached; remove the key to clear it')
+            if name == 'owner_file' and key_id in backend.ids(folder):
+                raise KeyStoreError('key_exists', f'the owner-only file still holds a value of {key_id} that no saved '
+                                    f'key names (its index was lost, emptied or put back); "remove {key_id}" deletes '
+                                    'it, then add the key again')
             now = _now(self._clock)
             record = KeyRecord(key_id, provider, env_name, now, backend.name, metered_spend_allowed, cap_usd,
                                _random_id())
@@ -321,7 +368,7 @@ class KeyStore:
             self._sized(replace(intent, keys=keys))                     # both states fit, before anything changes
             self._write_index(folder, intent)                           # 1. the intent, before the outside effect
             try:
-                backend.put(key_id, value, folder, frozenset(keys), record=record)     # 2. the value, bound to its record
+                backend.put(key_id, value, folder, record=record)     # 2. the value, bound to its record, and no other
             except KeyStoreError:
                 if backend.holds(key_id, folder) is False:              # verified: nothing of the id was saved
                     with contextlib.suppress(Exception):
@@ -331,7 +378,7 @@ class KeyStore:
                 self._write_index(folder, done)                         # 3. the key, and no intent
             except BaseException:
                 try:
-                    backend.delete(key_id, folder, frozenset(index.keys))
+                    backend.delete(key_id, folder)
                     undone = True
                 except Exception:  # noqa: BLE001 - the intent stays in the index: the next write recovers it
                     undone = False
@@ -344,8 +391,9 @@ class KeyStore:
     def remove(self, key_id: str) -> KeyRecord | None:
         """Delete a key's value from its backend, then its entry from the index.
 
-        Returns the key's record, or None when the id was only an unfinished operation (an interrupted add) whose
-        orphaned value this removal cleared.
+        Returns the key's record, or None when no record named the id: an unfinished operation (an interrupted add)
+        whose orphaned value this removal cleared, or a value of the id that the owner-only file held and the index no
+        longer named (see VALUES NO RECORD NAMES).
         """
         problem = v.id_problem(key_id)
         if problem is not None:
@@ -358,14 +406,14 @@ class KeyStore:
             index = self._read_index(folder)
             record = index.keys.get(key_id)
             if record is None and key_id not in index.pending:
-                raise KeyStoreError('key_unknown', f'{key_id} is not saved')
+                index = self._unnamed(folder, index, key_id)     # a value of the id no record names, or key_unknown
             backend = self._removal_backend(index.backend, index.store_id)
             index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
             others = {kid: p for kid, p in index.pending.items() if kid != key_id}
             now = _now(self._clock)
             self._write_index(folder, replace(index, pending={**others, key_id: Pending(key_id, 'remove', now)}))
-            backend.delete(key_id, folder, frozenset(keys))     # every value of the id in this store, or it refuses
+            backend.delete(key_id, folder)     # every value of the id in this store, and no other id's, or it refuses
             self._write_index(folder, replace(index, keys=keys, pending=others))
             return record
 
@@ -416,12 +464,31 @@ class KeyStore:
             record = index.keys.get(kid)
             try:
                 found[kid] = backend.get(kid, folder, record)
-            except KeyStoreError as exc:
-                if exc.code in ('owner_file_invalid', 'file_invalid'):
-                    raise
+            except KeyStoreError as exc:     # a file the store did not write is refused by values()' own read of it
                 if record is not None:
                     missing[kid] = exc.code
         return found, missing
+
+    def unnamed_items(self) -> int | None:
+        """For ``audit`` only: how many items in the Secret Service carry ``application recursion`` and are named by no
+        record or unfinished operation of this index (another store's, or this store's from before its index was lost
+        or emptied: see VALUES NO RECORD NAMES). None when the store does not use the Secret Service. A pin the host
+        no longer offers, or a keychain that cannot be asked, is refused with its code."""
+        folder = self._folder(create=False)
+        if folder is None:
+            return self._unnamed_items(Index(None, {}))
+        with folder, folder.locked(shared=True) as held:
+            index = self._read_index(folder)
+            if index.live() and not held:
+                raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
+            return self._unnamed_items(index)
+
+    def _unnamed_items(self, index: Index) -> int | None:
+        if index.backend == 'owner_file' or self._backend_name(index.backend) != 'secret_service':
+            return None
+        backend = SecretService(self.system, index.store_id)
+        named = sum(backend.count(kid) for kid in sorted(set(index.keys) | set(index.pending)))
+        return max(backend.count() - named, 0)
 
     def owner_file(self) -> Path:
         """Where the owner-only file is, or would be."""

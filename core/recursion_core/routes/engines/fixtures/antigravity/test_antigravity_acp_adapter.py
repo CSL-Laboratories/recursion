@@ -220,5 +220,102 @@ class FactoryTest(unittest.TestCase):
         self.assertNotIn(".register(", text)
 
 
+
+class LyingStr(str):
+    """A str whose checks lie: it claims to be absolute and to hold no NUL whatever it holds."""
+
+    def startswith(self, *args, **kwargs):
+        return True
+
+    def __contains__(self, item):
+        return False
+
+
+class TwoFaced(dict):
+    """A Mapping that answers .get one way and [] (and so items()) another."""
+
+    def __init__(self, data, lie):
+        super().__init__(data)
+        self._lie = lie
+
+    def get(self, key, default=None):
+        return self._lie.get(key, super().get(key, default))
+
+
+class ReviewRoundOne411Test(unittest.TestCase):
+    """DeepSeek's round-1 read of #411 at 78ed4424 (F1 STRICT, F2, F3, F5). Each fails on that head."""
+
+    def test_f1_a_cwd_that_is_not_exactly_a_str_is_refused(self) -> None:
+        for cwd in (LyingStr("relative/dir"), LyingStr("/var/tmp/a" + chr(0) + "b"), LyingStr(CWD)):
+            with self.subTest(cwd=str.__repr__(cwd)):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+                res = rig.run(request(cwd=cwd))
+                self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "cwd"))
+                self.assertEqual((rig.launches, rig.custody, rig.agent.received), ([], [], []))
+
+    def test_f2_every_str_field_is_read_as_exactly_a_str(self) -> None:
+        for field in ("request_id", "tenant", "prompt", "contract"):
+            with self.subTest(field=field):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+                req = request()
+                req[field] = LyingStr(req[field])
+                res = rig.run(req)
+                self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, field))
+                self.assertEqual(rig.launches, [])
+        for path in (("route", "model"), ("route", "auth_method"), ("route", "connection", "id")):
+            with self.subTest(field=".".join(path)):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+                req = request()
+                holder = req
+                for key in path[:-1]:
+                    holder = holder[key]
+                holder[path[-1]] = LyingStr(holder[path[-1]])
+                res = rig.run(req)
+                self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, ".".join(path)))
+                self.assertEqual(rig.launches, [])
+
+    def test_f2_a_mapping_that_answers_two_ways_is_read_once(self) -> None:
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        res = rig.run(TwoFaced(request(cwd="relative/dir"), {"cwd": CWD}))
+        self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "cwd"))
+        self.assertEqual(rig.launches, [])
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        res = rig.run(TwoFaced(request(), {"cwd": "relative/dir"}))   # the use reads what the check read
+        self.assertIsNone(res["code"])
+        self.assertEqual([m["params"]["cwd"] for m in rig.sent("session/new")], [CWD])
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        req = request()
+        req["request_id"] = 5
+        res = rig.run(TwoFaced(req, {"request_id": "r1"}))
+        self.assertEqual(res["code"], c.REQUEST_INVALID)
+        self.assertNotEqual(res["request_id"], 5)
+        self.assertEqual(rig.launches, [])
+
+    def test_f3_a_client_failure_naming_the_key_is_masked(self) -> None:
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]], methods=("gemini-api-key",))
+        rig.agent._accept = set()                                 # the agent refuses authenticate
+        read = rig.agent.read_line
+
+        def read_line(timeout_s):
+            line = read(timeout_s)
+            if line is not None and '"error"' in line:              # the refusal names the key
+                message = json.loads(line)
+                message["error"]["message"] = "bad credential " + KEY
+                line = json.dumps(message)
+            return line
+
+        rig.agent.read_line = read_line
+        res = rig.run(request())
+        self.assertIn(res["code"], c.CODES)
+        self.assertNotIn(KEY, json.dumps(res))
+        self.assertEqual(len(rig.agent.fenced), 1)
+
+    def test_f5_a_lone_surrogate_in_the_turns_text_leaves_the_result_writable(self) -> None:
+        rig = Rig([[("chunk", "a" + chr(0xD800) + "b"), ("end", "end_turn")]])
+        res = rig.run(request())
+        self.assertIsNone(res["code"])
+        json.dumps(res, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(res["text"], "a" + chr(0xFFFD) + "b")
+
 if __name__ == "__main__":
     unittest.main()

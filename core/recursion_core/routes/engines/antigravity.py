@@ -1079,10 +1079,22 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
     session/new in the request's ``cwd``, one prompt), and the request's ``cwd``.
 
     THE RUN'S FOLDER IS THE CALLER'S. A run is refused ``request_invalid`` (``cwd``) unless the request names
-    an absolute ``cwd`` holding no NUL. There is NO fallback of any kind: never the daemon's own working
-    directory, never the route home, never the user's home. Nothing here decides what a run's folder is: that
-    is the workspace lane's (#392). The field is read from ``request["cwd"]`` until SPINE names it in the
-    route contract (the Liaison's ruling, Nov 15).
+    a ``cwd`` that is exactly a ``str`` (not a subclass), absolute and holding no NUL. There is NO fallback of
+    any kind: never the daemon's own working directory, never the route home, never the user's home. Nothing
+    here decides what a run's folder is: that is the workspace lane's (#392). The field is read from
+    ``request["cwd"]`` until SPINE names it in the route contract (the Liaison's ruling, Nov 15). It is the
+    ACP session's folder (``session/new``); the child process's own working directory is the launcher's to
+    set, and the launcher contract (``routes.launch``) has no field for it yet.
+
+    THE REQUEST IS READ ONCE. ``run`` copies it, its route and its connection into plain dicts (each key read
+    once), and every check and every use after that reads the copy: one Mapping cannot answer the check one
+    way and the use another. A str field it reads (``request_id``, ``tenant``, ``prompt``, ``cwd``,
+    ``contract``, ``route.model``, ``route.auth_method``, ``route.connection`` ``kind``, ``id`` and
+    ``credential_env``) must be exactly a ``str``.
+
+    The turn's text and a failure's detail are masked (``mask``) and never keep a lone surrogate. Nothing is
+    drafted: this adapter returns the turn's text only (``AcpDrafts`` is a driver's, for a drive that
+    publishes events).
 
     Every failure path fences the child: a refusal or failure of the client (``AcpError``) and a turn that
     did not succeed are fenced with their code, and anything else that escapes is fenced by the one-shot
@@ -1091,10 +1103,13 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
 
     def run(self, request: dict, deadline_at: float) -> dict:
         if isinstance(request, Mapping):
-            rid = request.get("request_id")
-            cwd = request.get("cwd")
-            if isinstance(rid, str) and rid and not (isinstance(cwd, str) and cwd.startswith("/")
-                                                     and "\x00" not in cwd):
+            try:
+                request = _request_once(request)
+            except c.RouteError as err:
+                return c.result("", err.code, detail=err.detail)
+            rid, cwd = request.get("request_id"), request.get("cwd")
+            # _request_once has refused a str subclass: a str here is exactly one
+            if rid and not (isinstance(cwd, str) and cwd.startswith("/") and "\x00" not in cwd):
                 return c.result(rid, c.REQUEST_INVALID, detail=NO_CWD)
         return super().run(request, deadline_at)
 
@@ -1108,19 +1123,49 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
         forms = mask_forms(redact)
         acp = acp_module()
         try:
-            session = open_acp(process, self._clock, request["route"], request["cwd"], deadline_at,
-                               drafts=AcpDrafts(redact=redact))
+            session = open_acp(process, self._clock, request["route"], request["cwd"], deadline_at)
             outcome = session.prompt(request["prompt"], deadline_at)
         except acp.AcpError as err:
             code = err.code if err.code in c.CODES else c.ENGINE_ERROR
             process.fence(code)
-            return c.result(rid, code, events=events, detail=mask(err.detail, forms))
+            return c.result(rid, code, events=events, detail=_writable(mask(err.detail, forms)))
         if outcome.code is None:
             session.close()
-            return c.result(rid, None, text=mask(outcome.text, forms), events=events)
+            return c.result(rid, None, text=_writable(mask(outcome.text, forms)), events=events)
         code = c.ENGINE_ERROR if outcome.code == CANCELLED or outcome.code not in c.CODES else outcome.code
         process.fence(code)
-        return c.result(rid, code, events=events, detail=mask(outcome.detail, forms))
+        return c.result(rid, code, events=events, detail=_writable(mask(outcome.detail, forms)))
+
+
+_EXACT_STR = ("request_id", "tenant", "prompt", "cwd", "contract")
+_EXACT_STR_ROUTE = ("model", "auth_method")
+_EXACT_STR_CONNECTION = ("kind", "id", "credential_env")
+
+
+def _request_once(request: Mapping) -> dict:
+    """The request, its route and its connection copied into plain dicts, each key read once; a str field this
+    adapter reads that is a str subclass is refused ``request_invalid``, named."""
+    def copy(mapping, exact, prefix):
+        out = dict(mapping.items())
+        for name in exact:
+            value = out.get(name)
+            if isinstance(value, str) and type(value) is not str:
+                raise c.RouteError(c.REQUEST_INVALID, prefix + name)
+        return out
+
+    try:
+        snapshot = copy(request, _EXACT_STR, "")
+        route = snapshot.get("route")
+        if isinstance(route, Mapping):
+            route = snapshot["route"] = copy(route, _EXACT_STR_ROUTE, "route.")
+            connection = route.get("connection")
+            if isinstance(connection, Mapping):
+                route["connection"] = copy(connection, _EXACT_STR_CONNECTION, "route.connection.")
+    except c.RouteError:
+        raise
+    except Exception:   # a Mapping that cannot be read as one
+        raise c.RouteError(c.REQUEST_INVALID, "request") from None
+    return snapshot
 
 
 def acp_factory(launcher, clock, credentials, environ, **options) -> AntigravityAcpAdapter:

@@ -178,6 +178,22 @@ class CommandTests(unittest.TestCase):
             code, answer = self.run_action("install")
         self.assertEqual(answer["detail"], f"PermissionError: [Errno 13] Permission denied: '{self.home}'")
 
+    def test_the_folder_named_is_under_the_resolved_home(self):
+        # Review 4 of #382, DeepSeek (the named folder): a home reached through a link is named as every
+        # other message names it, resolved.
+        real_home = os.path.join(self._tmp.name, "real-home")
+        os.rename(self.home, real_home)
+        os.symlink(real_home, self.home)
+        # Slice 2: the stores are made (and fsynced) first; with them in place the unit's write fails.
+        self.run_action("install")
+        os.unlink(os.path.join(real_home, ".config", "systemd", "user", UNIT_NAME))
+        with mock.patch("os.fsync", side_effect=OSError(5, "Input/output error")):
+            code, answer = self.run_action("install")
+        self.assertEqual((code, answer["code"]), (1, "filesystem_error"))
+        resolved = os.path.join(os.path.realpath(real_home), ".config", "systemd", "user")
+        self.assertIn(f"(in {resolved})", answer["detail"])
+        self.assertNotIn(self.home + "/", answer["detail"])
+
     def test_an_existing_unit_another_user_could_change_is_printed_as_its_refusal(self):
         # Review 3 of #382, DeepSeek L1, as the command prints it: install refuses, upgrade writes it again.
         self.run_action("install")

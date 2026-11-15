@@ -18,8 +18,8 @@ import sqlite3
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .layout import (Owned, Roots, check_dirs, check_private_dir, ensure_dir, file_untrusted, owned_paths, read_regular, replace_regular,
-                     unlink_regular, write_exclusive)
+from .layout import (Owned, Roots, check_dirs, check_private_dir, ensure_dir, file_untrusted, owned_paths,
+                     read_regular, read_regular_and_stat, replace_regular, unlink_regular, write_exclusive)
 from .unit import MARKER, UNIT_NAME, render_unit
 
 _UNIT_MODE = 0o644
@@ -96,9 +96,12 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     present = os.path.lexists(paths.unit)
-    if present and read_regular(paths.unit) != unit:
-        raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
-    why = file_untrusted(paths.unit) if present else ""
+    why = ""
+    if present:
+        current, info = read_regular_and_stat(paths.unit)  # owner and mode of the file read, not looked up again
+        if current != unit:
+            raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
+        why = file_untrusted(paths.unit, info)
     if why:
         raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
     check_private_dir(paths.home, paths.homes)  # before anything is made
@@ -121,7 +124,8 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    current = read_regular(paths.unit) == unit and not file_untrusted(paths.unit)
+    data, info = read_regular_and_stat(paths.unit)  # owner and mode of the file read, not looked up again
+    current = data == unit and not file_untrusted(paths.unit, info)
     check_private_dir(paths.home, paths.homes)  # before anything is made
     made = ensure_stores(paths)
     homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)

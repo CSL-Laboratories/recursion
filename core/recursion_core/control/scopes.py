@@ -24,7 +24,9 @@ recovery Stop never passes here.
      read-only token is not widened by another grant of the same identity;
    - a ``plugin`` principal with no ``grant`` is host-attributed (the plugin host names it) and holds the
      union of its identity's live grants;
-   - any other device, session or agent principal with no ``grant`` holds nothing.
+   - any other device, session or agent principal with no ``grant`` holds nothing;
+   - a principal whose ``grant`` cannot be read holds nothing, whatever its kind: an unreadable grant is
+     not an absent one, so it never falls through to a plugin's identity grants.
    Every set is cut to the kind's ceiling (``credentials.CEILING``), so a plugin, session or agent never
    holds ``approve`` and no device ever holds ``manage``, whatever a grant says. SPINE's ``Principal`` has
    no ``grant`` field yet (``questions.md``); until it has, token principals hold nothing.
@@ -74,7 +76,11 @@ def register(hooks) -> None:
 
 def _same_session(run_session: str, principal_session: str) -> bool:
     """The default subtree test: the run's own session only. The session lineage is the sessions lane's;
-    until it is passed in, a session principal cannot stop a run of a session it started."""
+    until it is passed in, a session principal cannot stop a run of a session it started.
+
+    A lineage passed as ``in_subtree`` must return exactly ``True`` for a session inside the principal's
+    subtree. Anything else (``1``, ``"yes"``, a raise) counts as outside it, so a lineage that answers a
+    truthy value stops nothing (the read of #377 by DeepSeek V4.1 Flash, F12)."""
 
     return run_session == principal_session
 
@@ -105,7 +111,10 @@ class Authorizer:
         """The scopes ``principal`` holds now, within its kind's ceiling."""
 
         kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
-        grant = _attr(principal, "grant", None)
+        try:
+            grant = getattr(principal, "grant", None)   # absent (SPINE's Principal today): None
+        except Exception:  # noqa: BLE001 - unreadable is not absent: such a principal holds nothing at all
+            return frozenset()   # (the round-2 read of #377 by Sol, 2: it fell through to the plugin's grants)
         if kind in ("owner", "internal"):
             held = ALL_SCOPES
         elif grant is not None:

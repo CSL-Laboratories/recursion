@@ -25,9 +25,10 @@ def toml_string(value: str) -> str:
 
     Printable ASCII is written as itself; the short escapes are used where TOML has one; every other
     character is a Unicode scalar escape, ``\\uXXXX`` or, above U+FFFF, ``\\UXXXXXXXX`` (JSON's
-    surrogate pairs are not valid TOML, and JSON leaves DEL bare, which TOML refuses). Up to U+FFFF,
-    DEL aside, the text is what ``json.dumps`` wrote before. A lone surrogate is no Unicode scalar
-    value and has no TOML form: ``ValueError``.
+    surrogate pairs are not valid TOML). DEL is escaped too, because TOML refuses it bare; ``json.dumps``
+    escapes it as well (the read of #377 by DeepSeek V4.1 Flash, F11). Up to U+FFFF the text is what
+    ``json.dumps`` wrote before. A lone surrogate is no Unicode scalar value and has no TOML form:
+    ``ValueError``.
     """
 
     if type(value) is not str:

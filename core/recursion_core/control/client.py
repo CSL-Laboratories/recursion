@@ -22,6 +22,7 @@ with ``delivered: false`` and ``detail: "platform_unsupported"``; nothing is con
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from recursion_core.control_transport import (FrameError, PeerNotAdmitted, PlatformNotSupported, TransportBusy,
@@ -60,6 +61,10 @@ class SocketAPI:
     def call(self, method: str, params: dict | None = None) -> dict:
         if self.path is None:
             return {"code": UNAVAILABLE, "delivered": False, "detail": "platform_unsupported"}
+        if params is not None and not isinstance(params, Mapping):
+            # The params are an object on the wire. Anything else is refused here, typed and before anything
+            # is connected (the reads of #377 and #385 by DeepSeek V4.1 Flash, F9 and F6).
+            return {"code": UNAVAILABLE, "delivered": False, "detail": "not_sent:params_not_object"}
         message = {"op": "control", "method": method, "params": dict(params or {})}
         try:
             # A request the transport cannot frame is refused before any byte is written, so it was

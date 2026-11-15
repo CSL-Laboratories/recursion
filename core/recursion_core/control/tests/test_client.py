@@ -55,6 +55,19 @@ class NotSentTest(unittest.TestCase):
                                          "detail": "not_sent:frame_not_json"})
         self.assertEqual(connect.calls, [])
 
+    def test_params_that_are_not_an_object_are_refused_typed_and_connect_nothing(self) -> None:
+        # The reads of #377 and #385 by DeepSeek V4.1 Flash (F9, F6): these raised TypeError or ValueError,
+        # or (a list of pairs, a list of two-letter strings) were framed as an object nobody sent.
+        api, connect = self.api()
+        for params in (5, [1, 2], [("a", 1)], ["ab"], "ab", b"ab", [], ()):
+            with self.subTest(params=repr(params)):
+                self.assertEqual(api.call("run.list", params), {"code": "control_api_unavailable",
+                                                                "delivered": False,
+                                                                "detail": "not_sent:params_not_object"})
+        self.assertEqual(connect.calls, [])
+        self.assertEqual(api.call("run.list", None), {"code": "ok", "runs": []})
+        self.assertEqual(connect.calls[0][2].requests[0]["params"], {})
+
     def test_a_request_that_frames_is_sent_as_before(self) -> None:
         api, connect = self.api()
         self.assertEqual(api.call("run.list", {"limit": 5}), {"code": "ok", "runs": []})

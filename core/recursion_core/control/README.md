@@ -199,14 +199,18 @@ registered into seam S5 (`control/hooks.py`, lane SPINE) by a later pull request
   session, `rct1_` otherwise, 32 random bytes), returns each once, and keeps only its SHA-256 in one
   owner-only JSON file, written whole and renamed into place; the rename is the commit point (a failure
   after it, syncing the directory, is `CredentialStoreUncertain`: the change is made and memory keeps it).
-  `revoke` takes effect at once and answers success only once written; a failed write is retried by the
-  next `revoke`. No grant may name the page's own door (`device`, `page`). Issue and revoke are reported
+  Every write takes an exclusive lock on a sibling `.<name>.lock` and reads the file again under it, and a
+  store reads the file again when another has written it, so two stores on one file never drop each
+  other's grants and each sees the other's revocations at its next check.
+  `revoke` takes effect at once (dated no earlier than the grant's issue) and answers success only once
+  written; a failed write is retried by the next `revoke`. No grant may name the page's own door (`device`, `page`). Issue and revoke are reported
   to an `emit` callback without the token or its digest, a revocation once it is durable. Failed token
   checks are limited per peer (`FailedAuthLimit`) and logged without the token. Every refusal is
   `scope_refused`.
 - **Token principals.** A principal made from a verified token names its grant (`grant`, a field this
   lane asks SPINE to add to `Principal`) and holds only that grant's live scopes (`grant_scopes`); a
-  device, session or agent principal without one holds nothing. A plugin the host attributes by identity
+  device, session or agent principal without one holds nothing, and a principal whose `grant` cannot be
+  read holds nothing at all. A plugin the host attributes by identity
   holds the union of its identity's live grants (`held`).
 - **Scopes.** `Authorizer(scope_of=..., credentials=..., run_record=...)` answers S5's
   `authorize(principal, method, params)`: a run-unit peer is refused; otherwise the method's scope must

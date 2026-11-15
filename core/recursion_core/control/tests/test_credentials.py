@@ -109,7 +109,7 @@ class StoreTest(unittest.TestCase):
                                                                          frozenset({"read", "run"})))
         self.assertEqual(store.held("device", "phone-1"), frozenset({"read", "run"}))
         self.assertEqual(self.store().verify(session_token, peer="p").id, "sess-7")   # read back from the file
-        self.assertEqual(os.listdir(self.dir), ["credentials.json"])   # no temporary file left behind
+        self.assertEqual(sorted(os.listdir(self.dir)), [".credentials.json.lock", "credentials.json"])   # no temp file
 
     def test_a_revoked_token_is_refused_at_once_and_after_a_restart(self) -> None:
         store = self.store()
@@ -156,7 +156,7 @@ class StoreTest(unittest.TestCase):
         with mock.patch.object(creds.os, "replace", side_effect=OSError("EXDEV")):
             with self.assertRaises(CredentialStoreError):
                 store.mint("device", "phone-1", ["read"])
-        self.assertEqual(os.listdir(self.dir), [])
+        self.assertEqual(os.listdir(self.dir), [".credentials.json.lock"])
 
     def test_mint_refusals_write_nothing(self) -> None:
         store = self.store()
@@ -453,7 +453,7 @@ class ReviewAnswersTest(unittest.TestCase):
         self.assertEqual(open(self.path, "rb").read(), before)
         self.assertEqual(store.held("device", "phone-1"), frozenset({"read"}))
         self.assertEqual(self.store().held("device", "phone-1"), frozenset({"read"}))
-        self.assertEqual(os.listdir(self.dir), ["credentials.json"])
+        self.assertEqual(sorted(os.listdir(self.dir)), [".credentials.json.lock", "credentials.json"])
         self.assertEqual(self.events, [])
 
     def test_a_directory_sync_failure_after_the_rename_leaves_a_mint_issued_in_memory_and_on_disk(self) -> None:
@@ -664,6 +664,257 @@ class ReviewAnswersTest(unittest.TestCase):
         self.assertNotIn(token, json.dumps(public))
 
 
+
+
+@NEEDS_POSIX
+class RoundTwoTest(unittest.TestCase):
+    """The round-2 reads of #377 (Codex GPT-6 Astra 1-3, GPT-6.1 Sol 1 and 3)."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-r2-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.path = os.path.join(self.base, "state", "credentials.json")
+        self.wall = Clock()
+        self.events: list[tuple[str, dict]] = []
+
+    def store(self, **kwargs) -> CredentialStore:
+        kwargs.setdefault("emit", lambda kind, payload: self.events.append((kind, payload)))
+        kwargs.setdefault("wall", self.wall)
+        return CredentialStore(self.path, **kwargs)
+
+    def revoked_notices(self) -> list[dict]:
+        return [payload for kind, payload in self.events if kind == "credential.revoked"]
+
+    def test_a_revocation_after_the_wall_clock_steps_back_writes_a_store_that_loads(self) -> None:
+        # Astra 1, Sol 1: revoked_at fell before issued_at, and the load rule then refused the whole store.
+        store = self.store()
+        token, cred = store.mint("device", "one", ["read"])
+        issued = cred.issued_at
+        self.wall.now -= 3600
+        with mock.patch.object(store, "_write", side_effect=CredentialStoreError("disk full")):
+            with self.assertRaises(CredentialStoreError):
+                store.revoke(cred.token_id)               # refused at once, not yet written
+        self.wall.now -= 60                               # a retry keeps the first time
+        self.assertEqual(store.revoke(cred.token_id).revoked_at, issued)
+        (reopened,) = self.store().grants()
+        self.assertEqual(reopened.revoked_at, issued)
+        with self.assertRaises(CredentialRefused) as caught:
+            self.store().verify(token, peer="p")
+        self.assertEqual(caught.exception.detail, "token_revoked")
+        self.assertEqual([p["revoked_at"] for p in self.revoked_notices()], [issued])
+
+    def test_a_digest_that_collides_under_a_fresh_token_id_mints_nothing(self) -> None:
+        # Astra 2, Sol 3: the earlier test forced an id collision only; this one keeps the ids distinct.
+        store = self.store()
+        with mock.patch.object(creds.secrets, "token_bytes", return_value=b"\x01" * 32), \
+                mock.patch.object(creds.secrets, "token_urlsafe", side_effect=["record-a", "record-b"]):
+            store.mint("device", "first", ["read"])
+            with self.assertRaises(CredentialStoreError):
+                store.mint("device", "second", ["run"])
+        self.assertEqual([c.id for c in store.grants()], ["first"])
+        self.assertEqual([c.id for c in self.store().grants()], ["first"])
+        self.assertEqual([kind for kind, _ in self.events], ["credential.issued"])
+
+    def test_an_uncertain_mint_settles_no_pending_revocation(self) -> None:
+        # Astra 3, Sol 3: a mint whose directory sync fails has written the pending revocations, but not
+        # durably: their notices wait for the next write that succeeds fully, and go out once.
+        store = self.store()
+        ids = [store.mint("device", name, ["read"])[1].token_id for name in ("a", "b")]
+        for token_id in ids:
+            with mock.patch.object(store, "_write", side_effect=CredentialStoreError("disk full")):
+                with self.assertRaises(CredentialStoreError):
+                    store.revoke(token_id)
+        real_fsync = creds.os.fsync
+
+        def directory_sync_fails(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("EIO")
+            return real_fsync(fd)
+
+        with mock.patch.object(creds.os, "fsync", side_effect=directory_sync_fails):
+            with self.assertLogs(creds.log, "ERROR"):
+                store.mint("device", "c", ["read"])
+        self.assertEqual(self.revoked_notices(), [])
+        self.assertEqual(sorted(store._unpersisted), sorted(ids))
+        store.mint("device", "d", ["read"])               # a write that succeeds fully settles both, once
+        self.assertEqual(sorted(p["token_id"] for p in self.revoked_notices()), sorted(ids))
+        store.revoke(ids[0])
+        self.assertEqual(len(self.revoked_notices()), 2)
+        self.assertEqual(sum(c.revoked_at is not None for c in self.store().grants()), 2)
+
+    def test_a_descriptor_whose_check_fails_is_closed_the_store_s_and_the_lock_s(self) -> None:
+        # Sol's C11 and C12 (later coverage, not required): an fstat that fails is a typed refusal, and the
+        # descriptor it was asked of is closed. The lock is taken first, so each descriptor is tried on its own.
+        self.store().mint("device", "first", ["read"])
+        lock = os.path.join(self.base, "state", ".credentials.json.lock")
+        real_open, real_fstat = creds.os.open, creds.os.fstat
+        for target in (self.path, lock):
+            with self.subTest(target=os.path.basename(target)):
+                opened: list[int] = []
+
+                def record(path, flags, *args, **kwargs):
+                    fd = real_open(path, flags, *args, **kwargs)
+                    if path == target:
+                        opened.append(fd)
+                    return fd
+
+                def fstat(fd):
+                    if fd in opened:
+                        raise OSError("EIO")
+                    return real_fstat(fd)
+
+                with mock.patch.object(creds.os, "open", side_effect=record), \
+                        mock.patch.object(creds.os, "fstat", side_effect=fstat):
+                    with self.assertRaises(CredentialStoreError):
+                        self.store()
+                self.assertEqual(len(opened), 1)
+                with self.assertRaises(OSError):
+                    os.fstat(opened[0])
+
+
+@NEEDS_POSIX
+class TwoStoresTest(unittest.TestCase):
+    """The audited read of #377 by DeepSeek V4.1 Flash, F4: two stores on one file each wrote their own memory,
+    so the second write dropped the first store's grants. F13: a killed writer's temporary file stayed."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-two-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.dir = os.path.join(self.base, "state")
+        self.path = os.path.join(self.dir, "credentials.json")
+
+    def store(self, **kwargs) -> CredentialStore:
+        return CredentialStore(self.path, **kwargs)
+
+    def on_disk(self) -> list[str]:
+        with open(self.path, encoding="ascii") as handle:
+            return sorted(record["id"] for record in json.load(handle)["credentials"])
+
+    def test_two_stores_on_one_file_keep_each_others_grants(self) -> None:
+        a, b = self.store(), self.store()          # both opened before either writes, as in DeepSeek's attack
+        token_a, _ = a.mint("device", "sa", ["read"])
+        token_b, _ = b.mint("device", "sb", ["read"])
+        self.assertEqual(self.on_disk(), ["sa", "sb"])
+        for store in (a, b, self.store()):
+            for token in (token_a, token_b):
+                self.assertEqual(store.verify(token, peer="p").kind, "device")
+
+    def test_a_revocation_through_one_store_keeps_the_grant_another_store_minted(self) -> None:
+        a, b = self.store(), self.store()
+        token_a, cred_a = a.mint("device", "sa", ["read"])
+        token_b, _ = b.mint("device", "sb", ["read"])     # a has not read the file since
+        a.revoke(cred_a.token_id)
+        self.assertEqual(self.on_disk(), ["sa", "sb"])
+        fresh = self.store()
+        self.assertEqual(fresh.verify(token_b, peer="p").id, "sb")
+        with self.assertRaises(CredentialRefused):
+            fresh.verify(token_a, peer="p")
+
+    def test_a_revocation_through_one_store_is_refused_by_the_other_at_its_next_check(self) -> None:
+        a, b = self.store(), self.store()
+        token, cred = a.mint("plugin", "plugin.alpha", ["read", "run"])
+        self.assertEqual(b.held("plugin", "plugin.alpha"), frozenset({"read", "run"}))
+        a.revoke(cred.token_id)
+        with self.assertRaises(CredentialRefused) as caught:
+            b.verify(token, peer="p")
+        self.assertEqual(caught.exception.detail, "token_revoked")
+        self.assertEqual(b.held("plugin", "plugin.alpha"), frozenset())
+        self.assertEqual(b.grant_scopes(cred.token_id, "plugin", "plugin.alpha"), frozenset())
+        self.assertIsNotNone(b.revoke(cred.token_id).revoked_at)   # already written: answered from the file
+        self.assertEqual([c.revoked_at is not None for c in b.grants()], [True])
+
+    def test_writers_in_two_threads_lose_nothing(self) -> None:
+        stores, tokens = (self.store(), self.store()), []
+
+        def mint(store: CredentialStore, prefix: str) -> None:
+            for n in range(25):
+                tokens.append(store.mint("device", f"{prefix}{n}", ["read"])[0])
+
+        threads = [threading.Thread(target=mint, args=(store, prefix)) for store, prefix in zip(stores, "ab")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(120)
+        fresh = self.store()
+        self.assertEqual(len(self.on_disk()), 50)
+        self.assertEqual(len(tokens), 50)
+        for token in tokens:
+            fresh.verify(token, peer="p")
+
+    def test_a_writer_that_cannot_have_the_lock_is_refused_and_changes_nothing(self) -> None:
+        import fcntl
+        store = self.store(lock_timeout_s=0.2)
+        store.mint("device", "first", ["read"])
+        holder = os.open(os.path.join(self.dir, ".credentials.json.lock"), os.O_RDWR)
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            for attempt in (lambda: store.mint("device", "second", ["read"]),
+                            lambda: store.revoke(store.grants()[0].token_id)):
+                with self.assertRaises(CredentialStoreError) as caught:
+                    attempt()
+                self.assertIn("held by another writer", str(caught.exception))
+        finally:
+            os.close(holder)
+        self.assertEqual(self.on_disk(), ["first"])
+        self.assertEqual([c.revoked_at for c in self.store().grants()], [None])
+        store.mint("device", "second", ["read"])
+        self.assertEqual(self.on_disk(), ["first", "second"])
+
+    def test_a_lock_that_is_not_an_owner_only_file_of_this_user_is_refused(self) -> None:
+        self.store()
+        lock = os.path.join(self.dir, ".credentials.json.lock")
+        os.chmod(lock, 0o644)
+        with self.assertRaises(CredentialStoreError):
+            self.store()
+        os.unlink(lock)
+        os.symlink(self.path, lock)
+        with self.assertRaises(CredentialStoreError):
+            self.store()
+        os.unlink(lock)
+        os.mkfifo(lock, 0o600)
+        with self.assertRaises(CredentialStoreError):
+            self.store()
+        with self.assertRaises(CredentialStoreError):
+            self.store(lock_timeout_s=0)
+
+    def test_a_store_whose_file_turns_unreadable_refuses_every_token_without_counting_it(self) -> None:
+        limit = creds.FailedAuthLimit(max_failures=1)
+        store = self.store(limit=limit)
+        token, _ = store.mint("device", "d1", ["read"])
+        writer = self.store()
+        os.chmod(self.path, 0o644)                  # another hand changes the file: no longer owner-only
+        os.utime(self.path, ns=(1, 1))
+        with self.assertRaises(CredentialRefused) as caught:
+            store.verify(token, peer="p")
+        self.assertEqual(caught.exception.detail, "store_unavailable")
+        self.assertFalse(limit.blocked("p"))
+        with self.assertRaises(CredentialStoreError):
+            store.held("device", "d1")
+        os.chmod(self.path, 0o600)
+        self.assertEqual(store.verify(token, peer="p").id, "d1")
+        del writer
+
+    def test_opening_a_store_removes_a_killed_writers_temporary_files_only(self) -> None:
+        self.store().mint("device", "d1", ["read"])
+        orphans = [".credentials.json.0123456789abcdef.tmp", ".credentials.json.fedcba9876543210.tmp"]
+        kept = [".credentials.json.notes.tmp", ".other.json.0123456789abcdef.tmp", "credentials.json.bak"]
+        for name in orphans + kept:
+            with open(os.path.join(self.dir, name), "w", encoding="ascii") as handle:
+                handle.write("{}")
+        self.store()
+        left = sorted(os.listdir(self.dir))
+        self.assertEqual(left, sorted([".credentials.json.lock", "credentials.json"] + kept))
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "counts descriptors through /proc")
+    def test_a_directory_at_the_store_path_is_refused_and_leaks_no_descriptor(self) -> None:
+        os.makedirs(self.path, 0o700)                # the audited read's F3
+        before = len(os.listdir("/proc/self/fd"))
+        for _ in range(20):
+            with self.assertRaises(CredentialStoreError):
+                self.store()
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+
 class PlatformTest(unittest.TestCase):
     def test_without_uids_the_store_refuses_to_open(self) -> None:
         with mock.patch.object(creds.os, "name", "nt"):
@@ -680,6 +931,21 @@ class SourceTest(unittest.TestCase):
         for line in source.splitlines():
             if re.search(r"log\.\w+\(|raise \w+\(", line):
                 self.assertNotRegex(line, r"\btoken\b(?!_)", line)
+
+
+@NEEDS_POSIX
+class StorePathRefusalTest(unittest.TestCase):
+    """The read of #385 by DeepSeek V4.1 Flash: an absolute pathlib path was refused as "must be absolute"."""
+
+    def test_a_path_that_is_not_a_str_and_a_relative_path_are_refused_each_for_its_reason(self) -> None:
+        import pathlib
+        for path, reason in ((pathlib.PurePosixPath("/var/tmp/x/credentials.json"), "must be a str"),
+                             (b"/var/tmp/x/credentials.json", "must be a str"), (None, "must be a str"),
+                             ("credentials.json", "must be absolute")):
+            with self.subTest(path=repr(path)):
+                with self.assertRaises(CredentialStoreError) as caught:
+                    CredentialStore(path)
+                self.assertIn(reason, str(caught.exception))
 
 
 if __name__ == "__main__":

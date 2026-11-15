@@ -477,6 +477,35 @@ class BreakItAnswersTest(unittest.TestCase):
             authorizer(scope_of=broken)(PRINCIPALS["owner"], "run.list", {})
 
 
+class RoundTwoScopesTest(unittest.TestCase):
+    """The round-2 read of #377 by Codex GPT-6.1 Sol: 2 (required) and B10 (later coverage)."""
+
+    def test_a_principal_whose_grant_cannot_be_read_holds_nothing(self) -> None:
+        class Unreadable:
+            kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+            @property
+            def grant(self):
+                raise RuntimeError("the trusted grant context is unavailable")
+
+        class UnreadableOwner(Unreadable):
+            kind, id = "owner", "local"
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        self.assertEqual(auth.held(Principal("plugin", "plugin.alpha")), frozenset({"read", "run"}))  # absent grant
+        for principal in (Unreadable(), UnreadableOwner()):
+            with self.subTest(kind=principal.kind):
+                self.assertEqual(auth.held(principal), frozenset())
+                self.assertEqual(auth(principal, "run.start", {}), ("scope_refused", "needs_run"))
+
+    def test_a_run_whose_session_is_empty_is_in_nobody_s_subtree(self) -> None:
+        runs = {"run-empty": {"run_id": "run-empty", "launch": {"owner": "host", "session_id": ""}}}
+        auth = authorizer(credentials=Grants({("session", "s1"): {"run"}}), run_record=runs.get,
+                          in_subtree=lambda run_session, principal_session: True)
+        self.assertEqual(auth(bearer("session", "s1"), "run.stop", {"run_id": "run-empty"}),
+                         ("scope_refused", "run_outside_session"))
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

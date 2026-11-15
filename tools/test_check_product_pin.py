@@ -2,14 +2,18 @@
 """Tests for tools/check_product_pin.py, plus a check of the committed pin (CSL-585)."""
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("check_product_pin", ROOT / "tools" / "check_product_pin.py")
@@ -34,12 +38,23 @@ PINNED = {
     "sha256": "b" * 64,
     "claim": "Recursion product contract, candidate.",
 }
+# The committed contract/PRODUCT.pin.json names exactly these csl-research bytes.
+COMMITTED_COMMIT = "d84cdd26a4de2366f3c5d34c4aec5215f822a494"
+COMMITTED_SHA256 = "e1d5fb8c02594b2ca88281113ffc14e6f3125daded2a00d45739cfb9d2ed04dd"
+# One NUL, one other control character and one lone surrogate: none can be passed to git or printed raw.
+UNSAFE_PATHS = ("contracts/PRO\x00DUCT.md", "contracts/PRO\nDUCT.md", "contracts/PRO\ud800DUCT.md")
+UNSAFE_PATH = "path must not contain control characters or lone surrogates"
 
 
 class ShapeTests(unittest.TestCase):
     def test_committed_pin_is_valid(self) -> None:
         pin = json.loads(pin_check.PIN.read_text(encoding="utf-8"))
         self.assertEqual(pin_check.errors(pin), [])
+        self.assertEqual(pin["status"], "pinned")
+        self.assertEqual(pin["repository"], "CSL-Laboratories/csl-research")
+        self.assertEqual(pin["path"], "contracts/PRODUCT.md")
+        self.assertEqual(pin["commit"], COMMITTED_COMMIT)
+        self.assertEqual(pin["sha256"], COMMITTED_SHA256)
 
     def test_awaiting_and_pinned_examples_pass(self) -> None:
         self.assertEqual(pin_check.errors(AWAITING), [])
@@ -67,6 +82,13 @@ class ShapeTests(unittest.TestCase):
                     "path must be a relative posix path inside the repository",
                     pin_check.errors({**PINNED, "path": path}),
                 )
+
+    def test_pinned_rejects_control_characters_and_lone_surrogates(self) -> None:
+        for path in UNSAFE_PATHS:
+            with self.subTest(path=ascii(path)):
+                problems = pin_check.errors({**PINNED, "path": path})
+                self.assertEqual(problems, [UNSAFE_PATH])
+                "\n".join(problems).encode("utf-8")  # printable: raises if the bad string leaked in
 
     def test_rejects_other_repository_unknown_keys_and_status(self) -> None:
         pin = copy.deepcopy(PINNED)
@@ -113,6 +135,64 @@ class VaultTests(unittest.TestCase):
 
     def test_awaiting_needs_no_vault(self) -> None:
         self.assertEqual(pin_check.vault_errors(AWAITING, self.vault / "absent"), [])
+
+    def test_nul_or_lone_surrogate_fails_cleanly(self) -> None:
+        digest = hashlib.sha256(self.body).hexdigest()
+        cases = [({**self.pin(digest), "path": path}, self.vault) for path in UNSAFE_PATHS[::2]]
+        cases += [(self.pin(digest), Path(f"{self.vault}\x00")), (self.pin(digest), Path(f"{self.vault}\ud800"))]
+        for pin, vault in cases:
+            with self.subTest(path=ascii(pin["path"]), vault=ascii(str(vault))):
+                problems = pin_check.vault_errors(pin, vault)
+                self.assertEqual(len(problems), 1)
+                self.assertTrue(problems[0].startswith("cannot read"), problems[0])
+                self.assertNotIn("\x00", problems[0])
+                problems[0].encode("utf-8")
+
+    def test_git_timeout_fails_cleanly(self) -> None:
+        expired = subprocess.TimeoutExpired(["git"], pin_check.GIT_TIMEOUT_SECONDS)
+        with mock.patch.object(pin_check.subprocess, "run", side_effect=expired) as run:
+            problems = pin_check.vault_errors(self.pin("0" * 64), self.vault)
+        self.assertEqual(run.call_args.kwargs["timeout"], pin_check.GIT_TIMEOUT_SECONDS)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("cannot read"), problems[0])
+        self.assertTrue(problems[0].endswith(f"git timed out after {pin_check.GIT_TIMEOUT_SECONDS} seconds"))
+
+    def write_pin(self, path_escape: str) -> Path:
+        """Write a pin whose path holds a raw JSON escape, outside the vault clone."""
+        digest = hashlib.sha256(self.body).hexdigest()
+        text = json.dumps({**self.pin(digest), "path": "contracts/PRO@DUCT.md"}).replace("@", path_escape)
+        pin_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(pin_dir.cleanup)
+        target = Path(pin_dir.name) / "PRODUCT.pin.json"
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def test_script_fails_without_traceback_on_unsafe_path(self) -> None:
+        script = str(ROOT / "tools" / "check_product_pin.py")
+        for escape in ("\\u0000", "\\ud800"):
+            for extra in ([], ["--vault", str(self.vault)]):
+                with self.subTest(escape=escape, extra=extra):
+                    done = subprocess.run(
+                        [sys.executable, "-X", "utf8", "-B", script, "--pin", str(self.write_pin(escape)), *extra],
+                        capture_output=True,
+                        timeout=120,
+                    )
+                    output = (done.stdout + done.stderr).decode("utf-8", "replace")
+                    self.assertEqual(done.returncode, 1, output)
+                    self.assertIn(f"FAIL: {UNSAFE_PATH}", output.splitlines())
+                    self.assertNotIn("Traceback", output)
+
+    def test_main_fails_cleanly_on_unsafe_vault(self) -> None:
+        pin_file = self.write_pin("")
+        for vault in (f"{self.vault}\x00", f"{self.vault}\ud800"):
+            with self.subTest(vault=ascii(vault)):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = pin_check.main(["--pin", str(pin_file), "--vault", vault])
+                self.assertEqual(code, 1)
+                self.assertTrue(out.getvalue().startswith("FAIL: cannot read"), ascii(out.getvalue()))
+                self.assertNotIn("\x00", out.getvalue())
+                out.getvalue().encode("utf-8")
 
 
 if __name__ == "__main__":

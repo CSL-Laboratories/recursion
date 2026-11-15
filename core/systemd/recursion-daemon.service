@@ -1,0 +1,17 @@
+# Recursion per-user daemon (CSL-738). Install under ~/.config/systemd/user/.
+# Runs live in their own transient recursion-run-*.service units, not in this
+# unit's cgroup, so stopping or killing this unit never stops a run.
+[Unit]
+Description=Recursion per-user daemon
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=%h/.local/lib/recursion/core
+ExecStart=%h/.local/lib/recursion/venv/bin/python3.14t -X gil=0 -m recursion_core.daemon
+Restart=on-failure
+RestartSec=2
+UMask=0077
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

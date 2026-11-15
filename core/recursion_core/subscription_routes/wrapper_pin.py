@@ -137,12 +137,23 @@ def measure_package_pin(
     ``full_access_acknowledged`` is ``True``.
     """
 
+    return _measure_package_pin(launcher_path, install_root, allowed_link_targets=allowed_link_targets,
+                                full_access_acknowledged=full_access_acknowledged, require_owned=False)
+
+
+def _measure_package_pin(launcher_path, install_root, *, allowed_link_targets,
+                         full_access_acknowledged, require_owned):
+    # Offline measurement can inspect an unsafe install. Route verification also
+    # requires every visited path to satisfy the existing launch ownership rules.
     allowed = check_link_requirements(allowed_link_targets, full_access_acknowledged)
     if not isinstance(install_root, str) or not os.path.isabs(install_root):
         raise WrapperPinRefused("install_root_not_absolute", "")
-    files = _manifest(install_root, allowed, full_access_acknowledged is True)
+    files = _manifest(install_root, allowed, full_access_acknowledged is True, require_owned=require_owned)
     if not files:
         raise WrapperPinRefused("package_manifest_empty", "")
+    # Preserve the existing malformed/missing-launcher refusal from _hash_launcher.
+    if require_owned and isinstance(launcher_path, str) and launcher_path and os.path.lexists(launcher_path):
+        _require_owned_path(launcher_path, directory=False, detail="launcher")
     return PackagePin(_hash_launcher(launcher_path, install_root), files)
 
 
@@ -171,9 +182,10 @@ def verify_package_pin(
         if not isinstance(rel, str) or not rel or rel.startswith("/") or ".." in rel.split("/"):
             raise WrapperPinRefused("wrapper_pin_malformed", "path")
         _check_hex(digest, rel)
-    measured = measure_package_pin(
+    measured = _measure_package_pin(
         install.launcher_path, install.install_root,
         allowed_link_targets=allowed_link_targets, full_access_acknowledged=full_access_acknowledged,
+        require_owned=True,
     )
     if measured.launcher_sha256 != install.pin.launcher_sha256.lower():
         raise WrapperPinRefused("wrapper_pin_mismatch", "launcher")
@@ -257,7 +269,20 @@ def _hash_regular(path: str, detail: str) -> str:
     return digest.hexdigest()
 
 
-def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool) -> tuple[tuple[str, str], ...]:
+def _require_owned_path(path: str, *, directory: bool, detail: str) -> None:
+    from recursion_core.child_env.policy import _unsafe_dir, _unsafe_file
+
+    try:
+        cause = (_unsafe_dir if directory else _unsafe_file)(path)
+    except (OSError, ValueError, TypeError):
+        raise WrapperPinRefused("wrapper_tree_unreadable", detail) from None
+    if cause is not None:
+        # The package-relative name and child_env's cause, as the other wrapper refusals name a path.
+        raise WrapperPinRefused("wrapper_path_unsafe", f"{detail or '.'}: {cause}")
+
+
+def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool,
+              *, require_owned: bool = False) -> tuple[tuple[str, str], ...]:
     if not isinstance(install_root, str) or not os.path.isdir(install_root) or os.path.islink(install_root):
         raise WrapperPinRefused("wrapper_install_missing", "")
     real_root = os.path.realpath(install_root)
@@ -271,6 +296,8 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool) ->
         directory, prefix, above = pending.pop()
         if len(above) > _MAX_DEPTH:
             raise WrapperPinRefused("wrapper_tree_too_deep", prefix.rstrip("/"))
+        if require_owned:
+            _require_owned_path(directory, directory=True, detail=prefix.rstrip("/"))  # includes empty directories
         try:
             names = sorted(os.listdir(directory))
         except OSError:
@@ -285,6 +312,8 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool) ->
             if stat.S_ISDIR(mode):
                 pending.append((path, rel + "/", above + (os.path.realpath(path),)))
             elif stat.S_ISREG(mode):
+                if require_owned:
+                    _require_owned_path(path, directory=False, detail=rel)
                 rows.append((rel, _hash_regular(path, rel)))
             elif stat.S_ISLNK(mode):
                 real = os.path.realpath(path)
@@ -300,12 +329,16 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool) ->
                 where = "in:" + os.path.relpath(real, real_root) if inside else "out:" + real
                 link = os.fsencode(os.readlink(path)) + b"\x00" + os.fsencode(where)
                 if stat.S_ISDIR(target_mode):
+                    if require_owned:
+                        _require_owned_path(path, directory=True, detail=rel)
                     if real in above:
                         rows.append((rel, _link_digest(b"link-cycle", link)))
                         continue
                     rows.append((rel, _link_digest(b"link-dir", link)))
                     pending.append((real, rel + "/", above + (real,)))
                 elif stat.S_ISREG(target_mode):
+                    if require_owned:
+                        _require_owned_path(path, directory=False, detail=rel)
                     rows.append((rel, _link_digest(b"link-file", link + b"\x00" + _hash_regular(real, rel).encode())))
                 else:
                     raise WrapperPinRefused("wrapper_package_not_a_file", rel)

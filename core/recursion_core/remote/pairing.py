@@ -18,6 +18,8 @@ The rules, each with a test that fails without it:
 * Five wrong codes lock the offer for good; a locked or cancelled offer redeems nothing.
 * At most eight offers are open at once.
 * Failed tries are limited per source in a sliding window, and all sources together too.
+* A pairing link is ASCII and at most ``MAX_LINK_BYTES``, 415 bytes, by the bounds of its parts below;
+  ``qr.encode`` holds every such link (``tests/test_qr.py`` checks the two modules against each other).
 
 Whether a phone needs a second factor at pairing or per approval (F-14 step-up, and what happens where a
 passkey is not supported) is the owner's open choice; nothing here assumes an answer to it.
@@ -47,13 +49,21 @@ MAX_OPEN_OFFERS = 8
 OPEN, REDEEMED, EXPIRED, LOCKED, CANCELLED = "open", "redeemed", "expired", "locked", "cancelled"
 # Printable ASCII, no leading or trailing space: no control or bidirectional characters in a label.
 _LABEL = re.compile(r"[!-~](?:[ -~]{0,62}[!-~])?")
+# The bounds of a link's parts: the host, the port's digits, the offer id and the code.
+_MAX_HOST = 255
+_MAX_PORT_DIGITS = 5
+_MAX_TOKEN = 64
+_LINK = "https://{authority}/pair#offer={offer_id}&code={code}"
+# The longest link pairing_link can return; remote/qr.py is sized to hold it.
+MAX_LINK_BYTES = (len(_LINK.format(authority="", offer_id="", code="")) + _MAX_HOST + 1 + _MAX_PORT_DIGITS
+                  + 2 * _MAX_TOKEN)
 # The pairing origin, whole: https://, a DNS name (labels of letters, digits and inner hyphens) or a
 # bracketed IPv6 address, an optional port of 1 to 5 digits, an optional final slash. Nothing else: no
 # user, path, query, fragment, whitespace or control character.
 _DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _ORIGIN = re.compile(rf"https://(?P<host>{_DNS_LABEL}(?:\.{_DNS_LABEL})*|\[(?P<ipv6>[0-9A-Fa-f:.]+)\])"
-                     r"(?::(?P<port>[0-9]{1,5}))?/?")
-_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+                     rf"(?::(?P<port>[0-9]{{1,{_MAX_PORT_DIGITS}}}))?/?")
+_TOKEN = re.compile(rf"[A-Za-z0-9_-]{{1,{_MAX_TOKEN}}}")
 
 
 class PairingRefused(Exception):
@@ -105,10 +115,10 @@ def pairing_link(origin: str, offer_id: str, code: str) -> str:
     The fragment is never sent in a request line, so neither the overlay's proxy nor a server log sees
     the code. The origin must be ``https://host[:port]`` with nothing else: a DNS name or a bracketed IPv6
     address, and a port from 1 to 65535 when one is given. The ``/pair`` path is provisional: the phone door
-    that answers it is a later slice.
+    that answers it is a later slice. The link is ASCII and at most ``MAX_LINK_BYTES``; ``qr.encode`` holds it.
     """
     match = _ORIGIN.fullmatch(origin) if isinstance(origin, str) else None
-    if match is None or len(match.group("host")) > 255:
+    if match is None or len(match.group("host")) > _MAX_HOST:
         raise PairingRefused("origin_invalid", "the pairing origin is https://host[:port] and nothing else")
     if match.group("ipv6") is not None:
         try:
@@ -122,7 +132,7 @@ def pairing_link(origin: str, offer_id: str, code: str) -> str:
         if not isinstance(value, str) or not _TOKEN.fullmatch(value):
             raise PairingRefused("offer_invalid", "offer ids and codes are URL-safe base64")
     authority = match.group("host") + (f":{port}" if port is not None else "")
-    return f"https://{authority}/pair#offer={offer_id}&code={code}"
+    return _LINK.format(authority=authority, offer_id=offer_id, code=code)
 
 
 @dataclass(frozen=True)

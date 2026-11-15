@@ -1,13 +1,20 @@
-"""A QR code encoder for the pairing link (lane REMOTE): byte mode, error correction level M, versions 1 to 10.
+"""A QR code encoder for the pairing link (lane REMOTE): byte mode, error correction level M, versions 1 to 16.
 
 No dependency (the brief: "shown as a QR (remote/qr.py, no new dependency)"). Written from the QR code
 standard (ISO/IEC 18004): Reed-Solomon over GF(256) with the polynomial x^8 + x^4 + x^3 + x^2 + 1, the
-level-M block table for versions 1 to 10, the function patterns, the zigzag placement, the eight masks
+level-M block table for versions 1 to 16, the function patterns, the zigzag placement, the eight masks
 with the four penalty rules, and the BCH-coded format and version information.
 
-The range is chosen for what it carries: a pairing link (``pairing.pairing_link``) is about 100 bytes, and
-version 10 at level M holds 213 bytes in byte mode. Longer input is refused (``QrTooLong``); nothing here
-falls back to a weaker error correction level. Level M restores about 15 per cent of damaged codewords.
+The range is chosen for what it carries. ``pairing.pairing_link`` returns ASCII links of at most
+``pairing.MAX_LINK_BYTES``, 415 bytes (a 255-character host, a 5-digit port and two 64-character tokens), and
+every one of them is encoded: version 16 at level M holds 450 bytes in byte mode, and version 15 (412) would
+not. ``tests/test_qr.py`` checks the two modules against each other. A link of today's offers is about 100
+bytes. Longer input is refused (``QrTooLong``); nothing here falls back to a weaker error
+correction level. Level M restores about 15 per cent of damaged codewords.
+
+Text is encoded as UTF-8 with no ECI segment, so a reader takes bytes outside ASCII as ISO-8859-1; the
+pairing link is ASCII. A wrong argument (data that is not bytes or text, a mask, version, border or matrix
+out of range) is a ``ValueError`` or ``TypeError`` at once, never a symbol of something else.
 
 ``encode(data)`` returns a ``QrCode``; ``render_text`` draws it with half-block characters for a terminal,
 ``render_svg`` as an SVG document for a page. Both are pure functions of the code.
@@ -17,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-MAX_VERSION = 10
+MAX_VERSION = 16
 QUIET_ZONE = 4
 # Error correction level bits of the format information (ISO/IEC 18004, table 12): L 01, M 00, Q 11, H 10.
 _ECL_BITS = {"L": 0b01, "M": 0b00, "Q": 0b11, "H": 0b10}
@@ -25,7 +32,7 @@ _FORMAT_GENERATOR = 0b10100110111
 _FORMAT_XOR = 0b101010000010010
 _VERSION_GENERATOR = 0b1111100100101
 
-# Level M, versions 1 to 10: (EC codewords per block, ((block count, data codewords per block), ...)).
+# Level M, versions 1 to 16: (EC codewords per block, ((block count, data codewords per block), ...)).
 _BLOCKS_M = {
     1: (10, ((1, 16),)),
     2: (16, ((1, 28),)),
@@ -37,16 +44,23 @@ _BLOCKS_M = {
     8: (22, ((2, 38), (2, 39))),
     9: (22, ((3, 36), (2, 37))),
     10: (26, ((4, 43), (1, 44))),
+    11: (30, ((1, 50), (4, 51))),
+    12: (22, ((6, 36), (2, 37))),
+    13: (22, ((8, 37), (1, 38))),
+    14: (24, ((4, 40), (5, 41))),
+    15: (24, ((5, 41), (5, 42))),
+    16: (28, ((7, 45), (3, 46))),
 }
 # Row and column of the alignment pattern centres, per version.
 _ALIGNMENT = {
     1: (), 2: (6, 18), 3: (6, 22), 4: (6, 26), 5: (6, 30), 6: (6, 34),
     7: (6, 22, 38), 8: (6, 24, 42), 9: (6, 26, 46), 10: (6, 28, 50),
+    11: (6, 30, 54), 12: (6, 32, 58), 13: (6, 34, 62), 14: (6, 26, 46, 66), 15: (6, 26, 48, 70), 16: (6, 26, 50, 74),
 }
 
 
 class QrTooLong(ValueError):
-    """The data does not fit version 10 at level M (213 bytes)."""
+    """The data does not fit version 16 at level M (450 bytes). No pairing link reaches it."""
 
 
 # -- GF(256) and Reed-Solomon ----------------------------------------------------------------------
@@ -69,6 +83,8 @@ def _gf_mul(a: int, b: int) -> int:
 
 def rs_generator(degree: int) -> list[int]:
     """The generator polynomial (x - a^0)(x - a^1)...(x - a^(degree-1)), highest power first."""
+    if type(degree) is not int or degree < 1:
+        raise ValueError("a degree is a positive integer")
     poly = [1]
     for i in range(degree):
         product = [0] * (len(poly) + 1)
@@ -84,6 +100,8 @@ def rs_remainder(data: list[int], degree: int) -> list[int]:
     generator = rs_generator(degree)
     remainder = [0] * degree
     for byte in data:
+        if type(byte) is not int or not 0 <= byte <= 255:
+            raise ValueError("a codeword is an integer from 0 to 255")
         factor = byte ^ remainder[0]
         remainder = remainder[1:] + [0]
         for j in range(degree):
@@ -102,7 +120,7 @@ def _bch(value: int, generator: int) -> int:
 
 def format_bits(ecl: str, mask: int) -> int:
     """The 15 format bits for a level and a mask: 5 data bits, 10 BCH bits, masked with 101010000010010."""
-    if ecl not in _ECL_BITS or mask not in range(8):
+    if ecl not in _ECL_BITS or type(mask) is not int or mask not in range(8):
         raise ValueError("a level is L, M, Q or H and a mask is 0 to 7")
     data = _ECL_BITS[ecl] << 3 | mask
     return (data << 10 | _bch(data << 10, _FORMAT_GENERATOR)) ^ _FORMAT_XOR
@@ -129,13 +147,21 @@ class QrCode:
         return len(self.modules)
 
 
+def _check_version(version: object) -> int:
+    if type(version) is not int or version not in _BLOCKS_M:
+        raise ValueError(f"a version is an integer from 1 to {MAX_VERSION}")
+    return version
+
+
 def data_capacity(version: int) -> int:
-    """Data codewords of a version at level M."""
+    """Data codewords of a version at level M (versions 1 to ``MAX_VERSION``; others are a ``ValueError``)."""
+    _check_version(version)
     return sum(count * size for count, size in _BLOCKS_M[version][1])
 
 
 def byte_capacity(version: int) -> int:
-    """How many bytes a version holds at level M in byte mode."""
+    """How many bytes a version holds at level M in byte mode (versions 1 to ``MAX_VERSION``)."""
+    _check_version(version)
     count_bits = 8 if version <= 9 else 16
     return (data_capacity(version) * 8 - 4 - count_bits) // 8
 
@@ -279,8 +305,14 @@ _FINDER_LIKE = ((True, False, True, True, True, False, True, False, False, False
 
 
 def penalty(modules: list[list[bool]] | tuple[tuple[bool, ...], ...]) -> int:
-    """The four penalty rules: runs of five or more, 2x2 blocks, finder-like patterns, dark balance."""
-    size = len(modules)
+    """The four penalty rules: runs of five or more, 2x2 blocks, finder-like patterns, dark balance.
+
+    ``modules`` is a square matrix of booleans, at least 2 by 2; anything else is a ``ValueError``.
+    """
+    size = len(modules) if isinstance(modules, (list, tuple)) else 0
+    if size < 2 or any(not isinstance(row, (list, tuple)) or len(row) != size
+                       or any(type(v) is not bool for v in row) for row in modules):
+        raise ValueError("penalty() takes a square matrix of booleans, at least 2 by 2")
     lines = [list(row) for row in modules] + [[modules[r][c] for r in range(size)] for c in range(size)]
     score = 0
     for line in lines:
@@ -305,12 +337,18 @@ def penalty(modules: list[list[bool]] | tuple[tuple[bool, ...], ...]) -> int:
 
 
 def encode(data: bytes | str, *, mask: int | None = None) -> QrCode:
-    """Encode ``data`` (UTF-8 for text) in the smallest version that holds it.
+    """Encode ``data`` (bytes, or text as UTF-8) in the smallest version that holds it.
 
     The mask is the one of the eight with the lowest penalty (the first of equals), unless ``mask`` names one.
+    Anything but bytes, a bytearray, a memoryview or text is a ``TypeError`` (``bytes(5)`` would be five NULs).
     """
-    raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
-    if mask is not None and mask not in range(8):
+    if isinstance(data, str):
+        raw = data.encode("utf-8")
+    elif isinstance(data, (bytes, bytearray, memoryview)):
+        raw = bytes(data)
+    else:
+        raise TypeError("encode() takes bytes or text")
+    if mask is not None and (type(mask) is not int or mask not in range(8)):
         raise ValueError("a mask is 0 to 7")
     version = _choose_version(len(raw))
     codewords = _interleave(_data_codewords(raw, version), version)
@@ -336,11 +374,21 @@ _UPPER, _LOWER, _FULL = "\u2580", "\u2584", "\u2588"
 def render_text(code: QrCode, *, border: int = QUIET_ZONE, terminal_background: str = "dark") -> str:
     """The code in half-block characters, two module rows per line, with a quiet zone of ``border`` modules.
 
-    A glyph is drawn in the terminal's text colour. On a dark background (the default) the light modules
-    are drawn and the dark ones left as background, so that the code reads dark on light, as scanners expect.
+    A drawn glyph shows the terminal's text colour; a blank shows its background colour. A camera reads a
+    symbol of dark modules on light inside a light quiet zone, and that is what each setting gives on the
+    background it names:
+
+    * ``"dark"`` (the default; light text on a dark background): the light modules and the quiet zone are
+      drawn, the dark modules left blank.
+    * ``"light"`` (dark text on a light background): the dark modules are drawn, the rest left blank.
+
+    Shown on the other background, a drawing is an inverted symbol, which not every reader accepts, so the
+    caller names the terminal's background. ``border`` is an integer of 0 or more.
     """
     if terminal_background not in ("dark", "light"):
         raise ValueError("terminal_background is 'dark' or 'light'")
+    if type(border) is not int or border < 0:
+        raise ValueError("border is an integer of 0 or more")
     size = code.size + 2 * border
 
     def drawn(row: int, col: int) -> bool:
@@ -360,8 +408,8 @@ def render_text(code: QrCode, *, border: int = QUIET_ZONE, terminal_background: 
 
 def render_svg(code: QrCode, *, border: int = QUIET_ZONE, module_px: int = 8) -> str:
     """The code as a small SVG document: a white square and one black square per dark module."""
-    if border < 0 or module_px < 1:
-        raise ValueError("border is 0 or more and module_px 1 or more")
+    if type(border) is not int or border < 0 or type(module_px) is not int or module_px < 1:
+        raise ValueError("border is an integer of 0 or more and module_px an integer of 1 or more")
     side = (code.size + 2 * border) * module_px
     squares = "".join(
         f'<rect x="{(col + border) * module_px}" y="{(row + border) * module_px}" '

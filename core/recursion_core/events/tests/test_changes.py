@@ -1,8 +1,10 @@
 """The change reader (events/changes.py) against the daemon's real Registry and SPINE's real ChangeMarker.
 
 The reader is driven one ``step()`` at a time with a clock the test moves, so nothing here waits on time
-except to check that something has NOT happened yet. The store is the helper's fake (its own code, durability
-off); what the helper itself guarantees under a crash is in test_db.py and test_durability.py.
+except to check that something has NOT happened yet. Every case runs twice: on the helper's fake (its own code,
+durability off) and on the real event store in the test's folder (``RealStore``: WAL, synchronous FULL, its
+lock file), the paused-consumer cases among them. What the helper itself guarantees under a crash is in
+test_db.py and test_durability.py; the reader's own crash points, by kill -9, are in test_reader_crash.py.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -339,6 +342,11 @@ class ChangeReaderTest(unittest.TestCase):
         try:
             self.registry.add(RUN, 'boot-1')
             self.assertTrue(seen.wait(BOUND_S), 'the service thread logged the change')
+            # The first pass may have found the run on its first page; it completes at the empty page after it.
+            deadline = time.monotonic() + BOUND_S
+            while not service.ready and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(service.ready, 'the first pass of this start completed')
         finally:
             service.stop(context)
         self.assertIsNone(service._thread, 'stop returned after the thread joined')
@@ -356,6 +364,36 @@ class ChangeReaderTest(unittest.TestCase):
         self.assertEqual(os.path.basename(store.path), 'events.sqlite3')
         with store.transaction() as tx:
             self.assertEqual(tx.execute('SELECT count(*) FROM events_run_images'), [(0,)])
+
+
+class RealStore(D.EventStore):
+    """The real helper (WAL, ``synchronous=FULL``, its lock file), with the fake's read-only views for the
+    assertions above and its ``fail_commit`` seam: the same code as the fake's, over this durable file."""
+
+    fail_commit = False
+    _before_commit = D.FakeStore._before_commit
+    _reader = D.FakeStore._reader
+    _read = D.FakeStore._read
+    events = D.FakeStore.events
+    open_transactions = D.FakeStore.open_transactions
+
+
+@unittest.skipUnless(POSIX, 'the daemon registry is Linux only')
+class ChangeReaderOnTheRealStoreTest(ChangeReaderTest):
+    """Every case above, against the real event store."""
+
+    def new_store(self) -> RealStore:
+        store = RealStore(self.folder / 'events.sqlite3')
+        store.register_tables(C.LANE, C.LANE_VERSION, C.LANE_DDL)
+        self.addCleanup(lambda: store.open_transactions or store.close())
+        return store
+
+    def test_the_store_here_is_the_durable_one(self) -> None:
+        self.assertIs(type(self.store), RealStore)
+        self.assertEqual(self.store._conn.execute('PRAGMA synchronous').fetchone(), (2,), 'FULL on its own connection')
+        with self.store._reader() as conn:
+            self.assertEqual(conn.execute('PRAGMA journal_mode').fetchone(), ('wal',))
+        self.assertTrue(os.path.exists(self.store.path + '.lock'), 'it holds the one-writer lock file')
 
 
 if __name__ == '__main__':

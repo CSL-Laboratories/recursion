@@ -119,7 +119,7 @@ class ChangeReader:
         self._scan_wanted = True          # a start scans
         self._scan_cursor = None
         self._scanning = False
-        self._next_scan_at = 0.0
+        self._next_scan_at = float('inf')   # the clock schedules a scan only once a pass has completed
         self._first_pass_ever = None      # read from the store at the first scan of this start
         self._ready = False
         self._registry = self._store = None

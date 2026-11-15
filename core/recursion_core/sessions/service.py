@@ -58,8 +58,10 @@ refused ``unsupported`` (questions.md Q6, Lucas's).
 
 AN INTERRUPT (``interrupt``) acts on a turn, not a run. Where the driver declares ``interrupt`` and the turn is
 running in a live worker, the driver's own cancel is committed as work and the turn ends ``interrupted`` only when
-the driver reports it (``turn_interrupted``); the worker lives on. Otherwise (no such flag, or the turn has not
-started) a Stop of the unit is asked instead (the method table's fallback ``stop_then_resume``): the session is
+the driver reports it (``turn_interrupted``); the worker lives on. The cancel is sent only if, at its claim, the
+turn is still the one in progress of a live session: not once it ended (another turn may be in progress in the
+same worker by then) and not under a pending Stop. Otherwise (no such flag, or the turn has not started) a Stop
+of the unit is asked instead (the method table's fallback ``stop_then_resume``): the session is
 ``stop_pending`` and refuses new turns until the Stop is confirmed, and the next turn then runs in a new unit that
 resumes the engine's session where the driver can. A driver that refuses the cancel, or whose cancel has an outcome
 nobody can vouch for, while the turn is still in progress, gets the same Stop: an interrupt is never left hanging.
@@ -285,6 +287,13 @@ class Sessions:
                     return 0
                 if store.load(tx, operation['session_id'])['state'] == 'stop_pending':
                     store.move_work(tx, operation_id, 'pending', 'failed', {'code': 'stop_requested'})
+                    return 0
+            if operation['kind'] == 'interrupt':
+                # A cancel is sent only while its turn is the one in progress of a live session: once the turn
+                # ended, or a Stop of its unit is pending, there is nothing left for the cancel to do.
+                session = store.load(tx, operation['session_id'])
+                if session['state'] != 'live' or session['active_turn_id'] != operation['payload']['turn_id']:
+                    store.move_work(tx, operation_id, 'pending', 'failed', {'code': 'turn_not_in_progress'})
                     return 0
             if not store.move_work(tx, operation_id, 'pending', 'attempting'):
                 return 0

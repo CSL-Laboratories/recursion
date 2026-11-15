@@ -138,9 +138,13 @@ class InterruptTest(unittest.TestCase):
     def test_a_refused_cancel_for_a_turn_that_already_ended_asks_nothing_more(self):
         live = self.running('codex')
         self.lane.sessions.interrupt(live['session_id'], live['active_turn_id'], OWNER)
-        self.lane.sessions.turn_finished(live['session_id'], live['active_turn_id'], outcome='done', result=DONE,
-                                         worker_alive=True)
-        self.lane.units.then = [UnitRefused('turn_not_in_progress')]
+
+        def interrupt(order):        # the turn ends while the cancel is on its way, and the driver refuses it
+            self.lane.sessions.turn_finished(live['session_id'], live['active_turn_id'], outcome='done', result=DONE,
+                                             worker_alive=True)
+            raise UnitRefused('turn_not_in_progress')
+
+        self.lane.units.interrupt = interrupt
         self.lane.sessions.run_pending()
         self.assertEqual(work_states(self.lane)[1:], [('interrupt', 'failed')])
         self.assertEqual(session_of(self.lane, live['session_id'])['state'], 'idle')
@@ -151,6 +155,33 @@ class InterruptTest(unittest.TestCase):
         outcome, _ = self.lane.sessions.interrupt(live['session_id'], live['active_turn_id'], OWNER)
         self.assertEqual(outcome, 'stop_pending')
         self.assertEqual(work_states(self.lane)[1:], [('stop', 'pending')])
+
+    def test_an_interrupt_whose_turn_ended_or_is_being_stopped_before_its_claim_is_never_sent(self):
+        """As a launch or a send is never attempted under a pending Stop (the fence), a cancel is sent only while
+        its turn is still the one in progress of a live session; otherwise it fails at its claim, unsent."""
+        for end in ('finished', 'replaced', 'stop'):
+            with self.subTest(end=end):
+                self.lane = Lane()
+                live = self.running('codex')
+                self.lane.sessions.interrupt(live['session_id'], live['active_turn_id'], OWNER)
+                if end in ('finished', 'replaced'):
+                    idle = self.lane.sessions.turn_finished(live['session_id'], live['active_turn_id'],
+                                                            outcome='done', result=DONE, worker_alive=True)
+                    if end == 'replaced':          # the next turn is in progress in the same worker
+                        answer = self.lane.call('session.turn', {
+                            'command_id': 'cmd-turn-0001', 'session_id': live['session_id'], 'text': 'next',
+                            'expected_revision': idle['revision']})
+                        self.assertEqual(answer['code'], 'ok', answer)
+                        self.assertEqual(session_of(self.lane, live['session_id'])['state'], 'live')
+                else:
+                    self.lane.units.stop_answers = [stop_answer(live['worker']['run_id'], 'pending')]
+                    self.lane.sessions.request_stop(live['session_id'])
+                self.lane.sessions.run_pending()
+                self.assertEqual(self.lane.units.interrupts, [], 'never sent')
+                with self.lane.store.transaction() as tx:
+                    found = [(operation['state'], operation['outcome']) for operation in store.work(tx)
+                             if operation['kind'] == 'interrupt']
+                self.assertEqual(found, [('failed', {'code': 'turn_not_in_progress'})])
 
     def test_a_restart_with_an_interrupt_pending_never_sends_it_and_stops_the_unit(self):
         live = self.running('codex')

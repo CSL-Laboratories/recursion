@@ -106,7 +106,8 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
     what was launched unless the daemon is closing, and releases; an owner that wants another end does
     not raise. While the daemon or its composition is closing nothing is settled: the run's
     descriptors are closed, nothing is fenced, and the unit is left alive for the next daemon. That
-    holds for a settling that is already under way when closing begins, too.
+    holds for a settling that is already under way when closing begins, too. (A fence that is being
+    made at the moment a close is asked for is finished first: the close begins after it.)
     That fallback is for an ordinary exception out of ``owner.run`` itself. A failure after
     the hand-over, in the owner's own worker, is the driver's own try/finally, and the fallback is no
     promise to record a final result or to call ``fault_run``.
@@ -196,6 +197,10 @@ REGISTRANTS = (
 
 SINGLE = ('authorize', 'working_directory', 'credentials', 'read_result', 'drive_owner', 'launch_check',
           'page_methods', 'event_store')
+# The single hooks that are asked on a run's own thread (S4, S7, S9, S10). The start that made the thread may have
+# answered already, so each is asked under a lifetime reference of its own (S13), and any one of them, registered,
+# turns the gate on: without the gate that reference counts nothing.
+ON_A_RUNS_THREAD = ('working_directory', 'credentials', 'drive_owner', 'launch_check')
 # The launch snapshot: the keys of the stored ``launch`` object, and the ones a start registrant may set.
 # ``owner`` is not among them: the server derives it from the principal.
 LAUNCH_KEYS = ('route_entry', 'route_decision', 'workspace', 'containment_level', 'session_id', 'turn_id',
@@ -448,7 +453,8 @@ class ServiceContext:
 # OWNERSHIP. Four methods below take a lock for a piece of work that has to be finished and must not leave the lock
 # held, whatever interrupts them: Admission.close and Admission.drain, Hooks.stop_services and Hooks.finish_close.
 # (The composition's own close, in the daemon, has the same form; so have the gate's enter and leave, whose work is
-# the count of admitted calls.) Each is ONE protected region, written out in each:
+# the count of admitted calls, and its while_open, whose work is a caller's.) Each is ONE protected region, written
+# out in each:
 #
 #     done = False
 #     while True:
@@ -544,6 +550,7 @@ class Admission:
     reference until ``leave()``: through its handler, its transaction and ALL its after-commit
     callbacks. A ``ctx.call`` made inside a handler belongs to that admitted call and takes no new
     admission. ``close()`` stops new admissions; ``drain()`` waits until every admitted call has left.
+    ``while_open(act)`` does one thing with the gate held open, or nothing once it is closed.
 
     ``drain`` has no timeout, on purpose. The daemon's main closes its registry after the composition
     closes, even when closing raises, so closing must not return while a handler, a callback or a
@@ -552,15 +559,18 @@ class Admission:
     interruption of the wait: it is kept, the wait goes on, and it is raised once every call has left.
 
     The gate does nothing until it is ``enabled``, which composition does when a lane has registered a
-    handler, a service, an event store or a drive owner. With nothing registered a call is never refused
-    and closing waits for nothing, as today.
+    handler, a service, an event store, or one of the four hooks that are asked on a run's own thread
+    (``ON_A_RUNS_THREAD``): a drive owner, a launch check, a working directory or a credential source. With
+    none of these registered a call is never refused and closing waits for nothing, as today.
 
-    A drive owner turns it on by itself, with no service beside it: the run it accepts is handed over
-    under a lifetime reference (S9), and what S9 says of closing holds for every registered owner. Closing
-    waits for the hand-over, a run is refused once closing has begun, and a settling that is under way
-    fences nothing. Without the gate the reference would count nothing and none of the three would hold.
-    A launch hook or a credential source (S4, S7, S10) registered with none of the four above leaves the
-    gate off: its reference then counts nothing, and a launch during a close is what it is today.
+    Each of those four turns it on by itself, with no service beside it: it is asked under a lifetime
+    reference (S13), and what S13 and S9 say of closing holds for every one that is registered. Closing
+    waits for the hook and for a hand-over, a run or a launch is refused once closing has begun, a credential
+    source is not asked after it, and a settling fences nothing once the gate is shut (its fence is made
+    with the gate held open, ``while_open``: a close that is asked for while a fence is being made waits
+    for it). Without the gate the reference would count nothing and none of that would hold. The other three
+    single hooks (``authorize``, ``read_result``, ``page_methods``) are asked inside a client's call and
+    bring nothing that closing has to wait for: registered with nothing else they leave the gate off.
     """
 
     def __init__(self) -> None:
@@ -664,6 +674,67 @@ class Admission:
             except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
                 kept.append(exc)
         raise_kept(kept)
+
+    def while_open(self, act) -> bool:
+        """Do ``act()`` with the gate held OPEN and return True; or, once the gate is closed, do nothing and
+        return False.
+
+        It is for the one thing that must not be done once closing has begun and that is decided on a thread
+        closing may not be waiting for: the fence at the end of a settling (S9). To ask whether closing has
+        begun and then to act is two steps, and a close can begin between them. Here they are ONE step for
+        ``close``, which takes the same condition: a close that begins meanwhile waits until ``act`` has
+        returned, and one that began before is seen.
+
+        ``act`` runs on the calling thread, which holds the gate's condition for as long. Every call waits at
+        the gate meanwhile, on its way in and on its way out, so ``act`` is brief, waits for nothing that
+        passes the gate, and does not call the gate itself (another method of the gate, called from inside
+        ``act``, would take this hold of the condition for its own and give it up).
+
+        A failure of ``act`` (an ``Exception``) is raised here once the condition is free again, and ``act`` is
+        not asked again. An interruption that lands while ``act`` is being asked is kept like any other in a
+        region, and ``act`` is asked ONCE more: it may not have begun, and nothing here can tell. Whatever ends
+        that second asking is kept too; there is no third. So ``act`` is something that may be done twice, as a
+        fence may. With the gate off (nothing registered) ``act`` is simply called.
+
+        One protected region (OWNERSHIP)."""
+        if not self.enabled:
+            act()
+            return True
+        kept: list = []
+        answer = None           # None until it is decided: False, the gate was closed; True, act was asked
+        asked = 0
+        while True:
+            try:
+                if answer is None:
+                    if not self._lock._is_owned():
+                        take_once(self._lock, kept)
+                    if self._closed:
+                        answer = False
+                    else:
+                        asked += 1
+                        self._asked(act, kept, asked > 1)
+                        answer = True
+                if self._lock._is_owned():
+                    self._lock.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                kept.append(exc)
+        raise_kept(kept)
+        return answer
+
+    def _asked(self, act, kept: list, last: bool) -> None:
+        """``act()`` for ``while_open``, whose caller holds the condition. A method of its own because a
+        protected region has no try written in it (OWNERSHIP). A failure of ``act`` is kept and this returns:
+        the region releases the condition and raises it. An interruption goes out to the region, which asks
+        again; on that ``last`` asking it is kept here like a failure, so that nothing is asked for ever."""
+        try:
+            act()
+        except Exception as exc:  # noqa: BLE001 - kept; raised by the region once the condition is free
+            kept.append(exc)
+        except BaseException as exc:  # noqa: BLE001 - an interruption: out to the region, unless this was the last asking
+            if not last:
+                raise
+            kept.append(exc)
 
     @property
     def closed(self) -> bool:
@@ -829,10 +900,11 @@ class Hooks:
         if self._engines is not None:
             self._engines.freeze()
         self.methods.service_ready = self.service_ready
-        # The gate guards what a lane brought: a handler, a service, a store, or a drive owner, whose hand-over
-        # closing waits for whether or not its lane registered a service. With none of them it stays off.
+        # The gate guards what a lane brought: a handler, a service, a store, or a hook that is asked on a run's
+        # own thread, which closing waits for whether or not its lane registered a service. With none of them it
+        # stays off.
         self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single
-                                 or 'drive_owner' in self._single)
+                                 or any(name in self._single for name in ON_A_RUNS_THREAD))
 
     # -- S5 ---------------------------------------------------------------------------------------
     def authorize(self, principal: Principal, method, params) -> dict | None:

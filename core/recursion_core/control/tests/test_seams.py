@@ -1762,26 +1762,109 @@ class AdmissionTest(unittest.TestCase):
         made.freeze()
         self.assertFalse(made.gate.enabled, 'a hook that holds no resource does not need the gate')
 
-    def test_a_drive_owner_turns_the_gate_on_by_itself_and_the_other_single_hooks_do_not(self) -> None:
-        """A drive owner with no service beside it: the run it accepts is handed over under a lifetime reference,
-        which counts only where the gate is on. The other single hooks registered alone leave it off; that is
-        the gate's text, held here so that a change of it is a decision and not an accident."""
-        made = H.Hooks()
-        made.set('drive_owner', lambda ctx, request: None)
-        made.freeze()
-        self.assertTrue(made.gate.enabled)
-        self.assertTrue(made.gate.enter())
-        made.gate.leave()
-        made.begin_close()
-        self.assertFalse(made.gate.enter(), 'once closing has begun nothing is admitted, with the owner alone')
-        others = [name for name in H.SINGLE if name not in ('drive_owner', 'event_store')]
-        self.assertEqual(len(others), 6, 'every single hook is on one side or the other of this test')
+    def test_a_hook_asked_on_a_runs_own_thread_turns_the_gate_on_by_itself_and_the_other_single_hooks_do_not(self) -> None:
+        """A drive owner, a launch check, a working directory or a credential source with nothing beside it: it
+        is asked on a run's own thread under a lifetime reference, which counts only where the gate is on. The
+        three single hooks that are asked inside a client's call leave the gate off when they are registered
+        alone. That is the gate's text, held here so that a change of it is a decision and not an accident."""
+        self.assertEqual(sorted(H.ON_A_RUNS_THREAD), ['credentials', 'drive_owner', 'launch_check', 'working_directory'])
+        for name in H.ON_A_RUNS_THREAD:
+            with self.subTest(hook=name):
+                made = H.Hooks()
+                made.set(name, lambda *args: None)
+                made.freeze()
+                self.assertTrue(made.gate.enabled)
+                self.assertTrue(made.gate.enter())
+                made.gate.leave()
+                made.begin_close()
+                self.assertFalse(made.gate.enter(), 'once closing has begun nothing is admitted, with that hook alone')
+        others = [name for name in H.SINGLE if name not in H.ON_A_RUNS_THREAD and name != 'event_store']
+        self.assertEqual(others, ['authorize', 'read_result', 'page_methods'], 'every single hook is on one side or the other of this test')
         for name in others:
             with self.subTest(hook=name):
                 made = H.Hooks()
                 made.set(name, lambda *args: None)
                 made.freeze()
                 self.assertFalse(made.gate.enabled)
+
+    def test_while_open_does_its_work_with_the_gate_held_open_and_a_close_that_begins_then_waits_for_it(self) -> None:
+        """To ask whether the gate is closed and then to act is two steps, and a close can begin between them.
+        ``while_open`` makes them one step for ``close``: the work is inside when a close begins, the close finds
+        the gate's condition taken and WAITS, and the gate is open from the work's first moment to its last.
+        Nothing is traced: the condition itself says whether the closing thread found it free, which no schedule
+        decides once the work is inside. Once the gate is closed the work is not done at all."""
+        gate, inside, leave, moved = H.Admission(), threading.Event(), threading.Event(), threading.Event()
+        gate.enabled = True
+        seen, found_taken, answers = [], [], []
+        self.addCleanup(leave.set)
+        condition = gate._lock
+
+        class Asked:
+            """The gate's condition's lock, writing down whether the closing thread found it taken."""
+
+            def acquire(inner, *how):
+                if threading.current_thread().name == 'the close' and not how:
+                    free = condition.acquire(False)
+                    found_taken.append(not free)
+                    moved.set()
+                    if free:
+                        return True
+                return condition.acquire(*how)
+
+            def release(inner) -> None:
+                condition.release()
+
+            def _is_owned(inner) -> bool:
+                return condition._is_owned()
+        gate._lock = Asked()
+
+        def work() -> None:
+            seen.append(gate.closed)
+            inside.set()
+            leave.wait(BOUND_S)
+            seen.append(gate.closed)
+        working = threading.Thread(target=lambda: answers.append(gate.while_open(work)), daemon=True)
+        close = threading.Thread(target=gate.close, name='the close', daemon=True)
+        working.start()
+        self.assertTrue(inside.wait(BOUND_S), 'the work is inside')
+        close.start()
+        self.assertTrue(moved.wait(BOUND_S), 'the close asked for the gate')
+        self.assertEqual((found_taken, gate.closed), ([True], False), 'the close WAITS, with the gate still open')
+        leave.set()
+        working.join(BOUND_S)
+        close.join(BOUND_S)
+        self.assertEqual((answers, seen, gate.closed), ([True], [False, False], True))
+        self.assertEqual((gate.while_open(lambda: seen.append('late')), seen), (False, [False, False]), 'closed: nothing is done')
+
+    def test_while_open_with_the_gate_off_simply_does_its_work(self) -> None:
+        """With nothing registered the gate is off, and what asks it is what it was before the seams: a close
+        of the composition, which shuts that gate all the same, does not keep the work from being done."""
+        gate, done = H.Admission(), []
+        gate.close()
+        self.assertEqual((gate.enabled, gate.closed, gate.while_open(lambda: done.append(1)), done), (False, True, True, [1]))
+
+    def test_what_ends_the_work_of_while_open_is_raised_with_the_gate_free_again(self) -> None:
+        """A failure of the work is raised and the work is not asked again. An interruption may have landed
+        before the work began, which nothing can tell from outside it: the work is asked once more, and what ends
+        that second asking is final, so a piece of work that is interrupted every time is not asked for ever."""
+        for ending, times in ((ValueError('the work failed'), 1), (KeyboardInterrupt('the work was interrupted'), 2)):
+            with self.subTest(ending=type(ending).__name__):
+                gate, asked = H.Admission(), []
+                gate.enabled = True
+
+                def work(gate=gate, asked=asked, ending=ending) -> None:
+                    asked.append(gate._lock._is_owned())
+                    if len(asked) < 6:      # so that a gate which asked for ever would fail here, and not hang
+                        raise ending
+                with self.assertRaises(type(ending)) as caught:
+                    gate.while_open(work)
+                self.assertIs(caught.exception, ending)
+                self.assertEqual((asked, gate._lock._is_owned(), gate.closed), ([True] * times, False, False),
+                                 'asked holding the condition; the condition is free again and the gate is open')
+                self.assertTrue(gate.enter(), 'the gate goes on admitting')
+                gate.leave()
+                gate.close()
+                self.assertTrue(gate.closed)
 
     def test_no_call_is_admitted_after_closing_began(self) -> None:
         gate = H.Admission()
@@ -3571,6 +3654,8 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         'Admission.leave': (lambda self: self.leaving(), lambda gate: gate.leave(), lambda gate: gate._lock,
                             lambda gate: gate.admitted == 0),
         'Admission.close': (lambda self: self.gate(), lambda gate: gate.close(), lambda gate: gate._lock, lambda gate: gate.closed),
+        'Admission.while_open': (lambda self: (self.gate(), []), lambda pair: pair[0].while_open(lambda: pair[1].append('done')),
+                                 lambda pair: pair[0]._lock, lambda pair: len(pair[1]) >= 1),
         'Admission.drain': (lambda self: self.draining(), lambda gate: gate.drain(), lambda gate: gate._lock,
                             lambda gate: gate.admitted == 0),
         'Hooks.stop_services': (lambda self: self.lifecycle(), lambda pair: pair[0].stop_services(H.ServiceContext()),
@@ -3589,6 +3674,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         'Admission.enter': lambda gate: (gate.closed, gate.admitted),
         'Admission.leave': lambda gate: (gate.closed, gate.admitted),
         'Admission.close': lambda gate: (gate.closed, gate.admitted),
+        'Admission.while_open': lambda pair: (pair[0].closed, pair[0].admitted, len(pair[1])),
         'Admission.drain': lambda gate: (gate.closed, gate.admitted),
         'Hooks.stop_services': _teardown_touches,
         'Hooks.finish_close': _teardown_touches,
@@ -3599,7 +3685,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
 
     def test_the_regions_have_no_loop_no_try_and_no_with_written_in_them(self) -> None:
         for owner, name in (('Admission', 'enter'), ('Admission', 'leave'), ('Admission', 'close'), ('Admission', 'drain'),
-                            ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
+                            ('Admission', 'while_open'), ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
             with self.subTest(region=f'{owner}.{name}'):
                 self.straight(H, owner, name)
 
@@ -3637,6 +3723,13 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         self.walk('Admission.drain', self.EVENTS)
 
     @quiet
+    def test_work_done_while_the_gate_is_held_open_at_every_event(self) -> None:
+        """The work is the caller's, here one line of the test's own, which is not walked: every point of the
+        region around it is. An interruption that lands as the work has just returned has it done a second time,
+        which is why the work is something that may be done twice; "done" is read as at least once."""
+        self.walk('Admission.while_open', self.EVENTS)
+
+    @quiet
     def test_stopping_the_services_at_every_event(self) -> None:
         self.walk('Hooks.stop_services', self.EVENTS)
 
@@ -3663,6 +3756,10 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     @quiet
     def test_the_gates_drain_at_every_instruction(self) -> None:
         self.by_instruction('Admission.drain')
+
+    @quiet
+    def test_work_done_while_the_gate_is_held_open_at_every_instruction(self) -> None:
+        self.by_instruction('Admission.while_open')
 
     @quiet
     def test_stopping_the_services_at_every_instruction(self) -> None:

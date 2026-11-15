@@ -652,6 +652,42 @@ class EngineSeamTest(Composed):
             lookup('work', 'ANTHROPIC_API_KEY')
         self.assertEqual((caught.exception.code, caught.exception.detail, len(seen)), (c.LAUNCH_REFUSED, 'daemon_closing', 1))
 
+    def test_a_credential_source_registered_alone_is_waited_for_and_is_not_asked_once_closing_has_begun(self):
+        """The fifth reads. The same with ``credentials`` as the only hook a lane registered: no store, no
+        service, no handler. The gate is on all the same (``ON_A_RUNS_THREAD``): the composition's close waits
+        for the source while it is inside, and after it the lookup refuses the launch before the source is
+        asked. (With the gate off the close went past the source, and the source was asked again afterwards.)"""
+        built, ended = [], mock.Mock(closed=False)  # no store here: this says the close has ended, as a store's flag does
+        source, entered, leave, seen = held_hook(ended, 'the-secret')
+        self.addCleanup(leave.set)
+
+        def factory(launch, clock, credentials, environ, **options):
+            built.append(credentials)
+            return ClaudeCodeAdapter(launch, clock, credentials, environ, **options)
+
+        def register(made):
+            made.engines.register('claude_code', factory, replace=True)    # only so that the test gets the lookup
+            made.set('credentials', source)
+        made = hooks_of(register)
+        self.assertEqual((sorted(made._single), made.gate.enabled), (['credentials'], True), 'the source alone: the gate is on')
+        daemon, composed = self.boot(made)
+        lookup, = built
+        got = []
+        user = threading.Thread(target=lambda: got.append(lookup('work', 'ANTHROPIC_API_KEY')), daemon=True)
+        user.start()
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+
+        def close():
+            composed.close()
+            ended.closed = True
+        close_waits(self, composed.hooks, ended, close, entered, leave)
+        user.join(HELD_BOUND_S)
+        self.assertEqual((got, seen), (['the-secret'], [False]), 'the close had not ended while the source was inside')
+        with self.assertRaises(c.RouteError) as caught:
+            lookup('work', 'ANTHROPIC_API_KEY')
+        self.assertEqual((caught.exception.code, caught.exception.detail, len(seen)), (c.LAUNCH_REFUSED, 'daemon_closing', 1))
+
     def test_a_registered_factory_that_fails_leaves_no_plugin_host_and_no_breaker_store_open(self):
         closed = []
 
@@ -1535,6 +1571,70 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 starter._settle(ctx)
             self.assertEqual((ctx.process.fence.call_args_list, ctx.process.close.call_count), (fenced, 1))
 
+    def test_a_settling_makes_its_fence_with_the_gate_held_open_and_a_close_that_begins_then_waits_for_it(self):
+        """The fifth reads. A settling asked whether closing had begun and then fenced: two steps, and a close
+        could begin between them, so that a unit was fenced with the gate shut. The fence is now made with the
+        gate held open (``Admission.while_open``). Here a settling is making its fence when a close begins: the
+        close finds the gate's condition taken and WAITS, and the gate is open from the first moment of the
+        fence to its last. Nothing is traced; the gate's condition says whether the closing thread found it
+        free, which no schedule decides once the fence is inside."""
+        process, inside, leave, moved = mock.Mock(), threading.Event(), threading.Event(), threading.Event()
+        seen, found_taken = [], []
+        self.addCleanup(leave.set)
+        made = hooks_of(launch_check=lambda ctx, executable: None)   # one hook that is asked on a run's thread
+        self.assertTrue(made.gate.enabled)
+        condition = made.gate._lock
+
+        class Asked:
+            """The gate's condition's lock, writing down whether the closing thread found it taken."""
+
+            def acquire(inner, *how):
+                if threading.current_thread().name == 'the close' and not how:
+                    free = condition.acquire(False)
+                    found_taken.append(not free)
+                    moved.set()
+                    if free:
+                        return True
+                return condition.acquire(*how)
+
+            def release(inner):
+                condition.release()
+
+            def _is_owned(inner):
+                return condition._is_owned()
+        made.gate._lock = Asked()
+
+        def fence(reason):
+            seen.append((reason, made.gate.closed))
+            inside.set()
+            leave.wait(HELD_BOUND_S)
+            seen.append((reason, made.gate.closed))
+        process.fence.side_effect = fence
+        folder = tempfile.mkdtemp(prefix='rc-seams-settle-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False), folder,
+                                       hooks=made, exit_grace_s=0)
+        ctx = launcher.RunContext('run-1')
+        ctx.process = process
+        settling = threading.Thread(target=starter._settle, args=(ctx,), daemon=True)
+        close = threading.Thread(target=made.begin_close, name='the close', daemon=True)
+        settling.start()
+        self.assertTrue(inside.wait(HELD_BOUND_S), 'the fence is being made')
+        close.start()
+        self.assertTrue(moved.wait(HELD_BOUND_S), 'the close asked for the gate')
+        self.assertEqual((found_taken, made.gate.closed), ([True], False), 'the close WAITS, with the gate still open')
+        leave.set()
+        settling.join(HELD_BOUND_S)
+        close.join(HELD_BOUND_S)
+        self.assertEqual(seen, [('result_recorded', False), ('result_recorded', False)],
+                         'the gate was open from the first moment of the fence to its last')
+        self.assertEqual((made.gate.closed, made.closing.is_set(), process.close.call_count), (True, True, 1))
+        # And a settling that comes to its fence once the close has begun fences nothing, and closes its descriptors.
+        late = launcher.RunContext('run-2')
+        late.process = mock.Mock()
+        starter._settle(late)
+        self.assertEqual((late.process.fence.call_count, late.process.close.call_count), (0, 1))
+
     @quiet
     def test_an_owner_registered_alone_is_waited_for_and_its_settling_fences_nothing_once_closing_began(self):
         """The fourth reads. A lane can register ``drive_owner`` and nothing else: no service, no handler, no
@@ -1635,6 +1735,45 @@ class RunThreadLifetimeTest(unittest.TestCase):
         ctx, manager, state, call, outcome = self.launch(bare)
         call()
         self.assertEqual(outcome, ['reached the unit manager'])
+
+    def test_a_launch_hook_registered_alone_is_waited_for_and_its_launch_then_starts_nothing(self):
+        """The fifth reads. A lane can register ``launch_check`` or ``working_directory`` and nothing else: no
+        service, no handler, no store, no owner. The gate is on all the same (``ON_A_RUNS_THREAD``), so what S13
+        says holds for that hook too: a close waits for a launch that is inside it, and that launch, when the
+        hook returns, prepares and starts nothing. (With the gate off the close went past it, the daemon closed
+        its registry under the hook, and the launch went on into a closed daemon.)"""
+        for hook in ('launch_check', 'working_directory'):
+            with self.subTest(hook=hook):
+                ended = mock.Mock(closed=False)     # there is no store here: this says the close has ended, as a store's flag does
+                held, entered, leave, seen = held_hook(ended)
+                self.addCleanup(leave.set)
+                made = hooks_of(**{hook: held})
+                self.assertEqual((sorted(made._single), made.gate.enabled), ([hook], True), 'the hook alone: the gate is on')
+                ctx, manager, state, call, outcome = self.launch(made)
+                user = threading.Thread(target=call, daemon=True)
+                user.start()
+
+                def close(made=made, ended=ended):
+                    made.begin_close()
+                    made.finish_close(H.ServiceContext())
+                    ended.closed = True
+                close_waits(self, made, ended, close, entered, leave)
+                user.join(HELD_BOUND_S)
+                self.assertEqual((seen, outcome), ([False], [(c.LAUNCH_REFUSED, 'daemon_closing')]),
+                                 'the close had not ended while the hook was inside; closing had begun when it returned')
+                manager.prepare.assert_not_called()
+                self.assertFalse((state / 'runs').exists(), 'nothing of the unit was made')
+
+    def test_with_a_launch_hook_registered_alone_nothing_is_launched_once_closing_has_begun(self):
+        for hook in ('launch_check', 'working_directory'):
+            with self.subTest(hook=hook):
+                asked = []
+                made = hooks_of(**{hook: lambda *args: asked.append(hook)})
+                ctx, manager, state, call, outcome = self.launch(made)
+                made.begin_close()
+                call()
+                self.assertEqual((outcome, asked), ([(c.LAUNCH_REFUSED, 'daemon_closing')], []), 'refused before the hook is asked')
+                manager.prepare.assert_not_called()
 
     def test_a_start_that_was_abandoned_while_a_launch_hook_ran_launches_nothing(self):
         """The hook takes longer than the start waits: the start gives up and is answered while the hook is

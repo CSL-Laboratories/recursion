@@ -62,6 +62,7 @@ import json
 import math
 import posixpath
 import re
+import unicodedata
 from array import array
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -331,6 +332,8 @@ def mask_forms(values) -> tuple[str, ...]:
         if not isinstance(value, str) or not value:
             raise ValueError("a value to mask is a non-empty str")
         forms.add(value)
+        # a normalization variant reads as the same text to anyone who normalizes it
+        forms.update(unicodedata.normalize(form, value) for form in ("NFC", "NFD"))
     return tuple(sorted(forms, key=len, reverse=True))
 
 
@@ -358,8 +361,9 @@ def mask(text: str, forms: tuple[str, ...]) -> str:
     repeats until no spelling is left, since a fill could complete a value partly made of the fill
     character.
 
-    THE WORK IS BOUNDED: a round reads at most ``MASK_DEPTH`` layers of escapes, each in one linear pass, and
-    at most ``MASK_ROUNDS`` rounds run. Text that still has an escape to read after the last layer (escapes
+    THE WORK IS BOUNDED: a round reads the text and at most ``MASK_DEPTH`` layers of escapes beneath it (one
+    linear pass each; a further layer is decoded once only to see that it exists), and at most
+    ``MASK_ROUNDS`` rounds run. Text that still has an escape to read after the last layer (escapes
     nested deeper than any serializer writes, or built to peel one layer at a time), or that is not masked
     within the rounds, keeps nothing: it becomes fill of its whole UTF-8 length, which no reader takes for
     JSON, so the parser fails closed on it."""
@@ -601,14 +605,27 @@ class AntigravityOneShotAdapter(RouteAdapter):
 
     def run(self, request: dict, deadline_at: float) -> dict:
         """A request that is not the route contract's shape is refused ``request_invalid``, before anything
-        starts, even when the caller did not validate it first."""
+        starts, even when the caller did not validate it first: ``contract`` (the contract's version),
+        ``request_id``, ``tenant`` and ``prompt`` (non-empty str), ``deadline_s`` (a finite number above 0, not
+        a bool), ``route``, ``route.connection.id`` (non-empty str) and ``route.model``, as
+        ``contract.validate_request`` has them. Which engine a route names is the dispatcher's check
+        (``engine_unknown``), not this adapter's. ``deadline_at`` must be a finite number of the clock's
+        seconds, or the request is refused the same way: no child starts with a deadline that cannot end it.
+        Whatever escapes once a child has started fences it first."""
         rid = request.get("request_id") if isinstance(request, Mapping) else None
         rid = rid if isinstance(rid, str) and rid else ""
         if not isinstance(request, Mapping) or not rid:
             return c.result(rid, c.REQUEST_INVALID, detail="request_id")
-        for name in ("prompt",):
+        if request.get("contract") != c.CONTRACT_VERSION:
+            return c.result(rid, c.REQUEST_INVALID, detail="contract")
+        for name in ("tenant", "prompt"):
             if not isinstance(request.get(name), str) or not request[name]:
                 return c.result(rid, c.REQUEST_INVALID, detail=name)
+        deadline_s = request.get("deadline_s")
+        if not _finite(deadline_s) or deadline_s <= 0:
+            return c.result(rid, c.REQUEST_INVALID, detail="deadline_s")
+        if not _finite(deadline_at):
+            return c.result(rid, c.REQUEST_INVALID, detail="deadline_at")
         try:
             request["prompt"].encode("utf-8")
         except UnicodeEncodeError:   # a lone surrogate: agy's stdin takes UTF-8, so it could never be sent
@@ -616,7 +633,8 @@ class AntigravityOneShotAdapter(RouteAdapter):
         route = request.get("route")
         if not isinstance(route, Mapping):
             return c.result(rid, c.REQUEST_INVALID, detail="route")
-        if not isinstance(route.get("connection"), Mapping) or not isinstance(route["connection"].get("id"), str):
+        if (not isinstance(route.get("connection"), Mapping) or not isinstance(route["connection"].get("id"), str)
+                or not route["connection"]["id"]):
             return c.result(rid, c.REQUEST_INVALID, detail="route.connection")
         if not isinstance(route.get("model"), str):
             return c.result(rid, c.REQUEST_INVALID, detail="route.model")
@@ -655,6 +673,9 @@ class AntigravityOneShotAdapter(RouteAdapter):
         except OSError as err:
             process.fence("io_error")
             return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+        except BaseException:   # anything else (a caller's callable, an interruption): the child is fenced first
+            process.fence("unexpected")
+            raise
 
     def argv(self, request: dict) -> list[str]:
         route_method(request["route"])
@@ -747,6 +768,16 @@ class AntigravityOneShotAdapter(RouteAdapter):
         if code == CANCELLED:  # not a route contract code: a run agy reports stopped is an engine error here
             code = c.ENGINE_ERROR
         return c.result(rid, code, events=events, detail=detail)
+
+
+def _finite(value) -> bool:
+    """A finite int or float, not a bool (a float-sized one: ``10**400`` is not)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _usage_data(payload: Mapping) -> dict:

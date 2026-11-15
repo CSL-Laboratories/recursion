@@ -3,7 +3,10 @@ matcher with a leader, and the user's binding file. Toolkit-neutral: key names i
 
 Key names are ``keys.KeyDecoder``'s (``j``, ``enter``, ``ctrl+x``, ``alt+x``, ``shift+tab`` ...). A binding
 is a sequence of them, written with spaces (``"ctrl+d ctrl+d"``, ``"g g"``, ``"<leader> k"``); ``<leader>``
-stands for the leader key, ``ctrl+x`` unless the binding file says otherwise.
+stands for the leader key, ``ctrl+x`` unless the binding file says otherwise. A name is taken as the key a
+terminal sends for it: the decoder reads BS as ``backspace``, HT as ``tab`` and LF and CR as ``enter``, so
+``ctrl+h``, ``ctrl+i``, ``ctrl+j`` and ``ctrl+m`` (and their ``ctrl+alt+`` forms) are those keys; a name the
+decoder never makes (``ctrl+enter``, ``alt+esc``) is refused.
 
 Contexts. ``runs`` is the run list, ``output`` the output pager, ``command`` the ":" and "/" line, ``help``
 the help view. ``global`` applies in ``runs`` and ``output`` wherever they do not bind the same keys: a
@@ -27,7 +30,8 @@ default. A ``[safety]`` table states rules that a binding file can only make str
 - ``ctrl+c`` is kept: it ends the TUI from any mode (the terminal is in raw mode, so it arrives as a key),
   and no binding, nor the leader, can take it;
 - no action approves anything: approvals are answered by number and Enter, never by a key binding;
-- ``esc`` is bound to nothing that sends a request; Esc cancels local UI and never stops or interrupts a run;
+- ``esc`` is bound to nothing that sends a request; Esc cancels local UI and never stops or interrupts a run,
+  and no binding file takes that cancel away (``[safety] never_bind`` cannot hold Esc);
 - plugin actions (``plugin.<plugin>.<command>``) are bound only under ``<leader> p``, and only they are;
 - the Stop action opens the confirmation; no binding sends ``run.stop`` by itself.
 
@@ -61,10 +65,18 @@ NEVER_BIND = frozenset({"ctrl+y"})
 NEVER_BIND_GLOBAL = frozenset({"ctrl+p"})
 RESERVED = frozenset({"ctrl+c"})  # the app takes it before the keymap: it ends the TUI from any mode
 
-_NAMED = ("enter", "tab", "backspace", "esc", "up", "down", "left", "right", "home", "end", "pageup", "pagedown",
-          "insert", "delete", *(f"f{n}" for n in range(1, 13)))
+# Key names as keys.KeyDecoder makes them (review 2 of #404, Astra 4). The four one-byte keys take no modifier
+# but Alt (ESC before them), and Esc not even that (ESC ESC is two Escs); shift+tab is a sequence of its own.
+# The keys of _NAMED take xterm's modifier parameter.
+_SINGLE = ("enter", "tab", "backspace", "esc")
+_NAMED = ("up", "down", "left", "right", "home", "end", "pageup", "pagedown", "insert", "delete",
+          *(f"f{n}" for n in range(1, 13)))
 _MODIFIER_SETS = ("ctrl+", "alt+", "shift+", "alt+shift+", "ctrl+shift+", "ctrl+alt+", "ctrl+alt+shift+")
+# Control bytes the decoder reads as another key (keys._plain): BS is backspace, HT tab, LF and CR enter.
+_SAME_BYTE = {"h": "backspace", "i": "tab", "j": "enter", "m": "enter"}
 _CTRL = {"ctrl+space", "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_", *(f"ctrl+{chr(c)}" for c in range(ord("a"), ord("z") + 1))}
+ALIASES = {**{f"ctrl+{c}": key for c, key in _SAME_BYTE.items()},
+           **{f"ctrl+alt+{c}": f"alt+{key}" for c, key in _SAME_BYTE.items()}}
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,22 +161,29 @@ DEFAULT_KEYS = frozenset(key for context in LEADER_CONTEXTS for seq in DEFAULTS[
                          for key in seq.split() if key != "<leader>")
 
 
-def is_key_name(token: str) -> bool:
-    """True for a key name ``keys.KeyDecoder`` can produce (``space`` is accepted for " ")."""
+def key_name(token: str) -> str | None:
+    """The name ``keys.KeyDecoder`` gives the key that ``token`` names (``space`` is " ", ``ctrl+i`` is
+    ``tab``), or None when no key a terminal sends is read as it (review 2 of #404, Astra 4)."""
 
+    if not isinstance(token, str):
+        return None
+    token = " " if token == "space" else ALIASES.get(token, token)
     if len(token) == 1:
-        return token.isprintable()
-    if token in _CTRL or token == "shift+tab":
-        return True
-    for mods in _MODIFIER_SETS:
-        if token.startswith(mods) and token[len(mods):] in _NAMED:
-            return True
-    if token in _NAMED:
-        return True
+        return token if token.isprintable() else None
+    if token in _CTRL or token in _SINGLE or token in _NAMED or token == "shift+tab":
+        return token
+    if any(token.startswith(mods) and token[len(mods):] in _NAMED for mods in _MODIFIER_SETS):
+        return token
     if token.startswith("ctrl+alt+") and "ctrl+" + token[9:] in _CTRL:
-        return True
+        return token
     rest = token[4:] if token.startswith("alt+") else ""
-    return bool(rest) and (len(rest) == 1 and rest.isprintable() or rest in _NAMED)
+    return token if len(rest) == 1 and rest.isprintable() or rest in _SINGLE[:3] else None
+
+
+def is_key_name(token: str) -> bool:
+    """True for a key name ``keys.KeyDecoder`` can produce, or one it reads as another key (``ctrl+i``)."""
+
+    return key_name(token) is not None
 
 
 def parse_sequence(text: str, leader: str = LEADER) -> tuple[str, ...]:
@@ -172,10 +191,10 @@ def parse_sequence(text: str, leader: str = LEADER) -> tuple[str, ...]:
 
     out = []
     for token in text.split():
-        token = leader if token == "<leader>" else " " if token == "space" else token
-        if not is_key_name(token):
+        name = leader if token == "<leader>" else key_name(token)
+        if name is None:
             raise ValueError(f"unknown key {token!r}")
-        out.append(token)
+        out.append(name)
     if not out:
         raise ValueError("empty key sequence")
     return tuple(out)
@@ -247,10 +266,16 @@ class Keymap:
 
         if context not in CONTEXTS:
             return f"unknown context {context!r}"
+        if not isinstance(seq_text, str) or not isinstance(action, str):  # review 2 of #404, DeepSeek L3
+            return (f"a key sequence and an action are text, not {type(seq_text).__name__} and "
+                    f"{type(action).__name__}")
         try:
             seq = parse_sequence(seq_text, self.leader)
         except ValueError as exc:
             return str(exc)
+        return self._bind(context, seq, action)
+
+    def _bind(self, context: str, seq: tuple[str, ...], action: str) -> str | None:
         table = self.bindings.setdefault(context, {})
         if action == NONE:
             if seq == ("esc",) and context in ESC_CANCELS:
@@ -260,7 +285,7 @@ class Keymap:
         problem = self._refusal(context, seq, action)
         if problem:
             return problem
-        clash = next((other for other in table if other != seq and (other[:len(seq)] == seq or seq[:len(other)] == other)), None)
+        clash = next((other for other in table.copy() if other != seq and (other[:len(seq)] == seq or seq[:len(other)] == other)), None)
         if clash is not None:
             return f"overlaps {show_sequence(clash, self.leader)} in {context} (no binding may be a prefix of another)"
         table[seq] = action
@@ -305,11 +330,12 @@ class Keymap:
     # -- matching --------------------------------------------------------------------------------
     def view(self, focus: str) -> dict[tuple[str, ...], str]:
         """The bindings that apply with ``focus``: its own, then, in ``runs`` and ``output``, every global one
-        it does not overlap (``command`` and ``help`` have their own only)."""
+        it does not overlap (``command`` and ``help`` have their own only). It reads a copy of each table, so
+        a binding another client adds meanwhile cannot break it (review 2 of #404, DeepSeek L5)."""
 
         merged: dict[tuple[str, ...], str] = {}
         for context in VIEWS.get(focus, (focus,)):
-            for seq, action in self.bindings.get(context, {}).items():
+            for seq, action in self.bindings.get(context, {}).copy().items():
                 if any(seq[:len(s)] == s or s[:len(seq)] == seq for s in merged):
                     continue  # shadowed by the focused context
                 merged[seq] = action
@@ -362,20 +388,26 @@ def load(text: str, base: Keymap | None = None) -> Keymap:
     except tomllib.TOMLDecodeError as exc:
         km.notes.append(f"binding file not used: not TOML ({exc})")
         return km
-    problem = _file_refusal(doc)
+    problem = _file_refusal(doc, km.leader)
     if problem:
         km.notes.append(f"binding file not used: {problem}")
         return km
-    if isinstance(doc.get("leader"), str) and doc["leader"] != km.leader:
-        fresh = Keymap(leader=doc["leader"], never_bind=km.never_bind, notes=km.notes)
-        for context, table in DEFAULTS.items():
-            for seq_text, action in table.items():
-                refused = fresh.bind(context, seq_text, action)
+    leader = key_name(doc.get("leader", km.leader))  # as a terminal sends it: ctrl+i is tab (Astra 4)
+    if leader != km.leader:
+        # Every binding moves with the leader, base's as well as the defaults': a sequence that starts with the
+        # old leader where a leader can be typed starts with the new one; the rest stay (review 2 of #404,
+        # DeepSeek L1).
+        old, fresh = km.leader, Keymap(leader=leader, never_bind=km.never_bind, notes=km.notes)
+        for context, table in km.bindings.items():
+            for seq, action in table.items():
+                moved = (leader, *seq[1:]) if context in LEADER_CONTEXTS and seq[0] == old else seq
+                refused = fresh._bind(context, moved, action)
                 if refused:
-                    fresh.notes.append(f"default {context} {seq_text!r} dropped with leader {doc['leader']!r}: {refused}")
+                    fresh.notes.append(f"{context} {show_sequence(seq)} dropped with leader "
+                                       f"{show_sequence((leader,))}: {refused}")
         km = fresh
     safety = doc.get("safety", {})
-    km.never_bind = km.never_bind | frozenset(safety.get("never_bind", ()))
+    km.never_bind = km.never_bind | frozenset(key_name(k) for k in safety.get("never_bind", ()))
     for context, table in km.bindings.items():  # a key the file forbids leaves the defaults too
         for seq in [s for s in table if any(k in km.never_bind for k in s)]:
             km.notes.append(f"default {context} {show_sequence(seq, km.leader)} removed: [safety] never_bind")
@@ -394,21 +426,25 @@ def load(text: str, base: Keymap | None = None) -> Keymap:
     return km
 
 
-def _file_refusal(doc: Mapping) -> str | None:
+def _file_refusal(doc: Mapping, current: str = LEADER) -> str | None:
     if type(doc.get("version")) is not int or doc["version"] != FILE_VERSION:  # true and 1.0 are not 1
         return f"version must be {FILE_VERSION}"
     unknown = sorted(set(doc) - {"version", "leader", "bindings", "safety"})
     if unknown:
         return f"unknown table or key {unknown[0]!r}"
-    leader = doc.get("leader", LEADER)
-    if not isinstance(leader, str) or not is_key_name(leader) or len(leader) == 1 or leader in ("esc", "enter"):
-        return f"leader {leader!r} is not a usable key (a named or modified key other than Esc and Enter)"
+    written = doc.get("leader", current)
+    # Judged as the key a terminal sends: ctrl+i arrives as tab, ctrl+j and ctrl+m as enter (review 2 of #404,
+    # Astra 4), so a leader that only looks free is checked as the key it is.
+    leader = key_name(written)
+    said = repr(written) if leader in (None, written) else f"{written!r} (a terminal sends it as {leader!r})"
+    if leader is None or len(leader) == 1 or leader in ("esc", "enter"):
+        return f"leader {said} is not a usable key (a named or modified key other than Esc and Enter)"
     if leader in NEVER_BIND or leader in NEVER_BIND_GLOBAL:
-        return f"leader {leader!r} is a key bound nowhere"
+        return f"leader {said} is a key bound nowhere"
     if leader in RESERVED:
-        return f"leader {leader!r} is kept: it ends the TUI from any mode"
+        return f"leader {said} is kept: it ends the TUI from any mode"
     if leader in DEFAULT_KEYS:  # a context's own binding of it would shadow the leader's sequences there
-        return f"leader {leader!r} is a key the default bindings use; choose one they do not"
+        return f"leader {said} is a key the default bindings use; choose one they do not"
     if not isinstance(doc.get("bindings", {}), Mapping):
         return "bindings must be a table of contexts"
     safety = doc.get("safety", {})
@@ -418,8 +454,12 @@ def _file_refusal(doc: Mapping) -> str | None:
         if name == "never_bind":
             if not isinstance(value, list) or not all(isinstance(k, str) and is_key_name(k) for k in value):
                 return "[safety] never_bind must be a list of key names"
-            if leader in value:
+            keys = {key_name(k) for k in value}
+            if leader in keys:
                 return "[safety] never_bind holds the leader"
+            if "esc" in keys:  # review 2 of #404, Astra 1 and DeepSeek M1
+                return ("[safety] never_bind cannot hold esc: Esc always cancels the line, the keys and the "
+                        "pager, and sends nothing")
         elif name in SAFETY_RULES:
             if value is not True:
                 return f"[safety] {name} can only be true (a binding file may make the rules stricter, not looser)"

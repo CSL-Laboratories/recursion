@@ -36,6 +36,7 @@ Dispatch = Callable[[str, dict, Callable[[str, dict, dict], None]], None]
 OUTPUT_LINES = 2000  # per run; older engine lines leave the view (the run's own record is elsewhere)
 PARTIAL_CAP = 8192  # unfinished line with no newline; older cells are marked, not stored
 RUN_ROWS = 5
+HELP_ROWS = 3  # entries the open keys show at least; they take rows from the run list for them
 CONDITION_ROWS = 4
 _TRUNCATED = "⟦truncated⟧"
 _CURSOR = "▏"  # where the command line's cursor is, drawn only when it is not at the end
@@ -54,6 +55,11 @@ class _Output:
         self.events = 0
         self.dropped = 0
         self.label = f"output run={field(run_id)}: "
+        # The display rows of each retained line at one width, kept beside the lines, so a frame need not wrap
+        # the whole history to count it or show its newest rows (review 2 of #404, Astra 3). They are counted
+        # again only when the width changes.
+        self._width = 0
+        self._rows: collections.deque[int] = collections.deque(maxlen=cap)
 
     def feed(self, text: str | bytes) -> tuple[str, list[str]]:
         """Sanitize one chunk; return it and the lines it finished."""
@@ -76,6 +82,8 @@ class _Output:
             self.partial_cut = False
         self.partial = partial
         self.lines.extend(done)
+        if self._width:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
+            self._rows.extend(len(wrap(line, self._width)) for line in done)
         return chunk, done
 
     def source(self) -> list[str]:
@@ -85,20 +93,39 @@ class _Output:
 
     def tail(self, rows: int, width: int, offset: int = 0) -> list[str]:
         """``rows`` display rows ending ``offset`` display rows above the newest (the pager's view). The pager
-        counts wrapped rows, not lines, so every row of a long line can be reached (review 1 of #404, R2)."""
+        counts wrapped rows, not lines, so every row of a long line can be reached (review 1 of #404, R2).
+        Only the lines that hold those rows are wrapped; the others are counted from ``counts`` (review 2 of
+        #404, Astra 3)."""
 
         if not rows:
             return []
+        src, counts = self.source(), self.counts(width)
+        top = sum(counts)  # the display rows kept; it walks down to each line's first row
+        end = max(0, top - offset)
+        start = max(0, end - rows)
         out: list[str] = []
-        for line in reversed(self.source()):
-            out[:0] = wrap(line, width)
-            if len(out) >= rows + offset:
+        for line, n in zip(reversed(src), reversed(counts), strict=True):
+            first = top - n
+            if first < end:  # this line holds some of the rows shown
+                out[:0] = wrap(line, width)[max(start, first) - first:end - first]
+            if first <= start:
                 break
-        end = max(0, len(out) - offset)
-        return out[max(0, end - rows):end]
+            top = first
+        return out
+
+    def counts(self, width: int) -> list[int]:
+        """The display rows of each line ``source()`` gives, at ``width``."""
+
+        if width != self._width:
+            self._width = width
+            self._rows = collections.deque((len(wrap(line, width)) for line in self.lines), maxlen=self.lines.maxlen)
+        out = list(self._rows)
+        if self.partial:  # at most PARTIAL_CAP characters, so it is counted each time
+            out.append(len(wrap(self.partial, width)))
+        return out
 
     def total_rows(self, width: int) -> int:
-        return sum(len(wrap(line, width)) for line in self.source())
+        return sum(self.counts(width))
 
 
 
@@ -137,7 +164,7 @@ class TuiApp:
         self.cursor = 0  # the command line's insertion point, 0..len(line)
         self.line_kind = ":"  # what opened the line: ":" or "/" (a command) or "search" (the pager's search)
         self.focus = "runs"  # "runs" (the run list) or "output" (the output pager)
-        self.scroll = 0  # the pager's view, in lines above the newest; 0 follows new output
+        self.scroll = 0  # the pager's view, in display rows above the newest; 0 follows new output
         self.search = ""  # the pager's last search
         self.help_lines: list[str] = []
         self.help_scroll = 0  # the first help row shown in full screen
@@ -332,6 +359,9 @@ class TuiApp:
         with self._lock:
             if self.closed:
                 return
+            if not isinstance(text, (str, bytes, bytearray)):  # said, not raised (review 2 of #404, DeepSeek L6)
+                self._error(f"output for run={field(run_id)} skipped: its text is a {type(text).__name__}, not text")
+                return
             out = self.outputs.get(run_id)
             if out is None:
                 out = self.outputs[run_id] = _Output(self._output_lines, run_id)
@@ -356,9 +386,15 @@ class TuiApp:
         read with other input: an unbracketed paste, or typing faster than the client reads. Such a
         key cannot confirm a Stop or send the command line, because pasted text would otherwise act; nor
         can the next key, when the Stop was armed or the line typed with burst input. This is a heuristic
-        for an unbracketed paste: input that arrives one key per read cannot be told from typing."""
+        for an unbracketed paste: input that arrives one key per read cannot be told from typing. Anything
+        that is not a key name or a ``Paste`` is said as an error and does nothing (review 2 of #404, DeepSeek
+        L3)."""
 
         with self._lock:
+            if not isinstance(key, (str, Paste)):
+                if not self.closed:
+                    self._error(f"key ignored: a {type(key).__name__} is not a key name or a paste; nothing done")
+                return
             self._press(key, burst)
 
     def _press(self, key: Key, burst: bool) -> None:
@@ -566,7 +602,8 @@ class TuiApp:
     def _search(self, pattern: str, step: int) -> None:
         """Find ``pattern`` (case-insensitive when it has no capital letter) in the attached run's output.
         A new search starts at the newest line shown and goes to older lines; ``n`` goes on to older ones,
-        ``N`` back to newer ones, both wrapping around. The match becomes the pager's newest line."""
+        ``N`` back to newer ones, both wrapping around. The match's last display row becomes the pager's
+        newest row."""
 
         self.search = pattern
         out = self.outputs.get(self.attached or "")
@@ -735,6 +772,14 @@ class TuiApp:
 
     # -- frame ----------------------------------------------------------------------------------
     def frame(self) -> list[Row]:
+        """One full-screen frame (``_frame``), made under the app's lock: engine output another thread hands
+        in meanwhile waits for it, so the lines it reads cannot change under it (review 2 of #404, DeepSeek
+        L5). It only reads and wraps; it calls nothing outside the app."""
+
+        with self._lock:
+            return self._frame()
+
+    def _frame(self) -> list[Row]:
         """One full-screen frame of exactly ``self.height`` rows, none wider than ``self.width`` cells.
 
         It first logs any condition edge (one may appear with time alone). Every current condition stays
@@ -818,6 +863,10 @@ class TuiApp:
         pad = min(max(0, CONDITION_ROWS - len(cond)), max(0, rem - (RUN_ROWS + 3)))  # keep the layout steady
         rem -= pad
         run_rows = min(RUN_ROWS, rem - 1) if rem >= 2 else 0
+        if self.mode == "help":  # the open keys take rows from the run list until HELP_ROWS of them show
+            want = HELP_ROWS + 1  # and their header row (review 2 of #404, Astra 2)
+            while run_rows and rem - run_rows - 1 < want:
+                run_rows -= 1
         rem -= run_rows + (1 if run_rows else 0)
 
         mode = "watch_only" if self.watch_only else "live"
@@ -848,6 +897,8 @@ class TuiApp:
             lines = every[self.help_scroll:self.help_scroll + rem - 1]
             more = (f"; rows {self.help_scroll + 1}-{self.help_scroll + len(lines)} of {len(every)}, j/k and "
                     f"Page Up/Down scroll" if len(every) > rem - 1 else "")
+            if not lines:  # no row for an entry: name no range (review 2 of #404, Astra 2)
+                more = "; no room to show them here"
             rows.append((6, f"-- keys (Esc, q or ? closes{more}; the transcript has them too) --", None))
             rows.extend((6, "│ " + line, None) for line in lines)
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))

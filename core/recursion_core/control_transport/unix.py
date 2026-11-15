@@ -476,13 +476,18 @@ class UnixControlServer:
                     return  # one priority request per reserved connection
         finally:
             # The slot is freed before the connection is closed, so a client that has seen the close finds it
-            # free: a Stop sent right after it is served, not refused busy. For that instant the connection
-            # being closed and the next one overlap; the cap still bounds the handlers that run.
-            with self._lock:
-                self._workers.discard(threading.current_thread())
-                self._conns.discard(conn)
+            # free: a Stop sent right after it is served, not refused busy. The worker and its socket stay in
+            # the server's sets until the socket is disposed of, so a server shutting down meanwhile still finds,
+            # shuts and joins them (the round-1 reads of #407: Astra R2, Sol R1). The slots bound the handlers
+            # that run; a worker that has freed its slot and not yet disposed of its socket is not counted, so
+            # for a moment there can be several such tails, not only one.
             slots.release()
-            conn.close()
+            try:
+                conn.close()
+            finally:
+                with self._lock:
+                    self._workers.discard(threading.current_thread())
+                    self._conns.discard(conn)
 
 
     def _is_priority(self, request: Message) -> bool:

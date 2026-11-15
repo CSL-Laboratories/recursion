@@ -23,6 +23,8 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
                     shell ask before they run (permissions.py); permission_expired {turn_id, request_id} when the
                     deadline passes unanswered (the call is denied)
     acceptance      {turn_id, command, exit_code, passed, text}: the harness's acceptance check (done.py)
+    compaction      {turn_id, before_tokens, replaced, kept, summary: "model" | "fallback", reason, ...}
+    retry           {turn_id, attempt, code, delay_s, detail}: a failed call is tried again after delay_s
     turn_ended      {turn_id, outcome, result, reason}
     interrupt       {turn_id, delivered}
     protocol_error  {code, detail}

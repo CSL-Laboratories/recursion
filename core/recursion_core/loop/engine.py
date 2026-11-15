@@ -5,8 +5,11 @@ once, by cancelling the running turn's token, which closes the provider's connec
 command or acceptance check, and wakes a call waiting for permission. Approval answers are delivered there too.
 The main thread takes one message at a time: it writes ``input_accepted`` for it, then runs the turn:
 
-    the user's text is added; then, until the turn ends:
-      the model is called with the whole conversation and the tool list (one ``usage`` line per call);
+    the user's text is added (and kept, word for word, in the session's ledger); then, until the turn ends:
+      if the route gave a context window and the conversation nears its ceiling, it is compacted first
+      (compaction.py; a ``compaction`` line);
+      the model is called with the whole conversation and the tool list (one ``usage`` line per call); an
+      overload, a server error or a broken connection is retried after a wait (a ``retry`` line each);
       its text blocks are written as ``text`` lines and its reply is added to the conversation unchanged;
       if it asked for tools, each runs through the registry (``tool_call``, a ``permission_request`` for those
       that change something, then ``tool_result``) and the results go back as the next user message;
@@ -39,6 +42,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from recursion_core.loop import compaction as c
 from recursion_core.loop import done as d
 from recursion_core.loop import protocol as p
 from recursion_core.loop.permissions import PermissionGate
@@ -70,6 +74,14 @@ class Config:
     system: str | None = None
     acceptance: d.Acceptance | None = None
     instructions: str = ""
+    # The model's context window in tokens, from the route. None: the loop never compacts (it does not guess a
+    # window from a model's name).
+    context_window: int | None = None
+    keep_tail_tokens: int = c.KEEP_TAIL_TOKENS
+    # Waits before each retry of a call that failed with an overload, a server error or a broken connection
+    # (as the vendor SDKs retry twice). A typed limit and an auth, billing or request failure are not retried.
+    retry_delays: tuple[float, ...] = (1.0, 2.0)
+    summary_max_tokens: int = 8192
 
 
 @dataclass
@@ -132,6 +144,11 @@ class Session:
         base = config.system if config.system is not None else SYSTEM_PROMPT.format(root=workspace.root)
         self.system = base + (INSTRUCTIONS_HEADER + redactor.scrub(config.instructions) if config.instructions
                               else "")
+        # Every message the user sent, word for word: compaction re-injects them from here.
+        self.user_messages: list[tuple[str, str]] = []
+        self._ceiling = c.ceiling(config.context_window) if config.context_window else None
+        self._prompt_tokens: int | None = None  # the provider's count of the last prompt it was sent
+        self._counted = 0  # how many messages that count covers
 
     # -- one turn ----------------------------------------------------------------------------------------
 
@@ -140,8 +157,73 @@ class Session:
 
         return self._turn(turn_id, text, cancel, UsageTotal())
 
+    def _call(self, turn_id: str, request: b.TurnRequest, cancel: b.CancelToken) -> b.TurnResponse:
+        """One model call, retried after an overload, a server error or a broken connection (each wait written
+        as a ``retry`` line and cut short by an interrupt). Raises what the provider raises otherwise."""
+
+        attempt = 0
+        while True:
+            try:
+                return self.provider.stream_turn(request, cancel=cancel)
+            except (b.Cancelled, b.LimitError):
+                raise
+            except b.ProviderError as exc:
+                if not exc.retryable or attempt >= len(self.config.retry_delays):
+                    raise
+                delay = self.config.retry_delays[attempt]
+                attempt += 1
+                self.writer.write("retry", turn_id=turn_id, attempt=attempt, code=exc.code, delay_s=delay,
+                                  detail=self.redactor.scrub(exc.detail))
+                if cancel.wait(delay):
+                    raise b.Cancelled() from None
+
+    def _count(self, usage: UsageTotal, response: b.TurnResponse, turn_id: str, sent: int, purpose: str) -> None:
+        usage.add(response.usage, response.served_model)
+        self.session_usage.add(response.usage, response.served_model)
+        extra = {"purpose": purpose} if purpose != "turn" else {}
+        self.writer.write("usage", turn_id=turn_id, span="call", model=response.served_model,
+                          **response.usage.to_wire(), **extra)
+        u = response.usage
+        if purpose == "turn" and u.input_tokens.quality != b.UNKNOWN:
+            self._prompt_tokens = sum(m.value for m in (u.input_tokens, u.cache_read_tokens, u.cache_write_tokens)
+                                      if m.quality != b.UNKNOWN)
+            self._counted = sent
+
+    def _maybe_compact(self, turn_id: str, cancel: b.CancelToken, usage: UsageTotal) -> None:
+        if self._ceiling is None:
+            return
+        if self._prompt_tokens is not None:
+            size = self._prompt_tokens + c.estimate(self.messages[self._counted:])
+        else:
+            size = c.estimate(self.messages) + len(self.system) // c.CHARS_PER_TOKEN
+        if size <= self._ceiling:
+            return
+
+        def summarize(prefix: list[b.Message]) -> b.TurnResponse | None:
+            request = b.TurnRequest(self.config.model, self.system,
+                                    tuple(prefix) + (b.Message("user", (b.TextPart(c.SUMMARY_PROMPT),)),),
+                                    self.registry.specs(), self.config.summary_max_tokens, self.config.effort)
+            try:
+                response = self._call(turn_id, request, cancel)
+            except b.Cancelled:
+                raise
+            except b.ProviderError:
+                return None
+            self._count(usage, response, turn_id, 0, "compaction")
+            return response
+
+        done = c.compact(self.messages, self.user_messages, summarize, self.config.keep_tail_tokens)
+        if done is None:
+            return
+        self.messages = done.messages
+        self._prompt_tokens, self._counted = None, 0
+        self.writer.write("compaction", turn_id=turn_id, before_tokens=size, replaced=done.replaced, kept=done.kept,
+                          summary=done.summary_source, reason=done.reason,
+                          after_tokens_estimate=c.estimate(self.messages))
+
     def _turn(self, turn_id: str, text: str, cancel: b.CancelToken, usage: UsageTotal) -> str:
         self.messages.append(b.Message("user", (b.TextPart(text),)))
+        self.user_messages.append((turn_id, text))
         steps = 0
         checks = 0
         acceptance = self.config.acceptance
@@ -152,10 +234,14 @@ class Session:
                 return self._end(turn_id, "paused", self._result(None, f"the turn used its {steps} model calls"),
                                  "step_budget", usage)
             steps += 1
+            try:
+                self._maybe_compact(turn_id, cancel, usage)
+            except b.Cancelled:
+                return self._end(turn_id, "interrupted", None, "interrupted", usage)
             request = b.TurnRequest(self.config.model, self.system, tuple(self.messages), self.registry.specs(),
                                     self.config.max_output_tokens, self.config.effort)
             try:
-                response = self.provider.stream_turn(request, cancel=cancel)
+                response = self._call(turn_id, request, cancel)
             except b.Cancelled:
                 return self._end(turn_id, "interrupted", None, "interrupted", usage)
             except b.LimitError as exc:
@@ -164,10 +250,7 @@ class Session:
                 return self._end(turn_id, "paused", self._result(None, exc.detail), "limit", usage)
             except b.ProviderError as exc:
                 return self._end(turn_id, "failed", self._result(exc.code, exc.detail), "provider_error", usage)
-            usage.add(response.usage, response.served_model)
-            self.session_usage.add(response.usage, response.served_model)
-            self.writer.write("usage", turn_id=turn_id, span="call", model=response.served_model,
-                              **response.usage.to_wire())
+            self._count(usage, response, turn_id, len(request.messages), "turn")
             if response.parts:
                 self.messages.append(b.Message("assistant", response.parts))
             for part in response.parts:

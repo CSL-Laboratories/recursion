@@ -25,6 +25,7 @@ import sys
 import threading
 from pathlib import Path
 
+from recursion_core.loop import compaction
 from recursion_core.loop import done as d
 from recursion_core.loop import instructions as ins
 from recursion_core.loop import permissions as perm
@@ -62,6 +63,8 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--acceptance-rounds", type=int, default=d.DEFAULT_ROUNDS)
     ap.add_argument("--no-project-instructions", action="store_true",
                     help="do not read AGENTS.md and CLAUDE.md into the prompt")
+    ap.add_argument("--context-window", type=int, default=None,
+                    help="the model's context window in tokens, from the route; without it the loop never compacts")
     ap.add_argument("--fake-script", help="steps for the fake provider (tests and conformance runs)")
     ap.add_argument("--fake-record", help="append each request the fake provider receives to this file")
     return ap
@@ -117,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("recursion_loop: --approval-timeout must be positive")
     try:
         acceptance = d.Acceptance(args.acceptance, rounds=args.acceptance_rounds) if args.acceptance else None
+        if args.context_window is not None:
+            compaction.ceiling(args.context_window)  # refuses a window too small for a tool session
     except ValueError as exc:
         raise SystemExit(f"recursion_loop: {exc}") from None
     provider, model = build(args, dict(os.environ))
@@ -138,7 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     gate = perm.PermissionGate(writer, profile=args.permissions, deadline_s=args.approval_timeout)
     session = Session(provider, registry, workspace, writer, redactor,
                       Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
-                             effort=args.effort, acceptance=acceptance, instructions=text), gate=gate)
+                             effort=args.effort, acceptance=acceptance, instructions=text,
+                             context_window=args.context_window), gate=gate)
     engine = Engine(session, writer)
     writer.write("ready", protocol=p.PROTOCOL_VERSION, engine="recursion_loop", provider=provider.name, model=model,
                  tools=list(registry.names()), permissions=args.permissions,

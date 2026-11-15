@@ -18,6 +18,7 @@ import json
 import math
 import re
 import sys
+import unicodedata
 import unittest
 from unittest import mock
 from datetime import datetime
@@ -159,6 +160,8 @@ class Shape:
         self.assertIsInstance(value["value"], int if integer else (int, float))
         self.assertNotIsInstance(value["value"], bool)
         self.assertGreater(value["value"], 0)   # a 0 from OpenCode is never drafted as known
+        if integer:
+            self.assertLessEqual(value["value"], oc.MAX_EXACT)   # a count every JSON reader keeps exact
 
 
 class FixtureTests(Shape, unittest.TestCase):
@@ -1206,6 +1209,71 @@ class ReviewOneTests(Shape, unittest.TestCase):
         expected = parser().feed(raw)
         self.assertEqual(parser().feed(bytearray(raw)), expected)
         self.assertEqual(parser().feed(memoryview(raw)), expected)
+
+    # round 8
+    def test_r8_js_float_is_number_parse_float(self):
+        spaces = [chr(n) for n in range(0x110000) if unicodedata.category(chr(n)) == "Zs"]
+        for space in spaces + [chr(n) for n in (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x2028, 0x2029, 0xFEFF)]:
+            self.assertEqual(oc._js_float(space + "7"), 7.0, hex(ord(space)))   # JavaScript's white space
+        for other in (0x1C, 0x1D, 0x1E, 0x1F, 0x85, 0x180E, 0x200B):            # Python's \s takes the first five
+            self.assertIsNone(oc._js_float(chr(other) + "7"), hex(other))
+        for text, number in [("Infinity", math.inf), ("+Infinity", math.inf), ("-Infinityx", -math.inf),
+                             ("Infinitye5", math.inf), ("infinity", None), ("inf", None), ("NaN", None),
+                             ("1_000", 1.0), ("1e", 1.0), (".5e-1x", 0.05), ("5.", 5.0), (".", None), ("-", None),
+                             ("0x10", 0.0), (chr(0x661) + chr(0x662), None), ("1" + chr(0x662), 1.0),
+                             ("1." + chr(0x665), 1.0), ("." + chr(0x665), None), ("1e" + chr(0x662), 1.0),
+                             ("".join(chr(0xFF10 + int(d)) for d in "120"), None)]:
+            with self.subTest(text):
+                self.assertEqual(oc._js_float(text), number)
+
+    # round 9
+    def test_r9_the_shape_check_refuses_a_count_past_max_exact(self):
+        (usage,) = typed(parser().feed(line(step({"input": 5}))), "usage")
+        usage["input_tokens"] = known(oc.MAX_EXACT)
+        self.check({"type": "usage", "payload": usage})                  # the last exact count passes
+        usage["input_tokens"] = known(oc.MAX_EXACT + 1)
+        with self.assertRaises(self.failureException):
+            self.check({"type": "usage", "payload": usage})
+
+    def test_r8_waits_read_javascripts_digits_spaces_and_infinity(self):
+        cases = [({"retry-after": chr(0x661) + chr(0x662) + chr(0x660)}, None),   # NaN to JavaScript, and no date
+                 ({"retry-after-ms": "".join(chr(0xFF10 + int(d)) for d in "12000"), "retry-after": "60"},
+                  "2026-11-14T00:01:00.000Z"),                                 # NaN: OpenCode reads the next header
+                 ({"retry-after": "1" + chr(0x662)}, "2026-11-14T00:00:01.000Z"),   # parseFloat stops there
+                 ({"retry-after-ms": "Infinity", "retry-after": "60"}, None),  # a number: OpenCode reads no further
+                 ({"retry-after-ms": "-Infinity", "retry-after": "60"}, None),
+                 ({"retry-after-ms": chr(0x1C) + "5000", "retry-after": "60"}, "2026-11-14T00:01:00.000Z"),
+                 ({"retry-after": chr(0xFEFF) + "30"}, "2026-11-14T00:00:30.000Z")]
+        for headers, reset in cases:
+            with self.subTest(headers):
+                p = parser()
+                (limit,) = typed(p.feed(line(v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                                                       "responseHeaders": headers}))), "limit")
+                self.assertEqual(limit["reset_at"], reset)
+                p.end(1)
+                self.assertEqual(p.route_result("r1")["limit"]["reset_at"] is None, reset is None)
+
+    def test_r8_an_output_past_the_exact_range_is_a_lower_bound_of_the_larger_part(self):
+        top = oc.MAX_EXACT
+        bound = {"value": top, "quality": "lower_bound", "provenance": "observed"}
+        for output, reasoning, expected in [(top - 1, 1, known(top)),        # exactly the last exact number
+                                            (top, 1, bound), (1, top, bound), (top, top - 1, bound)]:
+            with self.subTest((output, reasoning)):
+                p = parser()
+                (usage,) = typed(p.feed(line(step({"output": output, "reasoning": reasoning}))), "usage")
+                self.assertEqual(usage["output_tokens"], expected)
+                self.check({"type": "usage", "payload": usage})
+                p.end(0)
+                self.assertEqual(p.route_result("r1")["events"][0]["data"]["output_tokens"], expected)
+
+    def test_r10_the_sentences_the_tenth_read_corrected_hold(self):
+        for value in (oc.MAX_EXACT + 1, 7.5):                     # past the exact range, or fractional
+            with self.subTest(value):
+                (usage,) = typed(parser().feed(line(step({"input": value}))), "usage")
+                self.assertEqual(usage["input_tokens"], UNKNOWN)
+        self.assertEqual(oc._timestamp(oc._LAST_EPOCH), "9999-12-31T23:59:58.000Z")
+        for epoch in (oc._LAST_EPOCH + 0.5, oc._LAST_EPOCH + 1):  # the last second of 9999 is refused too
+            self.assertIsNone(oc._timestamp(epoch))
 
 
 class DeclarationTests(unittest.TestCase):

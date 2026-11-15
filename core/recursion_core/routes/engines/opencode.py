@@ -53,10 +53,12 @@ USAGE. ``step_finish`` carries ``tokens`` ``{input, output, reasoning, cache: {r
 lines compute them the same way: ``input`` excludes the cached tokens, ``output`` excludes reasoning, and a count
 the provider did not report is written as 0 (1.19.5 packages/opencode/src/session/session.ts:338-372; 2.2.6
 packages/core/src/session/usage.ts:9-19). So a 0 cannot be told from "not reported": it is drafted ``unknown``,
-never 0. A positive count is ``known``, ``observed``. event.v1 counts reasoning inside ``output_tokens``, so
-``output_tokens`` is OpenCode's output plus its reasoning when both are positive, and a ``lower_bound`` (the one that
-is positive) when the other is not known. The
-cost is OpenCode's own figure, from its price table or from what the endpoint reported, and the stream does not say
+never 0. A positive whole count that every JSON reader keeps exact (at most ``MAX_EXACT``) is ``known``,
+``observed``; a larger or a fractional one is drafted ``unknown``, as if it had not been reported. event.v1 counts
+reasoning inside ``output_tokens``, so ``output_tokens`` is OpenCode's output plus its reasoning when both are
+positive and the sum is still a number every JSON reader keeps exact, and otherwise a ``lower_bound``: the larger
+part that is known. The cost
+is OpenCode's own figure, from its price table or from what the endpoint reported, and the stream does not say
 which: a positive cost is ``known``, ``modelled``; 0 is ``unknown``. A step of a sub-agent session is not in the
 stream (1.19.5 run.ts:712 prints only the run's own session), so the calls drafted here are each exact and their
 sum is not the run's whole spend.
@@ -141,7 +143,8 @@ _CONNECTION = re.compile(r"(subscription|api_key|passthrough):.+")
 # by parsedate_tz, which rewrites a year below 100 and skips words it does not know). Fields are separated by spaces
 # only; whitespace may surround the value. Names (weekday, month, zone) are read in any case, as Date.parse reads
 # them. IMF-fixdate, with its usual leniencies: an optional weekday, a day and an hour of one or two digits, optional
-# seconds.
+# seconds. A date without its weekday is read only when _http_date is called directly: from a header, a value that
+# starts with the day is first read as that many seconds (_js_float, as Number.parseFloat reads it in OpenCode).
 _IMF_DATE = re.compile(r"\s*(?:[A-Za-z]+, *)?([0-9]{1,2}) +([A-Za-z]{3}) +([0-9]{4}) +([0-9]{1,2}):([0-9]{2})"
                        r"(?::([0-9]{2}))? +(GMT|UTC|UT|Z|[+-][0-9]{4})\s*", re.IGNORECASE)
 # rfc850-date: weekday, DD-Mon-YY, a time with seconds, a zone; its two-digit year is read by RFC 9110's 50-year rule.
@@ -151,7 +154,13 @@ _MONTHS = {name: number for number, name in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
 _SURROGATE = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + "]")
 REPLACEMENT = chr(0xFFFD)
-_JS_FLOAT = re.compile(r"\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
+# Number.parseFloat's grammar. First JavaScript's white space (StrWhiteSpaceChar: tab, line feed, VT, FF, carriage
+# return, the BOM, the Zs spaces, U+2028 and U+2029), not Python's \s, which also takes U+001C-U+001F and U+0085
+# and not the BOM. Then StrDecimalLiteral: ASCII digits only (\d would take any script's digits), and Infinity in
+# that one spelling, signed or not, with nothing read after it.
+_JS_SPACE = ("[" + "".join(map(chr, (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F,
+                                     0x205F, 0x3000, 0xFEFF))) + chr(0x2000) + "-" + chr(0x200A) + "]")
+_JS_FLOAT = re.compile(_JS_SPACE + r"*([+-]?(?:Infinity|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?))")
 _LINE_BREAK = re.compile(r"[\r\n]")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -356,7 +365,8 @@ class Parser:
         # clock, an interruption, a memory error), up to and including the return, all of it is put back, so the line
         # counts as not read and feeding it again gives the same drafts at the same offsets, with no text, usage,
         # error or anomaly counted twice. An interruption that lands in the CALLER after the return finds the line
-        # read: its drafts are the caller's to keep or lose.
+        # read: its drafts are the caller's to keep or lose. A SECOND interruption that lands inside the rollback
+        # below is the one case not put back: no rollback written in Python can guard its own lines.
         start, lines, session, limit = self._offset, self._lines, self.engine_session_id, self._limit
         finish, last_type = self._finish, self.last_type
         kept = [(kept_list, len(kept_list)) for kept_list in (self.anomalies, self._text, self._usage, self._errors)]
@@ -389,7 +399,8 @@ class Parser:
             code, detail = self._result
             return [_draft("result", {"code": code, "detail": detail})]
         except BaseException:
-            # As in feed: an interruption before end() has returned leaves the run open, so end() can be called again.
+            # As in feed: one interruption before end() has returned leaves the run open, so end() can be called
+            # again; a second one that lands on the line below is not put back.
             self._result = None
             raise
 
@@ -496,10 +507,11 @@ class Parser:
         tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
         cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
         output, reasoning = _positive_int(tokens.get("output")), _positive_int(tokens.get("reasoning"))
-        if output is not None and reasoning is not None:
+        if output is not None and reasoning is not None and output + reasoning <= MAX_EXACT:
             output_tokens = _known(output + reasoning, "observed")
-        elif output is not None or reasoning is not None:   # the other part is not known: at least this one
-            output_tokens = {"value": output if output is not None else reasoning, "quality": "lower_bound",
+        elif output is not None or reasoning is not None:
+            # One part is not known, or the sum is past what every JSON reader keeps exact: at least the larger part.
+            output_tokens = {"value": max(n for n in (output, reasoning) if n is not None), "quality": "lower_bound",
                              "provenance": "observed"}
         else:
             output_tokens = _UNKNOWN
@@ -624,7 +636,11 @@ def _positive_finite(value: object, *, scale: float = 1.0) -> float | None:
 
 
 def _js_float(text: str) -> float | None:
-    """``Number.parseFloat``: the longest number at the start of the text, or None."""
+    """``Number.parseFloat``: the longest number at the start of the text, or None where it gives NaN.
+
+    The grammar is JavaScript's (``_JS_FLOAT``): its own white space first, ASCII digits only, and ``Infinity``
+    (signed or not) is a number, so a ``retry-after-ms`` of ``Infinity`` is a number and nothing else is read.
+    """
     match = _JS_FLOAT.match(text)
     return float(match.group(1)) if match else None
 
@@ -706,8 +722,10 @@ def _http_date(text: str, now: float) -> float | None:
 def _timestamp(epoch: float) -> str | None:
     """common.v1's timestamp, rounded UP to the millisecond (a reset is never earlier than asked).
 
-    None when it cannot be written: before the first second of the year 1, after the last of the year 9999 (only an
-    injected wall clock gets that far), infinite, or not a number. The year is always written with four digits.
+    None when it cannot be written: before the first second of the year 1, after 9999-12-31T23:59:58Z
+    (``_LAST_EPOCH``, kept a second short of the year's end so that rounding up never reaches the year 10000; the
+    last second of the year 9999 is refused too, and only an injected wall clock gets that far), infinite, or not
+    a number. The year is always written with four digits.
     """
     if not _FIRST_EPOCH <= epoch <= _LAST_EPOCH:
         return None

@@ -23,11 +23,15 @@ something is sent) and ``fence(reason)``. It keeps no thread and no clock.
   fake given the first one's id stands for a resumed session.
 * A queued steer is held apart from the output the fake has scheduled, as Pi holds it
   (agent-session.ts ``_queueSteer``, ``pendingMessageCount``; agent.ts ``steer``, ``abort``;
-  agent-loop.ts). It is taken one at a time where Pi polls its steering queue: when a turn ends and the
-  run would end (a turn of its own before ``agent_end``), and when a new run starts (its user message
-  right after the prompt's, in the same turn). An abort does not empty the queue: the aborted run ends
-  without polling it, and the next prompt's run delivers it. ``pendingMessageCount`` counts the steers
-  whose user message has not started.
+  agent-loop.ts). It is taken one at a time, by position, where Pi polls its steering queue: when a turn
+  ends and the run would end (a turn of its own before ``agent_end``), and when a new run starts (its
+  user message right after the prompt's, in the same turn). An abort does not empty the queue: the
+  aborted run ends without polling it, and the next prompt's run delivers it; a user message the loop
+  had already taken is still written before the aborted reply. Like Pi, the fake keeps two queues: the
+  one delivery takes from (agent.ts ``steeringQueue``) and the one ``pendingMessageCount`` counts
+  (agent-session.ts ``_steeringMessages``), from which a text leaves when a user message with that text
+  starts (agent-session.ts:1120-1130). So a prompt whose text equals a queued steer lowers the count,
+  as in Pi, and takes nothing from delivery.
 """
 
 from __future__ import annotations
@@ -113,7 +117,8 @@ class FakePi:
         self._run: deque[str] = deque()         # the rest of the run in progress, after _out
         self._running = False
         self._aborted = False                   # the run in progress was aborted: it polls no steer
-        self._steers: deque[str] = deque()      # steers Pi took whose user message has not started
+        self._steers: deque[str] = deque()      # steers Pi took, not yet taken by its loop (delivery)
+        self._shown: list[str] = []             # what pendingMessageCount counts (the session's list)
         self._replies = iter(replies) if replies is not None else (f"reply {n}" for n in range(1, 10**6))
         self._at = T0
         self.messages = 0
@@ -144,8 +149,8 @@ class FakePi:
             out = self._run.popleft()
             record = json.loads(out)
             message = record.get("message") if record["type"] == "message_start" else None
-            if message and message.get("role") == "user" and message.get("content") in self._steers:
-                self._steers.remove(message["content"])   # Pi drops it from the queue as it starts
+            if message and message.get("role") == "user" and message.get("content") in self._shown:
+                self._shown.remove(message["content"])    # the session drops the text from its list
             if record["type"] == "agent_settled":
                 self._running = False
             return out
@@ -191,7 +196,7 @@ class FakePi:
                 "steeringMode": "one-at-a-time", "followUpMode": "one-at-a-time",
                 "sessionFile": self.session_file, "sessionId": self.session_id,
                 "autoCompactionEnabled": True, "messageCount": self.messages,
-                "pendingMessageCount": len(self._steers)})
+                "pendingMessageCount": len(self._shown)})
         elif kind == "extension_ui_response":
             pass
         else:
@@ -206,6 +211,7 @@ class FakePi:
                 return
             self._respond(command, True, data={"disposition": "queued"})
             self._steers.append(text)          # held until Pi's loop polls its steering queue
+            self._shown.append(text)
             return
         self._respond(command, True, data={"disposition": "started"})
         self._running, self._aborted = True, False
@@ -215,7 +221,7 @@ class FakePi:
         if self._steers:
             # A new run polls the steering queue first (agent-loop.ts runLoop): one queued steer's user
             # message follows the prompt's in the run's first turn, and the reply answers both.
-            steer = user(self._steers[0], self._at + 1)
+            steer = user(self._steers.popleft(), self._at + 1)
             events[4:4] = [{"type": "message_start", "message": steer}, {"type": "message_end", "message": steer}]
             self.messages += 1
         self._run.extend(line(e) for e in events)
@@ -224,17 +230,24 @@ class FakePi:
         """The run's turn ended and a steer is queued: Pi takes it into a turn of its own before the run ends."""
         self._at += 1_000
         self.messages += 2
-        turn = reply_events(self._steers[0], next(self._replies), self._at)
+        turn = reply_events(self._steers.popleft(), next(self._replies), self._at)
         self._run.extendleft(line(r) for r in reversed(turn))
 
     def _abort(self) -> None:
         """End the run now: the reply being streamed stops ``aborted``, then the run settles aborted. The
-        queued steers stay queued (Pi's abort does not clear them)."""
+        queued steers stay queued (Pi's abort does not clear them). What the loop already took is still
+        written: the run's start and the user messages at the head of what is left (agent-loop.ts emits
+        them before it calls the model, and only that call sees the abort)."""
         self._aborted = True
         records = [json.loads(r) for r in self._run]
+        taken = 0
+        while taken < len(records) and (records[taken]["type"] in ("agent_start", "turn_start") or (
+                records[taken]["type"] in ("message_start", "message_end")
+                and records[taken]["message"].get("role") == "user")):
+            taken += 1
         streaming = next((r["message"] for r in records
                           if r["type"] == "message_end" and r["message"].get("role") == "assistant"), None)
-        self._run.clear()
+        self._run = deque(line(r) for r in records[:taken])
         if streaming is not None:
             stopped = dict(streaming, content=[], stopReason="aborted", errorMessage="Request was aborted",
                            usage=usage())

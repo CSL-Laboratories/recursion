@@ -265,6 +265,17 @@ class HeldUsageTest(unittest.TestCase):
                 self.assertEqual(quiet.feed(rec(empty)), [])
                 self.assertEqual(self.held(quiet), [])
 
+    def test_a_tool_result_whose_call_id_is_not_an_id_holds_nothing(self):
+        for call_id in ("", "x\ry", "x\ny", "x" * 129, None, 7, [], {}):
+            with self.subTest(call_id=str(call_id)[:20]):
+                stream = json_stream()
+                message = dict(self.tool_result(f.usage(100, 2, cost=0.02)), toolCallId=call_id)
+                self.assertEqual(stream.feed(rec({"type": "message_end", "message": message})), [])
+                self.assertEqual(self.held(stream), [])
+        stream = json_stream()                                # the longest id that is one is held
+        stream.feed(rec({"type": "message_end", "message": self.tool_result(f.usage(100, 2), call_id="x" * 128)}))
+        self.assertEqual(len(self.held(stream)), 1)
+
     def test_a_tool_result_without_reported_usage_holds_nothing(self):
         for used in (None, f.usage(0, 0), "x"):
             with self.subTest(used=used):
@@ -700,6 +711,21 @@ class RpcModeTest(unittest.TestCase):
             self.stream.feed(self.response(token, command="get_state", data={"sessionId": "another"}))
         self.assertEqual(caught.exception.code, "session_changed")
         self.assertEqual(self.stream.engine_session_id, f.SESSION_ID)
+
+    def test_a_malformed_get_state_answer_leaves_the_command_pending(self):
+        # The session id is checked before the command is taken, so a corrected answer under the same token
+        # is still read (the run is fenced on the first in practice; the stream does not lose its state).
+        token, _ = self.stream.command("get_state")
+        for bad in ([], "", "x" * 257, None):
+            with self.subTest(bad=bad), self.assertRaises(pi.PiProtocolError) as caught:
+                self.stream.feed(self.response(token, command="get_state",
+                                               data={"sessionId": bad, "sessionFile": f.SESSION_FILE}))
+            self.assertEqual(caught.exception.code, "session_id")
+        self.assertIsNone(self.stream.engine_session_id)
+        self.stream.feed(self.response(token, command="get_state",
+                                       data={"sessionId": f.SESSION_ID, "sessionFile": f.SESSION_FILE}))
+        self.assertEqual((self.stream.engine_session_id, self.stream.session_file), (f.SESSION_ID, f.SESSION_FILE))
+        self.assertEqual(self.stream.ignored, {})
 
     def test_an_empty_or_absent_session_file_keeps_the_last_good_path(self):
         token, _ = self.stream.command("get_state")

@@ -198,6 +198,70 @@ class FakeRpcTest(unittest.TestCase):
                                                      "text": "two"})
         self.assertEqual(self.pending_count(), 0)
 
+    def users(self, records):
+        return [r["message"]["content"] for r in records
+                if r["type"] == "message_start" and r["message"].get("role") == "user"]
+
+    def test_steers_with_the_same_text_as_the_next_prompt_are_each_delivered(self):
+        # Delivery takes Pi's steering queue by position; only the count matches text (agent.ts steeringQueue
+        # against agent-session.ts _steeringMessages). A prompt with a queued steer's text takes nothing.
+        self.prompt("First.", "dlv-1", "turn-1")
+        drafts = read(self.process, self.stream, 7)
+        self.prompt("repeat", "dlv-2", "turn-1", how="mid_turn")
+        self.prompt("repeat", "dlv-3", "turn-1", how="mid_turn")
+        _token, record = self.stream.command("abort")
+        self.send(record)
+        self.read_all(drafts)
+        self.assertEqual(self.pending_count(), 2)
+        self.prompt("repeat", "dlv-4", "turn-2")
+        records = self.read_all(drafts)
+        self.assertEqual(self.users(records), ["repeat", "repeat", "repeat"])
+        self.assertEqual(self.accepted(drafts), [("dlv-1", "new_turn"), ("dlv-2", "mid_turn"), ("dlv-3", "mid_turn"),
+                                                 ("dlv-4", "new_turn")])
+        self.assertEqual(self.pending_count(), 0)
+
+    def test_the_count_drops_when_the_steers_message_starts_not_when_it_ends(self):
+        self.prompt("Long task.", "dlv-1", "turn-1")
+        read(self.process, self.stream, 7)
+        self.prompt("Also this.", "dlv-2", "turn-1", how="mid_turn")
+        while True:
+            record = json.loads(self.process.read_line(1.0))
+            if record["type"] == "message_start" and record["message"].get("content") == "Also this.":
+                break
+        self.assertEqual(self.pending_count(), 0)          # its message_end is still to come
+        self.assertEqual(json.loads(self.process.read_line(1.0))["type"], "message_end")
+
+    def test_an_abort_after_the_loop_took_a_steer_still_writes_the_steers_message(self):
+        self.prompt("Long task.", "dlv-1", "turn-1")
+        read(self.process, self.stream, 7)
+        self.prompt("Also this.", "dlv-2", "turn-1", how="mid_turn")
+        read(self.process, self.stream, 4)                 # queued, the reply's end, turn_end, the steer's turn_start
+        _token, record = self.stream.command("abort")
+        self.send(record)
+        aborted = self.read_all()
+        self.assertEqual(self.users(aborted), ["Also this."])
+        self.assertEqual([r["type"] for r in aborted][-4:], ["turn_end", "agent_end", "agent_settled", "response"])
+        self.assertEqual(settles(self.stream)[-1]["aborted"], True)
+        self.assertEqual(self.pending_count(), 0)
+        self.prompt("Next.", "dlv-3", "turn-2")
+        self.assertEqual(self.users(self.read_all()), ["Next."])     # delivered once, not again
+
+    def test_a_run_after_an_aborted_one_polls_its_steers_again(self):
+        self.prompt("Long task.", "dlv-1", "turn-1")
+        read(self.process, self.stream, 7)
+        _token, record = self.stream.command("abort")
+        self.send(record)
+        self.read_all()
+        self.prompt("Next.", "dlv-2", "turn-2")
+        read(self.process, self.stream, 7)
+        self.prompt("More.", "dlv-3", "turn-2", how="mid_turn")
+        records = self.read_all()
+        self.assertEqual(self.users(records), ["More."])                # its own turn, before the run ends
+        steer_at = next(i for i, r in enumerate(records) if r["type"] == "message_start"
+                        and r["message"].get("content") == "More.")
+        self.assertLess(steer_at, [r["type"] for r in records].index("agent_end"))
+        self.assertEqual(self.pending_count(), 0)
+
     def pending_count(self):
         """Pi's ``pendingMessageCount``, read with a ``get_state`` (what comes before its answer is fed too)."""
         _token, record = self.stream.command("get_state")
@@ -209,7 +273,8 @@ class FakeRpcTest(unittest.TestCase):
             if got["type"] == "response" and got["command"] == "get_state":
                 return got["data"]["pendingMessageCount"]
 
-    def read_all(self):
+    def read_all(self, drafts=None):
+        """Every record the fake has to give, each fed to the stream; its drafts go to ``drafts`` if given."""
         records = []
         while True:
             try:
@@ -217,7 +282,9 @@ class FakeRpcTest(unittest.TestCase):
             except ReadTimeout:
                 return records
             records.append(json.loads(line))
-            self.stream.feed(line)
+            got = self.stream.feed(line)
+            if drafts is not None:
+                drafts += got
 
     def test_a_dialog_answer_gets_no_response(self):
         self.send(self.stream.cancel_dialog("u1"))

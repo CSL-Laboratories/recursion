@@ -290,6 +290,17 @@ def _settings_refusal(found: list) -> str:
             "nothing)")
 
 
+def _absolute_folder(value: str, what: str) -> Path:
+    """A configuration folder named to the engine, which must be an absolute path: the runner checks it from
+    its own working folder, while the engine, started in the task's work tree, would read a relative one
+    there (and a "~" in a variable is not expanded: it is a folder named "~"). Empty is not absolute."""
+    path = Path(value)
+    if not path.is_absolute():
+        raise ArmRefused(f"direct arm (claude_code): {what} {value!r} is not an absolute path; the engine would read "
+                         "its settings relative to the task's work tree, not where they were checked")
+    return path
+
+
 def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -433,16 +444,18 @@ class DirectArm(Arm):
                 raise ArmRefused(_settings_refusal(found))
 
     def _user_settings(self, env: dict | None) -> list:
-        """The user settings file the engine reads: in CLAUDE_CONFIG_DIR when that is passed, else in
-        HOME/.claude. Before an attempt (``env`` None) HOME is the route home; without one it is the
-        attempt's fresh scratch home, checked at the attempt."""
+        """The user settings file the engine reads: in CLAUDE_CONFIG_DIR when that is passed (whatever its
+        value, even empty), else in HOME/.claude; either folder must be absolute (ArmRefused otherwise).
+        Before an attempt (``env`` None) HOME is the route home; without one it is the attempt's fresh
+        scratch home, checked at the attempt."""
         if env is not None:
-            given = env.get("CLAUDE_CONFIG_DIR")
-            return [(Path(given) if given else Path(env["HOME"]) / ".claude") / "settings.json"]
-        if "CLAUDE_CONFIG_DIR" in self.claude.pass_env and os.environ.get("CLAUDE_CONFIG_DIR"):
-            return [Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json"]
+            if "CLAUDE_CONFIG_DIR" in env:
+                return [_absolute_folder(env["CLAUDE_CONFIG_DIR"], "CLAUDE_CONFIG_DIR") / "settings.json"]
+            return [_absolute_folder(env["HOME"], "HOME") / ".claude" / "settings.json"]
+        if "CLAUDE_CONFIG_DIR" in self.claude.pass_env and "CLAUDE_CONFIG_DIR" in os.environ:
+            return [_absolute_folder(os.environ["CLAUDE_CONFIG_DIR"], "CLAUDE_CONFIG_DIR") / "settings.json"]
         if self.claude.home:
-            return [Path(self.claude.home) / ".claude" / "settings.json"]
+            return [_absolute_folder(self.claude.home, "the route home") / ".claude" / "settings.json"]
         return []
 
     def check_tasks(self, tasks) -> None:

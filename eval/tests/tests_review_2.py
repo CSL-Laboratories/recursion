@@ -187,7 +187,8 @@ class SessionCleanupTests(unittest.TestCase):
                 if found and not forked:
                     forked.append(sid)
                     trigger.write_text("go")
-                    while not child_marker.exists():
+                    # Wait for the pid itself, not the file: the helper creates the file before writing.
+                    while not (child_marker.exists() and child_marker.read_text().strip()):
                         time.sleep(0.001)
                 return found
 
@@ -204,7 +205,7 @@ class SessionCleanupTests(unittest.TestCase):
                     if marker.exists():
                         try:
                             os.kill(int(marker.read_text()), signal.SIGKILL)
-                        except ProcessLookupError:
+                        except (ProcessLookupError, ValueError):
                             pass
 
     def test_a_session_that_will_not_empty_is_reported(self):

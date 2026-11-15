@@ -1,4 +1,4 @@
-# Evaluation protocol (lane EVAL), version 4
+# Evaluation protocol (lane EVAL), version 5
 
 Written before any measured run. This file, the analysis script `eval/analyze.py` and the calculator
 `eval/passk.py` are hashed in `eval/FROZEN.sha256`; every record carries those hashes, and a test fails
@@ -37,7 +37,10 @@ cannot be read counts as set) refuses the arm, naming it, in the engine's user c
 (`/etc/claude-code/managed-settings.json` and `managed-settings.d/`) and, before any attempt, in any
 task's start tree (`.claude/settings.json`, `.claude/settings.local.json`); the same places are checked
 again at each attempt, with the attempt's own environment and work tree, and a file found only then makes
-that attempt an infra failure (`setup_failed`) without starting the engine. Engine arguments that set a
+that attempt an infra failure (`setup_failed`) without starting the engine. The configuration folder must
+be an absolute path (`CLAUDE_CONFIG_DIR` when passed, even empty, and the route home), before the run and
+at each attempt: the engine starts in the task's work tree and would read a relative folder, or a literal
+`~`, from there rather than where it was checked. Engine arguments that set a
 fallback model or a main-thread agent are refused as well. A paired comparison refuses two records that differ in these settings, the engine
 version, the runner, the evaluated commit, the protocol or the analysis; and a record is scored only by
 the protocol and analysis version it names: a record of any other version is refused, never scored by
@@ -232,3 +235,6 @@ be done and whose hidden tests did not pass.
   and refuses fallback-model and agent arguments; session cleanup confirms an empty scan with a fresh
   one, reports a failure at once with no unbounded wait, and reports output pipes held open by a process
   outside the session. Neither the analysis nor the calculator changed.
+- 5 (Nov 14, 2026, answering the two fourth-round reads of #381; still before any measured run): the
+  engine's configuration folder (`CLAUDE_CONFIG_DIR` when passed, the route home) must be an absolute
+  path, before the run and at each attempt. Neither the analysis nor the calculator changed.

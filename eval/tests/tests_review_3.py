@@ -219,12 +219,14 @@ class ConfirmedEmptyScanTests(unittest.TestCase):
             engine = ("import subprocess,sys,time\nfrom pathlib import Path\n"
                       f"subprocess.Popen([sys.executable,'-B','-c',{helper!r}],stdin=subprocess.DEVNULL,"
                       "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
-                      f"while not Path({str(ready)!r}).exists(): time.sleep(.001)\n")
+                      # the pid itself, not the file: the helper creates the file before writing it
+                      f"while not (Path({str(ready)!r}).exists() and Path({str(ready)!r}).read_text()): "
+                      "time.sleep(.001)\n")
             original = arms._session_of
             fired = []
 
             def disappear(pid):
-                if ready.exists() and not fired and pid == int(ready.read_text()):
+                if not fired and ready.exists() and ready.read_text().strip() == str(pid):
                     fired.append((pid, original(pid)[0]))
                     trigger.write_text("go")
                     until = time.monotonic() + 5

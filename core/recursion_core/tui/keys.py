@@ -116,6 +116,9 @@ class KeyDecoder:
         self._paste: list[str] = []
         self._paste_len = self._paste_dropped = 0
         self._paste_tail = ""  # the end of the paste so far that may be the start of its end marker
+        # Sequences that ended without a key (unknown, overlong, broken by another character, or cut off
+        # by the wait or the end of input). A read counts them as input beside its keys (term.Tty: burst).
+        self.discarded = 0
 
     @property
     def waiting(self) -> bool:
@@ -156,6 +159,8 @@ class KeyDecoder:
         elif self._state in (_CSI, _SS3) and self._seq == "":
             out.append("alt+[" if self._state == _CSI else "alt+O")
         if self.waiting:
+            if not out:
+                self.discarded += 1
             self._state, self._seq = _GROUND, ""
         return out
 
@@ -191,6 +196,8 @@ class KeyDecoder:
                 key = _plain(ch)
                 if key is not None:
                     out.append(_alt(key))
+                else:  # ESC and a character that is no key
+                    self.discarded += 1
         elif st in (_CSI, _SS3, _SKIP):
             o = ord(ch)
             if 0x20 <= o <= 0x3F:  # parameter and intermediate characters
@@ -206,14 +213,18 @@ class KeyDecoder:
                     self._emit(_csi_name(params, ch), out)
                 elif st == _SS3:
                     self._emit(_SS3_FINAL.get(ch) if params == "" else None, out)
+                else:  # the end of an overlong sequence
+                    self.discarded += 1
             else:  # a control or non-ASCII character ends the sequence unfinished; it is read on its own
                 self._state, self._seq = _GROUND, ""
+                self.discarded += 1
                 self._step(ch, out)
 
-    @staticmethod
-    def _emit(name: str | None, out: list[Key]) -> None:
+    def _emit(self, name: str | None, out: list[Key]) -> None:
         if name is not None:
             out.append(name)
+        else:
+            self.discarded += 1
 
     # -- bracketed paste --------------------------------------------------------------------------
     def _paste_feed(self, text: str, i: int, out: list[Key]) -> int:

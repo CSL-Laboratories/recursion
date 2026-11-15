@@ -688,5 +688,261 @@ class CoverageTest(unittest.TestCase):
         self.assertIn("run=run-1", app._uncertain)
 
 
+class SharedInputThatEndsWithoutAKeyTest(unittest.TestCase):
+    """Round 3 (both reads of 46b8d7d8, Astra C3): an Enter or y that shares a read with an unfinished
+    sequence stays a burst however that sequence ends: at the end of input, as an unknown sequence, by
+    the wait, or broken by the Enter itself. A lone Esc and one split key stay one key."""
+
+    def read_one(self, reads: list) -> tuple:
+        tty = tty_for(-1)
+        with mock.patch.object(tty, "_read", side_effect=reads):
+            key = tty.read_key(0)
+        return key, tty.burst
+
+    def test_every_way_the_sequence_can_end(self) -> None:
+        for reads in ([b"\n\x1b[12", b""], [b"\n\x1b[12", b"z"], [b"\n\x1b[12", None], [b"\x1b[12\n"],
+                      [b"\n\x1b[" + b"1" * (MAX_SEQ + 2) + b"A"], [b"\n\x1b[999~"], [b"\n\x1b" + chr(0x85).encode()]):
+            with self.subTest(reads=reads):
+                self.assertEqual(self.read_one(reads), ("enter", True))
+        self.assertEqual(self.read_one([b"y\x1bO12", b""]), ("y", True))
+
+    def test_a_lone_esc_and_one_split_key_stay_one_key(self) -> None:
+        for reads, expected in (([b"\x1b[", b"1;5C"], "ctrl+right"), ([b"\x1b", None], "esc"),
+                                ([b"\x1b", b""], "esc"), ([b"\x1bx"], "alt+x")):
+            with self.subTest(reads=reads):
+                self.assertEqual(self.read_one(reads), (expected, False))
+
+    def test_a_prepared_line_or_stop_is_not_sent_through_the_whole_client(self) -> None:
+        # Astra's interactive probes (a pipe, interactive() and its threads) and Sol's real-PTY hangup.
+        for keybytes, prefix, completion in ((b"\n", ":stop run-1", b""), (b"\n", ":stop run-1", b"z"),
+                                             (b"y", "s", b""), (b"y", "s", b"z")):
+            with self.subTest(keybytes=keybytes, completion=completion):
+                driver = FakeDriver()
+                driver.start_run()
+                api = RecordingAPI(driver.api)
+                read_fd, write_fd = os.pipe()
+                tty = tty_for(read_fd)
+                tty.cbreak = contextlib.nullcontext
+                real_read, reads = tty._read, [0]
+                handled = threading.Event()
+
+                def read(timeout):
+                    nonlocal write_fd
+                    reads[0] += 1
+                    if reads[0] == 2:  # the wait after the unfinished sequence: its end, then end of input
+                        if completion:
+                            os.write(write_fd, completion)
+                        os.close(write_fd)
+                        write_fd = -1
+                    return real_read(timeout)
+
+                tty._read = read
+                real_key, ended = tty.read_key, [False]
+
+                def read_key(timeout):  # a client that ignores the end of input fails here, not hangs
+                    if ended[0]:
+                        raise AssertionError("interactive() read the terminal again after it ended input")
+                    key = real_key(timeout)
+                    ended[0] = key is None and tty.eof  # keys read with the end still come out first
+                    return key
+
+                tty.read_key = read_key
+
+                def prepare(app):
+                    app.open()
+                    for key in prefix:
+                        app.press(key)
+                    api.calls.clear()
+                    actual = app.press
+
+                    def press(*args, **kwargs):
+                        try:
+                            actual(*args, **kwargs)
+                        finally:
+                            handled.set()
+
+                    app.press = press
+
+                class WaitUntilHandled(term.Loop):
+                    def press(self, *args, **kwargs):
+                        super().press(*args, **kwargs)
+                        handled.wait()
+
+                try:
+                    os.write(write_fd, keybytes + b"\x1b[12")
+                    with mock.patch.object(term, "Loop", WaitUntilHandled):
+                        self.assertEqual(term.interactive(api, io.StringIO(), {"NO_COLOR": "1"}, tty,
+                                                          on_app=prepare, stderr=io.StringIO()), 0)
+                    self.assertEqual([c for c in api.calls if c[0] == "run.stop"], [])
+                finally:
+                    os.close(read_fd)
+                    if write_fd >= 0:
+                        os.close(write_fd)
+
+    @unittest.skipIf(pty is None, "needs POSIX terminals")
+    def test_a_real_hangup_cannot_erase_the_burst(self) -> None:  # Sol's PTY probe
+        for keybytes, prefix in ((b"\n", ":stop run-1"), (b"y", "s")):
+            with self.subTest(keybytes=keybytes):
+                app, api = fresh()
+                for key in prefix:
+                    app.press(key)
+                master, slave = pty.openpty()
+                tty = tty_for(slave)
+                actual, first = tty._read, [True]
+
+                def read(timeout):
+                    nonlocal master
+                    data = actual(timeout)
+                    if first[0] and data:
+                        first[0] = False
+                        os.close(master)
+                        master = -1
+                    return data
+
+                tty._read = read
+                try:
+                    with tty.cbreak():
+                        os.write(master, keybytes + b"\x1b[12")
+                        key = tty.read_key(1)
+                    app.press(key, burst=tty.burst)
+                    self.assertTrue(tty.eof)
+                    self.assertEqual((tty.burst, api.calls), (True, []))
+                finally:
+                    if master >= 0:
+                        os.close(master)
+                    os.close(slave)
+
+    def test_the_decoder_counts_each_sequence_that_ends_without_a_key(self) -> None:
+        for data, keys, discarded in ((b"\x1b[999~", [], 1), (b"\x1b[1;99A", [], 1), (b"\x1bOz", [], 1),
+                                      (b"\x1b[12\n", ["enter"], 1), (b"\x1b[" + b"1" * (MAX_SEQ + 1) + b"A", [], 1),
+                                      (b"\x1b" + chr(0x85).encode(), [], 1), (b"\x1b[C\x1bx\x1b[200~p\x1b[201~", ["right", "alt+x", Paste("p")], 0)):
+            with self.subTest(data=data):
+                d = KeyDecoder()
+                self.assertEqual((d.feed(data), d.discarded), (keys, discarded))
+        d = KeyDecoder()
+        d.feed(b"\x1b[12")
+        self.assertEqual((d.timeout(), d.discarded), ([], 1))
+        d.feed(b"\x1b")
+        self.assertEqual((d.timeout(), d.discarded), (["esc"], 1), "a lone Esc is a key, not a dropped sequence")
+        d.feed(b"\x1b[3")
+        self.assertEqual((d.end(), d.discarded), ([], 2))
+
+
+class Round3CoverageTest(unittest.TestCase):
+    """The third reads' coverage cases for rules that held (green on 46b8d7d8), with untimed waits."""
+
+    def test_only_pollhup_is_a_hangup_and_no_poll_is_none(self) -> None:
+        tty = tty_for(-1)
+        with mock.patch.object(term.select, "poll", None, create=True):
+            self.assertFalse(tty._hung_up())
+        if not hasattr(term.select, "poll"):
+            return
+        for flags in (term.select.POLLIN, term.select.POLLERR, term.select.POLLNVAL, term.select.POLLHUP):
+            with self.subTest(flags=flags):
+                poller = mock.Mock()
+                poller.poll.return_value = [(-1, flags)]
+                with mock.patch.object(term.select, "poll", return_value=poller):
+                    self.assertEqual(tty._hung_up(), flags == term.select.POLLHUP)
+
+    @unittest.skipIf(pty is None, "needs POSIX terminals")
+    def test_every_inherited_input_flag_and_high_bytes(self) -> None:
+        master, slave = pty.openpty()
+        tty = tty_for(slave)
+        mask = (termios.IGNBRK | termios.BRKINT | termios.IGNPAR | termios.PARMRK | termios.INPCK | termios.ISTRIP
+                | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON | termios.IXANY | termios.IXOFF)
+        saved = termios.tcgetattr(slave)
+        saved[0] |= mask
+        termios.tcsetattr(slave, termios.TCSANOW, saved)
+        payload = b"\x00\r\n\x03\x11\x13\xff\xc3\xa9\x80"
+        try:
+            with tty.cbreak():
+                mode = termios.tcgetattr(slave)
+                self.assertEqual(mode[0] & mask, 0)
+                self.assertEqual(mode[1], saved[1])
+                os.write(master, payload)
+                self.assertEqual(os.read(slave, 128), payload)
+            self.assertEqual(termios.tcgetattr(slave), saved)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_many_writers_and_two_final_events_keep_one_last_event(self) -> None:
+        from recursion_core.tui.events import EventLog
+
+        log = EventLog(10000)
+        ready = threading.Barrier(10)
+        errors: list = []
+
+        def writer(final: bool) -> None:
+            try:
+                ready.wait()
+                if final:
+                    log.append_last(0, "close", "operator", "closed", "closed", "", "")
+                else:
+                    for i in range(100):
+                        log.append(i, "output", "engine", "live", str(i), "", "")
+            except BaseException as error:  # noqa: BLE001
+                errors.append(repr(error))
+
+        workers = [threading.Thread(target=writer, args=(i < 2,)) for i in range(10)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        events = list(log)
+        self.assertEqual(errors, [])
+        self.assertEqual([e.event_type for e in events].count("close"), 1)
+        self.assertEqual(events[-1].event_type, "close")
+        self.assertEqual([e.seq for e in events], list(range(1, len(events) + 1)))
+
+    def test_ending_waits_for_a_request_under_way_and_then_refuses_new_ones(self) -> None:
+        app, api = fresh()
+        inside, release, attempt, returned = (threading.Event() for _ in range(4))
+        sent: list = []
+
+        class Watched:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                if threading.current_thread().name == "ender":
+                    attempt.set()
+                return self.inner.__enter__()
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+        app._lock = Watched(app._lock)
+
+        def dispatch(*args):
+            inside.set()
+            release.wait()
+            sent.append(args[:2])
+
+        app.dispatch = dispatch
+
+        def end():
+            try:
+                app.close()
+            finally:
+                returned.set()
+                attempt.set()
+
+        worker = threading.Thread(target=app.request, args=("run.status", {"run_id": "run-1"}))
+        ender = threading.Thread(target=end, name="ender")
+        worker.start()
+        try:
+            inside.wait()
+            ender.start()
+            attempt.wait()
+            self.assertFalse(returned.is_set(), "ending went on while a request was under way")
+        finally:
+            release.set()
+            worker.join()
+            ender.join()
+        app.request("run.list", {})
+        self.assertEqual(sent, [("run.status", {"run_id": "run-1"})])
+
+
 if __name__ == "__main__":
     unittest.main()

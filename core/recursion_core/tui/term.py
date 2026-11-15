@@ -196,7 +196,7 @@ class Tty:
 
         decoder, keys = self._decoder, []
         held_before = decoder.holding  # part of a key held from an earlier read
-        dropped = False  # an unfinished sequence that the wait ended without a key (review of a1f16a20, C3)
+        discarded_before = decoder.discarded
         data = self._read(timeout)
         while data is not None:
             if not data:
@@ -208,12 +208,13 @@ class Tty:
                 break
             data = self._read(self.esc_wait_s)
             if data is None:
-                timed_out = decoder.timeout()  # a lone ESC becomes esc; a longer unfinished sequence is dropped
-                dropped = not timed_out
-                keys += timed_out
+                keys += decoder.timeout()  # a lone ESC becomes esc; a longer unfinished sequence is dropped
         # Other input in the same read: another key, part of one held before or after it, or a sequence
-        # the wait dropped. (A lone Esc, or one key split over the wait, is one key, not a burst.)
-        burst = len(keys) > 1 or bool(keys) and (held_before or dropped or decoder.holding)
+        # that ended without a key however it ended (dropped by the wait or the end of input, completed
+        # as an unknown sequence, broken by another character; reviews of a1f16a20 and 46b8d7d8, C3).
+        # A lone Esc, or one key split over the wait, is one key, not a burst.
+        units = len(keys) + decoder.discarded - discarded_before
+        burst = units > 1 or bool(keys) and (held_before or decoder.holding)
         self._ready.extend((key, burst) for key in keys)
 
 

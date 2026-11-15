@@ -222,7 +222,31 @@ class RelayRefusesTests(unittest.TestCase):
                 reply = relay.handle(codec.read_message(io.BytesIO(HEADER.pack(len(body)) + body)))
                 self.assertEqual((reply["error"]["code"], reply["error"]["delivered"], reply["id"]),
                                  ("bad_frame", False, 1))
+        # A caller handing the relay a value JSON has no form for (a set) is refused the same way.
+        reply = relay.handle({"op": "control", "method": "run.list", "params": {"x": {1, 2}}, "id": 2})
+        self.assertEqual((reply["error"]["code"], reply["error"]["delivered"], reply["error"]["detail"]),
+                         ("bad_frame", False, "frame_not_encodable:TypeError"))
         self.assertEqual(daemon.seen, [])
+
+    def test_a_daemon_answer_that_cannot_be_framed_again_is_typed_and_delivered(self) -> None:
+        daemon = support.SocketDaemon(self)  # its socket directory; the answer comes from the client below
+
+        class NotEncodable:
+            def __init__(self, path, timeout_s):
+                pass
+
+            def request(self, message):
+                return {"ok": True, "result": {"code": "ok", "value": float("nan")}}
+
+            def close(self):
+                pass
+
+        out = io.BytesIO()
+        code = Relay(environ=daemon.environ, connect=NotEncodable).serve(
+            io.BytesIO(frames({"op": "control", "method": "run.list", "params": {}, "id": 7})), out)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(read_all(out.getvalue()),
+                         [codec.relay_error("response_not_encodable", delivered=True, request={"id": 7})])
 
     def test_the_relays_own_answers_can_always_be_written(self) -> None:
         daemon = support.SocketDaemon(self)

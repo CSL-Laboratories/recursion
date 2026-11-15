@@ -14,14 +14,16 @@ Delivery is reported as the socket client reports it, with one more hop to accou
   Details begin ``connect:`` (before any request was written), ``request:`` (the request was not written
   whole), ``relay:`` (the relay's own answer) or are the socket's own words (``busy``,
   ``daemon:scope_refused``).
-* ``delivered: "unknown"``: the request was written whole and no complete answer came back (the SSH link
-  or the relay died, or the answer did not arrive in time). It may have been carried out: read the run's
-  status before retrying. Nothing is ever resent.
+* ``delivered: "unknown"``: the request may have been written whole and no complete answer came back (the
+  SSH link or the relay died, the answer did not arrive in time, or the write's own outcome is not known).
+  It may have been carried out: read the run's status before retrying. Nothing is ever resent.
 * Otherwise the daemon's answer, verbatim.
 
-The request's deadline covers writing it and waiting for the answer. A write that does not finish in
-time ends the session (the ssh child is killed), and the request was not delivered: the relay acts only
-on whole frames. ``close()`` ends a session at once, also while a request is blocked in it.
+The request's deadline covers writing it and waiting for the answer; each wait gets only what is left of
+it. A write that does not finish in time ends the session (the ssh child is killed). The request is "not
+delivered" only when the write failed with bytes still unsent, since the relay acts only on whole frames;
+when the writer cannot show that (every byte may have gone out), it is ``"unknown"``. ``close()`` ends a
+session at once, also while a request is blocked in it.
 
 The host key is pinned, not trusted on first use. ``SshTarget.known_hosts`` names one known_hosts file
 that must accept exactly one key for the host, the expected one (``host_key_fingerprint``), and must hold
@@ -340,8 +342,8 @@ class SshRelayClient:
     def _handshake(self, timeout_s: float) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_s
         sent = self._send(encode_frame({"op": HELLO_OP, "relay_version": RELAY_VERSION}), deadline)
-        if sent == "write_timeout":
-            raise RelayHandshakeFailed("hello_timeout")
+        if sent in ("write_timeout", "write_unknown"):
+            raise RelayHandshakeFailed("hello_timeout")  # no request was sent: the session never came up
         if sent is not True:
             raise RelayHandshakeFailed(self._ended(sent))
         try:
@@ -377,9 +379,13 @@ class SshRelayClient:
                 raise RelayNotDelivered(f"request:{refusal}")  # nothing written; the session is intact
             deadline = time.monotonic() + self._timeout_s
             sent = self._send(encode_frame(message, max_bytes=self._max_frame_bytes), deadline)
+            if sent == "write_unknown":
+                # The writer did not show that bytes stayed unsent: the whole frame may have reached the relay.
+                self._close_locked()
+                raise RelayDeliveryUnknown("request:write_unknown")
             if sent is not True:
-                # Not written whole (ssh stopped reading, or the deadline passed): the relay acts only on
-                # whole frames, so this request was not carried out.
+                # The write failed with bytes unsent (ssh stopped reading, or the deadline's kill ended it):
+                # the relay acts only on whole frames, so this request was not carried out.
                 self._close_locked()
                 raise RelayNotDelivered(f"request:{sent}")
             try:
@@ -435,7 +441,12 @@ class SshRelayClient:
 
     # -- the child process ------------------------------------------------------------------------
     def _send(self, frame: bytes, deadline: float) -> bool | str:
-        """Write ``frame`` whole by ``deadline``: ``True``, or why not (``write_timeout``, ``write:<error>``).
+        """Write ``frame`` whole by ``deadline``.
+
+        ``True``: every byte was handed to ssh. ``write_timeout`` or ``write:<error>``: the write failed with
+        bytes still unsent, so the frame never went out whole (the deadline's kill ends a blocked write with
+        such a failure). ``write_unknown``: the writer has shown neither, so the frame may have gone out
+        whole; only a shown failure counts as "not delivered".
 
         The write runs in a thread of its own, so that a far side that stops reading cannot hold the caller
         past the deadline; at the deadline the ssh child is killed, which ends the write.
@@ -443,7 +454,7 @@ class SshRelayClient:
         proc = self._proc
         if proc is None:
             return "write:session_closed"
-        outcome: list[bool | str] = []
+        state: dict[str, Any] = {"all_sent": False, "error": None}
         done = threading.Event()
 
         def write() -> None:
@@ -454,22 +465,25 @@ class SshRelayClient:
                     if written is None or written <= 0:
                         raise BrokenPipeError("ssh took no bytes")
                     data = data[written:]
+                state["all_sent"] = True  # before the flush: from here the frame may have gone out whole
                 proc.stdin.flush()
-                outcome.append(True)
             except (OSError, ValueError) as exc:
-                outcome.append(f"write:{type(exc).__name__}")
+                state["error"] = f"write:{type(exc).__name__}"
             finally:
                 done.set()
 
         writer = threading.Thread(target=write, name="remote-ssh-writer", daemon=True)
         writer.start()
-        if not done.wait(max(0.0, deadline - time.monotonic())):
+        timed_out = not done.wait(max(0.0, deadline - time.monotonic()))
+        if timed_out:
             _kill(proc)
             done.wait(CLOSE_GRACE_S)
-            writer.join(CLOSE_GRACE_S)
-            return True if outcome and outcome[0] is True else "write_timeout"
-        writer.join()
-        return outcome[0]
+        writer.join(CLOSE_GRACE_S)
+        if state["all_sent"]:
+            return True
+        if done.is_set() and state["error"] is not None:
+            return "write_timeout" if timed_out else state["error"]
+        return "write_unknown"
 
     def _close_locked(self) -> int | None:
         """End the session: close ssh's stdin (the relay sees end of input), wait, kill if it lingers."""

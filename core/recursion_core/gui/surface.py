@@ -92,8 +92,10 @@ def withhold_venue_data(value: object) -> object:
 
     Any mapping is read as a dict and any list or tuple as a list, at every depth, and they
     come back as a dict and a list (C7 finding 4: a tuple of rows or a mapping proxy used to
-    pass through unredacted). A value JSON cannot carry (a set, a deque, any other object) is
-    replaced by a fixed marker, never shown.
+    pass through unredacted). Any other value that is not a str, an int (bool included), a
+    float or None (a set, a deque, any other object) is replaced by a fixed marker, never shown.
+    A float is kept whatever its value, NaN and the infinities included, as ``json.loads``
+    gives them; this is a redaction, not a strict-JSON sanitiser.
     """
     if isinstance(value, Mapping):
         out = {k: withhold_venue_data(v) for k, v in value.items()}

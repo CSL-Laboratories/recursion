@@ -517,6 +517,30 @@ class PanelTests(GuiHarness):
         self.assertNotIn("SET-SECRET", body)
         self.assertIn("Withheld: data not in the paper book", body)
 
+    def test_kept_response_metadata_in_any_mapping_stays_and_comes_back_plain(self):
+        # First review of #384 (both readers): an unlabelled or owned errors/provenance entry held in a
+        # mapping that is not a dict is kept, as a dict; a foreign entry nested in it still goes.
+        from collections import OrderedDict, UserDict
+        from types import MappingProxyType
+
+        for factory in (MappingProxyType, UserDict, OrderedDict):
+            for field in ("errors", "provenance"):
+                for venue in (None, "paper", "stock"):
+                    item = {"message": "KEPT-METADATA"}
+                    if venue:
+                        item["venue"] = venue
+                    with self.subTest(factory=factory.__name__, field=field, venue=venue):
+                        kept, withheld = filter_venue_rows({field: (factory(item),)}, "paper")
+                        self.assertEqual((kept, withheld), ({field: [item]}, False))
+                        self.assertIs(type(kept[field][0]), dict)
+                with self.subTest(factory=factory.__name__, field=field, nested="foreign"):
+                    value = factory({"source": "KEPT-SOURCE", "inputs": (
+                        factory({"venue": "kalshi", "source": "FOREIGN-SECRET"}), factory({"source": "KEPT-INPUT"}))})
+                    kept, withheld = filter_venue_rows({field: value}, "paper")
+                    self.assertEqual(kept, {field: {"source": "KEPT-SOURCE", "inputs": [{"source": "KEPT-INPUT"}]}})
+                    self.assertTrue(withheld)
+                    self.assertIs(type(kept[field]), dict)
+
     # C7 finding 12 (gemini-wave R2): the test from R2/fix-12.patch, and only the test. Which side
     # adapts the O7 answer shape is F1, held (CSL-DECISIONS.md section F, 7:07 PM Nov 12), so no
     # fix is made here; lane PAGE's report carries the proposal. When the shape is decided and

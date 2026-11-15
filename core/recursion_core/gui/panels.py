@@ -82,7 +82,7 @@ def panel_registry(panels):
 
 _DROP = object()
 _RESPONSE_LEVEL = ("errors", "provenance")
-# What JSON can carry besides objects and arrays (bool is an int). Anything else is withheld.
+# The scalars json.loads gives (bool is an int; a float may be NaN or infinite). Anything else is withheld.
 _JSON_SCALARS = (str, int, float, type(None))
 # One paper book. O7 v0 labels positions ``stock``; the paper gateway labels orders ``paper``.
 # A panel declaring either id keeps both row labels and both key prefixes. Any other venue
@@ -110,8 +110,11 @@ def filter_venue_rows(value, venue):
     """Keep read data for a declared panel venue, without mutating the response.
 
     ``value`` is one control-API response, a mapping; anything else is withheld whole.
-    Returns ``(kept, withheld)``: ``kept`` is a new dict, ``withheld`` is true when anything
-    was left out. A panel whose venue is ``paper`` or ``stock`` keeps both
+    Returns ``(kept, withheld)``: ``kept`` is a new dict; ``withheld`` is true when the
+    filter dropped a dict labelled with another venue, a value outside a dict labelled with
+    an owned venue, or a value JSON cannot carry. An unlabelled container that is empty, or
+    left empty, is left out too, and on its own does not set ``withheld`` (what was dropped
+    from it does). A panel whose venue is ``paper`` or ``stock`` keeps both
     labels, and ``paper_*`` / ``stock_*`` keys, as one book. Any other venue keeps only
     that id. Fails closed: a dict labelled with a venue the panel does not own, and any
     value outside a dict labelled with an owned venue (unlabelled nested dicts, totals,
@@ -126,8 +129,10 @@ def filter_venue_rows(value, venue):
 
     Containers (C7 finding 4): any mapping is read as a dict and any list or tuple as a
     list, and they come back as a dict and a list, so a tuple of rows or a mapping proxy is
-    filtered like the JSON it stands for. A value JSON cannot carry (a set, a deque, any
-    other object) is withheld wherever it is, even inside a kept row.
+    filtered like the JSON it stands for. Any other value that is not a str, an int (bool
+    included), a float or None (a set, a deque, any other object) is withheld wherever it is,
+    even inside a kept row. A float is kept whatever its value, NaN and the infinities
+    included, as ``json.loads`` gives them; this filter is not a strict-JSON sanitiser.
     """
     if not isinstance(value, Mapping):
         return {}, True

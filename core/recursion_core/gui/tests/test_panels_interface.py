@@ -9,6 +9,7 @@ made to let another change pass.
 import inspect
 import unittest
 from collections import OrderedDict
+from collections.abc import Mapping
 from types import MappingProxyType
 
 from recursion_core.gui import panels
@@ -153,6 +154,49 @@ class InterfaceTests(unittest.TestCase):
         for entry in panel_registry([{"id": "q", "title": "Q", "reads": list(READS)}]).values():
             self.assertTrue(all(type(r) is str for r in entry["reads"]))
             self.assertIs(type(entry["title"]), str)
+
+    def test_reads_are_copied_before_anything_else_is_read_from_the_declaration(self):
+        # First review of #384 (both readers): a declaration that changes its own reads list while
+        # it is read further must not get an unchecked read stored. The mapping is permitted; only
+        # its get("venue") has a side effect, after the reads were checked.
+        reads = [READS[0]]
+
+        class Changing(Mapping):
+            def __init__(self, data):
+                self._data = data
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __iter__(self):
+                return iter(self._data)
+
+            def __len__(self):
+                return len(self._data)
+
+            def get(self, key, default=None):
+                if key == "venue":
+                    reads[:] = ["operator.orders.submit"]
+                return self._data.get(key, default)
+
+        registry = panel_registry([Changing({"id": "p", "title": "Panel", "reads": reads})])
+        self.assertEqual(reads, ["operator.orders.submit"])  # the declaration did change after the check
+        self.assertEqual(registry["p"]["reads"], (READS[0],))
+
+    def test_a_tuple_subclass_of_reads_is_refused(self):
+        class Reads(tuple):
+            pass
+
+        self.refused({**GOOD, "reads": Reads([READS[0]])}, BAD_READS)
+
+    def test_length_bounds_of_venue_and_of_each_venue_use_segment(self):
+        longest = "a" * 48 + ":" + "b" * 48
+        registry = panel_registry([{**GOOD, "venue": "v" * 48, "venue_use": longest}])
+        self.assertEqual((registry[GOOD["id"]]["venue"], registry[GOOD["id"]]["venue_use"]), ("v" * 48, longest))
+        for venue_use in ("a" * 49 + ":b", "a:" + "b" * 49, ":b", "a:", "a:b:c"):
+            with self.subTest(venue_use=venue_use):
+                self.refused({**GOOD, "venue_use": venue_use}, BAD_VENUE_USE)
+        self.refused({**GOOD, "venue": "v" * 49}, BAD_VENUE)
 
     def test_filter_venue_rows_contract(self):
         response = {"errors": [{"code": "E"}], "result": {"rows": [{"venue": "kalshi", "symbol": "K"},

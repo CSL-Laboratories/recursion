@@ -596,5 +596,76 @@ class _Audit(HTMLParser):
             self.button_text[-1] += data
 
 
+def _directives(header: str) -> dict:
+    out = {}
+    for part in header.split(";"):
+        words = part.split()
+        if words:
+            out[words[0].lower()] = words[1:]
+    return out
+
+
+class StrictDoorPins(GuiHarness):
+    """Two door rules no earlier test held (first review of #384, GPT-6.1 Sol, R1)."""
+
+    ROUTES = (
+        ("GET", "/", None, ""),
+        ("GET", "/read", None, "command=operator.positions.inspect"),
+        ("GET", "/panel", None, "id=missing"),
+        ("POST", "/action", {"command": ACTIONS[0], "confirm": "explicit"}, ""),
+        ("POST", "/stop", {"run_id": "run-1", "confirm": "explicit"}, ""),
+        ("GET", "/v1/control", None, ""),
+        ("POST", "/v1/control", {"method": "run.list"}, ""),
+    )
+
+    def test_only_the_value_true_admits_a_device(self) -> None:
+        # The core adapter's answer is taken only when it is the value True: a truthy number, text,
+        # list or principal-shaped mapping is not an admission, on every path, known or not.
+        for verdict in (False, None, 0, 1, "yes", [True], {"kind": "device", "id": "page"}):
+            for method, path, form, query in self.ROUTES:
+                with self.subTest(verdict=verdict, method=method, path=path):
+                    self.door.ok = verdict
+                    status, _, body = self.request(method, path, form, query=query)
+                    self.assertEqual(status, "401 Unauthorized")
+                    self.assertIn("device_not_authenticated", body)
+        self.assertEqual(self.api.calls, [])
+        self.door.ok = True
+        self.assertEqual(self.request("GET", "/")[0], "200 OK")
+
+    def test_every_response_class_denies_scripts_and_allows_only_the_page_stylesheet(self) -> None:
+        page = self.request("GET", "/")[2]
+        style = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
+        style_source = "'sha256-%s'" % base64.b64encode(hashlib.sha256(style.encode()).digest()).decode()
+        door_says_no = _Door(False)
+        cases = {
+            "200 OK": lambda: self.request("GET", "/"),
+            "400 Bad Request": lambda: self.request("GET", "/read", query="command=operator.orders.submit"),
+            "403 Forbidden": lambda: self.request("GET", "/", headers={"HTTP_HOST": "evil.example"}),
+            "404 Not Found": lambda: self.request("GET", "/nowhere"),
+            "405 Method Not Allowed": lambda: self.request("POST", "/panel", {"id": "x"}),
+        }
+        responses = {status: make() for status, make in cases.items()}
+        self.app._door = door_says_no
+        responses["401 Unauthorized"] = self.request("GET", "/")
+        for expected, (status, headers, body) in responses.items():
+            with self.subTest(status=expected):
+                self.assertEqual(status, expected)
+                policy = _directives(headers["Content-Security-Policy"])
+                self.assertEqual(policy["default-src"], ["'none'"])
+                # What a browser applies to script elements and to script attributes, fallbacks included.
+                for chain in (("script-src-elem", "script-src", "default-src"),
+                              ("script-src-attr", "script-src", "default-src")):
+                    effective = next(policy[name] for name in chain if name in policy)
+                    self.assertEqual(effective, ["'none'"], chain)
+                style_elem = next(policy[name] for name in ("style-src-elem", "style-src", "default-src") if name in policy)
+                self.assertEqual(style_elem, [style_source])
+                self.assertNotIn("style-src-attr", policy)
+                for values in policy.values():
+                    self.assertFalse({"'unsafe-inline'", "'unsafe-eval'", "'unsafe-hashes'", "*"} & set(values))
+                self.assertEqual(policy["base-uri"], ["'none'"])
+                self.assertEqual(policy["frame-ancestors"], ["'none'"])
+                self.assertNotIn("<script", body.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

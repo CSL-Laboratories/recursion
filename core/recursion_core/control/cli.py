@@ -25,7 +25,7 @@ import sys
 from collections.abc import Callable
 from typing import TextIO
 
-from recursion_core.tui.protocol import answer_conditions, list_all_runs
+from recursion_core.tui.protocol import COMMANDS as BUILT_IN, answer_conditions, list_all_runs
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PENDING, EXIT_UNKNOWN = 0, 1, 2, 3, 4
 _EXIT = {"ok": EXIT_OK, "started": EXIT_OK, "stopped": EXIT_OK, "pending": EXIT_PENDING, "run_unknown": EXIT_UNKNOWN}
@@ -40,7 +40,7 @@ class _Usage(Exception):
     pass
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser(commands=None) -> argparse.ArgumentParser:
     p = _Parser(prog="recursion-control")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("list")
@@ -52,18 +52,39 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--prompt", required=True)
     start.add_argument("--client-key")
     sub.add_parser("conditions")
+    if commands is not None:
+        commands.add_parsers(sub)  # seam S2: the command families other lanes registered; none by default
     return p
 
 
-def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = None) -> int:
-    """Run one command against ``api`` (anything with ``call(method, params) -> dict``)."""
+def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = None, commands=None) -> int:
+    """Run one command against ``api`` (anything with ``call(method, params) -> dict``).
+
+    ``commands`` is the command table of the composed hooks (``control.commands.CommandTable``), or None: with
+    None, or with a table nobody registered into, the commands are the five above and nothing else. Only a
+    REGISTERED name is dispatched to the table; any other name is a usage error, never a start.
+    """
 
     out, err = out or sys.stdout, err or sys.stderr
+    command_errors: tuple = ()
+    if commands is not None:  # only a table brings its module in: the five commands import what they did before
+        from recursion_core.control.commands import CommandTableError
+        command_errors = (CommandTableError,)
     try:
-        ns = _parser().parse_args(argv)
+        ns = _parser(commands).parse_args(argv)
     except _Usage as exc:
         print(f"usage error: {exc}", file=err)
         return EXIT_USAGE
+    except command_errors as exc:  # a family's parser broke the table's rules: no command runs, its own included
+        print(json.dumps({"code": "control_api_unavailable", "detail": f"commands:{exc}"}), file=out)
+        return EXIT_ERROR
+    if commands is not None and ns.command in commands:
+        ns.out, ns.err = out, err
+        try:
+            return commands.dispatch(ns, api)
+        except command_errors as exc:  # the command gave no exit status
+            print(json.dumps({"code": "control_api_unavailable", "detail": f"commands:{exc}"}), file=out)
+            return EXIT_ERROR
     if ns.command == "conditions":  # no state between invocations, so read the list, then show its conditions
         result = list_all_runs(api.call)
         shown = [{"label": label, "text": text} for label, text in answer_conditions(result)]
@@ -97,4 +118,15 @@ def run(argv: list[str], api_factory: Callable[[], object] | None) -> int:
         print(json.dumps({"code": "control_api_unavailable", "detail": f"factory:{type(err).__name__}"}),
               file=sys.stdout)
         return EXIT_ERROR
-    return main(argv, api)
+    if argv and argv[0] in BUILT_IN:
+        # This file's own five commands take the path they always took. No registrant is discovered or imported
+        # for them: a lane that is installed and broken cannot stop them, no family can reach their parsers, and
+        # they cost what they cost before the seams. No registrant can own one of these names.
+        return main(argv, api)
+    try:  # seam S2: compose the hooks to learn the registered command families; with none this adds nothing
+        from recursion_core.control import hooks
+        commands = hooks.compose().commands
+    except Exception as err:  # noqa: BLE001 - a registrant that is present and broken stops the CLI, loudly
+        print(json.dumps({"code": "control_api_unavailable", "detail": f"hooks:{type(err).__name__}"}), file=sys.stdout)
+        return EXIT_ERROR
+    return main(argv, api, commands=commands)

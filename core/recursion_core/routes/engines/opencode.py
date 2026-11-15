@@ -95,13 +95,15 @@ import hashlib
 import json
 import math
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 
 from recursion_core.routes import contract as c
-from recursion_core.routes.driver import Declaration, Driver, Flags, check_draft
+from recursion_core.routes.driver import (Declaration, Driver, DriverInputError, DriverStateError, Flags,
+                                          check_draft)
 
 ENGINE = "opencode"
 # The command a registration will state as ``default_executable``: argv[0] is the binary option composition gives,
@@ -314,6 +316,291 @@ class OpenCodeDriver(Driver):
         if worker["turn"] is not None and handle.live_turn == worker["turn"]:
             self.turn_ended(handle, worker["turn"])
         return drafts
+
+
+# -- the serve drive (the brief's step 5), built against fakes: nothing here is registered, wired or run live ------
+
+# driver.v2 flags of the serve drive. A later turn reaches the same conversation through the server, a turn can be
+# interrupted, and a conversation is resumed by OpenCode's own session id. No input reaches a turn in progress (a
+# turn's message is the whole of its standard input), no fork, and no permission bridge (lane questions Q1).
+SERVE_FLAGS = MappingProxyType({"multi_turn": True, "mid_turn_input": False, "interrupt": True, "resume": True,
+                                "fork": False, "permission_bridge": False, "typed_limits": True, "usage": True})
+LOOPBACK = "127.0.0.1"
+# The server's readiness line (1.x ``opencode serve``), and the only server a turn may attach to: this machine's
+# loopback address and a port from 1 to 65535, written without a leading zero.
+_LISTENING = re.compile(r"opencode server listening on (http://127\.0\.0\.1:[1-9][0-9]{0,4})[ \t]*\r?\n?")
+_LOOPBACK_URL = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})")
+
+
+def serve_declaration() -> dict:
+    """driver.v2's root record for the serve drive."""
+    return {"engine": ENGINE, "driver": 2, "flags": dict(SERVE_FLAGS), "input_ack": False}
+
+
+def _check_binary(binary: object) -> None:
+    if binary is not None and (not isinstance(binary, str) or not binary or _CONTROL.search(binary)):
+        raise ValueError("binary")
+
+
+def _port_ok(port: object) -> bool:
+    return type(port) is int and 1 <= port <= 65535
+
+
+def _loopback_url_ok(url: object) -> bool:
+    match = _LOOPBACK_URL.fullmatch(url) if isinstance(url, str) else None
+    return match is not None and int(match.group(1)) <= 65535
+
+
+def _session_ok(session: object) -> bool:
+    """OpenCode's own session id as an argv value: what the parser keeps as one, and never read as an option."""
+    return isinstance(session, str) and 1 <= len(session) <= MAX_SESSION_ID and not session.startswith("-") \
+        and not _CONTROL.search(session) and not _SURROGATE.search(session)
+
+
+def server_url(port: int) -> str:
+    if not _port_ok(port):
+        raise ValueError("port")
+    return f"http://{LOOPBACK}:{port}"
+
+
+def serve_argv(port: int, *, binary: str | None = None) -> list[str]:
+    """argv for ``opencode serve`` on the loopback address and the port the driver picked."""
+    _check_binary(binary)
+    if not _port_ok(port):
+        raise ValueError("port")
+    return [binary if binary is not None else DEFAULT_EXECUTABLE, "serve", "--hostname", LOOPBACK, "--port", str(port)]
+
+
+def listening_url(text: object, port: int) -> str | None:
+    """The server's own readiness line, when it names exactly the loopback address and ``port``; otherwise None."""
+    match = _LISTENING.fullmatch(text) if isinstance(text, str) else None
+    if match is None or match.group(1) != server_url(port):
+        return None
+    return match.group(1)
+
+
+def attach_argv(url: str, model: str | None, *, session: str | None = None, binary: str | None = None) -> list[str]:
+    """argv for one turn through the server: ``opencode run --format json [--model m] --attach <url>``, and
+    ``--session <id>`` to continue OpenCode's own conversation. Only the loopback server is ever attached."""
+    if not _loopback_url_ok(url):
+        raise ValueError("url")
+    argv = build_argv(model, binary=binary) + ["--attach", url]
+    if session is not None:
+        if not _session_ok(session):
+            raise ValueError("session")
+        argv += ["--session", session]
+    return argv
+
+
+def pick_port() -> int:
+    """A free loopback port, from the kernel (a bind to port 0). Another process may take it before the server binds
+    it; the server then gives no readiness line and ``start`` refuses."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((LOOPBACK, 0))
+        return probe.getsockname()[1]
+
+
+def http_abort(url: str, session: str, *, timeout: float = 5.0) -> bool:
+    """OpenCode's own abort of the session's running turn: ``POST <url>/session/<id>/abort`` on the loopback server,
+    never through a proxy and never following a redirect. True when the server answered 2xx; False when it
+    answered otherwise or not at all."""
+    if not _loopback_url_ok(url):
+        raise ValueError("url")
+    if not _session_ok(session):
+        raise ValueError("session")
+    import urllib.parse
+    import urllib.request
+
+    request = urllib.request.Request(f"{url}/session/{urllib.parse.quote(session, safe='')}/abort", data=b"",
+                                     method="POST")
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):   # a 3xx stays an HTTPError: nothing is followed
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(request, timeout=timeout):
+            return True   # any answer that is not 2xx raises HTTPError (urllib's HTTPErrorProcessor)
+    except OSError:   # URLError and HTTPError are OSErrors
+        return False
+
+
+class ServeDriver(Driver):
+    """driver.v2 for the serve drive: one ``opencode serve`` per handle on the loopback address, and one
+    ``opencode run --attach`` per turn (the 1.x line; 2.x's ``--server`` is not built). Built against fakes.
+
+    ``spawn(argv, env) -> process`` starts a process; the launch path behind it (the guard, the child environment,
+    the unit) is the caller's. A process has ``send(text)``, ``close_stdin()``, ``read_line(timeout)`` (a line, or
+    None once its output has ended) and ``terminate()``. ``port()`` picks the server's port.
+
+    ``start`` and ``resume`` start the server and read its output, on ``clock``, for up to ``ready_s`` seconds until
+    its readiness line names the loopback address and that port. Otherwise the server is terminated and the call
+    raises ``DriverStateError``; nothing else was started. ``resume`` continues OpenCode's own session id: every
+    turn of that handle passes ``--session <id>``.
+
+    A turn: the ``user_message`` is spawned as ``run --attach`` with its text on standard input, which is then
+    ended; ``parse`` reads that turn's stdout; the first ``step_start`` accepts the message (``new_turn``);
+    ``finish_turn(handle, exit_code)`` drafts the turn's result once its process has exited, and ends the turn. A
+    later turn of a handle whose conversation id is still unknown cannot reach the same conversation: it is refused
+    (``DriverStateError``), that turn is ended, and nothing is spawned. A turn whose process cannot be started
+    ends at once and the spawn's error is raised. A turn that reports another session id than
+    the conversation's is recorded in the turn parser's ``anomalies`` (``conversation_changed``).
+
+    ``interrupt`` asks the server to abort the session's running turn (``abort(url, session_id)``, OpenCode's own
+    abort); when no id is known yet, or the server does not answer 2xx, or the ask raises, the turn's process is
+    terminated instead. Either way the turn ends through ``finish_turn``. ``close`` ends the handle's input: the
+    server is stopped then, or once the turn in progress is finished. ``release(handle)`` stops both processes at
+    once and forgets the handle; who calls it on Stop and shutdown is lane STOP's and DRIVER-CC's to define.
+    """
+
+    declaration = Declaration(ENGINE, Flags(**SERVE_FLAGS), input_ack=False)
+
+    def __init__(self, spawn: Callable[[list, dict], object], *, binary: str | None = None,
+                 port: Callable[[], int] = pick_port, abort: Callable[[str, str], bool] = http_abort,
+                 ready_s: float = 30.0, wall: Callable[[], float] = time.time,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        if not all(callable(f) for f in (spawn, port, abort, wall, clock)):
+            raise ValueError("callable")
+        _check_binary(binary)
+        if type(ready_s) not in (int, float) or not math.isfinite(ready_s) or ready_s <= 0:
+            raise ValueError("ready_s")
+        self._spawn, self._binary, self._port, self._abort = spawn, binary, port, abort
+        self._ready_s, self._wall, self._clock = ready_s, wall, clock
+        self._workers: dict[int, dict] = {}
+        self._lock = threading.Lock()   # guards the table of workers only; never held while a process is called
+
+    def _worker(self, handle) -> dict:
+        with self._lock:   # a registered worker holds its handle, so no other handle can have its id
+            worker = self._workers.get(id(handle))
+        if worker is None:
+            raise DriverStateError("this handle has no server (released, or never started)")
+        return worker
+
+    def _start(self, handle, request: dict, env: dict) -> None:
+        route = request["route"]
+        connection = f"{route['connection']['kind']}:{route['connection']['id']}"
+        # A route the parser refuses is refused here, before anything is started.
+        Parser(connection_id=connection, model=route["model"], wall=self._wall, clock=self._clock)
+        if request["engine_session_id"] is not None and not _session_ok(request["engine_session_id"]):
+            raise DriverInputError("engine_session_id")
+        port = self._port()
+        argv = serve_argv(port, binary=self._binary)
+        server = self._spawn(argv, dict(env))
+        try:
+            url = self._await_ready(server, port)
+        except BaseException:
+            server.terminate()
+            raise
+        if url is None:
+            server.terminate()
+            raise DriverStateError("opencode serve gave no readiness line for its loopback address")
+        with self._lock:
+            self._workers[id(handle)] = {"handle": handle, "server": server, "url": url, "env": dict(env),
+                                         "route": route, "connection": connection, "turn": None, "turns": 0,
+                                         "closed": False}
+
+    def _await_ready(self, server, port: int) -> str | None:
+        from recursion_core.routes.launch import ReadTimeout   # local, as in OneShot
+
+        deadline = self._clock() + self._ready_s
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return None
+            try:
+                line = server.read_line(remaining)
+            except ReadTimeout:
+                return None
+            if line is None:   # its output ended: the server exited
+                return None
+            url = listening_url(line, port)
+            if url is not None:
+                return url
+
+    def _send(self, handle, item: dict) -> None:
+        worker = self._worker(handle)
+        if item["kind"] == "close":
+            worker["closed"] = True
+            if worker["turn"] is None:
+                self.release(handle)
+            return
+        # A user_message: the gate reserved it as a new turn (mid_turn_input is false).
+        session = handle.engine_session_id
+        if worker["turns"] and session is None:
+            self.turn_ended(handle, item["turn_id"])
+            raise DriverStateError("no conversation id to continue: the earlier turns reported none")
+        route = worker["route"]
+        argv = attach_argv(worker["url"], route["model"], session=session, binary=self._binary)
+        parser = Parser(connection_id=worker["connection"], model=route["model"], wall=self._wall, clock=self._clock)
+        try:
+            process = self._spawn(argv, dict(worker["env"]))
+        except BaseException:
+            self.turn_ended(handle, item["turn_id"])   # nothing started and nothing written: the turn ends
+            raise
+        worker["turn"] = {"id": item["turn_id"], "delivery": item["delivery_id"], "process": process,
+                          "parser": parser, "accepted": False}
+        worker["turns"] += 1
+        process.send(item["text"])
+        process.close_stdin()
+
+    def _parse(self, handle, line: str) -> list[dict]:
+        worker = self._worker(handle)
+        turn = worker["turn"]
+        if turn is None:
+            raise DriverStateError("no turn in progress")
+        parser = turn["parser"]
+        drafts = parser.feed(line)
+        reported = parser.engine_session_id
+        if reported is not None and handle.engine_session_id is None:
+            handle.set_engine_session_id(reported)
+        elif reported is not None and reported != handle.engine_session_id and not turn.get("changed"):
+            turn["changed"] = True
+            parser._anomaly("conversation_changed")
+        if not turn["accepted"] and parser.last_type == "step_start":
+            turn["accepted"] = True
+            drafts.append(_draft("input.accepted", {"delivery_id": turn["delivery"], "turn_id": turn["id"],
+                                                    "how": "new_turn"}))
+        return drafts
+
+    def finish_turn(self, handle, exit_code: int | None) -> list[dict]:
+        """The turn's ``result`` draft once its process has exited; the turn ends with it."""
+        worker = self._worker(handle)
+        turn = worker["turn"]
+        if turn is None:
+            raise DriverStateError("no turn in progress")
+        drafts = [check_draft(d) for d in turn["parser"].end(exit_code)]
+        worker["turn"] = None
+        if handle.live_turn == turn["id"]:
+            self.turn_ended(handle, turn["id"])
+        if worker["closed"]:
+            self.release(handle)
+        return drafts
+
+    def _interrupt(self, handle, turn_id: str) -> None:
+        worker = self._worker(handle)
+        turn = worker["turn"]
+        if turn is None or turn["id"] != turn_id:
+            raise DriverStateError(f"{turn_id} has no process")
+        session = handle.engine_session_id
+        if session is not None:
+            try:
+                if self._abort(worker["url"], session) is True:
+                    return
+            except Exception:   # an ask that fails is no abort: the process is ended instead
+                pass
+        turn["process"].terminate()
+
+    def release(self, handle) -> None:
+        """Stop the turn's process and the server, and forget the handle. A second call does nothing."""
+        with self._lock:
+            worker = self._workers.pop(id(handle), None)
+            if worker is None:
+                return
+        if worker["turn"] is not None:
+            worker["turn"]["process"].terminate()
+        worker["server"].terminate()
 
 
 class Parser:

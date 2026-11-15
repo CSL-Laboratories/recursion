@@ -243,7 +243,7 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
         for tool in tools:
             name = tool.spec.name
-            if not _NAME.fullmatch(name):
+            if not isinstance(name, str) or not _NAME.fullmatch(name):
                 raise ValueError(f"tool name {name!r}")
             if name in self._tools:
                 raise ValueError(f"tool {name!r} registered twice")
@@ -281,9 +281,12 @@ class ToolRegistry:
                                 ctx)
         if call.input is None:
             # The documented answer to input that is not JSON: hand the raw text back, built with the JSON
-            # library so quotes in it are escaped, and do not run the tool.
-            text = json.dumps({"INVALID_JSON": call.raw_input}, ensure_ascii=False)
-            return self._finish(call, ToolOutput(text, ERROR), ctx)
+            # library so quotes in it are escaped, and do not run the tool. Input refused for its depth had its
+            # raw text dropped (it was never decoded and scrubbed); the answer says why beside it.
+            answer = {"INVALID_JSON": call.raw_input}
+            if call.input_error == b.INPUT_TOO_DEEP:
+                answer["error"] = f"{b.INPUT_TOO_DEEP}; the tool did not run"
+            return self._finish(call, ToolOutput(json.dumps(answer, ensure_ascii=False), ERROR), ctx)
         if not isinstance(call.input, Mapping):
             return self._finish(call, ToolOutput("invalid input: the input must be a JSON object", ERROR), ctx)
         try:

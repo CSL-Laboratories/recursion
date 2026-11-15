@@ -25,8 +25,9 @@ Values a provider returns keep the wire's limits (event.v1): token counts are wh
 every measurement is finite, a call id is 1 to 128 characters and a tool name 1 to 256, neither with a CR or a
 LF. A provider refuses a reply that breaks them with ``ProtocolError``; the dataclasses below refuse such
 values with ``ValueError``. A tool input nested more than ``MAX_INPUT_DEPTH`` objects or arrays deep is kept as
-input that did not parse (``input_error`` is ``INPUT_TOO_DEEP``): no tool takes one, and walking it could reach
-Python's recursion limit wherever the loop scrubs, checks or writes it.
+input that did not parse (``input_error`` is ``INPUT_TOO_DEEP``) and its raw text is dropped: no tool takes one,
+walking it could reach Python's recursion limit wherever the loop scrubs, checks or writes it, and text that was
+never decoded and scrubbed could still spell a secret with JSON escapes.
 """
 
 from __future__ import annotations

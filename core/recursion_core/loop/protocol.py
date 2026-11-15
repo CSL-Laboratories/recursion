@@ -20,8 +20,8 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
     limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
     turn_ended      {turn_id, outcome, result, reason}
     interrupt       {turn_id, delivered}: delivered when that turn was running or waiting; such a line always
-                    comes before the turn's turn_ended, which is interrupted unless the turn had already finished
-                    its work
+                    comes before the turn's turn_ended, which is interrupted unless the model had already
+                    finished the turn (candidate_done) or the loop failed (loop_error)
     protocol_error  {code, detail}
     closed          once, when the loop exits after close or the end of its input
 
@@ -105,6 +105,8 @@ _FIELDS = {
 
 
 def parse_input(line: bytes | str) -> Input:
+    if not isinstance(line, (bytes, str)):
+        raise InputError("bad_input", "a line is bytes or text")
     if isinstance(line, bytes):
         try:
             line = line.decode("utf-8")

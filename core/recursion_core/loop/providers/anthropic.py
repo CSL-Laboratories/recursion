@@ -34,8 +34,9 @@ parts as one text (a key split across two text blocks is found in their join), t
 (a fragment that could be the start of the key is held back until the next fragment, in this block or the next
 text block, or the end of the message). A thinking or other vendor block that holds it is refused
 (``ProtocolError``), since changing it would break its signature, and so is a tool call whose id or name holds
-it. A stream nested deeper than this client reads is refused with ``ProtocolError`` too; a tool input nested
-more than ``MAX_INPUT_DEPTH`` levels deep is kept as input that did not parse.
+it. A stream nested deeper than this client reads, a block whose text is not text, and a reply longer than
+``MAX_REPLY_CHARS`` are refused with ``ProtocolError`` too; a tool input nested more than ``MAX_INPUT_DEPTH``
+levels deep is kept as input that did not parse, its raw text dropped.
 
 A call that fails or is interrupted after the stream began still reports what it measured: the exception's
 ``usage`` holds the counts the stream had given (an output count is a lower bound until ``message_stop``) and
@@ -67,6 +68,7 @@ ENV_KEY = "ANTHROPIC_API_KEY"
 ENV_BASE_URL = "ANTHROPIC_BASE_URL"
 FIRST_PARTY_HOST = "api.anthropic.com"
 MAX_ERROR_BODY = 1024 * 1024
+MAX_REPLY_CHARS = 32 * 1024 * 1024  # all the text, tool input, thinking and signature one reply may stream
 
 _STOP = {
     "end_turn": b.END_TURN, "tool_use": b.TOOL_USE, "max_tokens": b.MAX_TOKENS, "refusal": b.REFUSAL,
@@ -120,8 +122,13 @@ def _default_connection(scheme: str, host: str, port: int, timeout: float) -> ht
     return http.client.HTTPConnection(host, port, timeout=timeout)
 
 
-def _timestamp(epoch: float) -> str:
-    moment = datetime.fromtimestamp(epoch, tz=timezone.utc)
+def _timestamp(epoch: float) -> str | None:
+    """An event.v1 timestamp, or None for a moment the platform cannot write (a vendor's absurd retry time)."""
+
+    try:
+        moment = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
     return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
@@ -445,6 +452,7 @@ class _StreamState:
         self.order: list[int] = []
         self.done: dict[int, b.Part] = {}
         self.unsent = ""  # streamed text held back because it could be the start of the key (across blocks)
+        self.size = 0  # characters the reply has streamed, bounded by MAX_REPLY_CHARS
         self.last_text = 0  # the index of the last text block, for what is still held when the message ends
 
     def _protocol(self, what: str) -> b.ProtocolError:
@@ -495,6 +503,7 @@ class _StreamState:
                 raise self._protocol("content_block_delta for no open block")
             dtype = delta.get("type")
             if dtype == "text_delta" and isinstance(delta.get("text"), str):
+                self._grow(delta["text"])
                 entry["text"].append(delta["text"])
                 if on_event is not None and delta["text"]:
                     # What an earlier text block held back is carried over: a key can be split across blocks.
@@ -506,10 +515,13 @@ class _StreamState:
                     if pending:
                         on_event(b.TextDelta(index, pending))
             elif dtype == "input_json_delta" and isinstance(delta.get("partial_json"), str):
+                self._grow(delta["partial_json"])
                 entry["json"].append(delta["partial_json"])
             elif dtype == "thinking_delta" and isinstance(delta.get("thinking"), str):
+                self._grow(delta["thinking"])
                 entry["thinking"].append(delta["thinking"])
             elif dtype == "signature_delta" and isinstance(delta.get("signature"), str):
+                self._grow(delta["signature"])
                 entry["signature"].append(delta["signature"])
             # Other delta types (citations, for one) carry nothing this loop uses; they are skipped.
             return None
@@ -534,9 +546,18 @@ class _StreamState:
             return "stop"
         return None  # an event type this client does not know is skipped, as the stream format allows
 
+    def _grow(self, piece: str) -> None:
+        self.size += len(piece)
+        if self.size > MAX_REPLY_CHARS:
+            raise self._protocol(f"the reply is longer than {MAX_REPLY_CHARS} characters")
+
     def _finish_block(self, entry: dict, provider: AnthropicProvider) -> b.Part:
         block = entry["block"]
         btype = block.get("type")
+        # The text a block starts with is the vendor's JSON, whatever it is: anything but text is refused.
+        for key in {"text": ("text",), "thinking": ("thinking", "signature")}.get(btype, ()):
+            if block.get(key) is not None and not isinstance(block.get(key), str):
+                raise self._protocol(f"a {btype} block's {key} is not text")
         if btype == "text":
             return b.TextPart((block.get("text") or "") + "".join(entry["text"]))  # scrubbed with the whole reply
         if btype == "tool_use":
@@ -551,7 +572,7 @@ class _StreamState:
             if not raw.strip():
                 start = block.get("input")
                 if isinstance(start, dict) and b.nests_deeper(start, b.MAX_INPUT_DEPTH):
-                    return b.ToolCall(call_id, name, None, raw, b.INPUT_TOO_DEEP)
+                    return b.ToolCall(call_id, name, None, "", b.INPUT_TOO_DEEP)
                 return b.ToolCall(call_id, name, provider._scrub_obj(dict(start)) if isinstance(start, dict) else {},
                                   raw)
             try:
@@ -559,14 +580,15 @@ class _StreamState:
             except ValueError as exc:
                 return b.ToolCall(call_id, name, None, raw, f"input is not valid JSON: {exc.msg}")
             except RecursionError:  # nested deeper than the decoder goes
-                return b.ToolCall(call_id, name, None, raw, b.INPUT_TOO_DEEP)
-            if not isinstance(parsed, dict):
-                return b.ToolCall(call_id, name, None, raw, "input is not a JSON object")
+                return b.ToolCall(call_id, name, None, "", b.INPUT_TOO_DEEP)
+            # Raw text that was never decoded and scrubbed could spell the key with JSON escapes: dropped.
             if b.nests_deeper(parsed, b.MAX_INPUT_DEPTH):
-                return b.ToolCall(call_id, name, None, raw, b.INPUT_TOO_DEEP)
+                return b.ToolCall(call_id, name, None, "", b.INPUT_TOO_DEEP)
             clean = provider._scrub_obj(parsed)
             if clean != parsed:  # the key was there, spelt with JSON escapes the text scrub cannot see
                 raw = json.dumps(clean, ensure_ascii=False)
+            if not isinstance(parsed, dict):
+                return b.ToolCall(call_id, name, None, raw, "input is not a JSON object")
             return b.ToolCall(call_id, name, clean, raw)
         if btype == "thinking":
             data = dict(block)

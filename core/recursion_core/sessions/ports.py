@@ -10,8 +10,9 @@ stands on lane DRIVER-CC's handle service, lane STOP's Stop and lane ROUTING's c
     The engine's driver.v2 declaration (#368): ``{"engine", "driver", "flags", "input_ack"}``, or None when no
     driver serves that engine. The flags decide, BEFORE any side effect, how a turn is carried: a worker that
     takes a second message (``multi_turn``), input in the middle of a turn (``mid_turn_input``), ``resume``.
-    ``input_ack`` is read by nobody here: whether steering is offered where an engine gives no typed
-    acceptance is Lucas's open question, and this lane builds no fallback for it.
+    ``input_ack`` decides whether steering is offered at all: whether it is offered where an engine gives no
+    typed acceptance is Lucas's open question (questions.md Q7), so until he answers, a steer is refused on such
+    an engine, mid-turn and next-turn alike, and a steer already queued is held (``service.py``).
 
 ``Routes.resolve(principal, params)``
     The route a new session is billed through, as session.v1 writes it (``{"engine", "model", "connection"}``),
@@ -25,7 +26,9 @@ stands on lane DRIVER-CC's handle service, lane STOP's Stop and lane ROUTING's c
 
     ``launch(order: LaunchOrder)``: start a NEW run under ``order.run_id`` (allocated by this lane before the
     dispatch) whose input is ``order.text``, written under ``order.delivery_id`` and aimed at ``order.turn_id``;
-    ``order.resume`` is the engine's own session id to continue, or None for a fresh conversation. Returns when
+    ``order.resume`` is the engine's own session id to continue, or None for a fresh conversation. The order
+    also carries what the launcher must hold the run to and is not this lane's to enforce: the session's
+    ``tenant``, the ``principal`` that started it and its ``budget`` (lane QUOTA's admission). Returns when
     the input was handed to the engine. Raises ``UnitRefused`` when the unit DEFINITELY did not start and
     nothing was written; any other exception is an outcome nobody can vouch for.
 
@@ -34,7 +37,10 @@ stands on lane DRIVER-CC's handle service, lane STOP's Stop and lane ROUTING's c
     (``order.how``). Same returns and raises as ``launch``.
 
     ``stop(run_id)``: today's Stop of one run; returns its stop.result.v1 answer, or None when no run of that id
-    was ever registered. A Stop is safe to ask again (an emergency Stop never needs fresh state).
+    is registered. A Stop is safe to ask again (an emergency Stop never needs fresh state). Only a well-formed
+    answer that confirms the Stop settles a session (``records.stop_confirmed``). None is taken as "nothing of
+    that run runs" only when no launch of the run is still pending or in flight: a launch that is inside
+    ``launch`` may not have registered its run YET, so then the Stop is asked again (``service.py``).
 
 The engine side reports back through the service (``Sessions.accepted``, ``turn_finished``,
 ``engine_session_reported``); in this slice the tests make those calls.
@@ -64,6 +70,9 @@ class LaunchOrder:
     route: dict
     workspace: dict | None
     resume: str | None
+    tenant: str
+    principal: dict
+    budget: dict
 
 
 @dataclass(frozen=True)

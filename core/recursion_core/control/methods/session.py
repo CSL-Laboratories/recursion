@@ -20,10 +20,22 @@ handler with ``ctx.tx``; it stores the answer and commits. So a handler here:
   the command, which named old state, and is replayed for that id;
 - raises ``NotAccepted`` for a refusal that is about this moment or about a request that was never a command:
   ``busy`` (a turn is live), ``unavailable``, a turn that cannot continue the conversation YET, a field this
-  slice does not honour, and every ``request_invalid``. Nothing is stored and the id may be sent again;
+  slice does not honour, a steer on an engine where steering is not offered (questions.md Q7), and every
+  ``request_invalid``. Nothing is stored and the id may be sent again;
 - changes state only through ``ctx.tx`` and the lane's own tables, appends its events there, and opens no
   transaction of its own. What must happen outside the store is committed as a work intent (``service.py``);
   ``ctx.after_commit`` only wakes the lane's service, which finds the work without it.
+
+EVERY REQUEST IS CHECKED WHOLE FIRST (``records.check_request``): every field that is present must have its
+published shape (methods.v1, ``params.<method>``), a null included, before anything else is looked at. A
+malformed request is ``request_invalid`` naming the field, with nothing written and no receipt. A well-formed
+field this slice does not honour (a parent session, a containment level, a workspace) is ``unsupported``.
+
+THE TWO READS open their own transaction, as the dispatcher allows a read that is not inside a command. A read
+nested in a command gets ``ctx.tx`` None and may not open a second one (control/methods/__init__.py, "Nested
+read handlers still receive ctx.tx=None"), so a nested ``session.status`` answers ``unavailable``: another
+lane's command that needs a session reads it through this lane's interface with its own ``ctx.tx``
+(``store.load(ctx.tx, session_id)``), as the dispatcher says (questions.md Q11).
 
 Two answers have no exact word in the published table yet, and use the nearest one it allows (questions.md):
 an item that is no longer queued (``queue.update``, ``queue.cancel``) and a session that has ended are both
@@ -40,52 +52,19 @@ KEYED = ('session.start', 'session.turn', 'session.queue', 'session.steer', 'que
 READS = ('session.status', 'session.list')
 LIST_LIMIT = 100
 
-_PARAMS = {
-    'session.start': ({'command_id', 'tenant'},
-                      {'engine', 'hand_pick', 'workspace', 'prompt', 'parent_session_id', 'containment_level',
-                       'budget'}),
-    'session.turn': ({'command_id', 'session_id', 'text', 'expected_revision'}, set()),
-    'session.queue': ({'command_id', 'session_id', 'text'}, set()),
-    'session.steer': ({'command_id', 'session_id', 'text', 'expected_turn_id'}, set()),
-    'queue.update': ({'command_id', 'item_id', 'expected_revision'}, {'text', 'delivery'}),
-    'queue.cancel': ({'command_id', 'item_id', 'expected_revision'}, set()),
-    'session.status': ({'session_id'}, set()),
-    'session.list': (set(), {'tenant', 'state', 'parent_session_id', 'limit', 'after'}),
-}
-
 
 def _invalid(field: str):
     return NotAccepted({'code': 'request_invalid', 'detail': field})
 
 
 def _shape(method: str, params) -> dict:
-    """The params as supplied, refused ``request_invalid`` (naming the field) when they are not this method's."""
-    if not isinstance(params, dict):
-        raise _invalid('params')
-    required, optional = _PARAMS[method]
-    for field in sorted(required):
-        if field not in params:
-            raise _invalid(field)
-    unknown = sorted(set(params) - required - optional)
-    if unknown:
-        raise _invalid(unknown[0])
-    if 'command_id' in required and not records._matches(records.COMMAND_ID, params['command_id']):
-        raise _invalid('command_id')
+    """The params as supplied, refused ``request_invalid`` (naming the field, or ``params`` when they are not an
+    object) unless they are the published params of ``method`` (``records.check_request``)."""
+    try:
+        records.check_request(method, params)
+    except records.RecordError as problem:
+        raise _invalid(problem.path.lstrip('/') or 'params') from None
     return params
-
-
-def _text(params: dict, field: str = 'text') -> str:
-    value = params[field]
-    if not isinstance(value, str) or not value:
-        raise _invalid(field)
-    return value
-
-
-def _revision(params: dict) -> int:
-    value = params['expected_revision']
-    if not records._is_int(value) or value < 1:
-        raise _invalid('expected_revision')
-    return value
 
 
 def _stale(record: dict, **echo) -> dict:
@@ -156,17 +135,13 @@ def handlers(sessions) -> dict:
 
     def start(ctx, params):
         _shape('session.start', params)
-        prompt = _text(params, 'prompt') if 'prompt' in params else None
+        prompt = params.get('prompt')
         # A child session (lane DELEGATION's), a containment level (lane STOP's) and a workspace (lane WORKSPACE's)
-        # are honoured by those lanes, not by this slice: refused before anything is written, and never stored.
-        for field in ('parent_session_id', 'containment_level', 'workspace'):
-            if params.get(field) is not None:
-                raise NotAccepted({'code': 'unsupported', 'detail': 'not_implemented'})
+        # are honoured by those lanes, not by this slice: well-formed, they are refused before anything is
+        # written, and never stored. Only the workspace admits null (no workspace asked for).
+        if 'parent_session_id' in params or 'containment_level' in params or params.get('workspace') is not None:
+            raise NotAccepted({'code': 'unsupported', 'detail': 'not_implemented'})
         budget = params.get('budget', {'cap_usd': 0})
-        try:
-            records.check_budget(budget)
-        except records.RecordError:
-            raise _invalid('budget') from None
         route = sessions.ports.routes.resolve(ctx.principal, copy.deepcopy(params))
         if isinstance(route, tuple):
             code, detail = route
@@ -192,7 +167,7 @@ def handlers(sessions) -> dict:
 
     def turn(ctx, params):
         _shape('session.turn', params)
-        text, expected = _text(params), _revision(params)
+        text, expected = params['text'], records.integer(params['expected_revision'])
         session = _load(ctx, params['session_id'])
         if expected != session['revision']:
             return _stale(session, session_id=session['session_id'])
@@ -205,7 +180,7 @@ def handlers(sessions) -> dict:
 
     def queue(ctx, params):
         _shape('session.queue', params)
-        text = _text(params)
+        text = params['text']
         session = _load(ctx, params['session_id'])
         if session['state'] == 'ended':
             return _stale(session, session_id=session['session_id'])
@@ -216,11 +191,9 @@ def handlers(sessions) -> dict:
 
     def steer(ctx, params):
         _shape('session.steer', params)
-        text = _text(params)
-        expected = params['expected_turn_id']
-        if not records._matches(records.TURN_ID, expected):
-            raise _invalid('expected_turn_id')
+        text, expected = params['text'], params['expected_turn_id']
         session = _load(ctx, params['session_id'])
+        _steering_offered(session, session_id=session['session_id'])
         if session['active_turn_id'] != expected:
             return {'code': 'conflict', 'detail': 'stale_turn', 'session_id': session['session_id']}
         item = delivery.queue_item(ctx.tx, session, item_id=sessions.mint('qi-'), text=text, delivery='steer',
@@ -228,15 +201,22 @@ def handlers(sessions) -> dict:
         ctx.after_commit(sessions.wake.set)
         return {'code': 'ok', 'item': item}
 
-    def _item_change(method, ctx, params, change):
+    def _steering_offered(session, **echo):
+        refusal = sessions.steering_refusal(session)
+        if refusal is not None:
+            raise NotAccepted({'code': refusal[0], 'detail': refusal[1], **echo})
+
+    def _item_change(method, ctx, params, change, *, to_steer=False):
         _shape(method, params)
-        expected = _revision(params)
+        expected = records.integer(params['expected_revision'])
         item = store.load_item(ctx.tx, params['item_id'])
         if item is None:
             raise NotAccepted({'code': 'item_unknown', 'item_id': params['item_id']})
         if expected != item['revision'] or item['state'] != 'queued':
             return _stale(item, item_id=item['item_id'])
         session = store.load(ctx.tx, item['session_id'])
+        if to_steer:
+            _steering_offered(session, item_id=item['item_id'])     # an edit cannot open steering either
         after = change(item, session)
         ctx.after_commit(sessions.wake.set)
         return {'code': 'ok', 'item': after}
@@ -244,14 +224,9 @@ def handlers(sessions) -> dict:
     def update(ctx, params):
         _shape('queue.update', params)
         facts = {key: params[key] for key in ('text', 'delivery') if key in params}
-        if not facts:
-            raise _invalid('text')
-        if 'text' in facts:
-            _text(params)
-        if 'delivery' in facts and facts['delivery'] not in records.DELIVERIES:
-            raise _invalid('delivery')
         return _item_change('queue.update', ctx, params,
-                            lambda item, session: delivery.edit(ctx.tx, item['item_id'], facts, session))
+                            lambda item, session: delivery.edit(ctx.tx, item['item_id'], facts, session),
+                            to_steer=facts.get('delivery') == 'steer')
 
     def cancel(ctx, params):
         return _item_change('queue.cancel', ctx, params,
@@ -260,8 +235,6 @@ def handlers(sessions) -> dict:
     def status(ctx, params):
         _shape('session.status', params)
         session_id = params['session_id']
-        if not records._matches(records.SESSION_ID, session_id):
-            raise _invalid('session_id')
         with sessions.store.transaction() as tx:
             session = store.load(tx, session_id)
             found = [] if session is None else store.items(tx, session_id)
@@ -273,16 +246,7 @@ def handlers(sessions) -> dict:
         _shape('session.list', params)
         tenant, state = params.get('tenant'), params.get('state')
         parent, after = params.get('parent_session_id'), params.get('after')
-        limit = params.get('limit', LIST_LIMIT)
-        if tenant is not None and not (isinstance(tenant, str) and tenant):
-            raise _invalid('tenant')
-        if state is not None and state not in records.SESSION_STATES:
-            raise _invalid('state')
-        for field, value in (('parent_session_id', parent), ('after', after)):
-            if value is not None and not records._matches(records.SESSION_ID, value):
-                raise _invalid(field)
-        if not records._is_int(limit) or not 1 <= limit <= 1000:
-            raise _invalid('limit')
+        limit = records.integer(params.get('limit', LIST_LIMIT))
         with sessions.store.transaction() as tx:
             found, next_after = store.page(tx, tenant=tenant, state=state, parent_session_id=parent, after=after,
                                            limit=limit)

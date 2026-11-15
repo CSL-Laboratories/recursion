@@ -3248,11 +3248,18 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
       first ones of the run, with none in between that finished the work;
     - a second call, uninterrupted, returns and leaves the work done.
 
+    HOW THE INTERRUPTION IS DELIVERED, which is the standard a region is held to: by the trace function
+    (``sys.settrace``). The KeyboardInterrupt is raised from the trace callback of the event or instruction it is
+    aimed at, and so appears in the traced frame exactly there. That is stricter than a real signal, which the
+    interpreter delivers only where it looks for one (a call, a loop's jump back, a function's first
+    instruction): a point that nothing but a trace callback reaches is walked and held like every other, so the
+    standard does not depend on where an interpreter happens to look.
+
     The points are walked twice. Once by EVENT (every call, line and return), on every interpreter. Once by
     INSTRUCTION (every bytecode instruction), where the interpreter delivers an exception raised at an instruction
     event at all of them; that is measured here first, on a small function, and where it is not so the walk by
     instruction is skipped and says how many it would have lost. (Measured on Nov 14, 2026: 3.12.3 delivers all;
-    free-threaded 3.14.8 drops about one in four.) The first traced run of a function sees no instruction events
+    free-threaded 3.14.8 does not deliver 9 of the small function's 24.) The first traced run of a function sees no instruction events
     on either, so every count is taken on a later run.
 
     WHAT PURE PYTHON CANNOT PROTECT, and this test therefore does not visit: a second interruption that lands

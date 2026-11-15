@@ -443,21 +443,26 @@ class SshRelayClient:
     def _send(self, frame: bytes, deadline: float) -> bool | str:
         """Write ``frame`` whole by ``deadline``.
 
-        ``True``: every byte was handed to ssh. ``write_timeout`` or ``write:<error>``: the write failed with
-        bytes still unsent, so the frame never went out whole (the deadline's kill ends a blocked write with
-        such a failure). ``write_unknown``: the writer has shown neither, so the frame may have gone out
-        whole; only a shown failure counts as "not delivered".
+        ``True``: every byte was handed to ssh (a flush that fails afterwards does not undo that).
+        ``write_timeout`` or ``write:<error>``: the write failed with bytes still unsent, so the frame never
+        went out whole (the deadline's kill ends a blocked write with such a failure). ``write_unknown``: the
+        writer showed neither, because it is still running after the kill and its grace or it ended on
+        something other than an I/O failure, so the frame may have gone out whole. Only a shown failure counts
+        as "not delivered".
 
         The write runs in a thread of its own, so that a far side that stops reading cannot hold the caller
-        past the deadline; at the deadline the ssh child is killed, which ends the write.
+        past the deadline; at the deadline the ssh child is killed, which ends the write. The writer publishes
+        its outcome once, as one pair, when it ends; the caller reads that pair and nothing else, so it can
+        never combine a part of the outcome from before the writer finished with a part from after.
         """
         proc = self._proc
         if proc is None:
             return "write:session_closed"
-        state: dict[str, Any] = {"all_sent": False, "error": None}
+        final: list[tuple[bool, str | None]] = []
         done = threading.Event()
 
         def write() -> None:
+            all_sent, error = False, None
             try:
                 data = memoryview(frame)
                 while data:
@@ -465,11 +470,12 @@ class SshRelayClient:
                     if written is None or written <= 0:
                         raise BrokenPipeError("ssh took no bytes")
                     data = data[written:]
-                state["all_sent"] = True  # before the flush: from here the frame may have gone out whole
+                all_sent = True  # before the flush: from here the frame may have gone out whole
                 proc.stdin.flush()
             except (OSError, ValueError) as exc:
-                state["error"] = f"write:{type(exc).__name__}"
+                error = f"write:{type(exc).__name__}"
             finally:
+                final.append((all_sent, error))  # one consistent pair, published once
                 done.set()
 
         writer = threading.Thread(target=write, name="remote-ssh-writer", daemon=True)
@@ -479,11 +485,14 @@ class SshRelayClient:
             _kill(proc)
             done.wait(CLOSE_GRACE_S)
         writer.join(CLOSE_GRACE_S)
-        if state["all_sent"]:
+        if not final:
+            return "write_unknown"  # still running after the kill and its grace: nothing shown either way
+        all_sent, error = final[0]
+        if all_sent:
             return True
-        if done.is_set() and state["error"] is not None:
-            return "write_timeout" if timed_out else state["error"]
-        return "write_unknown"
+        if error is not None:
+            return "write_timeout" if timed_out else error
+        return "write_unknown"  # it ended on something other than an I/O failure
 
     def _close_locked(self) -> int | None:
         """End the session: close ssh's stdin (the relay sees end of input), wait, kill if it lingers."""

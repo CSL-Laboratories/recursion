@@ -52,11 +52,17 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   the subclass starts anything, and `parse` checks every payload value and relation of event.v1 (enums,
   identifiers, digests, timestamps as real instants, `text` xor `output_ref`, `model` exactly when a limit's
   scope is `model`), against #368 as pinned at `c77aa2e0`, in plain code. The calls, for the engine lanes:
-  `start(start_record, env) -> Handle`, `resume(start_record, env) -> Handle`, `send(handle, input)`,
+  `start(session, workspace, env) -> Handle` (`session` is `{session_id, run_id, route}`),
+  `resume(engine_session_id, session, workspace, env) -> Handle`, `send(handle, input)`,
   `interrupt(handle, turn_id)`, `fork(engine_session_id, at) -> engine_session_id`,
   `parse(handle, line) -> [draft]`; a subclass implements `_start`, `_send`, `_interrupt`, `_fork` and
   `_parse`, calls `turn_ended(handle, turn_id)` at the engine's end-of-turn sign and
-  `handle.set_engine_session_id(id)` when the engine reports its conversation id.
+  `handle.set_engine_session_id(id)` when the engine reports its conversation id. PROVISIONAL, by the
+  Liaison's ruling of Nov 14 (5:01 PM): the start and resume forms follow the frozen brief rather than
+  driver.v2's one start record (the subclass still receives that record), and a user_message sent into a
+  turn in progress, on a driver without `mid_turn_input`, answers the brief's `busy` (`DriverBusy`, a
+  `DriverRefused`) rather than driver.v2's `unsupported`. Which stands is Lucas's; consumers must not rely
+  on either yet.
 - `host.py`: `platform_supported()`, the one place in this package that reads `os` (`os.name` and whether
   `os.geteuid` exists, the same test as `child_env` and `subscription_routes`). The adapter modules still
   never import `os`.

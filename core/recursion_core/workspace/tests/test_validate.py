@@ -176,7 +176,9 @@ BOOLEANS = {'true': True, 'TRUE': True, 'yes': True, 'on': True, '1': True, '2':
             '': False, 'false': False, 'no': False, 'off': False, '0': False, '00': False, '-0': False, '0k': False,
             'maybe': None, 'y': None, 'tru': None, '2g': None, '08': None, '0x': None, '2147483648': None,
             '-2147483648': None, '0x80000000': None, '020000000000': None, '1 k': None, '"1 "': None, '"yes "': None,
-            '1kb': None, '1e3': None, '"\\b1"': None, '- 1': None, '+-1': None, '1t': None, 'tr\\ue': None}
+            '1kb': None, '1e3': None, '"\\b1"': None, '- 1': None, '+-1': None, '1t': None, 'tr\\ue': None,
+            '" true"': None, '9' * 5000: None, '1' * 4400: None, '0' * 5000: False, '-' + '0' * 5000 + '1': True,
+            '0' * 5000 + 'k': False, '0' + '7' * 5000: None}
 
 # Config files, and what git 2.43 made of each, asked from the folder they name: that top taken, the setting
 # ignored, or the file refused. <W> is the folder as a quoted value, <W1> and <W2> its two halves, <RAW> its path
@@ -228,7 +230,25 @@ CONFIG_TEXTS = (
     (HEADER + '\tworktree = /nonexistent-recursion-place\n\tworktree = <W>\n', 'taken'),
     (HEADER + '[include]\n\tpath = extra\n', 'ignored'),
     (HEADER + '[includeIf "gitdir:/"]\n\tpath = extra\n', 'ignored'),
+    # white space outside quotes is one ASCII space a character (the third reads); inside quotes it is kept
+    (HEADER + '\tworktree = <TOP>/na\tmed\n', 'taken'),
+    (HEADER + '\tworktree = <TOP>/na\rmed\n', 'taken'),
+    (HEADER + '\tworktree = <TOP>/na \tmed\n', 'refused'),
+    (HEADER + '\tworktree = "<TOP>/na\tmed"\n', 'refused'),
+    (HEADER + '\tworktree = "<TOP>/na"\t"med"\n', 'taken'),
+    (HEADER + '\tworktree =\t <TOP>/na med \t\n', 'taken'),
+    # the third reads' coverage witnesses
+    (HEADER + '[core   "x"]\n\tworktree = <W>\n', 'ignored'),
+    (HEADER + '[core ""]\n\tworktree = <W>\n', 'ignored'),
+    (HEADER + '\tworktree = <W>\n#worktree = /nonexistent-recursion-place\n', 'taken'),
+    (b'\xefAB' + (HEADER + '\tworktree = <W>\n').encode(), 'refused'),
+    (b'\xef', 'refused'),
+    (b'\xef\xbb', 'refused'),
+    (b'\xef\xbbX', 'refused'),
 )
+
+# The folder the files of CONFIG_TEXTS name, in the repository's top.
+NAMED = 'na med'
 
 
 def quoted(value) -> str:
@@ -240,7 +260,8 @@ def filled(text, named):
     """A file of ``CONFIG_TEXTS`` for the folder ``named``."""
     value = quoted(named)
     half = len(value) // 2
-    for mark, part in (('<W1>', value[:half]), ('<W2>', value[half:]), ('<W>', value), ('<RAW>', os.fspath(named))):
+    for mark, part in (('<W1>', value[:half]), ('<W2>', value[half:]), ('<W>', value), ('<RAW>', os.fspath(named)),
+                       ('<TOP>', os.fspath(named.parent))):
         text = text.replace(mark.encode(), part.encode()) if isinstance(text, bytes) else text.replace(mark, part)
     return text
 
@@ -576,10 +597,11 @@ class GitConfigTest(_Repositories, unittest.TestCase):
                      '[core]\n\tworktree = /nonexistent-recursion-place\n', ''):
             self.config(top / '.git', text)
             self.assertEqual(V.git_work_tree(top), top, text)
-        for version in ('0', '1', '01', '0x1', '"0"', '0 # a comment', ' 0'):
+        for version in ('0', '1', '01', '0x1', '"0"', '0 # a comment', ' 0', '0' * 5000, '0' * 5000 + '1'):
             self.config(top / '.git', '[core]\n\trepositoryformatversion = %s\n\tbare = true\n' % version)
             self.assertIsNone(V.git_work_tree(top), version)
-        for version, answer in (('1', top), ('2', None), ('1k', None), ('abc', None), ('', None), ('2147483648', None)):
+        for version, answer in (('1', top), ('2', None), ('1k', None), ('abc', None), ('', None), ('2147483648', None),
+                                ('9' * 5000, None), ('0' * 5000, top)):     # a long number is refused, not raised
             self.config(top / '.git', '[core]\n\trepositoryformatversion = %s\n' % version)
             self.assertEqual(V.git_work_tree(top), answer, version)
         self.config(top / '.git', '[core]\n\trepositoryformatversion\n')
@@ -616,7 +638,7 @@ class GitConfigTest(_Repositories, unittest.TestCase):
 
     def test_the_config_file_is_parsed_as_git_parses_it(self) -> None:
         top = self.repo('repo')
-        named = top / 'named'
+        named = top / NAMED
         named.mkdir()
         (top / '.git' / 'extra').write_text('[core]\n\tworktree = %s\n' % self.quoted(named))
         for text, answer in CONFIG_TEXTS:

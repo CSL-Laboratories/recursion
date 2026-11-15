@@ -127,6 +127,22 @@ class NormalizerTest(unittest.TestCase):
         self.assertEqual(self.ask({'path': str(container), 'mode': 'worktree'}),
                          H.Refusal('workspace_invalid', 'not_a_repository'))
 
+    def test_an_unquoted_tab_in_core_worktree_names_a_top_with_a_space_as_git_does(self) -> None:
+        actual = self.repo / 'actual project'
+        actual.mkdir()
+        for blank in ('\t', '\r'):              # git 2.43 reads each as one space: the third reads (Sol)
+            name = str(actual).replace('actual project', 'actual' + blank + 'project')
+            (self.repo / '.git' / 'config').write_bytes(
+                ('[core]\n\trepositoryformatversion = 0\n\tworktree = %s\n' % name).encode())
+            for value in ({'path': str(actual)}, {'path': str(actual), 'mode': 'worktree'}):
+                self.assertEqual(self.ask(value), self.launch('worktree', actual), (repr(blank), value))
+
+    def test_a_number_git_refuses_is_a_refusal_not_an_exception(self) -> None:
+        (self.repo / '.git' / 'config').write_text('[core]\n\trepositoryformatversion = 0\n\tbare = %s\n' % ('9' * 5000))
+        self.assertEqual(self.ask({'path': str(self.repo), 'mode': 'worktree'}),
+                         H.Refusal('workspace_invalid', 'not_a_repository'))     # the third reads (Astra)
+        self.assertEqual(self.ask({'path': str(self.repo)}), self.launch('direct', self.repo))
+
     def test_direct_mode_reads_no_git_metadata(self) -> None:
         def no_git(folder):
             raise AssertionError('direct mode read git metadata')

@@ -60,7 +60,8 @@ worktree's ``config.worktree`` may override them. git reads no global, system or
 repository, and neither does this. git refuses the repository (the answer is None) when:
 
 - a config file it reads cannot be read, or breaks its syntax (sections, ``"subsections"``, quoting, the four
-  escapes, comments, continued lines, a byte-order mark);
+  escapes, comments, continued lines, a byte-order mark; white space outside quotes is read as one space a
+  character);
 - a value is one git does not take. A boolean is true, yes, on, false, no, off, empty, or a number as
   ``strtoimax`` reads one in base 0, with a unit k, m or g, within an int. ``core.worktree`` needs a value;
 - the version is above 1, or names at version 0 an extension only version 1 knows;
@@ -263,9 +264,10 @@ def _int(value: bytes | None) -> int | None:
     while end < len(text) and text[end] in _DIGITS[base]:
         end += 1
     factor = _UNITS.get(text[end:].lower())
-    if not end or factor is None:
+    digits = text[:end].lstrip(b'0')                # leading zeros, any number of them, count for nothing
+    if not end or factor is None or len(digits) > 31:   # more than 31 digits is over an int in any base
         return None
-    number = sign * int(text[:end], base)
+    number = sign * int(digits or b'0', base)
     return None if abs(number) > _INT_MAX // factor else number * factor
 
 
@@ -347,28 +349,24 @@ def _section(source: _Source) -> bytes | None:
 
 
 def _value(source: _Source) -> bytes | None:
-    """git's ``parse_value``: after ``=``, to the end of the line."""
-    value, quoted, comment, trim = bytearray(), False, False, 0
+    """git 2.43's ``parse_value``: after ``=``, to the end of the line. White space outside quotes is dropped at
+    the start and the end, and in between each character of it is one ASCII space."""
+    value, quoted, comment, spaces = bytearray(), False, False, 0
     while True:
         char = source.next()
         if char == _LF:
-            if quoted:
-                return None
-            if trim:
-                del value[trim:]
-            return bytes(value)
+            return None if quoted else bytes(value)
         if comment:
             continue
         if char in _GIT_SPACE and not quoted:
-            if not trim:
-                trim = len(value)
             if value:
-                value.append(char)
+                spaces += 1
             continue
         if char in b';#' and not quoted:
             comment = True
             continue
-        trim = 0
+        value += b' ' * spaces
+        spaces = 0
         if char == ord('\\'):
             char = source.next()
             if char == _LF:

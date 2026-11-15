@@ -27,9 +27,11 @@ recovery Stop never passes here.
    - any other device, session or agent principal with no ``grant`` holds nothing;
    - a principal whose ``grant`` cannot be read holds nothing, whatever its kind: an unreadable grant is
      not an absent one, so it never falls through to a plugin's identity grants. A grant is absent only
-     when nothing named ``grant`` is declared on the principal; a declared one is read through its
-     declaration alone, and if that read raises, even ``AttributeError``, it is unreadable, whatever a
-     ``__getattr__`` fallback would answer.
+     when nothing named ``grant`` is declared on the principal, its class or its metaclass; a declared one
+     is read with the type's own ``__getattribute__``, never a ``__getattr__`` fallback, and if that read
+     raises, even ``AttributeError``, it is unreadable. An unset ``__slots__`` grant is unreadable too;
+   - a principal that names a grant and claims ``owner`` or ``internal`` holds nothing: those kinds come
+     from how a request arrives, never from a token.
    Every set is cut to the kind's ceiling (``credentials.CEILING``), so a plugin, session or agent never
    holds ``approve`` and no device ever holds ``manage``, whatever a grant says. SPINE's ``Principal`` has
    no ``grant`` field yet (``questions.md``); until it has, token principals hold nothing.
@@ -46,7 +48,9 @@ recovery Stop never passes here.
    internal or agent principal is refused (``questions.md``). A target that cannot be read is refused to a
    session or plugin principal, which may stop only runs it can be shown to own.
 
-Every refusal is ``("scope_refused", detail)``; ``scope_refused`` is the method table's code for it.
+Every refusal the authorizer makes is ``("scope_refused", detail)``; ``scope_refused`` is the method table's
+code for it, and S5 (``control/hooks.py`` ``Hooks.authorize``) turns the pair into ``{"code", "detail"}``. A
+method table that raises is not caught here: S5 refuses that call ``authorizer_failed`` and logs it.
 """
 
 from __future__ import annotations
@@ -92,6 +96,18 @@ def _same_session(run_session: str, principal_session: str) -> bool:
 _ABSENT = object()   # nothing named grant declared, told apart from a declared grant that cannot be read
 
 
+def _get(mapping, key):
+    """``mapping.get(key)`` for a dict; None for anything else, and None when the read raises (a dict subclass
+    can): a target that cannot be read is not shown to be owned."""
+
+    if not isinstance(mapping, dict):
+        return None
+    try:
+        return mapping.get(key)
+    except Exception:  # noqa: BLE001 - an unreadable record opens nothing
+        return None
+
+
 def _attr(principal, name: str, default):
     """A principal's attribute; ``default`` when it is missing or reading it raises (it then counts as unknown)."""
 
@@ -119,15 +135,23 @@ class Authorizer:
 
         kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
         try:
-            if inspect.getattr_static(principal, "grant", _ABSENT) is not _ABSENT:
-                # Declared: read through the declaration alone, so neither a default nor a __getattr__ fallback
-                # can stand in for a read that failed; such a failure, AttributeError included, is unreadable
-                # (the round-3 reads of #377, Astra 1 and Sol 1, and the round-4 read by Astra, 1).
-                grant = object.__getattribute__(principal, "grant")
+            declared = (inspect.getattr_static(principal, "grant", _ABSENT) is not _ABSENT
+                        or inspect.getattr_static(type(principal), "grant", _ABSENT) is not _ABSENT)
+            if declared:
+                # Declared on the principal, its class or its metaclass: read with the type's own reader, a
+                # custom __getattribute__ included, but never a __getattr__ fallback, so no default stands in
+                # for a read that failed; such a failure, AttributeError included, is unreadable (the round-3
+                # reads of #377, Astra 1 and Sol 1; round 4, Astra 1; round 5, Astra 1, Sol 1 and DeepSeek F6:
+                # a metaclass declaration no instance read reaches is unreadable too).
+                grant = type(principal).__getattribute__(principal, "grant")
             else:
                 grant = getattr(principal, "grant", None)   # not declared: absent (SPINE's Principal today)
         except Exception:  # noqa: BLE001 - unreadable is not absent: such a principal holds nothing at all
             return frozenset()   # (the round-2 read of #377 by Sol, 2: it fell through to the plugin's grants)
+        if grant is not None and kind in ("owner", "internal"):
+            # Owner and internal come from how a request arrives, never from a token: a principal naming a grant
+            # is a token principal, and one that also claims those kinds holds nothing (round 5, DeepSeek F5).
+            return frozenset()
         if kind in ("owner", "internal"):
             held = ALL_SCOPES
         elif grant is not None:
@@ -172,22 +196,22 @@ class Authorizer:
             return None    # with run: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):
             return (SCOPE_REFUSED, "stop_not_granted_to_kind")
-        run_id = params.get("run_id") if isinstance(params, dict) else None
+        run_id = _get(params, "run_id")   # each read of params, record and launch is guarded (round 5, DeepSeek F1)
         record = None
         if isinstance(run_id, str) and self._run_record is not None:
             try:
                 record = self._run_record(run_id)
             except Exception:  # noqa: BLE001 - a target that cannot be read is not shown to be owned
                 record = None
-        launch = record.get("launch") if isinstance(record, dict) else None
+        launch = _get(record, "launch")
         if not isinstance(launch, dict) or not isinstance(pid, str) or not pid:
             return (SCOPE_REFUSED, "run_not_owned")
         if kind == "plugin":
-            owner = launch.get("owner")
+            owner = _get(launch, "owner")
             if isinstance(owner, str) and owner and owner != HOST_OWNER and owner == pid:
                 return None
             return (SCOPE_REFUSED, "run_not_owned")
-        session = launch.get("session_id")
+        session = _get(launch, "session_id")
         if isinstance(session, str) and session:
             try:
                 if self._in_subtree(session, pid) is True:

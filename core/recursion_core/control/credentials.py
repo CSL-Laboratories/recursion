@@ -37,7 +37,9 @@ TWO STORES ON ONE FILE (two instances, or a second process) never drop each othe
 takes an exclusive lock on a sibling file, ``.<name>.lock`` (owner-only, like the store), and reads the
 file again under it before writing. A store reads the file again whenever it has changed since it last
 read or wrote it, so a grant or a revocation written through one store is seen by every other at its
-next check. Opening a store, under the same lock, removes the temporary files a killed writer left.
+next check. Opening a store, under the same lock, removes the temporary files a killed writer left. A
+revocation made in two stores keeps, in each, the time that store first recorded, so while both write
+the file's time is the last writer's, and each store sends its own notice once (round 5, DeepSeek F7).
 
 THE COMMIT POINT is the rename. A write that fails before it changes nothing (``CredentialStoreError``);
 one that fails after it, syncing the directory, has made its change (``CredentialStoreUncertain``): memory
@@ -194,6 +196,15 @@ class Credential:
                 "issued_at": self.issued_at, "expires_at": self.expires_at, "revoked_at": self.revoked_at}
 
 
+def _peer_key(peer: object) -> None:
+    """A peer that cannot key the failure count (unhashable, or whose hash raises) is refused ``peer_invalid``."""
+
+    try:
+        hash(peer)
+    except Exception:  # noqa: BLE001 - any failure to hash is a peer that cannot be counted
+        raise CredentialRefused("peer_invalid") from None
+
+
 class FailedAuthLimit:
     """Failed token checks per peer: ``max_failures`` within ``window_s`` seconds, then refused until it passes.
 
@@ -221,12 +232,14 @@ class FailedAuthLimit:
         return times
 
     def blocked(self, peer: Hashable) -> bool:
+        _peer_key(peer)
         with self._lock:
             times = self._recent(peer, self._clock())
             return times is not None and len(times) >= self._max
 
     def failed(self, peer: Hashable) -> bool:
         """Count one failed check; True when the peer is now refused."""
+        _peer_key(peer)
         with self._lock:
             now = self._clock()
             times = self._recent(peer, now)
@@ -622,10 +635,7 @@ class CredentialStore:
     def verify(self, token: object, *, peer: Hashable) -> Credential:
         """The live grant ``token`` names, or ``CredentialRefused``. Failed checks count against ``peer``."""
 
-        try:
-            hash(peer)
-        except TypeError:
-            raise CredentialRefused("peer_invalid") from None   # failed checks are counted per peer: it must key
+        _peer_key(peer)   # failed checks are counted per peer: it must key (round 5, DeepSeek F2: any raise)
         if self._limit.blocked(peer):
             log.warning("credential check refused for peer %r: too many failed checks", peer)
             raise CredentialRefused("auth_rate_limited")

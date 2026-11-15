@@ -1014,6 +1014,35 @@ class StoreFailureGuardsTest(unittest.TestCase):
         self.assertEqual(store.grants(), [])
 
 
+
+class PeerRefusalTest(unittest.TestCase):
+    """The round-5 read of #377 by DeepSeek V4.1 Flash, F2: only TypeError was caught around the peer's hash, and the
+    limit's own public methods raised for an unhashable peer."""
+
+    class HashRaises:
+        def __hash__(self):
+            raise RuntimeError("the connection is gone")
+
+    def test_a_peer_that_cannot_key_the_count_is_refused_peer_invalid(self) -> None:
+        limit = creds.FailedAuthLimit()
+        for peer in ([], {"a": 1}, self.HashRaises()):
+            for method in (limit.blocked, limit.failed):
+                with self.subTest(peer=type(peer).__name__, method=method.__name__):
+                    with self.assertRaises(CredentialRefused) as caught:
+                        method(peer)
+                    self.assertEqual(caught.exception.detail, "peer_invalid")
+
+    @NEEDS_POSIX
+    def test_verify_refuses_a_peer_whose_hash_raises_anything(self) -> None:
+        base = tempfile.mkdtemp(prefix="creds-peer-")
+        self.addCleanup(shutil.rmtree, base, True)
+        store = CredentialStore(os.path.join(base, "state", "credentials.json"))
+        token, _ = store.mint("device", "d1", ["read"])
+        with self.assertRaises(CredentialRefused) as caught:
+            store.verify(token, peer=self.HashRaises())
+        self.assertEqual(caught.exception.detail, "peer_invalid")
+
+
 @NEEDS_POSIX
 class TwoStoresTest(unittest.TestCase):
     """The audited read of #377 by DeepSeek V4.1 Flash, F4: two stores on one file each wrote their own memory,

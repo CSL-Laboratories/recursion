@@ -607,6 +607,98 @@ class RoundFourScopesTest(unittest.TestCase):
         self.assertEqual(auth.held(Dynamic("g-plugin-other")), frozenset())             # a grant not its own
 
 
+class _NoStore:
+    """A store the authorizer must not consult: any read of it fails the test."""
+
+    def held(self, *args):
+        raise AssertionError("the identity's grants were read")
+
+    def grant_scopes(self, *args):
+        raise AssertionError("a grant was read")
+
+
+class RoundFiveScopesTest(unittest.TestCase):
+    """The round-5 reads of #377: Codex GPT-6 Astra 1 and GPT-6.1 Sol 1 (STRICT), DeepSeek V4.1 Flash F1, F5, F6."""
+
+    def test_a_declared_grant_is_read_with_the_type_s_own_reader(self) -> None:
+        # Astra 1, Sol 1: object.__getattribute__ skipped a custom __getattribute__, so a declared default (None)
+        # stood in for its failed read, and a grant it would supply was ignored.
+        def principal(kind, principal_id, answer):
+            class Custom:
+                grant = None                       # the declared default the type's reader overrides
+                in_run_unit = False
+
+                def __init__(self):
+                    self.kind, self.id = kind, principal_id
+
+                def __getattribute__(self, name):
+                    if name == "grant":
+                        if isinstance(answer, BaseException):
+                            raise answer
+                        return answer
+                    return object.__getattribute__(self, name)
+
+                def __getattr__(self, name):
+                    return None                    # never consulted for a declared grant
+
+            return Custom()
+
+        refusing = authorizer(credentials=_NoStore())
+        for failure in (AttributeError("context unavailable"), RuntimeError("context unavailable")):
+            for kind, principal_id in (("plugin", "plugin.alpha"), ("owner", "local"), ("device", "page")):
+                with self.subTest(failure=type(failure).__name__, kind=kind):
+                    who = principal(kind, principal_id, failure)
+                    self.assertEqual(refusing.held(who), frozenset())
+                    self.assertEqual(refusing(who, "run.start", {}), ("scope_refused", "needs_run"))
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        self.assertEqual(auth.held(principal("plugin", "plugin.alpha", g("plugin", "plugin.alpha"))),
+                         frozenset({"read", "run"}))                         # the supplied grant is the one used
+        self.assertEqual(auth.held(principal("plugin", "plugin.alpha", "g-plugin-other")), frozenset())
+
+    def test_a_grant_declared_on_the_metaclass_is_unreadable(self) -> None:
+        # DeepSeek F6: getattr_static on the instance does not see a metaclass property, so it read as absent.
+        class Meta(type):
+            @property
+            def grant(cls):
+                raise RuntimeError("context unavailable")
+
+        class OnMeta(metaclass=Meta):
+            kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        self.assertEqual(auth.held(OnMeta()), frozenset())
+
+    def test_a_principal_naming_a_grant_is_never_owner_or_internal(self) -> None:
+        # DeepSeek F5: owner and internal were tested before grant, so a token principal claiming them held all.
+        auth = authorizer(credentials=Grants({("device", "d1"): {"read"}}))
+        for kind in ("owner", "internal"):
+            with self.subTest(kind=kind):
+                self.assertEqual(auth.held(Principal(kind, "local", grant=g("device", "d1"))), frozenset())
+                self.assertEqual(auth.held(Principal(kind, "local")), scopes.ALL_SCOPES)
+
+    def test_a_stop_target_whose_reads_raise_is_not_owned(self) -> None:
+        # DeepSeek F1: params.get, record.get and launch.get sat outside every try in the Stop fence.
+        class Raising(dict):
+            def get(self, *args, **kwargs):
+                raise RuntimeError("unreadable")
+
+        good_launch = {"owner": "plugin.alpha", "session_id": "s1"}
+        cases = {
+            "params": (Raising(run_id="r"), {"r": {"launch": good_launch}}),
+            "record": ({"run_id": "r"}, {"r": Raising(launch=good_launch)}),
+            "launch": ({"run_id": "r"}, {"r": {"launch": Raising(good_launch)}}),
+        }
+        for where, (params, runs) in cases.items():
+            auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"run"}, ("session", "s1"): {"run"}}),
+                              run_record=runs.get)
+            with self.subTest(where=where):
+                self.assertEqual(auth(Principal("plugin", "plugin.alpha"), "run.stop", params),
+                                 ("scope_refused", "run_not_owned"))
+                self.assertIn(auth(bearer("session", "s1"), "run.stop", params),
+                              (("scope_refused", "run_not_owned"), ("scope_refused", "run_outside_session")))
+                self.assertIsNone(auth(PRINCIPALS["owner"], "run.stop", params))
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

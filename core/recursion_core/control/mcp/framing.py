@@ -35,8 +35,9 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO
 
-# Two control-socket frames (control_transport.framing.MAX_FRAME_BYTES is 1 MiB): an argument larger than
-# that could never be forwarded, and a line this long is refused without being parsed.
+# Twice the control socket's frame (control_transport.framing.MAX_FRAME_BYTES, 1 MiB): a longer line is
+# refused without being parsed. A shorter one is read; if its call's frame would be over 1 MiB, the call
+# answers delivered: false before anything is written (socket_check.CheckedSocketAPI).
 MAX_LINE_BYTES = 2 * 1024 * 1024
 _DRAIN_CHUNK = 64 * 1024
 

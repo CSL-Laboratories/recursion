@@ -4,6 +4,7 @@ folder is never touched."""
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -15,6 +16,7 @@ from recursion_core.control.client import UNAVAILABLE
 from recursion_core.control.mcp import socket_check
 from recursion_core.control.mcp.socket_check import CheckedSocketAPI, SocketCheckFailed, check, check_path, locate
 from recursion_core.control_transport import UnixControlServer
+from recursion_core.control_transport.framing import MAX_FRAME_BYTES
 
 CAN_SERVE = hasattr(socket, "AF_UNIX") and hasattr(socket, "SO_PEERCRED") and hasattr(os, "geteuid")
 NEEDS_SERVER = unittest.skipUnless(
@@ -171,6 +173,19 @@ class SocketCheckTest(unittest.TestCase):
         self.assertEqual("daemon:scope_refused", self.refused("daemon_unreachable").detail)
 
     # -- every call ----------------------------------------------------------------------------------
+    def test_a_call_the_control_frame_cannot_carry_is_not_delivered_and_nothing_is_written(self) -> None:
+        daemon = Daemon()
+        self.serve(daemon)
+        api = check(self.environ)
+        envelope = len(json.dumps({"op": "control", "method": "run.stop", "params": {"run_id": ""}},
+                                  separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        fits = "r" * (MAX_FRAME_BYTES - envelope)  # the frame is exactly the transport's bound
+        self.assertEqual({"code": UNAVAILABLE, "delivered": False, "detail": "request:frame_too_large"},
+                         api.call("run.stop", {"run_id": fits + "r"}))
+        self.assertEqual(1, len(daemon.requests))  # only the check's probe: nothing was written for the stop
+        self.assertEqual({"code": "ok", "runs": []}, api.call("run.stop", {"run_id": fits}))
+        self.assertEqual("run.stop", daemon.requests[-1]["method"])
+
     def test_every_call_rechecks_the_path_and_sends_nothing_when_it_fails(self) -> None:
         daemon = Daemon()
         self.serve(daemon)

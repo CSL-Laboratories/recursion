@@ -29,7 +29,8 @@ call's answer included: the writer is one), the answers still queued are discard
 once).
 
 ``close()`` waits until every answer taken has been written, or discarded, and ends the thread; then it
-closes the queue's diagnostics (``DiagnosticQueue.close``).
+closes the queue's diagnostics (``DiagnosticQueue.close``). It starts the threads if ``start`` was never
+called, so answers offered before it are still written.
 """
 
 from __future__ import annotations
@@ -65,9 +66,16 @@ class ReplyQueue:
         self._dropped = 0
         self._lost = False
         self._closing = False
+        self._started = False
         self._thread = threading.Thread(target=self._run, name="mcp-replies", daemon=True)
 
     def start(self) -> None:
+        """Start the queue's thread and its diagnostics' thread; once only (a second call does nothing)."""
+
+        with self._cond:
+            if self._started:
+                return
+            self._started = True
         self._diagnostics.start()
         self._thread.start()
 
@@ -117,6 +125,7 @@ class ReplyQueue:
     def close(self) -> None:
         """Wait until every answer taken has been written (or discarded); the thread then ends."""
 
+        self.start()  # a queue never started still writes what it took
         with self._cond:
             while self._pending:
                 self._cond.wait()

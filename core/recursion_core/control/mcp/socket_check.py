@@ -24,7 +24,11 @@ of these hold, checked in this order, each with its own refusal reason:
 
 Steps 3 and 4 are repeated before every call the server forwards (``CheckedSocketAPI``): a directory or
 socket that stops passing answers ``control_api_unavailable`` with ``delivered: false`` and nothing is
-sent.
+sent. ``CheckedSocketAPI`` also encodes, before connecting, the frame ``SocketAPI`` would write
+(``{"op": "control", "method": ..., "params": ...}``, ``control_transport.framing.encode_frame``). A call
+the transport could never carry (over its 1 MiB frame, or nested too deep) answers ``control_api_unavailable``
+with ``delivered: false`` and the frame error as ``detail`` (``request:frame_too_large``), since nothing was
+written; ``SocketAPI`` itself would answer ``delivered: "unknown"`` for it.
 
 There is no token and no scope here: the daemon grants a same-user peer every verb, as it does the CLI.
 """
@@ -38,6 +42,8 @@ from typing import Any
 
 from recursion_core.control.client import UNAVAILABLE, SocketAPI, socket_path
 from recursion_core.control_transport import PlatformNotSupported
+from recursion_core.control_transport.errors import FrameError
+from recursion_core.control_transport.framing import encode_frame
 
 PROBE = ("run.list", {"limit": 1})
 
@@ -94,7 +100,8 @@ def check_path(path: str) -> None:
 
 
 class CheckedSocketAPI:
-    """``SocketAPI`` with steps 3 and 4 repeated before every call."""
+    """``SocketAPI`` with steps 3 and 4 repeated before every call, and a frame the transport would refuse
+    answered ``delivered: false`` before anything is written."""
 
     def __init__(self, path: str, *, socket_api: Any = None) -> None:
         self.path = path
@@ -105,6 +112,10 @@ class CheckedSocketAPI:
             check_path(self.path)
         except SocketCheckFailed as exc:
             return {"code": UNAVAILABLE, "delivered": False, "detail": f"socket_check:{exc.reason}"}
+        try:  # the frame SocketAPI.call writes (control/client.py), encoded as the transport encodes it
+            encode_frame({"op": "control", "method": method, "params": dict(params or {})})
+        except FrameError as exc:
+            return {"code": UNAVAILABLE, "delivered": False, "detail": f"request:{exc}"}
         return self._api.call(method, params)
 
 

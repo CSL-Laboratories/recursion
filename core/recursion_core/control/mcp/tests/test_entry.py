@@ -113,6 +113,13 @@ class EntryTest(unittest.TestCase):
                                        check=lambda environ: ScriptedAPI()))
         self.assertEqual({"code": "internal_error", "detail": "RuntimeError: the input broke"}, stderr_lines(err)[-1])
 
+    def test_a_stderr_line_that_cannot_be_written_is_dropped_quietly(self) -> None:
+        class Gone:
+            def write(self, data):
+                raise BrokenPipeError("stderr is closed")
+
+        self.assertIsNone(entry._fd_line(Gone(), {"event": "x"}))  # no exception reaches the caller
+
     @unittest.skipUnless(os.name == "nt", "Windows-only: the real socket check refuses the platform")
     def test_windows_refuses_with_the_real_check(self) -> None:
         err = io.StringIO()

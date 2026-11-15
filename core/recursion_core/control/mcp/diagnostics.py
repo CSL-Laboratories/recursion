@@ -15,13 +15,16 @@ that does not fit is dropped and counted; the next event taken is preceded by
 effort (the 2025-06-18 stdio transport lets a client capture, forward or ignore stderr): nothing the
 session does depends on one being delivered.
 
-A ``log`` that raises ends delivery: what is queued is discarded and every later ``offer`` returns
-``False``.
+A ``log`` that raises ends delivery: what is queued is discarded, every later ``offer`` returns ``False``,
+and ``close`` takes no ``last`` (that log takes nothing more).
 
-``close(last)`` takes ``last`` whatever the bound (``serve``'s last line, so it is never dropped), then
-nothing more, and waits until every event taken has been delivered (or discarded). A client that never
-reads stderr therefore holds ``serve`` there at its end, as a synchronous last line would; reading and
-admission are over by then.
+``close(last, timeout)`` takes ``last`` whatever the bound (``serve``'s last line, so the bound never drops
+it), then nothing more, and waits until every event taken has been delivered (or discarded) or until
+``timeout`` seconds have passed, whichever comes first; it returns whether everything was delivered.
+``serve`` gives it ``DIAGNOSTIC_DRAIN_S``, so a client that never reads stderr does not keep the process
+alive after end of input: what stderr has not taken by then is lost with the queue's thread, a daemon
+thread. ``close`` starts the thread if ``start`` was never called, so events offered before it are still
+delivered.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ import threading
 from collections.abc import Callable
 
 MAX_PENDING_DIAGNOSTIC_BYTES = 64 * 1024
+DIAGNOSTIC_DRAIN_S = 2.0
 
 Log = Callable[[dict], None]
 
@@ -53,9 +57,16 @@ class DiagnosticQueue:
         self._dropped = 0
         self._failed = False
         self._closing = False
+        self._started = False
         self._thread = threading.Thread(target=self._run, name="mcp-diagnostics", daemon=True)
 
     def start(self) -> None:
+        """Start the queue's thread; once only (a second call does nothing)."""
+
+        with self._cond:
+            if self._started:
+                return
+            self._started = True
         self._thread.start()
 
     def offer(self, event: dict) -> bool:
@@ -105,10 +116,11 @@ class DiagnosticQueue:
                     self._bytes = 0
                 self._cond.notify_all()
 
-    def close(self, last: dict | None = None) -> None:
+    def close(self, last: dict | None = None, timeout: float | None = None) -> bool:
         """Take ``last`` whatever the bound, then nothing more; wait until every event taken has been
-        delivered (or discarded)."""
+        delivered (or discarded), at most ``timeout`` seconds. ``True`` when nothing is left."""
 
+        self.start()  # a queue never started still delivers what it took
         with self._cond:
             if not self._closing and not self._failed:
                 self._take_dropped_count()
@@ -117,5 +129,4 @@ class DiagnosticQueue:
                     self._bytes += self._pending[-1][1]
             self._closing = True
             self._cond.notify_all()
-            while self._pending:
-                self._cond.wait()
+            return self._cond.wait_for(lambda: not self._pending, timeout)

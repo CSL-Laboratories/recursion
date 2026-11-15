@@ -306,6 +306,31 @@ class StdioTest(unittest.TestCase):
         self.assertNotIn("Fatal Python error", stderr)
         self.assertNotIn("Traceback", stderr)
 
+    def test_with_stderr_full_end_of_input_still_ends_the_process_with_status_0(self) -> None:
+        # The diagnostics left in the queue get at most the drain budget (2 s), then the process ends.
+        self.daemon(make_api()[0])
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        note = encode({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 999}})
+        child.proc.stdin.write(note * 6000)
+        child.proc.stdin.flush()
+        self.assertEqual({}, child.request(2, "ping")["result"])
+        child.proc.stdin.close()
+        status = child.proc.wait(timeout=HANG_GUARD_S)  # stderr is never read
+        child._guard.cancel()
+        self.assertEqual(0, status)
+
+    def test_an_argument_the_control_frame_cannot_carry_is_answered_not_delivered(self) -> None:
+        # 1.2 MiB: under the 2 MiB line limit, over the control socket's 1 MiB frame. Nothing is written.
+        self.daemon(make_api()[0])
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        answer = child.tool(2, "recursion_run_stop", {"run_id": "r" * 1_200_000})
+        self.assertEqual({"code": "control_api_unavailable", "delivered": False, "detail": "request:frame_too_large"},
+                         answer["structuredContent"])
+        self.assertEqual(["run.list"], [m["method"] for m in self.seen])  # the check's probe only
+        self.assertEqual(0, child.end()[0])
+
     def test_stdout_that_fails_ends_the_process_with_status_0_and_sends_nothing_more(self) -> None:
         release, status_seen = threading.Event(), threading.Event()
         seen: list[str] = []
@@ -363,6 +388,35 @@ class StdioTest(unittest.TestCase):
         status, rest, events = Child(self, self.runtime).end()
         self.assertEqual((1, b"", "socket_dir_mode"), (status, rest, events[0]["reason"]))
         self.assertEqual([], self.seen)
+
+
+class ClosedStderrTest(unittest.TestCase):
+    """The process's stderr lines go to fd 2 directly: a client that closes stderr before the first line is
+    written leaves nothing buffered for the interpreter's final flush (which would exit 120)."""
+
+    def run_with_stderr_closed(self, args: list[str], stdin: bytes) -> tuple[int, bytes]:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (CORE, env.get("PYTHONPATH", "")) if p)
+        proc = subprocess.Popen([sys.executable, "-B", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env)
+        proc.stderr.close()  # before the process writes anything there
+        proc.stderr = None   # so communicate() does not read it (on Windows it would, from a thread)
+        try:
+            out, _ = proc.communicate(stdin, timeout=HANG_GUARD_S)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        return proc.returncode, out
+
+    def test_serving_with_stderr_closed_ends_with_status_0(self) -> None:
+        code = "from recursion_core.control.mcp.__main__ import main; raise SystemExit(main([], check=lambda env: object()))"
+        status, out = self.run_with_stderr_closed(["-c", code], encode({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        self.assertEqual((0, {"jsonrpc": "2.0", "id": 1, "result": {}}), (status, json.loads(out)))
+
+    def test_a_usage_error_with_stderr_closed_still_exits_2(self) -> None:
+        status, out = self.run_with_stderr_closed(["-m", "recursion_core.control.mcp", "--stdio"], b"")
+        self.assertEqual((2, b""), (status, out))
 
 
 if __name__ == "__main__":

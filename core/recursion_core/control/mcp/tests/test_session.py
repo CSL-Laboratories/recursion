@@ -282,6 +282,30 @@ class CancellationWindowTest(SessionCase):
         self.assertEqual([], writer.drain())
         self.assertEqual({"event": "cancelled", "outcome": "answer_dropped"}, events[-1])
 
+    def test_a_stop_cancelled_after_admission_and_before_its_send_is_never_sent(self) -> None:
+        # The call holds its slot and its worker exists but has not run: the cancellation comes in between.
+        # The worker then decides under the session's lock and does not send (round 4 of #395, DeepSeek F1).
+        for tool in (STOP, STATUS):
+            with self.subTest(tool=tool[0]):
+                events: list[dict] = []
+                api = GateAPI()
+                session, writer = self.session(api, log=events.append)
+                held: list[threading.Thread] = []
+                real_start = threading.Thread.start
+                with mock.patch.object(server.threading.Thread, "start", lambda thread, held=held: held.append(thread)):
+                    self.feed(session, call(2, *tool))
+                self.assertEqual(1, len(held))
+                with session._cond:
+                    self.assertEqual(server.ADMITTED, session._in_flight[2].state)
+                self.feed(session, cancel(2))
+                self.assertEqual({"event": "cancelled", "outcome": "never_sent"}, events[-1])
+                real_start(held[0])
+                held[0].join(HANG_GUARD_S)
+                self.assertFalse(held[0].is_alive())
+                session.close()
+                api.assert_nothing_entered(self)
+                self.assertEqual(([], [], 0), (api.calls, writer.drain(), session.in_flight()))
+
     def test_a_cancelled_waiting_call_is_never_sent(self) -> None:
         for waiting in (STATUS, STOP):
             with self.subTest(waiting=waiting[0]):
@@ -619,6 +643,46 @@ class AnswerTest(SessionCase):
         self.assertEqual({"jsonrpc": "2.0", "id": 2, "error": {
             "code": -32603, "message": "Internal error: the answer is not JSON"}}, writer.next())
         session.close()
+
+    def test_an_api_that_raises_a_base_exception_answers_delivery_unknown(self) -> None:
+        class Exiting:
+            def call(self, method, params=None):
+                raise SystemExit("bye")
+
+        hooks: list = []
+        session, writer = self.session(Exiting())
+        with mock.patch.object(threading, "excepthook", hooks.append):
+            self.feed(session, call(2, *STOP))
+            answer = writer.next()
+            session.close()
+        self.assertEqual([], hooks)  # nothing escaped the worker
+        self.assertEqual({"code": "control_api_unavailable", "delivered": "unknown", "detail": "mcp:SystemExit"},
+                         answer["result"]["structuredContent"])
+
+    def test_a_write_that_raises_is_a_failed_output(self) -> None:
+        class RaisesOnTwo(QueueWriter):
+            def __call__(self, message):
+                if message.get("id") == 2:
+                    raise OSError("stdout is gone")
+                return super().__call__(message)
+
+        hooks: list = []
+        events: list[dict] = []
+        api = GateAPI()
+        writer = RaisesOnTwo()
+        session = server.LegacySession(api, writer, log=events.append)
+        self.feed(session, INIT)
+        writer.next()
+        with mock.patch.object(threading, "excepthook", hooks.append):
+            self.feed(session, call(2, *STATUS))
+            api.next_entered()[2].set()
+            session.close()
+        self.assertEqual([], hooks)  # no traceback on the process's stderr
+        self.assertIn({"event": "write_failed", "detail": "OSError"}, events)
+        self.assertEqual({"event": "output_lost", "dropped_unsent": 0}, events[-1])
+        self.feed(session, call(3, *STATUS))  # stdout failed: nothing more is sent
+        api.assert_nothing_entered(self)
+        self.assertEqual(0, session.in_flight())
 
 
 class EndOfInputTest(unittest.TestCase):

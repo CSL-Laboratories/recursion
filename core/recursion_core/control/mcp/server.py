@@ -30,11 +30,14 @@ One ``LegacySession`` serves one client over one stdio pair (``serve``). What it
     Accepted; requests after the ``initialize`` answer are served whether or not it has arrived.
 ``notifications/cancelled``
     Names one request by its id (a string or an integer; ``"1"`` and ``1`` are different requests).
-    A call still WAITING for a slot is dropped and never sent. A call RUNNING has its answer dropped; the
-    call already sent to the daemon is not withdrawn. A call whose answer is already being written is not
-    affected: the answer was committed before the cancellation arrived, as for a call that has finished
-    (the specification lets a receiver ignore a cancellation that comes too late). Which of these happened
-    is decided under the session's lock, so a cancellation and an answer never both win. No Stop is ever
+    A call still WAITING for a slot is dropped and never sent. A call ADMITTED (it holds a slot, its worker
+    has not sent it yet) is never sent either: the worker decides to send under the session's lock and
+    finds it cancelled. A call SENT to the daemon has its answer dropped; the call is not withdrawn. A call
+    whose answer is already being written is not affected: the answer was committed before the
+    cancellation arrived, as for a call that has finished (the specification lets a receiver ignore a
+    cancellation that comes too late). Which of these happened is decided under the session's lock, so a
+    cancellation and a send, or a cancellation and an answer, never both win, and the logged outcome
+    (``never_sent``, ``answer_dropped``, ``answer_already_written``) is what the daemon saw. No Stop is ever
     sent for a cancellation, and a cancellation for an id that is not in flight is ignored.
 
 The MCP face has no Stop path of its own: ``recursion_run_stop`` forwards to ``run.stop`` and answers
@@ -67,19 +70,22 @@ received: each of those requests sent nothing to the daemon, and a dropped ``ini
 the session uninitialized (``replies.py``, EXHAUSTION). An in-process session given no ``reply`` writes
 those answers with ``write``.
 
-DIAGNOSTICS. Nor does any thread of ``serve`` wait for stderr. Every event for ``log`` (a cancellation, a
-response the client sent, ``initialize``, a stretch of dropped answers, ``output_lost``, the last line)
-goes to a ``diagnostics.DiagnosticQueue``, which takes it without waiting and delivers it on a thread of
-its own; it is bounded, and an event that does not fit is dropped and counted. So a client that captures
-stderr and stops reading it never stops the reader either. An in-process session calls its ``log``
-directly.
+DIAGNOSTICS. Nor does any thread of ``serve`` wait for stderr while it serves. Every event for ``log`` (a
+cancellation, a response the client sent, ``initialize``, a stretch of dropped answers, ``output_lost``,
+the last line) goes to a ``diagnostics.DiagnosticQueue``, which takes it without waiting and delivers it on
+a thread of its own; it is bounded, and an event that does not fit is dropped and counted. So a client
+that captures stderr and stops reading it never stops the reader either. At its end ``serve`` waits for
+the events still queued, its last line included, for at most ``max_diagnostic_drain_s`` (2 s) and then
+returns, so a client that never reads stderr does not keep the process alive after end of input; what
+stderr has not taken by then is lost. An in-process session calls its ``log`` directly.
 
 OUTPUT FAILURE. When a write to stdout fails, the session stops forwarding: no frame read afterwards and no
 waiting call is sent, a call that has been admitted but not yet sent is not sent, the reader's answers not
 yet written are discarded, calls already sent are left to finish at the daemon (no Stop is sent in their
 place), and ``serve`` returns without waiting for more input. Reading runs on its own thread for that
 reason. The failure is known at the first write that fails: a call read before then is sent if its worker
-starts before then.
+starts before then. A ``write`` that raises instead of failing quietly (an in-process session's) counts
+as a failed output too: ``{"event": "write_failed", "detail": ...}`` is logged and nothing more is sent.
 """
 
 from __future__ import annotations
@@ -95,7 +101,7 @@ from recursion_core.control import mcp_tools
 
 from . import jsonrpc
 from .framing import MAX_INT_DIGITS, NOT_JSON, NOT_UTF8, NUMBER_TOO_LONG, TOO_LARGE, Frame, FrameWriter, read_frames
-from .diagnostics import MAX_PENDING_DIAGNOSTIC_BYTES, DiagnosticQueue
+from .diagnostics import DIAGNOSTIC_DRAIN_S, MAX_PENDING_DIAGNOSTIC_BYTES, DiagnosticQueue
 from .replies import MAX_PENDING_REPLY_BYTES, ReplyQueue
 from .tools import Tool, check_arguments, tool_table
 
@@ -117,7 +123,9 @@ SERVER_BUSY = -32000
 
 UNAVAILABLE = "control_api_unavailable"
 _KNOWN_AFTER_INIT = frozenset({"tools/list", "tools/call"})
-WAITING, RUNNING, ANSWERING = "waiting", "running", "answering"
+# A call's states: WAITING (no slot yet), ADMITTED (holds a slot, not sent), SENT (sent to the daemon),
+# ANSWERING (its answer is being written). Each change is made under the session's lock.
+WAITING, ADMITTED, SENT, ANSWERING = "waiting", "admitted", "sent", "answering"
 
 Log = Callable[[dict], None]
 
@@ -241,7 +249,10 @@ class LegacySession:
                 del self._in_flight[request_id]
                 self._cond.notify_all()
                 outcome = "never_sent"
-            elif call.state == RUNNING:
+            elif call.state == ADMITTED:  # its worker finds it cancelled before sending (_run)
+                call.cancelled = True
+                outcome = "never_sent"
+            elif call.state == SENT:
                 call.cancelled = True
                 outcome = "answer_dropped"
             else:
@@ -336,12 +347,12 @@ class LegacySession:
             return
         with self._cond:
             call.arguments, call.ready = arguments, True
-            start = [call] if call.state == RUNNING else self._startable()
+            start = [call] if call.state == ADMITTED else self._startable()
         for each in start:
             self._start(each)
 
     def _admit(self, request_id: Any, tool: Tool) -> _Call:
-        """Record the call as in flight, holding a slot (``running``) or a place in its queue (``waiting``);
+        """Record the call as in flight, holding a slot (``admitted``) or a place in its queue (``waiting``);
         never waits. ``_Busy`` when its queue is full, ``_OutputLost`` once stdout has failed."""
 
         with self._cond:
@@ -349,7 +360,7 @@ class LegacySession:
                 raise _OutputLost()
             call = _Call(request_id, tool)
             if self._take_slot(call):
-                call.state = RUNNING
+                call.state = ADMITTED
             elif tool.is_stop and len(self._waiting_stops) < self._max_waiting_stops:
                 self._waiting_stops.append(call)
             elif not tool.is_stop and len(self._waiting) < self._max_waiting:
@@ -373,7 +384,7 @@ class LegacySession:
         return True
 
     def _startable(self) -> list[_Call]:
-        """Under the lock: waiting calls that can now take a slot, stop calls first; each is moved to running."""
+        """Under the lock: waiting calls that can now take a slot, stop calls first; each is moved to admitted."""
 
         started: list[_Call] = []
         if self._output_lost:
@@ -383,7 +394,7 @@ class LegacySession:
                 if not call.ready or not self._take_slot(call):
                     continue
                 queue.remove(call)
-                call.state = RUNNING
+                call.state = ADMITTED
                 started.append(call)
         return started
 
@@ -397,24 +408,35 @@ class LegacySession:
 
     def _run(self, call: _Call) -> None:
         try:
-            if self._output_open() and not self._output_lost:
+            with self._cond:  # the send is decided here: a cancellation before this point means never sent
+                send = not call.cancelled and not self._output_lost and self._output_open()
+                if send:
+                    call.state = SENT
+            if send:
                 try:
                     outcome = mcp_tools.call_tool(self._api, call.tool.name, call.arguments)
-                except Exception as exc:  # noqa: BLE001 - an answer is owed; the call's effect is unknown
+                except BaseException as exc:  # noqa: BLE001 - an answer is owed; the call's effect is unknown
                     outcome = _unknown_outcome(exc)
                 with self._cond:
-                    send = not call.cancelled
-                    if send:
+                    answer = not call.cancelled
+                    if answer:
                         call.state = ANSWERING
-                if send:
-                    try:
-                        self._write(jsonrpc.result(call.request_id, outcome))
-                    except (TypeError, ValueError):  # an answer JSON cannot hold; it claims nothing either way
-                        self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR,
-                                                  "Internal error: the answer is not JSON"))
-            # Output already lost: the call is not sent at all.
+                if answer:
+                    self._answer(call, outcome)
+            # Cancelled before the send, or output already lost: the call is not sent at all.
         finally:
             self._finish(call)
+
+    def _answer(self, call: _Call, outcome: dict) -> None:
+        try:
+            try:
+                self._write(jsonrpc.result(call.request_id, outcome))
+            except (TypeError, ValueError):  # an answer JSON cannot hold; it claims nothing either way
+                self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR,
+                                          "Internal error: the answer is not JSON"))
+        except Exception as exc:  # noqa: BLE001 - a write that raises is an output that failed
+            self._log({"event": "write_failed", "detail": type(exc).__name__})
+            self.output_lost()
 
     def _finish(self, call: _Call) -> None:
         """The call is over and its answer, if wanted, written: give its slot and id back, start what waits."""
@@ -464,7 +486,8 @@ def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None 
           max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP,
           max_waiting: int = MAX_WAITING, max_waiting_stops: int = MAX_WAITING_STOPS,
           max_pending_reply_bytes: int = MAX_PENDING_REPLY_BYTES,
-          max_pending_diagnostic_bytes: int = MAX_PENDING_DIAGNOSTIC_BYTES) -> int:
+          max_pending_diagnostic_bytes: int = MAX_PENDING_DIAGNOSTIC_BYTES,
+          max_diagnostic_drain_s: float = DIAGNOSTIC_DRAIN_S) -> int:
     """Serve one client until end of input or until stdout fails; returns the process exit status (0).
 
     Reading runs on a thread of its own, so that a failure of stdout ends the session even while the
@@ -507,5 +530,5 @@ def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None 
     session.close()
     replies.close()
     diagnostics.close(last={"event": "end_of_input" if not writer.broken else "output_failed",
-                            "stdout_broken": writer.broken})
+                            "stdout_broken": writer.broken}, timeout=max_diagnostic_drain_s)
     return 0

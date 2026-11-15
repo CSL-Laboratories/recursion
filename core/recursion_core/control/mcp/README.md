@@ -29,8 +29,10 @@ nothing to stdout, and exits 1. The folder and socket steps are repeated before 
 Exit statuses: 0 when the client ends stdin or stdout fails; 1 when the socket check fails; 2 for an
 argument; 3 for an unexpected error while serving (one JSON line, `internal_error`); 130 when interrupted.
 Ending stdin never stops a run: admitted calls finish and are answered, and the runs go on. The process
-reads fd 0 and writes fd 1 directly (`stdio.py`): nothing is buffered in `sys.stdout`, so a client that
-stops reading ends the process with status 0, not with a failed final flush.
+reads fd 0 and writes fd 1 and fd 2 directly (`stdio.py`): nothing is buffered in `sys.stdout` or
+`sys.stderr`, so a client that stops reading, or closes stderr, ends the process with its status, not
+with a failed final flush (120). Once the last answer is out it waits at most 2 s for stderr to take the
+remaining diagnostics, so a client that never reads stderr does not keep it alive.
 
 ## The wire
 
@@ -41,7 +43,9 @@ stops reading ends the process with status 0, not with a failed final flush.
 - `server/discover` (a dual-era client's probe) and every other unknown method answer `-32601` and the
   process keeps serving, so such a client falls back to `initialize`.
 - `tools/list` and `tools/call` are refused until `initialize`. Invalid arguments are `-32602` and reach
-  nothing; `arguments` may be left out (`{}`), and when present must be an object (`null` is refused).
+  nothing; `arguments` may be left out (`{}`), and when present must be an object (`null` is refused). A
+  call whose control frame would be over the socket's 1 MiB answers `control_api_unavailable` with
+  `delivered: false`, and nothing is written (`socket_check.CheckedSocketAPI`).
 - Request ids are strings or integers. A fraction or a boolean is not an id, so it can never name another
   request.
 - Admission never makes the reader wait: a call takes one of 8 ordinary slots (the stop tool also one of
@@ -59,10 +63,12 @@ stops reading ends the process with status 0, not with a failed final flush.
 - Nothing waits for stderr either. Every diagnostic goes to a queue delivered by a thread of its own
   (`diagnostics.py`, 64 KiB; the process writes fd 2 directly). A client that captures stderr and stops
   reading it loses lines, counted in a `diagnostics_dropped` line once stderr moves again, but the reader
-  goes on reading and answering. The last line (`end_of_input` or `output_failed`) is never dropped.
-- `notifications/cancelled`: a waiting call is dropped unsent; a running call's answer is dropped; an
-  answer already being written goes out (the cancellation came too late). Nothing is ever sent to the
-  daemon for a cancellation.
+  goes on reading and answering. The bound never drops the last line (`end_of_input` or
+  `output_failed`); it is lost only if stderr takes nothing for 2 s at the end, or a log has failed.
+- `notifications/cancelled`: a call not yet sent (waiting, or holding a slot before its worker sends it)
+  is never sent; a sent call's answer is dropped; an answer already being written goes out (the
+  cancellation came too late). The send is decided under the session's lock, so the logged outcome is
+  what the daemon saw. Nothing is ever sent to the daemon for a cancellation.
 - When stdout fails, nothing more is sent: waiting calls are dropped, queued answers discarded, and the
   session ends without waiting for more input.
 

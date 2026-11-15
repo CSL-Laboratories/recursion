@@ -16,8 +16,8 @@ from unittest import mock
 from recursion_core.control.mcp.diagnostics import DiagnosticQueue
 from recursion_core.control.mcp.framing import FrameWriter, encode
 from recursion_core.control.mcp.replies import ReplyQueue
-from recursion_core.control.mcp.tests.support import HANG_GUARD_S, Events, GateAPI, Served, Stalling
-from recursion_core.control.mcp.tests.test_session import INIT, START, STATUS, STOP, call, cancel, ping
+from recursion_core.control.mcp.tests.support import HANG_GUARD_S, Capture, Events, GateAPI, Served, Stalling
+from recursion_core.control.mcp.tests.test_session import INIT, SHORT, START, STATUS, STOP, call, cancel, ping
 
 
 def event(n) -> dict:
@@ -141,8 +141,64 @@ class DiagnosticQueueTest(unittest.TestCase):
         log.release.set()  # the delivery of event 1 raises
         self.assertTrue(self.idle(queue))
         self.assertEqual([False], self.offers(queue, [3]))  # refused for the failure, before close()
-        queue.close()
+        with queue._cond:
+            self.assertEqual((True, 0, 0), (queue._failed, queue._bytes, len(queue._pending)))
+        self.assertTrue(queue.close(last=event(9)))  # that log takes no last line either, and close returns
         self.assertEqual([], log.events.all)
+
+    def test_a_queue_never_started_delivers_what_it_took_at_close(self) -> None:
+        log = Events()
+        queue = DiagnosticQueue(log)
+        self.assertEqual([True, True], self.offers(queue, [1, 2]))
+        self.assertTrue(queue.close(last=event(9)))
+        self.assertEqual([event(1), event(2), event(9)], log.all)
+
+    def test_close_waits_for_delivery(self) -> None:
+        log = StalledLog()
+        queue = self.queue(log)
+        self.assertEqual([True], self.offers(queue, [1]))
+        self.assertTrue(log.stalled.wait(HANG_GUARD_S))
+        closing = threading.Thread(target=queue.close, daemon=True)
+        closing.start()
+        closing.join(SHORT)
+        self.assertTrue(closing.is_alive(), "close() returned before event 1 was delivered")
+        log.release.set()
+        closing.join(HANG_GUARD_S)
+        self.assertFalse(closing.is_alive())
+        self.assertEqual([event(1)], log.events.all)
+
+    def test_close_gives_up_after_its_timeout(self) -> None:
+        log = StalledLog()
+        queue = self.queue(log)
+        self.assertEqual([True], self.offers(queue, [1]))
+        self.assertTrue(log.stalled.wait(HANG_GUARD_S))
+        self.assertFalse(queue.close(last=event(9), timeout=0.05))  # stderr never moved: not all delivered
+        self.assertEqual([], log.events.all)
+        log.release.set()  # the thread, still holding event 1, goes on alone
+        self.assertEqual([event(1), event(9)], log.events.wait(2))
+
+    def test_events_are_counted_as_ascii_json(self) -> None:
+        log = StalledLog()
+        snow = {"event": "snow", "n": 1, "text": "\u2603" * 100}  # 100 characters, 600 bytes escaped
+        queue = self.queue(log, max_bytes=800)
+        self.assertTrue(queue.offer(snow))
+        self.assertTrue(log.stalled.wait(HANG_GUARD_S))
+        self.assertFalse(queue.offer(dict(snow, n=2)))  # two cannot fit in 800 bytes
+        log.release.set()
+        queue.close()
+
+    def test_the_default_bound_holds_64_kib_of_a_stalled_log(self) -> None:
+        log = StalledLog()
+        queue = self.queue(log)
+        bulk = {"event": "bulk", "n": 1, "text": "x" * 1000}
+        self.assertTrue(queue.offer(bulk))
+        self.assertTrue(log.stalled.wait(HANG_GUARD_S))
+        taken = sum(queue.offer(dict(bulk, n=2)) for _ in range(100))  # 100 KB offered
+        self.assertLess(taken, 100)
+        with queue._cond:
+            self.assertLessEqual(queue._bytes, 64 * 1024)
+        log.release.set()
+        queue.close()
 
     def test_the_bound_must_be_positive(self) -> None:
         with self.assertRaises(ValueError):
@@ -187,6 +243,42 @@ class ReplyDiagnosticsTest(unittest.TestCase):
             out.release.set()
             replies.close()
         self.assertEqual([stalled_on == "replies_resumed"], taken)
+
+    def test_close_waits_for_its_diagnostics_and_ends_their_thread(self) -> None:
+        entered, release = threading.Event(), threading.Event()
+        events = Events()
+
+        def log(item):
+            entered.set()
+            if not release.wait(HANG_GUARD_S):
+                raise AssertionError("the log was never released")
+            events(item)
+
+        out = Stalling({1})
+        replies = ReplyQueue(FrameWriter(out), max_bytes=len(encode(answer(1))), log=log)
+        replies.start()
+        self.assertTrue(replies.offer(answer(1)))
+        self.assertTrue(out.stalled.wait(HANG_GUARD_S))
+        self.assertFalse(replies.offer(answer(2)))  # its replies_dropped line stalls in the log
+        self.assertTrue(entered.wait(HANG_GUARD_S))
+        out.release.set()
+        closing = threading.Thread(target=replies.close, daemon=True)
+        closing.start()
+        closing.join(SHORT)
+        self.assertTrue(closing.is_alive(), "close() returned before its diagnostic was delivered")
+        release.set()
+        closing.join(HANG_GUARD_S)
+        self.assertFalse(closing.is_alive())
+        self.assertEqual([{"event": "replies_dropped", "pending_bytes": len(encode(answer(1)))}], events.all)
+        replies._diagnostics._thread.join(HANG_GUARD_S)
+        self.assertFalse(replies._diagnostics._thread.is_alive())
+
+    def test_a_reply_queue_never_started_writes_what_it_took_at_close(self) -> None:
+        out = Capture()
+        replies = ReplyQueue(FrameWriter(out))
+        self.assertTrue(replies.offer(answer(1)))
+        replies.close()
+        self.assertEqual([1], [m["id"] for m in out.drain()])
 
     def test_the_drop_line_never_makes_offer_wait(self) -> None:
         self.check_offer_returns_while_the_log_is_stalled("replies_dropped")
@@ -235,6 +327,21 @@ class StalledStderrTest(unittest.TestCase):
         self.assertEqual({"event": "end_of_input", "stdout_broken": False}, delivered[-1])
 
 
+    def test_end_of_input_returns_after_the_drain_budget_while_stderr_stays_stalled(self) -> None:
+        stalled, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def log(item):
+            if item["event"] == "initialize":  # stderr stops here and never moves again during the test
+                stalled.set()
+                release.wait(HANG_GUARD_S)
+
+        served = Served(GateAPI(), log=log, max_diagnostic_drain_s=0.05)
+        served.send(INIT)
+        self.assertEqual("init", served.out.next()["id"])
+        self.assertTrue(stalled.wait(HANG_GUARD_S))
+        self.assertEqual([], served.finish(self))  # serve returned 0 although its last line is not out
+
     def test_the_last_line_is_delivered_though_the_queue_is_full(self) -> None:
         stalled, release, closing = threading.Event(), threading.Event(), threading.Event()
         events = Events()
@@ -248,10 +355,10 @@ class StalledStderrTest(unittest.TestCase):
 
         real_close = DiagnosticQueue.close
 
-        def close(queue, last=None):
+        def close(queue, last=None, timeout=None):
             if queue._log is log:  # serve's own queue (the reply queue's queue delivers to it)
                 closing.set()
-            real_close(queue, last)
+            return real_close(queue, last, timeout)
 
         with mock.patch.object(DiagnosticQueue, "close", close):
             served = Served(GateAPI(), log=log, max_pending_diagnostic_bytes=1)

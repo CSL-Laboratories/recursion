@@ -1081,13 +1081,21 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
     What differs is the argv (``agy acp``), the drive (initialize, authenticate with the route's one method,
     session/new in the request's ``cwd``, one prompt), and the request's ``cwd``.
 
-    THE RUN'S FOLDER IS THE CALLER'S. A run is refused ``request_invalid`` (``cwd``) unless the request names
-    a ``cwd`` that is exactly a ``str`` (not a subclass), absolute and holding no NUL. There is NO fallback of
-    any kind: never the daemon's own working directory, never the route home, never the user's home. Nothing
-    here decides what a run's folder is: that is the workspace lane's (#392). The field is read from
-    ``request["cwd"]`` until SPINE names it in the route contract (the Liaison's ruling, Nov 15). It is the
-    ACP session's folder (``session/new``); the child process's own working directory is the launcher's to
-    set, and the launcher contract (``routes.launch``) has no field for it yet.
+    WHAT THE AGENT IS TOLD IS THE CALLER'S FOLDER. A run is refused ``request_invalid`` (``cwd``) unless the
+    request names a ``cwd`` that is exactly a ``str`` (not a subclass), absolute and holding no NUL, and that
+    folder, with no fallback, is the one the agent is told (``session/new``). Nothing here decides what a
+    run's folder is: that is the workspace lane's (#392). The field is read from ``request["cwd"]`` until
+    SPINE names it in the route contract (the Liaison's ruling, Nov 15).
+
+    WHERE THE PROCESS STARTS IS NOT THIS ADAPTER'S. It hands the launch boundary ``argv``, ``env`` and
+    ``shell`` and no working directory: the launcher contract (``launcher(argv, *, env, shell=False)``) has no
+    field for one, and the daemon's launcher refuses any other option (``launch_option_denied``,
+    ``daemon/launcher.py`` ``ProductionLauncher.__call__``). In the daemon as started no launcher for this
+    engine can be built yet (``ENGINE_PROFILES`` has no ``antigravity``); once one can, the child starts in the
+    engine's home under the daemon's state folder (``<state>/homes/<engine>``), not in the run's folder, and
+    with #370's S4 where the ``working_directory`` provider says (from the run's workspace), or there.
+    THIS ADAPTER MUST NOT BE REGISTERED UNTIL THE LAUNCH BOUNDARY STARTS THE CHILD IN THE RUN'S FOLDER, and
+    ``acp_factory`` refuses until then.
 
     THE REQUEST IS READ ONCE. ``run`` copies it, its route and its connection into plain dicts (each key read
     once), and every check and every use after that reads the copy: one Mapping cannot answer the check one
@@ -1108,8 +1116,8 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
         if isinstance(request, Mapping):
             try:
                 request = _request_once(request)
-            except c.RouteError as err:
-                return c.result("", err.code, detail=err.detail)
+            except _RequestRefused as err:
+                return c.result(err.request_id, err.code, detail=err.detail)
             rid, cwd = request.get("request_id"), request.get("cwd")
             # _request_once has refused a str subclass: a str here is exactly one
             if rid and not (isinstance(cwd, str) and cwd.startswith("/") and "\x00" not in cwd):
@@ -1145,36 +1153,54 @@ _EXACT_STR_ROUTE = ("model", "auth_method")
 _EXACT_STR_CONNECTION = ("kind", "id", "credential_env")
 
 
+class _RequestRefused(c.RouteError):
+    """A refusal of ``_request_once``: ``request_invalid``, the field named, and the caller's ``request_id``
+    when the copy holds one that is exactly a str (else ``""``), so the caller can match the refusal."""
+
+    def __init__(self, request_id: str, detail: str) -> None:
+        super().__init__(c.REQUEST_INVALID, detail)
+        self.request_id = request_id
+
+
 def _request_once(request: Mapping) -> dict:
     """The request, its route and its connection copied into plain dicts, each key read once; a str field this
-    adapter reads that is a str subclass is refused ``request_invalid``, named."""
+    adapter reads that is a str subclass is refused ``request_invalid``, named (``_RequestRefused``)."""
     def copy(mapping, exact, prefix):
         out = dict(mapping.items())
-        for name in exact:
-            value = out.get(name)
-            if isinstance(value, str) and type(value) is not str:
-                raise c.RouteError(c.REQUEST_INVALID, prefix + name)
-        return out
+        return out, [prefix + name for name in exact
+                     if isinstance(out.get(name), str) and type(out.get(name)) is not str]
 
+    rid, bad = "", []
     try:
-        snapshot = copy(request, _EXACT_STR, "")
+        snapshot, bad = copy(request, _EXACT_STR, "")
+        if type(snapshot.get("request_id")) is str:
+            rid = snapshot["request_id"]
         route = snapshot.get("route")
-        if isinstance(route, Mapping):
-            route = snapshot["route"] = copy(route, _EXACT_STR_ROUTE, "route.")
+        if not bad and isinstance(route, Mapping):
+            route, bad = copy(route, _EXACT_STR_ROUTE, "route.")
+            snapshot["route"] = route
             connection = route.get("connection")
-            if isinstance(connection, Mapping):
-                route["connection"] = copy(connection, _EXACT_STR_CONNECTION, "route.connection.")
-    except c.RouteError:
-        raise
+            if not bad and isinstance(connection, Mapping):
+                route["connection"], bad = copy(connection, _EXACT_STR_CONNECTION, "route.connection.")
     except Exception:   # a Mapping that cannot be read as one
-        raise c.RouteError(c.REQUEST_INVALID, "request") from None
+        raise _RequestRefused(rid, "request") from None
+    if bad:
+        raise _RequestRefused(rid, bad[0])
     return snapshot
 
 
+NO_RUN_FOLDER = "antigravity_acp_launch_has_no_run_folder"
+
+
 def acp_factory(launcher, clock, credentials, environ, **options) -> AntigravityAcpAdapter:
-    """S3's ``factory(launcher, clock, credentials, environ, **options)``. ``options`` is at most ``binary``,
-    so a factory-built adapter has no prepared home and refuses every launch, as the one-shot factory does."""
+    """S3's ``factory(launcher, clock, credentials, environ, **options)``; ``options`` is at most ``binary``.
+
+    IT REFUSES (``RouteError``, ``launch_refused``, ``NO_RUN_FOLDER``), so a composition that registers it
+    fails: this adapter must not be registered until the launch boundary starts the child in the run's
+    folder. Nothing given to a factory can say that yet (the launcher contract has no working directory, and
+    the daemon's launcher refuses any option it does not know), so the refusal is unconditional. It goes in
+    the change that gives the launcher contract a working directory and has ``run`` pass the run's folder."""
     unknown = set(options) - {"binary"}
     if unknown:
         raise TypeError(f"unknown options: {sorted(unknown)}")
-    return AntigravityAcpAdapter(launcher, clock, credentials, environ, binary=options.get("binary"))
+    raise c.RouteError(c.LAUNCH_REFUSED, NO_RUN_FOLDER)

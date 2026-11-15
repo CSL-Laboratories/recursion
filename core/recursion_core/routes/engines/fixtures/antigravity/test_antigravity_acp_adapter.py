@@ -9,6 +9,7 @@ Run: PYTHONPATH=core <python> -m unittest \\
 from __future__ import annotations
 
 import json
+import pathlib
 import unittest
 
 from recursion_core.routes import contract as c
@@ -46,9 +47,11 @@ class Rig:
         self.launches: list = []
         self.asked: list = []
         self.custody: list = []
+        self.handed: list = []                  # what each launch was handed: (positional count, keyword names)
 
-        def launcher(argv, *, env, shell=False, **kw):
-            self.launches.append({"argv": list(argv), "env": dict(env), "shell": shell})
+        def launcher(*args, **kw):
+            self.handed.append((len(args), sorted(kw)))
+            self.launches.append({"argv": list(args[0]), "env": dict(kw["env"]), "shell": kw.get("shell", False)})
             return self.agent
 
         def boundary_fn(values):
@@ -203,12 +206,20 @@ class TurnTest(unittest.TestCase):
 
 
 class FactoryTest(unittest.TestCase):
-    def test_the_factory_takes_only_binary_and_its_adapter_refuses_every_launch(self) -> None:
+    def test_the_factory_takes_only_binary_and_refuses_to_be_registered(self) -> None:
         for option in ("prepared_home", "output_boundary", "cwd", "env"):
             with self.subTest(option=option), self.assertRaises(TypeError):
                 ag.acp_factory(None, None, None, PARENT, **{option: None})
         launches = []
-        made = ag.acp_factory(lambda *a, **k: launches.append(a), lambda: 0.0, lambda *a: KEY, PARENT)
+        for options in ({}, {"binary": "/opt/agy"}):
+            with self.subTest(options=options), self.assertRaises(c.RouteError) as caught:
+                ag.acp_factory(lambda *a, **k: launches.append(a), lambda: 0.0, lambda *a: KEY, PARENT, **options)
+            self.assertEqual((caught.exception.code, caught.exception.detail), (c.LAUNCH_REFUSED, ag.NO_RUN_FOLDER))
+        self.assertEqual(launches, [])
+
+    def test_an_adapter_with_no_prepared_home_refuses_every_launch(self) -> None:
+        launches = []
+        made = ag.AntigravityAcpAdapter(lambda *a, **k: launches.append(a), lambda: 0.0, lambda *a: KEY, PARENT)
         res = made.run(request("oauth-business", "subscription", None), 60.0)
         self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.NOT_PREPARED))
         self.assertEqual(launches, [])
@@ -240,6 +251,20 @@ class TwoFaced(dict):
 
     def get(self, key, default=None):
         return self._lie.get(key, super().get(key, default))
+
+
+class TwoFacedItem(TwoFaced):
+    """A TwoFaced that lies on [] as well (items() still tells the truth)."""
+
+    def __getitem__(self, key):
+        return self._lie[key] if key in self._lie else super().__getitem__(key)
+
+
+class Unreadable(dict):
+    """A route that cannot be read as a mapping."""
+
+    def items(self):
+        raise RuntimeError("synthetic")
 
 
 class ReviewRoundOne411Test(unittest.TestCase):
@@ -316,6 +341,98 @@ class ReviewRoundOne411Test(unittest.TestCase):
         self.assertIsNone(res["code"])
         json.dumps(res, ensure_ascii=False).encode("utf-8")
         self.assertEqual(res["text"], "a" + chr(0xFFFD) + "b")
+
+
+class ReviewRoundTwo411Test(unittest.TestCase):
+    """DeepSeek's round-2 read of #411 at 16fd5d50 (MEDIUM F1, LOW F3, F4, F6; F2 and F5 are #408's, pinned
+    there by its round-4 answer). Each fails on that head."""
+
+    def test_f1_the_launch_boundary_is_handed_no_working_directory(self) -> None:
+        # The fact, pinned: argv, env and shell, nothing else. The agent is told the request's cwd; where the
+        # process starts is the launch boundary's (in the daemon as started, the engine's home), not the run's.
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        self.assertIsNone(rig.run(request())["code"])
+        self.assertEqual(rig.handed, [(1, ["env", "shell"])])
+        self.assertEqual([m["params"]["cwd"] for m in rig.sent("session/new")], [CWD])
+
+    def test_f1_the_precondition_is_written_where_the_adapter_is_read(self) -> None:
+        sentence = "MUST NOT BE REGISTERED UNTIL THE LAUNCH BOUNDARY STARTS THE CHILD IN THE RUN'S FOLDER"
+        def flat(text):                                   # 3.13 and later strip a docstring's indentation
+            return " ".join(text.split())
+
+        self.assertIn(sentence, flat(ag.AntigravityAcpAdapter.__doc__))
+        self.assertIn(sentence.lower(), flat(ag.acp_factory.__doc__).lower())
+        readme = pathlib.Path(ag.__file__).parent / "fixtures" / "antigravity" / "README.md"
+        self.assertIn(sentence.lower(), readme.read_text(encoding="utf-8").lower())
+        for untrue in ("never the daemon's own working directory", "no fallback of any kind"):
+            self.assertNotIn(untrue, ag.AntigravityAcpAdapter.__doc__)
+            self.assertNotIn(untrue, readme.read_text(encoding="utf-8"))
+
+    def test_f3_a_lone_surrogate_in_a_client_failures_detail_leaves_the_result_writable(self) -> None:
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]], methods=("gemini-api-key",))
+        rig.agent._accept = set()                                 # the agent refuses authenticate
+        read = rig.agent.read_line
+
+        def read_line(timeout_s):
+            line = read(timeout_s)
+            if line is not None and '"error"' in line:              # the refusal carries a lone surrogate
+                message = json.loads(line)
+                message["error"]["message"] = "bad " + chr(0xD800) + " credential"
+                line = json.dumps(message)
+            return line
+
+        rig.agent.read_line = read_line
+        res = rig.run(request())
+        self.assertIn(res["code"], c.CODES)
+        self.assertNotIn(chr(0xD800), res["detail"])
+        json.dumps(res, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(len(rig.agent.fenced), 1)
+
+    def test_f4_a_lone_surrogate_in_a_failed_turns_detail_leaves_the_result_writable(self) -> None:
+        rig = Rig([[("error", -32603, "refused " + chr(0xD800))]])
+        res = rig.run(request())
+        self.assertEqual(res["code"], c.ENGINE_ERROR)
+        self.assertNotIn(chr(0xD800), res["detail"])
+        self.assertIn(chr(0xFFFD), res["detail"])
+        json.dumps(res, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(len(rig.agent.fenced), 1)
+
+    def test_f2_a_route_and_a_connection_that_answer_two_ways_are_read_once(self) -> None:
+        # (the lane's removal probes found this unpinned below the top level)
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        req = request()
+        req["route"] = TwoFaced(req["route"], {"auth_method": "agent-platform"})
+        self.assertIsNone(rig.run(req)["code"])
+        self.assertEqual([m["params"]["methodId"] for m in rig.sent("authenticate")], ["gemini-api-key"])
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        req = request()
+        req["route"]["connection"] = TwoFacedItem(req["route"]["connection"], {"id": "conn-B"})
+        self.assertIsNone(rig.run(req)["code"])
+        self.assertEqual(rig.custody, [("conn-A", "GEMINI_API_KEY")])
+
+    def test_f6_a_refusal_of_the_request_keeps_the_callers_request_id(self) -> None:
+        for path in (("tenant",), ("prompt",), ("contract",), ("route", "model"), ("route", "connection", "id")):
+            with self.subTest(field=".".join(path)):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+                req = request()
+                holder = req
+                for key in path[:-1]:
+                    holder = holder[key]
+                holder[path[-1]] = LyingStr(holder[path[-1]])
+                res = rig.run(req)
+                self.assertEqual((res["request_id"], res["code"], res["detail"]),
+                                 ("r1", c.REQUEST_INVALID, ".".join(path)))
+                self.assertEqual(rig.launches, [])
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        req = request()
+        req["route"] = Unreadable(req["route"])
+        res = rig.run(req)
+        self.assertEqual((res["request_id"], res["code"], res["detail"]), ("r1", c.REQUEST_INVALID, "request"))
+        req = request()
+        req["request_id"] = LyingStr("r1")                          # not exactly a str: never echoed
+        res = rig.run(req)
+        self.assertEqual((type(res["request_id"]), res["request_id"], res["detail"]), (str, "", "request_id"))
+        self.assertEqual(rig.launches, [])
 
 if __name__ == "__main__":
     unittest.main()

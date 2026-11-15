@@ -95,15 +95,26 @@ def withhold_venue_data(value: object) -> object:
     pass through unredacted). Any other value that is not a str, an int (bool included), a
     float or None (a set, a deque, any other object) is replaced by a fixed marker, never shown.
     A float is kept whatever its value, NaN and the infinities included, as ``json.loads``
-    gives them; this is a redaction, not a strict-JSON sanitiser.
+    gives them; this is a redaction, not a strict-JSON sanitiser. An entry whose key is not a
+    str (JSON gives only str keys) is left out. Anything nested deeper than ``_MAX_DEPTH``
+    containers is replaced by a fixed marker, so a deep answer is drawn, never a crash.
     """
+    return _withhold(value, 0)
+
+
+_MAX_DEPTH = 64  # containers below the answer's top level; the same bound as gui/panels.py's filter
+
+
+def _withhold(value: object, depth: int) -> object:
+    if depth > _MAX_DEPTH and isinstance(value, (Mapping, list, tuple)):
+        return "[withheld: nested too deeply to show]"
     if isinstance(value, Mapping):
-        out = {k: withhold_venue_data(v) for k, v in value.items()}
+        out = {k: _withhold(v, depth + 1) for k, v in value.items() if isinstance(k, str)}
         if "venue_data" in value and value.get("venue_data_switch") != "on":
             out["venue_data"] = "[withheld: venue data switch is off]"
         return out
     if isinstance(value, (list, tuple)):
-        return [withhold_venue_data(v) for v in value]
+        return [_withhold(v, depth + 1) for v in value]
     if value is None or isinstance(value, (str, int, float)):
         return value
     return "[withheld: not JSON data]"
@@ -144,17 +155,22 @@ class Application:
     # -- door ---------------------------------------------------------------------------
     def _refusal(self, env: dict) -> str | None:
         method = env.get("REQUEST_METHOD")
-        if env.get("HTTP_HOST") not in self._hosts:
+        host = env.get("HTTP_HOST")
+        if not isinstance(host, str) or host not in self._hosts:
             return "host_not_allowed"
         origin = env.get("HTTP_ORIGIN")
-        if origin is not None and ("," in origin or origin not in self._origins):
+        if origin is not None and (not isinstance(origin, str) or "," in origin or origin not in self._origins):
             return "origin_not_allowed"
         if method == "POST" and origin is None:
             return "origin_required"
         site = env.get("HTTP_SEC_FETCH_SITE")
         if site is not None and site != "same-origin" and not (method == "GET" and site == "none"):
             return "cross_site_request"
-        if self._door(env) is not True:
+        try:
+            admitted = self._door(env) is True
+        except Exception:  # noqa: BLE001 - an adapter that cannot answer has not admitted the device
+            admitted = False
+        if not admitted:
             return "device_not_authenticated"
         return None
 
@@ -173,10 +189,18 @@ class Application:
                               self._page("Not available", "<p>Not available.</p>"))
         try:
             title, body = handler(env)
-            return self._send(start_response, "200 OK", self._page(title, body))
+            html = self._page(title, body)
         except _BadRequest as exc:
             return self._send(start_response, "400 Bad Request",
                               self._page("Bad request", "<p>Bad request: %s</p>" % escape(str(exc))))
+        except Exception as exc:  # noqa: BLE001 - every answer this module gives carries the same headers
+            # Only the exception's type is named, never its text. Nothing here says whether a request
+            # that was sent took effect.
+            return self._send(start_response, "500 Internal Server Error", self._page(
+                "Not available", '<p role="status">Not available: the page could not finish this request '
+                "(%s). It does not know whether anything that was sent took effect; check the run before "
+                "sending it again.</p>" % escape(type(exc).__name__)))
+        return self._send(start_response, "200 OK", html)
 
     @staticmethod
     def _send(start_response, status: str, html: str) -> list[bytes]:

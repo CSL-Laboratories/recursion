@@ -207,6 +207,33 @@ class InterfaceTests(unittest.TestCase):
                 self.assertNotEqual(source, [READS[0]])  # the check did change the declaration
                 self.assertEqual(answer["p"]["reads"], (READS[0],))
 
+    def test_panels_that_cannot_be_iterated_get_the_first_refusal(self):
+        # DeepSeek break-it read of #384, F6: the ValueError promise holds for the container too.
+        for panels_value in (None, 7, 1.5, object()):
+            with self.subTest(panels=panels_value):
+                with self.assertRaises(ValueError) as caught:
+                    panel_registry(panels_value)
+                self.assertIs(type(caught.exception), ValueError)
+                self.assertEqual(caught.exception.args, (NEEDS_KEYS,))
+
+    def test_deep_responses_and_keys_that_are_not_text_are_withheld_not_a_crash(self):
+        # DeepSeek break-it read of #384, F1 and F7, at the filter itself.
+        leaf = "DEEP-LEAF"
+        deep = leaf
+        for _ in range(5000):
+            deep = {"next": deep}
+        for response in ({"result": {"venue": "paper", "rows": deep}}, {"errors": [deep]}, {"provenance": deep},
+                         {"venue": "paper", "rows": deep}):
+            with self.subTest(top=sorted(response)):
+                kept, withheld = filter_venue_rows(response, "paper")
+                self.assertTrue(withheld)
+                self.assertNotIn(leaf, repr(kept))
+        shallow = {"result": {"venue": "paper", "rows": {"a": {"b": {"c": "SHALLOW-LEAF"}}}}}
+        self.assertEqual(filter_venue_rows(shallow, "paper"), (shallow, False))
+        kept, withheld = filter_venue_rows({"result": {"venue": "paper", 1: "INT-KEY", "symbol": "OK"},
+                                            "errors": [{2: "INT-KEY", "code": "E"}]}, "paper")
+        self.assertEqual((kept, withheld), ({"result": {"venue": "paper", "symbol": "OK"}, "errors": [{"code": "E"}]}, True))
+
     def test_a_tuple_subclass_of_reads_is_refused(self):
         class Reads(tuple):
             pass

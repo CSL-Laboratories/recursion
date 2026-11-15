@@ -225,6 +225,54 @@ class StdioTest(unittest.TestCase):
         self.assertEqual(set(range(1, 10)), {child.recv()["id"] for _ in range(9)})
         self.assertEqual(0, child.end()[0])
 
+    def test_with_the_default_limits_a_stop_is_sent_behind_a_busy_answer_while_stdout_is_full(self) -> None:
+        # Eight large answers fill the pipe nobody reads and hold the eight ordinary slots; sixteen calls
+        # wait; the next is refused Server busy; the stop behind it must still be read and sent.
+        stop_seen = threading.Event()
+        changed = threading.Condition()
+        entered: list[str] = []
+
+        class Padded:
+            def call(self, method, params=None):
+                with changed:
+                    entered.append(method)
+                    changed.notify_all()
+                if method == "run.status":
+                    return {"code": "ok", "run": {"run_id": "r"}, "padding": "x" * 40000}
+                if method == "run.stop":
+                    stop_seen.set()
+                    return {"code": "pending", "run_id": params["run_id"], "state": "pending"}
+                return {"code": "ok", "runs": []}
+
+        def status(request_id) -> dict:
+            return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                    "params": {"name": "recursion_run_status", "arguments": {"run_id": "r"}}}
+
+        self.daemon(Padded())
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        for n in range(2, 10):
+            child.send(status(n))
+        with changed:
+            self.assertTrue(changed.wait_for(lambda: entered.count("run.status") == 8, HANG_GUARD_S))
+        for n in range(10, 27):  # sixteen wait, and the seventeenth (26) is refused
+            child.send(status(n))
+        child.send({"jsonrpc": "2.0", "id": 27, "method": "tools/call",
+                    "params": {"name": "recursion_run_stop", "arguments": {"run_id": "r"}}})
+        self.assertTrue(stop_seen.wait(HANG_GUARD_S), "the stop was not sent while stdout was full")
+        with changed:
+            self.assertEqual(8, entered.count("run.status"))  # the waiting calls were not sent meanwhile
+        answers = {}
+        for _ in range(26):  # reading stdout lets everything through
+            answer = child.recv()
+            answers[answer["id"]] = answer
+        self.assertEqual(set(range(2, 28)), set(answers))
+        self.assertEqual(-32000, answers[26]["error"]["code"])
+        self.assertEqual("pending", answers[27]["result"]["structuredContent"]["code"])
+        self.assertEqual(0, child.end()[0])
+        with changed:
+            self.assertEqual((24, 1), (entered.count("run.status"), entered.count("run.stop")))
+
     def test_stdout_that_fails_ends_the_process_with_status_0_and_sends_nothing_more(self) -> None:
         release, status_seen = threading.Event(), threading.Event()
         seen: list[str] = []

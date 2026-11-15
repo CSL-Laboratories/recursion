@@ -162,23 +162,43 @@ def write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-class Served:
-    """``server.serve`` on a thread, reading a real pipe and writing to a ``Capture``."""
+class Stalling(Capture):
+    """A ``Capture`` whose write of a message with an id in ``stall_ids`` blocks until ``release`` is set
+    (a client that stopped reading stdout); with ``fail``, that write then fails as a broken pipe."""
 
-    def __init__(self, api: Any, **kwargs: Any) -> None:
+    def __init__(self, stall_ids, *, fail: bool = False) -> None:
+        super().__init__()
+        self.stall_ids = set(stall_ids)
+        self.fail = fail
+        self.stalled = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, data: bytes) -> int:
+        if json.loads(data).get("id") in self.stall_ids:
+            self.stalled.set()
+            if not self.release.wait(HANG_GUARD_S):
+                raise AssertionError("stdout was never released")
+            if self.fail:
+                raise BrokenPipeError("the client went away")
+        return super().write(data)
+
+
+class Served:
+    """``server.serve`` on a thread, reading a real pipe and writing to a ``Capture`` (or to ``out``)."""
+
+    def __init__(self, api: Any, out: Capture | None = None, **kwargs: Any) -> None:
         read_fd, self._write_fd = os.pipe()
         self._instream = os.fdopen(read_fd, "rb")
-        self.out = Capture()
+        self.out = out if out is not None else Capture()
         self.events: list[dict] = []
         self.status: int | None = None
         self._thread = threading.Thread(target=self._serve, args=(api, kwargs), name="mcp-test-serve", daemon=True)
         self._thread.start()
 
     def _serve(self, api: Any, kwargs: dict) -> None:
-        try:
-            self.status = server.serve(api, self._instream, self.out, log=self.events.append, **kwargs)
-        finally:
-            self._instream.close()
+        # stdin is not closed here: after stdout fails, serve returns while its reader still waits on
+        # stdin, and closing a buffered stream another thread is reading waits for that read.
+        self.status = server.serve(api, self._instream, self.out, log=self.events.append, **kwargs)
 
     def send(self, message: Any) -> None:
         self.send_bytes(encode(message) if isinstance(message, dict) else message)
@@ -192,10 +212,14 @@ class Served:
             self._write_fd = None
 
     def join(self, timeout: float = HANG_GUARD_S) -> bool:
-        """``True`` when ``serve`` has returned within ``timeout``."""
+        """``True`` when ``serve`` has returned within ``timeout``. Once it has and input has ended, stdin
+        is closed (a reader still running, when serve ended on an output failure, has end of input)."""
 
         self._thread.join(timeout)
-        return not self._thread.is_alive()
+        returned = not self._thread.is_alive()
+        if returned and self._write_fd is None:
+            self._instream.close()
+        return returned
 
     def finish(self, test) -> list:
         """End input, wait for ``serve`` to return 0, and return what was written after the last read."""

@@ -48,11 +48,19 @@ stops reading ends the process with status 0, not with a failed final flush.
   2 reserved slots), or waits in a queue (16 places for ordinary calls, 8 for stop calls, served first),
   or is refused at once with `-32000` "Server busy" and `data.delivered: false` (nothing was sent). A slot
   is held until the call's answer is written, so slow stdout cannot pile up workers.
+- The reader never writes to stdout, so slow stdout never stops it reading: a Stop behind a busy answer is
+  still sent and a cancellation still applied. The answers it owes (refusals, `ping`, `initialize`,
+  `tools/list`) go to a reply queue written by a thread of its own (`replies.py`), holding at most 1 MiB.
+  A client that stops reading stdout and goes on writing fills it; an answer that does not fit is dropped
+  and its request treated as never received (each such request sent nothing to the daemon; a dropped
+  `initialize` answer leaves the session uninitialized). The client times out, as 2025-06-18 says it
+  should, and may send it again. Stderr gets two lines per stretch of drops (`replies_dropped`,
+  `replies_resumed`).
 - `notifications/cancelled`: a waiting call is dropped unsent; a running call's answer is dropped; an
   answer already being written goes out (the cancellation came too late). Nothing is ever sent to the
   daemon for a cancellation.
-- When stdout fails, nothing more is sent: waiting calls are dropped, and the session ends without
-  waiting for more input.
+- When stdout fails, nothing more is sent: waiting calls are dropped, queued answers discarded, and the
+  session ends without waiting for more input.
 
 Diagnostics go to stderr as JSON lines; stdout carries only protocol messages, one ASCII line each.
 

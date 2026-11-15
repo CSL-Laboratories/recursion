@@ -78,9 +78,11 @@ class EntryTest(unittest.TestCase):
              "params": {"name": "recursion_run_status", "arguments": {"run_id": "run-1"}}})))
         out, err = io.BytesIO(), io.StringIO()
         self.assertEqual(0, entry.main([], stdin=stdin, stdout=out, stderr=err, check=lambda environ: api))
-        answers = [json.loads(line) for line in out.getvalue().splitlines()]
-        self.assertEqual([1, 2], [a["id"] for a in answers])
-        self.assertEqual("run_unknown", answers[1]["result"]["structuredContent"]["code"])
+        # The two answers come from two threads (the reply queue's and the call's worker): any order.
+        lines = out.getvalue().splitlines()
+        answers = {a["id"]: a for a in map(json.loads, lines)}
+        self.assertEqual((2, {1, 2}), (len(lines), set(answers)))
+        self.assertEqual("run_unknown", answers[2]["result"]["structuredContent"]["code"])
         events = stderr_lines(err)
         self.assertEqual({"event": "serving", "protocol": "2025-06-18"}, events[0])
         self.assertEqual("initialize", events[1]["event"])

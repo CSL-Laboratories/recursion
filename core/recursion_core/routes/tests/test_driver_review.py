@@ -18,7 +18,7 @@ from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBre
 from recursion_core.routes import contract as c
 from recursion_core.routes import driver as d
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, claude_ok, codex_script, request
-from recursion_core.routes.tests.test_driver import ALL, StandIn, accepted, draft_line, msg, start_record
+from recursion_core.routes.tests.test_driver import ALL, StandIn, accepted, draft_line, msg, session
 from recursion_core.routes.tests.test_engine_check import EchoAdapter, StandInTable
 
 
@@ -60,7 +60,7 @@ class WriteOrderTest(unittest.TestCase):
                     second_written.set()
 
         driver = Held(ALL)
-        handle = driver.start(start_record(), {})
+        handle = driver.start(session(), None, {})
 
         def call(item):
             try:
@@ -96,7 +96,7 @@ class WriteOrderTest(unittest.TestCase):
                 super()._send(handle, item)
 
         driver = Held(ALL)
-        handle = driver.start(start_record(), {})
+        handle = driver.start(session(), None, {})
         writer = threading.Thread(target=lambda: driver.send(handle, msg()))
         writer.start()
         self.assertTrue(entered.wait(30))
@@ -114,14 +114,14 @@ class WriteOrderTest(unittest.TestCase):
 class StartRecordTest(unittest.TestCase):
     """R2: the nested route and workspace are checked (common.v1) before the start hook is asked."""
 
-    def refused(self, record):
+    def refused(self, sess, ws):
         driver = StandIn(ALL)
         with self.assertRaises(d.DriverInputError):
-            driver.start(record, {})
+            driver.start(sess, ws, {})
         self.assertEqual(driver.started, [])
 
     def test_a_malformed_route_never_reaches_the_start_hook(self):
-        good = start_record()["route"]
+        good = session()["route"]
         for route in ({}, [], 7, None, {"engine": "claude_code", "model": "m"},
                       dict(good, engine="Invalid-Engine"), dict(good, connection={}),
                       dict(good, connection={"kind": "cloud", "id": "x"}),
@@ -129,18 +129,18 @@ class StartRecordTest(unittest.TestCase):
                       dict(good, connection={"kind": "subscription", "id": "x" * 201}),
                       dict(good, model=""), dict(good, unlisted=1)):
             with self.subTest(route=route):
-                self.refused(dict(start_record(), route=route))
+                self.refused(dict(session(), route=route), None)
 
     def test_a_malformed_workspace_never_reaches_the_start_hook(self):
         for value in ({}, [], 7, "/srv/work", workspace(path=""), workspace(path=42), workspace(mode="shared"),
                       workspace(mode="worktree"), workspace(mode="worktree", base_ref="main"),
                       workspace(worktree_path="/srv/other"), workspace(extra=1)):
             with self.subTest(workspace=value):
-                self.refused(dict(start_record(), workspace=value))
+                self.refused(session(), value)
 
     def test_valid_records_start_and_the_hook_gets_copies(self):
         for value in (None, workspace(), workspace(mode="worktree", base_ref="main", worktree_path="/srv/wt")):
-            record = dict(start_record(), workspace=value)
+            sess = session()
             expected = None if value is None else dict(value)  # a separate copy: the hook may not reach the caller's
             driver = StandIn(ALL)
 
@@ -150,11 +150,11 @@ class StartRecordTest(unittest.TestCase):
                     request["workspace"]["path"] = "/changed"
 
             driver._start = hook
-            self.assertEqual(driver.start(record, {}).run_id, "run-1")
-            self.assertEqual(record["route"]["connection"]["id"], "login-A")
-            self.assertEqual(record["workspace"], expected)
-        self.assertEqual(StandIn(ALL).start(dict(start_record(), route=dict(start_record()["route"], model=None)),
-                                            {}).run_id, "run-1")  # model null: the engine's own default
+            self.assertEqual(driver.start(sess, value, {}).run_id, "run-1")
+            self.assertEqual(sess["route"]["connection"]["id"], "login-A")
+            self.assertEqual(value, expected)
+        self.assertEqual(StandIn(ALL).start(dict(session(), route=dict(session()["route"], model=None)),
+                                            None, {}).run_id, "run-1")  # model null: the engine's own default
 
 
 class DraftValueTest(unittest.TestCase):
@@ -162,7 +162,7 @@ class DraftValueTest(unittest.TestCase):
 
     def parse(self, type_, payload):
         driver = StandIn(ALL)
-        return driver.parse(driver.start(start_record(), {}), draft_line(type_, payload))
+        return driver.parse(driver.start(session(), None, {}), draft_line(type_, payload))
 
     def test_invalid_values_are_refused(self):
         tool_result = {"call_id": "c1", "status": "ok", "text": "x", "output_ref": None, "truncated": False}
@@ -278,7 +278,7 @@ class GuardEdgeTest(unittest.TestCase):
         self.assertEqual(driver.forks, [])
 
     def test_a_reported_conversation_id_has_its_shape(self):
-        handle = StandIn(ALL).start(start_record(), {})
+        handle = StandIn(ALL).start(session(), None, {})
         for value in (None, "", 42, "x" * 257):
             with self.subTest(value=repr(value)[:20]), self.assertRaises(d.DriverInputError):
                 handle.set_engine_session_id(value)
@@ -286,7 +286,7 @@ class GuardEdgeTest(unittest.TestCase):
 
     def test_an_acceptance_draft_has_its_shape(self):
         driver = StandIn(ALL)
-        handle = driver.start(start_record(), {})
+        handle = driver.start(session(), None, {})
         for line in (accepted(delivery="invalid"), accepted(turn="invalid"), accepted(how="invalid")):
             with self.subTest(line=line), self.assertRaises(d.DriverInputError):
                 driver.parse(handle, line)
@@ -306,7 +306,7 @@ class GuardEdgeTest(unittest.TestCase):
 
     def test_an_interrupt_with_a_malformed_turn_id_writes_nothing(self):
         driver = StandIn(ALL)
-        handle = driver.start(start_record(), {})
+        handle = driver.start(session(), None, {})
         driver.send(handle, msg())
         before = list(driver.written)
         with self.assertRaises(d.DriverInputError):
@@ -314,11 +314,11 @@ class GuardEdgeTest(unittest.TestCase):
         self.assertEqual(driver.written, before)
 
     def test_the_start_hook_gets_a_copy_of_the_record(self):
-        record = start_record()
+        sess = session()
         driver = StandIn(ALL)
         driver._start = lambda handle, request, env: request.update(run_id="mutated")
-        driver.start(record, {})
-        self.assertEqual(record["run_id"], "run-1")
+        driver.start(sess, None, {})
+        self.assertEqual(sess["run_id"], "run-1")
 
 
 class SharedBoundaryTest(unittest.TestCase):

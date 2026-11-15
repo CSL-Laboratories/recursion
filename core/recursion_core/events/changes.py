@@ -61,7 +61,10 @@ service (S13). The marker's text is the protocol; this module follows it:
 
 What this gives, and what it does not. Replay of the log reaches the registry's durable state for every
 run not listed in ``unlogged``: the last image logged for a run equals what the registry holds once the
-reader (one per store) has caught up. Changes between two reads appear as the last image: the log does NOT claim every
+reader has caught up, with one reader per store. ``start`` holds to that: another reader's ``start`` or ``bind`` on
+a started reader's store is refused. ``bind`` alone takes no claim (it is the tests' stand-in for a restart), so two
+readers that are only bound to one store can leave a run's last image behind the registry's until its next read.
+Changes between two reads appear as the last image: the log does NOT claim every
 intermediate transition (a transition-exact log would need a write inside Stop's durable path, which is
 lane STOP's to propose). Its source reads take the registry's lock, so a paused reader CAN delay a Stop;
 SPINE's S12 text states that cost, and nothing here adds a registry write.
@@ -243,6 +246,7 @@ class ChangeReader:
         self._registry = self._store = None
         self._stopping = threading.Event()   # the current start's stop signal; each start makes its own
         self._thread = None                   # the current start's thread, from before it is started to its join
+        self._claimed = None                  # the store the current start claimed, until its stop
         self._reset()
 
     def _reset(self) -> None:
@@ -280,7 +284,8 @@ class ChangeReader:
 
     def bind(self, registry, store) -> None:
         """The two things the reader reads and writes. ``start`` binds them from the service context. A store
-        another reader's ``start`` holds (until its ``stop``) is refused."""
+        another reader's ``start`` holds (until its ``stop``) is refused. ``bind`` alone takes no claim: the tests
+        bind a second reader on one store to stand for a restart."""
         _claim(store, self, take=False)
         self._registry, self._store = registry, store
 
@@ -292,6 +297,7 @@ class ChangeReader:
         if context.store is None:
             raise RuntimeError('the change reader needs the event store')
         _claim(context.store, self, take=True)
+        self._claimed = context.store
         self.bind(context.registry, context.store)
         self._reset()
         stopping = self._stopping = threading.Event()
@@ -302,7 +308,8 @@ class ChangeReader:
         thread.start()
 
     def stop(self, context) -> None:
-        """Ends the current start's thread, joins it, and gives up the store's claim. A thread whose start raised
+        """Ends the current start's thread, joins it, and gives up the claim that start took, on the store it was
+        started with (a later ``bind`` to another store does not move the claim). A thread whose start raised
         before it began is not joined: when it runs, it reads its own stop signal, set here, before anything else,
         and does nothing."""
         self._stopping.set()
@@ -311,7 +318,8 @@ class ChangeReader:
             if thread.is_alive():
                 thread.join()
             self._thread = None
-        _release(self._store, self)
+        _release(self._claimed, self)
+        self._claimed = None
 
     def _run(self, stopping=None) -> None:
         stopping = self._stopping if stopping is None else stopping

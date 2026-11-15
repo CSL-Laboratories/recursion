@@ -1322,6 +1322,19 @@ class ChangeReaderTest(unittest.TestCase):
         second.stop(context)
         first.bind(self.registry, self.store)                  # free again after second's stop
 
+    def test_stop_gives_up_the_claim_its_start_took_after_a_bind_to_another_store(self) -> None:
+        # DeepSeek r4, LOW-2: stop gave up the store bound last, and the store its start claimed stayed claimed.
+        first, second = C.ChangeReader(self.marker), C.ChangeReader(H.ChangeMarker())
+        first._run = second._run = lambda stopping=None: None
+        context, other = self.context(), D.FakeStore()
+        other.register_tables(C.LANE, C.LANE_VERSION, C.LANE_DDL)
+        self.addCleanup(other.close)
+        first.start(context)
+        first.bind(self.registry, other)
+        first.stop(context)
+        second.start(context)                                  # the store first's start claimed is free again
+        second.stop(context)
+
     def test_log_id_of_and_image_digest_refuse_what_is_not_a_post_image(self) -> None:
         # DeepSeek r3, L4.
         for image in ([1], None, 'text', {}, {'daemon_row': [], 'control_record': None},

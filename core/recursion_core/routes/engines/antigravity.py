@@ -369,6 +369,8 @@ def mask(text: str, forms: tuple[str, ...]) -> str:
     nested deeper than any serializer writes, or built to peel one layer at a time), or that is not masked
     within the rounds, keeps nothing: it becomes fill of its whole UTF-8 length, which no reader takes for
     JSON, so the parser fails closed on it."""
+    if type(text) is not str:   # a str subclass could answer find() or `in` falsely and keep a value unmasked
+        raise TypeError("mask takes exactly a str")
     if not forms:
         return text
     fill = _fill(forms)
@@ -849,26 +851,34 @@ class AcpDrafts:
     ``on_turn_end``). ``open_acp(..., drafts=d)`` wires all four, and wiring any of the first three bound to
     ``d`` brings ``turn_end`` along (``AcpSession``'s rule). ``ended(outcome, turn_id, delivery_id)`` drafts
     the ``input.accepted`` of the delivery that began the turn (when the agent answered the prompt) and the
-    turn's result; ``abandoned(code, detail)`` drafts the result of a turn whose ``prompt`` raised. A second
-    end of one turn (``ended`` twice, ``abandoned`` after ``turn_end`` drafted the result, either after the
-    other) drafts nothing and raises nothing, so no close can replace the turn's own error. The two ids are
-    given together or not at all, each of common.v1's form (``turn-...``, ``dlv-...``).
+    turn's result; ``abandoned(code, detail)`` drafts the result of a turn whose ``prompt`` raised. The two
+    ids are given together or not at all, each exactly a ``str`` of common.v1's form (``turn-...``,
+    ``dlv-...``).
+
+    A TURN'S RESULT IS DRAFTED ONCE. A turn is named by ``(session, turn)`` (``TurnOutcome.session`` is its
+    connection's serial, so one ``AcpDrafts`` may serve several sessions: turn 1 of the second is not turn 1
+    of the first). ``ended`` for a turn already resulted, ``ended`` or ``abandoned`` after ``abandoned`` or a
+    raised turn's ``turn_end`` with nothing read since, and ``turn_end`` again for one turn draft nothing and
+    raise nothing, so no second end can replace the turn's own error. A driver that ends a turn with a
+    code outside the route contract's, or a detail that is not a str, is refused (``TypeError``).
 
     ONE PLACE OWNS A TURN'S OPEN TOOL CALLS: ``_close``. Every way a turn ends reaches it, and a second
     close is harmless (nothing is open by then). A call left open ends ``cancelled`` when the turn was
-    stopped (the caller's cancel, Recursion's deadline, the agent answering ``cancelled``, or a turn abandoned
-    because handling it raised) and ``error`` otherwise. The ways in: the session's ``turn_end`` for every
-    exit of ``prompt`` (the answer, a cancel, the deadline, the agent going away, a protocol error, a line it
-    cannot parse, a raise in any callback, an abandoned prompt); ``on_line`` and ``on_update`` raising;
-    ``ended``, ``abandoned`` and ``start_turn``. Without ``turn_end`` wired, the agent's answer to the prompt
-    (a response read by ``on_line`` while a call is open) ends the calls at the next line read, which comes
-    before any line of the next turn (an abandoned turn's answer is read when the next prompt drains it).
+    stopped (the caller's cancel, Recursion's deadline, or a turn abandoned because handling it raised) and
+    ``error`` otherwise. The ways in: the session's ``turn_end`` for every exit of ``prompt`` (the answer, a
+    cancel, the deadline, the agent going away, a protocol error, a line it cannot parse, a raise in any
+    callback, an abandoned prompt); ``on_line`` and ``on_update`` raising; ``ended``, ``abandoned`` and
+    ``start_turn``. NO LINE ENDS A TURN BY ITSELF: only the session (``turn_end``) or the driver (``ended``,
+    ``abandoned``, ``start_turn``) says a turn ended, so a stray or repeated response line ends nothing.
+    Callbacks wrapped so that the session cannot see this object get its turn end only from the driver:
+    ``abandoned`` in its ``except``, ``start_turn`` before the next prompt.
 
     Not thread-safe: the pumping thread calls the callbacks. ``redact`` names the values no draft may carry
-    (the route's selected credential): each line is masked as ``mask`` does, and each update's params are
-    masked string by string (keys included) before a tool call's input, its digest or its result text is
-    taken from them; a number, a bool or null whose text spells a value, or a number equal to one, is a
-    protocol error (the turn is abandoned, as above). A result's text and detail never keep a lone surrogate.
+    (the route's selected credential): each line (exactly a str) is masked as ``mask`` does, and each
+    update's params are masked string by string (keys included) before a tool call's input, its digest or its
+    result text is taken from them; a number, a bool or null whose text spells a value, or a number equal to
+    one, is a protocol error (the turn is abandoned, as above). A result's text and detail never keep a lone
+    surrogate.
 
     A tool_call the agent writes AFTER its answer to a stopped turn is drafted in the next turn: no line on
     the wire names a turn (ACP updates carry only the session), so it reads exactly as the next turn's own
@@ -876,30 +886,25 @@ class AcpDrafts:
     the same lines). Lines read while an abandoned turn is drained are stray and reach no ``on_update``."""
 
     def __init__(self, *, offset: int = 0, redact=()) -> None:
+        if type(offset) is not int or offset < 0:
+            raise TypeError("offset is a count of bytes (an int, 0 or more)")
         self.offset = offset
         self.drafts: list[dict] = []
         self._redact = mask_forms(redact)
         self._tools = self._new_tools()
-        self._ended = False             # the current turn's result is drafted; nothing read since
-        self._resulted: set = set()     # the numbers of turns whose result is drafted
-        self._answered: str | None = None   # the agent answered the prompt while a call was open: its stopReason
+        self._ended = False             # the current turn's end is drafted, with no turn named; nothing read since
+        self._resulted: set = set()     # (session, turn) of every turn whose result is drafted
 
     def _new_tools(self):
         forms = self._redact
-        return acp_module().ToolCalls(input_digest, mask=(lambda text: mask(text, forms)) if forms else None)
+        return acp_module().ToolCalls(tool_input_digest, mask=(lambda text: mask(text, forms)) if forms else None)
 
     def _close(self, stopped: bool) -> list[dict]:
         """THE place a turn's open tool calls end. Harmless when nothing is open."""
-        self._answered = None
         out = self._tools.turn_ended(stopped)
         self._tools = self._new_tools()
         self.drafts += out
         return out
-
-    def _settle(self) -> None:
-        """Without ``turn_end`` wired: the agent's answer, read on an earlier line, ends the open calls now."""
-        if self._answered is not None:
-            self._close(self._answered == "cancelled")
 
     def _result(self, code, detail: str) -> dict:
         draft = {"type": "result", "payload": {"code": code, "detail": _writable(mask(detail, self._redact))}}
@@ -913,24 +918,28 @@ class AcpDrafts:
         self._ended = False
         return out
 
-    def turn_end(self, number, outcome, code: str, detail: str) -> list[dict]:
+    def turn_end(self, key, outcome, code: str, detail: str) -> list[dict]:
         """The session's ``on_turn_end``: every exit of ``prompt`` comes here. ``outcome`` is the turn's
         ``TurnOutcome``, or None when ``prompt`` raised: then the turn's open calls end ``cancelled`` and its
-        result is drafted here (once per turn number; no result when no turn began)."""
+        result is drafted here, once per ``key`` (no result when no turn began)."""
+        if not (key is None or (type(key) is tuple and len(key) == 2 and all(type(k) is int for k in key))):
+            raise TypeError("turn_end takes the key (session, turn) the session gives, or None")
         if outcome is not None:
+            if not isinstance(outcome, acp_module().TurnOutcome):
+                raise TypeError("turn_end takes the TurnOutcome the session gave, or None")
             return self._close(_stopped(outcome))
+        _check_end(code, detail)
         out = self._close(True)
-        if number is not None and number not in self._resulted and code in c.CODES and isinstance(detail, str):
+        if key is not None and key not in self._resulted:
             out.append(self._result(code, detail))
-            self._resulted.add(number)
+            self._resulted.add(key)
             self._ended = True
         return out
 
     def abandoned(self, code: str, detail: str) -> list[dict]:
         """A turn whose ``prompt`` raised: its open calls end ``cancelled``, then its result draft with ``code``
         (a route contract code). Nothing when the turn's end is already drafted."""
-        if code not in c.CODES or not isinstance(detail, str):
-            raise TypeError("abandoned takes a route contract code and a str detail")
+        _check_end(code, detail)
         if self._ended:
             return []
         out = self._close(True)
@@ -941,7 +950,6 @@ class AcpDrafts:
     def on_update(self, params) -> None:
         if not isinstance(params, Mapping) or not isinstance(params.get("update"), Mapping):
             raise TypeError("on_update takes a session/update's params: a mapping whose update is a mapping")
-        self._settle()
         self._ended = False
         try:
             try:
@@ -960,9 +968,8 @@ class AcpDrafts:
         self._tools.asked(ask)
 
     def on_line(self, line: str) -> None:
-        if not isinstance(line, str):
+        if type(line) is not str:
             raise TypeError("on_line takes the line as a str")
-        self._settle()
         self._ended = False
         raw = mask(line, self._redact) + "\n"
         try:
@@ -973,18 +980,17 @@ class AcpDrafts:
         start, self.offset = self.offset, self.offset + length
         self.drafts.append({"type": "engine.output", "payload": {
             "stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
-        if self._tools.has_open:
-            self._answered = _prompt_answer(line)
 
     def ended(self, outcome, turn_id: str | None = None, delivery_id: str | None = None) -> list[dict]:
         if not isinstance(outcome, acp_module().TurnOutcome):
             raise TypeError("ended takes the TurnOutcome the session gave")
         if (turn_id is None) != (delivery_id is None):
             raise TypeError("ended takes turn_id and delivery_id together, or neither")
-        if turn_id is not None and not (isinstance(turn_id, str) and TURN_ID.fullmatch(turn_id)
-                                        and isinstance(delivery_id, str) and DELIVERY_ID.fullmatch(delivery_id)):
+        if turn_id is not None and not (type(turn_id) is str and TURN_ID.fullmatch(turn_id)
+                                        and type(delivery_id) is str and DELIVERY_ID.fullmatch(delivery_id)):
             raise TypeError("ended takes a turn_id of the form turn-<id> and a delivery_id of the form dlv-<id>")
-        if outcome.turn in self._resulted:
+        key = (outcome.session, outcome.turn)
+        if key in self._resulted or self._ended:
             return []
         out = self._close(_stopped(outcome))
         if outcome.stop_reason is not None and turn_id is not None:
@@ -993,9 +999,14 @@ class AcpDrafts:
             self.drafts.append(accepted)
             out.append(accepted)
         out.append(self._result(outcome.code, outcome.detail))
-        self._resulted.add(outcome.turn)
+        self._resulted.add(key)
         self._ended = True
         return out
+
+
+def _check_end(code, detail) -> None:
+    if code not in c.CODES or type(code) is not str or type(detail) is not str:
+        raise TypeError("a turn's end takes a route contract code and a str detail")
 
 
 def _stopped(outcome) -> bool:
@@ -1003,21 +1014,13 @@ def _stopped(outcome) -> bool:
     return outcome.cancel_requested or outcome.code in (c.DEADLINE_EXCEEDED, CANCELLED)
 
 
-def _prompt_answer(line: str) -> str | None:
-    """The stopReason (or "error") of a line that is the agent's answer to a client request, else None. While a
-    tool call is open the one request it can answer is the prompt."""
+def tool_input_digest(value) -> str | None:
+    """``input_digest`` as the shared client's ``ToolCalls`` takes a digest: None when the value has no RFC
+    8785 text (the agent's protocol error there), never a raise for it."""
     try:
-        message = json.loads(line)
-    except (ValueError, RecursionError):
+        return input_digest(value)
+    except NoCanonicalText:
         return None
-    if not isinstance(message, dict) or "method" in message or "id" not in message:
-        return None
-    if "error" in message:
-        return "error"
-    result = message.get("result")
-    if isinstance(result, Mapping) and isinstance(result.get("stopReason"), str):
-        return result["stopReason"]
-    return None
 
 
 def _writable(text: str) -> str:

@@ -141,6 +141,7 @@ running cost) or read a rate limit (stable ACP has none). The driver.v2 flags of
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import math
 import threading
@@ -281,6 +282,9 @@ def _limit_signal(value: object) -> dict | None:
     return dict(value)
 
 
+_SERIALS = itertools.count(1)
+
+
 def _ask_token(token: object) -> None:
     """A token is the str an ask was given; anything else (a list, a dict) is the caller's error."""
     if not isinstance(token, str):
@@ -342,6 +346,7 @@ class TurnOutcome:
     limit: dict | None
     detail: str
     text: str                     # agent_message_chunk text of the turn; empty when code is not None
+    session: int = 0              # the connection's serial: (session, turn) names one turn across sessions
 
 
 @dataclass
@@ -387,6 +392,9 @@ class AcpConnection:
 
     def __init__(self, *, hooks: EngineHooks = NO_HOOKS, clock: Callable[[], float] | None = None,
                  permission_timeout_s: float | None = None) -> None:
+        # A serial no other connection in this process has: a turn's number starts again at 1 in each session,
+        # so (serial, number) is what names one turn.
+        self.serial = next(_SERIALS)
         if permission_timeout_s is not None and (
                 not _finite_number(permission_timeout_s) or not permission_timeout_s > 0):
             raise AcpInvalid("permission_timeout_s must be a finite number of seconds above zero")
@@ -894,7 +902,7 @@ class AcpConnection:
         # on as if they were its answer (they stay in the raw lines the caller was given with on_line).
         text = "".join(turn.text) if code is None else ""
         return TurnOutcome(turn.number, code, stop_reason, turn.cancel_requested, confirmed, late, error, limit,
-                           detail, text)
+                           detail, text, self.serial)
 
     def _end(self, turn: _Turn, **kwargs) -> TurnOutcome:
         turn.outcome = self._outcome(turn, **kwargs)
@@ -915,15 +923,17 @@ class AcpSession:
     from it). ``on_update(params)`` gets each session/update of the turn; ``on_ask(ask)`` each new permission
     ask (it must not block: the answer comes back through ``answer_permission``, from any thread). When one
     of them raises, the error reaches the caller of ``prompt`` and the turn is abandoned (item 12).
-    ``on_turn_end(number, outcome, code, detail)`` is told EVERY end of a turn ``prompt`` began, once: the
+    ``on_turn_end(key, outcome, code, detail)`` is told EVERY end of a turn ``prompt`` began, once: the
     answer, the deadline, the agent going away (``outcome`` is the ``TurnOutcome``), and every raise while the
     turn was handled (a protocol error, a line it cannot parse, any callback raising; ``outcome`` is None,
-    ``code`` and ``detail`` are the abandoned turn's, after the agent was asked to stop it). ``number`` is the
-    turn's number, or None when no turn began (a prompt refused before it was written). An ``Exception`` out
+    ``code`` and ``detail`` are the abandoned turn's, after the agent was asked to stop it). ``key`` is
+    ``(session, number)``, the connection's serial and the turn's number (``TurnOutcome.session`` and
+    ``.turn``), or None when no turn began (a prompt refused before it was written). An ``Exception`` out
     of it is dropped and counted (``turn_end_failures``), so it never replaces the turn's own error or
     outcome; an interruption is raised. A callback bound to an object that has a ``turn_end`` method (the
     engine's draft maker) brings that method along as ``on_turn_end`` when none is given, so wiring that
-    object's callbacks wires its turn end too.
+    object's callbacks wires its turn end too; callbacks of two such objects with no ``on_turn_end`` given are
+    refused (``AcpInvalid``), never left with none. A callback that is neither None nor callable is refused.
 
     The session reads the clock with its ordering lock held, at the moment a step that starts work is
     serialized (item 11); the connection's own lock is never held while calling out.
@@ -934,7 +944,11 @@ class AcpSession:
                  on_line: Callable[[str], object] | None = None,
                  on_update: Callable[[dict], object] | None = None,
                  on_ask: Callable[[PermissionAsk], object] | None = None,
-                 on_turn_end: Callable[[int | None, object, str, str], object] | None = None) -> None:
+                 on_turn_end: Callable[[tuple | None, object, str, str], object] | None = None) -> None:
+        for name, cb in (("on_line", on_line), ("on_update", on_update), ("on_ask", on_ask),
+                         ("on_turn_end", on_turn_end)):
+            if cb is not None and not callable(cb):
+                raise AcpInvalid(f"{name} must be callable")
         self.process = process
         self._clock = clock
         self.connection = AcpConnection(hooks=hooks, clock=clock, permission_timeout_s=permission_timeout_s)
@@ -952,7 +966,9 @@ class AcpSession:
                 owner = getattr(cb, "__self__", None)
                 if callable(getattr(owner, "turn_end", None)) and not any(owner is o for o in owners):
                     owners.append(owner)
-            on_turn_end = owners[0].turn_end if len(owners) == 1 else None
+            if len(owners) > 1:
+                raise AcpInvalid("the callbacks belong to two draft makers: give on_turn_end")
+            on_turn_end = owners[0].turn_end if owners else None
         self._on_turn_end = on_turn_end
         self.turn_end_failures = 0
 
@@ -1096,13 +1112,14 @@ class AcpSession:
         if self._on_turn_end is None:
             return
         if outcome is not None:
-            number, code, detail = outcome.turn, outcome.code, outcome.detail
+            key, code, detail = (outcome.session, outcome.turn), outcome.code, outcome.detail
         else:
             number = self.connection.abandoned_turn
+            key = None if number is None else (self.connection.serial, number)
             code = error.code if isinstance(error, AcpError) else c.ENGINE_ERROR
             detail = f"handling the turn raised {type(error).__name__}"
         try:
-            self._on_turn_end(number, outcome, code, detail)
+            self._on_turn_end(key, outcome, code, detail)
         except Exception:   # never replaces the turn's own error or outcome; an interruption still goes up
             self.turn_end_failures += 1
 
@@ -1288,7 +1305,9 @@ class ToolCalls:
     """One turn's ``tool_call`` and ``tool_call_update`` updates as tool.call and tool.result drafts (driver.v2).
 
     ``digest(value) -> sha256 hex`` is the caller's (RFC 8785 text, then SHA-256): this file writes no canonical
-    form of its own. ``update(params)`` takes a session/update's params and gives the drafts it causes;
+    form of its own. It returns None when the value has no canonical text (the agent's protocol error); anything
+    it raises, ``ValueError`` included, is the caller's failure (``AcpInvalid``).
+    ``update(params)`` takes a session/update's params and gives the drafts it causes;
     ``asked(ask)`` tells it of a permission ask (its final answer is read when the call fails);
     ``turn_ended(stopped)`` gives a result for every call drafted without one: ``cancelled`` when the turn was
     stopped, ``error`` otherwise. ``mask(text) -> text``, when given, is applied to each result text once its
@@ -1355,13 +1374,16 @@ class ToolCalls:
         return name or call.kind or "other"
 
     def _call(self, call: _ToolCall) -> dict:
+        """The tool.call draft. An input with no RFC 8785 text (an integer beyond 2^53 - 1, a float that is not
+        finite, or a string holding an unpaired surrogate, which RFC 8785 cannot write) is the agent's protocol
+        error, by design (R6, as the one-shot parser has it): its input is never altered or dropped."""
         value = call.raw_input if call.has_input else None
         try:
             digest = self._digest(value)
-        except ValueError:          # no canonical text: the agent's protocol error, never an input dropped
-            raise AcpProtocolError("tool input has no RFC 8785 text") from None
-        except Exception as err:    # the caller's digest failed in another way: the caller's error, typed
+        except Exception as err:    # the caller's digest failed: the caller's error, typed (ValueError too)
             raise AcpInvalid(f"the digest function failed: {type(err).__name__}") from None
+        if digest is None:          # no canonical text: the agent's protocol error, never an input dropped
+            raise AcpProtocolError("tool input has no RFC 8785 text")
         if not (isinstance(digest, str) and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)):
             raise AcpInvalid("the digest function must give a SHA-256 as 64 lowercase hex characters")
         call.called = True          # only once its draft exists: a refused call is never "drafted"

@@ -1975,7 +1975,7 @@ class ReviewRoundFourTest(unittest.TestCase):
 def digest(value) -> str:
     """A stand-in digest for these cases (the engine supplies the RFC 8785 one)."""
     if isinstance(value, float) and value != value:
-        raise ValueError("no canonical text")
+        return None   # no canonical text: the ToolCalls contract (#408 round 4)
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 

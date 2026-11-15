@@ -28,9 +28,12 @@ call's answer included: the writer is one), the answers still queued are discard
 ``offer`` returns ``False``; nothing is logged for them (``server.py``, OUTPUT FAILURE, logs the failure
 once).
 
-``close()`` waits until every answer taken has been written, or discarded, and ends the thread; then it
-closes the queue's diagnostics (``DiagnosticQueue.close``). It starts the threads if ``start`` was never
-called, so answers offered before it are still written.
+``close(timeout)`` waits until every answer taken has been written, or discarded, and ends the thread. That
+wait has no limit, since an answer is never dropped: a client that stops reading stdout while keeping it
+open holds it until it reads again or stdout fails. Then it gives the queue's diagnostics at most
+``timeout`` seconds (``DiagnosticQueue.close``; ``DIAGNOSTIC_DRAIN_S`` unless given), so a log that has
+stopped taking events does not hold it. It starts the threads if ``start`` was never called, so answers
+offered before it are still written.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ import collections
 import threading
 from collections.abc import Callable
 
-from .diagnostics import DiagnosticQueue
+from .diagnostics import DIAGNOSTIC_DRAIN_S, DiagnosticQueue, check_seconds
 from .framing import FrameWriter, encode
 
 MAX_PENDING_REPLY_BYTES = 1024 * 1024
@@ -122,13 +125,16 @@ class ReplyQueue:
                     self._bytes = 0
                 self._cond.notify_all()
 
-    def close(self) -> None:
-        """Wait until every answer taken has been written (or discarded); the thread then ends."""
+    def close(self, timeout: float | None = DIAGNOSTIC_DRAIN_S) -> bool:
+        """Wait until every answer taken has been written (or discarded), with no limit: an answer is never
+        dropped. Then give the queue's diagnostics at most ``timeout`` seconds; ``True`` when they were all
+        delivered."""
 
+        check_seconds(timeout, "timeout")  # before anything changes
         self.start()  # a queue never started still writes what it took
         with self._cond:
             while self._pending:
                 self._cond.wait()
             self._closing = True
             self._cond.notify_all()
-        self._diagnostics.close()
+        return self._diagnostics.close(timeout=timeout)

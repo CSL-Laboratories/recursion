@@ -36,8 +36,21 @@ from collections.abc import Callable
 
 MAX_PENDING_DIAGNOSTIC_BYTES = 64 * 1024
 DIAGNOSTIC_DRAIN_S = 2.0
+MAX_WAIT_S = 24 * 60 * 60  # a day: far below every platform's threading.TIMEOUT_MAX (Windows: about 49 days)
 
 Log = Callable[[dict], None]
+
+
+def check_seconds(value: float | None, name: str) -> None:
+    """``ValueError`` unless ``value`` is ``None`` (no limit) or a number of seconds from 0 to ``MAX_WAIT_S``
+    (a day); a bool is not a number here. NaN, an infinity and anything over a day are refused: a wait longer
+    than ``threading.TIMEOUT_MAX`` raises ``OverflowError`` only once it begins, after the work it follows,
+    and ``None`` already means no limit."""
+
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= MAX_WAIT_S:
+        raise ValueError(f"{name} must be None or a number of seconds from 0 to {MAX_WAIT_S}")
 
 
 def _size(event: dict) -> int:
@@ -120,6 +133,7 @@ class DiagnosticQueue:
         """Take ``last`` whatever the bound, then nothing more; wait until every event taken has been
         delivered (or discarded), at most ``timeout`` seconds. ``True`` when nothing is left."""
 
+        check_seconds(timeout, "timeout")  # before anything changes
         self.start()  # a queue never started still delivers what it took
         with self._cond:
             if not self._closing and not self._failed:

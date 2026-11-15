@@ -38,7 +38,10 @@ One ``LegacySession`` serves one client over one stdio pair (``serve``). What it
     cancellation that comes too late). Which of these happened is decided under the session's lock, so a
     cancellation and a send, or a cancellation and an answer, never both win, and the logged outcome
     (``never_sent``, ``answer_dropped``, ``answer_already_written``) is what the daemon saw. No Stop is ever
-    sent for a cancellation, and a cancellation for an id that is not in flight is ignored.
+    sent for a cancellation, and a cancellation for an id that is not in flight is ignored. A cancellation
+    names an id, not a request: the 2025-06-18 basic protocol says a request id MUST NOT have been used
+    before in the same session, and a client that reuses a finished id anyway, while a late cancellation of
+    the earlier request is on its way, cancels the newer call (logged as that call's outcome).
 
 The MCP face has no Stop path of its own: ``recursion_run_stop`` forwards to ``run.stop`` and answers
 what it answered (``stopped`` only when cleanup is confirmed, otherwise ``pending``). A call that raises,
@@ -56,8 +59,9 @@ busy" and ``data.delivered: false``: nothing was sent, so it is safe to send aga
 still in flight (waiting, running or being answered) is refused.
 
 END OF INPUT. The client ending stdin ends reading: calls already admitted are run (waiting ones as slots
-free) and answered while stdout stays open, then ``serve`` returns 0. It never stops a run: the runs it
-started go on (detach, not stop).
+free) and answered while stdout stays open, then ``serve`` returns 0. An answer is never dropped, so a
+client that ends stdin and stops reading stdout without shutting it holds ``serve`` until it reads again
+or stdout fails. It never stops a run: the runs it started go on (detach, not stop).
 
 REPLIES. The reader never writes to stdout. The answers it owes (every refusal, ``Server busy`` included,
 ``ping``, ``initialize`` and ``tools/list``) go to ``reply``, which takes an answer without waiting and
@@ -101,7 +105,7 @@ from recursion_core.control import mcp_tools
 
 from . import jsonrpc
 from .framing import MAX_INT_DIGITS, NOT_JSON, NOT_UTF8, NUMBER_TOO_LONG, TOO_LARGE, Frame, FrameWriter, read_frames
-from .diagnostics import DIAGNOSTIC_DRAIN_S, MAX_PENDING_DIAGNOSTIC_BYTES, DiagnosticQueue
+from .diagnostics import DIAGNOSTIC_DRAIN_S, MAX_PENDING_DIAGNOSTIC_BYTES, DiagnosticQueue, check_seconds
 from .replies import MAX_PENDING_REPLY_BYTES, ReplyQueue
 from .tools import Tool, check_arguments, tool_table
 
@@ -434,7 +438,7 @@ class LegacySession:
             except (TypeError, ValueError):  # an answer JSON cannot hold; it claims nothing either way
                 self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR,
                                           "Internal error: the answer is not JSON"))
-        except Exception as exc:  # noqa: BLE001 - a write that raises is an output that failed
+        except BaseException as exc:  # noqa: BLE001 - a write that raises anything is an output that failed
             self._log({"event": "write_failed", "detail": type(exc).__name__})
             self.output_lost()
 
@@ -494,8 +498,12 @@ def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None 
     reader waits for input; the reader's answers are written by the reply queue's thread (REPLIES), and
     every event for ``log`` is delivered by a diagnostics thread (DIAGNOSTICS). An exception raised while
     reading (an interrupt included) is raised here at once; diagnostics not yet delivered then may be lost.
+    ``max_diagnostic_drain_s`` is ``None`` for no limit or a number of seconds from 0 to a day
+    (``diagnostics.check_seconds``); anything else is a ``ValueError`` before anything is read, as the queues'
+    bounds and the session's limits are.
     """
 
+    check_seconds(max_diagnostic_drain_s, "max_diagnostic_drain_s")  # refused before anything is read
     diagnostics = DiagnosticQueue(log or _quiet, max_bytes=max_pending_diagnostic_bytes)
     log = diagnostics.offer
     done = threading.Event()

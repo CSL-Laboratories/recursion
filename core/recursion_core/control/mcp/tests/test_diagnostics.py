@@ -9,11 +9,13 @@ Every wait synchronises on an event; time is only the hang guard.
 
 from __future__ import annotations
 
+import io
 import threading
 import unittest
 from unittest import mock
 
-from recursion_core.control.mcp.diagnostics import DiagnosticQueue
+from recursion_core.control.mcp import server
+from recursion_core.control.mcp.diagnostics import MAX_WAIT_S, DiagnosticQueue
 from recursion_core.control.mcp.framing import FrameWriter, encode
 from recursion_core.control.mcp.replies import ReplyQueue
 from recursion_core.control.mcp.tests.support import HANG_GUARD_S, Capture, Events, GateAPI, Served, Stalling
@@ -25,6 +27,9 @@ def event(n) -> dict:
 
 
 SIZE = len('{"event":"e","n":1}')  # the compact JSON the queue counts; the same for n from 1 to 9
+# Not a number of seconds from 0 to a day: each is refused before anything changes. The last four would
+# raise OverflowError only once a wait began (diagnostics.check_seconds).
+BAD_SECONDS = ("x", -1, True, float("nan"), float("inf"), 1e300, 10 ** 400, MAX_WAIT_S + 0.5)
 
 
 class StalledLog:
@@ -204,6 +209,61 @@ class DiagnosticQueueTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             DiagnosticQueue(Events(), max_bytes=0)
 
+    def test_a_timeout_must_be_seconds_and_a_bad_one_changes_nothing(self) -> None:
+        log = Events()
+        queue = self.queue(log)
+        for bad in BAD_SECONDS:
+            with self.subTest(timeout=bad), self.assertRaises(ValueError):
+                queue.close(last=event(9), timeout=bad)
+        self.assertEqual([True], self.offers(queue, [1]))  # still open: the refused calls changed nothing
+        log.wait(1)
+        self.assertTrue(queue.close(timeout=MAX_WAIT_S))  # the bound itself is a timeout (nothing is left)
+        self.assertEqual([event(1)], log.all)
+
+    def test_a_repeated_close_after_a_timeout_neither_reopens_nor_repeats_the_last_line(self) -> None:
+        log = StalledLog()
+        queue = self.queue(log, max_bytes=1)
+        self.assertEqual([True], self.offers(queue, [1]))
+        self.assertTrue(log.stalled.wait(HANG_GUARD_S))
+        self.assertFalse(queue.close(last=event(8), timeout=0.01))
+        self.assertEqual([False], self.offers(queue, [2]))
+        self.assertFalse(queue.close(last=event(9), timeout=0.01))  # takes no second last line
+        log.release.set()
+        self.assertTrue(queue.close(timeout=HANG_GUARD_S))
+        self.assertEqual([event(1), event(8)], log.events.all)
+
+    def test_start_is_once_only_under_concurrent_starters_and_repeated_closes(self) -> None:
+        for kind in ("diagnostics", "replies"):
+            with self.subTest(queue=kind):
+                out, log = Capture(), Events()
+                if kind == "replies":
+                    queue, item = ReplyQueue(FrameWriter(out)), answer(1)
+                else:
+                    queue, item = DiagnosticQueue(log), event(1)
+                self.assertTrue(queue.offer(item))
+                barrier = threading.Barrier(9)
+                errors: list[str] = []
+
+                def starter(queue=queue, barrier=barrier, errors=errors):
+                    try:
+                        barrier.wait(HANG_GUARD_S)
+                        queue.start()
+                    except BaseException as exc:  # noqa: BLE001 - the test reports any
+                        errors.append(repr(exc))
+
+                starters = [threading.Thread(target=starter, daemon=True) for _ in range(8)]
+                for each in starters:
+                    each.start()
+                barrier.wait(HANG_GUARD_S)
+                for each in starters:
+                    each.join(HANG_GUARD_S)
+                queue.close()
+                queue.start()
+                queue.close()
+                self.assertEqual([], errors)
+                self.assertFalse(queue.offer(item))
+                self.assertEqual([item], out.drain() if kind == "replies" else log.all)
+
 
 def answer(n) -> dict:
     return {"jsonrpc": "2.0", "id": n, "result": {}}
@@ -273,6 +333,37 @@ class ReplyDiagnosticsTest(unittest.TestCase):
         replies._diagnostics._thread.join(HANG_GUARD_S)
         self.assertFalse(replies._diagnostics._thread.is_alive())
 
+    def test_close_gives_its_diagnostics_at_most_its_timeout(self) -> None:
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def log(item):
+            entered.set()
+            release.wait(HANG_GUARD_S)  # a log that has stopped taking events
+
+        out = Stalling({1})
+        replies = ReplyQueue(FrameWriter(out), max_bytes=len(encode(answer(1))), log=log)
+        replies.start()
+        self.assertTrue(replies.offer(answer(1)))
+        self.assertTrue(out.stalled.wait(HANG_GUARD_S))
+        self.assertFalse(replies.offer(answer(2)))
+        self.assertTrue(entered.wait(HANG_GUARD_S))
+        out.release.set()
+        self.assertFalse(replies.close(timeout=0.05))  # the answer is written; the stalled line is left
+        self.assertEqual([1], [m["id"] for m in out.drain()])
+        with self.assertRaises(ValueError):
+            replies.close(timeout="x")
+
+    def test_a_refused_timeout_leaves_the_reply_queue_open(self) -> None:
+        out = Capture()
+        replies = ReplyQueue(FrameWriter(out))
+        for bad in BAD_SECONDS:
+            with self.subTest(timeout=bad), self.assertRaises(ValueError):
+                replies.close(timeout=bad)
+        self.assertTrue(replies.offer(answer(1)))  # still open: the refused closes changed nothing
+        self.assertTrue(replies.close())
+        self.assertEqual([1], [m["id"] for m in out.drain()])
+
     def test_a_reply_queue_never_started_writes_what_it_took_at_close(self) -> None:
         out = Capture()
         replies = ReplyQueue(FrameWriter(out))
@@ -326,6 +417,17 @@ class StalledStderrTest(unittest.TestCase):
         self.assertEqual({"event": "diagnostics_dropped", "dropped": 1}, delivered[1])  # the cancellation's line
         self.assertEqual({"event": "end_of_input", "stdout_broken": False}, delivered[-1])
 
+    def test_a_drain_budget_that_is_not_seconds_is_refused_before_anything_is_read(self) -> None:
+        class Untouchable(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readline(self, size=-1):
+                raise AssertionError("stdin was read")
+
+        for bad in BAD_SECONDS:
+            with self.subTest(drain=bad), self.assertRaises(ValueError):
+                server.serve(GateAPI(), Untouchable(), Capture(), max_diagnostic_drain_s=bad)
 
     def test_end_of_input_returns_after_the_drain_budget_while_stderr_stays_stalled(self) -> None:
         stalled, release = threading.Event(), threading.Event()

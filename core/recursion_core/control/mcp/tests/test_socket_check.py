@@ -186,6 +186,19 @@ class SocketCheckTest(unittest.TestCase):
         self.assertEqual({"code": "ok", "runs": []}, api.call("run.stop", {"run_id": fits}))
         self.assertEqual("run.stop", daemon.requests[-1]["method"])
 
+    def test_a_call_utf8_cannot_encode_or_params_not_an_object_are_not_delivered(self) -> None:
+        daemon = Daemon()
+        self.serve(daemon)
+        api = check(self.environ)
+        lone_surrogate = chr(0xD800)  # JSON can carry it ("\\ud800"); UTF-8, and so the socket, cannot
+        self.assertEqual({"code": UNAVAILABLE, "delivered": False, "detail": "request:frame_unencodable:UnicodeEncodeError"},
+                         api.call("run.stop", {"run_id": lone_surrogate}))
+        for params in (5, "ab", [1, 2], [("run_id", "run-1")]):  # the last one dict() would take
+            with self.subTest(params=params):
+                self.assertEqual({"code": UNAVAILABLE, "delivered": False, "detail": "request:params_not_an_object"},
+                                 api.call("run.stop", params))
+        self.assertEqual(1, len(daemon.requests))  # only the check's probe: nothing was written
+
     def test_every_call_rechecks_the_path_and_sends_nothing_when_it_fails(self) -> None:
         daemon = Daemon()
         self.serve(daemon)

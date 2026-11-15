@@ -331,6 +331,22 @@ class StdioTest(unittest.TestCase):
         self.assertEqual(["run.list"], [m["method"] for m in self.seen])  # the check's probe only
         self.assertEqual(0, child.end()[0])
 
+    def test_a_run_id_utf8_cannot_encode_is_answered_not_delivered(self) -> None:
+        # A lone surrogate is legal JSON text ("\\ud800") and passes the schema; the control socket's UTF-8
+        # frame cannot carry it, so nothing is written and the answer says so.
+        self.daemon(make_api()[0])
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        line = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": "recursion_run_stop", "arguments": {"run_id": chr(0xD800)}}})
+        child.proc.stdin.write(line.encode("ascii") + b"\n")
+        child.proc.stdin.flush()
+        answer = child.recv()["result"]["structuredContent"]
+        self.assertEqual({"code": "control_api_unavailable", "delivered": False,
+                          "detail": "request:frame_unencodable:UnicodeEncodeError"}, answer)
+        self.assertEqual(["run.list"], [m["method"] for m in self.seen])  # the check's probe only
+        self.assertEqual(0, child.end()[0])
+
     def test_stdout_that_fails_ends_the_process_with_status_0_and_sends_nothing_more(self) -> None:
         release, status_seen = threading.Event(), threading.Event()
         seen: list[str] = []

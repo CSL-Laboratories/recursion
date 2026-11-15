@@ -26,8 +26,10 @@ run unit is not admitted). It proves the socket is sound and answered, not which
 step fails it writes one JSON line to stderr, `{"code": "socket_check_failed", "reason": ..., "detail": ...}`,
 nothing to stdout, and exits 1. The folder and socket steps are repeated before every forwarded call.
 
-Exit statuses: 0 when the client ends stdin or stdout fails; 1 when the socket check fails; 2 for an
-argument; 3 for an unexpected error while serving (one JSON line, `internal_error`); 130 when interrupted.
+Exit statuses: 0 when the client ends stdin (once the answers owed have been read) or stdout fails; 1 when
+the socket check fails; 2 for an argument; 3 for an unexpected error while serving (one JSON line,
+`internal_error`); 130 when interrupted. An answer is never dropped, so a client that ends stdin and stops
+reading stdout without shutting it keeps the process until it reads again or stdout fails.
 Ending stdin never stops a run: admitted calls finish and are answered, and the runs go on. The process
 reads fd 0 and writes fd 1 and fd 2 directly (`stdio.py`): nothing is buffered in `sys.stdout` or
 `sys.stderr`, so a client that stops reading, or closes stderr, ends the process with its status, not
@@ -44,8 +46,9 @@ remaining diagnostics, so a client that never reads stderr does not keep it aliv
   process keeps serving, so such a client falls back to `initialize`.
 - `tools/list` and `tools/call` are refused until `initialize`. Invalid arguments are `-32602` and reach
   nothing; `arguments` may be left out (`{}`), and when present must be an object (`null` is refused). A
-  call whose control frame would be over the socket's 1 MiB answers `control_api_unavailable` with
-  `delivered: false`, and nothing is written (`socket_check.CheckedSocketAPI`).
+  call the control socket could never carry (a frame over its 1 MiB, or a string UTF-8 cannot encode, such
+  as a lone surrogate, which JSON can carry) answers `control_api_unavailable` with `delivered: false`, and
+  nothing is written (`socket_check.CheckedSocketAPI`).
 - Request ids are strings or integers. A fraction or a boolean is not an id, so it can never name another
   request.
 - Admission never makes the reader wait: a call takes one of 8 ordinary slots (the stop tool also one of
@@ -68,7 +71,9 @@ remaining diagnostics, so a client that never reads stderr does not keep it aliv
 - `notifications/cancelled`: a call not yet sent (waiting, or holding a slot before its worker sends it)
   is never sent; a sent call's answer is dropped; an answer already being written goes out (the
   cancellation came too late). The send is decided under the session's lock, so the logged outcome is
-  what the daemon saw. Nothing is ever sent to the daemon for a cancellation.
+  what the daemon saw. Nothing is ever sent to the daemon for a cancellation. A cancellation names an id:
+  MCP forbids reusing one in a session, and a client that does so anyway can have its newer call cancelled
+  by a late cancellation of the earlier one.
 - When stdout fails, nothing more is sent: waiting calls are dropped, queued answers discarded, and the
   session ends without waiting for more input.
 

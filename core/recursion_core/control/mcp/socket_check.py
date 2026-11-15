@@ -26,9 +26,11 @@ Steps 3 and 4 are repeated before every call the server forwards (``CheckedSocke
 socket that stops passing answers ``control_api_unavailable`` with ``delivered: false`` and nothing is
 sent. ``CheckedSocketAPI`` also encodes, before connecting, the frame ``SocketAPI`` would write
 (``{"op": "control", "method": ..., "params": ...}``, ``control_transport.framing.encode_frame``). A call
-the transport could never carry (over its 1 MiB frame, or nested too deep) answers ``control_api_unavailable``
-with ``delivered: false`` and the frame error as ``detail`` (``request:frame_too_large``), since nothing was
-written; ``SocketAPI`` itself would answer ``delivered: "unknown"`` for it.
+the transport could never carry answers ``control_api_unavailable`` with ``delivered: false``, since nothing
+was written (``SocketAPI`` itself would answer ``delivered: "unknown"`` for some of them): over its 1 MiB
+frame or nested too deep (the frame error as ``detail``, ``request:frame_too_large``); a string UTF-8
+cannot encode, such as a lone surrogate, which JSON can carry (``request:frame_unencodable:...``); ``params``
+that are not an object (``request:params_not_an_object``).
 
 There is no token and no scope here: the daemon grants a same-user peer every verb, as it does the CLI.
 """
@@ -112,10 +114,14 @@ class CheckedSocketAPI:
             check_path(self.path)
         except SocketCheckFailed as exc:
             return {"code": UNAVAILABLE, "delivered": False, "detail": f"socket_check:{exc.reason}"}
+        if params is not None and not isinstance(params, Mapping):
+            return {"code": UNAVAILABLE, "delivered": False, "detail": "request:params_not_an_object"}
         try:  # the frame SocketAPI.call writes (control/client.py), encoded as the transport encodes it
             encode_frame({"op": "control", "method": method, "params": dict(params or {})})
         except FrameError as exc:
             return {"code": UNAVAILABLE, "delivered": False, "detail": f"request:{exc}"}
+        except (ValueError, TypeError) as exc:  # a string UTF-8 cannot carry (a lone surrogate), a value JSON cannot
+            return {"code": UNAVAILABLE, "delivered": False, "detail": f"request:frame_unencodable:{type(exc).__name__}"}
         return self._api.call(method, params)
 
 

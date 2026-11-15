@@ -10,7 +10,9 @@ Every line it writes to stderr goes to fd 2 directly too, never through ``sys.st
 closes stderr leaves nothing buffered for the final flush to fail on (exit 120), and the diagnostics
 thread (``server.py``, DIAGNOSTICS) holds no lock of ``sys.stderr`` while it waits on a stderr nobody reads
 (a daemon thread holding that lock keeps the interpreter from ending, or makes it abort, after an
-interrupt too).
+interrupt too). Written through ``sys.stderr`` instead, four process tests in ``tests/test_stdio.py`` fail:
+with stderr closed, exit 120 instead of 0 and 2 (``ClosedStderrTest``); with stderr full, a process that
+does not end, or that aborts after an interrupt.
 
 Exit statuses: 0 end of input or stdout failed; 1 the socket check failed; 2 usage (an argument was given);
 3 an unexpected error while serving (one JSON line on stderr, ``{"code": "internal_error", ...}``); 130

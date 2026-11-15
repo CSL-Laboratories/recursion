@@ -19,6 +19,7 @@ import threading
 import unittest
 from unittest import mock
 
+import recursion_core.control.tests.test_seams as control_seams
 import recursion_core.daemon as daemon_module
 from recursion_core.control import hooks as H, methods
 from recursion_core.control.client import SocketAPI
@@ -1748,40 +1749,50 @@ class CompositionCloseRegionTest(RegionWalk, unittest.TestCase):
     asserts at every point, are in ``control/tests/test_seams.py``). Every traceable point between the entry of
     ``Composition.close`` and its return is interrupted once: in the close and its steps here, and in the hooks'
     whole teardown under them. Each time the interruption reaches the caller, the close's ownership is free, and
-    the close is complete or nothing of it was done and it can be asked for again. How the interruption is
-    delivered (raised from the trace callback of the point it is aimed at, which is stricter than a real signal)
-    is said once, in that file's ``OwnershipRegionTest``, with what pure Python cannot protect."""
+    the close is complete or nothing of it was done and it can be asked for again. The same oracles as there:
+    the service instances say that a stop of each returned, both references to the store are gone, each of the
+    three locks the close can take is free (its own, the lifecycle, the gate's), and a close that did not finish
+    left everything it touches as it was. How the interruption is delivered (raised from the trace callback of
+    the point it is aimed at, which is stricter than a real signal) is said once, in that file's
+    ``OwnershipRegionTest``, with what pure Python cannot protect and the one kind of point 3.14 lets pass."""
 
-    FILES = (H.__file__, adapter.__file__)
+    FILES = (*RegionWalk.FILES, adapter.__file__)
+
+    def at_the_marker(self) -> bool:
+        """Here a region is under a region: the lifecycle's close under the composition's. The marker of that
+        INNER region's own function is the same point one level down (3.14 only, and only a trace callback raises
+        there). What it leaves the outer close cannot mend: the lifecycle stays owned by this thread, the close
+        asks for the teardown again and is refused as a call from inside a lifecycle method, and it ends
+        unfinished. It is let pass by the same name, in that one function and no other."""
+        code, offset, outermost, event = self.raised_at
+        self.raised_at = (code, offset, outermost or code is H.Hooks.finish_close.__code__, event)
+        return super().at_the_marker()
 
     def composition(self):
-        """A composition over stand-ins, with a store open and two services started (two, so that every loop of
-        the teardown under the close goes round): cheap enough to make a few hundred times. ``(the composition,
-        its store, what its close closed)``."""
-        class Store:
-            closed = False
-
-            def close(inner):
-                inner.closed = True
-        made, store, closed = H.Hooks(), Store(), []
-        made.service(Service('events', []))
-        made.service(Service('sessions', []))
-        made.set('event_store', lambda state_dir: store)
-        made.freeze()
-        made.open_store('/state')
-        context = H.ServiceContext(registry=mock.Mock(mark_changed=None))
-        made.start_services(context)
+        """A composition over stand-ins, around the hooks the control-side walk makes: a store open, two services
+        started (two, so that every loop of the teardown under the close goes round), two waiters on the closing
+        signal, and service instances that count the stops of them that returned. Cheap enough to make a few
+        hundred times. ``(the composition, its store, what its close closed)``."""
+        made, store = control_seams.OwnershipRegionTest('test_the_gates_close_at_every_event').lifecycle()
+        closed: list = []
 
         def part(name):
             return mock.Mock(close=lambda: closed.append(name))
         composed = adapter.Composition(mock.Mock(), part('server'), part('door'), plugins=part('plugins'), breaker=part('breaker'),
-                                       hooks=made, context=context)
+                                       hooks=made, context=H.ServiceContext(registry=mock.Mock(mark_changed=None)))
         return composed, store, closed
 
     REGIONS = {
         'Composition.close': (lambda self: self.composition(), lambda trio: trio[0].close(), lambda trio: trio[0]._closing,
-                              lambda trio: trio[0]._closed and trio[1].closed
+                              lambda trio: trio[0]._closed and control_seams._lifecycle_closed((trio[0].hooks, trio[1]))
                               and {'server', 'door', 'plugins', 'breaker'} <= set(trio[2])),
+    }
+    LOCKS = {       # the close's own ownership, and the two under it
+        'Composition.close': lambda trio: (trio[0]._closing, trio[0].hooks._lifecycle, trio[0].hooks.gate._lock),
+    }
+    STATE = {       # everything the close touches: what the teardown touches, how far the close has got, what it closed
+        'Composition.close': lambda trio: (control_seams._teardown_touches((trio[0].hooks, trio[1])), trio[0]._closed,
+                                           trio[0]._close_step, tuple(trio[2])),
     }
 
     def test_the_compositions_close_has_no_loop_and_no_try_written_in_it(self):

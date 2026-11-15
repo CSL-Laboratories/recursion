@@ -18,14 +18,17 @@ import itertools
 import json
 import os
 import socket
+import string
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from recursion_core.plugin_security.canonical import canonical
 from recursion_core.plugin_security.errors import Refused
 from recursion_core.plugin_security.loader import CoreHealth, PluginLoader
+from recursion_core.plugin_security import manifest as manifest_module
 from recursion_core.plugin_security.manifest import (
-    Grant, ReservedEffects, TrustStore, destination_in_normal_form, effective_permissions,
+    PERMISSIONS_V1, Grant, ReservedEffects, TrustStore, destination_in_normal_form, effective_permissions,
     host_in_normal_form, parse_manifest,
 )
 from recursion_core.plugin_security.signing import key_id
@@ -81,6 +84,40 @@ class ReservedNormalFormTests(unittest.TestCase):
         self.assertEqual((policy.hosts, policy.credential_prefixes), (frozenset({"venue.example"}), ("venue:",)))
         self.assertIs(type(policy.hosts), frozenset)
         self.assertEqual(ReservedEffects(), ReservedEffects(frozenset(), ()))
+
+    def test_every_upper_case_letter_is_refused_in_hosts_and_prefixes(self) -> None:
+        # Codex GPT-6.1 Sol: a test with "Venue.Example" alone let a pattern admitting "Z" through.
+        for char in string.ascii_uppercase:
+            with self.subTest(char=char):
+                self.assertFalse(host_in_normal_form(char + ".example"))
+                self.assertFalse(host_in_normal_form("api.x" + char + ".example"))
+                self.assertFalse(host_in_normal_form("api.example." + char + "x"))  # in the last label too
+                self.assertEqual(refusal(ReservedEffects, credential_prefixes=(char + ":",)), INSTALL_CONFIG)
+                self.assertEqual(refusal(ReservedEffects, credential_prefixes=("vault" + char,)), INSTALL_CONFIG)
+
+    def test_what_is_stored_is_what_was_checked(self) -> None:
+        # Codex GPT-6.1 Sol's check, made deterministic (no thread, no timeout): the caller's lists change
+        # while they are being checked; the stored values are the ones checked, for hosts and prefixes.
+        hosts, prefixes = ["one.example", "two.example"], ["vault:", "other:"]
+        check_host, prefix_pattern = manifest_module.host_in_normal_form, manifest_module._CRED_PREFIX
+
+        def host_check(host):
+            if host == "two.example":
+                hosts[0] = "UPPER.invalid"
+            return check_host(host)
+
+        class PrefixPattern:
+            def fullmatch(self, value):
+                if value == "other:":
+                    prefixes[0] = "UPPER:"
+                return prefix_pattern.fullmatch(value)
+
+        with mock.patch.object(manifest_module, "host_in_normal_form", host_check), \
+                mock.patch.object(manifest_module, "_CRED_PREFIX", PrefixPattern()):
+            policy = ReservedEffects(hosts, prefixes)
+        self.assertEqual(hosts[0], "UPPER.invalid")  # the change did happen during the check
+        self.assertEqual(policy.hosts, frozenset({"one.example", "two.example"}))
+        self.assertEqual(policy.credential_prefixes, ("vault:", "other:"))
 
     def test_a_string_or_mapping_in_place_of_a_list_is_refused(self) -> None:
         # A string is iterable: "venue.example" would otherwise reserve its single letters.
@@ -186,6 +223,9 @@ class PortAndAddressTests(unittest.TestCase):
         self.assertEqual(self.destinations(name), ("accepted", "accepted"))
         self.assertFalse(host_in_normal_form(name + "d"))
         self.assertEqual(self.destinations(name[:-1] + "dd"), ("manifest_network_destinations",) * 2)
+        # The 253 counts the host only, never its port.
+        self.assertTrue(destination_in_normal_form(name + ":65535"))
+        self.assertFalse(destination_in_normal_form(name[:-1] + "dd:1"))
 
     def test_a_label_is_at_most_63_characters(self) -> None:
         # The earlier pattern let a label of 64 characters through; DNS stops at 63.
@@ -221,21 +261,33 @@ class GrantBoundToDeveloperKeyTests(unittest.TestCase):
         self.assertEqual(effective_permissions(self.m2, "unsigned", None, grant),
                          ((), [("grant_developer_key_mismatch", "grant is for another developer key; grant again")]))
 
-    def test_an_unbound_manual_grant_never_carries_order(self) -> None:
-        unbound = Grant("demo.plugin", DIGEST, None, ALL, True)
-        for manifest in (self.m1, self.m2):
-            with self.subTest(key=manifest.developer_key[:2]):
-                perms, dropped = effective_permissions(manifest, "unsigned", None, unbound)
-                self.assertEqual(perms, ("read", "propose"))
-                self.assertEqual(dropped, [("manual_grant_not_bound_to_developer_key", "order")])
+    def test_an_unbound_manual_grant_grants_nothing_in_either_form(self) -> None:
+        # Both reads of #374 (Codex GPT-6 Astra R2, GPT-6.1 Sol R1): D0 binds the whole manual grant.
+        missing = ((), [("grant_developer_key_missing", "manual grant names no developer key; grant again")])
+        wide = ("read", "network", "credential", "process", "order")
+        for raw in (manifest_bytes(K1), manifest_bytes(K2), v1(K1, permissions=ALL),
+                    manifest_bytes(K1, permissions=wide, network=("api.example.org",), credentials=("vault:test",))):
+            manifest = parse_manifest(raw)
+            with self.subTest(schema=manifest.schema, permissions=manifest.permissions):
+                for ack in (True, False):
+                    unbound = Grant("demo.plugin", DIGEST, None, manifest.permissions, ack)
+                    self.assertEqual(effective_permissions(manifest, "unsigned", None, unbound), missing)
+                bound = Grant("demo.plugin", DIGEST, None, manifest.permissions, True,
+                              developer_key_id=key_id(manifest.developer_key))
+                self.assertEqual(effective_permissions(manifest, "unsigned", None, bound), (manifest.permissions, []))
+        read_only = Grant("demo.plugin", DIGEST, None, ("read",), developer_key_id=key_id(K1))
+        self.assertEqual(effective_permissions(self.m1, "unsigned", None, read_only)[0], ("read",))
 
-    def test_an_unbound_manual_grant_on_a_version_1_manifest_grants_nothing(self) -> None:
-        manifest = parse_manifest(v1(K1, permissions=ALL))
-        unbound = Grant("demo.plugin", DIGEST, None, ALL, True)
-        self.assertEqual(effective_permissions(manifest, "unsigned", None, unbound),
-                         ((), [("grant_developer_key_missing", "manual grant names no developer key; grant again")]))
-        bound = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
-        self.assertEqual(effective_permissions(manifest, "unsigned", None, bound), (ALL, []))
+    def test_every_pair_of_version_1_permissions_keeps_the_canonical_order(self) -> None:
+        # Codex GPT-6 Astra R3: a swap of two returned permissions must turn a test red.
+        for first, second in itertools.combinations(PERMISSIONS_V1, 2):
+            requested = (first, second)
+            extra = {"network": ("api.example.org",)} if "network" in requested else {}
+            creds = {"credentials": ("vault:test",)} if "credential" in requested else {}
+            manifest = parse_manifest(v1(K1, permissions=requested, **extra, **creds))
+            grant = Grant("demo.plugin", DIGEST, key_id(K1), (second, first))
+            with self.subTest(pair=requested):
+                self.assertEqual(effective_permissions(manifest, "signed", key_id(K1), grant), (requested, []))
 
     def test_the_key_order_was_turned_back_on_for_binds_a_manual_grant(self) -> None:
         grant = Grant("demo.plugin", DIGEST, None, ALL, True, order_after_revoked_key=key_id(K1))
@@ -298,10 +350,10 @@ class LoaderBindingTests(unittest.TestCase):
         self.assertEqual((swapped.trust, swapped.permissions), ("unsigned", ()))
         self.assertIn("grant_developer_key_mismatch", [f["code"] for f in swapped.findings])
 
-    def test_an_unbound_manual_grant_loads_without_order_and_says_why(self) -> None:
+    def test_an_unbound_manual_grant_loads_with_no_permission_and_says_why(self) -> None:
         loaded = self.load(manifest_bytes(K1), Grant("demo.plugin", DIGEST, None, ALL, True))
-        self.assertEqual(loaded.permissions, ("read", "propose"))
-        self.assertIn("manual_grant_not_bound_to_developer_key", [f["code"] for f in loaded.findings])
+        self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ()))
+        self.assertIn("grant_developer_key_missing", [f["code"] for f in loaded.findings])
 
 
 @needs_crypto
@@ -329,10 +381,10 @@ class ManualGrantIdentityTests(unittest.TestCase):
         changed_manifest = manifest_bytes(replacement.public)
         # Same plugin id, artifact bytes and grant; only the unsigned manifest's developer_key changed.
         self.assertEqual(self.reload(changed_manifest, bound).permissions, ())
-        # The reviewer's own grant names no key: it is unbound, so it carries no order anywhere.
+        # The reviewer's own grant names no key: it is unbound, so it grants nothing anywhere.
         unbound = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True)
-        self.assertNotIn("order", self.reload(self.world.manifest, unbound).permissions)
-        self.assertNotIn("order", self.reload(changed_manifest, unbound).permissions)
+        self.assertEqual(self.reload(self.world.manifest, unbound).permissions, ())
+        self.assertEqual(self.reload(changed_manifest, unbound).permissions, ())
         # Order under the new key comes back only through a new grant the user makes for that key.
         regranted = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True,
                           developer_key_id=key_id(replacement.public))

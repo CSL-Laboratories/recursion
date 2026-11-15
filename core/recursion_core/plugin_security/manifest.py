@@ -12,8 +12,8 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
   verify the package: that is ``verify_package`` (lane PLUGIN-SIGN, next slice), and the
   loader imports only ``plugin.py`` until it uses it.
 * Grants are bound to the developer key they were given for (review R4, finding 6, under
-  Lucas's D0, Nov 12, 2026): a grant naming another developer key grants nothing, and a
-  manual grant that names none never carries ``order``.
+  Lucas's D0, Nov 12, 2026): a grant naming another developer key grants nothing, and so
+  does a manual grant that names none, in either form (grant again).
 * Installer configuration is refused unless it is in normal form: a reserved host is a
   lower-case host name with no port, no trailing dot and no IP address; a reserved
   credential prefix is lower case. A declared destination's port is 1 to 65535, and a
@@ -106,7 +106,7 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 # - a port is 1 to 65535, with no sign and no leading zero.
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _LAST_LABEL = r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?"
-_HOST_NAME = r"(?=[a-z0-9.-]{1,253}(?::|$))(?:" + _LABEL + r"\.)+" + _LAST_LABEL
+_HOST_NAME = r"(?=[^:]{1,253}(?::|$))(?:" + _LABEL + r"\.)+" + _LAST_LABEL
 _PORT_NUMBER = r"(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])"
 _HOSTNAME = re.compile(_HOST_NAME)
 _HOST = re.compile(_HOST_NAME + r"(?::" + _PORT_NUMBER + r")?")
@@ -116,6 +116,10 @@ _CRED_PREFIX = re.compile(r"[a-z][a-z0-9_.:/-]{0,127}")
 _SCRIPT = re.compile(r"[ -~]{1,200}")
 _VERSION_V1 = re.compile(r"[ -~]{1,64}")
 _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
+# Refused so that one package names one set of files on every system: a segment ending in '.'
+# (Windows drops it, so "lib." is "lib") and a name Windows reserves for a device, in any case and
+# with any extension ("CON.txt").
+_WINDOWS_DEVICE = re.compile(r"(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?")
 
 
 @dataclass(frozen=True)
@@ -188,6 +192,9 @@ def _parse_files(value: object, artifact: str) -> tuple:
                           "a relative path of letters, digits, '_', '.' and '-', no segment "
                           "starting with a dot, at most %d characters" % _MAX_PATH)
         lowered = path.lower()
+        if any(segment.endswith(".") or _WINDOWS_DEVICE.fullmatch(segment) for segment in lowered.split("/")):
+            raise Refused("manifest_files_path",
+                          "%s: not portable (a segment ending in '.', or a name Windows keeps for a device)" % path)
         if lowered.split("/", 1)[0] in _ENVELOPE_FILES:
             raise Refused("manifest_files_envelope", path)
         if type(digest) is not str or not _HEX64.fullmatch(digest):
@@ -426,8 +433,8 @@ class Grant:
     # under D0: a manual grant is bound to the developer key it was given for). A grant
     # naming another key grants nothing. A manual grant (signer_key_id None) that names no
     # key here may still be bound by ``order_after_revoked_key``, which names the key the
-    # user turned order back on for; with neither it is unbound and never carries order,
-    # and on a version 1 manifest it grants nothing.
+    # user turned order back on for; with neither it is unbound and grants nothing, in
+    # either manifest form: the user grants again, for the key the manifest names now.
     developer_key_id: str | None = None
 
 
@@ -507,8 +514,8 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
     grant whose bound key (``_bound_developer_key``) is not the manifest's developer key
     grants nothing, so rewriting an unsigned manifest under another key does not carry a
     manual grant (or escape that key's revocation). A manual grant bound to no key cannot
-    show which key it was for: it never carries ``order``, and on a version 1 manifest,
-    which the install commands always bind, it grants nothing.
+    show which key it was for, so it grants nothing in either form (``grant_developer_key_missing``);
+    its identity is never inferred from the unsigned manifest on disk.
     """
     dropped: list[tuple[str, str]] = []
     if grant is None:
@@ -520,8 +527,7 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
     bound = _bound_developer_key(grant)
     if bound is not None and bound != key_id(manifest.developer_key):
         return (), [("grant_developer_key_mismatch", "grant is for another developer key; grant again")]
-    unbound_manual = grant.signer_key_id is None and bound is None
-    if unbound_manual and manifest.schema == MANIFEST_SCHEMA_V1:
+    if grant.signer_key_id is None and bound is None:
         return (), [("grant_developer_key_missing", "manual grant names no developer key; grant again")]
     out = []
     for perm in PERMISSIONS_V1:
@@ -538,8 +544,5 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
             if type(generation) is not int or not _order_cites_this_revocation(grant, revoked_key_id, generation):
                 dropped.append(("signer_key_revoked_order_off", revoked_key_id))
                 continue
-        if perm == "order" and unbound_manual:
-            dropped.append(("manual_grant_not_bound_to_developer_key", perm))
-            continue
         out.append(perm)
     return tuple(out), dropped

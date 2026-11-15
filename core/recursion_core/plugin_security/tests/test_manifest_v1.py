@@ -129,6 +129,27 @@ class ParseV1Tests(unittest.TestCase):
         for value in ("", "v" * 65, "1.0\n", "1.0\t", "1.0\x7f", 1, None):
             with self.subTest(version=value):
                 self.assertRefused(v1(version=value), "manifest_version")
+        for number in list(range(32)) + [127]:  # every control character (Codex GPT-6.1 Sol: "\r" was untested)
+            with self.subTest(control=number):
+                self.assertRefused(v1(version="1" + chr(number)), "manifest_version")
+
+    def test_every_field_of_another_type_gets_a_typed_refusal(self) -> None:
+        # Codex GPT-6.1 Sol's check: no field value raises anything but Refused.
+        baseline = v1_fields()
+        optional_empty = ("permissions", "install_scripts", "network_destinations", "credential_refs",
+                          "dependency_lock_sha256")
+        for name, good in baseline.items():
+            for value in (None, False, 0, {}, [], ["x"], {"x": 1}, ""):
+                if type(value) is type(good) and value == good:
+                    continue
+                body = dict(baseline)
+                body[name] = value
+                with self.subTest(field=name, value=value):
+                    try:
+                        parse_manifest(canonical(body))
+                    except Refused:
+                        continue
+                    self.assertIn(name, optional_empty)  # an empty list or a null lock is a valid value
 
     def test_the_vnext_rules_hold_for_version_1(self) -> None:
         self.assertRefused(v1(plugin_id="host"), "manifest_plugin_id_reserved")
@@ -188,6 +209,23 @@ class FilesTests(unittest.TestCase):
         for digest in (sha(b"").upper(), sha(b"")[:63], sha(b"") + "0", "", None, 7, [sha(b"")]):
             with self.subTest(digest=digest):
                 self.assertRefused(self.files(**{"notes/index.py": digest}), "manifest_files_digest")
+        for char in "ghijklmnopqrstuvwxyzGHIJKLMNOPQRSTUVWXYZ-_: ":  # Codex GPT-6.1 Sol: "g" was untested
+            with self.subTest(char=char):
+                self.assertRefused(self.files(**{"notes/index.py": char * 64}), "manifest_files_digest")
+
+    def test_a_path_that_is_not_portable_is_refused(self) -> None:
+        # Both reads of #374: Windows drops a trailing '.' and keeps device names, so these would name other
+        # files, or devices, there.
+        for extra in ({"data": sha(b""), "data.": sha(b"")}, {"lib./a.py": sha(b""), "lib/a.py": sha(b"")},
+                      {"manifest.json.": sha(b"")}, {"notes/x.": sha(b"")}):
+            with self.subTest(paths=sorted(extra)):
+                self.assertRefused(self.files(**extra), "manifest_files_path")
+        for name in ("CON.txt", "con", "Nul", "aux.py", "prn.tar.gz", "COM1", "lpt9.log", "notes/com0"):
+            with self.subTest(name=name):
+                self.assertRefused(self.files(**{name: sha(b"")}), "manifest_files_path")
+        for name in ("console.py", "conn", "nullable.py", "com10", "lpt", "auxiliary/x.py", "x.con"):
+            with self.subTest(accepted=name):
+                self.assertIn(name, dict(parse_manifest(v1(files=self.files(**{name: sha(b"")}))).files))
 
     def test_the_signature_envelope_cannot_be_listed(self) -> None:
         for path in ("manifest.json", "manifest.sig", "Manifest.JSON", "MANIFEST.SIG", "manifest.json/x.py",

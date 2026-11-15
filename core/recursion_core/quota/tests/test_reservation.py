@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sqlite3
 import threading
 import unittest
 from decimal import Decimal
@@ -199,14 +200,19 @@ class AdmissionTest(Case):
         self.assertTrue(again["allowed"])
         self.assertEqual([row["amount_usd"] for row in held(self.store)], ["5", "3"])
 
-    def test_free_holds_do_not_count_against_a_cap(self):
-        self.assertTrue(self.res.admit(SUB, route(), RUN_A)["allowed"])
-        self.keys.policies["login-A"] = opted_in("1")
-        self.reads.spent_by[SUB] = R.known_spend(0)
-        self.reads.paid_by[SUB] = True  # the next run on this login would draw on the plan's paid fallback
-        answer = self.res.admit(SUB, route(), RUN_B)
-        self.assertEqual((answer["allowed"], answer["metered"]), (True, True))
-        self.assertEqual(held(self.store)[-1]["amount_usd"], "1")
+    def test_a_keys_consent_covers_no_other_kind_with_the_same_id(self):
+        # Review R4 (gpt-6.1-sol) / R3 (gpt-6-astra): key-A's opt-in is a stored key's, never a subscription's or a
+        # cloud's that happens to share the id; those meters bill other funding sources.
+        self.reads.spent_by["subscription:key-A"] = R.known_spend(0)
+        self.reads.spent_by["passthrough:key-A"] = R.known_spend(0)
+        self.reads.paid_by["subscription:key-A"] = True
+        self.assertRefused(self.res.admit("subscription:key-A", route(conn_id="key-A"), RUN_A),
+                           "consent_unsupported")
+        self.assertRefused(self.res.admit("passthrough:key-A", route("passthrough", "key-A"), RUN_B),
+                           "consent_unsupported")
+        self.assertEqual(self.keys.calls, [])  # KEYS is asked about its own keys only
+        self.assertTrue(self.res.admit(KEY, key_route(), RUN_C)["allowed"])
+        self.assertEqual(self.keys.calls, [("key-A", 0)])
 
     def test_a_retried_start_reuses_its_reservation(self):
         for connection, made, run_id in ((SUB, route(), RUN_A), (KEY, key_route(), RUN_B)):
@@ -275,8 +281,7 @@ class AdmissionTest(Case):
         res = R.Reservations(self.store, broken, reads=self.reads)
         with self.assertLogs("recursion_core.quota.reservation", "ERROR"):
             self.assertRefused(res.admit(KEY, key_route(), RUN_A), "policy_unavailable")
-        with self.assertLogs("recursion_core.quota.reservation", "ERROR"):
-            self.assertTrue(res.admit(SUB, route(), RUN_B)["allowed"])
+        self.assertTrue(res.admit(SUB, route(), RUN_B)["allowed"])  # a subscription never asks KEYS
         no_keys = R.Reservations(self.store, None, reads=self.reads)
         self.assertRefused(no_keys.admit(KEY, key_route(), RUN_C), "policy_unavailable")
 
@@ -293,27 +298,135 @@ class AdmissionTest(Case):
 
     def test_what_can_spend_money(self):
         self.assertRefused(self.res.admit("passthrough:cloud-A", route("passthrough", "cloud-A"), RUN_A),
-                           "no_opt_in")
+                           "consent_unsupported")
         billing = route(api_key_helper="present", billing_ack="api_key_helper")
-        self.assertRefused(self.res.admit(SUB, billing, RUN_B), "no_opt_in")
+        self.assertRefused(self.res.admit(SUB, billing, RUN_B), "consent_unsupported")
         self.assertEqual(rows(self.store)[-1]["basis"], "api_key_helper_billing")
+        self.assertEqual(self.keys.calls, [])
         asks = route(api_key_helper="present")  # not acknowledged: the adapter asks, nothing is billed
         self.assertEqual(self.res.admit(SUB, asks, RUN_C)["reason"], "no_spend")
         ack_without_helper = route(billing_ack="api_key_helper")
         self.assertEqual(self.res.admit(SUB, ack_without_helper, "run-d4")["reason"], "no_spend")
 
-    def test_a_subscription_on_its_plans_paid_fallback_needs_an_opt_in(self):
-        self.reads.paid_by[SUB] = True
-        self.assertRefused(self.res.admit(SUB, route(), RUN_A), "no_opt_in")
-        self.assertEqual(rows(self.store)[-1]["basis"], "plan_paid_fallback")
-        self.keys.policies["login-A"] = opted_in("10")
+    def test_a_subscription_on_its_plans_paid_fallback_is_refused_until_a_consent_exists(self):
+        self.keys.policies["login-A"] = opted_in("10")  # a key policy by the same id does not count (R4/R3)
         self.reads.spent_by[SUB] = R.known_spend(1)
-        answer = self.res.admit(SUB, route(), RUN_B)
+        self.reads.paid_by[SUB] = True
+        self.assertRefused(self.res.admit(SUB, route(), RUN_A), "consent_unsupported")
+        last = rows(self.store)[-1]
+        self.assertEqual((last["basis"], last["paid_fallback"]), ("plan_paid_fallback", "active"))
+        self.reads.paid_by[SUB] = False  # a typed reading of free billing: the way out
+        self.assertEqual(self.res.admit(SUB, route(), RUN_B)["reason"], "no_spend")
+        self.assertEqual(rows(self.store)[-1]["paid_fallback"], "inactive")
+        self.assertEqual(self.keys.calls, [])
+
+    def test_no_reading_keeps_the_last_typed_one(self):
+        # Review R2 (both): a missing reading must not erase a known paid fallback.
+        self.assertEqual(self.res.admit(SUB, route(), RUN_A)["reason"], "no_spend")  # cold: free, as documented
+        self.reads.paid_by[SUB] = True
+        self.assertRefused(self.res.admit(SUB, route(), RUN_B), "consent_unsupported")
+        self.reads.paid_by[SUB] = None
+        self.assertRefused(self.res.admit(SUB, route(), RUN_C), "consent_unsupported")
+        self.reads.paid_by[SUB] = False
+        self.assertEqual(self.res.admit(SUB, route(), "run-d4")["reason"], "no_spend")
+        self.reads.paid_by[SUB] = None
+        self.assertEqual(self.res.admit(SUB, route(), "run-e5")["reason"], "no_spend")
+        self.assertEqual(self.res.admit("subscription:login-B", route(conn_id="login-B"), "run-f6")["reason"],
+                         "no_spend")  # another login's reading is not this one's
+
+    def test_a_failed_or_untyped_reading_refuses(self):
+        # Review R2 (both): a failure, or an answer that is neither True, False nor None, is not free billing.
+        class Failing(Reads):
+            def paid_fallback_active(self, tx, connection_id):
+                raise RuntimeError("meters down")
+
+        failing = R.Reservations(self.store, self.keys, reads=Failing())
+        with self.assertLogs("recursion_core.quota.reservation", "ERROR"):
+            self.assertRefused(failing.admit(SUB, route(), RUN_A), "paid_fallback_unknown")
+        for number, odd in enumerate(("true", 1, "false", 0)):
+            with self.subTest(reading=odd):
+                self.reads.paid_by[SUB] = odd
+                self.assertRefused(self.res.admit(SUB, route(), f"run-u{number}"), "paid_fallback_unknown")
+        self.assertEqual(held(self.store), [])
+
+    def test_a_paid_retry_whose_reading_is_lost_keeps_its_policy(self):
+        # Review R2 (gpt-6-astra): a run held as metered on a subscription keeps being checked as paid.
+        self.hold_directly(RUN_A, SUB, metered=True, amount="4", basis="plan_paid_fallback", paid="active")
+        self.reads.paid_by[SUB] = None
+        self.assertRefused(self.res.admit(SUB, route(), RUN_A), "consent_unsupported")
+        self.assertEqual(held(self.store), [])
+        self.assertEqual(rows(self.store)[-2]["reason"], "refused_on_retry")
+
+    def test_a_paid_retry_whose_meter_fails_is_refused_and_lets_its_hold_go(self):
+        # Review R2 (gpt-6-astra), its second case: a failing meter on a held paid run.
+        self.hold_directly(RUN_A, SUB, metered=True, amount="4", basis="plan_paid_fallback", paid="active")
+
+        class Failing(Reads):
+            def paid_fallback_active(self, tx, connection_id):
+                raise RuntimeError("meters down")
+
+        with self.assertLogs("recursion_core.quota.reservation", "ERROR"):
+            self.assertRefused(R.Reservations(self.store, self.keys, reads=Failing()).admit(SUB, route(), RUN_A),
+                               "paid_fallback_unknown")
+        self.assertEqual(held(self.store), [])
+
+    def test_a_paid_retry_that_is_now_free_lets_its_money_go(self):
+        # Review R3 (gpt-6.1-sol): a retry that spends nothing must not keep a money hold.
+        for run_id, basis, paid, reading in ((RUN_A, "plan_paid_fallback", "active", False),
+                                             (RUN_B, "api_key_helper_billing", None, None)):
+            with self.subTest(basis=basis):
+                old = self.hold_directly(run_id, SUB, metered=True, amount="4", basis=basis, paid=paid)
+                self.reads.paid_by[SUB] = reading
+                answer = self.res.admit(SUB, route(), run_id)
+                self.assertEqual((answer["allowed"], answer["reason"], answer["metered"]), (True, "no_spend", False))
+                self.assertNotEqual(answer["reservation_id"], old)
+                [now] = [row for row in held(self.store) if row["run_id"] == run_id]
+                self.assertEqual((now["metered"], now["amount_usd"]), (0, "0"))
+                self.assertIn((old, "released", "superseded"),
+                              [(row["reservation_id"], row["state"], row["reason"]) for row in rows(self.store)])
+
+    def test_a_free_retry_that_now_spends_replaces_its_zero_hold(self):
+        # Review M07 (gpt-6-astra) / M08 (gpt-6.1-sol): one current hold, never a zero hold kept for a paid attempt.
+        old = self.hold_directly(RUN_A, KEY, metered=False, amount="0", basis=None, paid=None)
+        answer = self.res.admit(KEY, key_route(), RUN_A)
         self.assertEqual((answer["allowed"], answer["metered"]), (True, True))
-        for state in (False, None):
-            with self.subTest(paid=state):
-                self.reads.paid_by[SUB] = state
-                self.assertEqual(self.res.admit(SUB, route(), f"run-q{state}")["reason"], "no_spend")
+        self.assertNotEqual(answer["reservation_id"], old)
+        [now] = held(self.store)
+        self.assertEqual((now["metered"], now["amount_usd"]), (1, "3"))
+
+    def test_a_retry_after_the_cap_was_cut_holds_only_what_is_left(self):
+        # Review R4 (gpt-6-astra): an old hold larger than the headroom the cap now leaves is not reused.
+        first = self.res.admit(KEY, key_route(), RUN_A)  # cap 5, spent 2: holds 3
+        self.keys.policies["key-A"] = opted_in("3")
+        again = self.res.admit(KEY, key_route(), RUN_A)
+        self.assertTrue(again["allowed"])
+        self.assertNotEqual(again["reservation_id"], first["reservation_id"])
+        [now] = held(self.store)
+        self.assertEqual((now["amount_usd"], now["cap_usd"]), ("1", "3"))
+        same = self.res.admit(KEY, key_route(), RUN_A)  # nothing changed: the same hold
+        self.assertEqual(same["reservation_id"], again["reservation_id"])
+        self.keys.policies["key-A"] = opted_in("2")  # spent 2 reaches a cap of 2: refused, and the hold goes
+        self.assertRefused(self.res.admit(KEY, key_route(), RUN_A), "cap_reached")
+        self.assertEqual(held(self.store), [])
+
+    def test_a_raised_cap_opens_headroom_for_another_run(self):
+        first = self.res.admit(KEY, key_route(), RUN_A)  # cap 5, spent 2: holds 3
+        self.keys.policies["key-A"] = opted_in("10")
+        self.assertEqual(self.res.admit(KEY, key_route(), RUN_A)["reservation_id"], first["reservation_id"])
+        second = self.res.admit(KEY, key_route(), RUN_B)  # 10 - 2 - 3 = 5 left
+        self.assertTrue(second["allowed"])
+        self.assertEqual(sorted(row["amount_usd"] for row in held(self.store)), ["3", "5"])
+
+    def hold_directly(self, run_id, connection, *, metered, amount, basis, paid):
+        """A held row as an earlier admission would have written it (for the retry transitions)."""
+        reservation_id = "rsv-" + "f" * 24 + run_id[-8:]
+        with self.store.transaction() as tx:
+            tx.execute("INSERT INTO quota_reservation (reservation_id, run_id, connection_id, engine, model, state, "
+                       "metered, basis, reason, amount_usd, cap_usd, paid_fallback) "
+                       "VALUES (?, ?, ?, 'claude_code', 'claude-sonnet-5-5', 'held', ?, ?, ?, ?, ?, ?)",
+                       (reservation_id, run_id, connection, 1 if metered else 0, basis,
+                        "within_cap" if metered else "no_spend", amount, "5" if metered else None, paid))
+        return reservation_id
 
     def test_a_reader_that_fails_knows_nothing(self):
         class Broken(Reads):
@@ -327,7 +440,7 @@ class AdmissionTest(Case):
         with self.assertLogs("recursion_core.quota.reservation", "ERROR"):
             self.assertRefused(res.admit(KEY, key_route(), RUN_A), "spend_unknown")
         with self.assertLogs("recursion_core.quota.reservation", "ERROR"):
-            self.assertEqual(res.admit(SUB, route(), RUN_B)["reason"], "no_spend")
+            self.assertRefused(res.admit(SUB, route(), RUN_B), "paid_fallback_unknown")
         odd = Reads(spent={KEY: 2.0})  # not a Spend: unknown
         self.assertRefused(R.Reservations(self.store, self.keys, reads=odd).admit(KEY, key_route(), RUN_C),
                            "spend_unknown")
@@ -351,6 +464,10 @@ class AdmissionTest(Case):
         cases = ((KEY, route(), RUN_A),                       # the connection is not the route's
                  (SUB, route(), "run id with spaces"),
                  (SUB, route(), 7),
+                 (SUB, route(), "r" * 65),                    # a run id is 1 to 64 characters (review R6/M09)
+                 ("subscription:", route(conn_id=""), RUN_A),  # an empty connection id (R6/M11)
+                 (SUB, dict(route(), engine=""), RUN_A),      # an empty engine or model (R6/M10)
+                 (SUB, dict(route(), model=""), RUN_A),
                  (SUB, {k: v for k, v in route().items() if k != "model"}, RUN_A),
                  ("other:x", dict(route(), connection={"kind": "other", "id": "x"}), RUN_A),
                  (SUB, "not a route", RUN_A))
@@ -359,6 +476,9 @@ class AdmissionTest(Case):
                 self.assertRefused(self.res.admit(connection, made, run_id), "route_invalid")
         self.assertEqual(rows(self.store), [])
         self.assertEqual(self.keys.calls, [])
+
+    def test_a_run_id_of_sixty_four_characters_is_a_run_id(self):
+        self.assertTrue(self.res.admit(SUB, route(), "r" * 64)["allowed"])
 
     def test_the_connection_is_the_route_services_meter(self):
         for made in (route(), key_route(), route("passthrough", "cloud-A")):
@@ -424,14 +544,19 @@ class ConcurrencyTest(unittest.TestCase):
 class ModuleTest(unittest.TestCase):
     """``reservation.admit`` and ``release``, which the route service calls."""
 
-    def test_before_composition_the_lane_acts_as_if_absent(self):
+    def test_before_composition_only_a_route_that_cannot_spend_is_admitted(self):
+        # Review R1 (both): a present module that is not composed owes the zero-dollar rule; only the module's
+        # ABSENCE is the caller's base behaviour.
         with mock.patch.object(R, "_installed", None):
             self.assertEqual(R.admit(SUB, route(), RUN_A),
                              {"allowed": True, "code": None, "reservation_id": None, "reason": "no_spend",
                               "metered": False})
-            self.assertEqual(R.admit(KEY, key_route(), RUN_A),
-                             {"allowed": True, "code": None, "reservation_id": None, "reason": "quota_not_composed",
-                              "metered": True})
+            for connection, made in ((KEY, key_route()), ("passthrough:cloud-A", route("passthrough", "cloud-A")),
+                                     (SUB, route(api_key_helper="present", billing_ack="api_key_helper"))):
+                with self.subTest(connection=connection):
+                    self.assertEqual(R.admit(connection, made, RUN_A),
+                                     {"allowed": False, "code": "reservation_refused", "reservation_id": None,
+                                      "reason": "quota_not_composed", "metered": True})
             self.assertEqual(R.admit(KEY, route(), RUN_A)["reason"], "route_invalid")
             self.assertEqual(R.release(RUN_A), [])
 
@@ -455,13 +580,51 @@ class ModuleTest(unittest.TestCase):
             tables.declare(store)
 
 
+class TableConstraintTest(unittest.TestCase):
+    """Review R6 (gpt-6-astra) / M18-M22 (gpt-6.1-sol): each constraint the table declares refuses a bad row."""
+
+    GOOD = {"reservation_id": "rsv-" + "1" * 32, "run_id": RUN_A, "connection_id": KEY, "engine": "claude_code",
+            "model": "m", "state": "held", "metered": 1, "basis": "api_key", "reason": "within_cap",
+            "amount_usd": "1", "cap_usd": "5", "spent_usd": "2", "spent_quality": "known",
+            "spent_provenance": "observed", "paid_fallback": None}
+
+    def insert(self, store, **changes):
+        row = dict(self.GOOD, **changes)
+        with store.transaction() as tx:
+            tx.execute(f"INSERT INTO quota_reservation ({', '.join(row)}) VALUES ({', '.join('?' for _ in row)})",
+                       tuple(row.values()))
+
+    def test_a_good_row_is_kept(self):
+        store = declared()
+        self.insert(store)
+        self.assertEqual(len(rows(store)), 1)
+
+    def test_each_constraint_refuses(self):
+        for change in ({"state": "open"}, {"metered": 2}, {"spent_quality": "exact"},
+                       {"spent_provenance": "guessed"}, {"paid_fallback": "maybe"}, {"reason": None}):
+            with self.subTest(change=change):
+                store = declared()
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.insert(store, **change)
+                self.assertEqual(rows(store), [])
+
+    def test_a_reservation_has_one_row_per_state(self):
+        store = declared()
+        self.insert(store)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert(store, run_id=RUN_B)  # a second held row for the same reservation
+        self.insert(store, state="released", reason="run_ended")
+        self.assertEqual([row["state"] for row in rows(store)], ["held", "released"])
+
+
 class SpendTypeTest(unittest.TestCase):
     def test_unknown_is_null_never_zero(self):
         self.assertEqual(R.UNKNOWN_SPEND, R.Spend(None, "unknown", "unavailable"))
         for bad in ((Decimal(0), "unknown", "unavailable"), (None, "unknown", "observed"),
                     (None, "known", "observed"), (Decimal(1), "known", "unavailable"),
                     (Decimal(-1), "known", "observed"), (Decimal("NaN"), "known", "observed"),
-                    (1, "known", "observed"), (Decimal(1), "exact", "observed")):
+                    (1, "known", "observed"), (Decimal(1), "exact", "observed"),
+                    (Decimal(1), "known", "guessed")):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 R.Spend(*bad)
 
@@ -543,10 +706,14 @@ class FixtureTest(Case):
         self.assertEqual((view["state"], answer["code"]), ("start_failed", "start_failed"))
 
     def test_the_fixtures_validate_against_spines_schemas(self):
+        # Review R5 (both): the schemas are part of this branch (SPINE's #368, merged in), so on an interpreter that
+        # has jsonschema (3.12, as hosted CI) their absence is a failure. Only an interpreter without jsonschema
+        # (the free-threaded venv) skips.
         client_path = REPO / "conformance" / "wire_client.py"
         folder = REPO / "schemas" / "control" / "v1"
-        if importlib.util.find_spec("jsonschema") is None or not client_path.is_file() or not folder.is_dir():
-            self.skipTest("needs jsonschema and SPINE's schemas (#368) in the tree")
+        if importlib.util.find_spec("jsonschema") is None:
+            self.skipTest("jsonschema is not installed in this interpreter")
+        self.assertTrue(client_path.is_file() and folder.is_dir(), "SPINE's schemas (#368) are not in the tree")
         spec = importlib.util.spec_from_file_location("quota_wire_client", client_path)
         client = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(client)

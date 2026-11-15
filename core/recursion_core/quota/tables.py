@@ -18,7 +18,8 @@ VERSION = 1
 # row of its own. Money is kept as decimal text, never a float: ``amount_usd`` is what the hold reserves ('0'
 # when nothing may be spent), ``cap_usd`` the cap the admission read (null when the route cannot spend), and
 # ``spent_*`` what admission knew of the connection's spend, with its quality and provenance (null value when
-# unknown, never 0).
+# unknown, never 0). ``paid_fallback`` is a subscription's typed meter reading at that admission ('active' or
+# 'inactive'; null when there was none): the latest one stands while the meters give no reading.
 DDL = """
 CREATE TABLE quota_reservation (
     row_id INTEGER PRIMARY KEY,
@@ -36,7 +37,8 @@ CREATE TABLE quota_reservation (
     spent_usd TEXT,
     spent_quality TEXT CHECK (spent_quality IS NULL OR spent_quality IN ('known', 'lower_bound', 'unknown')),
     spent_provenance TEXT CHECK (spent_provenance IS NULL
-                                 OR spent_provenance IN ('observed', 'modelled', 'inferred', 'unavailable'))
+                                 OR spent_provenance IN ('observed', 'modelled', 'inferred', 'unavailable')),
+    paid_fallback TEXT CHECK (paid_fallback IS NULL OR paid_fallback IN ('active', 'inactive'))
 );
 CREATE UNIQUE INDEX quota_reservation_one_row_per_state ON quota_reservation (reservation_id, state);
 CREATE INDEX quota_reservation_by_run ON quota_reservation (run_id);

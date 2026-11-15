@@ -6,55 +6,82 @@ is the connection, not the engine (grill Q8).
 
 ## What is here (slice 1)
 
-`reservation.admit(connection, route, run_id)` is the admission at the breaker's admission. The route service
-calls it before any adapter runs; lane DRIVER-CC keeps `routes/service.py` and applies the call there through a
-guarded import (module absent: nothing changes). It answers a plain dict:
+`reservation.admit(connection: str, route: Mapping, run_id: str) -> dict` is the admission at the breaker's
+admission. The route service calls it before any adapter runs. Lane DRIVER-CC keeps `routes/service.py` and
+applies the call there through a guarded import: with the module ABSENT nothing changes. It answers a plain dict:
 
 ```text
-{"allowed": true,  "code": null,                  "reservation_id": "rsv-<32 hex>", "reason": "no_spend" | "within_cap", "metered": bool}
-{"allowed": false, "code": "reservation_refused", "reservation_id": null,           "reason": <refusal>,                 "metered": bool}
+{"allowed": true,  "code": null,                  "reservation_id": "rsv-<32 hex>" | null, "reason": "no_spend" | "within_cap", "metered": bool}
+{"allowed": false, "code": "reservation_refused", "reservation_id": null,                  "reason": <refusal>,                 "metered": bool}
 ```
 
-A refusal launches nothing. On the wire it is a launch-path refusal like every other: `start_failed` with
-`start_error` {code: `reservation_refused`, detail: the reason}. It is not a direct code of `run.start`.
-`reservation.release(run_id)` ends the run's reservation when the run is over.
+- **A refusal launches nothing.** On the wire it is a launch-path refusal like every other: `start_failed` with
+  `start_error` {code: `reservation_refused`, detail: the reason}. It is not a direct code of `run.start`.
+- **Admission is where the reservation is made.** There is no separate `reserve` call.
+- **`reservation.release(run_id) -> list[str] | None`** ends the run's held reservations once the run is over.
+  It returns their ids. `[]` means none was held, so a second release writes nothing. `None` means the store
+  could not record the release; the hold then stays and still counts.
+- **Composition** builds `reservation.Reservations(db, spend_policy, *, reads=None)` and calls
+  `reservation.install(reservations)` once. A second call raises `RuntimeError`; anything but a `Reservations`
+  raises `TypeError`. Before it does, a route that can spend is refused (`quota_not_composed`), and one that cannot
+  is admitted with no reservation id and no row.
+- **`reads`** answers two calls inside admission's transaction (`reservation.NoReads` until the ledger exists):
+  - `spent(tx, connection) -> Spend`: anything that is not a `Spend` counts as unknown;
+  - `paid_fallback_active(tx, connection) -> bool | None`: True or False is a typed reading; None is no reading,
+    and the connection's last typed reading stands; anything else, or an exception, refuses.
 
 | Reason | When |
 |---|---|
-| `no_spend` | The route cannot spend money: a subscription that bills nothing. Admitted with a zero hold. |
-| `within_cap` | The route can spend; the user opted in; the cap is above 0; the connection's spend is known and below the cap; no other run holds the rest. The hold reserves the whole headroom left. |
-| `no_opt_in` | KEYS' policy says no opt-in, or KEYS keeps no key by the connection's id. |
+| `no_spend` | Allowed. The route cannot spend money: a subscription that bills nothing. A zero hold. |
+| `within_cap` | Allowed. An API-key route; KEYS says the user opted in; the cap is above 0; the connection's spend is known and below the cap; the headroom left after other runs' holds is above 0. The hold reserves that headroom. |
+| `no_opt_in` | KEYS' policy says no opt-in, or KEYS keeps no key by the route's connection id. |
 | `cap_zero` | Opted in, but the cap is 0 or absent (absent is 0). |
 | `cap_reached` | The spend is known, or a lower bound, at or past the cap. |
 | `cap_held` | Other runs on the same connection hold the headroom left. |
 | `spend_unknown` | The spend is unknown, or only a lower bound below the cap: nothing shows the cap is not reached. |
+| `consent_unsupported` | The route can spend money through a funding source that has no consent interface yet: a passthrough (a cloud or gateway bills it), a subscription billing its apiKeyHelper (`billing_ack`), or a subscription on its plan's paid fallback. KEYS' policy is a stored key's and is never applied to another kind of connection that shares its id. |
+| `paid_fallback_unknown` | A subscription's meter read failed, or did not answer True, False or None. |
 | `policy_unavailable`, `policy_invalid` | KEYS failed or is not composed; or its answer is not `{metered_spend_allowed: bool, cap_usd: number >= 0}`. |
 | `store_unavailable` | The reservation could not be recorded. Nothing is admitted, a free route included. |
-| `route_invalid` | The call is malformed (the connection is not the route's, a bad run id). |
-| `quota_not_composed` | ADMITTED, with no reservation id and no row: no `Reservations` is installed, so the lane acts as if absent and launch behaves exactly as at the base. Today no route that can spend money launches in the daemon (an API key has no custody yet; a helper or passthrough route is refused before launch); the composition that gives a key its custody is the one that installs this. |
+| `route_invalid` | The call is malformed: the connection is not the route's, the run id is not 1 to 64 of `[A-Za-z0-9_-]`, or the engine, model or connection id is empty. |
+| `quota_not_composed` | No `Reservations` is installed, and the route can spend money. |
 
-What can spend money: an API-key route; a passthrough route; a subscription route the user told to bill its
-apiKeyHelper (`billing_ack: api_key_helper` with `api_key_helper: present`); a subscription that the meters show
-drawing on the plan's own paid fallback (usage credits, overage). A fallback route is admitted on its own, so a
-switch to a paid route at a limit meets the same rules.
+**What can spend money:**
+- an API-key route;
+- a passthrough route;
+- a subscription route the user told to bill its apiKeyHelper (`billing_ack: api_key_helper` with
+  `api_key_helper: present`);
+- a subscription that the meters show drawing on the plan's own paid fallback (usage credits, overage).
 
-One reservation per run: a retried start on the same connection is checked again and reuses the run's held
-reservation; on another connection the earlier hold is released (`superseded`).
+Only the first can be admitted today. A fallback route is admitted on its own, so a switch to a paid route at a
+limit meets the same rules.
+
+**One current reservation per run.** A retried start is checked again.
+- It reuses the run's hold when that still fits: a free hold for a free attempt, or a paid hold no larger than
+  the headroom now left.
+- Otherwise the hold is released (`superseded`) and a new one made, in the same transaction.
+- On another connection the earlier hold is released (`superseded`).
+- A refused retry releases the run's hold (`refused_on_retry`).
+- A raised cap opens new headroom that another run can take.
 
 ## Where it keeps things
 
-`tables.py` declares the lane's tables once through the event store's transaction helper (lane EVENTS'). The
-table `quota_reservation` is append-only: one row per admission (`held` or `refused`) and one per release
-(`released`, with `run_ended`, `superseded` or `refused_on_retry`). Money is decimal text; what admission knew of
-the spend is kept with its quality and provenance, and an unknown spend is null, never 0.
+- `tables.py` declares the lane's tables once through the event store's transaction helper (lane EVENTS').
+- The table `quota_reservation` is append-only: one row per admission (`held` or `refused`), and one per release
+  (`released`, with `run_ended`, `superseded` or `refused_on_retry`).
+- Money is decimal text. What admission knew of the spend is kept with its quality and provenance; an unknown
+  spend is null, never 0.
+- A subscription's typed meter reading is kept on its admission row (`paid_fallback`: `active` or `inactive`).
 
-KEYS' policy is read before the transaction. The spend and the holds are read, and the row written, in one
-transaction. Nothing here calls the registry, the daemon or an engine.
+KEYS' policy is read before the transaction, for API-key routes only. The spend, the holds and the last meter
+reading are read, and the rows written, in one transaction. Nothing here calls the registry, the daemon or an
+engine.
 
 ## Not here yet
 
 - The ledger (slice 2): `spent` and `paid_fallback_active` read from it. Until then every spend is unknown, so
   every route that can spend is refused (`spend_unknown`).
-- The part of the start path that writes `budget {cap_usd}` into the run record (slice 2, `quota/hooks.py`).
+- A consent interface for funding sources other than a stored key (passthrough, helper billing, plan overage).
+- The part of the start path that writes `budget {cap_usd}` into the run record (`quota/hooks.py`).
 - `budget.show` and `route.explain` (slice 3).
 - A sweep that releases the holds of runs that ended while the daemon was down.

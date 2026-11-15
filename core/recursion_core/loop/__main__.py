@@ -38,6 +38,8 @@ from recursion_core.loop.tools.registry import DEFAULT_MAX_BYTES, DEFAULT_MAX_LI
 from recursion_core.loop.tools.workspace import SpillStore, ToolError, Workspace, check_private_dir
 
 TOOLS = (read.TOOL, search.TOOL, write.TOOL, edit.TOOL, shell.TOOL)
+STOP_WAIT_S = 5  # how long the main thread waits for the input thread to end after closed
+INPUT_THREAD = "recursion-loop-stdin"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Keys the loop may find in its environment. Each one present is redacted from everything the loop writes and
 # removed from its environment, whichever provider runs. (OPENAI_API_KEY is LOOP-OAI's provider's.)
@@ -147,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     except (st.StoreError, ToolError) as exc:
         raise SystemExit(f"recursion_loop: {exc}") from None
     out = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False, buffering=1)
-    writer = p.Writer(out, redactor)
+    writer = p.Writer(out, redactor, seal_after="closed")  # nothing follows closed on standard output
     gate = perm.PermissionGate(writer, profile=args.permissions, deadline_s=args.approval_timeout)
     session = Session(provider, registry, workspace, writer, redactor,
                       Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
@@ -160,17 +162,36 @@ def main(argv: list[str] | None = None) -> int:
                  instructions=[f.to_wire() for f in found], engine_session_id=store.session_id,
                  resumed=loaded is not None, unknown_outcomes=list(loaded.repaired) if loaded else [])
 
+    try:
+        return serve_input(engine, sys.stdin.fileno())
+    finally:
+        store.close()
+
+
+def serve_input(engine: Engine, fd: int) -> int:
+    """Run ``engine`` on the lines a thread of its own reads from ``fd``. On POSIX that thread has ended when
+    this returns, so the interpreter never exits with it inside a read (``protocol.InputReader`` says why)."""
+
+    reader = p.InputReader(fd)
+
     def pump() -> None:
         try:
-            p.read_lines(sys.stdin.buffer, engine.feed_line, engine.line_too_long)
+            p.lines_from(reader.read, engine.feed_line, engine.line_too_long)
+        except p.Stopped:
+            pass
         finally:
             engine.input_ended()
 
-    threading.Thread(target=pump, name="recursion-loop-stdin", daemon=True).start()
+    thread = threading.Thread(target=pump, name=INPUT_THREAD, daemon=True)
+    thread.start()
     try:
         return engine.serve()
     finally:
-        store.close()
+        reader.stop()
+        if reader.stoppable:
+            thread.join(STOP_WAIT_S)
+            if not thread.is_alive():
+                reader.close()
 
 
 if __name__ == "__main__":

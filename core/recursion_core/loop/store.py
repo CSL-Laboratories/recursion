@@ -15,12 +15,16 @@ Reading it back gives the conversation as it stood. A tool call whose result nev
 engine stopped while it ran or before it ran) gets a result that says its outcome is unknown and that it is
 to be checked before it is repeated: an effect may have happened, so it is never silently run again
 (vault record 20261028-recursion-frontier-dr-completion-control-02: "unknown triggers reconciliation, not
-replay"). A line cut off by a crash at the very end is ignored; any other damaged line refuses the resume.
+replay"). A line cut off by a crash at the very end is ignored; any other damaged line refuses the resume, and so
+does a record holding what no request could carry (NaN, an infinity, text that is not valid Unicode). Messages
+are journaled as they are added; one the engine joined to the message before it (the roles alternate) is joined
+again here.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import uuid
@@ -39,6 +43,21 @@ UNKNOWN_OUTCOME = ("outcome unknown: the engine stopped while this call was runn
 
 class StoreError(Exception):
     pass
+
+
+class _NotJSON(ValueError):
+    """A number JSON cannot write (NaN, an infinity), which Python's decoder would take."""
+
+
+def _no_constant(name: str):
+    raise _NotJSON(name)
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise _NotJSON(text)
+    return value
 
 
 def new_id() -> str:
@@ -103,7 +122,7 @@ class ConversationStore:
 
     def _write(self, record: dict) -> None:
         fh = self._open()
-        fh.write(json.dumps(self._scrub(record), ensure_ascii=False, separators=(",", ":")) + "\n")
+        fh.write(json.dumps(self._scrub(record), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
         fh.flush()
 
     def message(self, message: b.Message) -> None:
@@ -144,30 +163,21 @@ class ConversationStore:
         pending: dict[str, b.ToolResult] = {}  # results journaled for the last assistant message's calls
         for n, line in enumerate(raw):
             try:
-                rec = json.loads(line)
-            except ValueError:
+                rec = json.loads(line, parse_constant=_no_constant, parse_float=_finite)
+            except json.JSONDecodeError:
                 if n == len(raw) - 1:
                     break  # cut off by a crash while it was being written
                 raise StoreError(f"line {n + 1} of the stored conversation is damaged") from None
-            kind = rec.get("k")
-            if kind == "message":
-                msg = b.Message(rec["role"], tuple(part_from_json(p) for p in rec["parts"]))
-                if msg.role == "user" and any(isinstance(p, b.ToolResult) for p in msg.parts):
-                    pending.clear()
-                out.messages.append(msg)
-            elif kind == "user":
-                out.user_messages.append((rec["turn"], rec["text"]))
-            elif kind == "result":
-                part = part_from_json(rec["part"])
-                pending[part.call_id] = part
-            elif kind == "replace":
-                out.messages = [b.Message(m["role"], tuple(part_from_json(p) for p in m["parts"]))
-                                for m in rec["messages"]]
-                pending.clear()
-            elif kind == "totals":
-                out.totals = rec["state"]
-            else:
-                raise StoreError(f"line {n + 1} has an unknown record {kind!r}")
+            except (ValueError, RecursionError):  # a number JSON cannot write, or nested past the decoder
+                raise StoreError(f"line {n + 1} of the stored conversation holds what JSON cannot write") from None
+            if b.holds_unencodable(rec):
+                raise StoreError(f"line {n + 1} of the stored conversation holds text that is not valid Unicode")
+            try:
+                _read_record(out, pending, rec, n)
+            except StoreError:
+                raise
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise StoreError(f"line {n + 1} of the stored conversation is damaged ({type(exc).__name__})") from None
         last = out.messages[-1] if out.messages else None
         if last is not None and last.role == "assistant":
             calls = [p for p in last.parts if isinstance(p, b.ToolCall)]
@@ -181,3 +191,54 @@ class ConversationStore:
                         out.repaired.append(call.call_id)
                 out.messages.append(b.Message("user", tuple(results)))
         return out
+
+
+def _check_totals(state: Any) -> None:
+    """The shape UsageTotal.to_state writes; anything else is a damaged record (TypeError)."""
+
+    def count(v: Any) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+    if not isinstance(state, dict) or not count(state.get("calls")) or not isinstance(state.get("null_model"), bool):
+        raise TypeError("a totals record holds the totals' shape")
+    models = state.get("models")
+    if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
+        raise TypeError("a totals record names its models as text")
+    for key, ok in (("sum", lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0),
+                    ("known", count), ("exact", lambda v: isinstance(v, bool))):
+        table = state.get(key)
+        if not isinstance(table, dict) or set(table) != set(b.USAGE_FIELDS) or not all(ok(v) for v in table.values()):
+            raise TypeError(f"a totals record's {key} has one value per usage field")
+
+
+def _read_record(out: Loaded, pending: dict[str, b.ToolResult], rec: Any, n: int) -> None:
+    """One journal record into what is being loaded. Raises KeyError, TypeError, ValueError or AttributeError for
+    a record of the wrong shape (the caller makes them a StoreError)."""
+
+    if not isinstance(rec, dict):
+        raise TypeError("a record is an object")
+    kind = rec.get("k")
+    if kind == "message":
+        msg = b.Message(rec["role"], tuple(part_from_json(p) for p in rec["parts"]))
+        if msg.role == "user" and any(isinstance(p, b.ToolResult) for p in msg.parts):
+            pending.clear()
+        if out.messages and out.messages[-1].role == msg.role:
+            msg = b.Message(msg.role, out.messages.pop().parts + msg.parts)  # joined, as the engine joined it
+        out.messages.append(msg)
+    elif kind == "user":
+        if not isinstance(rec["turn"], str) or not isinstance(rec["text"], str):
+            raise TypeError("a user record holds text")
+        out.user_messages.append((rec["turn"], rec["text"]))
+    elif kind == "result":
+        part = part_from_json(rec["part"])
+        if not isinstance(part, b.ToolResult):
+            raise TypeError("a result record holds a tool result")
+        pending[part.call_id] = part
+    elif kind == "replace":
+        out.messages = [b.Message(m["role"], tuple(part_from_json(p) for p in m["parts"])) for m in rec["messages"]]
+        pending.clear()
+    elif kind == "totals":
+        _check_totals(rec["state"])
+        out.totals = rec["state"]
+    else:
+        raise StoreError(f"line {n + 1} has an unknown record {kind!r}")

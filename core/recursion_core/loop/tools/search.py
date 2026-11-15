@@ -14,6 +14,7 @@ returned and kept under the output cap, with a note saying more exist.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -31,6 +32,7 @@ MAX_RESULTS = 1000
 MAX_LINE_CHARS = 500
 MAX_FILE_BYTES = 8 * 1024 * 1024
 DEADLINE_S = 60.0
+WORKER_GRACE_S = 5  # the worker's own alarm rings this long after the deadline
 NOTE_ROOM = 400
 
 SPEC = b.ToolSpec(
@@ -68,6 +70,9 @@ def _child_env() -> dict[str, str]:
 
 
 def run_worker(request: dict, cancel: b.CancelToken, deadline_s: float = DEADLINE_S) -> dict:
+    # The worker also bounds its own life (see search_worker.bound_own_life): this process kills it at the
+    # deadline, but if this process dies first nothing else would.
+    request = dict(request, alarm_s=math.ceil(deadline_s) + WORKER_GRACE_S, parent_pid=os.getpid())
     proc = subprocess.Popen([sys.executable, "-I", str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=_child_env(), cwd=request["root"])
     unregister = cancel.on_cancel(proc.kill)

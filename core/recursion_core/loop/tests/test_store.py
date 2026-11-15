@@ -162,8 +162,10 @@ class Journal(unittest.TestCase):
             "turn-2", "what happened?", b.CancelToken())
         s2.close()
         msgs = st.ConversationStore(home, "rep").load().messages
-        self.assertEqual([m.role for m in msgs], ["user", "assistant", "user", "user", "assistant"])
-        self.assertEqual(msgs[2].parts, (b.ToolResult("toolu_b", st.UNKNOWN_OUTCOME, True),))
+        # The repaired results and the next user message are one user message: the roles alternate (#379).
+        self.assertEqual([m.role for m in msgs], ["user", "assistant", "user", "assistant"])
+        self.assertEqual(msgs[2].parts, (b.ToolResult("toolu_b", st.UNKNOWN_OUTCOME, True),
+                                         b.TextPart("what happened?")))
 
     def test_a_compacted_conversation_is_what_resumes(self) -> None:
         ws = workspace(self, {"a.py": "print(1)\n" * 50})

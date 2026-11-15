@@ -11,10 +11,12 @@ strictly: a vendor that sends something else is a protocol fault, not text to gu
 from __future__ import annotations
 
 import codecs
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 MAX_EVENT_CHARS = 64 * 1024 * 1024  # one event larger than this is refused rather than buffered without end
+_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 class SSEError(Exception):
@@ -32,22 +34,11 @@ def _split_lines(text: str) -> tuple[list[str], str]:
 
     lines: list[str] = []
     start = 0
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "\n":
-            lines.append(text[start:i])
-            i += 1
-            start = i
-        elif ch == "\r":
-            if i + 1 == n:
-                break  # a CR at the very end may be the first half of a CRLF: wait for the next byte
-            lines.append(text[start:i])
-            i += 2 if text[i + 1] == "\n" else 1
-            start = i
-        else:
-            i += 1
+    for found in _BREAK.finditer(text):
+        if found.end() == len(text) and found.group() == "\r":
+            break  # a CR at the very end may be the first half of a CRLF: wait for the next byte
+        lines.append(text[start:found.start()])
+        start = found.end()
     return lines, text[start:]
 
 
@@ -55,7 +46,11 @@ def iter_events(read: Callable[[int], bytes], chunk_size: int = 8192) -> Iterato
     """Yield events from ``read(n)``, which returns b"" at the end of the stream."""
 
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
-    rest = ""
+    # The unfinished line is kept in pieces and never scanned again: each byte is scanned once, so a long line
+    # costs linear time and is refused as soon as it passes the bound.
+    pieces: list[str] = []
+    held = 0
+    held_cr = False  # the last chunk ended in a CR, which may be the first half of a CRLF
     event_type = ""
     data_lines: list[str] = []
     size = 0
@@ -66,11 +61,21 @@ def iter_events(read: Callable[[int], bytes], chunk_size: int = 8192) -> Iterato
             text = decoder.decode(chunk, final=final)
         except UnicodeDecodeError as exc:
             raise SSEError(f"stream is not UTF-8: {exc.reason}") from None
-        lines, rest = _split_lines(rest + text)
-        if final and rest:
-            lines.append(rest.rstrip("\r"))
-            rest = ""
-        if len(rest) > MAX_EVENT_CHARS:
+        if held_cr:
+            text, held_cr = "\r" + text, False
+        lines, tail = _split_lines(text)
+        if lines and pieces:
+            lines[0] = "".join(pieces) + lines[0]
+            pieces, held = [], 0
+        if tail.endswith("\r") and not final:
+            tail, held_cr = tail[:-1], True
+        if tail:
+            pieces.append(tail)
+            held += len(tail)
+        if final and pieces:
+            lines.append("".join(pieces).rstrip("\r"))
+            pieces, held = [], 0
+        if held > MAX_EVENT_CHARS:
             raise SSEError("one line is longer than the reader accepts")
         for line in lines:
             if line == "":

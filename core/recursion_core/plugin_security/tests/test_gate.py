@@ -1040,6 +1040,33 @@ class CommitFenceTests(unittest.TestCase):
                 self.assertFalse(real.in_transaction)
                 self.assertEqual(_charges(w), 1 if raised is Refused else 0)
 
+    def test_a_rollback_that_fails_leaves_no_transaction_for_the_next_charge(self) -> None:
+        # Review 3 of #378 (DeepSeek N2): a ROLLBACK that raised left the connection inside the transaction,
+        # and every later charge failed to begin its own. Now the connection is closed, which discards what
+        # the transaction wrote, and the ledger is opened again.
+        for guard in (None, _SwallowingGuard()):
+            with self.subTest(guard=type(guard).__name__):
+                w = World(self)
+                w.load()
+                env = profile(w.installer, profile_id="prof-new", total=10_000, max_effect=1_000)
+                failing = _FailingInsertAndRollback(w.authority._db)
+                w.authority._db = failing
+                expected = sqlite3.OperationalError
+                with self.assertRaises(expected) as raised:
+                    w.authority.charge(env, **_charge_args(w, "fails"), commit_guard=guard)
+                # Without a guard the rollback's error reaches the caller; a swallowing guard leaves the first.
+                self.assertIn("rollback" if guard is None else "insert", str(raised.exception))
+                self.assertIsNot(w.authority._db, failing)
+                self.assertFalse(w.authority._db.in_transaction)
+                db = sqlite3.connect(w.ledger)
+                try:  # the profile the failed charge wrote inside its transaction was discarded
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0], 0)
+                finally:
+                    db.close()
+                self.assertEqual(_charges(w), 0)
+                self.assertEqual(w.authority.charge(env, **_charge_args(w, "after"))["spent_minor"], 1_000)
+                self.assertEqual(_charges(w), 1)
+
     def test_a_guard_whose_exit_raises_on_a_refusal_reports_its_error_with_the_refusal_as_context(self) -> None:
         # Review 2 of #378 (DeepSeek, section 6): the guard's error takes the refusal's place, with the
         # refusal as its context, and nothing is written. Either way the call is not authorized.
@@ -1053,6 +1080,27 @@ class CommitFenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.__context__.code, "budget_total_exceeded")
         self.assertFalse(w.authority._db.in_transaction)
         self.assertEqual(_charges(w), 1)
+
+
+class _FailingInsertAndRollback:
+    """The ledger's connection, failing the charge's INSERT and then the ROLLBACK, which rolls nothing back."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+    def execute(self, sql, params=()):
+        if sql.startswith("INSERT INTO charges"):
+            raise sqlite3.OperationalError("injected insert failure")
+        if sql == "ROLLBACK":
+            raise sqlite3.OperationalError("injected rollback failure")
+        return self._real.execute(sql, params)
+
+    def close(self) -> None:
+        self._real.close()
 
 
 class _Interrupt(BaseException):
@@ -1273,6 +1321,23 @@ class CommitFencePrimitiveTests(unittest.TestCase):
         self.assertFalse(any(worker.is_alive() for worker in workers))
         self.assertEqual(fence.position(), threads * marks)
         self.assertEqual(unseen, [])
+
+    def test_the_marks_are_read_under_the_marks_lock(self) -> None:
+        # Review 3 of #378 (DeepSeek N1): the writer's lock is pinned by the concurrent marks; this pins the
+        # two readers. While the marks lock is held, neither position() nor trip_changed_since() answers.
+        fence = CommitFence()
+        fence.mark_trip_change("conn-a")
+        for name, read, expected in (("position", fence.position, 1),
+                                     ("trip_changed_since", lambda: fence.trip_changed_since("conn-a", 0), True)):
+            with self.subTest(read=name):
+                done = threading.Event()
+                answer: list = []
+                reader = threading.Thread(target=lambda: (answer.append(read()), done.set()), daemon=True)
+                with fence._marks_lock:
+                    reader.start()
+                    self.assertFalse(done.wait(0.3), name + " answered while the marks lock was held")
+                reader.join(10.0)
+                self.assertEqual(answer, [expected])
 
     def test_a_thread_waiting_to_enter_does_not_take_the_holders_place(self) -> None:
         # Review 2 of #378 (DeepSeek F3): the holder's slot is set only once the fence is taken. Set

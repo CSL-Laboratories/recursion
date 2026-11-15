@@ -4,7 +4,8 @@ One thread reads standard input (``protocol.InputReader``) and queues messages; 
 once, by cancelling the running turn's token, which closes the provider's connection and kills a running search,
 or, for a message read but not started yet, by marking it so that it starts interrupted (no model call). Its
 answer is written under the lock a turn's ``turn_ended`` is written under, with the turn no longer running: one
-answered ``delivered: true`` comes before that turn's end, and one read after the end is ``delivered: false``.
+answered ``delivered: true`` comes before that turn's end, and one read after the end is ``delivered: false``
+(until ``closed``: the process writes nothing after that line, while an Engine driven in-process still answers).
 A turn whose interrupt was delivered ends ``interrupted``, keeping the result and reason it would have had (a
 limit's line is still written, a failure's code stays in the result), unless the model had already finished it
 (``candidate_done``) or the loop failed (``loop_error``).
@@ -20,8 +21,11 @@ The main thread takes one message at a time: it writes ``input_accepted`` for it
 How a turn ends (``turn_ended``; outcomes are session.v1's):
     the model finished                      candidate_done (the harness's acceptance step, which can make it
                                             done, comes with the second pull request; the model never says done)
-    interrupted                             interrupted, result null
-    a typed limit                           paused, after a ``limit`` line
+    interrupted                             interrupted, with the result and reason the turn would otherwise
+                                            have had (a failure's code, a limit's detail); result null and
+                                            reason ``interrupted`` when the interrupt itself ended it
+    a typed limit                           paused, after a ``limit`` line (its retry_after_s null when the
+                                            provider's is not a finite number of seconds)
     the reply hit the output limit          paused
     the step budget ran out                 paused (budget exhaustion is never done)
     a refusal, a provider failure, a full   failed, with the code
@@ -38,10 +42,10 @@ before they join the conversation, and so are the model's text (all its text par
 split across two of them is caught) and tool inputs before the reply is kept. A vendor block that holds one (a
 signed thinking block) or a tool call whose id or name holds one cannot be changed without breaking it, so the
 reply is refused and the turn fails with ``provider_protocol``; so is a reply holding a part of a kind a reply
-cannot carry (a tool result), two tool calls of one id, or one nested deeper than the loop can walk. A tool
-input holding NaN or an infinity, or nested more than
-``MAX_INPUT_DEPTH`` levels deep is kept as input that did not parse, its raw text dropped: the call gets an
-error result.
+cannot carry (a tool result), two tool calls of one id, text UTF-8 cannot encode (a lone surrogate: no line
+could carry it and no request send it), or one nested deeper than the loop can walk. A tool input holding NaN,
+an infinity or an integer too long for Python, or nested more than ``MAX_INPUT_DEPTH`` levels deep, is kept as
+input that did not parse, its raw text dropped: the call gets an error result.
 
 However a turn ends, a loop error included, the conversation is left valid (``settle``): every tool call of
 the last reply has a result (its own when it ran, a "not run" one when it did not) and a reply follows the
@@ -51,6 +55,7 @@ user's side.
 from __future__ import annotations
 
 import json
+import math
 import queue
 import sys
 import threading
@@ -90,6 +95,29 @@ class _NotKept(Exception):
 
 def _now(write: Callable[[], None]) -> None:
     write()
+
+
+def _writable(value: object) -> bool:
+    """Whether ``value`` can be written as JSON: no NaN, no infinity, no integer too long for Python to write,
+    nothing JSON has no form for."""
+
+    try:
+        json.dumps(value, allow_nan=False)
+    except (ValueError, TypeError, RecursionError):
+        return False
+    return True
+
+
+def _texts(part: b.Part) -> object:
+    """Every text a reply's part carries, for the Unicode check."""
+
+    if isinstance(part, b.TextPart):
+        return part.text
+    if isinstance(part, b.ToolCall):
+        return [part.call_id, part.name, part.raw_input, part.input_error, part.input]
+    if isinstance(part, b.OpaquePart):
+        return [part.vendor, part.data]
+    return None
 
 
 SYSTEM_PROMPT = (
@@ -156,8 +184,14 @@ class Session:
                 return self._end(turn_id, "interrupted", None, "interrupted")
             except b.LimitError as exc:
                 self._usage(turn_id, exc.usage, exc.served_model)
+                # A value JSON cannot write (NaN, an infinity) or that is not what the field holds would make the
+                # line unwritable: the line says the time is unknown instead, and the turn still pauses.
+                retry = exc.retry_after_s
+                if isinstance(retry, bool) or not isinstance(retry, (int, float)) or not math.isfinite(retry):
+                    retry = None
+                reset_at = exc.reset_at if isinstance(exc.reset_at, str) else None
                 self.writer.write("limit", turn_id=turn_id, scope="connection", kind="plan_limit", model=None,
-                                  bucket=None, reset_at=exc.reset_at, retry_after_s=exc.retry_after_s)
+                                  bucket=None, reset_at=reset_at, retry_after_s=retry)
                 return self._end(turn_id, "paused", self._result(None, exc.detail), "limit")
             except b.ProviderError as exc:
                 self._usage(turn_id, exc.usage, exc.served_model)
@@ -246,6 +280,9 @@ class Session:
         for part in parts:
             if not isinstance(part, (b.TextPart, b.ToolCall, b.OpaquePart)):
                 raise _NotKept(f"the reply holds a {type(part).__name__} part, which a reply cannot carry")
+            if b.holds_unencodable(_texts(part)):
+                # A lone surrogate: no line could carry it and no request send it, and it cannot be changed.
+                raise _NotKept("the reply holds text that is not valid Unicode (a lone surrogate)")
             if isinstance(part, b.ToolCall) and (self.redactor.holds(part.call_id) or self.redactor.holds(part.name)):
                 raise _NotKept(SECRET_INSIDE)  # an id pairs the call with its result, a name picks the tool
             if isinstance(part, b.ToolCall):
@@ -260,9 +297,9 @@ class Session:
                 # Kept as input that did not parse too, its raw text dropped: no tool takes one so deep, and
                 # scrubbing, checking or writing it could reach Python's recursion limit.
                 part = b.ToolCall(part.call_id, part.name, None, "", b.INPUT_TOO_DEEP)
-            elif isinstance(part, b.ToolCall) and b.holds_nonfinite(part.input):
-                # JSON cannot write NaN or an infinity, so the tool_call line could not be JSON: kept as input that
-                # did not parse, its raw text dropped.
+            elif isinstance(part, b.ToolCall) and not _writable(part.input):
+                # JSON cannot write NaN or an infinity (nor Python an integer too long), so the tool_call line
+                # could not be written: kept as input that did not parse, its raw text dropped.
                 part = b.ToolCall(part.call_id, part.name, None, "", b.INPUT_NOT_FINITE)
             elif isinstance(part, b.ToolCall):
                 clean = self.redactor.scrub_obj(dict(part.input)) if part.input is not None else None
@@ -270,6 +307,10 @@ class Session:
                 if clean is not None and clean != dict(part.input):
                     raw = json.dumps(clean, ensure_ascii=False)  # a secret spelt with JSON escapes
                 part = b.ToolCall(part.call_id, part.name, clean, raw, part.input_error)
+            elif isinstance(part, b.OpaquePart) and not _writable(part.data):
+                # Sent back unchanged in the next request, which could then not be written.
+                raise _NotKept("a vendor block holds a value JSON cannot write (NaN, an infinity, or an integer too "
+                               "long for Python)")
             elif isinstance(part, b.OpaquePart) and self.redactor.holds(part.data):
                 raise _NotKept(SECRET_INSIDE)
             kept.append(part)

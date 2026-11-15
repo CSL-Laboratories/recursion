@@ -34,11 +34,15 @@ parts as one text (a key split across two text blocks is found in their join), t
 (a fragment that could be the start of the key is held back until the next fragment, in this block or the next
 text block, or the end of the message). A thinking or other vendor block that holds it is refused
 (``ProtocolError``), since changing it would break its signature, and so is a tool call whose id or name holds
-it. A stream nested deeper than this client reads, NaN or an infinity anywhere in it (JSON has neither), a block
-whose type or text is not text, two tool calls of one id, and a reply longer than ``MAX_REPLY_CHARS`` (what its
-blocks start with counted as well as their deltas) are refused with ``ProtocolError`` too; a tool input nested
-more than ``MAX_INPUT_DEPTH`` levels deep is kept as input that did not parse, its raw text dropped, and so is
-a block-start input that is not an object.
+it. A stream nested deeper than this client reads, NaN or an infinity anywhere in it (JSON has neither; a
+number too large for a float, such as ``1e400``, is one too), a block whose type or text is not text, two tool
+calls of one id, and a reply longer than ``MAX_REPLY_CHARS`` are refused with ``ProtocolError`` too. The bound
+counts what the blocks start with as well as their deltas: every value a kept block carries (a vendor block's
+type, id and name included) and every field name of the vendor's own, except the type of the four block kinds
+this client reads and a tool call's id and name, which are checked against their own bounds before the block
+is kept. A tool input nested more than ``MAX_INPUT_DEPTH`` levels deep, one holding NaN, an infinity or an
+integer too long for Python (``INPUT_NOT_FINITE``), and a block-start input that is not an object (``null``
+included) are kept as input that did not parse, their raw text dropped: it was never decoded and scrubbed.
 
 A call that fails or is interrupted after the stream began still reports what it measured: the exception's
 ``usage`` holds the counts the stream had given (an output count is a lower bound until ``message_stop``) and
@@ -52,6 +56,7 @@ import email.utils
 import http.client
 import ipaddress
 import json
+import math
 import socket
 import ssl
 import time
@@ -124,10 +129,31 @@ def _default_connection(scheme: str, host: str, port: int, timeout: float) -> ht
     return http.client.HTTPConnection(host, port, timeout=timeout)
 
 
+class _NotFinite(ValueError):
+    """A number JSON cannot write: NaN, an infinity, or a number too large for a float (``1e400``)."""
+
+
 def _no_constant(name: str) -> Any:
     """For json.loads: NaN, Infinity and -Infinity are not JSON, though Python's decoder takes them."""
 
-    raise ValueError(f"{name} is not a JSON number")
+    raise _NotFinite(f"{name} is not a JSON number")
+
+
+def _finite_float(text: str) -> float:
+    """For json.loads: a number too large for a float (``1e400``) would be read as an infinity, which JSON cannot
+    write back; it is refused as the constants are."""
+
+    value = float(text)
+    if not math.isfinite(value):
+        raise _NotFinite("a number too large for a float")
+    return value
+
+
+def _loads(text: str) -> Any:
+    """The vendor's JSON, strictly: no NaN and no infinity, whether written as a constant or as a number too large
+    for a float. Raises ValueError (``_NotFinite`` for those numbers) or RecursionError."""
+
+    return json.loads(text, parse_constant=_no_constant, parse_float=_finite_float)
 
 
 def _timestamp(epoch: float) -> str | None:
@@ -370,7 +396,7 @@ class AnthropicProvider:
             raw = b""
         vendor_type, message = None, ""
         try:
-            doc = json.loads(raw.decode("utf-8"), parse_constant=_no_constant)
+            doc = _loads(raw.decode("utf-8"))
             err = doc.get("error") if isinstance(doc, dict) else None
             if isinstance(err, dict):
                 vendor_type = err.get("type") if isinstance(err.get("type"), str) else None
@@ -417,7 +443,7 @@ class AnthropicProvider:
                 for event in iter_events(read):
                     cancel.raise_if_cancelled()
                     try:
-                        data = json.loads(event.data, parse_constant=_no_constant)
+                        data = _loads(event.data)
                     except ValueError:
                         raise b.ProtocolError(f"event {event.event!r} is not JSON", request_id=request_id) from None
                     if not isinstance(data, dict):
@@ -444,6 +470,12 @@ class AnthropicProvider:
             # once the model is attached.
             self._scrub_failure(exc)
             raise
+
+
+# The block kinds this client reads (their type is not counted toward a reply's bound) and the documented field
+# names of content blocks (bounded in length, so not counted either; any other field name is).
+_READ_KINDS = ("text", "thinking", "redacted_thinking", "tool_use")
+_FIELD_NAMES = ("type", "id", "name", "text", "input", "thinking", "signature", "data")
 
 
 class _StreamState:
@@ -561,16 +593,26 @@ class _StreamState:
             raise self._protocol(f"the reply is longer than {MAX_REPLY_CHARS} characters")
 
     def _grow_start(self, block: dict) -> None:
-        """What a block starts with (its text, thinking, signature, opaque data or tool input) counts toward the
-        reply's bound as its deltas do; its type, id and name are bounded on their own."""
+        """Everything a block starts with counts toward the reply's bound as its deltas do, before the block is
+        kept: every value it carries (a vendor block is sent back with all of them, its type, id and name
+        included) and every field name of the vendor's own. Left out are the documented field names
+        (``_FIELD_NAMES``, nine characters at most), the type of the four block kinds this client reads, and a
+        tool call's id and name, which are checked against their own bounds here first."""
 
+        btype = block.get("type")
+        read_kind = isinstance(btype, str) and btype in _READ_KINDS
+        if btype == "tool_use":
+            problem = b.call_id_problem(block.get("id"), block.get("name"))
+            if problem:
+                raise self._protocol(f"tool_use block: {problem}")
         for key, value in block.items():
-            if key in ("type", "id", "name"):
+            if key not in _FIELD_NAMES:
+                self._grow(key)  # a field name of the vendor's own, sent back with the block
+            if key == "type" and read_kind:
                 continue
-            if isinstance(value, str):
-                self._grow(value)
-            elif isinstance(value, (dict, list)):
-                self._grow(json.dumps(value, ensure_ascii=False))
+            if btype == "tool_use" and key in ("id", "name"):
+                continue
+            self._grow(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
 
     def _finish_block(self, entry: dict, provider: AnthropicProvider) -> b.Part:
         block = entry["block"]
@@ -585,25 +627,28 @@ class _StreamState:
             return b.TextPart((block.get("text") or "") + "".join(entry["text"]))  # scrubbed with the whole reply
         if btype == "tool_use":
             call_id, name = block.get("id"), block.get("name")
-            problem = b.call_id_problem(call_id, name)
-            if problem:
-                raise self._protocol(f"tool_use block: {problem}")
+            # Its id and name were checked when the block started (_grow_start), before it was kept.
             if provider._key in call_id or provider._key in name:
                 # An id pairs the call with its result and a name picks the tool: neither can be scrubbed.
                 raise self._protocol("a tool_use block's id or name holds the connection's key; it is not kept")
             raw = provider._scrub("".join(entry["json"]))
             if not raw.strip():
-                start = block.get("input")
-                if start is not None and not isinstance(start, dict):
+                if "input" in block and not isinstance(block["input"], dict):
+                    # An input the vendor sent that is not an object, null included: not an empty argument list.
                     return b.ToolCall(call_id, name, None, "", "input is not a JSON object")
-                if isinstance(start, dict) and b.nests_deeper(start, b.MAX_INPUT_DEPTH):
+                start = block.get("input", {})
+                if b.nests_deeper(start, b.MAX_INPUT_DEPTH):
                     return b.ToolCall(call_id, name, None, "", b.INPUT_TOO_DEEP)
-                return b.ToolCall(call_id, name, provider._scrub_obj(dict(start)) if isinstance(start, dict) else {},
-                                  raw)
+                return b.ToolCall(call_id, name, provider._scrub_obj(dict(start)), raw)
             try:
-                parsed = json.loads(raw, parse_constant=_no_constant)
-            except ValueError as exc:
-                return b.ToolCall(call_id, name, None, raw, f"input is not valid JSON: {getattr(exc, 'msg', exc)}")
+                parsed = _loads(raw)
+            except json.JSONDecodeError as exc:
+                return b.ToolCall(call_id, name, None, raw, f"input is not valid JSON: {exc.msg}")
+            except ValueError:
+                # Not its syntax but a number: NaN, an infinity, or an integer too long for Python (the decoder's
+                # only other refusals). Refused before its strings were decoded and scrubbed, so the raw text could
+                # still spell the key with JSON escapes: dropped, and the reason is the one the engine gives.
+                return b.ToolCall(call_id, name, None, "", b.INPUT_NOT_FINITE)
             except RecursionError:  # nested deeper than the decoder goes
                 return b.ToolCall(call_id, name, None, "", b.INPUT_TOO_DEEP)
             # Raw text that was never decoded and scrubbed could spell the key with JSON escapes: dropped.

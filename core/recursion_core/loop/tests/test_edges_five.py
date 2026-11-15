@@ -197,7 +197,7 @@ class NonFiniteNumbers(unittest.TestCase):
     def test_the_client_never_takes_a_number_json_does_not_have(self) -> None:
         call = _read(_wire(_start(), *_tool_block(0, "toolu_1", '{"path": "a.txt", "limit": NaN}'),
                            *_stop("tool_use"))).tool_calls[0]
-        self.assertEqual((call.input, call.input_error), (None, "input is not valid JSON: NaN is not a JSON number"))
+        self.assertEqual((call.input, call.raw_input, call.input_error), (None, "", b.INPUT_NOT_FINITE))
         with self.assertRaises(b.ProtocolError):
             _read(_wire(_start(), '{"type": "ping", "x": Infinity}', *_stop()))
 

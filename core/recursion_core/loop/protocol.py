@@ -196,6 +196,8 @@ class Writer:
     """Writes one JSON object per line, whole, under a lock (the input thread writes too)."""
 
     def __init__(self, stream: IO[str], redactor: Redactor, *, seal_after: str | None = None) -> None:
+        if seal_after is not None and (not isinstance(seal_after, str) or not seal_after):
+            raise ValueError("seal_after is a line type (text) or None")
         self._stream = stream
         self._redactor = redactor
         self._lock = threading.Lock()
@@ -204,6 +206,8 @@ class Writer:
 
     def write(self, line_type: str, /, **fields: Any) -> None:
         # Positional-only: a line may carry a field called "kind" (limit lines do).
+        if not isinstance(line_type, str) or not line_type:
+            raise ValueError("a line's type is text")
         doc = {"type": line_type}
         doc.update(fields)
         # Every string (keys included) is scrubbed before serialising, so a secret holding a character JSON

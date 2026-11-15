@@ -46,7 +46,7 @@ Standard input is read on its own descriptor, never through `sys.stdin`: after `
 | `providers/fake.py` | A scripted provider |
 | `providers/sse.py` | The event-stream reader the providers share |
 | `tools/registry.py` | Input checks and the one output cap, with spill, that every tool passes through |
-| `tools/read.py`, `tools/search.py` | Reading files and folders; searching contents (in a child process). A tool runs only through `ToolRegistry.dispatch`, which checks its input first; its `run` called directly assumes checked input |
+| `tools/read.py`, `tools/search.py` | Reading files and folders; searching contents (in a child process). A tool runs only through `ToolRegistry.dispatch`, which checks its input, the approval rule and cancellation, scrubs and caps its output; the registry hands out a tool's spec, never its `run`, and a `run` called directly skips all of that |
 | `tools/workspace.py` | Path confinement, the spill store, and the record of what was read |
 | `engine.py`, `protocol.py` | The turn loop, and the input and output lines |
 

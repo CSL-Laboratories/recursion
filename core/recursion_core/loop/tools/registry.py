@@ -1,15 +1,17 @@
 """The tool registry and the one output cap every tool's result passes through.
 
 Each tool is one immutable entry: its name, description and input schema (sent to the model as they are), the
-function that runs it, and whether it must ask the approval queue first (write, edit and shell will; read and
-search do not). ``dispatch`` is the only way a tool runs:
+function that runs it, and whether it must ask the approval queue first (``True`` or ``False`` and nothing else:
+write, edit and shell will; read and search do not). ``dispatch`` is the only way a tool runs, and the registry
+never hands a tool's ``run`` out (``get`` gives its spec); a ``run`` called directly skips every rule below:
 
 1. the call's input must have arrived as a JSON object and must match the tool's schema (a small, strict subset
    of JSON Schema: object, string, integer, number, boolean, array, enum, required, additionalProperties false,
    minimum and maximum, minLength and maxLength); otherwise the tool does not run and the model gets an error;
 2. the tool runs with the turn's cancel token; an exception becomes an error result naming its type, and so
    does anything else that goes wrong with one call (input that is not an object, a tool that returns
-   something other than text, a library's ``sys.exit``): one bad call costs one error result, never the turn.
+   something other than text, a library's ``sys.exit``, something passed in that is not a tool call): one bad
+   call costs one error result, never the turn.
    ``KeyboardInterrupt`` is the one exception let through: it is how the process itself is interrupted
    (SIGINT), which stops the loop, not one call;
 3. every secret the loop knows is removed from the output;
@@ -79,6 +81,11 @@ class Tool:
     spec: b.ToolSpec
     run: ToolFn
     needs_approval: bool = False
+
+    def __post_init__(self) -> None:
+        # The approval rule reads this flag: 0, "" or None must not quietly mean "runs without approval".
+        if not isinstance(self.needs_approval, bool):
+            raise ValueError("needs_approval is True or False")
 
 
 @dataclass(frozen=True)
@@ -242,6 +249,8 @@ class ToolRegistry:
             raise ValueError("the output cap is too small to hold a head, a tail and the marker")
         self._tools: dict[str, Tool] = {}
         for tool in tools:
+            if not isinstance(tool, Tool):
+                raise ValueError("a registry holds Tool entries only")
             name = tool.spec.name
             if not isinstance(name, str) or not _NAME.fullmatch(name):
                 raise ValueError(f"tool name {name!r}")
@@ -259,10 +268,20 @@ class ToolRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._tools))
 
-    def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
+    def get(self, name: str) -> b.ToolSpec | None:
+        """The spec of the tool of that name, or None. The tool itself is never handed out: its ``run`` called
+        directly would skip the input check, the approval rule, the cancel check, the scrubbing and the cap."""
+
+        tool = self._tools.get(name) if isinstance(name, str) else None
+        return tool.spec if tool is not None else None
 
     def dispatch(self, call: b.ToolCall, ctx: ToolContext) -> Outcome:
+        if not isinstance(call, b.ToolCall):
+            # Only a tool call runs a tool: anything else gets an error result, never an exception.
+            ids = [getattr(call, field, "") for field in ("call_id", "name")]
+            call_id, name = (value if isinstance(value, str) else "" for value in ids)
+            text = f"the call could not be run (a {type(call).__name__} is not a tool call)"
+            return Outcome(call_id, name, ERROR, text, False, None, len(text))
         try:
             return self._dispatch(call, ctx)
         except KeyboardInterrupt:

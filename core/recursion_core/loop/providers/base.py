@@ -28,8 +28,11 @@ values with ``ValueError``. A tool input nested more than ``MAX_INPUT_DEPTH`` ob
 input that did not parse (``input_error`` is ``INPUT_TOO_DEEP``) and its raw text is dropped: no tool takes one,
 walking it could reach Python's recursion limit wherever the loop scrubs, checks or writes it, and text that was
 never decoded and scrubbed could still spell a secret with JSON escapes. So is an input holding NaN or an
-infinity (``INPUT_NOT_FINITE``): Python's decoder takes them, but JSON cannot write them. Text parts and tool
-results hold text; the dataclasses refuse anything else.
+infinity (``INPUT_NOT_FINITE``), which Python's decoder takes but JSON cannot write, or an integer too long for
+Python to write. Text parts and tool results hold text; the dataclasses refuse anything else. Text UTF-8
+cannot encode (a lone surrogate, which a
+``\\ud800`` escape gives Python's decoder) can be neither written on a line nor sent in a request:
+``holds_unencodable`` finds it, and the loop refuses a reply that holds it.
 """
 
 from __future__ import annotations
@@ -137,7 +140,7 @@ MAX_CALL_ID = 128
 MAX_TOOL_NAME = 256
 MAX_INPUT_DEPTH = 64
 INPUT_TOO_DEEP = f"input is nested more than {MAX_INPUT_DEPTH} levels deep"
-INPUT_NOT_FINITE = "input holds a number JSON cannot write (NaN or an infinity)"
+INPUT_NOT_FINITE = "input holds a number JSON cannot write (NaN, an infinity, or an integer too long for Python)"
 REFUSED_INPUT = (INPUT_TOO_DEEP, INPUT_NOT_FINITE)  # input errors whose raw text is dropped and whose reason is shown
 
 
@@ -176,6 +179,26 @@ def holds_nonfinite(value: Any) -> bool:
     return False
 
 
+def holds_unencodable(value: Any) -> bool:
+    """Whether ``value`` holds text UTF-8 cannot encode (a lone surrogate), in a string or an object's key. Walked
+    without recursion."""
+
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return True
+        elif isinstance(item, Mapping):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return False
+
+
 def call_id_problem(call_id: object, name: object) -> str | None:
     """What is wrong with a vendor's call id and tool name for the wire (event.v1), or None."""
 
@@ -188,8 +211,9 @@ def call_id_problem(call_id: object, name: object) -> str | None:
 
 @dataclass(frozen=True)
 class ToolCall:
-    """The model asked for a tool. ``input`` is the parsed object, or None when the text the vendor sent was
-    not a JSON object (then ``input_error`` says why and ``raw_input`` keeps what was received)."""
+    """The model asked for a tool. ``input`` is the parsed object, or None when what the vendor sent was not a
+    JSON object, ``null`` included (then ``input_error`` says why, and ``raw_input`` keeps what was received,
+    except where it was refused before it could be decoded and scrubbed: then it is empty)."""
 
     call_id: str
     name: str

@@ -822,6 +822,25 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual((caught.exception.registrant, str(caught.exception)),
                          ('recursion_core.events.hooks', "hook 'authorize' already has a registrant"))
 
+    def test_an_error_that_takes_no_attribute_leaves_composition_as_the_lane_raised_it(self) -> None:
+        """A lane's own error class may refuse an attribute. Composition then raises the lane's error as it was
+        raised, the same object, and no registrant is told beside it: the name is an aid to the CLI's line and
+        never worth another exception in the error's place. (An eighth read: the note itself had raised.)"""
+        package = self.fake.lane('keys', hooks=(
+            'from recursion_core.control import hooks as H\n\n\n'
+            'class Locked(H.HookError):\n'
+            '    def __setattr__(self, key, value):\n'
+            '        if not key.startswith("__"):       # (what Python and unittest themselves set on an error stays settable)\n'
+            '            raise RuntimeError("this error takes no attribute")\n'
+            '        super().__setattr__(key, value)\n\n\n'
+            'REFUSAL = Locked("the refusal of the lane itself")\n\n\n'
+            'def register(hooks):\n'
+            '    raise REFUSAL\n'))
+        with self.assertRaises(H.HookError) as caught:
+            H.compose()
+        self.assertIs(caught.exception, sys.modules[f'{package}.hooks'].REFUSAL)
+        self.assertEqual((str(caught.exception), caught.exception.registrant), ('the refusal of the lane itself', None))
+
     def test_what_fails_after_the_last_registrant_names_no_registrant(self) -> None:
         """The check that is made when the tables close is no one registrant's, and neither is an error that no
         composition raised: each names none. (The CLI's line then says only that the registrants could not be
@@ -1513,7 +1532,7 @@ class CommandTableTest(unittest.TestCase):
                 with self.assertRaises(commands.CommandTableError):
                     table.register((name,), lambda sub: None, lambda args, client: 0)
         table.register(('session',), lambda sub: sub.add_parser('session'), lambda args, client: 0)
-        for names in (('session',), ('queue', 'session'), ('a', 'a'), (), 'session', ('',)):
+        for names in (('session',), ('queue', 'session'), ('a', 'a'), (), 'session', ('',), (' ',), ('\n',), ('queue', ' ')):
             with self.subTest(names=names):
                 with self.assertRaises(commands.CommandTableError):
                     table.register(names, lambda sub: None, lambda args, client: 0)
@@ -4869,7 +4888,8 @@ class CliSeamTest(unittest.TestCase):
             for lane, text in lanes.items():
                 fake.lane(lane, hooks=text)
             note = f"{what} (hooks:HookError): registered commands are missing, these are only the CLI's own\n"
-            for argv in ([], ['--help'], ['-h'], ['--no-such-option']):
+            # (An eighth read: an empty word and a blank one name no command either, and no family can register one.)
+            for argv in ([], [''], [' '], ['\n'], ['--help'], ['-h'], ['--no-such-option']):
                 with self.subTest(lanes=sorted(lanes), argv=argv):
                     answers = []
                     for composed in (False, True):  # the CLI with no table; then the same argv, composed

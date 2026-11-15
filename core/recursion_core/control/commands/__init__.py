@@ -34,7 +34,9 @@ Only a registered name is dispatched. A name nobody registered is rejected by ar
 as today; it is never treated as a start. (That is so when the registrants compose. When one is installed
 and broken, the CLI cannot tell a mistyped name from that lane's command: any name that is not one of its
 own five is answered ``control_api_unavailable``, while its own help and its own usage error for an argv
-that names no command stay what they are, after a line on stderr that names the broken registrant.)
+that names no command stay what they are, after a line on stderr that names the broken registrant. An
+argv names no command when it has no first word, or an empty or blank one, or one that begins an option;
+no family can register an empty or a blank name.)
 
 Registration happens once, when the hooks are composed, before any command is parsed; ``freeze()`` then
 closes the table. Two families that claim one name, or a family that claims one of the CLI's five,
@@ -77,7 +79,7 @@ class CommandTable:
     def register(self, names, parser: Callable, dispatch: Callable) -> None:
         if self._frozen:
             raise CommandTableError('the command table is closed; register at composition')
-        if isinstance(names, str) or not names or not all(isinstance(name, str) and name for name in names):
+        if isinstance(names, str) or not names or not all(isinstance(name, str) and name.strip() for name in names):
             raise CommandTableError('a command family names its commands: a tuple of one or more names')
         names = tuple(names)
         if len(set(names)) != len(names):

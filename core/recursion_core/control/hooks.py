@@ -211,7 +211,9 @@ class HookError(Exception):
     """Composition cannot go on: a registrant failed, or two of them claim one thing. The daemon does not start.
 
     ``registrant`` is the registrant module ``compose()`` stopped at, when it stopped at one. The error's text is
-    the failure's own, and names that module only where composition wrote the text itself."""
+    the failure's own, and names that module only where composition wrote the text itself. The name is an aid
+    to whoever reports the failure and no more: an error object that takes no attribute carries none, and
+    leaves composition as it was raised."""
 
     registrant: str | None = None
 
@@ -1454,7 +1456,10 @@ def compose() -> Hooks:
                 continue        # the lane is not installed, or its package has no such module
             module.register(hooks)
         except HookError as exc:
-            exc.registrant = name       # its text stays its own; the registrant composition stopped at goes beside it
+            try:
+                exc.registrant = name   # its text stays its own; the registrant composition stopped at goes beside it
+            except Exception:           # noqa: BLE001 - an error that takes no attribute leaves as it was raised
+                pass
             raise
         except Exception as exc:
             failed = HookError(f'registrant {name}: {type(exc).__name__}: {exc}')

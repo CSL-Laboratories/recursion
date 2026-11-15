@@ -232,7 +232,7 @@ class PageCheckTest(unittest.TestCase):  # Sol R2; DeepSeek H1, L1, L2
         self.assertIn("goes on from seq 7 with epoch 1", app.notice)
         app.command(f"transcript {SID}")
         self.assertEqual(shown(app)[-1], "after")
-        self.assertEqual(reads(daemon)[-1]["cursor"], {"epoch": 1, "session_id": SID, "seq": 7})
+        self.assertEqual(reads(daemon)[-1]["cursor"], {"epoch": 1, "session_id": SID, "seq": 6}, "checks seq 7")
 
 
 class SpineAgreesTest(unittest.TestCase):  # Sol R2: the reader's check is rule (7) as SPINE states it

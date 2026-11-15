@@ -20,12 +20,12 @@ class ShorterLogTest(unittest.TestCase):  # F1
     def test_a_log_shorter_than_what_was_shown_is_read_again_from_its_start(self) -> None:
         app, daemon = new_app()
         app.command(f"transcript {SID}")
-        self.assertEqual(app.transcripts[SID].printed, daemon.high_water)
+        self.assertEqual(app.transcripts[SID].last_seq, daemon.high_water)
         daemon.lines.clear()  # a restart whose log did not persist
         daemon.restart()
-        app.command(f"transcript {SID}")  # cursor_ahead for the last line shown itself
-        self.assertIn("the next read goes on from the start of its log", app.notice)
-        self.assertEqual(app.transcripts[SID].cursor, s.first_cursor(SID))
+        app.command(f"transcript {SID}")  # cursor_ahead for the line before the last line shown
+        self.assertTrue(shown(app)[-1].startswith("-- view rebuilt: the daemon has no position seq 6"))
+        self.assertEqual(app.transcripts[SID].cursor, {**s.first_cursor(SID), "epoch": 2})
         daemon.append("engine.output", "after the restart\n")
         app.command(f"transcript {SID}")
         self.assertEqual(shown(app)[-1], "after the restart")
@@ -106,7 +106,7 @@ class GapShownOnceTest(unittest.TestCase):  # F3
 class SentencesTest(unittest.TestCase):  # F4
     def test_the_sentences_say_what_the_code_does(self) -> None:
         doc = " ".join(s.__doc__.split())
-        self.assertIn("or to the start of the log when that line was the position refused", doc)
+        self.assertIn("sends the next read back to the start", doc)
         self.assertIn("A replay.gap line already shown is not shown again", doc)
 
 

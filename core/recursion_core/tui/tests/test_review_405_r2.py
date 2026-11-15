@@ -47,10 +47,10 @@ class GapPastTheLogTest(unittest.TestCase):  # M1
         self.assertEqual(app.transcripts[SID].cursor["seq"], far)
         daemon.change = lambda answer: answer
         daemon.append("engine.output", "after\n")
-        app.command(f"transcript {SID}")  # the daemon refuses the position: cursor_ahead
-        self.assertIn(f"has no position seq {far}; the next read goes on from seq 1", app.notice)
-        app.command(f"transcript {SID}")
+        app.command(f"transcript {SID}")  # asks from before the last line shown, never from the gap's end
         self.assertEqual(shown(app)[-1], "after")
+        self.assertEqual(len(shown(app)), len(set(shown(app))), "nothing twice")
+        self.assertNotIn("has no position", app.notice)
 
 
 class AnyAnswerTest(unittest.TestCase):  # L1

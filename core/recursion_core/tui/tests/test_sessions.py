@@ -160,7 +160,8 @@ class TranscriptTest(unittest.TestCase):
         app, _ = new_app(daemon)
         app.command(f"transcript {SID}")
         reads = [p for m, p in daemon.calls if m == "events.read"]
-        self.assertEqual([p["cursor"]["seq"] for p in reads], [0, 200, 400])
+        # after the first page each read asks from the line before the last line shown, to check it (review 5)
+        self.assertEqual([p["cursor"]["seq"] for p in reads], [0, 199, 399])
         self.assertEqual(len(shown(app)), daemon.high_water)
         self.assertEqual(shown(app)[-1], "line 449")
         self.assertEqual(app.transcripts[SID].cursor["seq"], daemon.high_water)
@@ -191,7 +192,7 @@ class TranscriptTest(unittest.TestCase):
         line = daemon.append("engine.output", "one more\n")
         daemon.calls.clear()
         app.command(f"transcript {SID}")
-        self.assertEqual(daemon.calls[0][1]["cursor"]["seq"], line["seq"] - 1)
+        self.assertEqual(daemon.calls[0][1]["cursor"]["seq"], line["seq"] - 2, "from the line before the last shown")
         self.assertEqual(shown(app)[before:], ["one more"])
 
     def test_after_a_restart_the_read_goes_on_from_the_cursor_and_says_so(self) -> None:
@@ -273,7 +274,9 @@ class TranscriptStateTest(unittest.TestCase):
         self.assertEqual(t.cursor["seq"], 2, "never back")
         t.apply({"lines": [], "cursor": {"epoch": 1, "session_id": "other", "seq": 9}})
         self.assertEqual(t.cursor["seq"], 2, "another session's cursor is not this one's")
-        t.apply({"lines": [{"seq": 5, "text": "c"}], "cursor": {"epoch": 2, "session_id": SID, "seq": 7}})
+        # an answer goes on from the last line shown, which comes again first (review 5 of #405)
+        t.apply({"lines": [{"seq": 2, "text": "b"}, {"seq": 5, "text": "c"}],
+                 "cursor": {"epoch": 2, "session_id": SID, "seq": 7}})
         self.assertEqual(t.cursor, {"epoch": 2, "session_id": SID, "seq": 7})
         self.assertEqual(t.apply({"lines": [{"seq": "8"}, None, {"seq": True}]}), [], "only an int seq is a line")
 

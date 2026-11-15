@@ -16,15 +16,16 @@ from recursion_core.tui.tests.test_sessions import SID, new_app, shown
 
 
 class SameEpochReadAgainTest(unittest.TestCase):  # R1
-    def test_a_log_read_again_from_its_start_in_the_same_epoch_shows_nothing_twice(self) -> None:
+    def test_a_log_read_again_from_its_start_in_the_same_epoch_shows_nothing_twice_in_silence(self) -> None:
         app, daemon = new_app()
         app.command(f"transcript {SID}")
         first = list(shown(app))
         del daemon.lines[3:]  # the log kept three of the seven positions shown, in the same epoch
-        app.command(f"transcript {SID}")  # cursor_ahead for the last line shown itself
-        self.assertIn("the next read goes on from the start of its log", app.notice)
-        app.command(f"transcript {SID}")  # read again from the start
-        self.assertEqual(shown(app), first, "nothing is shown twice")
+        app.command(f"transcript {SID}")  # cursor_ahead: the view is rebuilt below a marker (review 5 of #405)
+        app.command(f"transcript {SID}")  # reads on: nothing new
+        marker = shown(app)[len(first)]
+        self.assertTrue(marker.startswith("-- view rebuilt: "), marker)
+        self.assertEqual(shown(app), [*first, marker, *first[:3]], "shown again only below the marker")
 
 
 class NewLogGapTest(unittest.TestCase):  # R2
@@ -109,10 +110,10 @@ class CopyOutsideTheLockTest(unittest.TestCase):  # R4
 class SentencesTest(unittest.TestCase):
     def test_the_sentences_say_what_the_code_does(self) -> None:
         doc = " ".join(s.__doc__.split())
-        self.assertIn("Each line is shown once in an epoch", doc)
+        self.assertIn("never shows one twice in silence", doc)
         self.assertIn("A refusal of the start itself is said as an error", doc)
-        self.assertIn("a later epoch is a log of its own", doc)
-        self.assertIn("shown_epoch", s.Transcript.__doc__)
+        self.assertIn("in an epoch and across the epochs of one store", doc)
+        self.assertIn("last_line", s.Transcript.__doc__)
 
 
 if __name__ == "__main__":

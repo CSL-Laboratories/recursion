@@ -415,7 +415,8 @@ class TuiApp:
         the answer to the read asked is said, changes nothing, rows or cursor, and is not asked for again
         (review 1 of #405, Sol R2; DeepSeek H1, L2). A right page: each new line logged once (so every
         renderer prints the same rows), its rows kept for the output pane, and the next page asked for while
-        the answer says there is more."""
+        the answer says there is more. A page, or a ``cursor_ahead``, that shows the log no longer holds the
+        last line shown as it was shown rebuilds the view (``_rebuild``)."""
 
         sid = (params.get("cursor") or {}).get("session_id")
         transcript = self.transcripts.get(sid)
@@ -426,27 +427,29 @@ class TuiApp:
             # read on by its seq, so the next read starts there (DeepSeek L1).
             transcript.cursor = {**transcript.cursor, "epoch": 1}
             self._notice(f"transcript session={field(sid)}: the daemon's epoch is behind the one held; the next "
-                         f"read goes on from seq {transcript.cursor['seq']} with epoch 1")
+                         f"read goes on from seq {transcript.cursor['seq']} with epoch 1, and checks the last line "
+                         f"shown first")
             return
         if code == "request_invalid" and answer.get("detail") == "cursor_ahead":
-            # The seq held is past the daemon's log: rule (7) does not bound the last position a gap line names,
-            # and a daemon whose log did not persist has fewer positions than were shown. The next read goes on
-            # from the last line shown, or from the start of the log when that was the position refused, so a
-            # position past the start is never refused twice in a row; what was shown is not shown again in the
-            # same epoch (review 2 of #405, DeepSeek M1; review 3, F1; review 4, R1, R3).
+            # The daemon has no position where the read asked from. After a line was shown that position is the
+            # one before it, so the log lost a position it had: a broken promise, and the view is rebuilt (the
+            # Liaison's ruling on review 5 of #405). Before any line, only gap lines were shown (one may name a
+            # position past the log): the next read goes back to the start, and a gap line shown is not shown
+            # again (review 2, M1; review 3, F3). A refusal of the start itself is an error (review 4, R3).
             refused = params["cursor"]["seq"]
-            if transcript.printed < refused:
-                transcript.cursor = {**transcript.cursor, "seq": transcript.printed}
-                then = f"from seq {transcript.printed}, the last line shown"
-            elif refused > 0:
-                transcript.cursor, transcript.printed = s.first_cursor(sid), 0
-                then = "from the start of its log"
-            else:  # the start itself is refused: no read can be served (review 4 of #405, DeepSeek R3)
+            if type(refused) is int and refused > transcript.read_cursor()["seq"]:
+                return  # a read sent before the view began again: the read from the start is on its way
+            if transcript.last_line is not None:
+                self._rebuild(sid, transcript, f"the daemon has no position seq {refused}, so it no longer holds "
+                                               f"seq {transcript.last_seq}, the last line shown (epoch "
+                                               f"{transcript.cursor['epoch']})")
+            elif refused:
+                transcript.cursor = {**transcript.cursor, "seq": 0}
+                self._notice(f"transcript session={field(sid)}: the daemon has no position seq {refused}; no line "
+                             f"has been shown, so the next read goes on from the start of its log")
+            else:
                 self._error(f"transcript session={field(sid)}: the daemon refuses even the start of its log (seq 0); "
                             f"nothing can be read from it until it serves that")
-                return
-            self._notice(f"transcript session={field(sid)}: the daemon has no position seq {refused}; the next read "
-                         f"goes on {then}")
             return
         if code != "ok":
             return
@@ -455,9 +458,13 @@ class TuiApp:
             self._error(f"transcript session={field(sid)}: the answer was not taken ({problem}): nothing shown, "
                         f"the cursor stays at seq {transcript.cursor['seq']}; transcript {field(sid)} reads again")
             return
+        lines = transcript.apply(answer, params["cursor"]["seq"])
+        if lines is None:  # the log no longer holds the last line shown as it was shown
+            self._rebuild(sid, transcript, transcript.broken)
+            return
         out = self.transcript_rows.setdefault(sid, _Output(self._output_lines, sid))
         added = 0
-        for line in transcript.apply(answer):
+        for line in lines:
             rows = s.rows(line)
             out.extend(rows)
             added += sum(len(wrap(row, self._pane_width())) for row in rows)
@@ -471,10 +478,29 @@ class TuiApp:
                          f"{transcript.cursor['seq']} (epoch {transcript.cursor['epoch']})")
         if answer.get("more") is True and transcript.pages < s.MAX_PAGES:
             transcript.pages += 1
-            self.request(s.READ, s.read_params(transcript.cursor))
+            self.request(s.READ, transcript.read_params())
         elif answer.get("more") is True:
             self._notice(f"transcript session={field(sid)}: more lines after seq {transcript.cursor['seq']}; "
                          f"the command transcript {field(sid)} reads on")
+
+    def _rebuild(self, sid: str, transcript: s.Transcript, why: str) -> None:
+        """The daemon's log no longer holds the last line shown as it was shown: a marker line says so, in the
+        pane and in every renderer as a transcript row, and the log is read again from its start, shown below
+        it. What was shown stays above the marker (the Liaison's ruling on review 5 of #405)."""
+
+        marker = f"-- view rebuilt: {why}; the log is shown again from its start --"
+        out = self.transcript_rows.setdefault(sid, _Output(self._output_lines, sid))
+        out.extend([marker])
+        if self.scroll and self.pane == sid:
+            self.scroll += len(wrap(marker, self._pane_width()))
+        self._emit("transcript", "recursion", marker, speech=f"transcript session={field(sid)}: {marker}")
+        transcript.restart()
+        if transcript.pages < s.MAX_PAGES:
+            transcript.pages += 1
+            self.request(s.READ, transcript.read_params())
+        else:
+            self._notice(f"transcript session={field(sid)}: the command transcript {field(sid)} reads the log "
+                         f"from its start")
 
     def open_transcript(self, session_id: str) -> None:
         """Show a session's transcript in the output pane, reading it from the cursor (from the start the
@@ -485,7 +511,7 @@ class TuiApp:
         if self.pane != session_id:  # another pane: start at its newest rows; reading on keeps the view
             self.pane, self.scroll = session_id, 0
         self.transcript_rows.setdefault(session_id, _Output(self._output_lines, session_id))
-        self.request(s.READ, s.read_params(transcript.cursor))
+        self.request(s.READ, transcript.read_params())
 
     def _pane_output(self) -> _Output | None:
         """What the output pane and its pager show: the open transcript, else the attached run's output."""

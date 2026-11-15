@@ -105,21 +105,21 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   logged as untrusted text), and a `replay.gap` line like any other. The TUI never projects or parses an
   event, and a line never makes it send anything. Full screen shows the lines in the output pane (the
   pager pages and searches them); `--no-alt-screen` and `--plain` say each as `transcript session=S: <row>`,
-  so all three print the same rows. The same command again reads on from the cursor, after a daemon restart
-  too (the answer's newer epoch is said and kept). Attaching a run returns the pane to the run's output.
+  so all three print the same rows. The same command again reads on, after a daemon restart too (the
+  answer's newer epoch is said and kept), and checks first that the log still holds the last line shown
+  (below). Attaching a run returns the pane to the run's output.
   Until the verb lanes' CLI twins exist, the parity tests compare these requests with SPINE's recorded ones.
   Each page is checked before anything of it is taken (rule (7), as SPINE's `conformance/rules.py` states it
   for a reader): a page in another projection, of another log, with a line out of order or of the wrong
   shape, a cursor that is not its last position, or an epoch that goes back is said as an error and changes
   nothing, neither rows nor cursor, and that page is not asked for again (a right page that says `more` is
-  followed, up to the 50 reads). If the daemon then answers that the epoch held is ahead of its own, the next
-  read goes on from epoch 1 by its seq; if it answers that the seq held is past its log (a gap line may name
-  any later position), the next read goes on from the last line shown, and from the start of the log when
-  the daemon has not that either (a log that did not persist), and a daemon that refuses even the start is
-  said as an error. A line already shown, a gap line included, is not shown again in the same epoch, so a
-  log read again from its start does not fill the pane twice; a later epoch is a log of its own. An answer
-  that cannot be read at all is said as an error, and the copy every frame reads is made before the TUI's
-  lock is taken, so such an answer never holds it; a control API call that raises never stops the TUI.
+  followed, up to the 50 reads). A transcript never loses a line in silence and never shows one twice in
+  silence: see "What a transcript relies on". If the daemon answers that the epoch held is ahead of its own,
+  the next read goes on from epoch 1 by its seq, and the check decides; a daemon that refuses even the start
+  of its log is said as an error. An answer that cannot be read at all is said as an error. The plain copy
+  every frame reads is made before the TUI's lock is taken; the answer itself is still read under the lock,
+  as slice 1's reads always were, so an answer whose reads do not return holds the lock until they do
+  (`call_api` hands in plain objects). A control API call that raises never stops the TUI.
 - The binding file: `$XDG_CONFIG_HOME/recursion/tui-keys.toml` (or `~/.config/...`), or `--keys FILE`;
   `--print-keys` prints the defaults to start from. `version = 1`, an optional `leader`, a table per
   context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action
@@ -185,6 +185,40 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 - O7's `surface` allows only `gui` or `cli`, so the TUI labels itself `surface=cli` until O7 adds `tui`
   (A36). The control API has no surface field, and TUI requests are byte-identical to the CLI's.
 - Approve and deny are not here. They wait for O11 and a later PR.
+
+## What a transcript relies on
+
+The rule (the Liaison's ruling on review 5 of #405): an operator's transcript never loses a line in silence
+and never shows one twice in silence. The user sees every line once, or a marker line that says the view
+was rebuilt.
+
+What the TUI relies on from the daemon about positions, as the store and the cursor state it:
+
+- A log's positions are gapless from 1, and a line at a position never changes: the event store appends one
+  row per event at the next seq and refuses every update and delete of the log in the file itself (lane
+  EVENTS, #373 at `31ce13eb`, `core/recursion_core/events/db.py` lines 115-124 and 349-352).
+- The epoch rises by one each time the store is opened, and a cursor carries it (the same file, lines 55-56
+  and 574-576). An older epoch goes on with the same persistent log; `epoch_advanced` is not a reset; a seq
+  past the high-water mark is `cursor_ahead`, and a seq at it is a valid empty read; a position that
+  retention skipped is a `replay.gap` line (SPINE's cursor, `schemas/control/v1/common.v1.json` line 245).
+- So, in an epoch and across the epochs of one store, the high-water mark never goes down and a position
+  shown never holds another line. Lane EVENTS' #403 (`45eedbcf`) lists `events.read` and `events.follow` as
+  read rows (`core/recursion_core/control/methods/__init__.py` line 206) and changes none of this; its change
+  reader keeps the digest of the last image it logged for the same reason (`events/changes.py` lines 11-14).
+
+What it checks: every read after a line was shown asks from the position before the last line shown, for
+one line more, so the answer begins with that line, and it must be the line shown (every field but its
+position). A `transcript.line.v1` line has no id, so the line itself is what is compared. When it is
+another line, the answer goes past it or ends before it, or the daemon has no position there any more
+(`cursor_ahead`), the promise above was broken: a marker line, `-- view rebuilt: <why>; the log is shown
+again from its start --`, is printed as a transcript row in every renderer, and the log is read again from
+its start and shown below it. What was shown stays above the marker. A gap line over the last line shown is
+retention: it is shown when it covers more than that line, and the lines after it are shown.
+
+What it cannot see: a line rewritten in place before the last line shown, with the last line left as it
+was. A reader that resumes after a position sees nothing of what lies before it; the store refuses such a
+write, and noticing it would take a value per line that covers the log up to it (a field of SPINE's
+`transcript.line.v1`, filled from lane EVENTS' store).
 
 ## Not wired yet
 

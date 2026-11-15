@@ -11,7 +11,12 @@ real table when it is importable. Fake doubles only.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
+import os
+import shutil
+import sys
+import tempfile
 import unittest
 
 from recursion_core.routes import contract as c
@@ -65,6 +70,40 @@ def _engine_code(engine: str, engines=None) -> str | None:
     except c.RouteError as err:
         return err.code
     return None
+
+
+SPINE_TABLE = "recursion_core.routes.engines"
+SPINE_ABSENT = "S3's engine table (routes/engines) is not on this base: SPINE's seams pull request brings it"
+
+
+def _regular_package(name: str) -> bool:
+    """Whether ``name`` is a package with an ``__init__.py``, not only a directory on the path.
+
+    A directory without one is a namespace package; ``find_spec`` finds it, and its spec has no origin (3.12 and
+    3.14 alike).
+    """
+
+    spec = importlib.util.find_spec(name)
+    return spec is not None and spec.origin is not None
+
+
+def _engine_table(module: str = SPINE_TABLE):
+    """S3's ``EngineTable``, imported itself; ``SkipTest`` where this base does not have S3's module.
+
+    The Liaison's ruling of Nov 14, 8:27 PM (on DRIVER-CX's Q7): the guard tests for what the test needs. Lane
+    DRIVER-CX's #393 adds ``routes/engines/fixtures/`` without S3's ``routes/engines/__init__.py``, so on a tree
+    with #393 and without SPINE's #369 ``routes.engines`` is a namespace package, which the earlier guard (a
+    plain ``find_spec``) took for the table module. A failed import is a skip only where ``routes/engines`` is
+    absent or such a namespace package. Where S3's ``__init__.py`` is there, a table module that does not import,
+    or has no ``EngineTable``, is an error, never a skip.
+    """
+
+    try:
+        return importlib.import_module(module).EngineTable
+    except (ImportError, AttributeError):
+        if _regular_package(module):
+            raise
+        raise unittest.SkipTest(SPINE_ABSENT) from None
 
 
 class NothingRegisteredTest(unittest.TestCase):
@@ -142,13 +181,53 @@ class RegisteredTest(unittest.TestCase):
                 RouteService({bad: EchoAdapter()}, ConnectionBreaker(clock), clock)
 
 
-@unittest.skipUnless(importlib.util.find_spec("recursion_core.routes.engines"),
-                     "S3's engine table (routes/engines) is not on this base: SPINE's seams pull request brings it")
+def _guard_answer(module: str) -> str:
+    """What ``_engine_table`` does for ``module``: returns the class, skips, or raises (which error)."""
+
+    try:
+        _engine_table(module)
+    except unittest.SkipTest:
+        return "skip"
+    except ImportError:
+        return "ImportError"
+    except AttributeError:
+        return "AttributeError"
+    return "table"
+
+
+class EngineTableGuardTest(unittest.TestCase):
+    """The guard of ``SpineTableTest`` on each shape ``routes/engines`` can have on a base."""
+
+    def test_it_skips_only_where_s3s_module_is_not_there(self) -> None:
+        root = tempfile.mkdtemp(prefix="engine-check-")
+        self.addCleanup(shutil.rmtree, root, True)
+        tag = os.path.basename(root).replace("-", "_")  # names no earlier run can have cached
+        shapes = ("absent", "ns_only", "table", "no_class", "broken")
+        files = {
+            "ns_only/fixtures/codex/schema.json": "{}",  # what #393 adds under routes/engines, no __init__.py
+            "table/__init__.py": "class EngineTable:\n    pass\n",
+            "no_class/__init__.py": "",
+            "broken/__init__.py": "from .absent_module import EngineTable\n",
+        }
+        for path, text in files.items():
+            os.makedirs(os.path.join(root, f"{tag}_{os.path.dirname(path)}"), exist_ok=True)
+            with open(os.path.join(root, f"{tag}_{path}"), "w", encoding="utf-8") as handle:
+                handle.write(text)
+        sys.path.insert(0, root)
+        self.addCleanup(sys.path.remove, root)
+        for shape in shapes:
+            self.addCleanup(sys.modules.pop, f"{tag}_{shape}", None)
+        importlib.invalidate_caches()
+        self.assertIsNotNone(importlib.util.find_spec(f"{tag}_ns_only"))  # what the earlier guard answered
+        self.assertEqual({shape: _guard_answer(f"{tag}_{shape}") for shape in shapes},
+                         {"absent": "skip", "ns_only": "skip", "table": "table", "no_class": "AttributeError",
+                          "broken": "ImportError"})
+
+
 class SpineTableTest(unittest.TestCase):
     def test_against_spines_engine_table(self) -> None:
-        from recursion_core.routes.engines import EngineTable
-
-        table = EngineTable()
+        engine_table = _engine_table()  # SkipTest where S3's module is not on this base
+        table = engine_table()
         self.assertEqual(c.engine_names(table), BASE_FIVE)
         table.register("recursion_loop", lambda *args, **kwargs: EchoAdapter())
         table.freeze()

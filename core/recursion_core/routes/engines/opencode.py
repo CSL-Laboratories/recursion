@@ -86,6 +86,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_tz
 
 from recursion_core.routes import contract as c
+from recursion_core.routes.driver import Declaration, Driver, Flags, check_draft
 
 ENGINE = "opencode"
 # The command a registration will state as ``default_executable``: argv[0] is the binary option composition gives,
@@ -119,7 +120,7 @@ def declaration() -> dict:
     return {"engine": ENGINE, "driver": 2, "flags": dict(FLAGS), "input_ack": False}
 
 
-def build_argv(model: str, *, binary: str | None = None) -> list[str]:
+def build_argv(model: str | None, *, binary: str | None = None) -> list[str]:
     """argv for one turn of ``opencode run``. The prompt goes on standard input, never into argv.
 
     ``binary`` is the binary option composition gives (argv[0] is it, else ``DEFAULT_EXECUTABLE``). 1.19.5 reads a
@@ -127,6 +128,8 @@ def build_argv(model: str, *, binary: str | None = None) -> list[str]:
     """
     if binary is not None and (not isinstance(binary, str) or not binary or "\x00" in binary):
         raise ValueError("binary")
+    if model is None:   # driver.v2's route: null is the engine's own default model
+        return [binary if binary is not None else DEFAULT_EXECUTABLE, "run", "--format", "json"]
     if not isinstance(model, str) or not 3 <= len(model) <= 256 or model.startswith("-") or "/" not in model:
         raise ValueError("model")
     if model.split("/", 1)[0] == "" or _CONTROL.search(model) or any(ch.isspace() for ch in model):
@@ -191,6 +194,67 @@ class OneShot:
         return result
 
 
+class OpenCodeDriver(Driver):
+    """driver.v2 for the one-shot drive, on the gate every driver shares (``routes.driver.Driver``, lane DRIVER-CC).
+
+    ``spawn(argv, env) -> process`` starts the engine; the launch path behind it (the guard, the child environment,
+    the unit) is the caller's. ``start`` spawns ``opencode run``; the first ``user_message`` is the prompt, written
+    to standard input, which is then closed; ``parse`` reads stdout; ``finish(handle, exit_code)`` drafts the result
+    once the process has exited and ends the turn. The flags are ``FLAGS``: resume, a second message, a message
+    mid-turn, an interrupt, a fork and an approval answer are refused by the gate before this class is asked, so no
+    process is started and no byte written. The one prompt is accepted (``input.accepted``, ``new_turn``) on the
+    first ``step_start`` OpenCode prints for it: the engine's own typed sign that it began the turn.
+    """
+
+    declaration = Declaration(ENGINE, Flags(**FLAGS), input_ack=False)
+
+    def __init__(self, spawn: Callable[[list, dict], object], *, binary: str | None = None,
+                 wall: Callable[[], float] = time.time, clock: Callable[[], float] = time.monotonic) -> None:
+        self._spawn, self._binary, self._wall, self._clock = spawn, binary, wall, clock
+        self._workers: dict[int, dict] = {}
+
+    def _worker(self, handle) -> dict:
+        return self._workers[id(handle)]
+
+    def _start(self, handle, request: dict, env: dict) -> None:
+        route = request["route"]
+        parser = Parser(connection_id=f"{route['connection']['kind']}:{route['connection']['id']}",
+                        model=route["model"], wall=self._wall, clock=self._clock)
+        argv = build_argv(route["model"], binary=self._binary)
+        process = self._spawn(argv, env)
+        self._workers[id(handle)] = {"process": process, "parser": parser, "turn": None, "delivery": None,
+                                     "accepted": False, "handle": handle}
+
+    def _send(self, handle, item: dict) -> None:
+        worker = self._worker(handle)
+        if item["kind"] == "user_message":     # the gate lets exactly one through: multi_turn is false
+            worker["turn"], worker["delivery"] = item["turn_id"], item["delivery_id"]
+            worker["process"].send(item["text"])
+        if not worker.get("stdin_closed"):     # the prompt is the whole input; a close only ends it sooner
+            worker["stdin_closed"] = True
+            worker["process"].close_stdin()
+
+    def _parse(self, handle, line: str) -> list[dict]:
+        worker = self._worker(handle)
+        parser = worker["parser"]
+        drafts = parser.feed(line)
+        if parser.engine_session_id is not None and handle.engine_session_id is None:
+            handle.set_engine_session_id(parser.engine_session_id)
+        if not worker["accepted"] and worker["delivery"] is not None and parser.last_type == "step_start":
+            worker["accepted"] = True
+            drafts.append(_draft("input.accepted", {"delivery_id": worker["delivery"], "turn_id": worker["turn"],
+                                                    "how": "new_turn"}))
+        return drafts
+
+    def finish(self, handle, exit_code: int | None) -> list[dict]:
+        """The ``result`` draft once the process has exited; the turn in progress ends with it."""
+        worker = self._workers.pop(id(handle))
+        drafts = [check_draft(d) for d in worker["parser"].end(exit_code)]
+        if worker["turn"] is not None and handle.live_turn == worker["turn"]:
+            self.turn_ended(handle, worker["turn"])
+        return drafts
+
+
 class Parser:
     """One run's stdout, a line at a time. One reader feeds it; it is not shared between threads.
 
@@ -215,6 +279,7 @@ class Parser:
         self._usage: list[dict] = []          # the route contract's usage events
         self._result: tuple[str | None, str] | None = None
         self._finish: str | None = None       # the reason of the latest step_finish, a typed field
+        self.last_type: str | None = None     # the type of the line just fed, when it was an event
         self.engine_session_id: str | None = None
         self.anomalies: list[str] = []
 
@@ -236,6 +301,7 @@ class Parser:
         start = self._offset
         self._offset += len(raw)
         self._lines += 1
+        self.last_type = None
         drafts = [_draft("engine.output", {"stream": "stdout", "text": raw.decode("utf-8", errors="replace"),
                                            "offset_start": start, "offset_end": self._offset})]
         event = self._load(raw)
@@ -284,7 +350,7 @@ class Parser:
 
     def _typed(self, event: dict) -> list[dict]:
         self._session(event.get("sessionID"))
-        kind = event["type"]
+        kind = self.last_type = event["type"]
         if kind == "text":
             part = event.get("part")
             if isinstance(part, dict) and isinstance(part.get("text"), str):

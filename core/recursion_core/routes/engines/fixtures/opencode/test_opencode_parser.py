@@ -672,7 +672,8 @@ class DeclarationTests(unittest.TestCase):
         self.assertEqual(oc.build_argv(MODEL), ["opencode", "run", "--format", "json", "--model", MODEL])
         self.assertEqual(oc.build_argv(MODEL, binary="/opt/opencode/bin/opencode")[0], "/opt/opencode/bin/opencode")
         self.assertEqual(oc.build_argv(MODEL)[0], oc.DEFAULT_EXECUTABLE)
-        for model in ("-x/y", "openai", "/gpt", "a b/c", "a/b\n", "", "a/", None, "x" * 257 + "/y",
+        self.assertEqual(oc.build_argv(None), ["opencode", "run", "--format", "json"])   # the engine's default
+        for model in ("-x/y", "openai", "/gpt", "a b/c", "a/b\n", "", "a/", 5, "x" * 257 + "/y",
                       "a/" + chr(7) + "b", "a/" + chr(0x7F) + "b"):
             with self.subTest(model):
                 with self.assertRaises(ValueError):

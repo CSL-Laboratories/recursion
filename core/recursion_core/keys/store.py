@@ -20,10 +20,12 @@ same lock and reaches the same values. A relative folder is refused, so the work
 THE BINDING. Each save also gets a random ``save_id``, recorded with its key. The backend stores the value WITH
 the store's id, that save id and the record's provider (a Secret Service item's attributes; the owner-only file's
 entry and its header), and ``credential`` asks for the value of exactly that record: a value is released only
-when all three match the record being used and the store. So an older index put back, an index copied in from
-another folder or a copy of the whole folder, or an edited record, can never pair one save's provider and opt-in
-with another save's value; it gets ``secret_missing``. A removal deletes every value saved for the id in the
-store, whichever save stored it.
+when all three match the record being used and the store. So an older index put back, or an edited record, gets
+``secret_missing``, never another save's value. An index copied in from another store's folder carries that
+store's id: on a keychain it reaches that store's own values through that store's own records, and on the
+owner-only file it reaches nothing (the file names another store). A copy of the whole folder is a second store
+over the same values (questions.md K18). A removal deletes every value saved for the id in the store, whichever
+save stored it.
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
 {"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending":
@@ -299,8 +301,10 @@ class KeyStore:
         with self._folder(create=True) as folder, folder.locked():
             folder.sweep()
             index = self._read_index(folder)
-            if index.store_id is None:                   # the first save names the store, once
-                index = replace(index, store_id=_random_id())
+            if not index.live():
+                # A store with no record takes the id of the owner-only file already in its folder (an index lost,
+                # replaced or emptied): the same folder is the same store. Only a folder with neither mints one.
+                index = replace(index, store_id=OwnerFile(None).store_of(folder) or index.store_id or _random_id())
             backend = self._backend(index.backend, index.store_id)   # None while the index is empty: a first save pins
             index = self._recover(folder, index, backend)
             if key_id in index.keys:
@@ -488,8 +492,6 @@ def _parse_index(raw: bytes) -> Index | None:
     if (backend not in STORES) if live else (backend is not None):
         return None
     keys = {}
-    if len({entry.get('save_id') for entry in doc['keys'].values() if isinstance(entry, dict)}) != len(doc['keys']):
-        return None                      # two records naming one save: an index this store never writes
     for key_id, entry in doc['keys'].items():
         if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != set(FIELDS):
             return None
@@ -501,6 +503,8 @@ def _parse_index(raw: bytes) -> Index | None:
             return None
         keys[key_id] = KeyRecord(key_id, entry['provider'], entry['env_name'], entry['created_at'], entry['store'],
                                  allowed, cap, entry['save_id'])
+    if len({record.save_id for record in keys.values()}) != len(keys):
+        return None                      # two records naming one save: an index this store never writes
     pending = {}
     for key_id, entry in doc['pending'].items():
         if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != set(PENDING_FIELDS):

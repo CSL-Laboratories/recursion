@@ -88,7 +88,7 @@ class ValueBindingTest(TempStoreCase):
         overwrite(first.root / 'index.json', (second.root / 'index.json').read_bytes())
         with self.assertRaises(KeyRefused) as refused:
             first.credential('codex-key', 'CODEX_API_KEY')
-        self.assertEqual(refused.exception.code, 'owner_file_invalid')
+        self.assertEqual(refused.exception.code, 'secret_missing')     # the file names another store (round 4)
 
     def test_an_owner_file_value_without_its_binding_is_refused(self) -> None:
         store = KeyStore(self.root, system=FakeSystem(), clock=fixed_clock)
@@ -136,7 +136,7 @@ class ValueBindingTest(TempStoreCase):
                     self.assertEqual(caught.exception.code, 'secret_missing')
             with self.assertRaises(KeyStoreError) as caught:
                 OwnerFile('f' * 32).get('codex-key', folder, record)
-            self.assertEqual(caught.exception.code, 'owner_file_invalid')
+            self.assertEqual(caught.exception.code, 'secret_missing')   # releases nothing to another store
 
     def test_a_keychain_item_is_bound_to_save_provider_and_store(self) -> None:
         system, chain = keychain_system()

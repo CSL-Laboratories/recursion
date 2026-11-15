@@ -35,8 +35,11 @@ its intent only then.
 
 OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "store_id": <the store's id>,
 "secrets": {id: {"save_id", "provider", "value"}}}``, read and written through ``files.Folder`` (0600, owner and
-mode checked on every read, temp file, fsync, rename). A file whose store id is not the index's belongs to
-another store and is refused (``owner_file_invalid``), as is any other shape.
+mode checked on every read, temp file, fsync, rename). Any other shape is refused (``owner_file_invalid``). A
+file whose store id is not the index's belongs to another store: it releases nothing to this store's records
+(``secret_missing``), holds nothing this store can remove (a removal or recovery succeeds without touching it),
+and is not written over while this store has records (``owner_file_invalid``); the audit reads it unbound. A
+store with no records takes that file's id as its own at its next save (``KeyStore.add``).
 """
 from __future__ import annotations
 
@@ -173,19 +176,25 @@ class OwnerFile:
     def __repr__(self) -> str:
         return 'OwnerFile()'
 
-    def _load(self, folder: Folder, *, any_store: bool = False) -> dict:
-        """``{id: (save_id, provider, value)}``. A file of another store is refused unless ``any_store`` (the
-        audit, which only searches for the values)."""
+    def _read(self, folder: Folder) -> tuple:
+        """``(store id or None when there is no file, {id: (save_id, provider, value)})``; a malformed file is
+        refused."""
         raw = folder.read(OWNER_FILE_NAME, OWNER_FILE_MAX)
         if raw is None:
-            return {}
+            return None, {}
         parsed = _parse(raw)
         if parsed is None:
             raise KeyStoreError('owner_file_invalid', f'{folder.path / OWNER_FILE_NAME} is not a file this store wrote')
-        store_id, entries = parsed
-        if store_id != self._store_id and not any_store:
-            raise KeyStoreError('owner_file_invalid', f'{folder.path / OWNER_FILE_NAME} belongs to another store')
-        return entries
+        return parsed
+
+    def _load(self, folder: Folder) -> dict:
+        """This store's entries: none when the file belongs to another store."""
+        store_id, entries = self._read(folder)
+        return entries if store_id in (None, self._store_id) else {}
+
+    def store_of(self, folder: Folder) -> str | None:
+        """The store id the file names, or None when there is no file."""
+        return self._read(folder)[0]
 
     def _save(self, folder: Folder, entries: dict) -> None:
         """Write the file, refusing ``store_full`` BEFORE writing when it would be larger than a read accepts."""
@@ -200,7 +209,7 @@ class OwnerFile:
         folder.write(OWNER_FILE_NAME, data)
 
     def get(self, key_id: str, folder: Folder, record=None) -> str:
-        entry = self._load(folder).get(key_id)
+        entry = (self._load(folder) if record is not None else self._read(folder)[1]).get(key_id)
         if entry is None:
             raise KeyStoreError('secret_missing', f'the owner-only file has no value for {key_id}')
         save_id, provider, value = entry
@@ -210,7 +219,7 @@ class OwnerFile:
 
     def values(self, folder: Folder) -> dict:
         """For the audit only: every value the file holds, by id, whatever store or record it names."""
-        return {kid: value for kid, (_, _, value) in self._load(folder, any_store=True).items()}
+        return {kid: value for kid, (_, _, value) in self._read(folder)[1].items()}
 
     def holds(self, key_id: str, folder: Folder) -> bool | None:
         try:
@@ -219,11 +228,16 @@ class OwnerFile:
             return None
 
     def put(self, key_id: str, value: str, folder: Folder, keep: frozenset, *, record) -> None:
+        if self.store_of(folder) not in (None, self._store_id):
+            raise KeyStoreError('owner_file_invalid', f'{folder.path / OWNER_FILE_NAME} belongs to another store; '
+                                'remove this index\'s keys, or put its own index back, before saving here')
         entries = {kid: entry for kid, entry in self._load(folder).items() if kid in keep}
         entries[key_id] = (record.save_id, record.provider, value)
         self._save(folder, entries)
 
     def delete(self, key_id: str, folder: Folder, keep: frozenset) -> None:
+        if self.store_of(folder) not in (None, self._store_id):
+            return                       # another store's file holds nothing of this store: nothing to remove
         entries = self._load(folder)
         kept = {kid: entry for kid, entry in entries.items() if kid in keep and kid != key_id}
         if kept != entries:

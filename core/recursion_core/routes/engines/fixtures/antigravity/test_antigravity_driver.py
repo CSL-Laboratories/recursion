@@ -189,12 +189,13 @@ class AcpDraftsTest(unittest.TestCase):
         drafts = ag.AcpDrafts()
         holder = {}
 
-        def on_update(_p):
+        def on_update(params):
+            drafts.on_update(params)
             if cancel_on_update:
                 holder["s"].cancel()
 
         session = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR,
-                              on_line=drafts.on_line, on_update=on_update)
+                              on_line=drafts.on_line, on_update=on_update, on_ask=drafts.on_ask)
         holder["s"] = session
         out = session.prompt("x", FAR)
         return out, drafts, drafts.ended(out, "turn-1", "dlv-1")
@@ -265,11 +266,38 @@ class AcpDraftsTest(unittest.TestCase):
         out = acp.TurnOutcome(1, c.ENGINE_ERROR, None, False, False, None, None, None, "acp error 1: " + key, "")
         self.assertNotIn(key, json.dumps(masked.ended(out)))
 
+
+    TOOL_TURN = [
+        ("update", {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Run ls", "kind": "execute",
+                    "status": "pending", "rawInput": {}}),
+        ("update", {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "in_progress",
+                    "rawInput": {"CommandLine": "ls", "Cwd": CWD}}),
+        ("update", {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "a\n"}}]}),
+        ("chunk", "done"), ("end", "end_turn")]
+
+    def test_tool_calls_are_drafted_with_antigravitys_rfc8785_digest(self) -> None:
+        _out, drafts, _ended = self.run_turn(self.TOOL_TURN)
+        calls = [d["payload"] for d in drafts.drafts if d["type"] == "tool.call"]
+        results = [d["payload"] for d in drafts.drafts if d["type"] == "tool.result"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input_digest"], ag.input_digest({"CommandLine": "ls", "Cwd": CWD}))
+        self.assertEqual([(r["call_id"], r["status"], r["text"]) for r in results], [("c1", "ok", "a\n")])
+
+    def test_a_stopped_turn_ends_its_open_tool_calls_cancelled_before_its_result(self) -> None:
+        script = self.TOOL_TURN[:2] + [("wait_cancel",), ("end", "cancelled")]
+        out, _drafts, ended = self.run_turn(script, cancel_on_update=True)
+        self.assertTrue(out.cancel_confirmed)
+        self.assertEqual([d["type"] for d in ended], ["tool.result", "input.accepted", "result"])
+        self.assertEqual(ended[0]["payload"]["status"], "cancelled")
+
     @unittest.skipUnless(schema_check.AVAILABLE, schema_check.SKIP_REASON)
     def test_every_acp_draft_fits_driver_v2(self) -> None:
         for script, cancel in (([("chunk", "hi"), ("end", "end_turn")], False),
                                ([("chunk", "x"), ("end", "end_turn")], True),
-                               ([("error", -32603, "boom")], False)):
+                               ([("error", -32603, "boom")], False),
+                               (self.TOOL_TURN, False),
+                               (self.TOOL_TURN[:2] + [("wait_cancel",), ("end", "cancelled")], True)):
             _out, drafts, _ended = self.run_turn(script, cancel_on_update=cancel)
             for draft in drafts.drafts:
                 self.assertTrue(schema_check.fits("driver.v2.json#/$defs/event_draft", draft), draft)

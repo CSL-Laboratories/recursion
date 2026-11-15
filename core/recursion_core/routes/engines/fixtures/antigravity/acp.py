@@ -117,9 +117,21 @@ that is not a str (``answer_permission``, ``ask``) or a request id that is not a
 ``pending_result``). ``answer_permission`` and ``ask`` raise ``KeyError`` for a str token this connection
 never issued, ``pending_result`` for an int id it never minted.
 
-WHAT IT DOES NOT DO (yet): map ``tool_call`` updates to tool.call drafts (their ``rawInput`` arrives late
-and differs by agent), read usage (stable ACP has only ``usage_update``: context size, and an optional
-running cost), or read a rate limit (stable ACP has none). The driver.v2 flags of an ACP engine say so.
+TOOL CALLS (``ToolCalls``). ``tool_call`` and ``tool_call_update`` become one tool.call and one tool.result
+draft per tool call id. The agent's ``rawInput`` arrives late and differs by agent (one sends ``{}`` while
+the call is pending and fills it in later; another sends it whole at once), so the call is drafted ONCE, at
+the first update whose status is past ``pending``, with the latest ``rawInput`` seen; the result when the
+status is ``completed`` or ``failed``. A failed call whose permission ask this client answered ``deny`` or
+``cancelled`` is ``denied``. When a turn the caller asked to stop ends, every call drafted without a result
+gets one with status ``cancelled`` (ACP: the client marks the turn's unfinished calls cancelled). The draft's
+``name`` is the call's ``kind`` (ACP's fixed list: read, edit, execute, ...), never its ``title``, which is
+display text, unless the agent sends the call's ``name`` ("programmatic name of the tool", stable since
+schema 1.x): then that. The draft's input is ``rawInput`` when it is an object; when it is another JSON value
+the input is null and the digest is that value's; when the agent sent none, the input is null and the digest
+is that of JSON null. The digest function is the caller's (RFC 8785, then SHA-256).
+
+WHAT IT DOES NOT DO (yet): read usage (stable ACP has only ``usage_update``: context size, and an optional
+running cost) or read a rate limit (stable ACP has none). The driver.v2 flags of an ACP engine say so.
 """
 
 from __future__ import annotations
@@ -164,6 +176,9 @@ REFUSED_CLIENT_METHODS = (
 SENT_METHODS = (INITIALIZE, AUTHENTICATE, SESSION_NEW, SESSION_LOAD, SESSION_PROMPT, SESSION_CANCEL)
 ANSWERED_METHODS = (SESSION_UPDATE, REQUEST_PERMISSION) + REFUSED_CLIENT_METHODS
 
+# schema.json $defs/ToolCallStatus and ToolKind.
+TOOL_STATUSES = ("pending", "in_progress", "completed", "failed")
+TOOL_KINDS = ("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "switch_mode", "other")
 # schema.json $defs/StopReason, PermissionOptionKind, RequestPermissionOutcome, ErrorCode.
 STOP_REASONS = ("end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled")
 ALLOW_ONCE, ALLOW_ALWAYS, REJECT_ONCE, REJECT_ALWAYS = "allow_once", "allow_always", "reject_once", "reject_always"
@@ -1196,3 +1211,109 @@ class AcpSession:
             fed = None
         if fed is not None and fed.replies:
             self._write(fed.replies)
+
+
+# -- tool calls -------------------------------------------------------------------------------------------
+TOOL_TEXT_LIMIT = 64_000   # characters of a result's text; beyond it the text is cut and marked truncated
+
+
+@dataclass
+class _ToolCall:
+    call_id: str
+    name: str | None = None
+    kind: str | None = None
+    status: str = "pending"
+    raw_input: object = None
+    has_input: bool = False
+    raw_output: object = None
+    content: list = field(default_factory=list)
+    called: bool = False
+    resulted: bool = False
+
+
+class ToolCalls:
+    """One turn's ``tool_call`` and ``tool_call_update`` updates as tool.call and tool.result drafts (driver.v2).
+
+    ``digest(value) -> sha256 hex`` is the caller's (RFC 8785 text, then SHA-256): this file writes no canonical
+    form of its own. ``update(params)`` takes a session/update's params and gives the drafts it causes;
+    ``asked(ask)`` tells it of a permission ask (its final answer is read when the call fails);
+    ``turn_ended(cancel_requested)`` gives a ``cancelled`` result for every call drafted without one when the
+    caller asked to stop the turn. Not thread-safe: one turn's updates arrive on one thread.
+    """
+
+    def __init__(self, digest: Callable[[object], str]) -> None:
+        self._digest = digest
+        self._calls: dict[str, _ToolCall] = {}
+        self._asks: dict[str, list] = {}
+        self.ignored = 0   # updates with no usable tool call id
+
+    def asked(self, ask: PermissionAsk) -> None:
+        call_id = ask.tool_call.get("toolCallId") if isinstance(ask.tool_call, Mapping) else None
+        if isinstance(call_id, str):
+            self._asks.setdefault(call_id, []).append(ask)
+
+    def update(self, params: Mapping) -> list[dict]:
+        update = params.get("update") if isinstance(params, Mapping) else None
+        if not isinstance(update, Mapping) or update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
+            return []
+        call_id = update.get("toolCallId")
+        if not isinstance(call_id, str) or not 1 <= len(call_id) <= 128 or "\n" in call_id or "\r" in call_id:
+            self.ignored += 1
+            return []
+        call = self._calls.setdefault(call_id, _ToolCall(call_id))
+        if isinstance(update.get("name"), str) and update["name"]:
+            call.name = update["name"]
+        if update.get("kind") in TOOL_KINDS:
+            call.kind = update["kind"]
+        if update.get("status") in TOOL_STATUSES:
+            call.status = update["status"]
+        if "rawInput" in update and update["rawInput"] is not None:
+            call.raw_input, call.has_input = update["rawInput"], True
+        if "rawOutput" in update:
+            call.raw_output = update["rawOutput"]
+        if isinstance(update.get("content"), list):
+            call.content = list(update["content"])   # ACP: a content list replaces the one before it
+        drafts = []
+        if not call.called and call.status != "pending":
+            drafts.append(self._call(call))
+        if call.called and not call.resulted and call.status in ("completed", "failed"):
+            drafts.append(self._result(call, "ok" if call.status == "completed" else self._failed(call)))
+        return drafts
+
+    def turn_ended(self, cancel_requested: bool) -> list[dict]:
+        if not cancel_requested:
+            return []
+        return [self._result(call, "cancelled") for call in self._calls.values() if call.called and not call.resulted]
+
+    # -- internals ------------------------------------------------------------------------------------------
+    def _name(self, call: _ToolCall) -> str:
+        name = call.name if call.name and len(call.name) <= 256 and not any(c in call.name for c in "\r\n") else None
+        return name or call.kind or "other"
+
+    def _call(self, call: _ToolCall) -> dict:
+        call.called = True
+        value = call.raw_input if call.has_input else None
+        try:
+            digest = self._digest(value)
+        except ValueError:          # no canonical text: the agent's protocol error, never an input dropped
+            raise AcpProtocolError("tool input has no RFC 8785 text") from None
+        payload = {"call_id": call.call_id, "name": self._name(call), "input_digest": digest,
+                   "input": dict(value) if isinstance(value, Mapping) else None}
+        return {"type": "tool.call", "payload": payload}
+
+    def _failed(self, call: _ToolCall) -> str:
+        answers = [a.answer for a in self._asks.get(call.call_id, ())]
+        return "denied" if answers and answers[-1] in (DENY, "cancelled") else "error"
+
+    def _result(self, call: _ToolCall, status: str) -> dict:
+        call.resulted = True
+        parts = []
+        for item in call.content:
+            inner = item.get("content") if isinstance(item, Mapping) and item.get("type") == "content" else None
+            if isinstance(inner, Mapping) and inner.get("type") == "text" and isinstance(inner.get("text"), str):
+                parts.append(inner["text"])
+        text = "".join(parts) if parts else (call.raw_output if isinstance(call.raw_output, str) else "")
+        truncated = len(text) > TOOL_TEXT_LIMIT
+        payload = {"call_id": call.call_id, "status": status, "text": text[:TOOL_TEXT_LIMIT], "output_ref": None,
+                   "truncated": truncated}
+        return {"type": "tool.result", "payload": payload}

@@ -774,18 +774,30 @@ def open_acp(process: EngineProcess, clock, route: Mapping, cwd: str, deadline_a
 
 
 class AcpDrafts:
-    """Event drafts (driver.v2) for an ACP turn: one engine.output per stdout line, then the turn's result.
+    """Event drafts (driver.v2) for ACP turns: one engine.output per stdout line, tool.call and tool.result
+    as the agent reports its tool calls, then each turn's result.
 
-    ``on_line`` is the session's ``on_line``. ``ended(outcome, turn_id, delivery_id)`` gives the result
-    draft and, when the agent answered the prompt (a typed answer to the client's own request id), the
-    ``input.accepted`` draft of the delivery that began the turn. The two ids are given together or not at
+    ``on_line``, ``on_update`` and ``on_ask`` are the session's callbacks of the same names (``on_ask`` only
+    records the ask; a driver also hands it to the approval queue). ``ended(outcome, turn_id, delivery_id)``
+    gives a ``cancelled`` result for each tool call left open by a turn the caller stopped, the
+    ``input.accepted`` draft of the delivery that began the turn when the agent answered the prompt (a typed
+    answer to the client's own request id), and the result draft. The two ids are given together or not at
     all, each of common.v1's form (``turn-...``, ``dlv-...``). ``redact`` names the values no draft may carry
-    (the route's selected credential), masked as ``mask`` does."""
+    (the route's selected credential): each line is masked as ``mask`` does, and each update's params are
+    masked string by string (keys included) before a tool call's input, its digest or its result text is
+    taken from them; a float whose text spells a value is a protocol error, which abandons the turn."""
 
     def __init__(self, *, offset: int = 0, redact=()) -> None:
         self.offset = offset
         self.drafts: list[dict] = []
         self._redact = mask_forms(redact)
+        self._tools = acp_module().ToolCalls(input_digest)
+
+    def on_update(self, params) -> None:
+        self.drafts += self._tools.update(_masked(params, self._redact))
+
+    def on_ask(self, ask) -> None:
+        self._tools.asked(ask)
 
     def on_line(self, line: str) -> None:
         if not isinstance(line, str):
@@ -803,13 +815,30 @@ class AcpDrafts:
         if turn_id is not None and not (isinstance(turn_id, str) and TURN_ID.fullmatch(turn_id)
                                         and isinstance(delivery_id, str) and DELIVERY_ID.fullmatch(delivery_id)):
             raise TypeError("ended takes a turn_id of the form turn-<id> and a delivery_id of the form dlv-<id>")
-        out = []
+        out = self._tools.turn_ended(outcome.cancel_requested)
+        self._tools = acp_module().ToolCalls(input_digest)   # the next turn's calls start afresh
         if outcome.stop_reason is not None and turn_id is not None:
             out.append({"type": "input.accepted",
                         "payload": {"delivery_id": delivery_id, "turn_id": turn_id, "how": "new_turn"}})
         out.append({"type": "result", "payload": {"code": outcome.code, "detail": mask(outcome.detail, self._redact)}})
         self.drafts += out
         return out
+
+
+def _masked(value, forms):
+    """A decoded ACP value with every string in it (keys included) masked as ``mask`` does. A float whose text
+    spells a value is the agent's protocol error: it cannot be masked in place."""
+    if not forms:
+        return value
+    if isinstance(value, dict):
+        return {_masked(k, forms): _masked(v, forms) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_masked(v, forms) for v in value]
+    if isinstance(value, str):
+        return mask(value, forms)
+    if isinstance(value, float) and any(form in repr(value) for form in forms):
+        raise acp_module().AcpProtocolError("a value to keep out is still in an update once it is read")
+    return value
 
 
 # common.v1 $defs/turn_id and $defs/delivery_id.

@@ -4,7 +4,8 @@ Mode ``schema`` records what the installed Codex says its own app-server protoco
 field name in ``routes/codex.py`` rests on memory or on a source map. It runs two commands of the installed
 binary and nothing else: ``codex --version`` and the binary's own generator,
 ``codex -c check_for_update_on_startup=false app-server generate-json-schema --out <scratch>``. Neither
-signs in, reads a credential or starts a worker. It then writes one extract,
+signs in, reads a credential or starts a worker, and both get the environment mode ``run`` gives its worker
+(below). It then writes one extract,
 ``app-server-<version>.json``, into the fixtures folder: every method name the protocol defines, in its
 four tables, and a summary (required keys, property names and types, enum values) of each definition the
 Codex driver touches. With ``--native <path>`` it also records whether the native binary contains the
@@ -14,9 +15,10 @@ exact literal texts the driver matches on (today one: the ChatGPT-auth error of 
         --out core/recursion_core/routes/engines/fixtures/codex [--codex codex] [--native <codex binary>]
 
 Mode ``run`` is the founder-attended run of the session driver (``routes/engines/codex.py``), for Lucas,
-signed in with his own ``codex login`` (the tool never reads, copies or asks for a credential; the child's
-environment keeps only the names Codex needs to find its own login and drops every API-key name, so the
-run uses that login). It starts ONE app-server worker in a scratch working folder, and turns what is
+signed in with his own ``codex login`` (the tool never reads, copies or asks for a credential; every child
+it starts, the worker and ``codex --version`` alike, gets an environment that keeps only the names Codex
+needs to find its own login and drops every API-key name, so the run uses that login). It starts ONE
+app-server worker in a scratch working folder, and turns what is
 typed into driver calls:
 
     text           a user message: a new turn, or, while a turn is in progress, a steer into it
@@ -207,7 +209,11 @@ def scan_literals(native: Path, texts: tuple[str, ...] = LITERALS) -> dict:
 
 
 def _run(argv: list[str]) -> str:
-    done = subprocess.run(argv, capture_output=True, text=True, check=True, timeout=300)
+    """One command of the installed binary (``--version``, the schema generator), with the environment the
+    run's worker gets: no API-key name reaches it (the #402 reads, round 4, DeepSeek R4-3)."""
+
+    done = subprocess.run(argv, env=child_env(dict(os.environ)), capture_output=True, text=True, check=True,
+                          timeout=300)
     return done.stdout.strip()
 
 
@@ -226,7 +232,8 @@ def schema_mode(args: argparse.Namespace) -> int:
 
 
 # -- mode run ---------------------------------------------------------------------------------------------
-# Names a Codex child may inherit for the founder run: what it needs to find its own login and run tools.
+# Names any Codex child of this tool may inherit (the worker, and ``--version`` and the schema generator through
+# ``_run``: the #402 reads, round 4, DeepSeek R4-3): what it needs to find its own login and run tools.
 # Every API-key name is left out, so the run uses Codex's own login (Lucas, Nov 8: "Codex's own login only").
 CHILD_ENV_NAMES = ("PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
                    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "LANG",

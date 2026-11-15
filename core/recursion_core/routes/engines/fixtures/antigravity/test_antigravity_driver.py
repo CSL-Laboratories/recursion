@@ -313,5 +313,66 @@ class AcpDraftsTest(unittest.TestCase):
                 self.assertTrue(schema_check.fits("driver.v2.json#/$defs/event_draft", draft), draft)
 
 
+
+TOOL_KEY = "r5-made-up-custody-value-7d1"   # invented here; no real key, custody or auth file is read
+
+
+def tool_update(raw_input, text, call_id="c1"):
+    return {"sessionId": "s", "update": {"sessionUpdate": "tool_call", "toolCallId": call_id, "kind": "execute",
+                                         "status": "completed", "rawInput": raw_input,
+                                         "content": [{"type": "content", "content": {"type": "text", "text": text}}]}}
+
+
+class ToolDraftRedactionTest(unittest.TestCase):
+    """ACP tool-call drafts carry no spelling of the route's selected credential (the round-5 rule of #396,
+    applied to the drafts this slice adds). Each fails without the masking of the update's params."""
+
+    def spelled(self):
+        nested = json.dumps({"k": TOOL_KEY})                               # JSON carried inside a string
+        escaped = json.dumps(json.dumps({"k": TOOL_KEY}).replace("r", chr(92) + "u0072", 1))
+        return {"as a value": ({"cmd": "echo " + TOOL_KEY}, "out " + TOOL_KEY),
+                "as a key": ({TOOL_KEY: 1}, "ok"),
+                "inside JSON in a string": ({"body": nested}, nested),
+                "escaped inside JSON in a string": ({"body": json.loads(escaped)}, json.loads(escaped))}
+
+    def test_a_selected_value_never_reaches_a_tool_draft(self) -> None:
+        for name, (raw_input, text) in self.spelled().items():
+            with self.subTest(spelling=name):
+                drafts = ag.AcpDrafts(redact=(TOOL_KEY,))
+                drafts.on_update(tool_update(raw_input, text))
+                kinds = [d["type"] for d in drafts.drafts]
+                self.assertEqual(kinds, ["tool.call", "tool.result"])
+                for draft in drafts.drafts:
+                    value = draft
+                    for _ in range(4):
+                        self.assertNotIn(TOOL_KEY, json.dumps(value, ensure_ascii=False))
+                        value = _unwrap(value)
+                call = drafts.drafts[0]["payload"]
+                self.assertEqual(call["input_digest"], ag.input_digest(call["input"]))   # the masked input's
+
+    def test_a_float_that_spells_the_value_is_a_protocol_error(self) -> None:
+        drafts = ag.AcpDrafts(redact=("12345",))
+        with self.assertRaises(acp.AcpProtocolError):
+            drafts.on_update(tool_update({"n": 12345.0}, "ok"))
+        self.assertEqual(drafts.drafts, [])
+
+    def test_without_a_value_to_keep_out_the_input_is_carried_as_it_came(self) -> None:   # guard
+        drafts = ag.AcpDrafts()
+        drafts.on_update(tool_update({"cmd": "echo " + TOOL_KEY}, "out"))
+        self.assertEqual(drafts.drafts[0]["payload"]["input"], {"cmd": "echo " + TOOL_KEY})
+
+
+def _unwrap(value):
+    if isinstance(value, dict):
+        return {_unwrap(k): _unwrap(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_unwrap(v) for v in value]
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
 if __name__ == "__main__":
     unittest.main()

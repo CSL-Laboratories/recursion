@@ -60,14 +60,21 @@ is ever refused -32601. Every other server request is answered with JSON-RPC err
 THE UPDATER. The worker is ``codex -c check_for_update_on_startup=false app-server`` (routes/codex.py's
 override) and this module starts no other process.
 
-Not here yet: ``fork`` (false until SESSIONS asks), APPROVALS' real port, ``tool.call`` and
-``tool.result`` drafts (their input digest is RFC 8785, taken by the core), who owns a live handle
-between turns (DRIVER-CC's S9 drive owner, ``routes/workers.py``).
+TOOLS. A command, file-change, MCP or dynamic tool item the server announces (``item/started``) is a
+``tool.call`` draft: the item id as ``call_id``, the tool's name, its input as the engine gave it (the
+command and cwd, the changes, or the arguments) and ``input_digest``, the SHA-256 of that input as RFC
+8785 writes it (``control.methods.canonical_text``, SPINE's); an input over 64 KiB is not carried
+(``input: null``, the digest still of the whole). Its ``item/completed`` is the ``tool.result``:
+``ok``, ``error`` or ``denied`` from the item's status, the output text (cut at 64 KiB, ``truncated``).
+
+Not here yet: ``fork`` (false until SESSIONS asks), APPROVALS' real port, who owns a live handle between
+turns (DRIVER-CC's S9 drive owner, ``routes/workers.py``).
 """
 
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import threading
 import time
@@ -92,6 +99,9 @@ DECLINE = {"decision": "decline"}  # CommandExecutionApprovalDecision / FileChan
 ACCEPT = {"decision": "accept"}
 _DECISIONS = {"approve": ACCEPT, "deny": DECLINE}
 _UNKNOWN = {"value": None, "quality": "unknown", "provenance": "unavailable"}
+TOOL_ITEMS = ("commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall")
+CARRY_LIMIT = 64 * 1024  # bytes of a tool's input or output a draft carries
+_TOOL_STATUS = {"completed": "ok", "failed": "error", "declined": "denied"}
 # event.v1 usage field <- ThreadTokenUsage breakdown field (0.160.0). cacheWriteInputTokens is optional there.
 _USAGE_FIELDS = (("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
                  ("reasoning_tokens", "reasoningOutputTokens"), ("cache_read_tokens", "cachedInputTokens"),
@@ -119,6 +129,7 @@ class _Session:
         self.early: list[str] = []               # notifications read during start, parsed with the next line
         self.offset = 0                          # bytes of standard output read so far
         self.items: dict[str, dict] = {}         # item id -> the command or file-change item the server announced
+        self.calls: set[str] = set()             # tool call ids drafted and not yet given a result
         self.bindings: dict[str, dict] = {}      # approval id -> the pending engine request it answers (PRIVATE)
         self.session_id: str | None = None
         self.run_id: str | None = None
@@ -326,7 +337,7 @@ class CodexDriver(Driver):
             if item.get("type") in ("commandExecution", "fileChange") and isinstance(item.get("id"), str):
                 with session.lock:
                     session.items[item["id"]] = item
-            return []
+            return self._tool_call(session, item)
         if method == "serverRequest/resolved":
             with session.lock:
                 for approval_id, bound in list(session.bindings.items()):
@@ -338,7 +349,7 @@ class CodexDriver(Driver):
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str) and span is not None:
                 return [{"type": "engine.output", "payload": {"stream": "stdout", "text": item["text"],
                                                                "offset_start": span[0], "offset_end": span[1]}}]
-            return []
+            return self._tool_result(session, item)
         if method == "thread/tokenUsage/updated":
             if isinstance(params.get("turnId"), str) and isinstance(params.get("tokenUsage"), dict):
                 with session.lock:
@@ -443,6 +454,44 @@ class CodexDriver(Driver):
         if code == c.PLAN_LIMIT:
             drafts.append(self._limit_draft(session, seen))
         drafts.append({"type": "result", "payload": {"code": code, "detail": "the turn failed"}})
+        return drafts
+
+    def _tool_call(self, session: _Session, item: dict) -> list[dict]:
+        call_id = item.get("id")
+        named = _tool_name_and_input(item)
+        if named is None or not _good_id(call_id):
+            return []
+        name, tool_input = named
+        try:
+            from recursion_core.control.methods import canonical_text
+            text = canonical_text(tool_input)
+        except (ImportError, ValueError):
+            return []  # no RFC 8785 text for this input (or no canonicaliser): no digest, so no draft
+        with session.lock:
+            if call_id in session.calls:
+                return []
+            session.calls.add(call_id)
+        carried = tool_input if len(text.encode("utf-8")) <= CARRY_LIMIT else None
+        return [{"type": "tool.call", "payload": {
+            "call_id": call_id, "name": name, "input_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "input": carried}}]
+
+    def _tool_result(self, session: _Session, item: dict) -> list[dict]:
+        if item.get("type") not in TOOL_ITEMS or not _good_id(item.get("id")):
+            return []
+        status = _TOOL_STATUS.get(item.get("status"))
+        if status is None:
+            return []
+        with session.lock:
+            drafted = item["id"] in session.calls
+        drafts = [] if drafted else self._tool_call(session, item)
+        with session.lock:
+            if item["id"] not in session.calls:
+                return []
+            session.calls.discard(item["id"])
+        text, truncated = _cut(_tool_output(item))
+        drafts.append({"type": "tool.result", "payload": {"call_id": item["id"], "status": status, "text": text,
+                                                         "output_ref": None, "truncated": truncated}})
         return drafts
 
     def _usage_draft(self, session: _Session, usage: dict | None) -> dict:
@@ -559,6 +608,52 @@ def _code_of(error: dict) -> str:
     if info is None and c.sounds_like_quota(error.get("message")):
         return c.SHORT_FAULT
     return c.ENGINE_ERROR
+
+
+def _good_id(value: object) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= 128 and "\r" not in value and "\n" not in value
+
+
+def _tool_name_and_input(item: dict) -> tuple[str, dict] | None:
+    """The tool's name and its input as the engine gave it, for the four tool items of 0.160.0."""
+
+    kind = item.get("type")
+    if kind == "commandExecution" and isinstance(item.get("command"), str):
+        return "commandExecution", {"command": item["command"], "cwd": item.get("cwd")}
+    if kind == "fileChange" and isinstance(item.get("changes"), list):
+        return "fileChange", {"changes": item["changes"]}
+    if kind in ("mcpToolCall", "dynamicToolCall"):
+        tool = item.get("tool")
+        if not isinstance(tool, str) or not tool:
+            return None
+        prefix = item.get("server") if kind == "mcpToolCall" else item.get("namespace")
+        name = f"{prefix}/{tool}" if isinstance(prefix, str) and prefix else tool
+        if len(name) > 256 or "\r" in name or "\n" in name:
+            return None
+        args = item.get("arguments")
+        return name, args if isinstance(args, dict) else {"arguments": args}
+    return None
+
+
+def _tool_output(item: dict) -> str:
+    kind = item.get("type")
+    if kind == "commandExecution":
+        return item.get("aggregatedOutput") if isinstance(item.get("aggregatedOutput"), str) else ""
+    if kind == "mcpToolCall":
+        error = item.get("error") if isinstance(item.get("error"), dict) else None
+        if error is not None and isinstance(error.get("message"), str):
+            return error["message"]
+        return json.dumps(item.get("result"), sort_keys=True) if item.get("result") is not None else ""
+    if kind == "dynamicToolCall":
+        return json.dumps(item.get("contentItems"), sort_keys=True) if item.get("contentItems") is not None else ""
+    return ""
+
+
+def _cut(text: str) -> tuple[str, bool]:
+    data = text.encode("utf-8")
+    if len(data) <= CARRY_LIMIT:
+        return text, False
+    return data[:CARRY_LIMIT].decode("utf-8", errors="ignore"), True
 
 
 def _accepted(delivery: str, turn: str, how: str) -> dict:

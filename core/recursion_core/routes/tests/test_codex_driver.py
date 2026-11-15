@@ -9,6 +9,7 @@ captured fixtures come from Lucas's attended run. No real codex process, credent
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unittest
@@ -403,6 +404,78 @@ class MidTurnTest(Base):
         self.assertEqual(cx.DECLARATION.as_record(), {"engine": "codex", "driver": 2, "input_ack": True, "flags": {
             "multi_turn": True, "mid_turn_input": True, "interrupt": True, "resume": True, "fork": False,
             "permission_bridge": False, "typed_limits": True, "usage": True}})
+
+
+def item_note(method, item):
+    def note(tid):
+        params = {"threadId": "thr-1", "turnId": tid, "item": item}
+        params["startedAtMs" if method == "item/started" else "completedAtMs"] = 1
+        return {"method": method, "params": params}
+    return note
+
+
+def plain_digest(value):
+    """RFC 8785 text of a value made only of ASCII strings, lists and objects: sorted keys, no spaces."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+class ToolDraftTest(Base):
+    def drafts_of(self, notes):
+        self.open(script={1: [*notes, done()]})
+        self.driver.send(self.handle, message())
+        return [d for d in self.drain() if d["type"] in ("tool.call", "tool.result")]
+
+    def command(self, status, output="a\nb"):
+        return {"type": "commandExecution", "id": "it-1", "command": "ls", "commandActions": [], "cwd": "/w",
+                "status": status, **({"aggregatedOutput": output} if status != "inProgress" else {})}
+
+    def test_a_command_is_a_call_and_its_completion_the_result(self):
+        drafts = self.drafts_of([item_note("item/started", self.command("inProgress")),
+                                 item_note("item/completed", self.command("completed"))])
+        tool_input = {"command": "ls", "cwd": "/w"}
+        self.assertEqual(drafts, [
+            {"type": "tool.call", "payload": {"call_id": "it-1", "name": "commandExecution",
+                                              "input_digest": plain_digest(tool_input), "input": tool_input}},
+            {"type": "tool.result", "payload": {"call_id": "it-1", "status": "ok", "text": "a\nb",
+                                                "output_ref": None, "truncated": False}}])
+
+    def test_statuses(self):
+        for status, word in (("failed", "error"), ("declined", "denied")):
+            with self.subTest(status=status):
+                drafts = self.drafts_of([item_note("item/started", self.command("inProgress")),
+                                         item_note("item/completed", self.command(status, ""))])
+                self.assertEqual(drafts[-1]["payload"]["status"], word)
+
+    def test_file_changes_and_mcp_tools(self):
+        changes = [{"path": "/w/a.txt", "kind": {"type": "add"}, "diff": "x"}]
+        patch_item = {"type": "fileChange", "id": "it-2", "changes": changes, "status": "inProgress"}
+        mcp = {"type": "mcpToolCall", "id": "it-3", "server": "docs", "tool": "search", "status": "inProgress",
+               "arguments": {"q": "codex"}}
+        drafts = self.drafts_of([item_note("item/started", patch_item), item_note("item/started", mcp),
+                                 item_note("item/completed", dict(mcp, status="failed", error={"message": "down"}))])
+        self.assertEqual([(d["payload"]["call_id"], d["payload"].get("name")) for d in drafts],
+                         [("it-2", "fileChange"), ("it-3", "docs/search"), ("it-3", None)])
+        self.assertEqual(drafts[0]["payload"]["input"], {"changes": changes})
+        self.assertEqual(drafts[1]["payload"]["input_digest"], plain_digest({"q": "codex"}))
+        self.assertEqual((drafts[2]["payload"]["status"], drafts[2]["payload"]["text"]), ("error", "down"))
+
+    def test_a_completion_without_its_announcement_still_gives_the_call_first(self):
+        drafts = self.drafts_of([item_note("item/completed", self.command("completed"))])
+        self.assertEqual([d["type"] for d in drafts], ["tool.call", "tool.result"])
+
+    def test_large_input_and_output_are_cut_and_said_so(self):
+        big = "x" * (cx.CARRY_LIMIT + 10)
+        item = dict(self.command("inProgress"), command=big)
+        drafts = self.drafts_of([item_note("item/started", item),
+                                 item_note("item/completed", dict(item, status="completed", aggregatedOutput=big))])
+        self.assertIsNone(drafts[0]["payload"]["input"])
+        self.assertEqual(drafts[0]["payload"]["input_digest"], plain_digest({"command": big, "cwd": "/w"}))
+        self.assertEqual((len(drafts[1]["payload"]["text"]), drafts[1]["payload"]["truncated"]), (cx.CARRY_LIMIT, True))
+
+    def test_a_call_is_drafted_once_and_an_unfinished_one_has_no_result(self):
+        started = item_note("item/started", self.command("inProgress"))
+        drafts = self.drafts_of([started, started, item_note("item/completed", self.command("inProgress"))])
+        self.assertEqual([d["type"] for d in drafts], ["tool.call"])
 
 
 class OtherThreadTest(Base):

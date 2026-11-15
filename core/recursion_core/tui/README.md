@@ -100,8 +100,9 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   input: another key, part of another key, a paste begun beside it (an unfinished sequence that turns
   into a paste opener included), or a sequence that ended without a key (dropped by the Esc wait or the
   end of input, unknown, overlong, or broken off). A lone Esc, one key whose bytes the wait joins, and one
-  paste however it is split, are each one event and not a burst. A key sequence is burst when any of its
-  keys is. A burst `y`, or any `y` after a Stop armed by a burst `s` or `Ctrl+X k` (either key of it),
+  paste however it is split (inside a UTF-8 character too), are each one event and not a burst. A typed
+  UTF-8 character split over two reads is marked: its first bytes were held from an earlier read. A key
+  sequence is burst when any of its keys is. A burst `y`, or any `y` after a Stop armed by a burst `s` or `Ctrl+X k` (either key of it),
   cancels the Stop; a burst Enter, or the first Enter on a line opened, typed or pasted into with burst
   input, does not send it (the next Enter on its own does). The TUI says so each time. Input that arrives one key per read cannot be told from
   typing, so a slow unbracketed paste still acts as keys; bracketed paste is the protection.

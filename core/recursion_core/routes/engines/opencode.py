@@ -139,7 +139,8 @@ _CONNECTION = re.compile(r"(subscription|api_key|passthrough):.+")
 # The two HTTP-date forms RFC 9110 (5.6.7) has a recipient read that carry a zone, matched whole and parsed here (not
 # by parsedate_tz, which rewrites a year below 100 and skips words it does not know). Fields are separated by spaces
 # only; whitespace may surround the value. Names (weekday, month, zone) are read in any case, as Date.parse reads
-# them. IMF-fixdate, with its usual leniencies: an optional weekday, a day of one or two digits, optional seconds.
+# them. IMF-fixdate, with its usual leniencies: an optional weekday, a day and an hour of one or two digits, optional
+# seconds.
 _IMF_DATE = re.compile(r"\s*(?:[A-Za-z]+, *)?([0-9]{1,2}) +([A-Za-z]{3}) +([0-9]{4}) +([0-9]{1,2}):([0-9]{2})"
                        r"(?::([0-9]{2}))? +(GMT|UTC|UT|Z|[+-][0-9]{4})\s*", re.IGNORECASE)
 # rfc850-date: weekday, DD-Mon-YY, a time with seconds, a zone; its two-digit year is read by RFC 9110's 50-year rule.
@@ -535,8 +536,11 @@ def _http_date(text: str, now: float) -> float | None:
     nothing else. An unknown zone, no zone (asctime-date, which ``Date.parse`` reads in the machine's own zone), a word
     or a second time between the time and the zone, a tab or a line break between fields, and an impossible day or
     time ("32 Nov", "25:00", which ``calendar.timegm`` would roll forward) give None. A four-digit year is the year
-    written (0068 is the year 68, long past); a two-digit rfc850 year is the century of ``now`` that is not more than
-    50 years ahead of it (RFC 9110, 5.6.7).
+    written (0068 is the year 68, long past). A two-digit rfc850 year is first put in the century of ``now``; if the
+    instant it then names, zone included, is MORE than 50 calendar years after ``now``, it means the same date a
+    century earlier (RFC 9110, 5.6.7: "the most recent year in the past that had the same last two digits"), which is
+    past, so the answer is None, as for any past date. Exactly 50 years ahead stays ahead. Fifty years after a 29
+    February is the 28th.
     """
     match = _IMF_DATE.fullmatch(text) or _RFC850_DATE.fullmatch(text)
     if match is None:
@@ -547,17 +551,22 @@ def _http_date(text: str, now: float) -> float | None:
         return None
     day, hour, minute, second = int(day), int(hour), int(minute), int(second or 0)
     year = int(year_text)
+    offset = 0 if zone[0] not in "+-" else (-1 if zone[0] == "-" else 1) * (int(zone[1:3]) * 3600 + int(zone[3:]) * 60)
     if len(year_text) == 2:
         if not _FIRST_EPOCH <= now <= _LAST_EPOCH:
             return None
-        this_year = (_UNIX_EPOCH + timedelta(seconds=now)).year
-        year += this_year // 100 * 100
-        if year > this_year + 50:
-            year -= 100
+        this = _UNIX_EPOCH + timedelta(seconds=now)
+        year += this.year // 100 * 100
+        later = this.year + 50
+        # Only a leap year has 29 February, and a leap year plus 50 never is one (50 is not a multiple of 4).
+        cutoff_day = 28 if (this.month, this.day) == (2, 29) else this.day
+        # A date is whole seconds, so the fraction of a second in ``now`` cannot change which side of this it falls.
+        cutoff = calendar.timegm((later, this.month, cutoff_day, this.hour, this.minute, this.second, 0, 0, 0))
+        if calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0)) - offset > cutoff:
+            return None   # it names the same date a century earlier, which is past: no wait at all
     if not (1 <= year and 1 <= day <= calendar.monthrange(year, month)[1] and hour <= 23 and minute <= 59
             and second <= 59):
         return None
-    offset = 0 if zone[0] not in "+-" else (-1 if zone[0] == "-" else 1) * (int(zone[1:3]) * 3600 + int(zone[3:]) * 60)
     return calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0)) - offset
 
 

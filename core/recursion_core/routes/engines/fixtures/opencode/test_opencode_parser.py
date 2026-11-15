@@ -11,6 +11,7 @@ The shape checks below follow event.v1 (SPINE's ``schemas/control/v1/event.v1.js
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import inspect
 import json
@@ -377,8 +378,16 @@ class LimitTests(Shape, unittest.TestCase):
                  ({"retry-after": "Sat, 14 Nov 26 00:05:00 GMT"}, None),            # a two-digit year
                  ({"retry-after": "Sunday, 15-Nov-26 00:05:00 GMT"}, "2026-11-15T00:05:00.000Z"),   # rfc850-date
                  ({"retry-after": "sunday, 15-nov-26 00:05:00 gmt"}, "2026-11-15T00:05:00.000Z"),
-                 ({"retry-after": "Sunday, 15-Nov-76 00:05:00 GMT"}, "2076-11-15T00:05:00.000Z"),   # 50 years on
+                 ({"retry-after": "Sunday, 15-Nov-76 00:05:00 GMT"}, None),         # 1976: more than 50 years on
                  ({"retry-after": "Sunday, 15-Nov-77 00:05:00 GMT"}, None),         # 1977: more than 50 ahead
+                 ({"retry-after": "Friday, 13-Nov-76 23:59:59 GMT"}, "2076-11-13T23:59:59.000Z"),   # the 50-year
+                 ({"retry-after": "Saturday, 14-Nov-76 00:00:00 GMT"}, "2076-11-14T00:00:00.000Z"), # boundary is
+                 ({"retry-after": "Saturday, 14-Nov-76 00:00:01 GMT"}, None),                       # the instant,
+                 ({"retry-after": "Saturday, 14-Nov-76 01:30:00 +0130"}, "2076-11-14T00:00:00.000Z"),   # zone in
+                 ({"retry-after": "Saturday, 14-Nov-76 01:30:01 +0130"}, None),
+                 ({"retry-after": "Sat, 14 Nox 2027 00:05:00 GMT"}, None),          # not a month (a future year)
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 UT"}, "2026-11-14T00:05:00.000Z"),
+                 ({"retry-after": "Sat, 14 Nov 2026 0:05:00 GMT"}, "2026-11-14T00:05:00.000Z"),     # one-digit hour
                  ({"retry-after": "Sunday, 15-Nov-2026 00:05:00 GMT"}, None),       # rfc850 has two digits
                  ({"retry-after": "Sunday, 15-Nov-26 00:05 GMT"}, None),            # and seconds
                  ({"retry-after": "Sun Nov 15 00:05:00 2026"}, None),               # asctime-date: no zone
@@ -1070,6 +1079,20 @@ class ReviewOneTests(Shape, unittest.TestCase):
                 error = v1_error({"message": "x", "statusCode": 429, "isRetryable": True, "responseHeaders": headers})
                 (limit,) = typed(p.feed(line(error)), "limit")
                 self.assertIsNone(limit["reset_at"])
+
+    def test_r5_the_fifty_year_cutoff_is_an_instant_on_any_day(self):
+        def reset_at(wall: float, value: str):
+            p = parser(wall=wall)
+            error = v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                              "responseHeaders": {"retry-after": value}})
+            return typed(p.feed(line(error)), "limit")[0]["reset_at"]
+
+        leap_noon = calendar.timegm((2028, 2, 29, 12, 0, 0, 0, 0, 0))      # 50 years after a 29 February: the 28th
+        self.assertEqual(reset_at(leap_noon, "Monday, 28-Feb-78 12:00:00 GMT"), "2078-02-28T12:00:00.000Z")
+        self.assertIsNone(reset_at(leap_noon, "Monday, 28-Feb-78 12:00:01 GMT"))
+        year_end = calendar.timegm((2026, 12, 31, 23, 0, 0, 0, 0, 0))       # the zone moves the date across a year
+        self.assertEqual(reset_at(year_end, "Friday, 01-Jan-77 00:30:00 +0200"), "2076-12-31T22:30:00.000Z")
+        self.assertIsNone(reset_at(year_end, "Friday, 01-Jan-77 01:30:00 +0200"))
 
     def test_r4_the_first_and_last_writable_instants(self):
         self.assertEqual(oc._timestamp(oc._FIRST_EPOCH), "0001-01-01T00:00:00.000Z")

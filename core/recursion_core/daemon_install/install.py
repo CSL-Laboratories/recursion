@@ -57,6 +57,7 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     check_dirs(paths.home, paths.unit_dir)
     if os.path.lexists(paths.unit):
         current, info = read_regular_and_stat(paths.unit)  # owner and mode of the file read, not looked up again
+        _still_the_file_read(paths.unit, info)
         if current != unit:
             raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
         why = file_untrusted(paths.unit, info)
@@ -78,6 +79,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
     current, info = read_regular_and_stat(paths.unit)
+    _still_the_file_read(paths.unit, info)
     if current == unit and not file_untrusted(paths.unit, info):
         return _plan("upgrade", False, paths)
     replace_regular(paths.unit, unit, _UNIT_MODE)
@@ -92,11 +94,30 @@ def uninstall(roots: Roots) -> Plan:
     if os.path.lexists(paths.enabled):
         raise InstallRefused("unit_enabled", f"run `systemctl --user disable --now {UNIT_NAME}` first")
     if os.path.lexists(paths.unit):
-        first = read_regular(paths.unit).split(b"\n", 1)[0]
+        try:
+            first = read_regular(paths.unit).split(b"\n", 1)[0]
+        except InstallRefused as refusal:
+            if refusal.kind != "unit_missing":
+                raise
+            return _plan("uninstall", False, paths)  # removed since the lexists above: nothing is left to remove
         if first != MARKER.encode():
             raise InstallRefused("unit_not_ours", f"{paths.unit} was not written by `recursiond install`; it is left as it is")
     removed = unlink_regular(paths.unit)
     return _plan("uninstall", removed, paths)
+
+
+def _still_the_file_read(path: str, info: os.stat_result) -> None:
+    """Refuse unless ``path`` still names the file that was read (the same device and inode), so the
+    answer is never about a file that is no longer there: removed meanwhile (a concurrent
+    ``uninstall``) is ``unit_missing``, replaced is ``unit_changed``. Nothing is written either way, and
+    the command run again reads what is there then."""
+
+    try:
+        now = os.lstat(path)
+    except FileNotFoundError:
+        raise InstallRefused("unit_missing", f"{path} was removed while it was read; run the command again") from None
+    if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+        raise InstallRefused("unit_changed", f"{path} was replaced while it was read; run the command again")
 
 
 def leftovers(roots: Roots) -> tuple[str, ...]:

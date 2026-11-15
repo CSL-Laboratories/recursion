@@ -179,10 +179,13 @@ def read_regular(path: str) -> bytes:
 def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
     """``read_regular``, with the ``fstat`` of the descriptor the bytes were read through: the owner
     and mode of the very file that was read. A second lookup by name could find another file, or
-    none (a concurrent ``uninstall``), and raise where a refusal is due."""
+    none (a concurrent ``uninstall``), and raise where a refusal is due. A file that is gone by the
+    time it is opened is ``unit_missing``, not a file of the wrong type."""
 
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:  # removed since the caller saw it (a concurrent uninstall)
+        raise InstallRefused("unit_missing", f"{path} was removed before it could be read; run the command again") from None
     except OSError as exc:
         raise InstallRefused("not_regular", path) from exc
     try:

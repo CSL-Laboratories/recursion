@@ -531,17 +531,190 @@ def approval_problems(record: dict) -> list:
 # ----------------------------------------------------------------------------- the shape of a record
 PUBLISHED = Path(__file__).resolve().parent.parent / "schemas" / "control" / "v1"
 _READ: dict = {}
+_READ_LOCATIONS: dict = {}      # the published set's schema locations, found once, when the whole set has been checked
 _NOT_RULES = ("$schema", "$id", "$defs", "title", "description", "x-version", "then", "else")
+_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+_DOCUMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# Keywords whose value is a schema, a list of schemas, or schemas by name: the schema locations below a schema.
+_ONE_SCHEMA = ("not", "if", "then", "else", "items", "additionalProperties")
+_SCHEMA_LIST = ("allOf", "anyOf", "oneOf")
+_SCHEMA_MAP = ("$defs", "properties")
+_SAME_VALUE = ("not", "if", "then", "else")    # with every list of schemas: read against the value the schema itself reads
+
+
+def _count(want) -> bool:
+    return type(want) is int and want >= 0
+
+
+def _number(want) -> bool:
+    return isinstance(want, (int, float)) and not isinstance(want, bool)
+
+
+def _names(want) -> bool:
+    return isinstance(want, list) and all(isinstance(name, str) for name in want) and len(set(want)) == len(want)
+
+
+def _types(want) -> bool:
+    kinds = ("null", "boolean", "integer", "number", "string", "array", "object")
+    return want in kinds if isinstance(want, str) else (isinstance(want, list) and bool(want) and _names(want)
+                                                         and all(kind in kinds for kind in want))
+
+
+def _pattern(want) -> bool:
+    try:
+        return isinstance(want, str) and re.compile(want) is not None
+    except re.error:
+        return False
+
+
+# The form of the value of every keyword that is a rule and does not hold schemas: a value of another form is not
+# read as if it were one (a string where a list of names belongs would be read one character at a time).
+_RULE_VALUE = {
+    "type": _types, "enum": lambda want: isinstance(want, list), "const": lambda want: True,
+    "minLength": _count, "maxLength": _count, "minItems": _count, "maxItems": _count, "pattern": _pattern,
+    "x-instant": lambda want: isinstance(want, bool), "uniqueItems": lambda want: isinstance(want, bool),
+    "minimum": _number, "maximum": _number, "exclusiveMinimum": _number, "required": _names,
+    "dependentRequired": lambda want: isinstance(want, dict) and all(_names(others) for others in want.values()),
+}
 
 
 def published() -> dict:
-    """The schemas of the published folder beside this file, by file name. Read once."""
+    """The schemas of the published folder beside this file, by file name. Read once, and checked once by the
+    first ``fits`` that reads them: they are not changed in place afterwards."""
     if not _READ:
         for file in sorted(PUBLISHED.glob("*.json")):
             schema = json.loads(file.read_text(encoding="utf-8"))
             if isinstance(schema, dict) and "$schema" in schema:
                 _READ[file.name] = schema
     return _READ
+
+
+def _pointer(tokens) -> str:
+    return "".join("/" + str(token).replace("~", "~0").replace("/", "~1") for token in tokens)
+
+
+def _walk(name: str, schema, at: tuple, found: set, refs: list, same: dict) -> None:
+    """Every schema location of one document, from the location ``at`` down: a location is recorded by its tokens
+    and checked for the vocabulary this reader supports. Values of const and enum, the names of properties and
+    of definitions, and instance data are not schema locations and are not walked. ``same`` gets, for each
+    location, the locations read against the same value as it (its alternatives, its conditions, its $ref)."""
+    where = f"{name}#{_pointer(at)}"
+    if isinstance(schema, bool):
+        found.add(at)
+        return
+    if not isinstance(schema, dict):
+        raise ValueError(f"{where} is not a schema")
+    found.add(at)
+    edges = same.setdefault((name, at), [])
+    for keyword, want in schema.items():
+        if keyword in ("$id", "$schema") and at:
+            raise ValueError(f"{where} carries {keyword} below the root of its document, which this reader does not support")
+        if keyword in _SCHEMA_MAP:
+            if not isinstance(want, dict):
+                raise ValueError(f"{where}: {keyword} is not schemas by name")
+            for key, part in want.items():
+                _walk(name, part, at + (keyword, key), found, refs, same)
+        elif keyword in _SCHEMA_LIST:
+            if not isinstance(want, list) or not want:
+                raise ValueError(f"{where}: {keyword} is not a list of schemas")
+            for index, part in enumerate(want):
+                edges.append((name, at + (keyword, index)))
+                _walk(name, part, at + (keyword, index), found, refs, same)
+        elif keyword in _ONE_SCHEMA:
+            if keyword in _SAME_VALUE:
+                edges.append((name, at + (keyword,)))
+            _walk(name, want, at + (keyword,), found, refs, same)
+        elif keyword == "$ref":
+            if not isinstance(want, str):
+                raise ValueError(f"{where}: $ref is not a string")
+            refs.append((name, at, want))
+        elif keyword in _RULE_VALUE:
+            if not _RULE_VALUE[keyword](want):
+                raise ValueError(f"{where}: the value of {keyword!r} is not of the form this reader reads")
+        elif keyword not in _NOT_RULES:
+            raise ValueError(f"the schema uses {keyword!r}, which this reader does not know")
+
+
+def _target(schemas: dict, found: dict, base: str, ref: str) -> tuple:
+    """Refuse (``ValueError``) a reference this reader would not resolve as the dialect does. Resolved: a bare
+    document name of the set or none (the document itself), then nothing or a JSON Pointer that steps through
+    objects only and ends at a schema location. Refused: any other URI (an absolute one, a path, another base),
+    a fragment that is a name and not a pointer, a percent-encoded pointer, a pointer through an array or into
+    a value that is not a schema, and a pointer to nothing."""
+    document, _, pointer = ref.partition("#")
+    document = document or base
+    if document not in schemas:
+        raise ValueError(f"the reference {ref!r} names no document of the set by its bare name")
+    if "%" in pointer or (pointer and not pointer.startswith("/")):
+        raise ValueError(f"the reference {ref!r} has a fragment that is not an unencoded JSON Pointer")
+    node, tokens = schemas[document], ()
+    for token in pointer.split("/")[1:]:
+        if re.search("~(?![01])", token):
+            raise ValueError(f"the reference {ref!r} has {token!r}, which is not a JSON Pointer token")
+        if not isinstance(node, dict):
+            raise ValueError(f"the reference {ref!r} points through an array or into a value, which this reader does not support")
+        key = token.replace("~1", "/").replace("~0", "~")
+        if key not in node:
+            raise ValueError(f"the reference {ref!r} points to nothing")
+        node, tokens = node[key], tokens + (key,)
+    if tokens not in found[document]:
+        raise ValueError(f"the reference {ref!r} points to a value that is not a schema")
+    return document, tokens
+
+
+def _no_loop(same: dict) -> None:
+    """Refuse (``ValueError``) a schema that comes back to itself through references, alternatives or
+    conditions without reading any deeper value: the dialect leaves that undefined, and read it would never end."""
+    state: dict = {}
+    for start in same:
+        if start in state:
+            continue
+        state[start], path = "open", [(start, iter(same[start]))]
+        while path:
+            node, ahead = path[-1]
+            for child in ahead:
+                if state.get(child) == "open":
+                    raise ValueError(f"{child[0]}#{_pointer(child[1])} comes back to itself on the same value")
+                if child not in state:
+                    state[child] = "open"
+                    path.append((child, iter(same.get(child, ()))))
+                    break
+            else:
+                state[node] = "done"
+                path.pop()
+
+
+def _locations(schemas: dict) -> dict:
+    """Check the whole schema set before any instance is looked at, and return its schema locations by
+    document; or raise ``ValueError``. Every document is checked, whether or not a reference reaches it."""
+    if not isinstance(schemas, dict):
+        raise ValueError("a schema set is schemas by document name")
+    found: dict = {}
+    refs: list = []
+    same: dict = {}
+    for name, document in schemas.items():
+        if not isinstance(name, str) or not _DOCUMENT_NAME.match(name):
+            raise ValueError(f"{name!r} is not a bare document name")
+        if isinstance(document, dict):
+            if document.get("$schema", _DIALECT) != _DIALECT:
+                raise ValueError(f"{name}: this reader reads the dialect {_DIALECT} and no other")
+            if document.get("$id", name) != name:
+                raise ValueError(f"{name}: a root $id other than the document's own name moves the base its references resolve against")
+        found[name] = set()
+        _walk(name, document, (), found[name], refs, same)
+    for name, at, ref in refs:
+        same[(name, at)].append(_target(schemas, found, name, ref))
+    _no_loop(same)
+    return found
+
+
+def _supported(schemas: dict) -> dict:
+    """The schema locations of a checked set: the published set's are found once, any other set's every time."""
+    if schemas is _READ and _READ:
+        if not _READ_LOCATIONS:
+            _READ_LOCATIONS.update(_locations(_READ))
+        return _READ_LOCATIONS
+    return _locations(schemas)
 
 
 def _kind(value) -> str:
@@ -656,9 +829,36 @@ def fits(ref: str, value, schemas: dict | None = None) -> bool:
 
     The reader knows the keywords the published files use and refuses a schema that uses any other
     (``ValueError``): a rule it does not know is never passed over as if it were not there.
+
+    Validate the supported schema vocabulary before evaluating an instance. An unsupported keyword anywhere in a
+    schema location, including an unused definition, absent property, unselected conditional branch or
+    short-circuited alternative, makes the schema unsupported and raises ValueError. Walk schema locations, not
+    property names or arbitrary values in const, enum or instance data. Instance control flow must not decide
+    whether a schema is supported. Before validating an instance, fits checks every schema position in its
+    supplied schema set for supported vocabulary, including definitions, alternatives and both conditional
+    branches.
+
+    Every accepted reference is resolved with the correct resource base and JSON Pointer semantics. This reader
+    either implements embedded resource identifiers and the reference forms it accepts, or rejects those schema
+    programs with ValueError before instance validation. An ignored resource identifier, KeyError or TypeError is
+    not a validation result.
+
+    So, before it looks at ``value``, it checks every document of ``schemas`` whole (the published set once, when
+    it is first read; a set handed to it at every call) and refuses (``ValueError``): a keyword it does not know,
+    at any schema location; a keyword whose value is not of the form it reads (a string where a list of names
+    belongs); ``$id`` or ``$schema`` below the root of a document, a root ``$id`` that is not the document's own
+    name, and a ``$schema`` other than Draft 2020-12; and every reference it would not resolve as the dialect
+    does: one that names a document other than by its bare name in the set, a fragment that is not an unencoded
+    JSON Pointer, a pointer through an array, into a value that is not a schema, or to nothing. ``ref`` itself is
+    held to the same. None of these forms occurs in the published files, and none may start to: the first
+    ``fits`` of the published set would refuse it. A schema that comes back to itself through references,
+    alternatives or conditions without reading a deeper value (``{"$ref": "#"}``) is refused as well: the
+    dialect leaves it undefined, and reading it would never end.
     """
     schemas = published() if schemas is None else schemas
+    found = _supported(schemas)
     name, _, _ = ref.partition("#")
+    _target(schemas, found, name, ref)
     return _fits(schemas, name, {"$ref": ref}, value)
 
 
@@ -1024,7 +1224,12 @@ class ApprovalModel:
     'request_invalid' naming the field, keeps no receipt and changes nothing; the same command id with
     the same params returns the first answer, and with other
     params is 'conflict' (command_id_reused): such a replay is HISTORICAL, it reports what was answered
-    and never carries an effect out again; then, before a fresh answer is taken, the current time is
+    and never carries an effect out again; then, before either fresh operation (approval.open as well as
+    approval.answer) reads any member of the retained record, the record's published shape is validated:
+    a restored record that is not the shape of an approval raises ``Refused("record_invalid")``, the
+    core's own refusal and not an answer of either method (the method table gains no code), and keeps no
+    receipt and changes neither record, binding nor receipts, while a replay of a kept receipt stays
+    historical and is answered as before; then, before a fresh answer is taken, the current time is
     compared with expires_at under the same serialisation as the request's state: at or after the
     deadline a pending request becomes 'expired' with no answer, answerer or answer time, and the
     fresh answer is 'conflict' (already_resolved); a request that is no longer pending is 'conflict'
@@ -1050,14 +1255,27 @@ class ApprovalModel:
     receipts or consumption state. An approved or consumed record must carry answer approve and the
     required answerer and answer time. Restoration is not permission to execute malformed durable data.
 
-    The refusals of a change, in the order they are looked for: ``nothing_to_change`` (neither an effect
+    Before consumption reads state or any other required member, validate the approval record's shape; an
+    invalid record is record_invalid. Before change reads the retained state, source, effect or revision,
+    validate the structural prerequisites needed to build and compare its candidate. A missing or wrongly
+    typed prerequisite is record_invalid, not a host exception. These refusals leave record, revision,
+    binding, receipts and consumption state unchanged. State-specific refusals apply to structurally valid
+    state values. A change validates the retained state's shape before branching, and validates a pending
+    record's complete shape before reading its source, effect or revision to build a candidate.
+
+    The refusals of a change, in the order they are looked for: ``record_invalid`` (a retained state that
+    is missing or is not a state of the published shape); ``resolved`` (a state other than pending);
+    ``record_invalid`` (a pending record that is not the published shape of an approval: a member
+    missing, of another type or outside its list, so that the candidate cannot be built from it);
+    ``nothing_to_change`` (neither an effect
     nor a deadline); ``effect`` (not the shape of an effect of the request's source: a member more or
     less, a value outside its list, its pattern or its range, an effect of the other source);
     ``target`` (a well-shaped effect that is bound to another run, session or engine, or comes from
     another plugin, than the effect it replaces); the renderer's own code for an effect that cannot be
     drawn whole (``too_many_lines``, ``too_large`` and the like); ``timestamp`` (a deadline that is not
-    a real instant); ``record_invalid`` (the candidate as a whole is not the shape of an approval, which
-    with a well-shaped effect means the record it was made from was not); and, for whatever else does
+    a real instant); ``record_invalid`` (the candidate as a whole is not the shape of an approval: checked
+    although the record it was made from was checked whole, so that lines the renderer drew outside the
+    published shape are never committed); and, for whatever else does
     not agree inside the candidate, the first word ``approval_problems`` gives for it. After validating a
     proposed effect's source and shape, change preserves engine/session/run for engine_tool and
     plugin_id/run for plugin_effect; a different retained target is refused as target without changing
@@ -1132,6 +1350,8 @@ class ApprovalModel:
             if first_payload == payload:
                 return copy.deepcopy(first_answer)
             return {"code": "conflict", "detail": "command_id_reused"}
+        if not fits("approval.v1.json", self.record):   # a fresh operation reads only a record that is an approval
+            raise Refused("record_invalid")
         answer = self._open(principal, params, at) if method == "approval.open" else self._answer(principal, params, at)
         self.receipts[receipt_key] = (payload, copy.deepcopy(answer))
         return answer
@@ -1169,8 +1389,14 @@ class ApprovalModel:
 
     def change(self, effect: dict | None = None, expires_at: str | None = None) -> None:
         record = self.record
+        # The retained record is read only once what is read of it is known to be there: its state first, and a
+        # pending record whole, before its source, effect or revision is read to build a candidate.
+        if "state" not in record or not fits("approval.v1.json#/properties/state", record["state"]):
+            raise Refused("record_invalid")
         if record["state"] != "pending":
             raise Refused("resolved")
+        if not fits("approval.v1.json", record):
+            raise Refused("record_invalid")
         if effect is None and expires_at is None:
             raise Refused("nothing_to_change")
         candidate = copy.deepcopy(record)           # nothing below touches the record until the candidate is whole
@@ -1203,11 +1429,13 @@ class ApprovalModel:
 
     def consume(self, revision: int, digest: str, binding: dict | None) -> None:
         record = self.record
+        if not fits("approval.v1.json", record):    # its shape before its state or any other member is read
+            raise Refused("record_invalid")
         if record["state"] == "consumed":
             raise Refused("already_consumed")
         if record["state"] != "approved":
             raise Refused("not_approved")
-        if not fits("approval.v1.json", record) or approval_problems(record):
+        if approval_problems(record):               # and what must agree inside it, before it is carried out
             raise Refused("record_invalid")
         if (revision, digest) != (record["revision"], record["digest"]):
             raise Refused("approval_mismatch")

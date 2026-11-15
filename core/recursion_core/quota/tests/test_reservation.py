@@ -334,6 +334,49 @@ class AdmissionTest(Case):
         self.assertEqual(self.res.admit("subscription:login-B", route(conn_id="login-B"), "run-f6")["reason"],
                          "no_spend")  # another login's reading is not this one's
 
+    def test_a_fresh_free_reading_on_a_reused_free_hold_is_kept(self):
+        # Second reads, change 1 of both (sol: test_r2_free_retry_persists_typed_transition_for_next_missing_read and
+        # test_r2_same_run_free_reading_survives_reuse; astra: test_R2_inactive_read_on_reused_free_hold_is_not_lost).
+        self.reads.paid_by[SUB] = False
+        first = self.res.admit(SUB, route(), RUN_A)
+        self.reads.paid_by[SUB] = True
+        self.assertRefused(self.res.admit(SUB, route(), RUN_B), "consent_unsupported")
+        self.reads.paid_by[SUB] = False
+        retry = self.res.admit(SUB, route(), RUN_A)  # free again: the reading is written with a new zero hold
+        self.assertEqual((retry["allowed"], retry["metered"]), (True, False))
+        self.assertNotEqual(retry["reservation_id"], first["reservation_id"])
+        [now] = held(self.store)
+        self.assertEqual((now["reservation_id"], now["paid_fallback"]), (retry["reservation_id"], "inactive"))
+        self.reads.paid_by[SUB] = None
+        same = self.res.admit(SUB, route(), RUN_A)  # the same run, no reading: still free, the same hold
+        self.assertEqual((same["allowed"], same["reservation_id"]), (True, retry["reservation_id"]))
+        restarted = R.Reservations(self.store, self.keys, reads=self.reads)  # another service on the same store
+        other = restarted.admit(SUB, route(), RUN_C)
+        self.assertEqual((other["allowed"], other["reason"], other["metered"]), (True, "no_spend", False))
+
+    def test_an_unchanged_reading_reuses_the_free_hold(self):
+        self.reads.paid_by[SUB] = False
+        first = self.res.admit(SUB, route(), RUN_A)
+        count = len(rows(self.store))
+        self.assertEqual(self.res.admit(SUB, route(), RUN_A)["reservation_id"], first["reservation_id"])
+        self.assertEqual(len(rows(self.store)), count)
+
+    def test_an_active_reading_is_scoped_to_its_connection(self):
+        # Second read, astra change 2: the last reading is the connection's own.
+        self.reads.paid_by[SUB] = True
+        self.assertRefused(self.res.admit(SUB, route(), RUN_A), "consent_unsupported")
+        other = self.res.admit("subscription:login-B", route(conn_id="login-B"), RUN_B)
+        self.assertEqual((other["allowed"], other["reason"]), (True, "no_spend"))
+
+    def test_repeated_missing_readings_never_erase_an_active_one(self):
+        # Second read, astra change 2: rows written without a reading are not readings.
+        self.reads.paid_by[SUB] = True
+        self.assertRefused(self.res.admit(SUB, route(), RUN_A), "consent_unsupported")
+        self.reads.paid_by[SUB] = None
+        self.assertRefused(self.res.admit(SUB, route(), RUN_B), "consent_unsupported")
+        self.assertRefused(self.res.admit(SUB, route(), RUN_C), "consent_unsupported")
+        self.assertEqual(held(self.store), [])
+
     def test_a_failed_or_untyped_reading_refuses(self):
         # Review R2 (both): a failure, or an answer that is neither True, False nor None, is not free billing.
         class Failing(Reads):

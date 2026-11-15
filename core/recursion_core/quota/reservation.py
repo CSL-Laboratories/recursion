@@ -287,7 +287,7 @@ class Reservations:
                 own = row  # a retried start: this run's reservation on this connection
             else:
                 self._close(tx, row, SUPERSEDED)  # the run is admitted on another connection now
-        reading = None
+        reading = stored = None
         if basis is None:
             observed = self._paid_fallback(tx, connection)
             if observed is _FAILED:
@@ -295,14 +295,17 @@ class Reservations:
                                     None, None, None)
             if observed is not None:
                 reading = "active" if observed else "inactive"
-            last = reading or self._last_reading(tx, connection)
-            if last == "active":
+            stored = self._last_reading(tx, connection)
+            if (reading or stored) == "active":
                 basis = PLAN_PAID_FALLBACK
         if basis is None:
             if own is not None:
-                if not own["metered"]:
+                # A free hold is reused only when there is no fresh typed reading to keep, or it is the one already
+                # kept. A changed reading (inactive after another run's active) is written with a new zero hold, so
+                # the next attempt that gets no reading finds it (second reads, change 1 of both).
+                if not own["metered"] and (reading is None or reading == stored):
                     return _answer(True, own["reservation_id"], NO_SPEND, False)
-                self._close(tx, own, SUPERSEDED)  # it held money; this attempt spends none
+                self._close(tx, own, SUPERSEDED)  # it held money, or a fresh reading must be kept
             return self._hold(tx, run_id, connection, engine, model, None, NO_SPEND, ZERO, None, None, reading)
 
         if basis != API_KEY:

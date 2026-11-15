@@ -15,6 +15,7 @@ import calendar
 import hashlib
 import inspect
 import json
+import math
 import re
 import sys
 import unittest
@@ -387,6 +388,7 @@ class LimitTests(Shape, unittest.TestCase):
                  ({"retry-after": "Saturday, 14-Nov-76 01:30:01 +0130"}, None),
                  ({"retry-after": "Sat, 14 Nox 2027 00:05:00 GMT"}, None),          # not a month (a future year)
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 UT"}, "2026-11-14T00:05:00.000Z"),
+                 ({"retry-after": "Sunday, 15-Nov-26 00:05:00 UT"}, "2026-11-15T00:05:00.000Z"),   # rfc850, UT
                  ({"retry-after": "Sat, 14 Nov 2026 0:05:00 GMT"}, "2026-11-14T00:05:00.000Z"),     # one-digit hour
                  ({"retry-after": "Sunday, 15-Nov-2026 00:05:00 GMT"}, None),       # rfc850 has two digits
                  ({"retry-after": "Sunday, 15-Nov-26 00:05 GMT"}, None),            # and seconds
@@ -1093,6 +1095,39 @@ class ReviewOneTests(Shape, unittest.TestCase):
         year_end = calendar.timegm((2026, 12, 31, 23, 0, 0, 0, 0, 0))       # the zone moves the date across a year
         self.assertEqual(reset_at(year_end, "Friday, 01-Jan-77 00:30:00 +0200"), "2076-12-31T22:30:00.000Z")
         self.assertIsNone(reset_at(year_end, "Friday, 01-Jan-77 01:30:00 +0200"))
+
+    def reset_pair(self, wall: float, value: str) -> tuple:
+        p = parser(wall=wall)
+        error = v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                          "responseHeaders": {"retry-after": value}})
+        (limit,) = typed(p.feed(line(error)), "limit")
+        p.end(1)
+        return limit["reset_at"], p.route_result("r1")["limit"]["reset_at"]
+
+    def test_r6_a_fraction_of_a_second_in_the_clock_never_moves_the_fifty_year_cutoff(self):
+        for fraction in (0.001, 0.125, 0.5, 0.999):
+            with self.subTest(fraction):
+                self.assertEqual(self.reset_pair(WALL + fraction, "Saturday, 14-Nov-76 00:00:01 GMT"), (None, None))
+                self.assertEqual(self.reset_pair(WALL + fraction, "Saturday, 14-Nov-76 00:00:00 GMT")[0],
+                                 "2076-11-14T00:00:00.000Z")
+        just_before_next_second = math.nextafter(WALL + 1, -math.inf)   # timedelta would round it up to WALL + 1
+        self.assertEqual(self.reset_pair(just_before_next_second, "Saturday, 14-Nov-76 00:00:01 GMT"), (None, None))
+        self.assertEqual(self.reset_pair(math.nextafter(WALL + 86400, -math.inf), "Sunday, 15-Nov-76 00:00:00 GMT"),
+                         (None, None))
+        leap = math.nextafter(float(calendar.timegm((2028, 2, 29, 12, 0, 1, 0, 0, 0))), -math.inf)
+        self.assertEqual(self.reset_pair(leap, "Monday, 28-Feb-78 12:00:01 GMT"), (None, None))
+        just_after = math.nextafter(WALL + 1, math.inf)
+        self.assertEqual(self.reset_pair(just_after, "Saturday, 14-Nov-76 00:00:01 GMT")[0], "2076-11-14T00:00:01.000Z")
+
+    def test_r6_a_two_digit_year_at_the_ends_of_the_writable_clock_gives_an_answer_not_an_error(self):
+        first_year = float(calendar.timegm((1, 1, 1, 0, 0, 0, 0, 0, 0)))
+        self.assertEqual(self.reset_pair(first_year, "Monday, 01-Jan-00 00:00:00 GMT"), (None, None))   # the year 0
+        for year in (9950, 9999):
+            with self.subTest(year):
+                now = float(calendar.timegm((year, 11, 14, 0, 0, 0, 0, 0, 0)))
+                self.assertEqual(self.reset_pair(now, "Monday, 01-Jan-00 00:00:00 GMT"), (None, None))   # past
+                self.assertEqual(self.reset_pair(now, f"Monday, 15-Nov-{year % 100:02d} 00:05:00 GMT"),
+                                 (f"{year}-11-15T00:05:00.000Z", CLOCK + 86700))                     # tomorrow
 
     def test_r4_the_first_and_last_writable_instants(self):
         self.assertEqual(oc._timestamp(oc._FIRST_EPOCH), "0001-01-01T00:00:00.000Z")

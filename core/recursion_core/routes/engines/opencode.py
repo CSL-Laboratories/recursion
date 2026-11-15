@@ -555,19 +555,22 @@ def _http_date(text: str, now: float) -> float | None:
     if len(year_text) == 2:
         if not _FIRST_EPOCH <= now <= _LAST_EPOCH:
             return None
-        this = _UNIX_EPOCH + timedelta(seconds=now)
+        # The whole second of now: timedelta would round a fraction such as .9999998 up into the next second. A date
+        # is whole seconds, so it lies past "now plus 50 years" exactly when it lies past this second plus 50 years.
+        this = _UNIX_EPOCH + timedelta(seconds=math.floor(now))
         year += this.year // 100 * 100
-        later = this.year + 50
-        # Only a leap year has 29 February, and a leap year plus 50 never is one (50 is not a multiple of 4).
-        cutoff_day = 28 if (this.month, this.day) == (2, 29) else this.day
-        # A date is whole seconds, so the fraction of a second in ``now`` cannot change which side of this it falls.
-        cutoff = calendar.timegm((later, this.month, cutoff_day, this.hour, this.minute, this.second, 0, 0, 0))
-        if calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0)) - offset > cutoff:
-            return None   # it names the same date a century earlier, which is past: no wait at all
+    # The date is checked before anything is computed from it (timegm refuses the year 0).
     if not (1 <= year and 1 <= day <= calendar.monthrange(year, month)[1] and hour <= 23 and minute <= 59
             and second <= 59):
         return None
-    return calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0)) - offset
+    moment = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0)) - offset
+    if len(year_text) == 2 and this.year + 50 <= 9999:   # a later cutoff lies past every date that can be written
+        # Only a leap year has 29 February, and a leap year plus 50 never is one (50 is not a multiple of 4).
+        cutoff_day = 28 if (this.month, this.day) == (2, 29) else this.day
+        cutoff = calendar.timegm((this.year + 50, this.month, cutoff_day, this.hour, this.minute, this.second, 0, 0, 0))
+        if moment > cutoff:
+            return None   # it names the same date a century earlier, which is past: no wait at all
+    return moment
 
 
 def _timestamp(epoch: float) -> str | None:

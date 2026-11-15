@@ -10,6 +10,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import types
 import unittest
 from unittest import mock
 
@@ -363,6 +364,304 @@ class FailedAuthLimitTest(unittest.TestCase):
         for kwargs in ({"max_failures": 0}, {"window_s": 0}, {"window_s": float("nan")}, {"max_peers": 0}):
             with self.assertRaises(ValueError):
                 FailedAuthLimit(**kwargs)
+
+
+@NEEDS_POSIX
+class ReviewAnswersTest(unittest.TestCase):
+    """The reads of #377 and #385 (Codex GPT-6 Astra and GPT-6.1 Sol): durability, typed refusals, the page's door."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-r1-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.dir = os.path.join(self.base, "state")
+        self.path = os.path.join(self.dir, "credentials.json")
+        self.wall = Clock()
+        self.events: list[tuple[str, dict]] = []
+
+    def store(self, **kwargs) -> CredentialStore:
+        kwargs.setdefault("emit", lambda kind, payload: self.events.append((kind, payload)))
+        kwargs.setdefault("wall", self.wall)
+        return CredentialStore(self.path, **kwargs)
+
+    def kinds(self) -> list[str]:
+        return [kind for kind, _ in self.events]
+
+    # -- revocation that is answered only once written --------------------------------------------------
+    def test_a_failed_revocation_is_written_by_the_retry_and_notified_once(self) -> None:
+        store = self.store()
+        token, cred = store.mint("device", "phone-1", ["read"])
+        real_write = store._write
+        with mock.patch.object(store, "_write", side_effect=CredentialStoreError("disk full")):
+            with self.assertRaises(CredentialStoreError):
+                store.revoke(cred.token_id)
+        with self.assertRaises(CredentialRefused):
+            store.verify(token, peer="p")                     # refused in memory from the first call
+        first = store.grants()[0].revoked_at
+        self.wall.now += 30
+        with mock.patch.object(store, "_write", side_effect=CredentialStoreError("still full")):
+            with self.assertRaises(CredentialStoreError):
+                store.revoke(cred.token_id)                   # a second outage: still not answered as done
+        with mock.patch.object(store, "_write", wraps=real_write) as writer:
+            self.assertEqual(store.revoke(cred.token_id).revoked_at, first)   # the first time is kept
+            self.assertEqual(writer.call_count, 1)
+        with self.assertRaises(CredentialRefused):
+            self.store().verify(token, peer="p")              # and the file holds it
+        self.assertEqual(self.kinds(), ["credential.issued", "credential.revoked"])
+        with mock.patch.object(store, "_write") as writer:
+            store.revoke(cred.token_id)                       # written: answered at once, no write, no notice
+            self.assertEqual(writer.call_count, 0)
+        self.assertEqual(self.kinds(), ["credential.issued", "credential.revoked"])
+
+    def test_a_pending_revocation_is_made_durable_by_the_next_write_and_then_notified(self) -> None:
+        store = self.store()
+        token, cred = store.mint("device", "phone-1", ["read"])
+        with mock.patch.object(store, "_write", side_effect=CredentialStoreError("disk full")):
+            with self.assertRaises(CredentialStoreError):
+                store.revoke(cred.token_id)
+        store.mint("device", "phone-2", ["read"])            # this write carries the revocation too
+        self.assertEqual(self.kinds(), ["credential.issued", "credential.issued", "credential.revoked"])
+        with self.assertRaises(CredentialRefused):
+            self.store().verify(token, peer="p")
+
+    # -- the rename is the commit point ---------------------------------------------------------------
+    def test_the_file_is_synced_then_renamed_then_its_directory_synced(self) -> None:
+        store = self.store()
+        operations, real_sync, real_replace = [], os.fsync, os.replace
+
+        def sync(fd):
+            operations.append("file_sync" if stat.S_ISREG(os.fstat(fd).st_mode) else "directory_sync")
+            return real_sync(fd)
+
+        def replace(source, target):
+            operations.append("replace")
+            return real_replace(source, target)
+
+        with mock.patch.object(creds.os, "fsync", side_effect=sync), \
+                mock.patch.object(creds.os, "replace", side_effect=replace):
+            store.mint("device", "phone-1", ["read"])
+        self.assertEqual(operations, ["file_sync", "replace", "directory_sync"])
+
+    def test_a_failure_before_the_rename_changes_nothing(self) -> None:
+        store = self.store()
+        store.mint("device", "phone-1", ["read"])
+        before = open(self.path, "rb").read()
+        self.events.clear()
+        with mock.patch.object(creds.os, "fsync", side_effect=OSError("EIO")):
+            with self.assertRaises(CredentialStoreError) as caught:
+                store.mint("device", "phone-1", ["run"])
+        self.assertNotIsInstance(caught.exception, creds.CredentialStoreUncertain)
+        self.assertEqual(open(self.path, "rb").read(), before)
+        self.assertEqual(store.held("device", "phone-1"), frozenset({"read"}))
+        self.assertEqual(self.store().held("device", "phone-1"), frozenset({"read"}))
+        self.assertEqual(os.listdir(self.dir), ["credentials.json"])
+        self.assertEqual(self.events, [])
+
+    def test_a_directory_sync_failure_after_the_rename_leaves_a_mint_issued_in_memory_and_on_disk(self) -> None:
+        store = self.store()
+        store.mint("device", "phone-1", ["read"])
+        real_sync = os.fsync
+
+        def sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("EIO on the directory")
+            return real_sync(fd)
+
+        with mock.patch.object(creds.os, "fsync", side_effect=sync):
+            with self.assertLogs("recursion_core.control.credentials", "ERROR"):
+                token, cred = store.mint("device", "phone-1", ["approve"])
+            with self.assertRaises(creds.CredentialStoreUncertain):
+                store._write(store._grants.values())       # what _write itself answers there
+        reopened = self.store()
+        self.assertEqual(store.held("device", "phone-1"), frozenset({"read", "approve"}))
+        self.assertEqual(reopened.held("device", "phone-1"), store.held("device", "phone-1"))
+        self.assertEqual(reopened.verify(token, peer="p").token_id, cred.token_id)
+
+    def test_a_directory_sync_failure_on_revoke_is_uncertain_and_the_retry_settles_it(self) -> None:
+        store = self.store()
+        token, cred = store.mint("device", "phone-1", ["read"])
+        real_sync = os.fsync
+
+        def sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("EIO on the directory")
+            return real_sync(fd)
+
+        with mock.patch.object(creds.os, "fsync", side_effect=sync):
+            with self.assertRaises(creds.CredentialStoreUncertain):
+                store.revoke(cred.token_id)
+        self.assertEqual(self.kinds(), ["credential.issued"])   # not durable yet: no notice
+        with self.assertRaises(CredentialRefused):
+            store.verify(token, peer="p")
+        store.revoke(cred.token_id)
+        self.assertEqual(self.kinds(), ["credential.issued", "credential.revoked"])
+
+    def test_a_temporary_name_that_exists_is_never_written_through(self) -> None:
+        store = self.store()
+        store.mint("device", "phone-1", ["read"])
+        temp = os.path.join(self.dir, ".credentials.json.ffffffffffffffff.tmp")
+        with open(temp, "w", encoding="ascii") as handle:
+            handle.write("not ours")
+        with mock.patch.object(creds.secrets, "token_hex", return_value="ffffffffffffffff"):
+            with self.assertRaises(CredentialStoreError):
+                store.mint("device", "phone-2", ["read"])
+        with open(temp, encoding="ascii") as handle:
+            self.assertEqual(handle.read(), "not ours")
+        self.assertEqual(store.held("device", "phone-2"), frozenset())
+
+    def test_a_fresh_grant_that_collides_with_a_stored_one_is_refused(self) -> None:
+        store = self.store()
+        _, cred = store.mint("device", "phone-1", ["read"])
+        with mock.patch.object(creds.secrets, "token_urlsafe", return_value=cred.token_id[len("ctk-"):]):
+            with self.assertRaises(CredentialStoreError):
+                store.mint("device", "phone-2", ["read"])
+        self.assertEqual(len(store.grants()), 1)
+        self.assertEqual(len(self.store().grants()), 1)
+
+    # -- typed refusals for malformed input -------------------------------------------------------------
+    def test_scope_elements_that_are_not_strings_are_a_typed_refusal(self) -> None:
+        for bad in ([["read"]], [{"scope": "read"}], [[]], [None], ("read", 1)):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(CredentialRefused) as caught:
+                    check_grant("device", bad)
+                self.assertEqual(caught.exception.detail, "scopes_invalid")
+
+    def test_a_stored_kind_that_is_not_a_string_is_a_store_error(self) -> None:
+        store = self.store()
+        store.mint("device", "phone-1", ["read"])
+        doc = json.load(open(self.path, encoding="ascii"))
+        for bad in ([], {}, 5):
+            with self.subTest(kind=repr(bad)):
+                doc["credentials"][0]["kind"] = bad
+                with open(self.path, "w", encoding="ascii") as handle:
+                    json.dump(doc, handle)
+                with self.assertRaises(CredentialStoreError):
+                    self.store()
+
+    def test_unreadable_or_odd_store_paths_are_store_errors(self) -> None:
+        store = self.store()
+        store.mint("device", "phone-1", ["read"])
+        real_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if path == self.dir:
+                raise PermissionError("EACCES")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(creds.os, "lstat", side_effect=lstat):
+            with self.assertRaises(CredentialStoreError):
+                self.store()
+        real_fstat = os.fstat
+        foreign = lambda fd: types.SimpleNamespace(st_mode=real_fstat(fd).st_mode, st_uid=os.getuid() + 1)  # noqa: E731
+        fifo = lambda fd: types.SimpleNamespace(st_mode=stat.S_IFIFO | 0o600, st_uid=os.getuid())          # noqa: E731
+        for fake in (foreign, fifo):   # the directory is this user's; only the file's own stat says no
+            with mock.patch.object(creds.os, "fstat", side_effect=fake):
+                with self.assertRaises(CredentialStoreError):
+                    self.store()
+        os.unlink(self.path)
+        os.mkdir(self.path, 0o700)     # a directory where the file should be
+        with self.assertRaises(CredentialStoreError):
+            self.store()
+
+    def test_a_store_version_or_record_that_only_looks_right_is_refused(self) -> None:
+        # Astra's stricter checks on #377: a version that is True or 1.0, an id that does not match its kind,
+        # times out of order.
+        store = self.store()
+        store.mint("device", "phone-1", ["read"])
+        good = json.load(open(self.path, encoding="ascii"))
+
+        def write(doc):
+            with open(self.path, "w", encoding="ascii") as handle:
+                json.dump(doc, handle)
+
+        for version in (True, 1.0):
+            write({"version": version, "credentials": good["credentials"]})
+            with self.assertRaises(CredentialStoreError):
+                self.store()
+        record = good["credentials"][0]
+        issued = record["issued_at"]
+        for changes in ({"kind": "session"},                                   # a ctk- id on a session grant
+                        {"token_id": "stk-" + record["token_id"][4:]},          # an stk- id on a device grant
+                        {"expires_at": issued}, {"expires_at": issued - 1},     # expiring before it was issued
+                        {"revoked_at": issued - 1}):                            # revoked before it was issued
+            with self.subTest(changes=changes):
+                write({"version": 1, "credentials": [{**record, **changes}]})
+                with self.assertRaises(CredentialStoreError):
+                    self.store()
+        write({"version": 1, "credentials": [{**record, "revoked_at": issued, "expires_at": issued + 1}]})
+        self.assertEqual(len(self.store().grants()), 1)                         # the boundaries themselves are fine
+
+    def test_an_unhashable_peer_is_a_typed_refusal(self) -> None:
+        # The DeepSeek read of #377, F9: failed checks are counted per peer, so a peer must key.
+        store = self.store()
+        token, _ = store.mint("device", "phone-1", ["read"])
+        for peer in ([], {}, {"pid": 1}, ("a", [])):
+            with self.subTest(peer=repr(peer)):
+                with self.assertRaises(CredentialRefused) as caught:
+                    store.verify(token, peer=peer)
+                self.assertEqual(caught.exception.detail, "peer_invalid")
+        self.assertEqual(store.verify(token, peer=("pid", 1)).id, "phone-1")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_a_fifo_at_the_store_path_is_refused_and_the_open_never_waits_for_a_writer(self) -> None:
+        # The DeepSeek read of #377, F6. The open is non-blocking (checked on its flags, since a test that
+        # blocked would hang the run), and the FIFO is refused by type.
+        self.store()                      # makes the owner-only directory
+        os.mkfifo(self.path, 0o600)
+        writer = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)   # so this test itself cannot wait either
+        self.addCleanup(os.close, writer)
+        real_open, flags_seen = os.open, []
+
+        def recording_open(path, flags, *args, **kwargs):
+            if path == self.path:
+                flags_seen.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(creds.os, "open", side_effect=recording_open):
+            with self.assertRaises(CredentialStoreError):
+                self.store()
+        self.assertTrue(flags_seen and all(flags & os.O_NONBLOCK for flags in flags_seen), flags_seen)
+
+    # -- the page's own door ----------------------------------------------------------------------------
+    def test_no_grant_may_name_the_pages_own_door(self) -> None:
+        store = self.store()
+        with self.assertRaises(CredentialRefused) as caught:
+            store.mint("device", "page", ["read"])
+        self.assertEqual(caught.exception.detail, "principal_id_reserved")
+        store.mint("plugin", "page", ["read"])            # only the device id is the door
+        _, cred = store.mint("device", "phone-1", ["read"])
+        doc = json.load(open(self.path, encoding="ascii"))
+        for record in doc["credentials"]:
+            if record["token_id"] == cred.token_id:
+                record["id"] = "page"
+        with open(self.path, "w", encoding="ascii") as handle:
+            json.dump(doc, handle)
+        with self.assertRaises(CredentialStoreError):
+            self.store()
+
+    # -- one grant's scopes, and the public record ----------------------------------------------------
+    def test_grant_scopes_are_one_live_grant_of_exactly_that_identity(self) -> None:
+        store = self.store()
+        _, read = store.mint("device", "phone-1", ["read"])
+        _, run = store.mint("device", "phone-1", ["read", "run"], expires_at=int(self.wall.now) + 60)
+        self.assertEqual(store.grant_scopes(read.token_id, "device", "phone-1"), frozenset({"read"}))
+        self.assertEqual(store.grant_scopes(run.token_id, "device", "phone-1"), frozenset({"read", "run"}))
+        for args in ((read.token_id, "device", "phone-2"), (read.token_id, "agent", "phone-1"),
+                     ("ctk-unknown", "device", "phone-1"), (None, "device", "phone-1")):
+            self.assertEqual(store.grant_scopes(*args), frozenset(), args)
+        self.wall.now += 60
+        self.assertEqual(store.grant_scopes(run.token_id, "device", "phone-1"), frozenset())
+        store.revoke(read.token_id)
+        self.assertEqual(store.grant_scopes(read.token_id, "device", "phone-1"), frozenset())
+
+    def test_the_public_record_names_every_field_and_no_secret(self) -> None:
+        store = self.store()
+        token, cred = store.mint("device", "phone-1", ["run", "read"], expires_at=int(self.wall.now) + 5)
+        store.revoke(cred.token_id)
+        (public,) = [c.public() for c in store.grants()]
+        self.assertEqual(public, {"token_id": cred.token_id, "kind": "device", "id": "phone-1",
+                                  "scopes": ["read", "run"], "issued_at": int(self.wall.now),
+                                  "expires_at": int(self.wall.now) + 5, "revoked_at": int(self.wall.now)})
+        self.assertNotIn(token, json.dumps(public))
 
 
 class PlatformTest(unittest.TestCase):

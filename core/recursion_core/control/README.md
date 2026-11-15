@@ -203,13 +203,22 @@ authorizer once the seams' daemon edits call S5.
   tokens; `device` (the page and paired devices) never holds `manage`; `plugin`, `session` and `agent`
   (the MCP face) hold at most `read` and `run`. `CredentialStore(path)` mints tokens (`rst1_` for a
   session, `rct1_` otherwise, 32 random bytes), returns each once, and keeps only its SHA-256 in one
-  owner-only JSON file, written whole and renamed into place. `revoke` takes effect at once. Issue and
-  revoke are reported to an `emit` callback without the token or its digest. Failed token checks are
-  limited per peer (`FailedAuthLimit`) and logged without the token. Every refusal is `scope_refused`.
+  owner-only JSON file, written whole and renamed into place; the rename is the commit point (a failure
+  after it, syncing the directory, is `CredentialStoreUncertain`: the change is made and memory keeps it).
+  `revoke` takes effect at once and answers success only once written; a failed write is retried by the
+  next `revoke`. No grant may name the page's own door (`device`, `page`). Issue and revoke are reported
+  to an `emit` callback without the token or its digest, a revocation once it is durable. Failed token
+  checks are limited per peer (`FailedAuthLimit`) and logged without the token. Every refusal is
+  `scope_refused`.
+- **Token principals.** A principal made from a verified token names its grant (`grant`, a field this
+  lane asks SPINE to add to `Principal`) and holds only that grant's live scopes (`grant_scopes`); a
+  device, session or agent principal without one holds nothing. A plugin the host attributes by identity
+  holds the union of its identity's live grants (`held`).
 - **Scopes.** `Authorizer(scope_of=..., credentials=..., run_record=...)` answers S5's
   `authorize(principal, method, params)`: a run-unit peer is refused; otherwise the method's scope must
-  be one the principal holds now, within its kind's ceiling. `run.stop` follows the method table's row
-  "Who may Stop": an owner or device with `run` may stop any run; a session principal only its own
+  be one the principal holds now, within its kind's ceiling; a credential store that raises is refused
+  (`credentials_unavailable`). `run.stop` follows the method table's row "Who may Stop", and needs a held
+  `run` scope whatever the row's scope column says: an owner or device with `run` may stop any run; a session principal only its own
   session's runs (and its descendants' once the session lineage is passed in); a plugin principal only a
   run whose `launch.owner` is that plugin. Internal and agent principals are not in the Stop row.
 

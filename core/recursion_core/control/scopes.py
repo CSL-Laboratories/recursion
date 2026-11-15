@@ -23,11 +23,19 @@ recovery Stop never passes here.
 
 1. A principal whose ``in_run_unit`` is not exactly False is refused ``scope_refused`` (today's predicate:
    true inside a run's unit, and when the peer's cgroup cannot be read).
-2. The scopes the principal holds NOW: ``owner`` and ``internal`` hold all four; the page's own device
-   principal (``device`` with id ``page``) holds ``PAGE_SCOPES``; any other device, plugin, session or
-   agent principal holds what its live grants in the ``CredentialStore`` give it. Every set is cut to the
-   kind's ceiling (``credentials.CEILING``), so a plugin, session or agent never holds ``approve`` and no
-   device ever holds ``manage``, whatever a grant says.
+2. The scopes the principal holds NOW:
+   - ``owner`` and ``internal`` hold all four;
+   - the page's own device principal (``device`` with id ``page``, which no grant may name) holds
+     ``PAGE_SCOPES``;
+   - a principal made from a verified token carries that grant's id as ``grant`` (set by the server from
+     the token, never from params) and holds exactly that one grant's scopes while it is live, so a
+     read-only token is not widened by another grant of the same identity;
+   - a ``plugin`` principal with no ``grant`` is host-attributed (the plugin host names it) and holds the
+     union of its identity's live grants;
+   - any other device, session or agent principal with no ``grant`` holds nothing.
+   Every set is cut to the kind's ceiling (``credentials.CEILING``), so a plugin, session or agent never
+   holds ``approve`` and no device ever holds ``manage``, whatever a grant says. SPINE's ``Principal`` has
+   no ``grant`` field yet (``questions.md``); until it has, token principals hold nothing.
 3. ``scope_of(method)`` reads the method's scope from the method table on every call. A name the table
    does not have runs nothing (the API answers ``method_unknown``); it passes only for a principal holding
    all four scopes, so their answer is today's, and is refused to everyone else.
@@ -50,13 +58,15 @@ import logging
 import os
 from collections.abc import Callable
 
-from recursion_core.control.credentials import (ALL_SCOPES, SCOPE_REFUSED, CredentialStore, CredentialStoreError,
-                                                ceiling)
+from recursion_core.control.credentials import (ALL_SCOPES, PAGE_DEVICE_ID, SCOPE_REFUSED, CredentialStore,
+                                                CredentialStoreError, ceiling)
 from recursion_core.control.methods import METHODS
 
 log = logging.getLogger(__name__)
 
-PAGE_PRINCIPAL_ID = "page"   # control/hooks.py DEVICE: the page's door, before per-device principals
+log = logging.getLogger(__name__)
+
+PAGE_PRINCIPAL_ID = PAGE_DEVICE_ID   # control/hooks.py DEVICE: the page's door; reserved against every grant
 # The page's device principal: read, run, approve (the brief's recommended option (a); the owner decides).
 PAGE_SCOPES = frozenset({"read", "run", "approve"})
 STOP_METHOD = "run.stop"
@@ -125,6 +135,15 @@ def _same_session(run_session: str, principal_session: str) -> bool:
     return run_session == principal_session
 
 
+def _attr(principal, name: str, default):
+    """A principal's attribute; ``default`` when it is missing or reading it raises (it then counts as unknown)."""
+
+    try:
+        return getattr(principal, name, default)
+    except Exception:  # noqa: BLE001 - an attribute that cannot be read makes the principal hold nothing
+        return default
+
+
 class Authorizer:
     """``authorizer(principal, method, params) -> None | ("scope_refused", detail)``. See the module text."""
 
@@ -146,34 +165,48 @@ class Authorizer:
     def held(self, principal) -> frozenset[str]:
         """The scopes ``principal`` holds now, within its kind's ceiling."""
 
-        kind, pid = getattr(principal, "kind", None), getattr(principal, "id", None)
+        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
+        grant = _attr(principal, "grant", None)
         if kind in ("owner", "internal"):
             held = ALL_SCOPES
+        elif grant is not None:
+            # A token principal: its one verified grant, while it is live, and only if it is this identity's.
+            held = (self._credentials.grant_scopes(grant, kind, pid)
+                    if self._credentials is not None and isinstance(grant, str) else frozenset())
         elif kind == "device" and pid == PAGE_PRINCIPAL_ID:
             held = self._page_scopes
-        elif self._credentials is not None and isinstance(pid, str):
-            held = self._credentials.held(kind, pid)
+        elif kind == "plugin" and self._credentials is not None and isinstance(pid, str):
+            held = self._credentials.held(kind, pid)   # host-attributed: the identity's live grants
         else:
-            held = frozenset()
+            held = frozenset()   # a device, session or agent principal holds only what its own grant gives
         return held & ceiling(kind)
 
     def __call__(self, principal, method, params) -> Verdict:
-        if getattr(principal, "in_run_unit", True) is not False:
+        if _attr(principal, "in_run_unit", True) is not False:
             return (SCOPE_REFUSED, "peer is inside a run unit")
-        held = self.held(principal)
+        try:
+            held = self.held(principal)
+        except Exception:  # noqa: BLE001 - a credential store that cannot be read refuses; it never lets through
+            log.exception("the credential store could not be read; the call is refused")
+            return (SCOPE_REFUSED, "credentials_unavailable")
+        # The method table is the composition's own; if reading it raises, S5 refuses the call (authorizer_failed)
+        # and logs it, so the failure is left to S5.
         scope = self._scope_of(method) if isinstance(method, str) else None
         if scope is None:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")
-        if scope not in ALL_SCOPES:
+        if not isinstance(scope, str) or scope not in ALL_SCOPES:
             return (SCOPE_REFUSED, "scope_unknown")   # a table row naming no known scope opens nothing
         if scope not in held:
             return (SCOPE_REFUSED, f"needs_{scope}")
         if method == STOP_METHOD:
+            if "run" not in held:
+                # The Stop row's own rule, whatever the table's scope column says for run.stop.
+                return (SCOPE_REFUSED, "needs_run")
             return self._stop(principal, params)
         return None
 
     def _stop(self, principal, params) -> Verdict:
-        kind, pid = principal.kind, principal.id
+        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
         if kind in ("owner", "device"):
             return None    # with run: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):

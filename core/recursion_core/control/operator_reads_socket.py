@@ -76,6 +76,9 @@ _SO_PEERCRED = getattr(socket, "SO_PEERCRED", None)
 _UMASK_LOCK = threading.Lock()  # the umask is process-wide
 _BACKLOG = 32  # waiting to be accepted, not served: the accept loop answers "busy" over the cap
 _LOCK_SUFFIX = ".lock"
+# A refusal is one non-blocking send on the accept thread; past this size it goes without the host profile, so
+# it always fits a fresh socket's buffer and arrives whole.
+_REFUSAL_MAX_BYTES = 16384
 # A holder that closes removes the lock file; one who opened it just before may lock the removed file.
 # Such a server opens the path again, this many times at most, then refuses.
 _LOCK_ATTEMPTS = 3
@@ -291,8 +294,22 @@ class OperatorReadsServer:
             raise
         self._path, self._identity, self._listener = path, (st.st_dev, st.st_ino), listener
         self._start_lock = held
-        self._thread = threading.Thread(target=self._accept_loop, name="operator-reads-accept", daemon=True)
-        self._thread.start()
+        try:
+            thread = threading.Thread(target=self._accept_loop, name="operator-reads-accept", daemon=True)
+            thread.start()
+        except BaseException:
+            # Nothing serves: undo this start whole, so the next server finds neither our socket nor our lock.
+            self._listener, self._start_lock, self._identity = None, None, None
+            listener.close()
+            try:
+                now = os.lstat(path)
+                if (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino):
+                    os.unlink(path)
+            except OSError:
+                pass
+            _release_start_lock(lock_path, held)
+            raise
+        self._thread = thread
         return self
 
     def close(self) -> None:
@@ -372,9 +389,13 @@ class OperatorReadsServer:
         cannot stall the accept loop.
         """
         profile = None if code == PEER_REFUSED else self._reads.profile
+        data = self._encode(refusal(code, profile=profile))
+        if len(data) > _REFUSAL_MAX_BYTES:
+            # One non-blocking send must carry the refusal whole; a host profile too large for that is left out.
+            data = self._encode(refusal(code, profile=None))
         try:
             conn.setblocking(False)
-            conn.send(self._encode(refusal(code, profile=profile)))
+            conn.send(data)
         except OSError:
             pass
         finally:

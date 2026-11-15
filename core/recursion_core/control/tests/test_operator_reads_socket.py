@@ -648,6 +648,30 @@ class StartLockTest(TempDirCase):
             OperatorReadsServer(composed(), self.path).start()
         self.assertEqual(os.listdir(os.path.dirname(self.path)), [os.path.basename(self.path)])
 
+    def test_a_socket_file_that_is_not_0600_after_bind_is_refused(self) -> None:
+        # The DeepSeek read of #377, F8: the socket file's mode check had no test of its own.
+        real_chmod = os.chmod
+
+        def open_to_all(path, mode, *args, **kwargs):
+            return real_chmod(path, 0o666 if path == self.path else mode, *args, **kwargs)
+
+        with mock.patch.object(transport.os, "chmod", side_effect=open_to_all):
+            with self.assertRaises(SocketUnsafe):
+                OperatorReadsServer(composed(), self.path).start()
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), [])   # neither the socket nor the lock is left
+
+    def test_an_accept_thread_that_cannot_start_undoes_the_whole_start(self) -> None:
+        # The reads of #377 (Codex GPT-6 Astra R3): the thread's start was outside the start's rollback, so a
+        # failure there kept the new lock (and the socket) of a server that serves nothing.
+        server = OperatorReadsServer(composed(), self.path)
+        with mock.patch.object(transport.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            with self.assertRaises(RuntimeError):
+                server.start()
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), [])   # neither socket nor lock is left
+        server.close()                                                 # nothing to join, nothing to remove
+        with OperatorReadsServer(composed(), self.path) as second:     # and the next server starts
+            self.assertEqual(connect(second.path).call(POSITIONS, {})["code"], "ok")
+
     @unittest.skipIf(fcntl is None, "no flock on this platform")
     def test_a_lock_held_elsewhere_refuses_even_a_stale_socket(self) -> None:
         os.makedirs(os.path.dirname(self.path), 0o700)
@@ -833,6 +857,17 @@ class RefusalTest(TempDirCase):
         holder.connect(self.path)
         reply = connect(self.path).call(POSITIONS, {})
         self.assertEqual((reply["code"], reply["profile"]), ("busy", self.PROFILE))
+
+    def test_a_busy_refusal_too_large_for_one_send_goes_whole_without_the_profile(self) -> None:
+        # The DeepSeek read of #377, F5: a 2 MB host profile made the one non-blocking send carry a part of it.
+        big = {"profile_id": "p-big", "signature_state": "signed", "note": "x" * (2 * 1024 * 1024)}
+        self.serve(OperatorReads(profile=big), max_connections=1, read_deadline_s=30.0)
+        holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(holder.close)
+        holder.connect(self.path)
+        reply = connect(self.path).call(POSITIONS, {})
+        self.assertEqual((reply["code"], reply["profile"]),
+                         ("busy", {"profile_id": None, "signature_state": "no_profile"}))
 
     def test_no_refusal_makes_a_blocking_write(self) -> None:
         server = OperatorReadsServer(OperatorReads(profile=self.PROFILE), self.path)

@@ -665,10 +665,28 @@ class RegistrationTest(unittest.TestCase):
             self.assertIn(sentence, text)
 
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
-        self.assertIsNone(importlib.util.find_spec('recursion_core.keys'), 'no keys lane is installed in this tree')
-        composed = H.compose()
-        self.assertEqual(composed.methods.registered(), ())
-        self.assertNotIn('recursion_core.keys', sys.modules)
+        """Whatever lanes this tree has, now or later: the absence is made for the test. Where the composition
+        asks whether a package or a module outside the core is there, it is told no. Each registrant is then
+        asked for once, at the outermost thing it needs that is not part of the core, and no further; nothing
+        of it is imported; and nothing registers. (It used to rely on one lane's package not being in the
+        tree, which stops being true the day that lane lands.)"""
+        find_spec, asked = importlib.util.find_spec, []
+
+        def absent(name, package=None):
+            asked.append(name)
+            return find_spec(name, package) if name in CORE_PACKAGES else None
+        before = set(sys.modules)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            composed = H.compose()
+        outermost = []
+        for name in H.REGISTRANTS:
+            parts = name.split('.')
+            above = ['.'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+            outermost.append(next(item for item in above if item not in CORE_PACKAGES))
+        self.assertEqual(asked, outermost, 'absent is decided at the first thing that is not there, before any import')
+        self.assertEqual(set(sys.modules) - before, set(), 'nothing was imported for a registrant that is not there')
+        self.assertEqual((composed.methods.registered(), composed.commands.names(), composed.engines.names()),
+                         ((), (), ('claude_code', 'codex')))
 
     def test_a_package_with_no_hooks_module_is_skipped(self) -> None:
         package = self.fake.lane('keys')

@@ -103,6 +103,17 @@ class BoundIsOneValueTests(unittest.TestCase):
         self.assertEqual(bound.rendered, self.record["rendered"])
         self.assertEqual(bound.effect["input"]["command"], self.record["effect"]["input"]["command"])
 
+    def test_a_plugin_effect_is_copied_too(self) -> None:
+        # Normalising an engine effect makes a new value anyway; a plugin effect is not normalised, so only
+        # the copy keeps a later change of the caller's dict out of what was bound.
+        plugin = dict(_vectors("approval.binding"))["g03-a-plugin-effect.json"]["record"]
+        effect = json.loads(json.dumps(plugin["effect"]))
+        bound = bind("plugin_effect", effect)
+        effect["payload"]["changed"] = "after binding"
+        effect["scope"]["environment"] = "live"
+        self.assertEqual(bound.effect, plugin["effect"])
+        self.assertEqual(bound.canonical, effects._effect_bytes("csl-cj/v0", plugin["effect"]))
+
     def test_what_bound_hands_out_is_a_copy(self) -> None:
         bound = bind("engine_tool", self.record["effect"])
         bound.effect["input"]["command"] = "changed"

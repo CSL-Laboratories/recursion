@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable, Mapping
 
 from recursion_core.tui import protocol as p
+from recursion_core.tui import sessions as s
 from recursion_core.tui.events import LOG_CAP, Event, EventLog
 from recursion_core.tui.keymap import BY_ID, PLUGIN_PREFIX, Keymap, Pending, Unbound, show_sequence
 from recursion_core.tui.keys import Key, Paste
@@ -151,6 +152,12 @@ class TuiApp:
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
         self.outputs: dict[str, _Output] = {}
         self.in_flight: dict[str, int] = collections.defaultdict(int)
+        # Sessions (slice 2, part 2): the last session.list, and each opened transcript with its rows. The
+        # output pane shows a transcript while ``pane`` names its session, else the attached run's output.
+        self.sessions: list[dict] = []
+        self.transcripts: dict[str, s.Transcript] = {}
+        self.transcript_rows: dict[str, _Output] = {}
+        self.pane: str | None = None
 
     # -- the event log --------------------------------------------------------------------------
     def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
@@ -192,6 +199,7 @@ class TuiApp:
 
     def attach(self, run_id: str) -> None:
         self.attached = self.selected = run_id
+        self.pane = None  # the output pane goes back to the run's output
         self._emit("attach", "operator", f"attach run={field(run_id)}: reads run.status; starts nothing")
         self.request("run.status", {"run_id": run_id})
 
@@ -210,7 +218,8 @@ class TuiApp:
 
     # -- requests -------------------------------------------------------------------------------
     def request(self, method: str, params: dict) -> None:
-        if method not in p.ALLOWED_METHODS:  # defensive: nothing outside the CLI's method set leaves the TUI
+        # Defensive: nothing outside the CLI's method set, and the session reads, leaves the TUI.
+        if method not in p.ALLOWED_METHODS and method not in s.SESSION_METHODS:
             raise ValueError(method)
         with self._lock:
             if self.closed:
@@ -300,6 +309,59 @@ class TuiApp:
         elif method == "run.stop":  # the answer line above already said it
             self._notice(f"stop run={field(params.get('run_id'))}: control API answered {field(code)}", speech="")
         self.sync_conditions()
+        if code == "ok" and method == s.LIST and isinstance(answer.get("sessions"), list):
+            self.sessions = [x for x in answer["sessions"] if isinstance(x, dict)]
+            rows = [s.session_row(x) for x in self.sessions] or ["no sessions listed"]
+            self._emit("sessions", "recursion", "\n".join([f"sessions: {len(self.sessions)}", *rows]))
+        elif code == "ok" and method == s.READ:
+            self._transcript_page(params, answer)
+
+    def _transcript_page(self, params: dict, answer: dict) -> None:
+        """One page of a transcript: each new line logged once (so every renderer prints the same rows), its
+        rows kept for the output pane, and the next page asked for while the answer says there is more."""
+
+        sid = (params.get("cursor") or {}).get("session_id")
+        transcript = self.transcripts.get(sid)
+        if transcript is None:  # not a transcript this TUI opened
+            return
+        out = self.transcript_rows.setdefault(sid, _Output(self._output_lines, sid))
+        added = 0
+        for line in transcript.apply(answer):
+            rows = s.rows(line)
+            out.lines.extend(rows)
+            added += len(rows)
+            source = "engine" if line.get("trust") == "untrusted" else "recursion"
+            self._emit("transcript", source, "\n".join(rows),
+                       speech="\n".join(f"transcript session={field(sid)}: {row}" for row in rows))
+        if self.scroll and self.pane == sid:  # a scrolled pager stays on the rows it shows
+            self.scroll = min(self.scroll + added, max(0, len(out.lines) - 1))
+        if answer.get("epoch_advanced") is True:
+            self._notice(f"transcript session={field(sid)}: the daemon restarted; read on from seq "
+                         f"{transcript.cursor['seq']} (epoch {transcript.cursor['epoch']})")
+        if answer.get("more") is True and transcript.pages < s.MAX_PAGES:
+            transcript.pages += 1
+            self.request(s.READ, s.read_params(transcript.cursor))
+        elif answer.get("more") is True:
+            self._notice(f"transcript session={field(sid)}: more lines after seq {transcript.cursor['seq']}; "
+                         f"the command transcript {field(sid)} reads on")
+
+    def open_transcript(self, session_id: str) -> None:
+        """Show a session's transcript in the output pane, reading it from the cursor (from the start the
+        first time; on again from where the last read ended)."""
+
+        transcript = self.transcripts.setdefault(session_id, s.Transcript(session_id))
+        transcript.pages = 0
+        if self.pane != session_id:  # another pane: start at its newest rows; reading on keeps the view
+            self.pane, self.scroll = session_id, 0
+        self.transcript_rows.setdefault(session_id, _Output(self._output_lines, session_id))
+        self.request(s.READ, s.read_params(transcript.cursor))
+
+    def _pane_output(self) -> _Output | None:
+        """What the output pane and its pager show: the open transcript, else the attached run's output."""
+
+        if self.pane is not None:
+            return self.transcript_rows.get(self.pane)
+        return self.outputs.get(self.attached or "")
 
     def _merge(self, run: dict) -> None:
         for i, known in enumerate(self.runs):
@@ -323,7 +385,7 @@ class TuiApp:
             if out is None:
                 out = self.outputs[run_id] = _Output(self._output_lines, run_id)
             chunk, done = out.feed(text)
-            if self.scroll and run_id == self.attached:  # a scrolled pager stays on the lines it shows
+            if self.scroll and self.pane is None and run_id == self.attached:  # a scrolled pager stays put
                 self.scroll = min(self.scroll + len(done), max(0, len(out.lines) - 1))
             speech, state = "\n".join(out.label + line for line in done), self._state
         # Logged already sanitized, outside the lock; the linear renderer says each finished line once,
@@ -424,6 +486,8 @@ class TuiApp:
                 self._notice("no run selected; nothing to stop")
         elif action == "conditions.show":
             self.show_conditions()
+        elif action == "sessions.show":
+            self.request(s.LIST, dict(s.LIST_PARAMS))
         elif action == "focus.output":
             self.focus = "output"
         elif action == "focus.runs":
@@ -484,7 +548,7 @@ class TuiApp:
 
     # -- the output pager -------------------------------------------------------------------------
     def _page(self, action: str, burst: bool = False) -> None:
-        out = self.outputs.get(self.attached or "")
+        out = self._pane_output()
         newest = len(out.source()) - 1 if out else 0
         half = max(1, self._out_rows // 2)
         step = {"pager.down": -1, "pager.up": 1, "pager.half_down": -half, "pager.half_up": half}.get(action)
@@ -508,7 +572,7 @@ class TuiApp:
         ``N`` back to newer ones, both wrapping around. The match becomes the pager's newest line."""
 
         self.search = pattern
-        out = self.outputs.get(self.attached or "")
+        out = self._pane_output()
         src = out.source() if out else []
         if not pattern or not src:
             self._notice(f"search {field(pattern)}: no output to search")
@@ -547,7 +611,8 @@ class TuiApp:
                 lines.append(f"  {keys}: {BY_ID[action].help if action in BY_ID else action}")
         lines += ["stop always asks: y sends run.stop, any other key cancels",
                   "commands (: or /, and --plain): list (or runs), status RUN, stop RUN, "
-                  "start --tenant T --engine E --prompt P [--client-key K], conditions, help (or keys), quit",
+                  "start --tenant T --engine E --prompt P [--client-key K], conditions, sessions, "
+                  "transcript SESSION, help (or keys), quit",
                   "Ctrl+C closes the TUI from any mode; closing the TUI never stops a run; Esc never sends anything"]
         self.help_lines = lines
         self.mode = "help"
@@ -556,7 +621,8 @@ class TuiApp:
     def command(self, line: str) -> None:
         """A command line in the CLI's grammar: ``list``, ``status RUN``, ``stop RUN``, ``start ...``,
         ``conditions``, and the TUI's own ``help`` (``keys``) and ``quit``, which send nothing. A leading
-        ``/`` is accepted (slash commands), and ``runs`` is another name for ``list``."""
+        ``/`` is accepted (slash commands), and ``runs`` is another name for ``list``. ``sessions`` reads
+        ``session.list`` and ``transcript SESSION`` reads that session's transcript (``events.read``)."""
 
         line = line.strip()
         if line.startswith("/"):
@@ -567,6 +633,18 @@ class TuiApp:
             return
         if word in ("quit", "q") and not rest.strip():
             self.close()
+            return
+        if word == "sessions":
+            if rest.strip():
+                self._error("usage error: sessions takes no arguments; nothing sent")
+            else:
+                self.request(s.LIST, dict(s.LIST_PARAMS))
+            return
+        if word == "transcript":
+            if len(rest.split()) != 1:
+                self._error("usage error: transcript SESSION; nothing sent")
+            else:
+                self.open_transcript(rest.strip())
             return
         if word == "runs":
             line = "list" + (" " + rest if rest else "")
@@ -783,13 +861,18 @@ class TuiApp:
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
         elif rem:
             self._out_rows = rem - 1
-            out = self.outputs.get(self.attached or "")
+            out = self._pane_output()
             pager = ""
             if self.focus == "output" or self.scroll:
                 pager = (f" [pager: {self.scroll} lines up, G follows]" if self.scroll else " [pager: following]")
-            rows.append((6, f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
-                            f"text, display only)" + (f" skipped_events={self.skipped_events}"
-                                                      if self.skipped_events else "") + pager + " --", None))
+            if self.pane is not None:
+                head = (f"-- transcript session={field(self.pane)} (the daemon's lines; engine text untrusted, "
+                        f"display only)")
+            else:
+                head = (f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
+                        f"text, display only)" + (f" skipped_events={self.skipped_events}"
+                                                  if self.skipped_events else ""))
+            rows.append((6, head + pager + " --", None))
             lines = out.tail(rem - 1, max(1, w - 2), self.scroll) if out else []
             rows.extend((6, "│ " + line, None) for line in lines)
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))

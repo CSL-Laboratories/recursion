@@ -21,6 +21,7 @@ from recursion_core.tui import term
 from recursion_core.tui.app import TuiApp
 from recursion_core.tui.keymap import ACTIONS, BY_ID, Keymap, Pending, Unbound, load, parse_sequence
 from recursion_core.tui.keys import Paste
+from recursion_core.tui.tests.fake_daemon import exchange
 from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI, ScriptedAPI
 from recursion_core.tui.tests.test_inline import FakeTerminal, TtyOut
 
@@ -47,6 +48,16 @@ def cli_requests(command: str) -> list:
     api = ScriptedAPI({})
     cli.main(command.split(), api, io.StringIO(), io.StringIO())
     return api.calls
+
+
+def twin_requests(action: str) -> list:
+    """What the action's CLI twin sends. The session verbs' twins belong to the verb lanes and do not exist
+    yet; until they do, their twin is SPINE's recorded request (schemas/control/v1/fixtures/good)."""
+
+    if action == "sessions.show":
+        frame = exchange("h27-session-list-ok")
+        return [(frame["method"], frame["params"])]
+    return cli_requests(plain_command(action))
 
 
 def plain_command(action: str) -> str:
@@ -223,7 +234,7 @@ class AppKeysTest(unittest.TestCase):
                     if app.mode == "confirm_stop":
                         app.press("y")
                     if BY_ID[action].sends or action == "run.stop":
-                        self.assertEqual(api.calls, cli_requests(plain_command(action)))
+                        self.assertEqual(api.calls, twin_requests(action))
                     else:
                         self.assertEqual(api.calls, [], f"{action} sends nothing")
 

@@ -35,6 +35,9 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   `output`, `command`, `help`), a matcher with a leader (`Ctrl+X`) and no timers (within a context no
   binding is a prefix of another; a pending sequence waits for its next key, Esc cancels it), and the
   binding file. Each action names its `--plain` command, or why the linear renderer needs none.
+- `sessions.py`: the session list and a session's transcript: the request frames (SPINE's recorded ones),
+  the rows a transcript line prints (its own text, sanitized as engine output is), and the cursor a read
+  goes on from. No request is sent from here, and no event is projected or parsed.
 - `view.py`: a frame is a list of `(text, style)` rows. It renders as plain text, as one full-screen
   ANSI repaint, or through `InlinePainter`. Colour is only decoration and is off under `NO_COLOR`.
 - `term.py`: the terminal driver. Its three modes all read the same log:
@@ -69,7 +72,7 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   - run list: `j`/`k` or arrows select, `a`/Enter attach, `r` refresh, `s` stop (asks `y`), `Tab` the
     output pager, `?` keys, `:` or `/` the command line, `q` or `Ctrl+D Ctrl+D` close (runs keep going);
   - leader `Ctrl+X`, then: `k` stop (asks `y`), `r` refresh, `n` the command line with `start `, `c` the
-    conditions again, `q` close. While a sequence waits, the prompt row lists what can follow; Esc
+    conditions again, `s` the sessions, `q` close. While a sequence waits, the prompt row lists what can follow; Esc
     cancels it, and an unbound key after `Ctrl+X` is said and does nothing;
   - output pager: `j`/`k` a line, `Ctrl+D`/`Ctrl+U` or Page Down/Up half a page, `g g`/Home the oldest
     line kept, `G`/End the newest (and follow), `/` search older lines (case-insensitive unless the
@@ -79,7 +82,19 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
     `Ctrl+P`. Ctrl-C is not the keymap's: it ends the TUI from any mode, and no binding can take it.
 - Commands (`:` or `/`, and `--plain`): the CLI's `list` (also `runs`), `status RUN`, `stop RUN`,
   `start ...`, `conditions`, and the TUI's own `help` (also `keys`) and `quit`, which send nothing. A
-  leading `/` is accepted.
+  leading `/` is accepted. `sessions` reads `session.list`; `transcript SESSION` reads that session's
+  transcript.
+- Sessions and transcripts (build step 4). `sessions` (or `Ctrl+X s`) reads `session.list` with SPINE's
+  recorded request (`state: "live"`, `limit: 20`) and logs one row per session in the record's own words.
+  `transcript SESSION` reads `events.read` with `projection: "transcript"` from the start (epoch 1, seq 0),
+  follows `more` page by page (at most 50 pages in a row, then it says how to read on), and logs each line
+  once, in seq order, as the projection gives it: its text, sanitized as engine output is (engine lines are
+  logged as untrusted text), and a `replay.gap` line like any other. The TUI never projects or parses an
+  event, and a line never makes it send anything. Full screen shows the lines in the output pane (the
+  pager pages and searches them); `--no-alt-screen` and `--plain` say each as `transcript session=S: <row>`,
+  so all three print the same rows. The same command again reads on from the cursor, after a daemon restart
+  too (the answer's newer epoch is said and kept). Attaching a run returns the pane to the run's output.
+  Until the verb lanes' CLI twins exist, the parity tests compare these requests with SPINE's recorded ones.
 - The binding file: `$XDG_CONFIG_HOME/recursion/tui-keys.toml` (or `~/.config/...`), or `--keys FILE`;
   `--print-keys` prints the defaults to start from. `version = 1`, an optional `leader`, a table per
   context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action

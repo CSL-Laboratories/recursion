@@ -81,6 +81,8 @@ ACTIONS: tuple[Action, ...] = (
     Action("runs.refresh", ("runs", "global"), "refresh", "refresh the run list (reads run.list)", "list", sends=True),
     Action("run.stop", ("runs", "global"), "stop", "stop the selected run (asks y first)", "stop RUN"),
     Action("conditions.show", ("runs", "global"), "conditions", "say the current conditions again", "conditions"),
+    Action("sessions.show", ("runs", "global"), "sessions", "list the sessions (reads session.list)", "sessions",
+           sends=True),
     Action("focus.output", ("runs",), "output", "move to the output pager", "(--plain prints the output once, in order)"),
     Action("focus.runs", ("output",), "runs", "back to the run list", "(--plain has no panes)"),
     Action("pager.down", ("output",), "down", "scroll down one line", "(--plain prints the output once, in order)"),
@@ -107,7 +109,7 @@ BY_ID: dict[str, Action] = {a.id: a for a in ACTIONS}
 DEFAULTS: dict[str, dict[str, str]] = {
     "global": {"q": "app.quit", "ctrl+d ctrl+d": "app.quit", "<leader> q": "app.quit", "?": "help.show",
                ":": "line.command", "/": "line.command", "<leader> n": "line.start", "<leader> r": "runs.refresh",
-               "<leader> k": "run.stop", "<leader> c": "conditions.show"},
+               "<leader> k": "run.stop", "<leader> c": "conditions.show", "<leader> s": "sessions.show"},
     "runs": {"j": "runs.next", "down": "runs.next", "k": "runs.prev", "up": "runs.prev", "a": "run.attach",
              "enter": "run.attach", "r": "runs.refresh", "s": "run.stop", "tab": "focus.output"},
     "output": {"j": "pager.down", "down": "pager.down", "k": "pager.up", "up": "pager.up",

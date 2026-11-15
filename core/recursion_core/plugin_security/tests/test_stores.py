@@ -33,13 +33,14 @@ SIDE_FILES = ("-wal", "-shm", "-journal")
 _real_lstat = os.lstat
 
 
-def _owned_by_someone_else(target: str):
-    """Patch ``os.lstat`` so that ``target`` alone reports another owner. Nothing is chowned."""
+def _owned_by_someone_else(target: str, uid: int | None = None):
+    """Patch ``os.lstat`` so that ``target`` alone reports another owner (``uid``, or ours plus one).
+    Nothing is chowned."""
     def fake(path, *args, **kwargs):
         info = _real_lstat(path, *args, **kwargs)
         if os.fspath(path) == target:
             fields = list(info[:10])
-            fields[4] = info.st_uid + 1
+            fields[4] = info.st_uid + 1 if uid is None else uid
             return os.stat_result(fields)
         return info
     return mock.patch("os.lstat", side_effect=fake)
@@ -227,6 +228,17 @@ class OpenStoreTests(_StoreCase):
         finally:
             os.chdir(cwd)
 
+    def test_a_path_with_a_nul_character_is_refused_untrusted(self):
+        # os.lstat would raise ValueError, not a refusal (review 1, Sol R4).
+        for prefix, magic, create in KINDS:
+            with self.subTest(store=prefix):
+                bad = self.path("bad") + "\0.sqlite3"
+                error = self.assertRefused(prefix + "_untrusted", stores.check_store, bad, magic)
+                self.assertIn("NUL", error.detail)
+                self.assertRefused(prefix + "_untrusted", stores.open_store, bad, magic)
+                self.assertRefused(prefix + "_untrusted", create, bad)
+        self.assertEqual(os.listdir(self.dir), [])
+
     def test_a_file_that_is_not_this_store_is_invalid(self):
         garbage = self.path("garbage.sqlite3")
         with open(garbage, "wb") as handle:
@@ -286,10 +298,21 @@ class OpenStoreTests(_StoreCase):
         stores.create_ledger(path, ANCHOR)
         for call in (stores.open_store, stores.check_store):
             with self.subTest(call=call.__name__):
-                with self.assertRaises(ValueError):
-                    call(path, "csl-something-else/v0")
-                with self.assertRaises(ValueError):
-                    call(path, None)
+                for magic in ("csl-something-else/v0", None, [], {}):  # a list or a dict is not hashable
+                    with self.assertRaises(ValueError):
+                        call(path, magic)
+
+    def test_a_refused_open_releases_its_connection(self):
+        # A refused open hands back nothing, so it must let go of what it opened (review 1, R6: M05, M06).
+        path = self.path()
+        stores.create_breaker_store(path)
+        for case, connection in (("sql error", mock.Mock(**{"execute.side_effect": sqlite3.OperationalError("x")})),
+                                 ("another magic", mock.Mock(**{"execute.return_value.fetchone.return_value": ("x",)})),
+                                 ("no magic row", mock.Mock(**{"execute.return_value.fetchone.return_value": None}))):
+            with self.subTest(case=case):
+                with mock.patch.object(stores.sqlite3, "connect", return_value=connection):
+                    self.assertRefused("breaker_store_invalid", stores.open_store, path, stores.BREAKER_MAGIC)
+                connection.close.assert_called_once_with()
 
 
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
@@ -365,8 +388,9 @@ class CreateStoreTests(_StoreCase):
         self.assertEqual(os.listdir(self.dir), [])
 
     def test_a_failure_part_way_leaves_nothing(self):
-        with self.assertRaises(Refused):
-            stores.create_ledger(self.path(), "not-a-key")
+        # An anchor that is not a public key: the factory's own refusal, as a frozen code (review 1, R5).
+        error = self.assertRefused("ledger_invalid", stores.create_ledger, self.path(), "not-a-key")
+        self.assertEqual(error.detail, "malformed_public_key")
         self.assertEqual(os.listdir(self.dir), [])
 
         def half_made(path):
@@ -381,10 +405,13 @@ class CreateStoreTests(_StoreCase):
         self.assertEqual(os.listdir(self.dir), [])
 
         real_factory = breaker_module.create_breaker_store
-        with mock.patch.object(breaker_module, "create_breaker_store",
-                               lambda path: (real_factory(path), open(path + "-wal", "wb").close())):
-            self.assertRefused("breaker_store_invalid", stores.create_breaker_store, self.path())
-        self.assertEqual(os.listdir(self.dir), [])
+        for suffix in SIDE_FILES:  # each side file a factory leaves is refused and removed (review 1, Sol R5)
+            with self.subTest(suffix=suffix):
+                with mock.patch.object(breaker_module, "create_breaker_store",
+                                       lambda path: (real_factory(path), open(path + suffix, "wb").close())):
+                    error = self.assertRefused("breaker_store_invalid", stores.create_breaker_store, self.path())
+                self.assertIn(suffix, error.detail)
+                self.assertEqual(os.listdir(self.dir), [])
 
     def test_losing_the_race_for_the_path_is_refused(self):
         with mock.patch("os.link", side_effect=FileExistsError):
@@ -412,10 +439,163 @@ class CreateStoreTests(_StoreCase):
             stores.create_revocation_store(self.path())
         self.assertEqual(order, ["link", "fsync folder"])
 
-    def test_a_new_store_is_checked_by_the_open_before_create_returns(self):
+    def test_a_new_store_is_checked_by_the_open_before_it_is_linked_into_place(self):
+        # Checked under its temporary name, so a store that fails never reaches the path and a later
+        # create can try again (review 1, DeepSeek F7).
         with mock.patch.object(stores, "open_store", side_effect=Refused("ledger_invalid")) as opened:
             self.assertRefused("ledger_invalid", stores.create_ledger, self.path(), ANCHOR)
-        opened.assert_called_once_with(self.path(), stores.LEDGER_MAGIC)
+        (checked, magic), _ = opened.call_args
+        self.assertEqual((os.path.dirname(checked), magic), (self.dir, stores.LEDGER_MAGIC))
+        self.assertTrue(os.path.basename(checked).startswith(".store.sqlite3.") and checked.endswith(".tmp"))
+        self.assertEqual(os.listdir(self.dir), [])
+
+        def wrong_magic(path):  # a factory whose store fails its own open: nothing at the path, and a retry works
+            real_breaker(path)
+            db = sqlite3.connect(path)
+            db.execute("UPDATE meta SET v='csl-something-else/v0' WHERE k='magic'")
+            db.commit()
+            db.close()
+        real_breaker = breaker_module.create_breaker_store
+        with mock.patch.object(breaker_module, "create_breaker_store", wrong_magic):
+            error = self.assertRefused("breaker_store_invalid", stores.create_breaker_store, self.path())
+        self.assertEqual(error.detail, "another store's magic")
+        self.assertEqual(os.listdir(self.dir), [])
+        stores.create_breaker_store(self.path())
+        stores.open_store(self.path(), stores.BREAKER_MAGIC).close()
+
+
+@unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+                     "requires Unix file modes and a non-root uid")
+class AncestorTests(_StoreCase):
+    """The folders above the store's own (review 1, R1): another user must not be able to change what
+    the path names. Each case runs through both ``open_store`` and a create, two and one levels up."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="stores-up-")
+        self.addCleanup(self._tmp.cleanup)
+        self.base = os.path.realpath(self._tmp.name)  # the names the walk builds from "/"
+        self.a = os.path.join(self.base, "a")
+        self.b = os.path.join(self.a, "b")
+        self.dir = os.path.join(self.b, "plugin-security")
+        os.makedirs(self.dir, 0o700)
+        self.store = os.path.join(self.dir, "store.sqlite3")
+        stores.create_breaker_store(self.store)
+        self.addCleanup(self._open_all)
+
+    def _open_all(self):
+        for folder in (self.a, self.b, self.dir):
+            if os.path.isdir(folder) and not os.path.islink(folder):
+                os.chmod(folder, 0o700)
+
+    def refused_both_ways(self, store_path: str, code: str = "breaker_store_untrusted") -> Refused:
+        with self.assertRaises(Refused) as opened:
+            stores.open_store(store_path, stores.BREAKER_MAGIC)
+        self.assertEqual(opened.exception.code, code, opened.exception.detail)
+        new = os.path.join(os.path.dirname(store_path), "new.sqlite3")
+        with self.assertRaises(Refused) as created:
+            stores.create_breaker_store(new)
+        self.assertEqual(created.exception.code, code, created.exception.detail)
+        self.assertFalse(os.path.lexists(new))
+        return opened.exception
+
+    def accepted_both_ways(self, store_path: str) -> None:
+        stores.open_store(store_path, stores.BREAKER_MAGIC).close()
+        new = os.path.join(os.path.dirname(store_path), "new.sqlite3")
+        stores.create_breaker_store(new)
+        os.unlink(new)
+
+    def test_a_folder_above_that_group_or_world_can_write_is_refused_unless_sticky(self):
+        self.accepted_both_ways(self.store)
+        for folder in (self.a, self.b):
+            for mode in (0o777, 0o770, 0o722):
+                with self.subTest(folder=os.path.basename(folder), mode=oct(mode)):
+                    os.chmod(folder, mode)
+                    error = self.refused_both_ways(self.store)
+                    self.assertEqual(error.detail, f"{folder} is writable by group or world and not sticky")
+            with self.subTest(folder=os.path.basename(folder), mode="0o1777"):
+                os.chmod(folder, 0o1777)  # as /tmp: only an entry's owner can rename it
+                self.accepted_both_ways(self.store)
+            os.chmod(folder, 0o700)
+
+    def test_a_folder_above_another_user_owns_is_refused_and_one_root_owns_is_not(self):
+        for folder in (self.a, self.b):
+            with self.subTest(folder=os.path.basename(folder)):
+                with _owned_by_someone_else(folder):
+                    error = self.refused_both_ways(self.store)
+                self.assertEqual(error.detail, f"{folder} is owned by another user")
+                with _owned_by_someone_else(folder, uid=0):
+                    self.accepted_both_ways(self.store)
+
+    def test_a_link_above_is_followed_and_its_target_is_held_to_the_same_rule(self):
+        absolute = os.path.join(self.base, "abs-link")
+        os.symlink(self.a, absolute)
+        relative = os.path.join(self.base, "rel-link")
+        os.symlink("a", relative)
+        inner = os.path.join(self.a, "inner-link")
+        os.symlink("b", inner)  # a link two levels up, inside a
+        paths = [os.path.join(absolute, "b", "plugin-security", "store.sqlite3"),
+                 os.path.join(relative, "b", "plugin-security", "store.sqlite3"),
+                 os.path.join(inner, "plugin-security", "store.sqlite3")]
+        for path in paths:
+            with self.subTest(path=path, case="good target"):
+                self.accepted_both_ways(path)
+        os.chmod(self.a, 0o777)
+        for path in paths[:2]:
+            with self.subTest(path=path, case="target open to writers"):
+                self.refused_both_ways(path)
+        os.chmod(self.a, 0o700)
+        os.chmod(self.b, 0o777)
+        with self.subTest(case="target of the inner link open to writers"):
+            self.refused_both_ways(paths[2])
+
+    def test_a_link_above_another_user_owns_is_refused(self):
+        link = os.path.join(self.base, "link")
+        os.symlink(self.a, link)
+        with _owned_by_someone_else(link):
+            error = self.refused_both_ways(os.path.join(link, "b", "plugin-security", "store.sqlite3"))
+        self.assertEqual(error.detail, f"{link} is a link another user owns")
+
+    def test_a_link_loop_above_is_refused(self):
+        os.symlink("loop-2", os.path.join(self.base, "loop-1"))
+        os.symlink("loop-1", os.path.join(self.base, "loop-2"))
+        error = self.refused_both_ways(os.path.join(self.base, "loop-1", "plugin-security", "store.sqlite3"))
+        self.assertEqual(error.detail, "more than 40 links above the store's folder")
+
+    def test_dot_dot_goes_up_from_where_the_resolution_is_not_from_the_text(self):
+        self.accepted_both_ways(os.path.join(self.b, "..", "b", ".", "plugin-security", "store.sqlite3"))
+        link = os.path.join(self.base, "to-b")
+        os.symlink(self.b, link)
+        # The kernel reads to-b/.. as a (b's parent), not as base: a lexical reading finds no base/b.
+        through = os.path.join(link, "..", "b", "plugin-security", "store.sqlite3")
+        self.accepted_both_ways(through)
+        os.chmod(self.a, 0o777)
+        self.refused_both_ways(through)
+
+    def test_a_file_or_a_missing_name_above_is_refused(self):
+        not_a_folder = os.path.join(self.a, "file")
+        with open(not_a_folder, "wb") as handle:
+            handle.write(b"x")
+        error = self.refused_both_ways(os.path.join(not_a_folder, "plugin-security", "store.sqlite3"))
+        self.assertEqual(error.detail, f"{not_a_folder} is not a folder")
+        self.refused_both_ways(os.path.join(self.a, "gone", "plugin-security", "store.sqlite3"),
+                               code="breaker_store_missing")
+
+    def test_off_posix_only_the_link_and_type_checks_apply(self):
+        # Windows has no os.geteuid and reports every file as group and world writable; the core's
+        # stores still open there (child_env's simulated-Windows run of every core suite).
+        link = os.path.join(self.dir, "link.sqlite3")
+        os.symlink(self.store, link)
+        os.chmod(self.store, 0o666)
+        os.chmod(self.dir, 0o777)
+        os.chmod(self.a, 0o777)
+        self.assertRefused("breaker_store_untrusted", stores.check_store, self.store, stores.BREAKER_MAGIC)  # POSIX here
+        with mock.patch.object(os, "name", "nt"), \
+                mock.patch.object(os, "geteuid", side_effect=AssertionError("Windows has no os.geteuid")):
+            stores.check_store(self.store, stores.BREAKER_MAGIC)  # (open_store's Path() would be a WindowsPath here)
+            error = self.assertRefused("breaker_store_untrusted", stores.check_store, link, stores.BREAKER_MAGIC)
+            self.assertIn("symlink", error.detail)
+            self.assertRefused("breaker_store_untrusted", stores.check_store, self.dir, stores.BREAKER_MAGIC)
+        os.chmod(self.store, 0o600)
 
 
 class FrozenInterfaceTests(unittest.TestCase):

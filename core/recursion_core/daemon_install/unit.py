@@ -41,12 +41,14 @@ def daemon_exec_args(interpreter: str) -> tuple[str, ...]:
     ``-I`` keeps the daemon from reading ``PYTHONPATH``, the user site folder or the working
     folder, so it runs the package installed beside that interpreter and nothing else. ``-X gil=0``
     turns the GIL off on the free-threaded build the daemon requires. The path is kept as given,
-    not resolved: a virtual environment's ``bin/python`` is a link whose target is outside it.
+    not resolved: a virtual environment's ``bin/python`` is a link whose target is outside it. Its
+    ``%`` signs are written ``%%``: systemd reads ``%`` in ``ExecStart`` as a specifier, and
+    ``%%`` is its literal ``%``, so the unit runs this exact path.
     """
 
     if type(interpreter) is not str or not os.path.isabs(interpreter):
         raise InstallRefused("exec_arg", "the interpreter path is not absolute")
-    return (interpreter, "-I", "-X", "gil=0", "-m", DAEMON_MODULE)
+    return (interpreter.replace("%", "%%"), "-I", "-X", "gil=0", "-m", DAEMON_MODULE)
 
 
 def render_unit(exec_args: tuple[str, ...]) -> str:
@@ -54,6 +56,8 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
 
     Each argument is one token (no spaces, no quotes, no ``..`` segment), so the line needs no
     shell and no quoting. The first token is an absolute path or a systemd specifier such as ``%h``.
+    A ``%`` is written as given, so systemd expands it: an argument meant literally has its ``%``
+    written ``%%`` before it gets here (``daemon_exec_args`` does that for the interpreter's path).
     A path with a space in it is refused (``exec_arg``) rather than quoted.
     """
 

@@ -7,11 +7,13 @@ import os
 import shutil
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from recursion_core.daemon_install import layout
 from recursion_core.daemon_install import (
     MARKER,
     STATE_HOME,
@@ -105,6 +107,41 @@ class RenderTests(unittest.TestCase):
                 with self.assertRaises(InstallRefused) as caught:
                     render_unit(bad)  # type: ignore[arg-type]
                 self.assertIn(caught.exception.kind, {"exec_args", "exec_arg"})
+
+    def test_a_literal_percent_in_the_interpreter_is_written_as_systemds_literal_percent(self) -> None:
+        # systemd reads % in ExecStart as a specifier; %% is its literal % (review 1: Astra R3, Sol R2).
+        for path, written in (("/opt/release%Q/bin/python3.14t", "/opt/release%%Q/bin/python3.14t"),
+                              ("/opt/a%h/bin/python3.14t", "/opt/a%%h/bin/python3.14t"),
+                              ("/opt/a%%b/python3.14t", "/opt/a%%%%b/python3.14t")):
+            with self.subTest(path=path):
+                self.assertEqual(daemon_exec_args(path)[0], written)
+                self.assertEqual(service_fields(render_unit(daemon_exec_args(path)))["Service.ExecStart"].split()[0],
+                                 written)
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "needs systemd-analyze")
+    def test_systemd_reads_the_interpreter_path_back_exactly(self) -> None:
+        # systemd's own unit reader, offline: no manager is contacted and nothing is started.
+        with tempfile.TemporaryDirectory(prefix="unit-verify-") as root:
+            for name in ("basic.target", "shutdown.target", "exit.target"):
+                with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+                    handle.write("[Unit]\nDescription=offline verify\nDefaultDependencies=no\n")
+            results = {}
+            for name in ("python-plain", "python%t"):
+                interpreter = os.path.join(root, name)
+                with open(interpreter, "w", encoding="utf-8") as handle:
+                    handle.write("#!/bin/sh\nexit 0\n")
+                os.chmod(interpreter, 0o700)
+                unit = os.path.join(root, UNIT_NAME)
+                with open(unit, "w", encoding="utf-8") as handle:
+                    handle.write(render_unit(daemon_exec_args(interpreter)))
+                env = dict(os.environ, SYSTEMD_UNIT_PATH=root, SYSTEMD_LOG_COLOR="0",
+                           XDG_RUNTIME_DIR=os.environ.get("XDG_RUNTIME_DIR") or root)
+                done = subprocess.run(["systemd-analyze", "--user", "--man=no", "verify", unit], env=env,
+                                      capture_output=True, text=True, timeout=60, check=False)
+                results[name] = (done.returncode, done.stderr.strip())
+            if results["python-plain"][0] != 0:
+                self.skipTest(f"systemd-analyze cannot verify a unit here: {results['python-plain'][1]}")
+            self.assertEqual(results["python%t"], (0, ""))
 
     def test_the_reader_keeps_the_last_value_and_refuses_a_line_outside_a_section(self) -> None:
         self.assertEqual(service_fields("[S]\nA=1\nA=2\n; c\n# c\n"), {"S.A": "2"})
@@ -280,6 +317,120 @@ class InstallTests(unittest.TestCase):
                 call()
             self.assertEqual(caught.exception.kind, "symlink_refused")
         self.assertEqual(os.listdir(outside), [])
+
+    def test_the_unit_mode_is_exact_under_a_restrictive_umask(self) -> None:
+        # The new file's mode is set, not left to the umask (review 1, R6: M10).
+        old = os.umask(0o077)
+        try:
+            install(self.roots, EXEC)
+            self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), 0o644)
+            upgrade(self.roots, EXEC_NEXT)
+            self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), 0o644)
+        finally:
+            os.umask(old)
+
+    def test_a_unit_folder_another_user_owns_or_can_write_is_refused(self) -> None:
+        # Another user could put a unit there or take ours away (review 1, DeepSeek F12).
+        install(self.roots, EXEC)
+        unit = _read(self.unit)
+        folders = (os.path.join(self.home, ".config"), os.path.dirname(self.unit_dir), self.unit_dir)
+        calls = (lambda: install(self.roots, EXEC), lambda: upgrade(self.roots, EXEC_NEXT), lambda: uninstall(self.roots))
+        for folder in folders:
+            for mode in (0o777, 0o770, 0o702):
+                with self.subTest(folder=folder, mode=oct(mode)):
+                    os.chmod(folder, mode)
+                    for call in calls:
+                        with self.assertRaises(InstallRefused) as caught:
+                            call()
+                        self.assertEqual(caught.exception.kind, "folder_untrusted")
+                        self.assertIn(folder, caught.exception.detail)
+                    os.chmod(folder, 0o700)
+            real_lstat = os.lstat
+
+            def other_owner(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if os.fspath(path) == folder:
+                    fields = list(info[:10])
+                    fields[4] = info.st_uid + 1
+                    return os.stat_result(fields)
+                return info
+            with self.subTest(folder=folder, case="another owner"), mock.patch("os.lstat", side_effect=other_owner):
+                for call in calls:
+                    with self.assertRaises(InstallRefused) as caught:
+                        call()
+                    self.assertEqual(caught.exception.kind, "folder_untrusted")
+        self.assertEqual(_read(self.unit), unit)  # nothing was rewritten or removed
+        os.chmod(self.unit_dir, 0o755)  # read and search for others is fine
+        self.assertFalse(install(self.roots, EXEC).changed)
+
+    def test_the_folder_walk_refuses_a_path_outside_the_root_and_a_link_on_its_own(self) -> None:
+        # Both callers build the path from the home today; the rule holds for any other (DeepSeek's list).
+        for call in (layout.ensure_dir, layout.check_dirs):
+            for outside in (self.case, os.path.join(self.case, "elsewhere"), self.home):
+                with self.subTest(call=call.__name__, path=outside):
+                    with self.assertRaises(InstallRefused) as caught:
+                        call(self.home, outside)
+                    self.assertEqual(caught.exception.kind, "path_escapes")
+        target = os.path.join(self.case, "target")
+        os.mkdir(target, 0o700)
+        os.symlink(target, os.path.join(self.home, "linked"))
+        with self.assertRaises(InstallRefused) as caught:
+            layout.ensure_dir(self.home, os.path.join(self.home, "linked", "below"))
+        self.assertEqual(caught.exception.kind, "symlink_refused")
+        self.assertEqual(os.listdir(target), [])
+
+    def test_unlink_regular_removes_only_a_regular_file(self) -> None:
+        missing = os.path.join(self.home, "missing")
+        self.assertFalse(layout.unlink_regular(missing))
+        dangling = os.path.join(self.home, "dangling")
+        os.symlink(missing, dangling)
+        folder = os.path.join(self.home, "folder")
+        os.mkdir(folder)
+        for path in (dangling, folder):
+            with self.subTest(path=path):
+                with self.assertRaises(InstallRefused) as caught:
+                    layout.unlink_regular(path)
+                self.assertEqual(caught.exception.kind, "not_regular")
+                self.assertTrue(os.path.lexists(path))
+        regular = os.path.join(self.home, "regular")
+        with open(regular, "wb"):
+            pass
+        self.assertTrue(layout.unlink_regular(regular))
+        self.assertFalse(os.path.lexists(regular))
+
+    def test_a_unit_larger_than_one_mib_is_refused(self) -> None:
+        # The read stops at 1 MiB (review 1, Sol R5: M21); a file of exactly 1 MiB is still read.
+        os.makedirs(self.unit_dir, 0o700)
+        with open(self.unit, "wb") as handle:
+            handle.write(b"#" * (1 << 20))
+        with self.assertRaises(InstallRefused) as caught:
+            install(self.roots, EXEC)
+        self.assertEqual(caught.exception.kind, "unit_differs")  # read in full, then compared
+        with open(self.unit, "ab") as handle:
+            handle.write(b"#")
+        for call in (lambda: install(self.roots, EXEC), lambda: upgrade(self.roots, EXEC), lambda: uninstall(self.roots)):
+            with self.assertRaises(InstallRefused) as caught:
+                call()
+            self.assertEqual(caught.exception.kind, "too_large")
+        self.assertEqual(os.path.getsize(self.unit), (1 << 20) + 1)
+
+    def test_a_fifo_at_the_unit_is_refused_without_blocking(self) -> None:
+        # The read opens with O_NONBLOCK, so a FIFO no writer holds open is refused by the type check
+        # instead of holding the command at the open (review 1, R2).
+        os.makedirs(self.unit_dir, 0o700)
+        os.mkfifo(self.unit, 0o600)
+        real_open, flags = os.open, []
+
+        def recorded(path, mode, *args, **kwargs):
+            flags.append(mode)
+            return real_open(path, mode, *args, **kwargs)
+        for call in (lambda: install(self.roots, EXEC), lambda: upgrade(self.roots, EXEC), lambda: uninstall(self.roots)):
+            with self.assertRaises(InstallRefused) as caught:
+                with mock.patch("os.open", side_effect=recorded):
+                    call()
+            self.assertEqual(caught.exception.kind, "not_regular")
+        self.assertTrue(flags and all(mode & os.O_NONBLOCK and mode & os.O_NOFOLLOW for mode in flags), flags)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(self.unit).st_mode))
 
     def test_a_link_or_folder_at_the_unit_itself_is_refused(self) -> None:
         os.makedirs(self.unit_dir, 0o700)

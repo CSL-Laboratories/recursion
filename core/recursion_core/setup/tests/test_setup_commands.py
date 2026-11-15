@@ -7,6 +7,7 @@ import inspect
 import io
 import json
 import os
+import subprocess
 import sys
 import sysconfig
 import tempfile
@@ -127,6 +128,33 @@ class CommandTests(unittest.TestCase):
         code, answer = self.run_action("purge")
         self.assertEqual((code, answer["code"]), (1, "action"))
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root writes through any mode")
+    def test_a_file_system_error_is_a_json_refusal(self):
+        # A folder this user can read but not write: the real PermissionError, as one JSON refusal
+        # with exit 1, for each command (review 1: Astra R4, Sol R1). An existing unit stays as it was.
+        unit_dir = os.path.dirname(self.unit)
+        config = os.path.join(self.home, ".config")
+        os.makedirs(config, 0o700)
+        os.chmod(config, 0o500)
+        code, answer = self.run_action("install")
+        self.assertEqual((code, answer["code"], answer["action"]), (1, "filesystem_error", "install"))
+        self.assertIn("PermissionError", answer["detail"])
+        self.assertIn(config, answer["detail"])
+        self.assertNotIn("changed", answer)
+        os.chmod(config, 0o700)
+        self.run_action("install")
+        with open(self.unit, "rb") as handle:
+            before = handle.read()
+        os.chmod(unit_dir, 0o500)
+        self.addCleanup(os.chmod, unit_dir, 0o700)
+        for action, probe in (("upgrade", None), ("uninstall", _refusing_probe)):
+            with self.subTest(action=action):
+                code, answer = self.run_action(action, interpreter=PY_NEXT, probe=probe)
+                self.assertEqual((code, answer["code"], answer["action"]), (1, "filesystem_error", action))
+                self.assertIn(unit_dir, answer["detail"])
+                with open(self.unit, "rb") as handle:
+                    self.assertEqual(handle.read(), before)
+
     def test_recursiond_install_end_to_end(self):
         out = io.StringIO()
         with mock.patch.object(entry, "_linux", return_value=True), \
@@ -152,6 +180,32 @@ class RealProbeTests(unittest.TestCase):
         self.assertEqual(info["free_threaded_build"], bool(sysconfig.get_config_var("Py_GIL_DISABLED")))
         if FROM_CHECKOUT:
             self.assertIsNone(info["package"])  # -I: PYTHONPATH does not reach it
+
+    def test_the_probe_has_a_finite_timeout(self):
+        # A probe that never answers is ended and refused (review 1, Sol R5: M18).
+        def blocked(*args, **kwargs):
+            timeout = kwargs.get("timeout")
+            self.assertIsInstance(timeout, (int, float))
+            self.assertTrue(0 < timeout < 3600)
+            raise subprocess.TimeoutExpired(args[0], timeout)
+        with mock.patch.object(setup.subprocess, "run", side_effect=blocked):
+            with self.assertRaises(setup.InstallRefused) as caught:
+                setup.probe_interpreter("/not/run/python3.14t")
+        self.assertEqual(caught.exception.kind, "interpreter_unknown")
+
+    def test_a_probe_that_prints_the_right_answer_but_fails_is_unknown(self):
+        # Its exit status counts, not only what it prints (review 1, DeepSeek's list).
+        with tempfile.TemporaryDirectory() as folder:
+            program = os.path.join(folder, "python3.14t")
+            answer = json.dumps({"implementation": "cpython", "version": [3, 14], "free_threaded_build": True,
+                                 "package": PACKAGE})
+            with open(program, "w", encoding="utf-8") as handle:
+                handle.write(f"#!/bin/sh\necho '{answer}'\nexit 3\n")
+            os.chmod(program, 0o700)
+            with self.assertRaises(setup.InstallRefused) as caught:
+                setup.probe_interpreter(program)
+        self.assertEqual(caught.exception.kind, "interpreter_unknown")
+        self.assertIn("exit 3", caught.exception.detail)
 
     def test_a_program_that_is_not_python_or_not_there_is_unknown(self):
         for program in ("/bin/true", "/nonexistent/bin/python3"):
@@ -187,13 +241,28 @@ class CommandFamilyShapeTests(unittest.TestCase):
         self.assertEqual(list(inspect.signature(setup.dispatch).parameters), ["args", "client"])
 
     def test_dispatch_runs_the_parsed_command_with_this_interpreter(self):
-        with mock.patch.object(setup, "run", return_value=0) as run, \
+        with mock.patch.object(setup, "run", return_value=0) as run, mock.patch.object(setup.sys, "platform", "linux"), \
                 mock.patch.object(setup, "default_roots", return_value=Roots(home="/h")):
             out = io.StringIO()
             args = mock.Mock(command="upgrade", out=out)
             self.assertEqual(setup.dispatch(args, None), 0)
         run.assert_called_once_with("upgrade", out=out, roots=Roots(home="/h"), interpreter=sys.executable,
                                     package=PACKAGE)
+
+    def test_dispatch_refuses_off_linux_before_it_reads_anything(self):
+        # Once the family is registered in the control CLI, recursiond's own platform check is not in
+        # front of it (review 1, follow-on).
+        for platform in ("win32", "darwin"):
+            with self.subTest(platform=platform):
+                with mock.patch.object(setup, "run") as run, mock.patch.object(setup.sys, "platform", platform), \
+                        mock.patch.object(setup, "default_roots") as roots:
+                    out = io.StringIO()
+                    self.assertEqual(setup.dispatch(mock.Mock(command="uninstall", out=out), None), 1)
+                answer = json.loads(out.getvalue())
+                self.assertEqual((answer["code"], answer["action"]), ("platform_unsupported", "uninstall"))
+                self.assertIn(platform, answer["detail"])
+                run.assert_not_called()
+                roots.assert_not_called()
 
 
 if __name__ == "__main__":

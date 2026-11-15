@@ -43,7 +43,10 @@ class HelpAndUsageTests(unittest.TestCase):
             self.assertIn(name, out)
 
     def test_a_command_has_its_own_help(self):
-        code, out, _ = _main(["install", "--help"])
+        # As on Linux: elsewhere ``install --help`` is refused platform_unsupported like any command
+        # (PlatformTests), which child_env's simulated-Windows run of this file showed.
+        with mock.patch.object(entry, "_linux", return_value=True):
+            code, out, _ = _main(["install", "--help"])
         self.assertEqual(code, 0)
         self.assertIn("per-user systemd unit", out)
 
@@ -62,7 +65,8 @@ class PlatformTests(unittest.TestCase):
         with mock.patch.object(entry, "_linux", return_value=False), \
                 mock.patch("recursion_core.control.commands.setup.dispatch") as dispatch, \
                 mock.patch("os.execv") as execv:
-            for argv in (["install"], ["upgrade"], ["uninstall"], ["serve"], ["serve", "--gui-port", "1"], ["doctor"]):
+            for argv in (["install"], ["upgrade"], ["uninstall"], ["serve"], ["serve", "--gui-port", "1"], ["doctor"],
+                         ["install", "--help"]):
                 with self.subTest(argv=argv):
                     code, out, _ = _main(argv)
                     self.assertEqual(code, 1)
@@ -80,6 +84,10 @@ class PlatformTests(unittest.TestCase):
 
     def test_linux_is_this_system_here(self):
         self.assertEqual(entry._linux(), sys.platform.startswith("linux"))
+        # The predicate reads the platform, not the host it happens to run on (review 1, Sol R5: M16).
+        for platform, linux in (("win32", False), ("darwin", False), ("freebsd14", False), ("linux", True)):
+            with self.subTest(platform=platform), mock.patch.object(entry.sys, "platform", platform):
+                self.assertIs(entry._linux(), linux)
 
 
 class ServeTests(unittest.TestCase):
@@ -100,13 +108,26 @@ class ServeTests(unittest.TestCase):
         execv.assert_called_once_with(sys.executable, [sys.executable, "-X", "gil=0", "-m", "recursion_core.daemon",
                                                        "--gui-port", "9000", "--plugin", "/p"])
 
-    def test_serve_refuses_an_interpreter_without_a_path(self):
+    def test_serve_refuses_an_interpreter_without_an_absolute_path(self):
+        for executable in ("", "bin/python3.14t"):  # a relative one too (review 1, R6: M15)
+            with self.subTest(executable=executable):
+                with mock.patch.object(entry, "_linux", return_value=True), \
+                        mock.patch.object(entry, "_daemon_build", return_value=True), \
+                        mock.patch.object(entry.sys, "executable", executable), mock.patch("os.execv") as execv:
+                    code, out, _ = _main(["serve"])
+                self.assertEqual((code, json.loads(out)["code"]), (1, "interpreter_unknown"))
+                execv.assert_not_called()
+
+    def test_serve_turns_a_failed_exec_into_a_refusal(self):
+        # execv returns only by raising (review 1, R4).
         with mock.patch.object(entry, "_linux", return_value=True), \
                 mock.patch.object(entry, "_daemon_build", return_value=True), \
-                mock.patch.object(entry.sys, "executable", ""), mock.patch("os.execv") as execv:
+                mock.patch("os.execv", side_effect=FileNotFoundError(2, "No such file or directory")):
             code, out, _ = _main(["serve"])
-        self.assertEqual((code, json.loads(out)["code"]), (1, "interpreter_unknown"))
-        execv.assert_not_called()
+        answer = json.loads(out)
+        self.assertEqual((code, answer["code"]), (1, "interpreter_unknown"))
+        self.assertIn("FileNotFoundError", answer["detail"])
+        self.assertIn(sys.executable, answer["detail"])
 
     def test_the_build_check_is_true_exactly_on_free_threaded_cpython_314(self):
         self.assertEqual(entry._daemon_build(), FREE_THREADED_314)
@@ -115,6 +136,14 @@ class ServeTests(unittest.TestCase):
         with mock.patch.object(entry.sys, "version_info", (3, 13, 0, "final", 0)), \
                 mock.patch("sysconfig.get_config_var", return_value=1):
             self.assertFalse(entry._daemon_build())
+        # Another implementation of 3.14 with the same build flag (review 1, R6: M14).
+        with mock.patch.object(entry.sys, "implementation", mock.Mock(name="impl")) as implementation, \
+                mock.patch.object(entry.sys, "version_info", (3, 14, 0, "final", 0)), \
+                mock.patch("sysconfig.get_config_var", return_value=1):
+            implementation.name = "pypy"
+            self.assertFalse(entry._daemon_build())
+            implementation.name = "cpython"
+            self.assertTrue(entry._daemon_build())
 
     @unittest.skipUnless(FREE_THREADED_314 and sys.platform.startswith("linux"), "needs free-threaded CPython 3.14 on Linux")
     def test_serve_really_turns_the_gil_off_in_the_daemon(self):
@@ -132,13 +161,15 @@ class ServeTests(unittest.TestCase):
         self.assertIn("Requires free-threaded CPython 3.14t with -X gil=0", direct.stderr)
 
     @unittest.skipIf(FREE_THREADED_314, "this build can run the daemon")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the child runs on this host: Linux only")
     def test_serve_refuses_this_build_for_real(self):
+        # The child is a real interpreter on this host, whatever this process's sys.platform says (the
+        # simulated-Windows run sets it to win32); refusing off Linux is PlatformTests' (mocked).
         with tempfile.TemporaryDirectory() as cwd:
             done = subprocess.run([sys.executable, "-B", "-m", "recursion_core._entrypoints", "serve"],
                                   cwd=cwd, env=_child_env(), capture_output=True, text=True)
         self.assertEqual(done.returncode, 1, done.stderr)
-        expected = "build_not_free_threaded" if sys.platform.startswith("linux") else "platform_unsupported"
-        self.assertEqual(json.loads(done.stdout)["code"], expected)
+        self.assertEqual(json.loads(done.stdout)["code"], "build_not_free_threaded")
 
 
 class BootstrapHygieneTests(unittest.TestCase):

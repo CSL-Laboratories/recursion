@@ -1255,6 +1255,15 @@ class ReviewOneTests(Shape, unittest.TestCase):
                 p.end(0)
                 self.assertEqual(p.route_result("r1")["events"][0]["data"]["output_tokens"], expected)
 
+    def test_r10_the_sentences_the_tenth_read_corrected_hold(self):
+        for value in (oc.MAX_EXACT + 1, 7.5):                     # past the exact range, or fractional
+            with self.subTest(value):
+                (usage,) = typed(parser().feed(line(step({"input": value}))), "usage")
+                self.assertEqual(usage["input_tokens"], UNKNOWN)
+        self.assertEqual(oc._timestamp(oc._LAST_EPOCH), "9999-12-31T23:59:58.000Z")
+        for epoch in (oc._LAST_EPOCH + 0.5, oc._LAST_EPOCH + 1):  # the last second of 9999 is refused too
+            self.assertIsNone(oc._timestamp(epoch))
+
 
 class DeclarationTests(unittest.TestCase):
     def test_the_one_shot_drive_declares_only_typed_limits_and_usage(self):

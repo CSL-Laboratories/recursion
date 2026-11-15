@@ -53,9 +53,11 @@ USAGE. ``step_finish`` carries ``tokens`` ``{input, output, reasoning, cache: {r
 lines compute them the same way: ``input`` excludes the cached tokens, ``output`` excludes reasoning, and a count
 the provider did not report is written as 0 (1.19.5 packages/opencode/src/session/session.ts:338-372; 2.2.6
 packages/core/src/session/usage.ts:9-19). So a 0 cannot be told from "not reported": it is drafted ``unknown``,
-never 0. A positive count is ``known``, ``observed``. event.v1 counts reasoning inside ``output_tokens``, so
-``output_tokens`` is OpenCode's output plus its reasoning when both are positive and the sum is still a number every
-JSON reader keeps exact (``MAX_EXACT``), and otherwise a ``lower_bound``: the larger part that is known. The cost
+never 0. A positive whole count that every JSON reader keeps exact (at most ``MAX_EXACT``) is ``known``,
+``observed``; a larger or a fractional one is drafted ``unknown``, as if it had not been reported. event.v1 counts
+reasoning inside ``output_tokens``, so ``output_tokens`` is OpenCode's output plus its reasoning when both are
+positive and the sum is still a number every JSON reader keeps exact, and otherwise a ``lower_bound``: the larger
+part that is known. The cost
 is OpenCode's own figure, from its price table or from what the endpoint reported, and the stream does not say
 which: a positive cost is ``known``, ``modelled``; 0 is ``unknown``. A step of a sub-agent session is not in the
 stream (1.19.5 run.ts:712 prints only the run's own session), so the calls drafted here are each exact and their
@@ -596,8 +598,10 @@ def _http_date(text: str, now: float) -> float | None:
 def _timestamp(epoch: float) -> str | None:
     """common.v1's timestamp, rounded UP to the millisecond (a reset is never earlier than asked).
 
-    None when it cannot be written: before the first second of the year 1, after the last of the year 9999 (only an
-    injected wall clock gets that far), infinite, or not a number. The year is always written with four digits.
+    None when it cannot be written: before the first second of the year 1, after 9999-12-31T23:59:58Z
+    (``_LAST_EPOCH``, kept a second short of the year's end so that rounding up never reaches the year 10000; the
+    last second of the year 9999 is refused too, and only an injected wall clock gets that far), infinite, or not
+    a number. The year is always written with four digits.
     """
     if not _FIRST_EPOCH <= epoch <= _LAST_EPOCH:
         return None

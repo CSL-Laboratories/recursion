@@ -137,6 +137,16 @@ class PageTest(unittest.TestCase):
         themed = [a for t, a, _ in parsed.tags if "data-theme-scope" in a]
         self.assertEqual([a.get("id") for a in themed], ["workspace"])
 
+    def test_the_stop_confirmation_is_the_cores_and_outside_every_view(self) -> None:
+        # A Stop asked from any view is confirmed in the bar every view shares, so it is never inside a hidden view.
+        found = [(a, parents) for t, a, parents in page().tags if a.get("id") == "stop-confirm"]
+        self.assertEqual(len(found), 1)
+        attrs, parents = found[0]
+        self.assertIn("header", parents)
+        self.assertNotIn("main", parents)
+        self.assertNotIn("section", parents)
+        self.assertIn("hidden", attrs)
+
     def test_the_window_says_it_is_beta_and_that_closing_stops_nothing(self) -> None:
         self.assertIn('class="beta"', HTML)
         self.assertIn("Closing this window stops nothing", HTML)

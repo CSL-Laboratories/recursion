@@ -20,6 +20,11 @@
     <button type="button" data-view="plugins">Plugins</button>
   </nav>
   <p id="status-line" role="status"></p>
+  <div id="stop-confirm" role="group" aria-labelledby="stop-confirm-text" hidden>
+    <p id="stop-confirm-text"></p>
+    <button type="button" id="stop-confirm-yes" class="stop">Stop</button>
+    <button type="button" id="stop-confirm-no">Cancel</button>
+  </div>
 </header>
 
 <main id="workspace" data-theme-scope>
@@ -27,11 +32,6 @@
     <h2 id="runs-title">Runs</h2>
     <button type="button" id="runs-refresh">Refresh</button>
     <div id="runs-conditions"></div>
-    <div id="stop-confirm" hidden>
-      <p id="stop-confirm-text"></p>
-      <button type="button" id="stop-confirm-yes" class="stop">Stop the run</button>
-      <button type="button" id="stop-confirm-no">Cancel</button>
-    </div>
     <div id="runs-table"></div>
   </section>
 

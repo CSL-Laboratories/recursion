@@ -181,7 +181,10 @@ test("send refuses a held action and a method the desktop may not call, and call
   await assert.rejects(send(transport, "approval.open", fixedActions()["approval.open"]({ approval_id: "apr-1" })), RefusedHere);
   await assert.rejects(send(transport, "anything", { method: "workspace.publish", params: {} }), RefusedHere);
   await assert.rejects(send(transport, "anything", { method: "run.kill", params: {} }), RefusedHere);
-  // A held method stays held under another action's name.
+  // A held action stays held whatever method it is handed, and a held method under another action's name.
+  for (const action of Object.keys(HELD)) {
+    await assert.rejects(send(transport, action, { method: "run.list", params: {} }), RefusedHere, action);
+  }
   for (const method of Object.keys(HELD)) {
     const built = method === "approval.open"
       ? fixedActions()["approval.open"]({ approval_id: "apr-1" })

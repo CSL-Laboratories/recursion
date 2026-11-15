@@ -174,6 +174,8 @@ export function windowDocument() {
   return {
     ...fakeDocument,
     root,
+    // Shown: neither the element nor any element around it is hidden, so an operator can see and press it.
+    isShown: (node) => !node.hidden && ancestors(node).every((a) => !a.hidden),
     getElementById: (id) => all().find((n) => n.getAttribute("id") === id) ?? null,
     querySelectorAll(selector) {
       if (selector === "main > section") return within("SECTION", "MAIN", true);

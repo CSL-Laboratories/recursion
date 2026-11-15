@@ -39,7 +39,11 @@ test("a walk that never ends stops at the TUI's page ceiling and says the list i
     return { code: "ok", runs: [{ run_id: runId }], next_after: runId };
   };
   assert.equal(LIST_FOLLOW_MAX_PAGES, 100000);
-  assert.deepEqual(await listAllRuns(call), { code: LIST_INCOMPLETE, detail: "too_many_pages", pages: LIST_FOLLOW_MAX_PAGES });
+  const got = await listAllRuns(call);
+  // Compared field by field, so a walk without the ceiling fails with a short message, not a list of 100005 runs.
+  assert.deepEqual({ code: got.code, detail: got.detail, pages: got.pages, runs: Array.isArray(got.runs) ? got.runs.length : undefined },
+    { code: LIST_INCOMPLETE, detail: "too_many_pages", pages: LIST_FOLLOW_MAX_PAGES, runs: undefined });
+  assert.deepEqual(Object.keys(got).sort(), ["code", "detail", "pages"]);
   assert.equal(calls, LIST_FOLLOW_MAX_PAGES);
 });
 

@@ -8,12 +8,15 @@ shape ``sync_spine._params_errors`` gives them, as jsonschema reported them agai
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import sync_spine
 
@@ -73,6 +76,10 @@ class VerdictTest(unittest.TestCase):
                 found, said = sync_spine.verdict(action, [], [DIGEST if isinstance(gap, dict) else SURFACE])
                 self.assertEqual(found, "FAIL")
                 self.assertTrue(any("is not one of" in s and "declared schema gap" in s for s in said), said)
+        # And gap_waives itself waives nothing for a gap that is not known, even one shaped like the known one.
+        unknown = {"at": "digest", "rule": "enum", "value": "x", "why": "not a known gap"}
+        enum_error = {"at": "digest", "rule": "enum", "value": "x", "allowed": ["a"], "message": "'x' is not one of ['a']"}
+        self.assertFalse(sync_spine.gap_waives(unknown, enum_error))
 
     def test_a_fixture_or_row_problem_fails_even_with_only_the_gap(self) -> None:
         self.assertEqual(sync_spine.verdict(self.gapped, ["x is not the recorded file"], [SURFACE])[0], "FAIL")
@@ -85,6 +92,80 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(gapped, {"approval.open", "approval.answer"})
         for name in gapped:
             self.assertIn(sync_spine._gap_key(BY_NAME[name]["schema_gap"]), sync_spine.KNOWN_GAPS)
+
+
+class CheckTest(unittest.TestCase):
+    """``sync_spine.check`` itself, end to end: only what needs #368 is stood in for (the checkout's head, the
+    schema registry and validator, the rows and answers it would build, the fixture files), so each case runs
+    without a checkout or jsonschema. The recorded rows and answers it compares with are this folder's own."""
+
+    def setUp(self) -> None:
+        self.checkout = Path(tempfile.mkdtemp(prefix="desktop-sync-check-"))
+        schemas = self.checkout / sync_spine.SCHEMA_DIR
+        schemas.mkdir(parents=True)
+        (schemas / "methods.v1.json").write_text(json.dumps({"$id": "methods.v1.json"}), encoding="utf-8")
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        self.rows = json.loads((fixtures / "spine-rows.json").read_text(encoding="utf-8"))
+        self.answers = json.loads((fixtures / "answers.json").read_text(encoding="utf-8"))
+
+    def run_check(self, *, head=None, sources=None, errors=None, answers=None) -> tuple[int, str]:
+        def schema_errors(registry, methods_id, method, params):
+            return (errors or {}).get(method, [SURFACE] if method in ("approval.open", "approval.answer") else [])
+
+        out = io.StringIO()
+        with mock.patch.object(sync_spine, "_checkout_head", return_value=head or ACTIONS["spine_head"]), \
+                mock.patch.object(sync_spine, "_registry", return_value=None), \
+                mock.patch.object(sync_spine, "_params_errors", side_effect=schema_errors), \
+                mock.patch.object(sync_spine, "build_rows", return_value=copy.deepcopy(self.rows)), \
+                mock.patch.object(sync_spine, "build_answers", return_value=answers or copy.deepcopy(self.answers)), \
+                mock.patch.object(sync_spine, "source_problems", side_effect=sources or (lambda action, where: [])), \
+                contextlib.redirect_stdout(out):
+            code = sync_spine.check(self.checkout, False)
+        return code, out.getvalue()
+
+    def test_a_true_checkout_gives_nineteen_ok_and_the_two_gaps(self) -> None:
+        code, out = self.run_check()
+        self.assertEqual(code, 0, out)
+        said = {}
+        for line in out.splitlines():
+            if line.split()[0] in ("OK", "GAP", "FAIL") and line.split()[1] in BY_NAME:
+                said[line.split()[1]] = line.split()[0]
+        self.assertEqual(set(said), set(BY_NAME))
+        self.assertEqual(sorted(name for name, verdict in said.items() if verdict == "GAP"), ["approval.answer", "approval.open"])
+        self.assertEqual(sum(verdict == "OK" for verdict in said.values()), 19)
+        self.assertIn("OK   answers.json matches this checkout", out)
+
+    def test_a_checkout_at_another_head_fails_before_anything_else(self) -> None:
+        code, out = self.run_check(head="0" * 40)
+        self.assertEqual(code, 1)
+        self.assertTrue(out.startswith("FAIL the checkout is at " + "0" * 40), out)
+
+    def test_a_fixture_that_is_not_the_recorded_file_fails_the_check(self) -> None:
+        def sources(action, where):
+            return ["h07-approval-open.json is not the recorded file"] if action["action"] == "approval.open" else []
+        code, out = self.run_check(sources=sources)
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^FAIL approval\.open .*h07-approval-open\.json is not the recorded file")
+
+    def test_another_schema_error_beside_the_gap_fails_the_check(self) -> None:
+        code, out = self.run_check(errors={"approval.answer": [DIGEST, SURFACE]})
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^FAIL approval\.answer .*digest: 'not-a-digest' does not match")
+
+    def test_answers_that_differ_from_the_recorded_ones_fail_the_check(self) -> None:
+        drifted = copy.deepcopy(self.answers)
+        drifted["answers"][0]["answer"]["code"] = "pending"
+        code, out = self.run_check(answers=drifted)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL answers.json differs from this checkout", out)
+        self.assertIn("OK   spine-rows.json matches this checkout", out)
+
+    def test_an_answer_recorded_for_another_method_fails_the_check(self) -> None:
+        wrong = copy.deepcopy(self.answers)
+        wrong["answers"][0]["method"] = "session.list"
+        code, out = self.run_check(answers=wrong)
+        self.assertEqual(code, 1)
+        self.assertIn(f"FAIL {wrong['answers'][0]['file']} answers session.list", out)
 
 
 class RowProblemsTest(unittest.TestCase):

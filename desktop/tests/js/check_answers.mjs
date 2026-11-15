@@ -162,3 +162,59 @@ test("the opened request draws its nine rendered lines and none of its display e
   renderApprovalList(doc, list, recorded("h10-approval-list-returns-summaries.json"));
   assert.equal(list.textContent, "apr-00c4 pending until 2026-11-13T07:49:30.000Z");
 });
+
+test("a non-run answer that is pending says why, a stale one says so, and one that is not an object is refused", () => {
+  assert.deepEqual(conditionsFor("session.turn", { code: "pending", detail: "queued behind turn-000c" }),
+    [["UNCERTAIN", "answer", "session.turn not confirmed: queued behind turn-000c"]]);
+  assert.deepEqual(conditionsFor("session.turn", { code: "pending", reason: "cgroup_populated" }),
+    [["UNCERTAIN", "answer", "session.turn not confirmed: cgroup_populated"]]);
+  assert.deepEqual(conditionsFor("session.turn", { code: "pending", detail: "first", reason: "second" })[0][2],
+    "session.turn not confirmed: first");
+  assert.deepEqual(conditionsFor("session.list", { code: "ok", stale: true, sessions: [] }),
+    [["STALE", "answer", "API marked this answer stale"]]);
+  for (const odd of [null, "ok", 7, ["ok"]]) {
+    assert.deepEqual(conditionsFor("session.list", odd), [["REFUSED", "answer", "the answer is not an object"]], String(odd));
+  }
+});
+
+test("every statement the host makes about plugins is drawn, in the host's order, before any plugin", () => {
+  const answer = recorded("h51-plugin-list-with-a-loaded-and-a-refused-plugin.json");
+  const list = doc.createElement("ul");
+  renderPlugins(doc, list, answer);
+  const host = list.children.filter((n) => n.getAttribute("class") === "host").map((n) => n.textContent);
+  assert.deepEqual(host, [
+    `approvals: ${answer.approval_surface}`,
+    `containment: ${answer.containment}`,
+    `authority profile: ${answer.authority_profile}`,
+    `verification: ${answer.verification}`,
+    `approvals drawn: ${answer.approvals_drawn}`,
+    "core poisoned: None",
+  ]);
+  assert.equal(list.children.findIndex((n) => n.getAttribute("class") === "plugin"), host.length);
+});
+
+test("a session row opens that session; its record shows its revision and each turn's outcome; a diff shows its base and a cut list", () => {
+  const sessions = recorded("h27-session-list-ok.json");
+  const box = doc.createElement("div");
+  const asked = [];
+  renderSessions(doc, box, sessions, (n, i) => asked.push([n, i]));
+  box.find((n) => n.tagName === "BUTTON" && n.textContent === "Open")[0].click();
+  assert.deepEqual(asked, [["session.open", { session_id: sessions.sessions[0].session_id }]]);
+
+  const status = recorded("h28-session-status-ok.json");
+  const turns = doc.createElement("div");
+  renderSession(doc, turns, status);
+  assert.equal(turns.children[0].textContent,
+    `${status.session.session_id} ${status.session.state} revision ${status.session.revision}`);
+  assert.deepEqual(turns.children[1].children.map((li) => li.textContent),
+    status.session.turns.map((t) => `${t.turn_id} ${t.state} outcome=${t.outcome === null ? "None" : t.outcome}`));
+
+  const diff = recorded("h36-workspace-diff-ok.json");
+  const whole = doc.createElement("div");
+  renderDiff(doc, whole, diff);
+  assert.equal(whole.children[0].textContent, `against ${diff.diff.base_ref}`);
+  assert.ok(!whole.textContent.includes("cut short"));
+  const cut = doc.createElement("div");
+  renderDiff(doc, cut, { ...diff, diff: { ...diff.diff, truncated: true } });
+  assert.equal(cut.children.at(-1).textContent, "The list was cut short by the daemon.");
+});

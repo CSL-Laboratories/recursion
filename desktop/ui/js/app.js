@@ -49,29 +49,33 @@ export function startWindow(doc, transport, actions = makeActions()) {
     renderRuns(doc, $("runs-table"), answer, onRunAction);
   }
 
-  // A Stop is asked for only after the operator confirms it here; nothing is sent before.
+  // A Stop is asked for only after the operator confirms it here; nothing is sent before. The confirmation
+  // sits in the core bar every view shares (index.html), so it shows whichever view asked.
   let pendingStop = null;
 
-  function askToStop(action, input, text, conditionsBox) {
+  function askToStop(action, input, text, label, conditionsBox) {
     pendingStop = { action, input, conditionsBox };
     $("stop-confirm-text").textContent = text;
+    $("stop-confirm-yes").textContent = label;
     $("stop-confirm").hidden = false;
   }
 
   function onRunAction(action, input) {
     if (action === "run.stop") {
-      askToStop(action, input, `Stop run ${input.run_id}? The run is asked to stop through the control API.`, "runs-conditions");
+      askToStop(action, input, `Stop run ${input.run_id}? The run is asked to stop through the control API.`, "Stop the run",
+        "runs-conditions");
       return;
     }
-    ask(action, input).then((answer) => answer && renderConditions(doc, $("runs-conditions"), answer, "run.status"));
+    return ask(action, input).then((answer) => answer && renderConditions(doc, $("runs-conditions"), answer, "run.status"));
   }
 
   function onSessionAction(action, input) {
     if (action === "session.stop") {
-      askToStop(action, input, `Stop session ${input.session_id}? It is asked to stop through the control API.`, "sessions-conditions");
+      askToStop(action, input, `Stop session ${input.session_id}? It is asked to stop through the control API.`, "Stop the session",
+        "sessions-conditions");
       return;
     }
-    ask(action, input).then((answer) => {
+    return ask(action, input).then((answer) => {
       if (!answer) return;
       renderConditions(doc, $("sessions-conditions"), answer, "session.status");
       renderSession(doc, $("session-detail"), answer);

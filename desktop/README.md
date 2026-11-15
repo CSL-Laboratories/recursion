@@ -32,8 +32,8 @@ which builds nothing. Nothing here is a desktop build, and nothing claims to be 
   words (`ui/js/model.js` `conditionsFor`): a pending session Stop or interrupt names its session, why, and
   every run whose Stop result is not settled, with that run's state and reason.
 - **A Stop is confirmed first.** The window sends a run's or a session's Stop only after the operator
-  confirms it, and never one that was cancelled (`tests/js/check_app.mjs` runs `ui/js/app.js` itself against
-  a stand-in of `ui/index.html`).
+  confirms it, in the core bar every view shares, and never one that was cancelled (`tests/js/check_app.mjs`
+  runs `ui/js/app.js` itself against a stand-in of `ui/index.html` and presses only what is shown).
 - **SPINE's answers.** `tests/fixtures/answers.json` holds the answers of SPINE's fixtures, copied unedited by
   `sync_spine.py`, and every view is checked drawing them.
 - **The core draws approvals.** The approval region is outside the themed workspace, uses only the core's

@@ -34,6 +34,19 @@ body {
   margin: 0;
 }
 
+/* The Stop confirmation is the core's: in the bar every view shares, never inside a view or the theme. */
+.core-bar button {
+  color: var(--core-fg);
+  background: transparent;
+  border: 1px solid var(--core-accent);
+}
+
+#stop-confirm {
+  border: 1px solid var(--core-warn);
+  padding: 0.3rem 0.6rem;
+  margin: 0.4rem 0;
+}
+
 .beta {
   color: var(--core-warn);
   border: 1px solid var(--core-warn);

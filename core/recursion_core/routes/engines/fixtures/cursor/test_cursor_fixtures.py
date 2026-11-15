@@ -286,14 +286,26 @@ class AcpTranscriptTest(unittest.TestCase):
             "text content needs its text": (prompt({"type": "text"}), True),
             "content of no known type": (prompt({"type": "video", "data": "x"}), True),
             "image needs data and mimeType": (prompt({"type": "image", "data": "x"}), True),
+            "image needs its data": (prompt({"type": "image", "mimeType": "image/png"}), True),
             "image with both": (prompt({"type": "image", "data": "x", "mimeType": "image/png"}), False),
+            "audio needs its data": (prompt({"type": "audio", "mimeType": "audio/wav"}), True),
+            "audio needs its mimeType": (prompt({"type": "audio", "data": ""}), True),
+            "audio with both": (prompt({"type": "audio", "data": "", "mimeType": "audio/wav"}), False),
             "resource link needs name and uri": (prompt({"type": "resource_link", "name": "n"}), True),
+            "resource link needs its name": (prompt({"type": "resource_link", "uri": "file:///a"}), True),
             "resource link with both": (prompt({"type": "resource_link", "name": "n", "uri": "file:///a"}), False),
             "resource needs its object": (prompt({"type": "resource", "resource": "x"}), True),
-            "resource with its object": (prompt({"type": "resource", "resource": {"uri": "file:///a"}}), False),
+            "resource with a uri only": (prompt({"type": "resource", "resource": {"uri": "file:///a"}}), True),
+            "resource with uri and text": (prompt({"type": "resource", "resource": {"uri": "file:///a", "text": "x"}}), False),
+            "resource with uri and blob": (prompt({"type": "resource", "resource": {"uri": "file:///a", "blob": ""}}), False),
             "chunk text must be text": (chunk({"type": "text", "text": 7}), True),
             "chunk text": (chunk({"type": "text", "text": "Hello"}), False),
             "load modes not an object": (("answer", ("session/load", {}, {"modes": "not-an-object"})), True),
+            "load modes need currentModeId": (("answer", ("session/load", {}, {"modes": {"availableModes": []}})), True),
+            "load modes need a list": (("answer", ("session/load", {}, {"modes": {
+                "currentModeId": "a", "availableModes": {}}})), True),
+            "load mode without an id": (("answer", ("session/load", {}, {"modes": {
+                "currentModeId": "a", "availableModes": [{"name": "A"}]}})), True),
             "load mode without a name": (("answer", ("session/load", {}, {"modes": {
                 "currentModeId": "agent", "availableModes": [{"id": "agent"}]}})), True),
             "load modes": (("answer", ("session/load", {}, {"modes": {
@@ -309,6 +321,126 @@ class AcpTranscriptTest(unittest.TestCase):
                 check = acp_params_problems if kind == "params" else acp_answer_problems
                 self.assertEqual(bool(check(*args)), expected, check(*args))
 
+    def test_each_content_field_is_required_with_its_type(self):
+        """Review 3 of #388 (Sol change 2, Astra change 4): each field of each content variant, missing, a
+        number or null, is refused, and so is each field of an embedded resource's contents."""
+        missing = object()
+        blocks = {"text": {"type": "text", "text": "x"},
+                  "image": {"type": "image", "data": "x", "mimeType": "image/png"},
+                  "audio": {"type": "audio", "data": "x", "mimeType": "audio/wav"},
+                  "resource_link": {"type": "resource_link", "name": "n", "uri": "file:///a"},
+                  "resource": {"type": "resource", "resource": {"uri": "file:///a", "text": "x"}}}
+        nested = {"text resource": {"uri": "file:///a", "text": "x"},
+                  "blob resource": {"uri": "file:///a", "blob": "eA=="}}
+        for kind, block in [*blocks.items(), *(
+                (name, {"type": "resource", "resource": contents}) for name, contents in nested.items())]:
+            self.assertEqual(content_problems(block), [], kind)
+            fields = [(key,) for key in block] + [("resource", key) for key in block.get("resource", {})]
+            for path in fields:
+                for value in (missing, 7, None):
+                    bad = json.loads(json.dumps(block))
+                    holder = bad if len(path) == 1 else bad["resource"]
+                    if value is missing:
+                        del holder[path[-1]]
+                    else:
+                        holder[path[-1]] = value
+                    with self.subTest(kind=kind, field=".".join(path), value=value):
+                        self.assertTrue(content_problems(bad))
+
+    def test_embedded_resources_are_checked_whole(self):
+        """Review 3 of #388 (Astra change 1, Sol change 1): an embedded resource is TextResourceContents or
+        BlobResourceContents, ``uri`` with ``text`` or ``blob``, each a string; the empty string is one."""
+        def prompt(resource):
+            block = {"type": "resource", "resource": resource}
+            return "client", "session/prompt", {"sessionId": "s", "prompt": [block]}
+        for resource in ({}, {"uri": "file:///a"}, {"uri": 7, "text": "x"}, {"uri": 9, "text": "x"},
+                         {"uri": "file:///a", "text": 7}, {"uri": "file:///a", "blob": False}, {"text": "x"},
+                         {"blob": "x"}, "x", None, []):
+            with self.subTest(resource=resource):
+                self.assertTrue(acp_params_problems(*prompt(resource)))
+        for resource in ({"uri": "file:///a", "text": ""}, {"uri": "file:///a", "blob": ""},
+                         {"uri": "", "blob": "eA=="}, {"uri": "file:///a", "text": "x", "mimeType": "text/plain"}):
+            with self.subTest(resource=resource):
+                self.assertEqual(acp_params_problems(*prompt(resource)), [])
+
+    def test_config_options_are_checked_item_by_item(self):
+        """Review 3 of #388 (Astra change 2, Sol change 1): each supplied SessionConfigOption, in a session/new
+        and a session/load answer alike, by its ``type``."""
+        boolean = {"id": "x", "name": "X", "type": "boolean", "currentValue": False}
+        select = {"id": "m", "name": "Model", "type": "select", "currentValue": "a",
+                  "options": [{"value": "a", "name": "A"}]}
+        group = {"group": "g", "name": "G", "options": [{"value": "a", "name": "A"}]}
+        grouped = {**select, "options": [group]}
+        untyped = {key: value for key, value in boolean.items() if key != "type"}
+        good = (boolean, {**boolean, "currentValue": True}, select, grouped, {**select, "options": []},
+                {**grouped, "options": [{**group, "options": []}]}, {**boolean, "category": "model"},
+                {**boolean, "category": None}, {**boolean, "category": "a-category-of-its-own"})
+        bad = (False, 1, {}, {"id": "x"}, {**boolean, "id": 7}, {**boolean, "name": 7}, {**boolean, "category": 7},
+               {**boolean, "type": "toggle"}, untyped, {**boolean, "currentValue": 1}, {**boolean, "currentValue": 0},
+               {**boolean, "currentValue": "true"}, {**boolean, "currentValue": None},
+               {**select, "currentValue": 7}, {**select, "options": {}}, {**select, "options": None},
+               {**select, "options": [False]}, {**select, "options": [{"value": "a"}]},
+               {**select, "options": [{"name": "A"}]}, {**select, "options": [{"value": 7, "name": "A"}]},
+               {**grouped, "options": [{**group, "group": 7}]}, {**grouped, "options": [{**group, "name": 7}]},
+               {**grouped, "options": [{"name": "G", "options": []}]},
+               {**grouped, "options": [{**group, "options": {}}]},
+               {**grouped, "options": [{**group, "options": [{"value": "a"}]}]},
+               {**select, "options": [{"value": "a", "name": "A"}, group]})
+        for method, answer in (("session/new", {"sessionId": "s"}), ("session/load", {})):
+            for option in good:
+                with self.subTest(method=method, option=option):
+                    self.assertEqual(acp_answer_problems(method, {}, {**answer, "configOptions": [option]}), [])
+            for option in bad:
+                with self.subTest(method=method, option=option):
+                    self.assertTrue(acp_answer_problems(method, {}, {**answer, "configOptions": [option]}))
+            with self.subTest(method=method, case="a bad option after a good one"):
+                self.assertTrue(acp_answer_problems(method, {}, {**answer, "configOptions": [boolean, {}]}))
+
+    def test_capabilities_are_checked_field_by_field(self):
+        """Review 3 of #388 (Astra change 3, Sol change 1): AgentCapabilities' supplied fields, and each nested
+        capability object's own fields, one level deep. The fields below are copied from the pinned schema on
+        purpose, so that dropping one from the check's tables fails here."""
+        def problems(caps):
+            return acp_answer_problems("initialize", {}, {"protocolVersion": 1, "agentCapabilities": caps})
+        flags = {"promptCapabilities": ("image", "audio", "embeddedContext"), "mcpCapabilities": ("http", "sse")}
+        objects = {"sessionCapabilities": ("list", "delete", "additionalDirectories", "systemPrompt", "resume",
+                                           "close"),
+                   "auth": ("logout",)}
+        good = {"loadSession": False, "promptCapabilities": {"image": True, "audio": False, "embeddedContext": True},
+                "mcpCapabilities": {"http": False, "sse": True}, "auth": {"logout": {}}, "_meta": {"x": 1},
+                "sessionCapabilities": {"list": {}, "delete": None, "additionalDirectories": {}, "systemPrompt": None,
+                                        "resume": {}, "close": None}}
+        self.assertEqual(problems(good), [])
+        self.assertEqual(problems({}), [])
+        breaks = [({"loadSession": value}, "loadSession is not a boolean") for value in (1, 0, "true", None)]
+        for key, fields in flags.items():
+            breaks += [({key: {field: 1}}, f"{key}.{field} is not a boolean") for field in fields]
+            breaks += [({key: {field: "yes"}}, f"{key}.{field} is not a boolean") for field in fields]
+        for key, fields in objects.items():
+            breaks += [({key: {field: True}}, f"{key}.{field} is not an object or null") for field in fields]
+            breaks += [({key: {field: []}}, f"{key}.{field} is not an object or null") for field in fields]
+        for key in [*flags, *objects]:
+            breaks += [({key: value}, f"{key} is not an object") for value in ([], None, True)]
+        for caps, expected in breaks:
+            with self.subTest(caps=caps):
+                self.assertEqual(problems(caps), [expected])
+        self.assertEqual(problems(None), ["agentCapabilities is not an object"])
+
+    def test_session_modes_check_every_supplied_field(self):
+        """Review 3 of #388 (Sol change 2, Astra change 4): each field of a session mode state, in a session/new
+        and a session/load answer alike."""
+        good = {"currentModeId": "agent", "availableModes": [{"id": "agent", "name": "Agent"}]}
+        bad = ([], {}, {"currentModeId": 1, "availableModes": []}, {"currentModeId": "a"}, {"availableModes": []},
+               {"currentModeId": "a", "availableModes": {}}, {"currentModeId": "a", "availableModes": [1]},
+               {"currentModeId": "a", "availableModes": [{"name": "A"}]},
+               {"currentModeId": "a", "availableModes": [{"id": 1, "name": "Agent"}]},
+               {"currentModeId": "a", "availableModes": [{"id": "a", "name": 1}]})
+        for method, answer in (("session/new", {"sessionId": "s"}), ("session/load", {})):
+            self.assertEqual(acp_answer_problems(method, {}, {**answer, "modes": good}), [])
+            for modes in bad:
+                with self.subTest(method=method, modes=modes):
+                    self.assertTrue(acp_answer_problems(method, {}, {**answer, "modes": modes}))
+
     def test_the_permission_transcript_denies(self):
         """Review 1 of #388 (Sol M25): the denial transcript must stay a denial."""
         entries = dict(self.transcripts())["acp/prompt_turns.jsonl"]
@@ -319,7 +451,13 @@ class AcpTranscriptTest(unittest.TestCase):
         self.assertIn({"sessionUpdate": "tool_call_update", "toolCallId": "call-acp-1", "status": "failed"}, updates)
 
 
-# ACP v1's closed values, at the revision index.json names.
+# What the shape check holds an ACP v1 body to, at the revision index.json names: each method's required
+# fields with their types; each content variant's required fields; and, where supplied, the optional fields
+# that change what a client does (session modes, config options, and agent capabilities with their nested
+# capability objects, one level deep). Descriptive and extension fields (``_meta``, ``annotations``,
+# ``mimeType`` where optional, ``title``, ``description``, ``size``) are not checked.
+#
+# ACP v1's closed values.
 STOP_REASONS = ("end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled")
 OPTION_KINDS = ("allow_once", "allow_always", "reject_once", "reject_always")
 UPDATES = ("user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
@@ -331,6 +469,12 @@ AGENT_METHODS = ("session/update", "session/request_permission")
 # ResourceLink; EmbeddedResource requires an object ``resource``).
 CONTENT_TEXT_FIELDS = {"text": ("text",), "image": ("data", "mimeType"), "audio": ("data", "mimeType"),
                        "resource_link": ("name", "uri"), "resource": ()}
+# AgentCapabilities' nested capability objects and their own fields: PromptCapabilities and McpCapabilities
+# hold booleans; SessionCapabilities and AgentAuthCapabilities hold objects or null.
+CAPABILITY_FLAGS = {"promptCapabilities": ("image", "audio", "embeddedContext"), "mcpCapabilities": ("http", "sse")}
+CAPABILITY_OBJECTS = {"sessionCapabilities": ("list", "delete", "additionalDirectories", "systemPrompt", "resume",
+                                              "close"),
+                      "auth": ("logout",)}
 
 
 def _text(value) -> bool:
@@ -344,8 +488,20 @@ def content_problems(block) -> list:
     kind = block["type"]
     if any(not isinstance(block.get(name), str) for name in CONTENT_TEXT_FIELDS[kind]):
         return [f"{kind} content lacks {'/'.join(CONTENT_TEXT_FIELDS[kind])} as text"]
-    if kind == "resource" and not isinstance(block.get("resource"), dict):
+    if kind == "resource":
+        return embedded_resource_problems(block.get("resource"))
+    return []
+
+
+def embedded_resource_problems(resource) -> list:
+    """EmbeddedResourceResource: TextResourceContents (``uri`` and ``text``) or BlobResourceContents (``uri`` and
+    ``blob``), each a string. The empty string is a string: the schema sets no minimum length."""
+    if not isinstance(resource, dict):
         return ["resource content lacks its resource object"]
+    if not isinstance(resource.get("uri"), str):
+        return ["embedded resource lacks uri as text"]
+    if not (isinstance(resource.get("text"), str) or isinstance(resource.get("blob"), str)):
+        return ["embedded resource lacks text or blob as text"]
     return []
 
 
@@ -358,8 +514,68 @@ def session_state_problems(result: dict) -> list:
                                   and all(isinstance(m, dict) and _text(m.get("id")) and _text(m.get("name"))
                                           for m in modes["availableModes"])):
         out.append("modes is not an ACP v1 session mode state")
-    if result.get("configOptions") is not None and not isinstance(result["configOptions"], list):
-        out.append("configOptions is not a list")
+    options = result.get("configOptions")
+    if options is not None:
+        if not isinstance(options, list):
+            out.append("configOptions is not a list")
+        else:
+            out += [p for option in options for p in config_option_problems(option)]
+    return out
+
+
+def config_option_problems(option) -> list:
+    """One SessionConfigOption: ``id`` and ``name`` as text, ``category`` text or null, and by ``type`` either a
+    boolean ``currentValue`` or a select's text ``currentValue`` with its ``options``."""
+    if not (isinstance(option, dict) and isinstance(option.get("id"), str) and isinstance(option.get("name"), str)):
+        return ["config option lacks id/name as text"]
+    if option.get("category") is not None and not isinstance(option["category"], str):
+        return ["config option category is not text"]
+    kind = option.get("type")
+    if kind == "boolean":
+        if type(option.get("currentValue")) is not bool:
+            return ["boolean config option's currentValue is not a boolean"]
+    elif kind == "select":
+        if not isinstance(option.get("currentValue"), str):
+            return ["select config option's currentValue is not text"]
+        if not select_options_ok(option.get("options")):
+            return ["select config option's options are neither all options nor all groups"]
+    else:
+        return ["config option of no ACP v1 type"]
+    return []
+
+
+def _select_option(value) -> bool:
+    return isinstance(value, dict) and isinstance(value.get("value"), str) and isinstance(value.get("name"), str)
+
+
+def _select_group(value) -> bool:
+    return (isinstance(value, dict) and isinstance(value.get("group"), str) and isinstance(value.get("name"), str)
+            and isinstance(value.get("options"), list) and all(_select_option(o) for o in value["options"]))
+
+
+def select_options_ok(options) -> bool:
+    """SessionConfigSelectOptions: a list of select options, or a list of groups of them, never a mix."""
+    return isinstance(options, list) and (all(map(_select_option, options)) or all(map(_select_group, options)))
+
+
+def capability_problems(caps) -> list:
+    """An initialize answer's AgentCapabilities: ``loadSession`` a boolean, and each nested capability object
+    supplied is an object whose own fields are booleans (prompt, MCP) or objects or null (session, auth)."""
+    if not isinstance(caps, dict):
+        return ["agentCapabilities is not an object"]
+    out = []
+    if "loadSession" in caps and type(caps["loadSession"]) is not bool:
+        out.append("loadSession is not a boolean")
+    for table, fits, what in ((CAPABILITY_FLAGS, lambda v: type(v) is bool, "a boolean"),
+                              (CAPABILITY_OBJECTS, lambda v: v is None or isinstance(v, dict), "an object or null")):
+        for key, fields in table.items():
+            if key not in caps:
+                continue
+            if not isinstance(caps[key], dict):
+                out.append(f"{key} is not an object")
+                continue
+            out += [f"{key}.{field} is not {what}" for field in fields
+                    if field in caps[key] and not fits(caps[key][field])]
     return out
 
 
@@ -423,8 +639,8 @@ def acp_answer_problems(method: str, params, result) -> list:
         if not (isinstance(methods, list) and all(isinstance(m, dict) and _text(m.get("id")) and _text(m.get("name"))
                                                   for m in methods)):
             return ["authMethods are not ACP v1 auth methods"]
-        if "agentCapabilities" in result and not isinstance(result["agentCapabilities"], dict):
-            return ["agentCapabilities is not an object"]
+        if "agentCapabilities" in result:
+            return capability_problems(result["agentCapabilities"])
     elif method in ("session/new", "session/load"):
         if method == "session/new" and not _text(result.get("sessionId")):
             return ["sessionId missing"]

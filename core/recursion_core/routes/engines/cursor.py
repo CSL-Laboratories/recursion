@@ -39,8 +39,8 @@ does not know, belongs to another conversation, has a shape this parser does not
 already drafted, gives no draft and is counted in ``StreamParser.counts``. A forged event.v1 line is such a
 line: its ``type`` is none of Cursor's. The conversation's id is set by the first line that is neither of an
 unknown type nor assistant text, so neither can bind the parser to another conversation. Model text
-(assistant content, the answer) is model
-payload and is never inspected; the answer is only checked to be text.
+(assistant content, the answer) is model payload and is never inspected; the answer is only checked to be
+text.
 
 THE RESULT IS TERMINAL. Cursor documents the result line as the stream's last: after the first one, a
 second result is counted ``result_repeated`` and any other line ``after_result``, and neither drafts

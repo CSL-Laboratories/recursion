@@ -197,8 +197,22 @@ class AcpMatchingTest(unittest.TestCase):
         for a, b in ((1, 1), (1, 1.0), (True, True), (None, None), ("a", "a"), ({"k": [1, {"x": False}]}, {"k": [1, {"x": False}]})):
             self.assertTrue(same(a, b), (a, b))
         for a, b in ((True, 1), (1, True), (False, 0), (0, False), (None, False), ("1", 1), ({"k": 1}, {"k": True}),
-                     ([1], [True]), ({"a": 1}, {"a": 1, "b": 2}), ([1], [1, 1]), ({}, []), (1.5, 1)):
+                     ([1], [True]), ({"a": 1}, {"a": 1, "b": 2}), ([1], [1, 1]), ({}, []), (1.5, 1),
+                     (True, False), (False, True), ({"k": [True]}, {"k": [False]})):
             self.assertFalse(same(a, b), (a, b))
+
+    def test_a_flipped_boolean_is_refused_and_the_retry_keeps_the_clients_id(self):
+        """Review 3 of #388 (Sol change 3): a boolean the client flips is refused, nothing is taken, and the
+        scripted message sent after it is answered under the client's own request id."""
+        process = fake_agent.FakeLauncher("acp/load.jsonl")(cursor.acp_argv(), env={})
+        msg = scripted("acp/load.jsonl", 0, "round3-bool-retry")
+        caps = msg["params"]["clientCapabilities"]
+        self.assertIs(caps["terminal"], False)
+        self.refused(process, {**msg, "params": {**msg["params"], "clientCapabilities": {**caps, "terminal": True}}})
+        with self.assertRaises(ReadTimeout):   # nothing was taken: the agent still waits for the client
+            process.read_line(0.1)
+        send(process, msg)
+        self.assertEqual(json.loads(process.read_line(1.0))["id"], "round3-bool-retry")
 
     def test_a_refused_message_is_not_taken(self):
         process = self.ready_for_the_prompt(count=4)

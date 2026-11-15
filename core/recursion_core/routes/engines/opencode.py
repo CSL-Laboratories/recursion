@@ -141,6 +141,56 @@ def input_digest(tool_input: object) -> str:
     return hashlib.sha256(canonical_text(tool_input).encode("utf-8")).hexdigest()
 
 
+def route_argv(request: dict, *, binary: str | None = None) -> list[str]:
+    """``ProfileRouteAdapter``'s argv hook for one route request. A model OpenCode cannot take is a typed refusal."""
+    try:
+        return build_argv(request["route"]["model"], binary=binary)
+    except ValueError as err:
+        raise c.RouteError(c.REQUEST_INVALID, f"route.{err}") from None
+
+
+class OneShot:
+    """The one-shot drive on today's route contract: ``ProfileRouteAdapter`` calls it once the guard has passed.
+
+    ``drive(process, request, deadline_at, events) -> result``: the prompt is written to standard input, which is
+    then closed (OpenCode reads it to its end as the message), and stdout is read a line at a time until it ends.
+    ``clock`` is the deadline and breaker clock; a read that would pass ``deadline_at`` raises ``Deadline``, which
+    the adapter fences for this request only. A route whose connection the parser refuses writes nothing.
+    """
+
+    def __init__(self, clock: Callable[[], float], *, wall: Callable[[], float] = time.time) -> None:
+        self._clock, self._wall = clock, wall
+
+    def __call__(self, process, request: dict, deadline_at: float, events: list) -> dict:
+        from recursion_core.routes.base import Deadline       # local: base imports nothing of this module
+        from recursion_core.routes.launch import ReadTimeout
+
+        route = request["route"]
+        try:
+            parser = Parser(connection_id=c.connection_key(route), model=route["model"], wall=self._wall,
+                            clock=self._clock)
+        except ValueError as err:
+            return c.result(request["request_id"], c.REQUEST_INVALID, detail=f"route.{err}")
+        process.send(request["prompt"])
+        process.close_stdin()
+        while True:
+            remaining = deadline_at - self._clock()
+            if remaining <= 0:
+                raise Deadline()
+            try:
+                line = process.read_line(remaining)
+            except ReadTimeout:
+                raise Deadline() from None
+            if line is None:
+                break
+            parser.feed(line if line.endswith("\n") else line + "\n")
+        parser.end(None)   # today's EngineProcess gives no exit status: the stream's last step decides
+        result = parser.route_result(request["request_id"])
+        events.extend(result["events"])
+        result["events"] = events
+        return result
+
+
 class Parser:
     """One run's stdout, a line at a time. One reader feeds it; it is not shared between threads.
 
@@ -164,6 +214,7 @@ class Parser:
         self._limit: dict | None = None       # the route contract's limit signal, from the latest typed 429
         self._usage: list[dict] = []          # the route contract's usage events
         self._result: tuple[str | None, str] | None = None
+        self._finish: str | None = None       # the reason of the latest step_finish, a typed field
         self.engine_session_id: str | None = None
         self.anomalies: list[str] = []
 
@@ -292,6 +343,7 @@ class Parser:
         if not isinstance(part, dict) or part.get("type") != "step-finish":
             self._anomaly("step_shape")
             return []
+        self._finish = part.get("reason") if isinstance(part.get("reason"), str) else None
         tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
         cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
         output, reasoning = _positive_int(tokens.get("output")), _positive_int(tokens.get("reasoning"))
@@ -361,7 +413,11 @@ class Parser:
         if exit_code == 0:
             return None, ""
         if exit_code is None:
-            return c.ENGINE_EXITED, "no exit status"
+            # No exit status was read (today's EngineProcess gives none): the stream's own end-of-turn sign
+            # decides, a last step that finished with reason "stop". OpenCode's loop goes on after "tool-calls".
+            if self._finish == "stop":
+                return None, ""
+            return c.ENGINE_EXITED, "no exit status and no finished step"
         return c.ENGINE_EXITED, f"exit {exit_code} without a typed error"
 
     def _anomaly(self, what: str) -> None:

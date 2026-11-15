@@ -608,7 +608,7 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(p.end(1)[0]["payload"], {"code": c.ENGINE_ERROR, "detail": "APIError status 503"})
 
     def test_how_the_run_ended(self):
-        cases = [(0, (None, "")), (None, (c.ENGINE_EXITED, "no exit status")),
+        cases = [(0, (None, "")), (None, (c.ENGINE_EXITED, "no exit status and no finished step")),
                  (-15, (c.ENGINE_EXITED, "exit -15 without a typed error")),
                  (1, (c.ENGINE_EXITED, "exit 1 without a typed error"))]
         for exit_code, (code, detail) in cases:
@@ -616,6 +616,17 @@ class StreamTests(unittest.TestCase):
                 self.assertEqual(parser().end(exit_code)[0]["payload"], {"code": code, "detail": detail})
         with self.assertRaises(ValueError):
             parser().end(True)
+
+    def test_without_an_exit_status_a_last_step_that_stopped_is_the_end_of_the_turn(self):
+        for reasons, code in ((["tool-calls", "stop"], None), (["stop", "tool-calls"], c.ENGINE_EXITED),
+                              (["length"], c.ENGINE_EXITED), ([7], c.ENGINE_EXITED)):
+            with self.subTest(reasons):
+                p = parser()
+                for reason in reasons:
+                    event = step({"input": 1})
+                    event["part"]["reason"] = reason
+                    p.feed(line(event))
+                self.assertEqual(p.end(None)[0]["payload"]["code"], code)
 
     def test_a_typed_limit_outranks_an_exit_0_and_an_auth_error_outranks_other_errors(self):
         p, _ = replay("synthetic-v1-limit-429.jsonl", exit_code=0)

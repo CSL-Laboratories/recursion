@@ -43,10 +43,10 @@ class Spy:
         return self.processes[-1]
 
 
-def start_record(model="openai/gpt-5.5", engine_session_id=None) -> dict:
-    return {"session_id": "ses-e3test", "run_id": "run-e3test", "workspace": None,
-            "route": {"engine": "opencode", "model": model, "connection": {"kind": "api_key", "id": "k1"}},
-            "engine_session_id": engine_session_id}
+def session(model="openai/gpt-5.5") -> dict:
+    """The ``session`` argument of #376's PROVISIONAL ``start(session, workspace, env)`` (its lane questions Q7)."""
+    return {"session_id": "ses-e3test", "run_id": "run-e3test",
+            "route": {"engine": "opencode", "model": model, "connection": {"kind": "api_key", "id": "k1"}}}
 
 
 def message(turn="turn-1", delivery="dlv-1", text="Run the tests.") -> dict:
@@ -69,7 +69,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(Declaration.from_record(oc.declaration()), self.driver.declaration)
 
     def test_a_one_shot_turn_from_start_to_result(self):
-        handle = self.driver.start(start_record(), ENV)
+        handle = self.driver.start(session(), None, ENV)
         self.assertEqual(self.spy.spawns, [(["opencode", "run", "--format", "json", "--model", "openai/gpt-5.5"], ENV)])
         self.driver.send(handle, message())
         process = self.spy.processes[0]
@@ -88,7 +88,7 @@ class DriverTests(unittest.TestCase):
         self.assertIsNone(handle.live_turn)
 
     def test_a_typed_429_comes_through_the_gate_as_a_limit_and_the_result(self):
-        handle = self.driver.start(start_record(), ENV)
+        handle = self.driver.start(session(), None, ENV)
         self.driver.send(handle, message())
         (limit,) = [d["payload"] for d in self.replay(handle, "synthetic-v1-limit-429.jsonl") if d["type"] == "limit"]
         self.assertEqual((limit["connection_id"], limit["reset_at"]), ("api_key:k1", "2026-11-14T00:02:00.000Z"))
@@ -96,14 +96,12 @@ class DriverTests(unittest.TestCase):
 
     def test_every_verb_the_drive_lacks_refuses_with_no_process_started_and_nothing_written(self):
         with self.assertRaises(DriverRefused) as caught:
-            self.driver.start(start_record(engine_session_id="ses_abc"), ENV)            # resume
+            self.driver.resume("ses_abc", session(), None, ENV)
         self.assertEqual(caught.exception.as_record(), {"code": "unsupported", "call": "resume", "flag": "resume"})
-        with self.assertRaises(DriverRefused):
-            self.driver.resume(start_record(engine_session_id="ses_abc"), ENV)
         with self.assertRaises(DriverRefused):
             self.driver.fork("ses_abc", "turn-1")
         self.assertEqual(self.spy.spawns, [])                                              # nothing started
-        handle = self.driver.start(start_record(), ENV)
+        handle = self.driver.start(session(), None, ENV)
         refused = []
         for call in (lambda: self.driver.send(handle, {"kind": "approval_answer", "approval_id": "apr-1",
                                                        "decision": "approve"}),
@@ -126,25 +124,25 @@ class DriverTests(unittest.TestCase):
         self.assertEqual((self.spy.processes[0].sent, self.spy.processes[0].closes), (["Run the tests."], 1))
 
     def test_a_close_before_any_message_ends_the_input_once(self):
-        handle = self.driver.start(start_record(), ENV)
+        handle = self.driver.start(session(), None, ENV)
         self.driver.send(handle, {"kind": "close"})
         self.assertEqual((self.spy.processes[0].sent, self.spy.processes[0].closes), ([], 1))
         self.assertEqual(self.driver.finish(handle, None)[0]["payload"]["code"], "engine_exited")
 
     def test_no_acceptance_without_a_step_start_and_none_before_the_message(self):
-        handle = self.driver.start(start_record(), ENV)
+        handle = self.driver.start(session(), None, ENV)
         early = self.replay(handle, "synthetic-v1-success.jsonl")       # stdout before the prompt was written
         self.assertNotIn("input.accepted", [d["type"] for d in early])
-        handle = self.driver.start(start_record(), ENV)
+        handle = self.driver.start(session(), None, ENV)
         self.driver.send(handle, message())
         drafts = self.replay(handle, "synthetic-v1-auth-error.jsonl")  # an error line, no step
         self.assertNotIn("input.accepted", [d["type"] for d in drafts])
 
     def test_the_engine_default_model_names_no_model(self):
-        self.driver.start(start_record(model=None), ENV)
+        self.driver.start(session(model=None), None, ENV)
         self.assertEqual(self.spy.spawns[0][0], ["opencode", "run", "--format", "json"])
         driver = oc.OpenCodeDriver(self.spy, binary="/opt/oc/bin/opencode")
-        driver.start(start_record(), ENV)
+        driver.start(session(), None, ENV)
         self.assertEqual(self.spy.spawns[1][0][0], "/opt/oc/bin/opencode")
 
 

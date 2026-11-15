@@ -10,6 +10,7 @@ Operator plugins are never imported by name. The composition loads each installe
 ``plugin_security.PluginLoader`` (``plugins.PluginHost``); a plugin that is refused is listed
 with its finding and the daemon runs without it.
 """
+import _thread
 import argparse
 import getpass
 import logging
@@ -38,13 +39,36 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
     state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
     stopped = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
-    signal.signal(signal.SIGINT, lambda *_: stopped.set())
+    asked = _thread.allocate_lock()
+    asked.acquire()  # held until a stop is asked for
+
+    def ask(*_):
+        """The handler of SIGTERM and SIGINT: one native call, which cannot wait.
+
+        A handler runs on the main thread, between two of its instructions, and the main thread is
+        the one that waits on ``stopped``. ``stopped.set()`` called from here takes the Event's lock
+        on that thread: it blocks for ever when the signal arrives while the thread holds that lock
+        inside ``wait``, or while an earlier handler is still inside ``set``. So the handler only
+        lets ``tell`` go, and ``tell`` sets the Event on a thread of its own.
+        """
+        try:
+            asked.release()
+        except RuntimeError:  # asked already
+            pass
+
+    def tell():
+        asked.acquire()
+        stopped.set()
+
+    signal.signal(signal.SIGTERM, ask)
+    signal.signal(signal.SIGINT, ask)
     with UserLock(runtime):
         injected = client is not None or door is not None
         daemon = Daemon(Registry(state), SystemdUserManager() if injected else EngineUnitManager())
         gui = composed = None
         try:
+            # Not a threading.Thread: this one is not waited for at exit, and it needs no Event of its own.
+            _thread.start_new_thread(tell, ())
             daemon.sweep()
             if not injected:
                 # After the startup sweep: recovered runs are re-observed before any surface can ask.
@@ -64,6 +88,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
                     gui = _start_gui(client, door, plugins, port, announced=announced)
                     announced = gui is None
         finally:
+            ask()  # ``tell`` ends with the daemon, whatever ended it
             try:
                 if gui is not None:
                     gui.__exit__(None, None, None)

@@ -1791,6 +1791,46 @@ class CompositionRootTest(unittest.TestCase):
         self.assertNotIsInstance(daemon.call_args.args[1], launcher.EngineUnitManager)
         self.assertEqual(order, ['sweep', 'sweep', 'close_daemon'])
 
+    def test_a_stop_signal_never_sets_the_event_on_the_thread_that_waits_on_it(self):
+        """The handlers run on the main thread, and the main thread is the one that waits on the Event.
+
+        ``Event.set`` takes the Event's lock: called from a handler it blocks for ever when the signal
+        arrives while that thread holds the lock inside ``wait``, or while an earlier handler is still
+        inside ``set`` (measured with real signals on both interpreters). Here the wait plays the
+        signals: on the waiting thread it calls each installed handler, a SIGTERM and a SIGINT
+        together, and then waits. The daemon stops, and no ``set`` ran on the waiting thread.
+        """
+        from recursion_core.daemon import __main__ as entry
+        handlers, sets = {}, []
+
+        class Watched(threading.Event):
+            def set(self):
+                sets.append(threading.get_ident())
+                super().set()
+
+            def wait(self, timeout=None):
+                for number in (signal.SIGTERM, signal.SIGINT):
+                    handlers[number](number, None)
+                return super().wait()
+
+        threads = mock.MagicMock(wraps=threading)  # module-local: whatever else main takes from threading is real
+        threads.Event = Watched
+        with mock.patch.object(entry, 'require_free_threaded'), \
+                mock.patch.object(entry, 'check_operator_linger'), \
+                mock.patch.object(entry.signal, 'signal', side_effect=handlers.__setitem__), \
+                mock.patch.object(entry, 'UserLock'), \
+                mock.patch.object(entry, 'Registry'), \
+                mock.patch.object(entry, 'Daemon') as daemon, \
+                mock.patch.object(entry, 'LoopbackGUI'), \
+                mock.patch.object(entry, 'compose_control'), \
+                mock.patch.object(entry, 'threading', threads), \
+                mock.patch.dict(entry.os.environ, {'RECURSION_ENGINE_USER': ''}):
+            entry.main(port=0)
+        self.assertEqual(sorted(handlers), sorted((signal.SIGTERM, signal.SIGINT)))
+        self.assertTrue(sets, 'nothing set the Event')
+        self.assertNotIn(threading.get_ident(), sets, 'a handler set the Event on the thread that waits on it')
+        daemon.return_value.close.assert_called_once()
+
     def test_a_composition_that_cannot_start_stops_the_daemon_before_any_gui(self):
         from recursion_core.daemon import __main__ as entry
         with mock.patch.object(entry, 'require_free_threaded'), mock.patch.object(entry, 'check_operator_linger'), \

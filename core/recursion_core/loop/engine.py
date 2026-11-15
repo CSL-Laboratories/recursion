@@ -1,7 +1,8 @@
 """The loop: a conversation, the model calls of each turn, and the tool calls between them.
 
 One thread reads standard input (``protocol.read_lines``) and queues messages; an interrupt is acted on there at
-once, by cancelling the running turn's token, which closes the provider's connection and kills a running search.
+once, by cancelling the running turn's token, which closes the provider's connection and kills a running search,
+or, for a message read but not started yet, by marking it so that it starts interrupted (no model call).
 The main thread takes one message at a time: it writes ``input_accepted`` for it, then runs the turn:
 
     the user's text is added; then, until the turn ends:
@@ -28,9 +29,13 @@ vendors require: a turn that ended with no reply kept after the user's message o
 the assistant's place saying why, and a reply that continues a paused one joins it.
 
 No secret the loop holds reaches the model or the next call: the system prompt and the user's text are scrubbed
-before they join the conversation, and so are the model's text and tool inputs before the reply is kept. A
-vendor block that holds one (a signed thinking block) cannot be changed without breaking it, so the reply is
-refused and the turn fails with ``provider_protocol``.
+before they join the conversation, and so are the model's text (all its text parts as one text, so a secret
+split across two of them is caught) and tool inputs before the reply is kept. A vendor block that holds one (a
+signed thinking block) or a tool call whose id or name holds one cannot be changed without breaking it, so the
+reply is refused and the turn fails with ``provider_protocol``.
+
+However a turn ends, a loop error included, the conversation is left valid (``settle``): every tool call of
+the last reply has a result and a reply follows the user's side.
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ NO_REPLY_WHY = {
     "refusal": "the model refused",
     "context_full": "the conversation filled the model's window",
     "unexpected_stop": "the model stopped unexpectedly",
+    "loop_error": "the loop failed",
 }
 DETAIL_MAX = 2000
 
@@ -134,8 +140,9 @@ class Session:
             parts = self._kept(response.parts)
             if parts is None:
                 return self._end(turn_id, "failed", self._result(
-                    "provider_protocol", "the reply holds a secret the loop keeps, inside a vendor block that "
-                                         "cannot be changed; the reply was not kept"), "provider_error")
+                    "provider_protocol", "the reply holds a secret the loop keeps, inside a vendor block or a tool "
+                                         "call's id or name, which cannot be changed; the reply was not kept"),
+                    "provider_error")
             if parts:
                 self._append(b.Message("assistant", parts))
             for part in parts:
@@ -202,9 +209,9 @@ class Session:
         scrub = self.redactor.scrub
         kept: list[b.Part] = []
         for part in parts:
-            if isinstance(part, b.TextPart):
-                part = b.TextPart(scrub(part.text))
-            elif isinstance(part, b.ToolCall) and part.input is not None and not isinstance(part.input, Mapping):
+            if isinstance(part, b.ToolCall) and (self.redactor.holds(part.call_id) or self.redactor.holds(part.name)):
+                return None  # an id pairs the call with its result, a name picks the tool: neither is scrubbed
+            if isinstance(part, b.ToolCall) and part.input is not None and not isinstance(part.input, Mapping):
                 # A provider bug: the input is not an object. Kept as input that did not parse, so the call gets
                 # an error result and the turn goes on.
                 part = b.ToolCall(part.call_id, part.name, None, scrub(part.raw_input), "input is not a JSON object")
@@ -217,6 +224,10 @@ class Session:
             elif isinstance(part, b.OpaquePart) and self.redactor.holds(part.data):
                 return None
             kept.append(part)
+        # The text parts are scrubbed as one text: a secret split across two of them is found in their join.
+        texts = [k for k, part in enumerate(kept) if isinstance(part, b.TextPart)]
+        for k, text in zip(texts, self.redactor.scrub_across([kept[k].text for k in texts])):
+            kept[k] = b.TextPart(text)
         return tuple(kept)
 
     def _result(self, code: str | None, detail: str) -> dict:
@@ -225,12 +236,25 @@ class Session:
             detail = detail[:DETAIL_MAX] + " [cut]"
         return {"code": code, "detail": detail, "result_ref": None}
 
-    def _end(self, turn_id: str, outcome: str, result: dict | None, reason: str) -> str:
+    def settle(self, reason: str) -> None:
+        """Leave the conversation valid however the turn ended: every tool call of the last reply gets a result
+        (a loop error can stop a turn between a reply and its tools' results), and a reply follows the user's
+        side (a harness note when none was kept). Only appends, so the history stays append-only."""
+
+        last = self.messages[-1] if self.messages else None
+        calls = ([part for part in last.parts if isinstance(part, b.ToolCall)]
+                 if last is not None and last.role == "assistant" else [])
+        if calls:
+            self._append(b.Message("user", tuple(
+                b.ToolResult(c.call_id, "not run: the turn ended before this call ran", True) for c in calls)))
         if self.messages and self.messages[-1].role == "user":
             # No reply was kept after the user's words or the tool results: a note in the assistant's place keeps
-            # the roles alternating and tells the model what happened, and the history stays append-only.
+            # the roles alternating and tells the model what happened.
             why = NO_REPLY_WHY.get(reason, "the turn ended")
             self._append(b.Message("assistant", (b.TextPart(NO_REPLY.format(why=why)),)))
+
+    def _end(self, turn_id: str, outcome: str, result: dict | None, reason: str) -> str:
+        self.settle(reason)
         self.writer.write("turn_ended", turn_id=turn_id, outcome=outcome, result=result, reason=reason)
         return outcome
 
@@ -244,6 +268,8 @@ class Engine:
         self._inbox: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
         self._live: _Live | None = None
+        self._queued: set[str] = set()  # turn ids read from standard input and not started yet
+        self._stopped: set[str] = set()  # of those, the ones interrupted while they waited
         self._log = log or (lambda msg: print(msg, file=sys.stderr, flush=True))
 
     # The input thread.
@@ -265,16 +291,22 @@ class Engine:
         if isinstance(item, p.Interrupt):
             with self._lock:
                 live = self._live
-                hit = live is not None and live.turn_id == item.turn_id
-            if hit:
+                running = live is not None and live.turn_id == item.turn_id
+                waiting = not running and item.turn_id in self._queued
+                if waiting:
+                    self._stopped.add(item.turn_id)  # it will start interrupted
+            if running:
                 live.cancel.cancel()
-            self.writer.write("interrupt", turn_id=item.turn_id, delivered=hit)
+            self.writer.write("interrupt", turn_id=item.turn_id, delivered=running or waiting)
             return
         if isinstance(item, p.ApprovalAnswer):
             # No tool asks for approval yet (write, edit and shell arrive with the second pull request).
             self.writer.write("protocol_error", code="no_pending_request",
                               detail=f"no permission request is waiting for {item.approval_id}")
             return
+        if isinstance(item, p.UserMessage):
+            with self._lock:
+                self._queued.add(item.turn_id)
         self._inbox.put(item)
 
     def line_too_long(self) -> None:
@@ -294,6 +326,10 @@ class Engine:
             assert isinstance(item, p.UserMessage)
             live = _Live(item.turn_id)
             with self._lock:
+                self._queued.discard(item.turn_id)
+                if item.turn_id in self._stopped:
+                    self._stopped.discard(item.turn_id)
+                    live.cancel.cancel()  # interrupted while it waited: it ends at once, with no model call
                 self._live = live
             # Taken: say so before anything reaches the model.
             self.writer.write("input_accepted", delivery_id=item.delivery_id, turn_id=item.turn_id, how="new_turn")
@@ -302,6 +338,10 @@ class Engine:
             except Exception as exc:  # noqa: BLE001 - a loop bug ends the turn as failed, visibly, and the loop goes on
                 self._log(self.session.redactor.scrub(
                     f"recursion_loop: turn {item.turn_id} failed inside the loop: {type(exc).__name__}: {exc}"))
+                try:
+                    self.session.settle("loop_error")
+                except Exception:  # noqa: BLE001 - the turn has failed already; its end is written regardless
+                    pass
                 self.writer.write("turn_ended", turn_id=item.turn_id, outcome="failed",
                                   result={"code": "loop_error", "detail": type(exc).__name__, "result_ref": None},
                                   reason="loop_error")

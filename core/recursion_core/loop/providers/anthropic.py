@@ -27,10 +27,12 @@ from memory:
   ends the turn with a typed code instead.
 
 The key is held in this object only. It goes into one request header, never into an exception, a return value,
-an event or a log. Vendor text that holds it is scrubbed before it leaves this module: error details, finished
-text blocks, tool inputs, and streamed text (a fragment that could be the start of the key is held back until
-the next fragment or the end of its block). A thinking or other vendor block that holds it is refused
-(``ProtocolError``), since changing it would break its signature.
+an event or a log. Vendor text that holds it is scrubbed before it leaves this module: every error detail
+(an event's name or a block's type included), the reply's text parts as one text (a key split across two text
+blocks is found in their join), tool inputs, and streamed text (a fragment that could be the start of the key
+is held back until the next fragment, in this block or the next text block, or the end of the message). A
+thinking or other vendor block that holds it is refused (``ProtocolError``), since changing it would break its
+signature, and so is a tool call whose id or name holds it.
 
 A call that fails or is interrupted after the stream began still reports what it measured: the exception's
 ``usage`` holds the counts the stream had given (an output count is a lower bound until ``message_stop``) and
@@ -39,6 +41,7 @@ A call that fails or is interrupted after the stream began still reports what it
 
 from __future__ import annotations
 
+import dataclasses
 import email.utils
 import http.client
 import ipaddress
@@ -257,6 +260,15 @@ class AnthropicProvider:
     def _holds_key(self, value: Any) -> bool:
         return self._key in json.dumps(value, ensure_ascii=False)
 
+    def _scrub_response(self, response: b.TurnResponse) -> b.TurnResponse:
+        """The reply's text parts scrubbed as one text, so a key split across two text blocks is caught."""
+
+        where = [k for k, part in enumerate(response.parts) if isinstance(part, b.TextPart)]
+        parts = list(response.parts)
+        for k, text in zip(where, b.scrub_across([parts[k].text for k in where], (self._key,))):
+            parts[k] = b.TextPart(text)
+        return dataclasses.replace(response, parts=tuple(parts))
+
     def _held_back(self, text: str) -> int:
         """How many characters at the end of ``text`` could be the start of the key (held until more comes)."""
 
@@ -378,8 +390,12 @@ class AnthropicProvider:
                 cancel.raise_if_cancelled()
                 raise b.ProtocolError(str(exc), request_id=request_id) from None
             cancel.raise_if_cancelled()
-            return state.finish()
+            return self._scrub_response(state.finish())
         except (b.ProviderError, b.Cancelled) as exc:
+            if isinstance(exc, b.ProviderError):
+                # Its detail may quote the vendor (an event's name, a block's type): scrubbed here, once for all.
+                exc.detail = self._scrub(exc.detail)
+                exc.args = (exc.detail,)
             # The call still happened: what the stream had measured goes with the failure.
             if exc.usage is None:
                 exc.usage = state.partial_usage()
@@ -401,7 +417,8 @@ class _StreamState:
         self.blocks: dict[int, dict] = {}
         self.order: list[int] = []
         self.done: dict[int, b.Part] = {}
-        self.unsent: dict[int, str] = {}  # streamed text held back because it could be the start of the key
+        self.unsent = ""  # streamed text held back because it could be the start of the key (across blocks)
+        self.last_text = 0  # the index of the last text block, for what is still held when the message ends
 
     def _protocol(self, what: str) -> b.ProtocolError:
         return b.ProtocolError(what, request_id=self.request_id)
@@ -453,11 +470,12 @@ class _StreamState:
             if dtype == "text_delta" and isinstance(delta.get("text"), str):
                 entry["text"].append(delta["text"])
                 if on_event is not None and delta["text"]:
-                    pending = provider._scrub(self.unsent.pop(index, "") + delta["text"])
+                    # What an earlier text block held back is carried over: a key can be split across blocks.
+                    pending = provider._scrub(self.unsent + delta["text"])
                     keep = provider._held_back(pending)
-                    if keep:
-                        self.unsent[index] = pending[-keep:]
-                        pending = pending[:-keep]
+                    self.unsent = pending[len(pending) - keep:] if keep else ""
+                    pending = pending[:len(pending) - keep]
+                    self.last_text = index
                     if pending:
                         on_event(b.TextDelta(index, pending))
             elif dtype == "input_json_delta" and isinstance(delta.get("partial_json"), str):
@@ -474,9 +492,6 @@ class _StreamState:
             if entry is None or index in self.done:
                 raise self._protocol("content_block_stop for no open block")
             self.done[index] = self._finish_block(entry, provider)
-            rest = self.unsent.pop(index, "")
-            if on_event is not None and rest:
-                on_event(b.TextDelta(index, provider._scrub(rest)))
             return None
         if kind == "message_delta":
             delta = data.get("delta")
@@ -486,6 +501,9 @@ class _StreamState:
             return None
         if kind == "message_stop":
             self.stopped = True
+            if on_event is not None and self.unsent:
+                on_event(b.TextDelta(self.last_text, provider._scrub(self.unsent)))
+                self.unsent = ""
             return "stop"
         return None  # an event type this client does not know is skipped, as the stream format allows
 
@@ -493,12 +511,15 @@ class _StreamState:
         block = entry["block"]
         btype = block.get("type")
         if btype == "text":
-            return b.TextPart(provider._scrub((block.get("text") or "") + "".join(entry["text"])))
+            return b.TextPart((block.get("text") or "") + "".join(entry["text"]))  # scrubbed with the whole reply
         if btype == "tool_use":
             call_id, name = block.get("id"), block.get("name")
             problem = b.call_id_problem(call_id, name)
             if problem:
                 raise self._protocol(f"tool_use block: {problem}")
+            if provider._key in call_id or provider._key in name:
+                # An id pairs the call with its result and a name picks the tool: neither can be scrubbed.
+                raise self._protocol("a tool_use block's id or name holds the connection's key; it is not kept")
             raw = provider._scrub("".join(entry["json"]))
             if not raw.strip():
                 start = block.get("input")

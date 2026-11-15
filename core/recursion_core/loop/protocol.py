@@ -50,6 +50,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import IO, Any
 
+from recursion_core.loop.providers.base import scrub_across
+
 PROTOCOL_VERSION = 1
 MAX_INPUT_LINE = 32 * 1024 * 1024
 
@@ -106,7 +108,7 @@ def parse_input(line: bytes | str) -> Input:
             raise InputError("not_utf8", "the line is not UTF-8") from None
     try:
         doc = json.loads(line)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: nested deeper than the decoder goes
         raise InputError("not_json", "the line is not JSON") from None
     if not isinstance(doc, dict):
         raise InputError("not_an_object", "the line is not a JSON object")
@@ -167,6 +169,11 @@ class Redactor:
 
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
         return any(secret in text for secret in self._secrets)
+
+    def scrub_across(self, texts: list[str]) -> list[str]:
+        """``texts`` scrubbed as one text (a secret split across two of them is found in their join)."""
+
+        return scrub_across(texts, self._secrets)
 
     def scrub_obj(self, value: Any) -> Any:
         if isinstance(value, str):

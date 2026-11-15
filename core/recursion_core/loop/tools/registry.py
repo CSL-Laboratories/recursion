@@ -9,7 +9,9 @@ search do not). ``dispatch`` is the only way a tool runs:
    minimum and maximum, minLength and maxLength); otherwise the tool does not run and the model gets an error;
 2. the tool runs with the turn's cancel token; an exception becomes an error result naming its type, and so
    does anything else that goes wrong with one call (input that is not an object, a tool that returns
-   something other than text): one bad call costs one error result, never the turn;
+   something other than text, a library's ``sys.exit``): one bad call costs one error result, never the turn.
+   ``KeyboardInterrupt`` is the one exception let through: it is how the process itself is interrupted
+   (SIGINT), which stops the loop, not one call;
 3. every secret the loop knows is removed from the output;
 4. the ONE cap applies: at most ``max_bytes`` bytes and ``max_lines`` lines reach the model. A larger output is
    saved whole to the spill store and the model sees its head and its tail around a single marker that names
@@ -263,7 +265,9 @@ class ToolRegistry:
     def dispatch(self, call: b.ToolCall, ctx: ToolContext) -> Outcome:
         try:
             return self._dispatch(call, ctx)
-        except Exception as exc:  # noqa: BLE001 - one bad call costs one error result, never the turn
+        except KeyboardInterrupt:
+            raise  # the process is being interrupted (SIGINT): that stops the loop, not one call
+        except BaseException as exc:  # noqa: BLE001 - one bad call costs one error result, never the turn
             text = f"the call could not be run ({type(exc).__name__})"
             return Outcome(call.call_id, call.name, ERROR, text, False, None, len(text))
 
@@ -298,7 +302,9 @@ class ToolRegistry:
             output = ToolOutput("stopped: the turn was interrupted", CANCELLED)
         except ToolError as exc:
             output = ToolOutput(str(exc), ERROR)
-        except Exception as exc:  # noqa: BLE001 - a tool's failure is the model's to see, not the loop's to die of
+        except KeyboardInterrupt:
+            raise  # the process is being interrupted (SIGINT): that stops the loop, not one call
+        except BaseException as exc:  # noqa: BLE001 - a tool's failure (a library's sys.exit too) is the model's to see
             output = ToolOutput(f"the tool failed: {type(exc).__name__}: {exc}", ERROR)
         if not isinstance(output, ToolOutput) or not isinstance(output.text, str) or output.status not in STATUSES:
             output = ToolOutput("the tool failed: it returned no text", ERROR)
@@ -317,6 +323,7 @@ class ToolRegistry:
             error = " ".join(ctx.scrub(f"{type(exc).__name__}: {exc}").split())
             if len(error) > ERROR_NOTE_MAX:
                 error = error[:ERROR_NOTE_MAX] + "..."
+            error = error.replace(MARKER_OPEN, QUOTED_OPEN)  # a marker in it is quoted, like one in the output
         head, tail, facts = cut_head_tail(text, self.max_bytes - MARKER_RESERVE, self.max_lines - 1)
         # A marker inside the tool's own text (a log it read, a file that quotes one) is shown quoted, so the
         # model sees one marker, the real one.

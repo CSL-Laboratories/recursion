@@ -11,8 +11,10 @@ Vendor specifics stay behind this interface: wire formats, headers, model names 
 the provider module's business. A provider never reads a key from anywhere but what it was constructed with,
 and never puts a key into an exception, an event or a return value: text the vendor sends back that holds the
 key is scrubbed (streamed text too, holding back a fragment that could be the start of the key until the next
-fragment shows it is not), and a vendor block that cannot be changed without breaking it (a signed thinking
-block) and holds the key is refused with ``ProtocolError``, never altered.
+fragment shows it is not, across text blocks too), the text parts of one reply are scrubbed as one text
+(``scrub_across``: a key split across two text blocks is found in their join), and a vendor block that cannot
+be changed without breaking it (a signed thinking block), or a tool call whose id or name holds the key (an id
+pairs a call with its result and cannot be scrubbed), is refused with ``ProtocolError``, never altered.
 
 A failed or interrupted call still has a usage record: every ``ProviderError`` and ``Cancelled`` carries
 ``usage`` (a ``Usage`` of what the provider had measured when the call ended: counts the vendor had reported
@@ -29,7 +31,7 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Union
 
@@ -371,6 +373,51 @@ class Provider(Protocol):
     def stream_turn(self, request: TurnRequest, *, on_event: OnEvent | None = None,
                     cancel: CancelToken | None = None) -> TurnResponse:
         ...
+
+
+def scrub_across(texts: Sequence[str], secrets: Iterable[str], mark: str = "[redacted]") -> list[str]:
+    """Remove every secret from ``texts`` as if they were one text, so a secret split across two of them (two
+    text blocks of one reply) is found in their join. Each stretch of secret becomes one ``mark``, in the text
+    where it begins; its pieces in later texts are dropped. With no secret found, the texts come back as they
+    were."""
+
+    joined = "".join(texts)
+    spans = []
+    for secret in secrets:
+        if not secret:
+            continue
+        at = joined.find(secret)
+        while at >= 0:
+            spans.append((at, at + len(secret)))
+            at = joined.find(secret, at + 1)
+    if not spans:
+        return list(texts)
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        if start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    out: list[str] = []
+    begin = 0
+    for text in texts:
+        finish = begin + len(text)
+        pieces: list[str] = []
+        cursor = begin
+        for start, end in merged:
+            if end <= begin or start >= finish:
+                continue
+            if start > cursor:
+                pieces.append(joined[cursor:start])
+            if start >= begin:
+                pieces.append(mark)  # the stretch begins in this text
+            cursor = max(cursor, min(end, finish))
+        if cursor < finish:
+            pieces.append(joined[cursor:finish])
+        out.append("".join(pieces))
+        begin = finish
+    return out
 
 
 def tool_specs(specs: Sequence[ToolSpec]) -> tuple[ToolSpec, ...]:

@@ -164,7 +164,9 @@ def check_grant(kind: object, scopes: object) -> frozenset[str]:
         raise CredentialRefused("kind_unknown")
     if kind not in MINTABLE:
         raise CredentialRefused("kind_not_mintable")
-    if not isinstance(scopes, (set, frozenset, list, tuple)) or not scopes:
+    # Exactly one of the four built-in containers, so none of a subclass's own __iter__, __len__ or __bool__ is
+    # asked: a subclass is refused (round 8 of #377, DeepSeek 1: one that raised left mint untyped).
+    if type(scopes) not in (set, frozenset, list, tuple) or not scopes:
         raise CredentialRefused("scopes_invalid")
     if not all(isinstance(s, str) for s in scopes):   # before hashing: a list may hold an unhashable value
         raise CredentialRefused("scopes_invalid")

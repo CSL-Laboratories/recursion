@@ -1339,6 +1339,45 @@ class RoundSevenCredentialsTest(unittest.TestCase):
         again.mint("device", "d2", ["read"])
 
 
+class RoundEightCredentialsTest(unittest.TestCase):
+    """The round-8 read of #377 by DeepSeek V4.1 Flash, 1: check_grant read the scopes container with the caller's
+    own __iter__, __len__ and __bool__, so a subclass that raised left check_grant and mint untyped."""
+
+    def containers(self):
+        def raising(base, method):
+            def fail(self, *args):
+                raise RuntimeError(f"{method} failed")
+            return type(f"{base.__name__}_{method}", (base,), {method: fail})
+
+        made = []
+        for base, value in ((list, ["read"]), (tuple, ("read",)), (set, {"read"}), (frozenset, frozenset({"read"}))):
+            for method in ("__iter__", "__len__", "__bool__", "__contains__"):
+                made.append(raising(base, method)(value))
+        made.append(type("PlainSubclass", (list,), {})(["read"]))     # a subclass that raises nothing is refused too
+        return made
+
+    def test_a_scopes_container_that_is_a_subclass_is_refused_scopes_invalid(self) -> None:
+        for scopes in self.containers():
+            with self.subTest(container=type(scopes).__name__):
+                with self.assertRaises(CredentialRefused) as caught:
+                    creds.check_grant("plugin", scopes)
+                self.assertEqual(caught.exception.detail, "scopes_invalid")
+        for scopes in (["read"], ("read",), {"read"}, frozenset({"read"})):
+            self.assertEqual(creds.check_grant("plugin", scopes), frozenset({"read"}))
+
+    @NEEDS_POSIX
+    def test_mint_refuses_such_a_container_typed_and_writes_nothing(self) -> None:
+        base = tempfile.mkdtemp(prefix="creds-r8-")
+        self.addCleanup(shutil.rmtree, base, True)
+        store = CredentialStore(os.path.join(base, "state", "credentials.json"))
+        for scopes in self.containers():
+            with self.subTest(container=type(scopes).__name__):
+                with self.assertRaises(CredentialRefused) as caught:
+                    store.mint("plugin", "p1", scopes)
+                self.assertEqual(caught.exception.detail, "scopes_invalid")
+        self.assertEqual(store.grants(), [])
+
+
 class PlatformTest(unittest.TestCase):
     def test_without_uids_the_store_refuses_to_open(self) -> None:
         with mock.patch.object(creds.os, "name", "nt"):

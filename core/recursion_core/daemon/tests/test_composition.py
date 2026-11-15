@@ -1792,7 +1792,7 @@ class CompositionRootTest(unittest.TestCase):
         self.assertNotIsInstance(daemon.call_args.args[1], launcher.EngineUnitManager)
         self.assertEqual(order, ['sweep', 'sweep', 'close_daemon'])
 
-    STOP_BOUND_S = 5.0  # only ends a wait that would otherwise never end; it never decides a pass
+    STOP_BOUND_S = 5.0  # how long a wait here lasts when what it waits for never comes; it never decides a pass
 
     def stopping(self, stack, event, held=None):
         """``main`` with stand-ins for everything but its stop: ``(entry, daemon, handlers, ended)``.
@@ -1800,15 +1800,24 @@ class CompositionRootTest(unittest.TestCase):
         ``event`` is the class ``main`` makes its stop Event of. ``handlers`` are the handlers ``main``
         installs, by signal number. ``ended`` is set when the thread ``main`` starts for its stop has
         returned, and ``ended.started`` says whether ``main`` started one; with ``held`` (an Event)
-        that thread does nothing until ``held`` is set.
+        that thread does nothing until ``held`` is set, and ``ended.parked`` is set when it has come
+        to wait there.
+
+        Two things a test that uses this must know. ``main``'s handlers are NOT installed in the
+        process (``entry.signal.signal`` is replaced, as in ``run_main``): a test plays a signal by
+        calling ``handlers[number]``, and a real signal sent to the process would take its default
+        action. And ``ended`` is set by that thread alone: ask ``ended.started`` first, and never
+        wait on ``ended`` without a bound (``STOP_BOUND_S``), or a ``main`` that started no thread
+        hangs the test.
 
         The lock ``main`` makes is a real one that also says what met it: ``ended.waits`` is true once
         a thread came to it, found it held and so waits for it; ``ended.moved`` is set at that moment,
         and again when the thread has returned.
         """
         from recursion_core.daemon import __main__ as entry
+        self.assertTrue(0 < self.STOP_BOUND_S < 60, 'the bound must end a wait: with none, a broken stop hangs the file')
         handlers, ended = {}, threading.Event()
-        ended.started, ended.waits, ended.moved = False, False, threading.Event()
+        ended.started, ended.waits, ended.moved, ended.parked = False, False, threading.Event(), threading.Event()
 
         class Latch:
             def __init__(self):
@@ -1829,6 +1838,7 @@ class CompositionRootTest(unittest.TestCase):
 
             def run():
                 if held is not None:
+                    ended.parked.set()
                     held.wait()
                 try:
                     function(*args)
@@ -1890,12 +1900,16 @@ class CompositionRootTest(unittest.TestCase):
         The stop must be kept all the same: the handler notes it on the main thread, and the loop
         reads the note before it starts anything. (Without the note the daemon swept once more, and a
         sweep can take as long as its calls to the unit manager do.) The thread is held back here,
-        and the wait itself plays the signal and then says that its time ran out.
+        and the wait itself plays the signal and then says that its time ran out. That the thread IS
+        held back is asserted, not assumed: the wait goes on only once the thread has come to its
+        hold, and when ``main`` has returned the thread has still not run.
         """
-        held, handlers = threading.Event(), {}
+        held, handlers, bound = threading.Event(), {}, self.STOP_BOUND_S
 
         class RunsOut(threading.Event):
             def wait(self, timeout=None):
+                if ended.started and not ended.parked.wait(bound):  # (a main that starts no thread has none to hold)
+                    raise AssertionError('the thread main started was not held back')
                 handlers[signal.SIGTERM](signal.SIGTERM, None)
                 return super().wait(0)
 
@@ -1909,9 +1923,11 @@ class CompositionRootTest(unittest.TestCase):
             try:
                 entry.main(client=object(), door=bool, port=0, sweep_seconds=0.001)
             finally:
+                ran_while_held = ended.is_set() or ended.waits
                 held.set()
                 if ended.started:
                     self.assertTrue(ended.wait(self.STOP_BOUND_S), 'the thread main started did not end')
+        self.assertFalse(ran_while_held, 'the thread ran before it was let go: this test showed nothing')
         self.assertEqual(daemon.sweep.call_count, 1, 'the sweep of the start, and no other')
         daemon.close.assert_called_once()
 
@@ -1940,8 +1956,8 @@ class CompositionRootTest(unittest.TestCase):
             entry, daemon, installed, ended = self.stopping(stack, Quiet)
             handlers = installed
             entry.main(port=0)
-        self.assertEqual(seen, [(True, True, False, False)], 'before any stop was asked for: (the thread showed '
-                         'itself, it waits for the lock, it has returned, the Event is set)')
+        self.assertEqual(seen, [(True, True, False, False)], 'four answers, as they stood before any stop was asked for: did '
+                         'the thread show itself, does it wait for the lock, has it returned, is the Event set')
         self.assertTrue(ended.wait(bound), 'the thread main started did not end')
         daemon.close.assert_called_once()
 

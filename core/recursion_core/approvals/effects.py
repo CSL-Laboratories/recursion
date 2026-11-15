@@ -50,6 +50,9 @@ __all__ = [
 
 MAX_INT = 2**53 - 1
 MAX_DEPTH = 64
+# PROVISIONAL (not decided by Lucas: the size limit of an effect, and what a prompt does when an input is
+# too long to show). Built as the brief proposes: past these limits the effect is refused with a typed
+# code (too_large, too_many_lines) and never truncated.
 CALL_MAX = 262144
 LINE_PIECE = 4000
 LINE_MAX = 4096

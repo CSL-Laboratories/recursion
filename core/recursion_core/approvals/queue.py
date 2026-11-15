@@ -30,8 +30,9 @@ record and is answered ``conflict``/``already_resolved``. A store that lets two 
 refuses the second one's write instead; the dispatcher then answers ``unavailable``, keeps no receipt, and
 the same command retried is ``already_resolved``. In both, one answer wins and none is taken twice.
 
-Deadlines (the brief's question to Lucas, not yet answered; built with its recommendation (b), marked
-here so one line changes): 15 minutes for an engine's tool call, 300 seconds for a plugin's effect.
+Deadlines, PROVISIONAL (the brief's question to Lucas, not yet answered; built with its recommendation
+(b), marked here so one line changes): 15 minutes for an engine's tool call, 300 seconds for a plugin's
+effect.
 """
 
 from __future__ import annotations
@@ -54,7 +55,8 @@ __all__ = ["DEADLINE_SECONDS", "ApprovalQueue", "timestamp_of"]
 
 log = logging.getLogger(__name__)
 
-DEADLINE_SECONDS = {"engine_tool": 15 * 60, "plugin_effect": 300}  # brief question (b); Lucas has not answered
+# PROVISIONAL: the brief's question (b) to Lucas, not yet answered.
+DEADLINE_SECONDS = {"engine_tool": 15 * 60, "plugin_effect": 300}
 RETRY_SECONDS = 1.0  # the deadline worker's pause after a failure before it tries again
 _CONSUME_ATTEMPTS = 12  # a consumption refused by a concurrent writer is read again this many times (about 0.4 s)
 

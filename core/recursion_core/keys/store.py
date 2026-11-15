@@ -286,6 +286,49 @@ class KeyStore:
         log.warning('the key store refused %s: %s', connection_id, code)
         raise KeyRefused(connection_id, code)
 
+    # -- for other lanes: QUOTA's spend policy, INSTALL's doctor -----------------------------------
+    def spend_policy(self, connection_id: str) -> dict:
+        """``{"metered_spend_allowed": bool, "cap_usd": number}`` as typed at ``add``; with no opt-in, the cap is 0.
+
+        Reads the index only (no backend, no keychain prompt). An unknown id raises ``KeyError(connection_id)``;
+        an index the store cannot read raises ``KeyRefused`` with its code, as ``credential`` does.
+        """
+        if not v.valid_key_id(connection_id):
+            raise KeyError(connection_id)
+        try:
+            index = self.list()
+        except KeyStoreError as exc:
+            code = exc.code
+        else:
+            record = index.keys.get(connection_id)
+            if record is None:
+                raise KeyError(connection_id)
+            return {'metered_spend_allowed': record.metered_spend_allowed, 'cap_usd': record.cap_usd}
+        raise KeyRefused(connection_id, code)
+
+    def describe(self) -> dict:
+        """Which store holds the keys and which backend this host offers now, for ``doctor``. Never a value.
+
+        ``store``: the pinned backend, or None when no key is saved. ``offered``: what the host offers now, or None
+        with ``offered_refusal`` saying why it cannot say. ``refusal``: why the index itself cannot be read, or None.
+        It never raises for a store it cannot use: a doctor reports that, it does not fail on it.
+        """
+        out = {'folder': str(self.root), 'store': None, 'keys': 0, 'owner_file': None, 'refusal': None,
+               'offered': None, 'offered_refusal': None}
+        try:
+            index = self.list()
+        except KeyStoreError as exc:
+            out['refusal'] = {'code': exc.code, 'detail': exc.detail}
+        else:
+            out['store'], out['keys'] = index.backend, len(index.keys)
+        try:
+            out['offered'] = detect(self.system)
+        except KeyStoreError as exc:
+            out['offered_refusal'] = {'code': exc.code, 'detail': exc.detail}
+        if 'owner_file' in (out['store'], out['offered']):
+            out['owner_file'] = str(self.owner_file())
+        return out
+
 
 def _parse_index(raw: bytes) -> Index | None:
     """The index exactly as ``_write_index`` writes it, or None. Nothing raises with the text attached."""
@@ -348,3 +391,13 @@ def default_store() -> KeyStore:
 def credentials(connection_id: str, env_name: str) -> str:
     """``routes.base.Credentials`` over the default store: what lane KEYS registers into seam S7."""
     return default_store().credential(connection_id, env_name)
+
+
+def spend_policy(connection_id: str) -> dict:
+    """The default store's spend policy for one key: what lane QUOTA reserves against at admission."""
+    return default_store().spend_policy(connection_id)
+
+
+def describe() -> dict:
+    """The default store's description: what lane INSTALL's ``doctor`` reports."""
+    return default_store().describe()

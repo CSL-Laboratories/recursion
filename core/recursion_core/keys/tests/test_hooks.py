@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from recursion_core.keys import store as store_mod
-from recursion_core.keys.tests.support import MARKER, TempStoreCase, needs_posix
+from recursion_core.keys.tests.support import MARKER, OTHER, TempStoreCase, needs_posix
 
 HAS_SEAMS = importlib.util.find_spec('recursion_core.control.hooks') is not None
 needs_seams = unittest.skipUnless(HAS_SEAMS, "SPINE's seams (control/hooks.py) are not on this tree yet")
@@ -79,7 +79,71 @@ class RegistrantTest(TempStoreCase):
 
         hooks = seams.compose()
         self.assertIn('key', hooks.commands.names())
+        self.assertIn('key.list', hooks.methods.registered())
         keys = self.store()
         self.add(keys)
         with mock.patch.object(store_mod, '_default', keys):
             self.assertEqual(hooks.credentials('codex-key', 'CODEX_API_KEY'), MARKER)
+
+
+@needs_posix
+@needs_seams
+class KeyListTest(TempStoreCase):
+    """``key.list`` through SPINE's real method table: registered, dispatched, and its answer's published shape."""
+
+    def dispatch(self, params, keys=None):
+        from recursion_core.control import hooks as seams
+        from recursion_core.keys import hooks as keys_hooks
+
+        hooks = seams.Hooks()
+        keys_hooks.register(hooks)
+        hooks.freeze()
+        self.assertEqual(hooks.methods.registered(), ('key.list',))
+        with mock.patch.object(store_mod, '_default', keys if keys is not None else self.store()):
+            return hooks.methods.dispatch('key.list', params, seams.OWNER, lambda method, inner: None)
+
+    def test_the_answer_is_the_published_shape_and_matches_the_fixture(self) -> None:
+        import json
+        import pathlib
+        import re
+
+        keys = self.store()
+        self.add(keys)
+        self.add(keys, key_id='claude-key', value=OTHER, env='ANTHROPIC_API_KEY', provider='anthropic', cap=0)
+        answer = self.dispatch({}, keys)
+        fixture = json.loads((pathlib.Path(__file__).parent / 'fixtures' / 'key.list.ok.json').read_text())
+        self.assertEqual(answer, fixture)
+        self.assertEqual(set(answer), {'code', 'keys'})
+        token = re.compile(r'[A-Za-z0-9._:-]{1,128}')
+        stamp = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z')
+        for item in answer['keys']:
+            self.assertEqual(set(item), {'key_id', 'provider', 'env_name', 'created_at', 'store'})
+            self.assertTrue(token.fullmatch(item['key_id']))
+            self.assertTrue(stamp.fullmatch(item['created_at']))
+            self.assertIn(item['store'], ('secret_service', 'macos_keychain', 'windows_credential', 'owner_file'))
+        self.assertNotIn(MARKER, json.dumps(answer))
+        self.assertNotIn(OTHER, json.dumps(answer))
+
+    def test_no_store_is_an_empty_list(self) -> None:
+        self.assertEqual(self.dispatch({}), {'code': 'ok', 'keys': []})
+        self.assertFalse(self.base.joinpath('config').exists())
+
+    def test_params_are_refused_by_name(self) -> None:
+        self.assertEqual(self.dispatch({'all': True}), {'code': 'request_invalid', 'detail': 'all'})
+
+    def test_a_store_it_cannot_read_is_unavailable_with_the_stores_code(self) -> None:
+        keys = self.store()
+        self.add(keys)
+        (self.root / 'index.json').chmod(0o644)
+        self.assertEqual(self.dispatch({}, keys), {'code': 'unavailable', 'detail': 'file_invalid'})
+
+    def test_it_never_asks_the_keychain(self) -> None:
+        from recursion_core.keys.tests.support import keychain_system
+
+        system, chain = keychain_system()
+        keys = self.store(system)
+        self.add(keys)
+        system.calls.clear()
+        chain.mode = 'locked'
+        self.assertEqual(self.dispatch({}, keys)['keys'][0]['store'], 'secret_service')
+        self.assertEqual(system.calls, [])

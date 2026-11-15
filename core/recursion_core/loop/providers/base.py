@@ -24,7 +24,9 @@ measured, which the loop records as all unknown, never as 0) and ``served_model`
 Values a provider returns keep the wire's limits (event.v1): token counts are whole numbers of 0 or more,
 every measurement is finite, a call id is 1 to 128 characters and a tool name 1 to 256, neither with a CR or a
 LF. A provider refuses a reply that breaks them with ``ProtocolError``; the dataclasses below refuse such
-values with ``ValueError``.
+values with ``ValueError``. A tool input nested more than ``MAX_INPUT_DEPTH`` objects or arrays deep is kept as
+input that did not parse (``input_error`` is ``INPUT_TOO_DEEP``): no tool takes one, and walking it could reach
+Python's recursion limit wherever the loop scrubs, checks or writes it.
 """
 
 from __future__ import annotations
@@ -126,6 +128,27 @@ class TextPart:
 
 MAX_CALL_ID = 128
 MAX_TOOL_NAME = 256
+MAX_INPUT_DEPTH = 64
+INPUT_TOO_DEEP = f"input is nested more than {MAX_INPUT_DEPTH} levels deep"
+
+
+def nests_deeper(value: Any, limit: int) -> bool:
+    """Whether ``value`` (anything JSON can write) nests objects or arrays more than ``limit`` deep (a flat
+    object is 1). Walked without recursion, so a value too deep for Python's own recursion is measured too."""
+
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, Mapping):
+            children = list(item.values())
+        elif isinstance(item, (list, tuple)):
+            children = list(item)
+        else:
+            continue
+        if depth >= limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def call_id_problem(call_id: object, name: object) -> str | None:
@@ -379,8 +402,14 @@ def scrub_across(texts: Sequence[str], secrets: Iterable[str], mark: str = "[red
     """Remove every secret from ``texts`` as if they were one text, so a secret split across two of them (two
     text blocks of one reply) is found in their join. Each stretch of secret becomes one ``mark``, in the text
     where it begins; its pieces in later texts are dropped. With no secret found, the texts come back as they
-    were."""
+    were. ``texts`` and ``secrets`` are each a sequence of strings: one string is refused (it would be read as
+    its characters), and so is anything in them that is not a string; an empty secret is skipped."""
 
+    if isinstance(texts, (str, bytes)) or isinstance(secrets, (str, bytes)):
+        raise TypeError("texts and secrets are each a sequence of strings, not one string")
+    texts, secrets = list(texts), list(secrets)
+    if not all(isinstance(t, str) for t in texts) or not all(isinstance(s, str) for s in secrets):
+        raise TypeError("every text and every secret is a string")
     joined = "".join(texts)
     spans = []
     for secret in secrets:

@@ -19,7 +19,9 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
                     interrupted one included (what it had measured; unknown, never 0, where nothing was)
     limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
     turn_ended      {turn_id, outcome, result, reason}
-    interrupt       {turn_id, delivered}
+    interrupt       {turn_id, delivered}: delivered when that turn was running or waiting; such a line always
+                    comes before the turn's turn_ended, which is interrupted unless the turn had already finished
+                    its work
     protocol_error  {code, detail}
     closed          once, when the loop exits after close or the end of its input
 
@@ -44,7 +46,9 @@ holds, before the line is serialised.
 from __future__ import annotations
 
 import json
+import os
 import re
+import select
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -205,21 +209,91 @@ class Writer:
             self._stream.flush()
 
 
+READ_CHUNK = 64 * 1024
+
+
 def read_lines(stream: IO[bytes], on_line: Callable[[bytes], None], on_too_long: Callable[[], None]) -> None:
     """Read LF-terminated lines from ``stream`` until its end. A line longer than MAX_INPUT_LINE is skipped to
     its end and reported once."""
 
+    lines_from(getattr(stream, "read1", None) or stream.read, on_line, on_too_long)
+
+
+def lines_from(read: Callable[[int], bytes], on_line: Callable[[bytes], None],
+               on_too_long: Callable[[], None]) -> None:
+    """``read_lines`` over ``read``, a call that gives the next bytes (b"" at the end): a stream's ``read1``, or
+    ``InputReader.read``. A line's trailing CRs and LF go, a blank line is skipped, and a last line with no LF is
+    a line. A line longer than MAX_INPUT_LINE (its LF not counted) is reported once and skipped to its end."""
+
+    held = bytearray()
+    skipping = False  # inside a line that was too long, until its LF
     while True:
-        line = stream.readline(MAX_INPUT_LINE + 1)
-        if not line:
+        chunk = read(READ_CHUNK)
+        if not chunk:
+            if held and not skipping:
+                _deliver(bytes(held), on_line)
             return
-        if len(line) > MAX_INPUT_LINE and not line.endswith(b"\n"):
-            on_too_long()
-            while True:  # discard the rest of the long line
-                rest = stream.readline(MAX_INPUT_LINE)
-                if not rest or rest.endswith(b"\n"):
-                    break
-            continue
-        stripped = line.rstrip(b"\r\n")
-        if stripped.strip():
-            on_line(stripped)
+        start = 0
+        while True:
+            end = chunk.find(b"\n", start)
+            piece = chunk[start:] if end < 0 else chunk[start:end]
+            if not skipping:
+                if len(held) + len(piece) > MAX_INPUT_LINE:
+                    on_too_long()
+                    held.clear()
+                    skipping = True
+                else:
+                    held += piece
+            if end < 0:
+                break
+            if not skipping:
+                _deliver(bytes(held), on_line)
+            held.clear()
+            skipping = False
+            start = end + 1
+
+
+def _deliver(line: bytes, on_line: Callable[[bytes], None]) -> None:
+    stripped = line.rstrip(b"\r\n")
+    if stripped.strip():
+        on_line(stripped)
+
+
+class Stopped(Exception):
+    """``InputReader.stop`` was called: the reading thread ends, and a line it had begun is not a line."""
+
+
+class InputReader:
+    """Standard input for the input thread, read with ``os.read`` on its descriptor and never through
+    ``sys.stdin``: a thread blocked inside a buffered reader holds that reader's lock, and an interpreter that
+    exits while it is held aborts (SIGABRT) instead of exiting, which is what a driver that keeps the pipe open
+    after ``close`` saw. On POSIX, ``stop`` (the main thread calls it once ``closed`` is written) makes a waiting
+    ``read`` raise ``Stopped``, so the thread ends and is joined; elsewhere the thread stays in the system call,
+    which holds no lock of Python's."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._wake: tuple[int, int] | None = os.pipe() if os.name == "posix" else None
+
+    @property
+    def stoppable(self) -> bool:
+        return self._wake is not None
+
+    def read(self, n: int) -> bytes:
+        if self._wake is not None:
+            ready, _, _ = select.select([self._fd, self._wake[0]], [], [])
+            if self._wake[0] in ready:
+                raise Stopped()
+        return os.read(self._fd, n)
+
+    def stop(self) -> None:
+        if self._wake is not None:
+            os.write(self._wake[1], b"\0")
+
+    def close(self) -> None:
+        """Close the wake pipe (once the reading thread has ended)."""
+
+        if self._wake is not None:
+            for fd in self._wake:
+                os.close(fd)
+            self._wake = None

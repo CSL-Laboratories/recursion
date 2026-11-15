@@ -28,11 +28,14 @@ from memory:
 
 The key is held in this object only. It goes into one request header, never into an exception, a return value,
 an event or a log. Vendor text that holds it is scrubbed before it leaves this module: every error detail
-(an event's name or a block's type included), the reply's text parts as one text (a key split across two text
-blocks is found in their join), tool inputs, and streamed text (a fragment that could be the start of the key
-is held back until the next fragment, in this block or the next text block, or the end of the message). A
-thinking or other vendor block that holds it is refused (``ProtocolError``), since changing it would break its
-signature, and so is a tool call whose id or name holds it.
+(an event's name or a block's type included) and every other text a failure or a reply carries that the vendor
+could have sent (its error type, the request id, the model it named, its own stop reason), the reply's text
+parts as one text (a key split across two text blocks is found in their join), tool inputs, and streamed text
+(a fragment that could be the start of the key is held back until the next fragment, in this block or the next
+text block, or the end of the message). A thinking or other vendor block that holds it is refused
+(``ProtocolError``), since changing it would break its signature, and so is a tool call whose id or name holds
+it. A stream nested deeper than this client reads is refused with ``ProtocolError`` too; a tool input nested
+more than ``MAX_INPUT_DEPTH`` levels deep is kept as input that did not parse.
 
 A call that fails or is interrupted after the stream began still reports what it measured: the exception's
 ``usage`` holds the counts the stream had given (an output count is a lower bound until ``message_stop``) and
@@ -261,13 +264,30 @@ class AnthropicProvider:
         return self._key in json.dumps(value, ensure_ascii=False)
 
     def _scrub_response(self, response: b.TurnResponse) -> b.TurnResponse:
-        """The reply's text parts scrubbed as one text, so a key split across two text blocks is caught."""
+        """The reply's text parts scrubbed as one text, so a key split across two text blocks is caught, and the
+        texts the vendor named it by (the model, its own stop reason, the request id) scrubbed too."""
 
         where = [k for k, part in enumerate(response.parts) if isinstance(part, b.TextPart)]
         parts = list(response.parts)
         for k, text in zip(where, b.scrub_across([parts[k].text for k in where], (self._key,))):
             parts[k] = b.TextPart(text)
-        return dataclasses.replace(response, parts=tuple(parts))
+        return dataclasses.replace(response, parts=tuple(parts), served_model=self._scrub_opt(response.served_model),
+                                   vendor_stop_reason=self._scrub_opt(response.vendor_stop_reason),
+                                   request_id=self._scrub_opt(response.request_id))
+
+    def _scrub_opt(self, text: str | None) -> str | None:
+        return self._scrub(text) if isinstance(text, str) else text
+
+    def _scrub_failure(self, exc: b.ProviderError | b.Cancelled) -> None:
+        """Scrub, in place, every text a failure carries that the vendor could have sent: its detail (an
+        event's name, a block's type), its error type, the request id and the model it named."""
+
+        if isinstance(exc, b.ProviderError):
+            exc.detail = self._scrub(exc.detail)
+            exc.args = (exc.detail,)
+            exc.vendor_type = self._scrub_opt(exc.vendor_type)
+            exc.request_id = self._scrub_opt(exc.request_id)
+        exc.served_model = self._scrub_opt(exc.served_model)
 
     def _held_back(self, text: str) -> int:
         """How many characters at the end of ``text`` could be the start of the key (held until more comes)."""
@@ -317,6 +337,9 @@ class AnthropicProvider:
                 raise b.ProtocolError(f"expected an event stream, got {ctype or 'no content type'}",
                                       status=200, request_id=request_id)
             return self._read_stream(response, request_id, on_event, cancel)
+        except (b.ProviderError, b.Cancelled) as exc:
+            self._scrub_failure(exc)  # every failure, whichever step raised it
+            raise
         finally:
             unregister()
             try:
@@ -337,7 +360,7 @@ class AnthropicProvider:
             if isinstance(err, dict):
                 vendor_type = err.get("type") if isinstance(err.get("type"), str) else None
                 message = err.get("message") if isinstance(err.get("message"), str) else ""
-        except (UnicodeDecodeError, ValueError):
+        except (UnicodeDecodeError, ValueError, RecursionError):  # RecursionError: nested deeper than it decodes
             message = ""
         detail = self._scrub(f"HTTP {status}" + (f" {vendor_type}" if vendor_type else "") +
                              (f": {message}" if message else ""))
@@ -389,18 +412,22 @@ class AnthropicProvider:
             except SSEError as exc:
                 cancel.raise_if_cancelled()
                 raise b.ProtocolError(str(exc), request_id=request_id) from None
+            except RecursionError:
+                # An event (or a block in it) nested deeper than the decoder or this client's walk goes: typed, so
+                # what the stream had measured still goes with it.
+                cancel.raise_if_cancelled()
+                raise b.ProtocolError("the stream nests deeper than the client reads", request_id=request_id) from None
             cancel.raise_if_cancelled()
             return self._scrub_response(state.finish())
         except (b.ProviderError, b.Cancelled) as exc:
-            if isinstance(exc, b.ProviderError):
-                # Its detail may quote the vendor (an event's name, a block's type): scrubbed here, once for all.
-                exc.detail = self._scrub(exc.detail)
-                exc.args = (exc.detail,)
             # The call still happened: what the stream had measured goes with the failure.
             if exc.usage is None:
                 exc.usage = state.partial_usage()
             if exc.served_model is None:
                 exc.served_model = state.model
+            # Its texts may quote the vendor (an event's name, a block's type, the model it named): scrubbed here,
+            # once the model is attached.
+            self._scrub_failure(exc)
             raise
 
 
@@ -523,14 +550,20 @@ class _StreamState:
             raw = provider._scrub("".join(entry["json"]))
             if not raw.strip():
                 start = block.get("input")
+                if isinstance(start, dict) and b.nests_deeper(start, b.MAX_INPUT_DEPTH):
+                    return b.ToolCall(call_id, name, None, raw, b.INPUT_TOO_DEEP)
                 return b.ToolCall(call_id, name, provider._scrub_obj(dict(start)) if isinstance(start, dict) else {},
                                   raw)
             try:
                 parsed = json.loads(raw)
             except ValueError as exc:
                 return b.ToolCall(call_id, name, None, raw, f"input is not valid JSON: {exc.msg}")
+            except RecursionError:  # nested deeper than the decoder goes
+                return b.ToolCall(call_id, name, None, raw, b.INPUT_TOO_DEEP)
             if not isinstance(parsed, dict):
                 return b.ToolCall(call_id, name, None, raw, "input is not a JSON object")
+            if b.nests_deeper(parsed, b.MAX_INPUT_DEPTH):
+                return b.ToolCall(call_id, name, None, raw, b.INPUT_TOO_DEEP)
             clean = provider._scrub_obj(parsed)
             if clean != parsed:  # the key was there, spelt with JSON escapes the text scrub cannot see
                 raw = json.dumps(clean, ensure_ascii=False)

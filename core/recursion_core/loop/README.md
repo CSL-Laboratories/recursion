@@ -32,7 +32,9 @@ included, with what it had measured (unknown, never 0, where nothing was).
 
 `input_accepted` is written the moment the loop takes a message, before the model sees it, and never for a
 message it did not take. A turn the model finishes ends `candidate_done`; the harness, not the model,
-decides when work is done.
+decides when work is done. An `interrupt` answered `delivered: true` always comes before that turn's
+`turn_ended`. Standard input is read on its own descriptor, never through `sys.stdin`: after `close` the
+loop writes `closed` and exits 0, whether or not the driver keeps the pipe open.
 
 ## The pieces
 

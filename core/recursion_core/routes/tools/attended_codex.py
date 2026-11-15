@@ -233,6 +233,9 @@ CHILD_ENV_NAMES = ("PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPD
                    "LC_ALL", "LC_CTYPE", "TERM", "TZ", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                    "XDG_STATE_HOME", "XDG_RUNTIME_DIR")
 _EOF = object()
+# Lines of output read at most before /stop or /quit ends the input, while the driver holds a write for the
+# turn's id (round 3 of #402, GPT-6 Astra 3).
+HELD_READS = 100
 
 
 def child_env(parent: dict) -> dict:
@@ -399,11 +402,13 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
 
     def next_command(during_turn: bool):
         """The next command to look at, or _NOTHING_YET. Outside a turn the oldest waiting one comes first;
-        during a turn a waiting one is taken only when an approval waits for it, and otherwise a fresh one is
-        read (when the source has one ready), so a waiting message never hides a later /interrupt, /stop or
-        /quit (the #402 reads, round 2: GPT-6 Astra 3, GPT-6.1 Sol 2, DeepSeek R2-6)."""
-        if held and (not during_turn or console.pending):
-            return held.pop(0)
+        during a turn the oldest waiting one that can be acted on now (``takes_now``) is taken, and otherwise a
+        fresh one is read (when the source has one ready), so a waiting command never hides a later
+        /interrupt, /stop or /quit, and one that must go on waiting (/resume) is not taken again and again
+        (the #402 reads, round 2: GPT-6 Astra 3, GPT-6.1 Sol 2, DeepSeek R2-6; round 3: Astra 2, Sol 3)."""
+        for index, waiting in enumerate(held):
+            if not during_turn or takes_now(waiting.strip(), bool(console.pending)):
+                return held.pop(index)
         if state["exhausted"]:
             return _NOTHING_YET
         ready = getattr(source, "ready", None)
@@ -427,10 +432,13 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
                 driver.interrupt(handle, handle.live_turn)
         elif line in ("/stop", "/quit"):
             if not handle.closed:
-                # What the worker has written already is read first, so an interrupt still held for the
-                # turn's id goes out before the input ends (the #402 reads, round 2, GPT-6 Astra 3).
-                while not state["eof"] and read_once():
-                    pass
+                # While the driver still holds a steer or an interrupt for the turn's id, the worker's output is
+                # read first, so it goes out before the input ends (the #402 reads, round 2, GPT-6 Astra 3); at
+                # most HELD_READS lines, so a worker that never stops writing cannot hold /stop or /quit back
+                # (round 3, GPT-6 Astra 3).
+                reads = 0
+                while reads < HELD_READS and not state["eof"] and driver.holding(handle) and read_once():
+                    reads += 1
                 driver.send(handle, {"kind": "close"})
             console.pending.clear()
             return line == "/quit"
@@ -469,14 +477,10 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
             except (DriverRefused, DriverStateError, c.RouteError) as err:
                 say(f"refused: {err}")
         handle = state["handle"]
-        while not state["eof"] and handle.closed:  # what the worker still writes after /quit, while it has some
-            try:
-                drafts = driver.pump(handle, read_s)
-            except ReadTimeout:
-                break
-            if drafts is None:
-                break
-            record(drafts)
+        # What the worker still writes after /quit, while it has some, read like any other output: a line that
+        # is not the protocol's ends the run with its message here too (the #402 reads, round 3, GPT-6.1 Sol 4).
+        while not state["eof"] and handle.closed and read_once():
+            pass
     except _OutputFailed as failed:
         say(f"the worker's output failed: {failed.args[0]}; the run ends")
     return seen
@@ -512,9 +516,10 @@ def run_mode(args: argparse.Namespace) -> int:
     route = {"engine": "codex", "model": args.model, "connection": {"kind": "subscription", "id": "own-login"}}
     seen: dict = {}
     # Every worker is ended and every capture closed however the loop ends, an exception or Ctrl-C included.
-    # Each step is tried even when one before it fails or is interrupted (the drafts file, a worker); the first
-    # failure is raised afterwards unless the loop's own exception is already on its way (the #402 reads:
-    # GPT-6 Astra R7 and round 2 change 4, DeepSeek F2).
+    # Each step is tried even when one before it fails or is interrupted (the drafts file, a worker), and even
+    # when its failure cannot be printed; the first failure is kept before it is said and raised afterwards
+    # unless the loop's own exception is already on its way (the #402 reads: GPT-6 Astra R7, round 2 change 4
+    # and round 3 change 4, DeepSeek F2).
     try:
         session_loop(driver, Typed(), say, console, env=child_env(dict(os.environ)), route=route, seen=seen,
                      on_draft=on_draft)
@@ -526,9 +531,12 @@ def run_mode(args: argparse.Namespace) -> int:
         for name, step in steps:
             try:
                 step()
-            except BaseException as err:  # noqa: BLE001 - say it, go on, raise the first one afterwards
-                print(f"[{name} could not be ended: {type(err).__name__}: {err}]")
+            except BaseException as err:  # noqa: BLE001 - kept first, then said; the next step is still tried
                 failure = failure or err
+                try:
+                    print(f"[{name} could not be ended: {type(err).__name__}: {err}]")
+                except Exception:  # noqa: BLE001 - a message that cannot be printed never stops the cleanup
+                    pass
         if failure is not None and in_flight is None:
             raise failure
     print(f"captured in {out}: threads {seen.get('threads')}")

@@ -7,6 +7,7 @@ Unix socket, the CLI and the GUI door all run for real with the stand-in engine.
 calls themselves are checked as argv here and against a real user manager by
 ``evidence_e2e.py`` (and by ``RealUserManagerTest`` where one is running).
 """
+import _thread
 import contextlib
 import http.client
 import io
@@ -1791,6 +1792,63 @@ class CompositionRootTest(unittest.TestCase):
         self.assertNotIsInstance(daemon.call_args.args[1], launcher.EngineUnitManager)
         self.assertEqual(order, ['sweep', 'sweep', 'close_daemon'])
 
+    STOP_BOUND_S = 5.0  # only ends a wait that would otherwise never end; it never decides a pass
+
+    def stopping(self, stack, event, held=None):
+        """``main`` with stand-ins for everything but its stop: ``(entry, daemon, handlers, ended)``.
+
+        ``event`` is the class ``main`` makes its stop Event of. ``handlers`` are the handlers ``main``
+        installs, by signal number. ``ended`` is set when the thread ``main`` starts for its stop has
+        returned, and ``ended.started`` says whether ``main`` started one; with ``held`` (an Event)
+        that thread does nothing until ``held`` is set.
+
+        The lock ``main`` makes is a real one that also says what met it: ``ended.waits`` is true once
+        a thread came to it, found it held and so waits for it; ``ended.moved`` is set at that moment,
+        and again when the thread has returned.
+        """
+        from recursion_core.daemon import __main__ as entry
+        handlers, ended = {}, threading.Event()
+        ended.started, ended.waits, ended.moved = False, False, threading.Event()
+
+        class Latch:
+            def __init__(self):
+                self.lock = _thread.allocate_lock()
+
+            def acquire(self):
+                if not self.lock.acquire(False):
+                    ended.waits = True
+                    ended.moved.set()
+                    self.lock.acquire()
+                return True
+
+            def release(self):
+                self.lock.release()
+
+        def start(function, args):
+            ended.started = True
+
+            def run():
+                if held is not None:
+                    held.wait()
+                try:
+                    function(*args)
+                finally:
+                    ended.set()
+                    ended.moved.set()
+            return _thread.start_new_thread(run, ())
+        for name in ('require_free_threaded', 'check_operator_linger', 'UserLock', 'Registry', 'SystemdUserManager',
+                     'LoopbackGUI', 'compose_control'):
+            stack.enter_context(mock.patch.object(entry, name))
+        daemon = stack.enter_context(mock.patch.object(entry, 'Daemon')).return_value
+        stack.enter_context(mock.patch.object(entry.signal, 'signal', side_effect=handlers.__setitem__))
+        threads = mock.MagicMock(wraps=threading)  # module-local: whatever else main takes from threading is real
+        threads.Event = event
+        stack.enter_context(mock.patch.object(entry, 'threading', threads))
+        stack.enter_context(mock.patch.object(
+            entry, '_thread', mock.Mock(allocate_lock=Latch, start_new_thread=start), create=True))
+        stack.enter_context(mock.patch.dict(entry.os.environ, {'RECURSION_ENGINE_USER': ''}))
+        return entry, daemon, handlers, ended
+
     def test_a_stop_signal_never_sets_the_event_on_the_thread_that_waits_on_it(self):
         """The handlers run on the main thread, and the main thread is the one that waits on the Event.
 
@@ -1799,9 +1857,11 @@ class CompositionRootTest(unittest.TestCase):
         inside ``set`` (measured with real signals on both interpreters). Here the wait plays the
         signals: on the waiting thread it calls each installed handler, a SIGTERM and a SIGINT
         together, and then waits. The daemon stops, and no ``set`` ran on the waiting thread.
+
+        The wait is bounded, so that a stop which never reaches the Event fails here and does not
+        hang the file.
         """
-        from recursion_core.daemon import __main__ as entry
-        handlers, sets = {}, []
+        handlers, sets, bound = {}, [], self.STOP_BOUND_S
 
         class Watched(threading.Event):
             def set(self):
@@ -1811,25 +1871,111 @@ class CompositionRootTest(unittest.TestCase):
             def wait(self, timeout=None):
                 for number in (signal.SIGTERM, signal.SIGINT):
                     handlers[number](number, None)
-                return super().wait()
+                if not super().wait(bound):
+                    raise AssertionError('the stop did not reach the Event')
+                return True
 
-        threads = mock.MagicMock(wraps=threading)  # module-local: whatever else main takes from threading is real
-        threads.Event = Watched
-        with mock.patch.object(entry, 'require_free_threaded'), \
-                mock.patch.object(entry, 'check_operator_linger'), \
-                mock.patch.object(entry.signal, 'signal', side_effect=handlers.__setitem__), \
-                mock.patch.object(entry, 'UserLock'), \
-                mock.patch.object(entry, 'Registry'), \
-                mock.patch.object(entry, 'Daemon') as daemon, \
-                mock.patch.object(entry, 'LoopbackGUI'), \
-                mock.patch.object(entry, 'compose_control'), \
-                mock.patch.object(entry, 'threading', threads), \
-                mock.patch.dict(entry.os.environ, {'RECURSION_ENGINE_USER': ''}):
+        with contextlib.ExitStack() as stack:
+            entry, daemon, installed, ended = self.stopping(stack, Watched)
+            handlers = installed
             entry.main(port=0)
         self.assertEqual(sorted(handlers), sorted((signal.SIGTERM, signal.SIGINT)))
         self.assertTrue(sets, 'nothing set the Event')
         self.assertNotIn(threading.get_ident(), sets, 'a handler set the Event on the thread that waits on it')
-        daemon.return_value.close.assert_called_once()
+        daemon.close.assert_called_once()
+
+    def test_a_stop_asked_for_as_a_wait_runs_out_starts_no_further_sweep(self):
+        """The handler has run, the wait runs out, and the thread that sets the Event has not run yet.
+
+        The stop must be kept all the same: the handler notes it on the main thread, and the loop
+        reads the note before it starts anything. (Without the note the daemon swept once more, and a
+        sweep can take as long as its calls to the unit manager do.) The thread is held back here,
+        and the wait itself plays the signal and then says that its time ran out.
+        """
+        held, handlers = threading.Event(), {}
+
+        class RunsOut(threading.Event):
+            def wait(self, timeout=None):
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+                return super().wait(0)
+
+        with contextlib.ExitStack() as stack:
+            entry, daemon, installed, ended = self.stopping(stack, RunsOut, held)
+            handlers = installed
+
+            def sweep():
+                self.assertEqual(daemon.sweep.call_count, 1, 'another sweep was started after the stop was asked for')
+            daemon.sweep.side_effect = sweep
+            try:
+                entry.main(client=object(), door=bool, port=0, sweep_seconds=0.001)
+            finally:
+                held.set()
+                if ended.started:
+                    self.assertTrue(ended.wait(self.STOP_BOUND_S), 'the thread main started did not end')
+        self.assertEqual(daemon.sweep.call_count, 1, 'the sweep of the start, and no other')
+        daemon.close.assert_called_once()
+
+    def test_nothing_sets_the_event_before_a_stop_is_asked_for(self):
+        """The thread that sets the Event waits, on the lock ``main`` holds, until a handler lets it go.
+
+        Were that lock free when the thread came to it, or were it not asked for at all, the Event
+        would be set at once and every daemon would stop as it started. Time decides nothing here:
+        the first wait goes on once that thread has either found the lock held or returned, and only
+        the first of the two is right.
+        """
+        seen, handlers, bound = [], {}, self.STOP_BOUND_S
+
+        class Quiet(threading.Event):
+            def wait(self, timeout=None):
+                if not ended.started:
+                    raise AssertionError('main started no thread for its stop')
+                if not seen:
+                    seen.append((ended.moved.wait(bound), ended.waits, ended.is_set(), self.is_set()))
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+                if not super().wait(bound):
+                    raise AssertionError('the stop did not reach the Event')
+                return True
+
+        with contextlib.ExitStack() as stack:
+            entry, daemon, installed, ended = self.stopping(stack, Quiet)
+            handlers = installed
+            entry.main(port=0)
+        self.assertEqual(seen, [(True, True, False, False)], 'before any stop was asked for: (the thread showed '
+                         'itself, it waits for the lock, it has returned, the Event is set)')
+        self.assertTrue(ended.wait(bound), 'the thread main started did not end')
+        daemon.close.assert_called_once()
+
+    def test_a_start_that_fails_lets_the_stop_thread_go_without_any_signal(self):
+        """``main``'s own clean-up lets that thread go, so it does not outlive a daemon that never ran."""
+        with contextlib.ExitStack() as stack:
+            entry, daemon, handlers, ended = self.stopping(stack, threading.Event)
+            daemon.sweep.side_effect = ValueError('the start failed')
+            try:
+                with self.assertRaisesRegex(ValueError, 'the start failed'):
+                    entry.main(client=object(), door=bool, port=0)
+                self.assertTrue(ended.started, 'main started no thread for its stop')
+                self.assertTrue(ended.wait(self.STOP_BOUND_S), 'the thread still waits after main has cleaned up')
+                daemon.close.assert_called_once()
+            finally:
+                handlers[signal.SIGTERM](signal.SIGTERM, None)  # whatever this test found, it leaves no thread waiting
+
+    def test_a_stop_thread_that_cannot_be_started_ends_the_start_with_the_daemon_shut(self):
+        """A machine that can start no more threads. ``main`` does not go on without a way to be
+        stopped: the refusal leaves it as it is, before any sweep and any surface, and its own
+        clean-up still shuts the daemon."""
+        class NeverWaitedOn(threading.Event):
+            def wait(self, timeout=None):
+                raise AssertionError('main went on to its loop with no thread for its stop')
+
+        with contextlib.ExitStack() as stack:
+            entry, daemon, handlers, ended = self.stopping(stack, NeverWaitedOn)
+            refused = entry._thread.start_new_thread = mock.Mock(side_effect=RuntimeError("can't start new thread"))
+            with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+                entry.main(client=object(), door=bool, port=0)
+            refused.assert_called_once()
+            daemon.sweep.assert_not_called()
+            entry.LoopbackGUI.assert_not_called()
+            daemon.close.assert_called_once()
 
     def test_a_composition_that_cannot_start_stops_the_daemon_before_any_gui(self):
         from recursion_core.daemon import __main__ as entry

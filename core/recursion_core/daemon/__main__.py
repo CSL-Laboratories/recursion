@@ -39,18 +39,25 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
     state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
     stopped = threading.Event()
+    stop_asked = False  # written by the handler and read by the loop below: both on the main thread
     asked = _thread.allocate_lock()
     asked.acquire()  # held until a stop is asked for
 
     def ask(*_):
-        """The handler of SIGTERM and SIGINT: one native call, which cannot wait.
+        """The handler of SIGTERM and SIGINT: it notes the stop, and makes one native call that
+        cannot wait.
 
         A handler runs on the main thread, between two of its instructions, and the main thread is
         the one that waits on ``stopped``. ``stopped.set()`` called from here takes the Event's lock
         on that thread: it blocks for ever when the signal arrives while the thread holds that lock
         inside ``wait``, or while an earlier handler is still inside ``set``. So the handler only
         lets ``tell`` go, and ``tell`` sets the Event on a thread of its own.
+
+        The note is what keeps the stop. ``tell`` only ends the wait early: a wait that runs out
+        before ``tell`` has run finds the note, and no further sweep is started.
         """
+        nonlocal stop_asked
+        stop_asked = True
         try:
             asked.release()
         except RuntimeError:  # asked already
@@ -68,6 +75,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
         gui = composed = None
         try:
             # Not a threading.Thread: this one is not waited for at exit, and it needs no Event of its own.
+            # A start that is refused ends ``main`` here, before any sweep: no daemon runs that cannot be stopped.
             _thread.start_new_thread(tell, ())
             daemon.sweep()
             if not injected:
@@ -80,6 +88,8 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
             gui = _start_gui(client, door, plugins, port, announced=False)
             announced = gui is None
             while not stopped.wait(sweep_seconds):
+                if stop_asked:
+                    break  # asked for as the wait ran out, before ``tell`` set the Event
                 require_free_threaded()
                 daemon.sweep()
                 if composed is not None:
@@ -88,7 +98,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
                     gui = _start_gui(client, door, plugins, port, announced=announced)
                     announced = gui is None
         finally:
-            ask()  # ``tell`` ends with the daemon, whatever ended it
+            ask()  # lets ``tell`` go, whatever ended the daemon; it is let go, not waited for
             try:
                 if gui is not None:
                     gui.__exit__(None, None, None)

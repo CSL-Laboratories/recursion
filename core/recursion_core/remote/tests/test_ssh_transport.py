@@ -288,6 +288,38 @@ class StuckAfterWrite(PipeProc):
         return taken
 
 
+class FlushFails(PipeProc):
+    """Takes every byte of a request; then its flush fails, as a pipe closed under it would."""
+
+    def flush(self) -> None:
+        if self.requests:
+            raise BrokenPipeError("the pipe closed after the write")
+
+
+class EndsWithoutAnIOFailure(PipeProc):
+    """Takes every byte of a request, then its write ends on an error that is not an I/O failure."""
+
+    def write(self, data):
+        taken = super().write(data)
+        if self.requests:
+            raise MemoryError("not an I/O failure")
+        return taken
+
+
+class StuckOnHello(PipeProc):
+    """Takes every byte of the hello, then does not return from that write until ``resume`` (a kill does not)."""
+
+    def __init__(self, **options) -> None:
+        super().__init__(**options)
+        self.resume = threading.Event()
+
+    def write(self, data):
+        taken = super().write(data)
+        if self._hello_seen and not self.requests:
+            self.resume.wait()
+        return taken
+
+
 class SessionEdgeTests(unittest.TestCase):
     REQUEST = {"op": "control", "method": "run.stop", "params": {"run_id": "r"}, "id": 1}
 
@@ -378,6 +410,32 @@ class SessionEdgeTests(unittest.TestCase):
         self.assertIsInstance(failure, RelayDeliveryUnknown)
         self.assertEqual(failure.detail, "request:write_unknown")
         self.assertTrue(client.closed)
+
+    def test_a_full_write_then_a_failed_flush_is_never_reported_unsent(self) -> None:
+        # The answer the far side already sent is the answer.
+        answered = self.client(FlushFails(answers=[{"ok": True, "result": {"code": "stopped"}, "id": 1}]))
+        self.assertEqual(answered.request(self.REQUEST)["result"], {"code": "stopped"})
+        # With no answer, the request may have been carried out: unknown, never unsent.
+        silent = self.client(FlushFails(), timeout_s=0.2)
+        failure = self.bounded(lambda: silent.request(self.REQUEST))
+        self.assertIsInstance(failure, RelayDeliveryUnknown)
+        self.assertEqual(failure.detail, "request:timeout")
+
+    def test_a_writer_that_ends_without_an_io_failure_is_unknown(self) -> None:
+        with mock.patch.object(threading, "excepthook", lambda args: None):  # the writer's error is expected
+            client = self.client(EndsWithoutAnIOFailure())
+            failure = self.bounded(lambda: client.request(self.REQUEST))
+        self.assertIsInstance(failure, RelayDeliveryUnknown)
+        self.assertEqual(failure.detail, "request:write_unknown")
+        self.assertTrue(client.closed)
+
+    def test_a_hello_whose_write_never_returns_is_a_failed_handshake(self) -> None:
+        proc = StuckOnHello()
+        self.addCleanup(proc.resume.set)
+        with mock.patch.object(ssh_transport, "CLOSE_GRACE_S", 0.2):
+            failure = self.bounded(lambda: self.client(proc, hello_timeout_s=0.2))
+        self.assertIsInstance(failure, RelayHandshakeFailed)
+        self.assertEqual(failure.detail, "hello_timeout")
 
     def test_a_request_that_cannot_be_serialised_is_refused_before_it_is_written(self) -> None:
         proc = PipeProc()

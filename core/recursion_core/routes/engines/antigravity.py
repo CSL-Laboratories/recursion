@@ -332,7 +332,8 @@ def mask_forms(values) -> tuple[str, ...]:
         if not isinstance(value, str) or not value:
             raise ValueError("a value to mask is a non-empty str")
         forms.add(value)
-        # a normalization variant reads as the same text to anyone who normalizes it
+        # a canonical variant reads as the same text to anyone who normalizes it; a compatibility one (NFKC,
+        # NFKD: fullwidth, superscript, ligature forms) is beyond ordinary output and is not listed
         forms.update(unicodedata.normalize(form, value) for form in ("NFC", "NFD"))
     return tuple(sorted(forms, key=len, reverse=True))
 
@@ -356,8 +357,10 @@ def mask(text: str, forms: tuple[str, ...]) -> str:
 
     A spelling is any stretch of ``text`` that reads as the form: as it stands, once its JSON string escapes
     are read (a u-escape of any character, an escaped slash, a surrogate pair for a character beyond the
-    BMP), or once they are read again for JSON written inside a JSON string, to any depth. Whatever spelling
-    the agent chose, the value it decodes to is masked. Text that is not JSON is read the same way. Masking
+    BMP), or once they are read again for JSON written inside a JSON string, to any depth. Whatever escape
+    spelling the agent chose, the value it decodes to is masked, and so are the value's canonical spellings
+    (NFC, NFD; ``mask_forms`` lists them). Its compatibility spellings (NFKC, NFKD: fullwidth, superscript or
+    ligature forms of its characters) are not read. Text that is not JSON is read the same way. Masking
     repeats until no spelling is left, since a fill could complete a value partly made of the fill
     character.
 

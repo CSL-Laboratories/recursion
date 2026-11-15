@@ -4,7 +4,9 @@ Stages, each reporting findings the developer sees (Q16 accept item 2):
 
 * ``verify``: manifest bytes are canonical and well formed; the artifact bytes match the
   manifest's SHA-256; the signature is classified signed or unsigned against this
-  install's trusted list. A bad signature is a finding, not a refusal (4.3).
+  install's trusted list. A bad signature is a finding, not a refusal (4.3); a plugin
+  that the finding leaves with no permission (a grant bound to the signer it lacks) is
+  then refused ``plugin_not_granted`` at ``admit``.
 * ``admit``: requested ∩ granted permissions, bound to digest and key; no reserved
   (effect-owner) credential or destination; process, network and install-script grants
   reported. A plugin left with no effective permission is refused here,
@@ -210,6 +212,9 @@ class PluginLoader:
     def load(self, manifest_bytes: bytes, signature: object, artifact: bytes,
              registry_label: str | None = None) -> LoadedPlugin:
         with self._load_lock:
+            # This load's findings only: a refusal before verify (a poisoned core) must not report the
+            # previous plugin's findings and id (review 1 of #380, DeepSeek F4).
+            self.last_findings = ()
             self._health.require_healthy()
             findings: list[dict] = []
             try:

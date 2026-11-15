@@ -144,6 +144,58 @@ class RevocationDuringImportTests(_Loaders):
         self.assertEqual(outcome["loaded"].permissions, ("read", "order"))
 
 
+class SerialLoadTests(_Loaders):
+    """Loads are serial (review 1 of #380, Astra R6): a second load is not admitted while one imports."""
+
+    def test_a_second_load_waits_and_then_finds_the_plugin_active(self):
+        source = b"VALUE = 1\n"
+        loader = self.loader([self.grant("demo.plugin", source, ("read",))])
+        raw = self.manifest("demo.plugin", source, ("read",))
+        in_first, second_waiting, release = threading.Event(), threading.Event(), threading.Event()
+        admitted, errors = [], []
+        real_admit, real_lock = loader._verify_admit, loader._load_lock
+
+        class Observed:  # the real load lock, which says when the second load reaches it
+            def __enter__(self):
+                if threading.current_thread().name == "r4-second":
+                    second_waiting.set()
+                real_lock.acquire()
+
+            def __exit__(self, *exc):
+                real_lock.release()
+
+        def admit(*args):
+            admitted.append(threading.current_thread().name)
+            if threading.current_thread().name == "r4-second":
+                second_waiting.set()  # without the load lock the second load gets here at once
+            return real_admit(*args)
+
+        def execute(_code, _namespace):  # stands in for the import of the first load only
+            if threading.current_thread().name == "r4-first":
+                in_first.set()
+                release.wait(WATCHDOG_S)
+
+        def run():
+            try:
+                loader.load(raw, None, source)
+            except Refused as exc:
+                errors.append(exc.code)
+        loader._load_lock = Observed()
+        with mock.patch.object(loader, "_verify_admit", side_effect=admit), \
+                mock.patch.object(loader_module, "exec", create=True, side_effect=execute):
+            first, second = (threading.Thread(target=run, name=n) for n in ("r4-first", "r4-second"))
+            first.start()
+            self.addCleanup(lambda: (release.set(), first.join(WATCHDOG_S), second.join(WATCHDOG_S)))
+            self.assertTrue(in_first.wait(WATCHDOG_S))
+            second.start()
+            self.assertTrue(second_waiting.wait(WATCHDOG_S))
+            self.assertEqual(admitted, ["r4-first"], "a second load was admitted while the first imported")
+            release.set()
+            first.join(WATCHDOG_S)
+            second.join(WATCHDOG_S)
+        self.assertEqual((admitted, errors), (["r4-first", "r4-second"], ["plugin_already_active"]))
+
+
 class PreExecutionRefusalTests(_Loaders):
     """R4 finding 7: no effective permission, no compile and no exec, and a typed code."""
 

@@ -3,9 +3,9 @@
 ``require_production_runtime`` refuses anything other than CPython 3.14 built
 free-threaded, started with ``-X gil=0``, with the GIL off. The daemon calls it at start
 (``daemon/__main__.py``, through its ``require_free_threaded``; decision D2, Lucas, Nov 12
-2026: "The daemon refuses to start without ``-X gil=0``"), and again on every sweep, where a
-refusal no longer stops the daemon: it poisons the plugin core and Stop and reconciliation
-go on. ``-X gil=0`` matters because without it importing an extension that does not declare
+2026: "The daemon refuses to start without ``-X gil=0``"), and again on every sweep. On the
+composed path a refusal there no longer stops the daemon: it poisons the plugin core and Stop and
+reconciliation go on. (A daemon given an injected client, which composes no plugins, still stops.) ``-X gil=0`` matters because without it importing an extension that does not declare
 ``Py_mod_gil`` turns the GIL on for the whole process (measured below). ``PYTHON_GIL=0``
 in the environment is not accepted in its place: the check reads ``sys._xoptions``.
 

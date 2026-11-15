@@ -72,6 +72,39 @@ class StartupRequiresXGil0Tests(unittest.TestCase):
                 entry.main(client=object(), door=bool, port=0)
 
 
+class SweepPoisonBranchTests(unittest.TestCase):
+    """The sweep's own poison, on its own (review 1 of #380, Astra R6): no plugin turns the GIL on here.
+
+    A synthetic main-loop test: every OS-facing name in ``__main__`` is replaced, so it runs on any
+    interpreter and claims nothing about a real daemon starting on 3.12.
+    """
+
+    def test_a_failed_sweep_check_poisons_plugins_and_the_sweep_goes_on(self):
+        import contextlib
+        from recursion_core.daemon import __main__ as entry
+        from recursion_core.plugin_security import CoreHealth
+        health, composed, daemon, stopped = CoreHealth(), mock.Mock(), mock.Mock(), mock.Mock()
+        composed.plugins.health, composed.plugins.registries = health, ()
+        stopped.wait.side_effect = [False, False, True]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(entry, 'require_free_threaded',
+                                                  side_effect=[None, RuntimeError('found on'), RuntimeError('found on')]))
+            for name in ('require_posix', 'refuse_engine_user', 'check_operator_linger', 'Registry',
+                         'SystemdUserManager', 'EngineUnitManager'):
+                stack.enter_context(mock.patch.object(entry, name))
+            stack.enter_context(mock.patch.object(entry, 'UserLock', return_value=contextlib.nullcontext()))
+            stack.enter_context(mock.patch.object(entry, 'Daemon', return_value=daemon))
+            stack.enter_context(mock.patch.object(entry, 'compose_control', return_value=composed))
+            stack.enter_context(mock.patch.object(entry, '_start_gui', return_value=None))
+            stack.enter_context(mock.patch.object(entry.threading, 'Event', return_value=stopped))
+            stack.enter_context(mock.patch.object(entry.signal, 'signal'))
+            with self.assertLogs('recursion_core.daemon', 'ERROR') as logs:
+                entry.main(port=0)
+        self.assertEqual(health.poisoned, entry.GIL_POISON)
+        self.assertEqual((daemon.sweep.call_count, composed.control.reconcile.call_count), (3, 3))
+        self.assertEqual(sum('GIL enabled in daemon process' in line for line in logs.output), 1)  # logged once
+
+
 @unittest.skipUnless(hasattr(sys, '_is_gil_enabled'), 'requires the CPython GIL probe')
 @unittest.skipUnless(FREE_THREADED_314 and STARTED_WITH_X_GIL_0 and LINUX,
                      'the real daemon entry point starts only on Linux free-threaded 3.14 run with -X gil=0')

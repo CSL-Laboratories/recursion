@@ -2,14 +2,16 @@
 
 A root is resolved once (links above it are the administrator's, such as ``/home`` pointing at
 ``/var/home``). Under a root, every folder this package creates and every file it writes or removes
-is reached without following a link: a link there is refused (``symlink_refused``). Nothing here
-reads ``os.environ`` or the process's home folder; the caller passes the roots.
+is reached without following a link: a link there is refused (``symlink_refused``), and so is a
+folder there that another user owns or that group or world can write (``folder_untrusted``). Nothing
+here reads ``os.environ`` or the process's home folder; the caller passes the roots.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import stat
 from dataclasses import dataclass
 
 from .errors import InstallRefused
@@ -56,48 +58,71 @@ def _directory_root(path: object) -> str:
 def ensure_dir(root: str, path: str, *, mode: int = 0o700) -> bool:
     """Create ``path`` and the folders between it and ``root``. True when anything was created.
 
-    Every new folder gets ``mode`` (less the umask). An existing folder is left as it is. A link
-    or a file on the way is refused instead of being followed.
+    Every new folder gets ``mode`` (less the umask). An existing folder is left as it is, if
+    ``_existing_folder`` accepts it: a link, a file, or a folder another user owns or can write
+    on the way is refused instead of being used.
     """
 
-    rel = os.path.relpath(path, root)
-    if rel == "." or rel.startswith("..") or os.path.isabs(rel):
-        raise InstallRefused("path_escapes", path)
     created = False
-    cur = root
-    for part in rel.split(os.sep):
-        cur = os.path.join(cur, part)
-        if os.path.islink(cur):
-            raise InstallRefused("symlink_refused", cur)
-        if os.path.isdir(cur):
+    for cur in _folders_below(root, path):
+        if _existing_folder(cur):
             continue
-        if os.path.lexists(cur):
-            raise InstallRefused("not_a_directory", cur)
         os.mkdir(cur, mode)
         created = True
     return created
 
 
 def check_dirs(root: str, path: str) -> None:
-    """Refuse a link or a file at any folder between ``root`` and ``path`` that exists."""
+    """Refuse what ``ensure_dir`` would refuse at any folder between ``root`` and ``path`` that exists."""
 
+    for cur in _folders_below(root, path):
+        _existing_folder(cur)
+
+
+def _folders_below(root: str, path: str) -> list[str]:
     rel = os.path.relpath(path, root)
     if rel == "." or rel.startswith("..") or os.path.isabs(rel):
         raise InstallRefused("path_escapes", path)
-    cur = root
+    folders, cur = [], root
     for part in rel.split(os.sep):
         cur = os.path.join(cur, part)
-        if os.path.islink(cur):
-            raise InstallRefused("symlink_refused", cur)
-        if os.path.lexists(cur) and not os.path.isdir(cur):
-            raise InstallRefused("not_a_directory", cur)
+        folders.append(cur)
+    return folders
+
+
+def _existing_folder(path: str) -> bool:
+    """True for an existing folder this installer may use, False when nothing is there.
+
+    Refused: a link (``symlink_refused``), something that is not a folder (``not_a_directory``), and
+    a folder another user owns or that group or world can write (``folder_untrusted``): another user
+    could put a unit there, or take ours away. The same rule ``plugin_security.stores`` holds a
+    store's folder to.
+    """
+
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        raise InstallRefused("symlink_refused", path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise InstallRefused("not_a_directory", path)
+    if info.st_uid != os.geteuid():
+        raise InstallRefused("folder_untrusted", f"{path} is owned by another user")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise InstallRefused("folder_untrusted", f"{path} can be written by group or world; `chmod go-w` it")
+    return True
 
 
 def read_regular(path: str) -> bytes:
-    """Read a regular file of at most 1 MiB. A link is refused, not followed."""
+    """Read a regular file of at most 1 MiB. A link is refused, not followed.
+
+    The open does not block (``O_NONBLOCK``): a FIFO or a device in the file's place is refused by
+    the type check after it instead of holding the command at the open. Regular files ignore the flag.
+    """
 
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise InstallRefused("not_regular", path) from exc
     try:

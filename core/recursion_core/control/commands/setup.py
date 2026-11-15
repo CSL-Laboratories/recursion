@@ -8,7 +8,11 @@ seams merge, and then lane INSTALL's ``setup/hooks.py`` registers this same fami
 Each command prints one JSON object on stdout. Success is ``"code": "ok"`` (exit 0), with
 ``changed`` (whether a file was written or removed), ``unit`` (its path) and ``next`` (the
 ``systemctl --user`` commands that apply the change; none is run here). A refusal is
-``"code": <kind>`` with ``detail`` (exit 1).
+``"code": <kind>`` with ``detail`` (exit 1). A file-system error on the way (a folder the user
+cannot write, a full disk) is the refusal ``filesystem_error``, its detail naming the error and the path;
+files written before it stay written, so the answer does not say that nothing changed. Off Linux
+the family refuses ``platform_unsupported`` before it reads anything (``recursiond`` refuses there
+first; this holds the same once the family is registered in the control CLI).
 
 ``install`` and ``upgrade`` point the unit at the interpreter running this command, and first ask
 that interpreter, started as the unit will start it (``-I``, from ``/``), what it is: it must be
@@ -57,8 +61,13 @@ def dispatch(args, client) -> int:
 
     import recursion_core
 
-    return run(args.command, out=getattr(args, "out", None) or sys.stdout, roots=default_roots(),
-               interpreter=sys.executable, package=recursion_core.__file__)
+    out = getattr(args, "out", None) or sys.stdout
+    if not sys.platform.startswith("linux"):
+        _print(out, {"code": "platform_unsupported", "action": args.command,
+                     "detail": f"the per-user service needs Linux with systemd; this system is {sys.platform}"})
+        return EXIT_REFUSED
+    return run(args.command, out=out, roots=default_roots(), interpreter=sys.executable,
+               package=recursion_core.__file__)
 
 
 def default_roots() -> Roots:
@@ -82,6 +91,9 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
             raise InstallRefused("action", repr(action))
     except InstallRefused as exc:
         _print(out, {"code": exc.kind, "action": action, "detail": exc.detail})
+        return EXIT_REFUSED
+    except OSError as exc:
+        _print(out, {"code": "filesystem_error", "action": action, "detail": f"{type(exc).__name__}: {exc}"})
         return EXIT_REFUSED
     answer = {"code": "ok", "action": action, "changed": plan.changed, "unit": plan.unit,
               "next": [list(command) for command in plan.commands]}

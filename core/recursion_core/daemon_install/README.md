@@ -17,13 +17,19 @@ calls `%h`; never `$HOME`, never `os.environ`):
 | the daemon's state folder (`$XDG_STATE_HOME/recursion`: the run registry, and from slice 2 the stores) | - | - | stays |
 
 A link at any folder or file under the home is refused (`symlink_refused`, `not_regular`), never
-followed. A link above the home (`/home` -> `/var/home`) is resolved. Every write goes to a fresh
+followed, and so is a folder there that another user owns or that group or world can write
+(`folder_untrusted`: another user could put a unit in it or take ours away; `chmod go-w` it). A
+link above the home (`/home` -> `/var/home`) is resolved. Every write goes to a fresh
 temporary name, is fsynced, and is linked (new file) or renamed (replacement) into place; the
-folder is fsynced after it.
+folder is fsynced after it. The unit is read with a non-blocking open of at most 1 MiB, so a FIFO
+or a device in its place is refused (`not_regular`) instead of holding the command. A file-system
+error on the way (a folder the user cannot write, a full disk) is the command's refusal
+`filesystem_error`, naming the error and the path.
 
 The unit runs `<interpreter> -I -X gil=0 -m recursion_core.daemon`, where `<interpreter>` is the
 Python that ran `recursiond install`, exactly as given (a virtual environment's `bin/python` is not
-resolved to its target). Before writing, the command layer starts that interpreter as the unit
+resolved to its target; a `%` in its path is written `%%`, systemd's literal percent, so systemd
+does not expand it as a specifier). Before writing, the command layer starts that interpreter as the unit
 will (`-I`, from `/`) and refuses unless it is free-threaded CPython 3.14
 (`interpreter_not_free_threaded`) and imports this same `recursion_core` without `PYTHONPATH`
 (`not_installed`). The unit has `Restart=on-failure`, `WantedBy=default.target`, `UMask=0077`,

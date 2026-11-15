@@ -80,7 +80,10 @@ def serve(args) -> int:
                        f"{' free-threaded' if sysconfig.get_config_var('Py_GIL_DISABLED') else ' with the GIL'}")
     if not sys.executable or not os.path.isabs(sys.executable):
         return _refuse("interpreter_unknown", "this interpreter does not know its own path")
-    os.execv(sys.executable, daemon_argv(sys.executable, args))
+    try:
+        os.execv(sys.executable, daemon_argv(sys.executable, args))
+    except OSError as exc:  # execv returns only by raising
+        return _refuse("interpreter_unknown", f"{sys.executable} could not be started: {type(exc).__name__}: {exc}")
     return EXIT_REFUSED  # not reached: execv either replaces the process or raises
 
 

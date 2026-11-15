@@ -3,7 +3,7 @@
 
     python -X utf8 -B tools/release/hash_lock_checks.py
 
-It is named hash_lock_checks.py until tools/release/proposals/ci-gate-release-tests.patch
+It is named hash_lock_checks.py until tools/release/proposals/ci-gate-test-discovery.patch
 is applied: the frozen gate (tools/ci_gate.py) fails on a test_*.py file outside its globs,
 and tools/release/ is not among them. That patch adds the glob and renames this file to
 tools/release/test_hash_lock.py, so hosted CI runs it from then on. Stdlib only, offline.
@@ -366,8 +366,7 @@ class WorkflowScanTests(TreeCase):
     def test_inline_jobs_fail(self) -> None:
         self.tree.write(".github/workflows/extra.yml", 'name: x\non: push\njobs: {build: {runs-on: ubuntu-24.04, '
                         'steps: [{run: "python -m pip install -r requirements-dev.txt"}]}}\n')
-        self.assertProblem(r"extra\.yml: `jobs:` is written inline")
-        self.assertProblem(r"extra\.yml:3: installer text in a `jobs:` value this check does not read")
+        self.assertProblem(r"extra\.yml:3: a flow mapping, which this check does not read")
 
     # Round-2 reads (GPT-6 Astra change 1, GPT-6.1 Sol changes 1-2): values are decoded as YAML
     # reads them before any matching, and every installer the check cannot read is refused.
@@ -375,11 +374,9 @@ class WorkflowScanTests(TreeCase):
         self.add_workflow(">-\n          python -m pip\n          install -r requirements-dev.txt")
         self.assertTrue(self.tree.problems(), "folded run silently hides an unlocked install")
 
-    def test_folded_and_multi_line_installs_are_read_as_installs(self) -> None:
+    def test_folded_installs_are_read_as_installs(self) -> None:
         for command in (">-\n          python -m pip\n          install -r requirements-dev.txt",
-                        ">\n          python -m pip\n          install -r requirements-dev.txt",
-                        "python -m pip\n          install -r requirements-dev.txt",
-                        "\"python -m pip\n          install -r requirements-dev.txt\""):
+                        ">\n          python -m pip\n          install -r requirements-dev.txt"):
             with self.subTest(command=command):
                 self.add_workflow(command)
                 self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\] but is not hash-locked")
@@ -410,14 +407,194 @@ class WorkflowScanTests(TreeCase):
         rel, template = self.WORKFLOW
         text = template.format(runner="ubuntu-24.04", python="3.12", command="echo")
         self.tree.write(rel, text + "      - pip install requests\n")
-        self.assertProblem(r"extra\.yml:\d+: a line that may install packages, outside any `key: value`")
+        self.assertProblem(r"extra\.yml:\d+: installer text in a list entry this check does not read")
 
     def test_a_run_step_outside_a_readable_job_fails(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="ubuntu-24.04", python="3.12", command="echo ok")
+        self.tree.write(rel, text.replace("jobs:\n", "run: >-\n  python -m pip\n  install -r requirements-dev.txt\njobs:\n"))
+        self.assertProblem(r"extra\.yml:3: a run step that may install packages sits outside any job")
+
+    # Round-3 reads (GPT-6 Astra changes 1-3, GPT-6.1 Sol changes 1-2): their supplied cases,
+    # as written; each also names the reason, so its problem cannot come from elsewhere.
+    def test_escaped_quote_before_install_is_not_truncated(self) -> None:
+        self.add_workflow(json.dumps('echo "preparing"; python -m pip install -r requirements-dev.txt'))
+        self.assertTrue(self.tree.problems(), "escaped quote silently hides an unlocked install")
+        self.assertProblem(r"extra\.yml:10: a backslash escape in a double-quoted value")
+
+    def test_escaped_newline_after_comment_is_not_ignored(self) -> None:
+        self.add_workflow(json.dumps('# preparing\npython -m pip install -r requirements-dev.txt'))
+        self.assertTrue(self.tree.problems(), "escaped newline silently hides an unlocked install")
+        self.assertProblem(r"extra\.yml:10: a backslash escape in a double-quoted value")
+
+    def test_folded_explicit_indent_preserves_more_indented_lines(self) -> None:
+        self.add_workflow('>2-\n            # preparing\n            python -m pip install -r requirements-dev.txt')
+        self.assertTrue(self.tree.problems(), "explicit indent silently hides an unlocked install")
+        self.assertProblem(r"extra\.yml:10: an explicit block indentation indicator")
+
+    def test_anchored_block_with_header_comment_is_not_ignored(self) -> None:
+        self.add_workflow('&review_anchor | # note\n          python -m pip install -r requirements-dev.txt')
+        self.assertTrue(self.tree.problems(), "anchored block silently hides an unlocked install")
+        self.assertProblem(r"extra\.yml:10: an anchor, alias or tag")
+
+    def test_folded_blank_line_preserves_second_command(self) -> None:
+        self.add_workflow('>-\n          # preparing\n\n          python -m pip install -r requirements-dev.txt')
+        self.assertTrue(self.tree.problems(), "blank-line boundary was lost")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_folded_more_indented_line_after_comment_is_checked(self) -> None:
+        self.add_workflow('>-\n          # preparing\n            python -m pip install -r requirements-dev.txt')
+        self.assertTrue(self.tree.problems(), "more-indented boundary was lost")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_escaped_yaml_quotes_cannot_hide_a_later_install(self) -> None:
+        self.add_workflow('"echo \\"ready\\"; pip install -r requirements-dev.txt"')
+        self.assertTrue(self.tree.problems(), "escaped YAML quotes truncate the run before its install")
+        self.assertProblem(r"extra\.yml:10: a backslash escape in a double-quoted value")
+
+    def test_a_shallow_quoted_continuation_cannot_hide_an_install(self) -> None:
+        self.add_workflow('"python -m pip\n        install -r requirements-dev.txt"')
+        self.assertTrue(self.tree.problems(), "valid quoted continuation silently hides an install")
+        self.assertProblem(r"extra\.yml:10: a quoted value that continues on the next line")
+
+    def test_an_anchored_literal_preserves_shell_comment_boundaries(self) -> None:
+        self.add_workflow("&ci |-\n          pip install -r requirements-ci.txt # first install\n"
+                          "          pip install -r requirements-dev.txt")
+        self.assertTrue(self.tree.problems(), "anchored literal folds the second install into a comment")
+        self.assertProblem(r"extra\.yml:10: an anchor, alias or tag")
+
+    def test_a_quoted_escaped_line_break_cannot_hide_an_install(self) -> None:
+        self.add_workflow('"python -m pi\\\n          p install -r requirements-dev.txt"')
+        self.assertTrue(self.tree.problems(), "quoted YAML continuation silently hides an unlocked install")
+        self.assertProblem(r"extra\.yml:10: a backslash escape in a double-quoted value")
+
+    def test_a_quoted_escaped_line_break_cannot_hide_a_second_installer(self) -> None:
+        self.add_workflow('"pip install -r requirements-ci.txt; u\\\n          v sync"')
+        self.assertTrue(self.tree.problems(), "quoted YAML continuation silently hides an unsupported installer")
+        self.assertProblem(r"extra\.yml:10: a backslash escape in a double-quoted value")
+
+    def test_a_chomped_literal_block_preserves_shell_comment_boundaries(self) -> None:
+        self.add_workflow("|-\n          pip install -r requirements-ci.txt # first install\n"
+                          "          pip install -r requirements-dev.txt")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    # The reader is closed: a YAML form it does not decode is a problem wherever it appears,
+    # with or without installer text, since what the value would decode to is unknown.
+    def test_every_yaml_form_this_check_does_not_read_is_refused(self) -> None:
+        rel, template = self.WORKFLOW
+        base = template.format(runner="ubuntu-24.04", python="3.12", command="echo ok")
+        cases = {
+            "alias": ("      - run: *ready\n", r"an anchor, alias or tag"),
+            "anchor": ("      - run: &ready echo ok\n", r"an anchor, alias or tag"),
+            "tag": ("      - run: !!str echo ok\n", r"an anchor, alias or tag"),
+            "merge key": ("      - <<: base\n", r"a merge key"),
+            "flow mapping": ("      - with: {a: b}\n", r"a flow mapping"),
+            "flow list it cannot read": ("      - with: ['a']\n", r"a flow list this check cannot read"),
+            "plain continuation": ("      - run: echo\n          ok\n", r"a line deeper than the value above it"),
+            "quoted continuation": ("      - run: 'echo\n          ok'\n", r"a quoted value that continues on the next line"),
+            "escape": ('      - run: "echo \\t ok"\n', r"a backslash escape in a double-quoted value"),
+            "indentation indicator": ("      - run: |2\n          echo ok\n", r"an explicit block indentation indicator"),
+            "tab in indentation": ("\t- run: echo ok\n", r"a tab in the indentation"),
+            "document marker": ("---\n", r"neither `key: value` nor a list entry"),
+            "directive": ("%YAML 1.2\n", r"neither `key: value` nor a list entry"),
+            "complex key": ("      - ? run\n", r"a value starting with '\?'"),
+            "duplicate key": ("        run: echo again\n", r"the key 'run' twice in one mapping"),
+            "next line (NEL)": ("      - run: echo ok" + chr(0x85) + "# x\n", r"a line break other than LF"),
+            "line separator": ("      - run: echo ok" + chr(0x2028) + "\n", r"a line break other than LF"),
+            "control character": ("      - run: echo" + chr(1) + "ok\n", r"a control character, which YAML does not allow"),
+            "text after a quote": ("      - run: 'echo' ok\n", r"text after a quoted value"),
+            "colon in a plain value": ("      - run: echo a: b\n", r"a `: ` inside a plain value"),
+            "backtick value": ("      - run: `echo`\n", r"a value starting with '`'"),
+            "block line less indented": ("      - run: |\n            echo a\n          echo b\n",
+                                         r"less indented than its first line"),
+            "blank block line with extra spaces": ("      - run: |\n          echo a\n             \n          echo b\n",
+                                                   r"a blank line of a block value with more spaces"),
+            "entry where a mapping continues": ("    - x\n", r"a list entry where its mapping continues"),
+            "line that is no key or entry": ("    just words\n", r"neither `key: value` nor a list entry"),
+        }
+        for name, (extra, reason) in cases.items():
+            with self.subTest(form=name):
+                self.tree.write(rel, base + extra)
+                self.assertProblem(r"extra\.yml:\d+: .*" + reason)
+
+    def test_values_that_continue_on_the_next_line_are_refused(self) -> None:
+        self.add_workflow("python -m pip\n          install -r requirements-dev.txt")
+        self.assertProblem(r"extra\.yml:11: a line deeper than the value above it")
+        self.add_workflow("\"python -m pip\n          install -r requirements-dev.txt\"")
+        self.assertProblem(r"extra\.yml:10: a quoted value that continues on the next line")
+
+    def test_a_quoted_jobs_key_is_read_as_jobs(self) -> None:
         rel, template = self.WORKFLOW
         text = template.format(runner="ubuntu-24.04", python="3.12",
                                command=">-\n          python -m pip\n          install -r requirements-dev.txt")
         self.tree.write(rel, text.replace("jobs:\n", '"jobs":\n'))
-        self.assertProblem(r"extra\.yml:\d+: a run step that may install packages sits outside any job")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    # Bash: each of these hid an install at e5adf594, which matched shell lines as raw text and
+    # split them with shlex (a `#` inside a word started a comment there).
+    def test_shell_forms_cannot_hide_an_install(self) -> None:
+        locked = "pip install -r requirements-ci.txt"
+        for script in (f"{locked}; echo a#b; pip install -r requirements-dev.txt",
+                       f"{locked} # note \\\n          pip install -r requirements-dev.txt",
+                       'p"i"p install -r requirements-dev.txt',
+                       "p\\ip install -r requirements-dev.txt",
+                       "$'\\x70ip' install -r requirements-dev.txt",
+                       "pip >log install -r requirements-dev.txt",
+                       "out=$(pip install -r requirements-dev.txt)",
+                       "x=`pip install -r requirements-dev.txt`",
+                       "tee >(pip install -r requirements-dev.txt)"):
+            with self.subTest(script=script):
+                self.add_workflow("|\n          " + script)
+                self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_installers_run_in_ways_this_check_does_not_read_are_refused(self) -> None:
+        cases = {
+            "P=pip\n          $P install -r requirements-dev.txt": r"a pip install through a variable",
+            "$TOOL install -r requirements-dev.txt": r"an installer verb after an expansion this check cannot resolve",
+            "/usr/bin/p?p install -r requirements-dev.txt": r"an installer verb after an expansion this check cannot",
+            "echo install -r requirements-dev.txt | xargs pip": r"an installer program run in a way",
+            "pip $VERB -r requirements-dev.txt": r"an installer program run in a way",
+            "uvx ruff check": r"an installer program run in a way",
+            "alias get='pip'": r"an installer program run in a way",
+            "eval \"$CMD\"": r"eval of text built at run time",
+            "bash -c \"$CMD\"": r"bash of text built at run time",
+            ". ./steps.sh": r"\. runs a file's text as the script",
+            "source steps.sh": r"source runs a file's text as the script",
+            "bash <<'EOF'\n          pip install -r requirements-dev.txt\n          EOF": r"an installer this check does not read",
+            "bash <<< 'pip install -r requirements-dev.txt'": r"an installer this check does not read",
+            "cat <<EOF\n          $(date)\n          EOF": r"a command substitution in an unquoted here-document",
+            "echo 'never closed": r"cannot read as bash: an unterminated single quote",
+        }
+        for script, reason in cases.items():
+            with self.subTest(script=script):
+                self.add_workflow("|\n          " + script)
+                self.assertProblem(r"extra\.yml(?::\d+| job build): .*" + reason)
+
+    def test_a_pip_install_runs_in_bash(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="windows-2025", python="3.12", command="python -m pip install -r requirements-ci.txt")
+        self.tree.write(rel, text)
+        self.assertProblem(r"a pip install in a step whose shell is 'pwsh'; this check reads bash")
+        self.tree.write(rel, text + "        shell: bash\n")
+        self.assertEqual(self.tree.problems(), [])
+        self.tree.write(rel, text.replace("windows-2025", "ubuntu-24.04") + "        shell: sh\n")
+        self.assertProblem(r"a pip install in a step whose shell is 'sh'")
+
+    def test_a_step_using_an_action_this_check_has_not_read_fails(self) -> None:
+        rel, template = self.WORKFLOW
+        base = template.format(runner="ubuntu-24.04", python="3.12", command="echo ok")
+        for uses in ("some/pip-install-action@v1", "docker://python:3.12", "./.github/actions/setup"):
+            with self.subTest(uses=uses):
+                self.tree.write(rel, base + f"      - uses: {uses}\n")
+                self.assertProblem(rf"extra\.yml:11: uses {re.escape(repr(uses))}, which this check has not read")
+        self.tree.write(rel, base + "  call:\n    uses: ./.github/workflows/extra.yml\n")
+        self.assertEqual(self.tree.problems(), [])
+
+    def test_job_settings_are_read_from_yaml_values_only(self) -> None:
+        # A run block's text belongs to the shell: a line in it that looks like a setting is not one.
+        self.add_workflow("|\n          cat > x.yml <<'EOF'\n          python-version: \"3.10\"\n          EOF\n"
+                          "          python -m pip install -r requirements-ci.txt")
+        self.assertEqual(self.tree.problems(), [])
 
     def test_a_crlf_workflow_is_read(self) -> None:
         rel, template = self.WORKFLOW
@@ -468,6 +645,91 @@ class WorkflowScanTests(TreeCase):
         self.assertEqual(self.tree.problems(), [])
         installs, _ = hl.all_installs(self.tree.root)
         self.assertIn(("ci.yml", "core-314t", THREADED), {(i.source, i.job, i.file) for i in installs})
+
+
+class YamlReadingTests(unittest.TestCase):
+    """The values the reader decodes. Each expected value is PyYAML 6.0.1's reading of the same
+    text (BaseLoader), taken once; the check itself stays stdlib only. A flow list is kept as
+    its text: only installer text is looked for in it."""
+
+    def test_values_are_decoded_as_yaml_decodes_them(self) -> None:
+        cases = [
+            ("a: |\n  x\n  y\n", {("a",): "x\ny\n"}),
+            ("a: |-\n  x\n\n", {("a",): "x"}),
+            ("a: |+\n  x\n\n", {("a",): "x\n\n"}),
+            ("a: | # note\n  x\n", {("a",): "x\n"}),
+            ("a: |\n   x\n    y\n", {("a",): "x\n y\n"}),
+            ("a: >\n  x\n  y\n\n  z\n", {("a",): "x y\nz\n"}),
+            ("a: >-\n  x\n    y\n  z\n", {("a",): "x\n  y\nz"}),
+            ("a: >\n\n  x\n", {("a",): "\nx\n"}),
+            ("a: >\n  x\n\n    y\n", {("a",): "x\n\n  y\n"}),
+            ("a: >+\n  x\n\n", {("a",): "x\n\n"}),
+            ("a: 'it''s'  # c\n", {("a",): "it's"}),
+            ('a: "x # y"\n', {("a",): "x # y"}),
+            ("a: x #y\n", {("a",): "x"}),
+            ("a: x#y\n", {("a",): "x#y"}),
+            ("a:\n- x\n- 'y'\nb: [p, q]\n", {("a", 0): "x", ("a", 1): "y", ("b",): "[p, q]"}),
+            ("s:\n  - k: v\n    l: |\n      t\n  - - n\n", {("s", 0, "k"): "v", ("s", 0, "l"): "t\n", ("s", 1, 0): "n"}),
+            ("s:\n  -\n    k: v\n", {("s", 0, "k"): "v"}),
+            ('"q k": v\n\'r\': w\n', {("q k",): "v", ("r",): "w"}),
+            ("a:\n  b:\n\n    # c\n    c: d\ne: f\n", {("a", "b", "c"): "d", ("e",): "f"}),
+            ("a: x\nb:\n", {("a",): "x"}),
+            ("a: |\n  x", {("a",): "x"}),
+            ("a: >+\n  x\n\n  ", {("a",): "x\n\n"}),
+            ("'it''s': w\n", {("it's",): "w"}),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                found, problems = hl.read_yaml(text)
+                self.assertEqual(problems, [])
+                self.assertEqual({s.path: s.text for s in found}, expected)
+
+
+class BashReadingTests(unittest.TestCase):
+    """How a `run:` value is split into commands and words: as bash splits it."""
+
+    def words(self, script: str) -> list[tuple[str, ...]]:
+        return sorted(tuple(w.text for w in command) for command in hl.shell_commands(script))
+
+    def test_commands_and_words_are_read_as_bash_forms_them(self) -> None:
+        cases = [
+            ("echo a#b; pip install x", [("echo", "a#b"), ("pip", "install", "x")]),
+            ("echo a # note \\\npip install x", [("echo", "a"), ("pip", "install", "x")]),
+            ("echo '#'; pip install x", [("echo", "#"), ("pip", "install", "x")]),
+            ('p"i"p install x', [("pip", "install", "x")]),
+            ("p\\ip install x", [("pip", "install", "x")]),
+            ("$'\\x70i\\160' install x", [("pip", "install", "x")]),
+            ("pip install \\\n  -r x", [("pip", "install", "-r", "x")]),
+            ("echo \"a;b\" 'c|d' \"e\\\"f\"", [("echo", "a;b", "c|d", 'e"f')]),
+            ("pip >log install -r x 2>&1", [("pip", "install", "-r", "x")]),
+            ("out=$(pip install x)", [("out=$(pip install x)",), ("pip", "install", "x")]),
+            ("x=`pip install y`", [("pip", "install", "y"), ("x=`pip install y`",)]),
+            ("tee >(pip install x)", [("pip", "install", "x"), ("tee",)]),
+            ("cat <<'EOF'\npip install x\nEOF\necho done", [("cat", "pip install x"), ("echo", "done")]),
+            ("cat <<-EOF\n\tbody\n\tEOF\necho done", [("cat", "\tbody"), ("echo", "done")]),
+            ("echo ${{ github.event_name }} done", [("echo", "${{ github.event_name }}", "done")]),
+            ("echo '${{ a == 'b' }}'", [("echo", "${{ a == 'b' }}")]),
+            ("a && b || c | d & e ; f", [("a",), ("b",), ("c",), ("d",), ("e",), ("f",)]),
+        ]
+        for script, expected in cases:
+            with self.subTest(script=script):
+                self.assertEqual(self.words(script), sorted(expected))
+
+    def test_values_known_only_at_run_time_are_marked(self) -> None:
+        for script, word, dynamic in (("$X install", "$X", True), ('"${Y}" a', "${Y}", True),
+                                      ("echo $(date)", "$(date)", True), ("ls *.txt", "*.txt", True),
+                                      ("echo {a,b}", "{a,b}", True), ("echo ${{ x }}", "${{ x }}", True),
+                                      ("echo '$X'", "$X", False), ("echo \\$X", "$X", False)):
+            with self.subTest(script=script):
+                words = {w.text: w.dynamic for command in hl.shell_commands(script) for w in command}
+                self.assertEqual(words.get(word), dynamic)
+
+    def test_scripts_bash_cannot_finish_reading_are_refused(self) -> None:
+        for script in ("echo 'a", 'echo "a', "echo $(a", "cat <<EOF\nnever ends", "echo `a", "echo ${a",
+                       "echo ${{ a", "echo " + chr(0) + "0" + chr(1)):
+            with self.subTest(script=script):
+                with self.assertRaises(hl.LockError):
+                    hl.shell_commands(script)
 
 
 class WheelTagTests(unittest.TestCase):

@@ -18,13 +18,15 @@ fails (exit 1, one line per problem) unless each one:
 - has, for every job that installs it (its runner and Python version), a wheel of every pin
   that applies there.
 
-Workflow values are decoded as YAML reads them before any matching (block `|` and `>`
-scalars, multi-line plain and quoted values), so a folded `run:` is read as the shell sees
-it. It reads every command of every shell line (`&&`, `||`, `;`, pipes, command
-substitution) and every spelling of pip it knows; a `run:` line that may install packages
-but cannot be read as pip installs of requirements files, one outside a job it can read,
-and installer text in any other value or in a line that is no `key: value`, are each a
-problem, never "nothing installed". The gate (tools/ci_gate.py) installs nothing; the check makes
+Workflows are read exactly as YAML and bash read them, in the forms this repository's
+workflows use; every other form is a problem wherever it appears (the comment above
+`read_yaml` lists both). Each `run:` value is split into commands and words as bash does it,
+and every command that runs an installer program or holds installer text must be a pip
+install of requirements files in a job the check found, in a bash step; installer text in
+any other value, a step that uses an action the check has not read (ACTIONS), and a command
+named by an expansion are each a problem, never "nothing installed". What a command
+computes at run time (variables, `eval`, the values of `${{ }}` expressions) is not read.
+The gate (tools/ci_gate.py) installs nothing; the check makes
 sure it stays that way.
 Stdlib only and offline; tools/release/relock.py is the one script that reads PyPI.
 """
@@ -33,7 +35,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -59,7 +60,6 @@ INSTALLER = re.compile(r"(?:-m\s*pip\b|\bpip3?\b|\bpipx\b|\buv\b|\bpoetry\b|\bco
                        r"|\bpip-sync\b|\buv\s+sync\b|\beasy_install\b")
 ALLOWED_PIP_OPTIONS = {"--only-binary=:all:", "--require-hashes", "--no-cache-dir", "-q", "--quiet",
                        "--disable-pip-version-check", "--no-input"}
-SHELL_OPERATORS = {"|", "||", "&", "&&", ";", ";;", "(", ")", "<", ">", ">>", "<<", "|&"}
 
 
 class LockError(ValueError):
@@ -456,138 +456,586 @@ class Install:
     target: Target
 
 
-JOBS_HEADER = re.compile(r"jobs:\s*(?:#.*)?")
-JOB_KEY = r"([A-Za-z0-9_-]+|\"[^\"]+\"|'[^']+'):\s*(?:#.*)?"
-KEY_LINE = re.compile(r"^(\s*)((?:-\s+)*)([^\s#:\-][^:#]*?|\"[^\"]*\"|'[^']*'):(?:\s+(.*?))?\s*$")
-BLOCK = re.compile(r"[|>][0-9+-]*\s*(?:#.*)?")
+# --- workflows: read exactly as YAML and bash read them, or refused -------------------
+# What this check does not decode it cannot vouch for, so every form it does not read is a
+# problem wherever it appears, whether or not the text looks like an install.
+#
+# YAML: block mappings and lists; one-line plain, single-quoted and double-quoted values
+# (a double-quoted value with no backslash); `|` and `>` blocks with an optional chomping
+# indicator; one-line flow lists of plain items. Refused: anchors, aliases, tags, merge keys,
+# flow mappings, a value that continues on the next line, backslash escapes, an explicit
+# block indentation indicator, a tab in indentation, document markers, directives, complex
+# keys, a key twice in one mapping, control characters, and line breaks other than LF and CRLF.
+#
+# Bash: every `run:` value is split into simple commands and words as bash does it (quotes,
+# backslashes, `$'...'`, comments, line continuations, here-documents, redirections,
+# `$(...)` and backticks, whose commands are read too), after GitHub's `${{ }}` expressions,
+# whose values are known only at run time. A command that runs an installer program, or
+# whose words hold installer text, must be a pip install of hash-locked files, in a job this
+# check found, in a bash step. A `$NAME` expansion is tried with every literal value the
+# script or the job's `env:` gives it; an expansion it cannot resolve before an installer
+# verb, `eval` or `bash -c` of such text, and `source` or `.` of any file are problems. What
+# the shell computes at run time beyond that (text assembled from pieces, files written and
+# then run) is not read.
+
+YAML_BREAKS = re.compile("[" + "".join(chr(c) for c in (0x0D, 0x85, 0x2028, 0x2029)) + "]")
+CONTROL = re.compile("[" + "".join(chr(c) for c in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F)) + "]")
+PLAIN_KEY = r"[^\s#'\"&*!?|>%@`\[\]{},:-][^:#]*?"
+KEY = re.compile(r"(" + PLAIN_KEY + r"|\"[^\"\\]*\"|'(?:[^']|'')*')[ \t]*:(?:[ \t]+(.*))?$")
+BLOCK_HEADER = re.compile(r"[|>]([+-]?)(?:[ \t]+#.*)?")
+FLOW_ITEM = r"[^\s,\[\]{}#&*!|>'\"%@`?:\\-][^,\[\]{}#'\"\\:]*?"
+FLOW_LIST = re.compile(rf"(\[[ \t]*(?:{FLOW_ITEM}(?:[ \t]*,[ \t]*{FLOW_ITEM})*[ \t]*,?)?[ \t]*\])(?:[ \t]+#.*)?")
+ENV_KEY = re.compile(r"[A-Z_][A-Z0-9_]*")
+# Actions a step may use. Each one installs no Python package from outside the lock; a new
+# action is added here only after reading what it installs. A reusable workflow of this
+# repository (`./.github/workflows/<file>`) is read as a workflow of its own.
+ACTIONS = {"actions/checkout", "actions/setup-python", "actions/upload-artifact",
+           "actions/download-artifact",
+           "anthropics/claude-code-action"}  # used only by the workflows retire-review-workflows.patch removes
+INSTALLER_PROGRAM = re.compile(r"(?:.*/)?(?:pip3?(?:\.\d+)?|pipx|uvx?|poetry|conda|mamba|micromamba|pip-sync"
+                               r"|easy_install)(?:\.exe)?")
+INSTALLER_VERBS = {"install", "sync"}
 
 
-def _jobs(lines: list[str]) -> tuple[dict[str, list[int]], list[str]]:
-    """The line numbers (0-based, into the LF lines) of each job under a block-style top-level
-    `jobs:`, at whatever indentation the first job uses, and what this reader cannot follow."""
-    problems: list[str] = []
-    headers = [i for i, line in enumerate(lines) if JOBS_HEADER.fullmatch(line)]
-    if any(re.match(r"jobs:\s*[^\s#]", line) for line in lines):
-        problems.append("`jobs:` is written inline; this check reads only a block mapping")
-    if len(headers) != 1:
-        if len(headers) > 1:
-            problems.append(f"{len(headers)} top-level `jobs:` lines")
-        return {}, problems
-    out: dict[str, list[int]] = {}
-    current: str | None = None
-    indent: int | None = None
-    for index in range(headers[0] + 1, len(lines)):
-        line = lines[index]
-        if not line.strip() or line.lstrip().startswith("#"):
-            if current is not None:
-                out[current].append(index)
-            continue
-        lead = len(line) - len(line.lstrip(" "))
-        if lead == 0:
-            break  # the next top-level key
-        if indent is None:
-            indent = lead
-        key = re.fullmatch(" " * indent + JOB_KEY, line) if lead == indent else None
-        if key:
-            current = key.group(1).strip("\"'")
-            out[current] = []
-        elif lead > indent and current is not None:
-            out[current].append(index)
-        else:
-            problems.append(f"a line under `jobs:` this check cannot place in a job: {line.strip()!r}")
-            current = None
-    return out, problems
+class Unread(Exception):
+    """A YAML form this check does not read."""
 
 
-def _yaml_scalar(text: str) -> str:
-    text = text.strip()
-    if text[:1] in ("'", '"'):
-        quote = text[0]
-        end = text.find(quote, 1)
-        while quote == "'" and end != -1 and text[end + 1:end + 2] == "'":
-            end = text.find(quote, end + 2)
-        if end != -1:
-            inner = text[1:end]
-            return inner.replace("''", "'") if quote == "'" else inner
-        return text
-    return re.split(r"\s+#", text, maxsplit=1)[0].strip()
+@dataclass(frozen=True)
+class Scalar:
+    line: int     # 0-based line of its key or list entry
+    path: tuple   # keys (str) and list positions (int) from the top of the file
+    text: str     # the value as YAML decodes it
 
 
-def _fold(lines: list[str]) -> str:
-    """YAML folding: a line break between two plain lines is a space, an empty line is a line
-    break, and a more-indented line keeps its own line."""
-    out = ""
-    previous_plain = False
-    for line in lines:
-        if not line.strip():
-            out += "\n"
-            previous_plain = False
-        elif line[:1] in (" ", "\t"):
-            out += ("\n" if out and not out.endswith("\n") else "") + line + "\n"
-            previous_plain = False
-        else:
-            out += (" " if previous_plain else "") + line
-            previous_plain = True
-    return out
+class _Lines(list):
+    """A file's lines, and whether its last line ends with a line break."""
+    final_break = True
 
 
-def _scalars(lines: list[str]) -> tuple[list[tuple[int, str, str]], set[int]]:
-    """Every scalar value written as `key: value`, decoded as YAML reads it: (line of the key,
-    key, text). Block scalars (`|`, `>`) and multi-line plain or quoted values are joined the
-    way YAML joins them. Also the set of lines those values take up."""
-    found: list[tuple[int, str, str]] = []
-    used: set[int] = set()
-    index = 0
+class _Frame:
+    def __init__(self, kind: str, indent: int, path: tuple) -> None:
+        self.kind, self.indent, self.path = kind, indent, path
+        self.keys: set[str] = set()
+        self.count = 0
+        self.pending = None  # the key or list position whose value starts on the next line
+
+
+def read_yaml(text: str) -> tuple[list[Scalar], list[tuple[int, str]]]:
+    """Every scalar of a workflow with its path, and (line, why) for each form not read."""
+    lines = _Lines(text.replace("\r\n", "\n").split("\n"))
+    if lines[-1] == "":
+        lines.pop()  # the final line break ends the last line; it starts none
+    else:
+        lines.final_break = False
+    scalars: list[Scalar] = []
+    problems: list[tuple[int, str]] = []
+    frames: list[_Frame] = []
+    index, skip_deeper_than = 0, None
     while index < len(lines):
         line = lines[index]
-        match = KEY_LINE.match(line)
-        if not match or line.lstrip().startswith("#"):
+        bare = line.lstrip(" ")
+        indent = len(line) - len(bare)
+        blank = not bare.strip(" \t") or bare.lstrip(" \t").startswith("#")
+        if skip_deeper_than is not None and (blank or indent > skip_deeper_than):
             index += 1
             continue
-        key = match.group(3).strip("\"'")
-        column = len(match.group(1)) + len(match.group(2))
-        value = match.group(4) or ""
-        following = []
-        scan = index + 1
-        while scan < len(lines) and (not lines[scan].strip()
-                                     or len(lines[scan]) - len(lines[scan].lstrip(" ")) > column):
-            following.append(scan)
-            scan += 1
-        while following and not lines[following[-1]].strip():
-            following.pop()
-        if not value or value.startswith("#"):
-            index += 1  # a mapping or sequence follows; its own keys are read in turn
-            continue
-        if BLOCK.fullmatch(value):
-            body = [lines[i] for i in following]
-            indent = min((len(l) - len(l.lstrip(" ")) for l in body if l.strip()), default=0)
-            body = [l[indent:] for l in body]
-            text = _fold(body) if value.startswith(">") else "\n".join(body) + "\n"
-        elif following:
-            text = _yaml_scalar(_fold([value] + [lines[i].strip() for i in following]))
-        else:
-            text = _yaml_scalar(value)
-        found.append((index, key, text))
-        used.update([index, *following])
-        index = following[-1] + 1 if following else index + 1
-    return found, used
+        skip_deeper_than = None
+        try:
+            if YAML_BREAKS.search(line):
+                raise Unread("a line break other than LF, which this check does not read")
+            if CONTROL.search(line):
+                raise Unread("a control character, which YAML does not allow")
+            if blank:
+                index += 1
+                continue
+            if bare.startswith("\t"):
+                raise Unread("a tab in the indentation")
+            index = _yaml_line(lines, index, indent, bare, frames, scalars)
+        except Unread as exc:
+            problems.append((index, str(exc)))
+            skip_deeper_than = indent
+            index += 1
+    return scalars, problems
 
 
-def _shell_lines(script: str) -> list[str]:
-    """Each line with its backslash continuations joined; shell comment lines dropped."""
-    out: list[str] = []
-    pending = ""
-    for line in script.replace("\r\n", "\n").split("\n"):
-        if not pending and line.lstrip().startswith("#"):
-            continue
-        if line.rstrip().endswith("\\"):
-            pending += line.rstrip()[:-1] + " "
-            continue
-        out.append(pending + line)
-        pending = ""
+def _yaml_line(lines: list[str], index: int, indent: int, bare: str, frames: list[_Frame],
+               scalars: list[Scalar]) -> int:
+    while frames and frames[-1].indent > indent:
+        frames.pop()
+    top = frames[-1] if frames else None
+    dash = bare == "-" or bare.startswith("- ")
+    if top is not None and top.pending is not None and (
+            indent > top.indent or (indent == top.indent and top.kind == "map" and dash)):
+        frame = _Frame("seq" if dash else "map", indent, top.path + (top.pending,))
+        top.pending = None
+        frames.append(frame)
+    elif top is not None and indent == top.indent:
+        if top.kind == "seq" and not dash:
+            frames.pop()  # the list ends; the line belongs to the mapping that holds it
+            return _yaml_line(lines, index, indent, bare, frames, scalars)
+        if top.kind == "map" and dash:
+            raise Unread("a list entry where its mapping continues")
+        top.pending = None  # a key or entry left empty above holds null
+        frame = top
+    elif top is None:
+        frame = _Frame("seq" if dash else "map", indent, ())
+        frames.append(frame)
+    else:
+        raise Unread("a line deeper than the value above it (a value that continues on the next line, "
+                     "or an indentation this check cannot follow)")
+    return _yaml_content(lines, index, indent, bare, frame, frames, scalars)
+
+
+def _yaml_content(lines: list[str], index: int, column: int, text: str, frame: _Frame,
+                  frames: list[_Frame], scalars: list[Scalar]) -> int:
+    if frame.kind == "seq":
+        position = frame.count
+        frame.count += 1
+        after = text[1:]
+        rest = after.lstrip(" ")
+        inner = column + 1 + len(after) - len(rest)
+        path = frame.path + (position,)
+        if not rest or rest.startswith("#"):
+            frame.pending = position
+            return index + 1
+        if rest == "-" or rest.startswith("- ") or KEY.match(rest):
+            child = _Frame("seq" if rest[0] == "-" else "map", inner, path)
+            frames.append(child)
+            return _yaml_content(lines, index, inner, rest, child, frames, scalars)
+        return _yaml_value(rest, lines, index, frame.indent, path, scalars)[0]
+    key = KEY.match(text)
+    if not key:
+        raise Unread("a line that is neither `key: value` nor a list entry")
+    raw = key.group(1)
+    name = raw[1:-1] if raw[0] == '"' else raw[1:-1].replace("''", "'") if raw[0] == "'" else raw.strip()
+    if name == "<<":
+        raise Unread("a merge key, which this check does not read")
+    if name in frame.keys:
+        raise Unread(f"the key {name!r} twice in one mapping")
+    frame.keys.add(name)
+    after, pending = _yaml_value(key.group(2) or "", lines, index, frame.indent, frame.path + (name,), scalars)
     if pending:
-        out.append(pending)
-    return out
+        frame.pending = name
+    return after
+
+
+def _yaml_value(text: str, lines: list[str], index: int, parent: int, path: tuple,
+                scalars: list[Scalar]) -> tuple[int, bool]:
+    """Read the value written after a key or a list dash. Returns the next line to read and
+    whether the value is a mapping or list on the lines that follow."""
+    value = text.strip(" \t")
+    if not value or value.startswith("#"):
+        return index + 1, True
+    first = value[0]
+    if first in "&*!":
+        raise Unread("an anchor, alias or tag, which this check does not read")
+    if first == "{":
+        raise Unread("a flow mapping, which this check does not read")
+    if first in "?%@`,]}" or value == "-" or value.startswith("- "):
+        raise Unread(f"a value starting with {value[:2] if first == '-' else first!r}, which this check does not read")
+    if first in "|>":
+        header = BLOCK_HEADER.fullmatch(value)
+        if not header:
+            raise Unread("an explicit block indentation indicator, which this check does not read"
+                         if re.match(r"[|>][+-]?[0-9]", value) else "a block header this check cannot read")
+        body, after = _block_lines(lines, index + 1, parent)
+        unbroken = after == len(lines) and not getattr(lines, "final_break", True) and bool(body)
+        scalars.append(Scalar(index, path, _block_text(first, header.group(1), body, unbroken)))
+        return after, False
+    if first == "[":
+        flow = FLOW_LIST.fullmatch(value)
+        if not flow:
+            raise Unread("a flow list this check cannot read (it reads one line of plain items)")
+        decoded = flow.group(1)
+        rest = ""
+    elif first == "'":
+        quoted = re.match(r"'((?:[^']|'')*)'", value)
+        if not quoted:
+            raise Unread("a quoted value that continues on the next line, which this check does not read")
+        decoded, rest = quoted.group(1).replace("''", "'"), value[quoted.end():]
+    elif first == '"':
+        quoted = re.match(r'"([^"\\]*)"', value)
+        if not quoted:
+            raise Unread("a backslash escape in a double-quoted value, which this check does not read"
+                         if re.match(r'"[^"\\]*\\', value) else
+                         "a quoted value that continues on the next line, which this check does not read")
+        decoded, rest = quoted.group(1), value[quoted.end():]
+    else:
+        decoded = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip(" \t")
+        rest = ""
+        if re.search(r":(?:[ \t]|$)", decoded):
+            raise Unread("a `: ` inside a plain value, which this check does not read")
+    if rest.strip(" \t") and not re.match(r"[ \t]+#", rest):
+        raise Unread("text after a quoted value")
+    scalars.append(Scalar(index, path, decoded))
+    return index + 1, False
+
+
+def _block_lines(lines: list[str], start: int, parent: int) -> tuple[list[str], int]:
+    """The lines of a `|` or `>` block with its indentation removed, and the next line to read.
+    A block holds the lines deeper than its parent; its indentation is its first line's."""
+    end = start
+    while end < len(lines) and (not lines[end].strip(" ") or len(lines[end]) - len(lines[end].lstrip(" ")) > parent):
+        end += 1
+    raw = lines[start:end]
+    filled = [line for line in raw if line.strip(" ")]
+    indent = len(filled[0]) - len(filled[0].lstrip(" ")) if filled else 0
+    body = []
+    for line in raw:
+        if not line.strip(" "):
+            if len(line) > indent:
+                raise Unread("a blank line of a block value with more spaces than the block's indentation")
+            body.append("")
+        elif line.strip(" \t") == "":
+            raise Unread("a line of only tabs and spaces in a block value")
+        elif len(line) - len(line.lstrip(" ")) < indent:
+            raise Unread("a line of a block value less indented than its first line")
+        else:
+            body.append(line[indent:])
+    return body, end
+
+
+def _block_text(style: str, chomping: str, body: list[str], unbroken: bool = False) -> str:
+    """YAML's reading of a block: `|` keeps every line break; `>` folds the break between two
+    lines that start with no space into a space, keeps it next to a more-indented line, and
+    turns each empty line into a line break. The chomping indicator decides the final breaks
+    (`unbroken`: the block's last line ends the file with no line break)."""
+    end = len(body)
+    while end and body[end - 1] == "":
+        end -= 1
+    content = body[:end]
+    breaks = len(body) - end + 1 - unbroken  # the line breaks after the last line with text
+    if not content:
+        return "\n" * (len(body) - unbroken) if chomping == "+" else ""
+    if style == "|":
+        text = "\n".join(content)
+    else:
+        parts: list[str] = []
+        previous = None
+        empty = 0
+        for line in content:
+            if line == "":
+                empty += 1
+                continue
+            if previous is None:
+                parts.append("\n" * empty)
+            elif previous[:1] not in (" ", "\t") and line[:1] not in (" ", "\t"):
+                parts.append(" " if empty == 0 else "\n" * empty)
+            else:
+                parts.append("\n" * (empty + 1))
+            parts.append(line)
+            previous, empty = line, 0
+        text = "".join(parts)
+    return text + {"-": "", "": "\n" * min(breaks, 1), "+": "\n" * breaks}[chomping]
+
+
+@dataclass(frozen=True)
+class Word:
+    text: str
+    dynamic: bool  # it holds an expansion or a substitution, whose value is known only at run time
+
+
+SHELL_OPERATORS_BY_LENGTH = (";;&", "&>>", "<<-", "<<<", "&&", "||", ";;", ";&", "|&", ">>", "<<",
+                             "<>", ">|", ">&", "<&", "&>", ";", "&", "|", "(", ")", "<", ">", "\n")
+REDIRECTIONS = {"&>>", "<<-", "<<<", ">>", "<<", "<>", ">|", ">&", "<&", "&>", "<", ">"}
+ANSI_C = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+          "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+GLOB_OR_BRACE = re.compile(r"[*?]|\[[^\]]+\]|\{[^{}]*(?:,|\.\.)[^{}]*\}")
+GITHUB_EXPRESSION = re.compile(r"\$\{\{.*?\}\}", re.S)
+RESERVED_WORDS = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for",
+                  "in", "case", "esac", "select", "function", "time", "coproc", "[[", "]]"}
+
+
+class _Bash:
+    """Bash's split of a script into simple commands and words (quote removal done), with the
+    commands of every command substitution among them."""
+
+    def __init__(self, text: str, expressions: list[str], commands: list[list[Word]]) -> None:
+        self.s, self.i, self.expressions, self.commands = text, 0, expressions, commands
+        self.heredocs: list[tuple[str, bool, bool, list[Word]]] = []
+
+    def expression(self, word: list[str]) -> None:
+        end = self.s.index("\x01", self.i)
+        word.append(self.expressions[int(self.s[self.i + 1:end])])
+        self.i = end + 1
+
+    def script(self, stop: str | None) -> None:
+        s = self.s
+        command: list[Word] = []
+        self.commands.append(command)
+        word: list[str] = []
+        plain: list[str] = []  # the word's unquoted characters, for pathname and brace expansion
+        dynamic = started = drop = False
+        depth = 0
+
+        def end_word() -> None:
+            nonlocal word, plain, dynamic, started, drop
+            if GLOB_OR_BRACE.search("".join(plain)):
+                dynamic = True
+            if started and not drop:
+                command.append(Word("".join(word), dynamic))
+            if started:
+                drop = False
+            word, plain, dynamic, started = [], [], False, False
+
+        def new_command() -> None:
+            nonlocal command, drop
+            end_word()
+            drop = False
+            command = []
+            self.commands.append(command)
+
+        while self.i < len(s):
+            c = s[self.i]
+            if c == "\\":
+                following = s[self.i + 1:self.i + 2]
+                if following != "\n":
+                    word.append(following or "\\")
+                    started = True
+                self.i += 2
+            elif c == "'":
+                end = s.find("'", self.i + 1)
+                if end < 0:
+                    raise LockError("an unterminated single quote")
+                piece = s[self.i + 1:end]
+                dynamic |= "\x00" in piece
+                word.append(re.sub(r"\x00(\d+)\x01", lambda m: self.expressions[int(m.group(1))], piece))
+                started, self.i = True, end + 1
+            elif c == '"':
+                self.i += 1
+                started = True
+                dynamic |= self.double(word)
+            elif c == "\x00":
+                self.expression(word)
+                started = dynamic = True
+            elif c == "$":
+                started = True
+                dynamic |= self.dollar(word, quoted=False)
+            elif c == "`":
+                self.backtick(word)
+                started = dynamic = True
+            elif c == "#" and not started:
+                end = s.find("\n", self.i)
+                self.i = len(s) if end < 0 else end
+            elif c in " \t":
+                end_word()
+                self.i += 1
+            else:
+                op = next((o for o in SHELL_OPERATORS_BY_LENGTH if s.startswith(o, self.i)), None)
+                if op is None:
+                    word.append(c)
+                    plain.append(c)
+                    started = True
+                    self.i += 1
+                    continue
+                if op in REDIRECTIONS and started and not dynamic and "".join(word).isdigit():
+                    word, started = [], False  # a file descriptor number: `2>`
+                end_word()
+                self.i += len(op)
+                if op == ")" and stop == ")" and depth == 0:
+                    return
+                if op in REDIRECTIONS:
+                    if op in ("<<", "<<-"):
+                        self.heredoc(op == "<<-", command)
+                    elif op != "<<<":
+                        drop = True  # the target of a redirection is no word of the command
+                    continue
+                depth += {"(": 1, ")": -1}.get(op, 0)  # `<(` and `>(`: the redirection, then `(`
+                new_command()
+                if op == "\n":
+                    self.read_heredocs()
+        end_word()
+        if stop is not None:
+            raise LockError("an unterminated $(...)")
+        if self.heredocs:
+            raise LockError(f"an unterminated here-document ({self.heredocs[0][0]})")
+
+    def double(self, word: list[str]) -> bool:
+        s, dynamic = self.s, False
+        while self.i < len(s):
+            c = s[self.i]
+            if c == '"':
+                self.i += 1
+                return dynamic
+            if c == "\\" and s[self.i + 1:self.i + 2] in ('"', "\\", "$", "`", "\n"):
+                if s[self.i + 1] != "\n":
+                    word.append(s[self.i + 1])
+                self.i += 2
+            elif c == "$":
+                dynamic |= self.dollar(word, quoted=True)
+            elif c == "`":
+                self.backtick(word)
+                dynamic = True
+            elif c == "\x00":
+                self.expression(word)
+                dynamic = True
+            else:
+                word.append(c)
+                self.i += 1
+        raise LockError("an unterminated double quote")
+
+    def dollar(self, word: list[str], quoted: bool) -> bool:
+        """Read the expansion at `$`; True when its value is known only at run time."""
+        s, start = self.s, self.i
+        following = s[start + 1:start + 2]
+        if s.startswith("$((", start):
+            depth, i = 0, start + 1
+            while i < len(s):
+                depth += {"(": 1, ")": -1}.get(s[i], 0)
+                if depth == 0:
+                    break
+                i += 1
+            text = s[start:i + 1]
+            if "$(" in text[3:] or "`" in text or "\x00" in text:
+                raise LockError("a substitution inside $((...)), which this check does not read")
+            word.append(text)
+            self.i = i + 1
+            return True
+        if following == "(":
+            self.i = start + 2
+            self.script(stop=")")
+            word.append(s[start:self.i])
+            return True
+        if following == "{":
+            self.i = start + 2
+            scratch: list[str] = []
+            while self.i < len(s) and s[self.i] != "}":
+                c = s[self.i]
+                if c == "\\":
+                    self.i += 2
+                elif c == "'" and not quoted:
+                    end = s.find("'", self.i + 1)
+                    if end < 0:
+                        raise LockError("an unterminated single quote")
+                    self.i = end + 1
+                elif c == '"':
+                    self.i += 1
+                    self.double(scratch)
+                elif c == "$":
+                    self.dollar(scratch, quoted)
+                elif c == "`":
+                    self.backtick(scratch)
+                elif c == "\x00":
+                    self.expression(scratch)
+                else:
+                    self.i += 1
+            if self.i >= len(s):
+                raise LockError("an unterminated ${...}")
+            self.i += 1
+            word.append(s[start:self.i])
+            return True
+        if following == "'" and not quoted:
+            self.i = start + 2
+            word.append(self.ansi_c())
+            return False
+        if following == '"' and not quoted:
+            self.i = start + 2
+            return self.double(word)
+        name = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]").match(s, start + 1)
+        if name:
+            self.i = name.end()
+            word.append(s[start:self.i])
+            return True
+        word.append("$")
+        self.i = start + 1
+        return False
+
+    def ansi_c(self) -> str:
+        s, out = self.s, []
+        while self.i < len(s):
+            c = s[self.i]
+            if c == "'":
+                self.i += 1
+                return "".join(out)
+            if c != "\\":
+                out.append(c)
+                self.i += 1
+                continue
+            e = s[self.i + 1:self.i + 2]
+            if e in ANSI_C:
+                out.append(ANSI_C[e])
+                self.i += 2
+                continue
+            for pattern, base in ((r"[0-7]{1,3}", 8), (r"x([0-9A-Fa-f]{1,2})", 16), (r"u([0-9A-Fa-f]{1,4})", 16),
+                                  (r"U([0-9A-Fa-f]{1,8})", 16), (r"c(.)", 0)):
+                m = re.compile(pattern, re.S).match(s, self.i + 1)
+                if m:
+                    if base == 0:
+                        out.append(chr(ord(m.group(1).upper()) ^ 0x40))
+                    else:
+                        out.append(chr(int(m.group(1) if m.groups() else m.group(0), base) % 0x110000))
+                    self.i = m.end()
+                    break
+            else:
+                out.append("\\" + e)
+                self.i += 2
+        raise LockError("an unterminated $'...'")
+
+    def backtick(self, word: list[str]) -> None:
+        s, i, inner = self.s, self.i + 1, []
+        while i < len(s) and s[i] != "`":
+            if s[i] == "\\" and s[i + 1:i + 2] in ("`", "\\", "$"):
+                inner.append(s[i + 1])
+                i += 2
+            else:
+                inner.append(s[i])
+                i += 1
+        if i >= len(s):
+            raise LockError("an unterminated backtick")
+        sub = _Bash("".join(inner), self.expressions, self.commands)
+        sub.script(stop=None)
+        word.append(s[self.i:i + 1])
+        self.i = i + 1
+
+    def heredoc(self, strip_tabs: bool, command: list[Word]) -> None:
+        m = re.compile(r"[ \t]*(?:'([^'\n]*)'|\"([^\"\\$`\n]*)\"|(\\?)([A-Za-z0-9_.+-]+))").match(self.s, self.i)
+        if not m:
+            raise LockError("a here-document delimiter this check cannot read")
+        quoted = m.group(4) is None or bool(m.group(3))
+        delimiter = m.group(1) if m.group(1) is not None else m.group(2) if m.group(2) is not None else m.group(4)
+        self.heredocs.append((delimiter, strip_tabs, quoted, command))
+        self.i = m.end()
+
+    def read_heredocs(self) -> None:
+        for delimiter, strip_tabs, quoted, command in self.heredocs:
+            body = []
+            while True:
+                if self.i >= len(self.s):
+                    raise LockError(f"an unterminated here-document ({delimiter})")
+                end = self.s.find("\n", self.i)
+                end = len(self.s) if end < 0 else end
+                line = self.s[self.i:end]
+                self.i = min(end + 1, len(self.s))
+                if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                    break
+                body.append(line)
+            text = "\n".join(body)
+            if not quoted and re.search(r"\$\(|`", text):
+                raise LockError("a command substitution in an unquoted here-document, which this check does not read")
+            command.append(Word(re.sub(r"\x00(\d+)\x01", lambda m: self.expressions[int(m.group(1))], text),
+                                "\x00" in text or (not quoted and "$" in text)))
+        self.heredocs = []
+
+
+def shell_commands(script: str) -> list[list[Word]]:
+    """The simple commands of a bash `run:` value, each as its words."""
+    if CONTROL.search(script):
+        raise LockError("a control character in the script")
+    expressions: list[str] = []
+
+    def hold(match: re.Match) -> str:
+        expressions.append(match.group(0))
+        return f"\x00{len(expressions) - 1}\x01"
+    text = GITHUB_EXPRESSION.sub(hold, script)
+    if "${{" in text:
+        raise LockError("an unterminated ${{ expression")
+    commands: list[list[Word]] = []
+    _Bash(text, expressions, commands).script(stop=None)
+    return [command for command in commands if command]
+
+
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=", re.S)
 
 
 def _resolve(path: str, env: dict[str, set[str]]) -> str:
@@ -601,19 +1049,6 @@ def _resolve(path: str, env: dict[str, set[str]]) -> str:
     if "$" in resolved or resolved.startswith("/"):
         raise LockError(f"requirements path {path!r} does not resolve inside the repository")
     return Path(resolved).as_posix()
-
-
-def _commands(line: str) -> list[list[str]]:
-    """The simple commands of one shell line, split at every shell operator."""
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    commands: list[list[str]] = [[]]
-    for token in lexer:
-        if token in SHELL_OPERATORS:
-            commands.append([])
-        else:
-            commands[-1].append(token)
-    return [command for command in commands if command]
 
 
 def _pip_install_args(command: list[str]) -> list[str] | None:
@@ -652,68 +1087,166 @@ def _requirement_files(args: list[str], env: dict[str, set[str]]) -> list[str]:
     return files
 
 
-def _job_settings(block: str) -> tuple[str | None, set[str], dict[str, set[str]]]:
-    child = min((len(line) - len(line.lstrip(" ")) for line in block.split("\n")
-                 if line.strip() and not line.lstrip().startswith("#")), default=0)
-    runner = re.search(rf"(?m)^ {{{child}}}runs-on:\s*(.+?)\s*$", block)
-    versions = {_yaml_scalar(v) for v in re.findall(r"(?m)^\s+python-version:\s*(.+?)\s*$", block)}
-    env: dict[str, set[str]] = {}
-    for key, value in re.findall(r"(?m)^\s+([A-Z_][A-Z0-9_]*):\s*(.+?)\s*$", block):
-        env.setdefault(key, set()).add(_yaml_scalar(value))
-    return (_yaml_scalar(runner.group(1)) if runner else None), versions, env
+SIMPLE_PARAMETER = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+
+
+def shell_variables(commands: list[list[Word]], env: dict[str, set[str]]) -> dict[str, set[str] | None]:
+    """The literal values each variable is given by the job's `env:` or an assignment in the
+    script; None for a variable that is also given a value known only at run time."""
+    values: dict[str, set[str] | None] = {name: (None if any("${{" in t for t in texts) else set(texts))
+                                          for name, texts in env.items()}
+    for words in commands:
+        for word in words:
+            match = ASSIGNMENT.match(word.text)
+            if not match:
+                continue
+            name = word.text[:match.end()].rstrip("+=")
+            if word.dynamic or word.text[match.end() - 2] == "+":
+                values[name] = None
+            elif values.get(name, set()) is not None:
+                values.setdefault(name, set()).add(word.text[match.end():])
+    return values
+
+
+def _substitutions(text: str, variables: dict[str, set[str] | None]) -> list[str] | None:
+    """Each text a word holding only `$NAME` and `${NAME}` expansions can become, or None."""
+    names = [m.group(1) or m.group(2) for m in SIMPLE_PARAMETER.finditer(text)]
+    rest = SIMPLE_PARAMETER.sub("", text)
+    if "$" in rest or "`" in rest or GLOB_OR_BRACE.search(text) or any(variables.get(n) is None for n in names):
+        return None
+    options = [text]
+    for name in dict.fromkeys(names):
+        options = [o.replace(f"${{{name}}}", v).replace(f"${name}", v) for o in options for v in sorted(variables[name])]
+        if len(options) > 64:
+            return None
+    return options
+
+
+def _literal_refusal(texts: list[str]) -> str | None:
+    if INSTALLER.search(" ".join(texts)):
+        return "an installer this check does not read"
+    for index, text in enumerate(texts):
+        value = text[ASSIGNMENT.match(text).end():] if ASSIGNMENT.match(text) else text
+        if (INSTALLER_PROGRAM.fullmatch(value) or text == "-mpip"
+                or (text == "-m" and texts[index + 1:index + 2] in (["pip"], ["pip3"]))):
+            return "an installer program run in a way this check does not read"
+    return None
+
+
+def unread_command(words: list[Word], variables: dict[str, set[str] | None]) -> str | None:
+    """Why a simple command that is no readable pip install may still install packages, or
+    None. Its words are read after quote removal; `$NAME` expansions are tried with every
+    literal value the script or the job gives them; other run-time values are not read."""
+    texts = [w.text for w in words]
+    why = _literal_refusal(texts)
+    named = [t for t in texts if not ASSIGNMENT.match(t) and t not in RESERVED_WORDS]
+    if not why and named and named[0] in ("source", "."):
+        why = f"{named[0]} runs a file's text as the script, which this check does not read"
+    if why or not any(w.dynamic for w in words):
+        return why
+    options: list[list[str]] = [[]]
+    unresolved = []
+    for index, word in enumerate(words):
+        values = _substitutions(word.text, variables) if word.dynamic else [word.text]
+        if values is None:
+            base = word.text.rsplit("/", 1)[-1]
+            if not ("/" in word.text and base and not re.search(r"[$`]", base) and not GLOB_OR_BRACE.search(base)):
+                unresolved.append(index)  # a program under an unknown folder is still known by its name
+            values = [word.text]
+        options = [o + (v.split() if word.dynamic else [v]) for o in options for v in values]
+        if len(options) > 64:
+            return "a command whose expansions this check cannot all try"
+    verb = next((i for i, t in enumerate(texts) if t in INSTALLER_VERBS), None)
+    if verb is not None and any(i < verb for i in unresolved):
+        return "an installer verb after an expansion this check cannot resolve"
+    if unresolved and named and (named[0] == "eval" or (Path(named[0]).name in ("bash", "sh") and "-c" in texts)):
+        return f"{named[0]} of text built at run time, which this check does not read"
+    for option in options:
+        if _pip_install_args(option) is not None:
+            return "a pip install through a variable, which this check does not read"
+        why = _literal_refusal(option)
+        if why:
+            return f"{why} (through a variable)"
+    return None
+
+
+def _job_of(path: tuple) -> str | None:
+    return path[1] if len(path) > 2 and path[0] == "jobs" and isinstance(path[1], str) else None
 
 
 def workflow_installs(source: str, text: str) -> tuple[list[Install], list[str]]:
-    """Every pip install in a workflow and the job it runs in. Values are decoded as YAML reads
-    them before any matching, so a folded or multi-line `run:` is read as the shell sees it. A
-    `run:` line that may install packages but cannot be read as pip installs of requirements
-    files, one outside a job this reader found, and installer text in any other value or in a
-    line that is no `key: value` at all, are each a problem."""
+    """Every pip install in a workflow and the job it runs in, read as YAML and bash read the
+    file (see the comment above `read_yaml`). Every form the check does not read, every step
+    that uses an action it has not read, every command that may install packages but is no
+    pip install of requirements files, and installer text in any value other than `run:`, is a
+    problem, never "nothing installed"."""
     installs: list[Install] = []
-    lines = text.replace("\r\n", "\n").split("\n")
-    jobs, layout = _jobs(lines)
-    problems = [f"{source}: {problem}" for problem in layout]
-    owner = {index: job for job, indexes in jobs.items() for index in indexes}
-    settings = {job: _job_settings("\n".join(lines[i] for i in indexes)) for job, indexes in jobs.items()}
-    scalars, used = _scalars(lines)
-    for index, line in enumerate(lines):
-        if index not in used and not line.lstrip().startswith("#") and INSTALLER.search(line):
-            problems.append(f"{source}:{index + 1}: a line that may install packages, outside any `key: value` "
-                            "this check reads")
-    for index, key, value in scalars:
-        if key != "run":
-            if INSTALLER.search(value):
-                problems.append(f"{source}:{index + 1}: installer text in a `{key}:` value this check does not read")
+    scalars, unread = read_yaml(text)
+    problems = [f"{source}:{line + 1}: {why}" for line, why in unread]
+    by_path = {scalar.path: scalar.text for scalar in scalars}
+    settings: dict[str, tuple[str | None, set[str], dict[str, set[str]]]] = {}
+    for scalar in scalars:
+        job = _job_of(scalar.path)
+        if job is None:
             continue
-        job = owner.get(index)
-        for line in _shell_lines(value):
-            if not INSTALLER.search(line):
-                continue
-            if job is None:
-                problems.append(f"{source}:{index + 1}: a run step that may install packages sits outside any job "
-                                "this check can read")
-                continue
-            where = f"{source} job {job}"
-            runner_label, versions, env = settings[job]
+        _, versions, env = settings.setdefault(job, (by_path.get(("jobs", job, "runs-on")), set(), {}))
+        key = scalar.path[-1]
+        if key == "python-version":
+            versions.add(scalar.text)
+        elif isinstance(key, str) and ENV_KEY.fullmatch(key):
+            env.setdefault(key, set()).add(scalar.text)
+    for scalar in scalars:
+        path, key, job = scalar.path, scalar.path[-1] if scalar.path else None, _job_of(scalar.path)
+        line = f"{source}:{scalar.line + 1}"
+        if key == "uses":
+            name = scalar.text.split("@", 1)[0]
+            reusable = len(path) == 3 and re.fullmatch(r"\./\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", scalar.text)
+            if not reusable and not (len(path) == 5 and path[2] == "steps" and name in ACTIONS):
+                problems.append(f"{line}: uses {scalar.text!r}, which this check has not read (add an action to "
+                                "ACTIONS only after reading what it installs)")
+            continue
+        if key != "run":
+            if INSTALLER.search(scalar.text):
+                what = f"a `{key}:` value" if isinstance(key, str) else "a list entry"
+                problems.append(f"{line}: installer text in {what} this check does not read")
+            continue
+        try:
+            commands = shell_commands(scalar.text)
+        except LockError as exc:
+            problems.append(f"{line}: a run step this check cannot read as bash: {exc}")
+            continue
+        if job is None:
+            variables = shell_variables(commands, {})
+            if any(_pip_install_args([w.text for w in words]) is not None or unread_command(words, variables)
+                   for words in commands):
+                problems.append(f"{line}: a run step that may install packages sits outside any job this check "
+                                "can read")
+            continue
+        runner_label, versions, env = settings[job]
+        variables = shell_variables(commands, env)
+        shell = next((by_path[p] for p in (path[:-1] + ("shell",), ("jobs", job, "defaults", "run", "shell"),
+                                           ("defaults", "run", "shell")) if p in by_path),
+                     "pwsh" if RUNNERS.get(runner_label or "", ("",))[0] == "windows" else "bash")
+        where = f"{source} job {job}"
+        for words in commands:
+            texts = [w.text for w in words]
             try:
-                found = False
-                for simple in _commands(line.strip()):
-                    args = _pip_install_args(simple)
-                    if args is None:
-                        if INSTALLER.search(" ".join(simple)):
-                            raise LockError(f"an installer this check does not read: {' '.join(simple)!r}")
-                        continue
-                    found = True
-                    files = _requirement_files(args, env)
-                    if runner_label not in RUNNERS:
-                        raise LockError(f"runner {runner_label!r} is not in RUNNERS")
-                    if len(versions) != 1:
-                        raise LockError(f"the job sets python-version {sorted(versions)} (exactly one is needed)")
-                    target = Target(runner_label, next(iter(versions)))
-                    target.python_match()
-                    installs.extend(Install(source, job, path, target) for path in files)
-                if not found:
-                    raise LockError(f"an installer this check does not read: {line.strip()!r}")
+                args = _pip_install_args(texts)
+                if args is None:
+                    why = unread_command(words, variables)
+                    if why:
+                        raise LockError(f"{why}: {' '.join(texts)!r}")
+                    continue
+                if shell.split()[:1] != ["bash"]:
+                    raise LockError(f"a pip install in a step whose shell is {shell!r}; this check reads bash")
+                files = _requirement_files(args, env)
+                if runner_label not in RUNNERS:
+                    raise LockError(f"runner {runner_label!r} is not in RUNNERS")
+                if len(versions) != 1:
+                    raise LockError(f"the job sets python-version {sorted(versions)} (exactly one is needed)")
+                target = Target(runner_label, next(iter(versions)))
+                target.python_match()
+                installs.extend(Install(source, job, file, target) for file in files)
             except (LockError, ValueError) as exc:
                 problems.append(f"{where}: {exc}")
     return installs, problems

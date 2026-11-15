@@ -5,7 +5,7 @@ proposes as patches. Run everything from the repository root. Stdlib only.
 
 | File | What it is |
 |---|---|
-| `hash_lock.py` | The check. `python -X utf8 -B tools/release/hash_lock.py` exits 1 unless every requirements file a workflow installs (as the workflows stand, and as the patches in `proposals/` would leave them) is exactly pinned, carries the hashes recorded for it, pins every dependency, and has a wheel for every job that installs it. Offline. |
+| `hash_lock.py` | The check. `python -X utf8 -B tools/release/hash_lock.py` exits 1 unless every requirements file a workflow installs (as the workflows stand, and as the patches in `proposals/` would leave them) is exactly pinned, carries the hashes recorded for it, pins every dependency, and has a wheel for every job that installs it. It reads the workflows exactly as YAML and bash read them, in the forms this repository's workflows use, and fails on every other form, on a step that uses an action not listed in `ACTIONS`, and on any command that may install packages but is no pip install of locked files in a bash step. Offline. |
 | `ci-lock.json` | The record the check reads: for each pin, every file PyPI publishes for that version with its sha256, the release's Requires-Python and its dependencies. |
 | `relock.py` | Rewrites `requirements-ci.txt`, `requirements-ci-314t.txt` and `ci-lock.json` from PyPI's JSON API, then runs the check. It never changes a version: edit the version first. Needs the network. |
 | `requirements-ci-314t.txt` | cryptography and its dependencies, hash-locked, for the proposed free-threaded 3.14 job. |

@@ -22,6 +22,22 @@
     {"argv": ["agent", "--disable-auto-update", "--auth-token", "made-up-token", "acp"], "detail": "credential_in_argv:--auth-token"},
     {"argv": ["agent", "--disable-auto-update", "-H", "Authorization: Bearer made-up", "acp"], "detail": "credential_in_argv:-H"},
     {"argv": ["agent", "--disable-auto-update", "-HAuthorization: Bearer made-up", "acp"], "detail": "credential_in_argv:-H"},
-    {"argv": ["agent", "--disable-auto-update", "--header=Authorization: Bearer made-up", "acp"], "detail": "credential_in_argv:--header"}
+    {"argv": ["agent", "--disable-auto-update", "--header=Authorization: Bearer made-up", "acp"], "detail": "credential_in_argv:--header"},
+    {"argv": ["agent", "-p", "--output-format", "stream-json", "--model", "synthetic-model", "--", "--disable-auto-update"], "detail": "updater_not_disabled"},
+    {"argv": ["agent", "-p", "--", "--disable-auto-update"], "detail": "updater_not_disabled"},
+    {"argv": ["agent", "--disable-auto-update", "a\u0000b", "acp"], "detail": "argv_invalid"},
+    {"argv": ["agent", "--disable-auto-update", "", "acp"], "detail": "argv_invalid"},
+    {"argv": ["agent", "acp", "--disable-auto-update"], "detail": "updater_not_disabled"},
+    {"argv": ["agent", "--disable-auto-update", "-vH", "Authorization: Bearer made-up", "acp"], "detail": "credential_in_argv:-H"},
+    {"argv": ["agent", "--disable-auto-update", "--force", "acp"], "detail": "full_access_not_acknowledged:--force"},
+    {"argv": ["agent", "--disable-auto-update", "--yolo", "acp"], "detail": "full_access_not_acknowledged:--yolo"},
+    {"argv": ["agent", "--disable-auto-update", "--approve-mcps", "acp"], "detail": "full_access_not_acknowledged:--approve-mcps"},
+    {"argv": ["agent", "--disable-auto-update", "-pf", "--", "say hi"], "detail": "full_access_not_acknowledged:-f"},
+    {"argv": ["agent", "--disable-auto-update", "--sandbox", "disabled", "acp"], "detail": "full_access_not_acknowledged:--sandbox"}
+  ],
+  "accepted": [
+    ["agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model", "--", "--api-key=only-the-prompt"],
+    ["agent", "-p", "--output-format", "stream-json", "--disable-auto-update", "--model", "synthetic-model", "--", "-HAuthorization: only the prompt"],
+    ["agent", "--disable-auto-update", "-p", "--", "--disable-auto-update"]
   ]
 }

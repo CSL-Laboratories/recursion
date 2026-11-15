@@ -32,17 +32,18 @@
     "result_code": null,
     "counts": {
       "not_json": 3,
+      "unknown_type": 2,
       "no_session": 1,
       "other_session": 1,
-      "unknown_type": 2,
+      "after_result": 1,
+      "result_repeated": 1,
       "unknown_subtype": 1,
       "init_repeated": 1,
       "user_unmatched": 2,
       "call_invalid": 1,
       "tool_shape_unknown": 1,
       "call_undigestible": 1,
-      "result_unpaired": 1,
-      "result_repeated": 1
+      "result_unpaired": 1
     }
   }
 }

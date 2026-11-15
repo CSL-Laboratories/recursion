@@ -17,5 +17,6 @@ this line is not JSON
 {"type":"system","subtype":"init","apiKeySource":"env","cwd":"/elsewhere","session_id":"c0ffee00-0000-4000-8000-000000000006","model":"other-model","permissionMode":"default"}
 {"type":"thinking","subtype":"delta","text":"not documented in print mode","session_id":"c0ffee00-0000-4000-8000-000000000006"}
 {"type":"result","subtype":"success","duration_ms":9,"duration_api_ms":9,"is_error":false,"result":"README.md","session_id":"c0ffee00-0000-4000-8000-000000000006"}
+{"type":"tool_call","subtype":"started","call_id":"call-late-1","tool_call":{"readToolCall":{"args":{"path":"late.txt"}}},"session_id":"c0ffee00-0000-4000-8000-000000000006"}
 {"type":"result","subtype":"success","duration_ms":9,"duration_api_ms":9,"is_error":false,"result":"a second answer","session_id":"c0ffee00-0000-4000-8000-000000000006"}
 {"type":"result","subtype":"success","is_error":false,"result":"no session id"}

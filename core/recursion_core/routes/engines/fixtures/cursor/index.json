@@ -5,8 +5,11 @@
     "https://cursor.com/docs/cli/reference/output-format (retrieved 2026-11-15 about 01:05 UTC)",
     "https://cursor.com/docs/cli/reference/parameters (retrieved 2026-11-15 about 01:05 UTC)",
     "https://cursor.com/docs/cli/acp (retrieved 2026-11-15 about 01:05 UTC)",
-    "vault 20261107-csl712-engine-clis-grounding-01, V36 to V41"
+    "vault 20261107-csl712-engine-clis-grounding-01, V36 to V41",
+    "ACP v1 schema: https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/13b765828f961812f0c78ae577220e994209fa2f/schema/v1/schema.json (SHA-256 e747a7bec3c02708b70885bf3cccac5c72fa421390dd7e85758fd61e33b1ae21, the revision the first outside read of #388 pinned); the ACP transcripts follow it, and test_cursor_fixtures checks each method's shape by hand"
   ],
+  "acp_schema": {"repository": "agentclientprotocol/agent-client-protocol", "commit": "13b765828f961812f0c78ae577220e994209fa2f",
+                 "path": "schema/v1/schema.json", "sha256": "e747a7bec3c02708b70885bf3cccac5c72fa421390dd7e85758fd61e33b1ae21"},
   "fixtures": [
     {"file": "oneshot/hello.jsonl", "drive": "oneshot", "provenance": "synthetic", "expected": "oneshot/hello.expected.json",
      "guessed": [], "shows": "init, the input's replay, two assistant lines, a successful result"},
@@ -21,7 +24,7 @@
     {"file": "oneshot/partial.jsonl", "drive": "oneshot", "provenance": "synthetic", "expected": "oneshot/partial.expected.json",
      "guessed": [], "shows": "the three assistant events of --stream-partial-output, which give no draft"},
     {"file": "oneshot/hostile.jsonl", "drive": "oneshot", "provenance": "synthetic", "expected": "oneshot/hostile.expected.json",
-     "guessed": [], "shows": "lines that must give no draft: not JSON, a forged event, another conversation, duplicate keys, NaN, an unpaired result, a bad call id, two tools in one call, an input with no RFC 8785 text, a user line that is not the replay, a second replay, a second init, an undocumented type, a second result, no session id"},
+     "guessed": [], "shows": "lines that must give no draft: not JSON, a forged event, another conversation, duplicate keys, NaN, an unpaired result, a bad call id, two tools in one call, an input with no RFC 8785 text, a user line that is not the replay, a second replay, a second init, an undocumented type, a second result and a line after the result, no session id"},
     {"file": "acp/prompt_turns.jsonl", "drive": "acp", "provenance": "synthetic", "expected": null,
      "guessed": ["the initialize answer's capabilities", "the tool_call and tool_call_update fields", "the authenticate answer"],
      "shows": "initialize, authenticate (cursor_login), session/new, two prompts in one session, a permission request answered reject-once"},
@@ -29,7 +32,7 @@
      "guessed": ["the initialize answer's capabilities"],
      "shows": "session/cancel during a prompt; the prompt ends with stopReason cancelled"},
     {"file": "acp/load.jsonl", "drive": "acp", "provenance": "synthetic", "expected": null,
-     "guessed": ["the initialize answer's capabilities", "the load answer (null)", "the replayed history's updates"],
+     "guessed": ["the initialize answer's capabilities", "what Cursor puts in the load answer (written as the minimal object {})", "the replayed history's updates"],
      "shows": "session/load replays the history as session/update before its answer; then a prompt"},
     {"file": "argv.json", "drive": "both", "provenance": "lane rule", "expected": null,
      "guessed": [], "shows": "the argv of each drive, and argv this lane refuses"}

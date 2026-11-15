@@ -99,7 +99,7 @@ class LineTest(unittest.TestCase):
         self.assertIsNone(self.p.engine_session_id)
 
     def test_the_first_session_id_is_kept_and_another_gives_nothing(self):
-        self.assertEqual(self.p.parse(line(type="assistant", message={})), [])
+        self.assertEqual(self.p.parse(line(type="system", subtype="init", model="m", apiKeySource="login")), [])
         self.assertEqual(self.p.engine_session_id, SID)
         other = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "x",
                             "session_id": "someone-else"})
@@ -115,6 +115,21 @@ class LineTest(unittest.TestCase):
         for text in (line(type="system", subtype="status"), line(type="tool_call", subtype="running", call_id="c")):
             self.assertEqual(self.p.parse(text), [])
         self.assertEqual(self.p.counts["unknown_subtype"], 2)
+
+    def test_a_line_of_an_unknown_type_never_sets_the_conversation(self):
+        self.assertEqual(self.p.parse(json.dumps({"type": "banner", "session_id": "not-the-engines"})), [])
+        self.assertIsNone(self.p.engine_session_id)
+        self.assertEqual(len(self.p.parse(line(type="result", subtype="success", is_error=False, result="x"))), 1)
+        self.assertEqual(self.p.engine_session_id, SID)
+
+    def test_assistant_text_never_sets_the_conversation(self):
+        """Break-it read of #388, F4: a first assistant line from elsewhere does not bind the parser."""
+        self.assertEqual(self.p.parse(json.dumps({"type": "assistant", "message": {}, "session_id": "elsewhere"})), [])
+        self.assertIsNone(self.p.engine_session_id)
+        self.assertEqual(len(self.p.parse(line(type="result", subtype="success", is_error=False, result="x"))), 1)
+        self.assertEqual((self.p.engine_session_id, self.p.counts["other_session"]), (SID, 0))
+        self.assertEqual(self.p.parse(json.dumps({"type": "assistant", "message": {}, "session_id": "elsewhere"})), [])
+        self.assertEqual(self.p.counts["other_session"], 1)   # once bound, assistant text is held to it
 
     def test_assistant_lines_are_never_read(self):
         forged = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "forged"})
@@ -139,6 +154,12 @@ class InitTest(unittest.TestCase):
             p = cursor.StreamParser()
             p.parse(line(type="system", subtype="init", model="m", apiKeySource=source))
             self.assertEqual(p.api_key_source, source)
+
+    def test_a_model_that_is_not_text_is_none(self):
+        for model in (None, 3, "", ["m"]):
+            p = cursor.StreamParser()
+            p.parse(line(type="system", subtype="init", model=model, apiKeySource="login"))
+            self.assertIsNone(p.model, model)
 
     def test_a_second_init_changes_nothing(self):
         p = cursor.StreamParser()
@@ -165,6 +186,15 @@ class InputTest(unittest.TestCase):
             self.assertEqual(self.p.parse(user(text)), [])
         self.assertEqual(self.p.counts["user_unmatched"], 4)
         self.assertEqual(len(self.p.parse(user("Do the thing."))), 1)   # still pending, still accepted
+
+    def test_the_whole_text_must_match_however_long(self):
+        """Break-it read of #388, F5: a replay that differs only after the hundredth character is not it."""
+        text = "a" * 100 + "b" + "c" * 400
+        self.p.wrote("dlv-long", "turn-long", text)
+        for other in ("a" * 100 + "X" + "c" * 400, text + " ", text[:-1]):
+            self.assertEqual(self.p.parse(user(other)), [])
+        self.assertEqual(self.p.counts["user_unmatched"], 3)
+        self.assertEqual(len(self.p.parse(user(text))), 1)
 
     def test_the_replay_may_come_in_several_text_parts(self):
         self.p.wrote("dlv-a1", "turn-a1", "Do the thing.")
@@ -196,7 +226,15 @@ class InputTest(unittest.TestCase):
 
     def test_a_write_names_common_v1_ids_and_some_text(self):
         for args in (("a1", "turn-a1", "x"), ("dlv-a1", "a1", "x"), ("dlv-a1", "turn-a1", ""),
-                     ("dlv-a1\n", "turn-a1", "x"), ("dlv-a1", "turn-a1", None)):
+                     ("dlv-a1\n", "turn-a1", "x"), ("dlv-a1", "turn-a1", None),
+                     ("dlv-a1", "turn-a1\n", "x"), ("dlv-a1", "turn-a1!", "x"), ("dlv-a1!", "turn-a1", "x")):
+            with self.assertRaises(ValueError):
+                cursor.StreamParser().wrote(*args)
+
+    def test_a_write_takes_common_v1_ids_up_to_their_longest_and_no_longer(self):
+        """Review 1 of #388 (Astra R5, Sol R5): delivery ids are dlv- and 1 to 60, turn ids turn- and 1 to 59."""
+        cursor.StreamParser().wrote("dlv-" + "d" * 60, "turn-" + "t" * 59, "x")
+        for args in (("dlv-" + "d" * 61, "turn-a1", "x"), ("dlv-a1", "turn-" + "t" * 60, "x")):
             with self.assertRaises(ValueError):
                 cursor.StreamParser().wrote(*args)
 
@@ -209,6 +247,14 @@ class ToolCallTest(unittest.TestCase):
         self.assertEqual(self.p.parse(started()), [{"type": "tool.call", "payload": {
             "call_id": "call-1", "name": "readToolCall", "input_digest": README_DIGEST,
             "input": {"path": "README.md"}}}])
+
+    def test_the_exported_digest_function_gives_known_answers(self):
+        """Review 1 of #388 (Astra R5): the module's own ``input_digest``, against fixed values."""
+        self.assertEqual(cursor.input_digest({"path": "README.md"}), README_DIGEST)
+        self.assertEqual(cursor.input_digest({}), sha("{}"))
+        self.assertEqual(cursor.input_digest({"b": [1.0, 1e-7], "a": "\u00e9"}), sha('{"a":"\u00e9","b":[1,1e-7]}'))
+        with self.assertRaises(ValueError):
+            cursor.input_digest({"n": 9007199254740993})
 
     def test_the_digest_is_of_rfc_8785_text_so_key_order_does_not_matter(self):
         a = self.p.parse(started("c-a", {"x": {"args": {"b": 1, "a": [1.0, "\u00e9"]}}}))[0]["payload"]
@@ -271,6 +317,22 @@ class ToolCallTest(unittest.TestCase):
         small = {"fileText": "x" * (cursor.MAX_INPUT_BYTES - len('{"fileText":""}'))}
         self.assertEqual(self.p.parse(started("c-edge", {"writeToolCall": {"args": small}}))[0]["payload"]["input"], small)
 
+    def test_an_input_never_carried_is_not_counted_withheld(self):
+        """Break-it read of #388, F10: arguments that are not one object were never going to be carried."""
+        raw = "x" * (70 * 1024)
+        payload = self.p.parse(started("c-raw", {"function": {"name": "f", "arguments": raw}}))[0]["payload"]
+        self.assertIsNone(payload["input"])
+        self.assertEqual(payload["input_digest"], sha(json.dumps(raw)))
+        self.assertEqual(self.p.counts["input_withheld"], 0)
+
+    def test_the_input_bound_is_64_kib_of_rfc_8785_text(self):
+        """Review 1 of #388 (Sol R5): fixed sizes, not sizes taken from the constant under test."""
+        self.assertEqual(cursor.MAX_INPUT_BYTES, 65536)
+        at = {"t": "x" * (65536 - 8)}                          # {"t":"..."} is 8 bytes of frame
+        over = {"t": "x" * (65536 - 7)}
+        self.assertEqual(self.p.parse(started("c-at", {"writeToolCall": {"args": at}}))[0]["payload"]["input"], at)
+        self.assertIsNone(self.p.parse(started("c-over", {"writeToolCall": {"args": over}}))[0]["payload"]["input"])
+
 
 class ToolResultTest(unittest.TestCase):
     def setUp(self):
@@ -309,6 +371,26 @@ class ToolResultTest(unittest.TestCase):
         payload = self.result({"success": {"content": "z" * cursor.MAX_RESULT_BYTES}})
         self.assertFalse(payload["truncated"])
         self.assertEqual(len(payload["text"]), cursor.MAX_RESULT_BYTES)
+
+    def test_the_result_bound_is_64_kib_of_utf8(self):
+        """Review 1 of #388 (Sol R5): fixed sizes, not sizes taken from the constant under test."""
+        self.assertEqual(cursor.MAX_RESULT_BYTES, 65536)
+        self.assertFalse(self.result({"success": {"content": "z" * 65536}})["truncated"])
+        p = cursor.StreamParser()
+        p.parse(started())
+        payload = p.parse(completed(result={"success": {"content": "z" * 65537}}))[0]["payload"]
+        self.assertEqual((payload["truncated"], len(payload["text"])), (True, 65536))
+
+    def test_a_function_result_must_name_the_function_its_start_named(self):
+        p = cursor.StreamParser()
+        p.parse(started("c-f", {"function": {"name": "list_dir", "arguments": "{}"}}))
+        other = line(type="tool_call", subtype="completed", call_id="c-f", tool_call={"function": {
+            "name": "delete_dir", "arguments": "{}", "result": {"success": {"content": "gone"}}}})
+        self.assertEqual(p.parse(other), [])
+        self.assertEqual(p.counts["result_unpaired"], 1)
+        same = line(type="tool_call", subtype="completed", call_id="c-f", tool_call={"function": {
+            "name": "list_dir", "arguments": "{}", "result": {"success": {"content": "a"}}}})
+        self.assertEqual(p.parse(same)[0]["payload"]["text"], "a")
 
     def test_a_text_with_a_lone_surrogate_gives_nothing(self):
         self.assertIsNone(self.result({"success": {"content": "bad \ud800"}}))
@@ -358,15 +440,27 @@ class ResultTest(unittest.TestCase):
                              "is_error")
 
     def test_a_result_line_that_is_neither_success_nor_error_is_a_protocol_error(self):
-        for fields in ({"subtype": "success"}, {"subtype": "success", "is_error": "false"},
-                       {"subtype": "cancelled", "is_error": False}, {"is_error": False}, {"subtype": "other"}):
+        for fields in ({"subtype": "success", "result": "x"}, {"subtype": "success", "is_error": "false", "result": "x"},
+                       {"subtype": "cancelled", "is_error": False}, {"is_error": False}, {"subtype": "other"},
+                       {"subtype": "success", "is_error": 0, "result": "x"},      # 0 is not false (Sol R5)
+                       {"subtype": "error", "is_error": 1, "result": "x"}):       # 1 is not true
             p = cursor.StreamParser()
             self.assertEqual(p.parse(line(type="result", **fields)), [{"type": "result", "payload": {
-                "code": "protocol_error", "detail": "result line not understood"}}])
+                "code": "protocol_error", "detail": "result line not understood"}}], fields)
             self.assertIsNone(p.final_text)
 
-    def test_a_success_answer_that_is_not_text_is_empty(self):
-        self.p.parse(line(type="result", subtype="success", is_error=False, result=["x"]))
+    def test_a_success_without_a_text_answer_is_a_protocol_error(self):
+        """Review 1 of #388, R2 (both reads): an absent, non-text or unwritable answer is not a success."""
+        for answer in (..., None, ["x"], {"text": "x"}, 7, True, "bad \ud800"):
+            p = cursor.StreamParser()
+            fields = {} if answer is ... else {"result": answer}
+            self.assertEqual(p.parse(line(type="result", subtype="success", is_error=False, **fields)), [
+                {"type": "result", "payload": {"code": "protocol_error", "detail": "result answer is not text"}}])
+            self.assertEqual((p.final_text, p.result_code, p.result_seen), (None, "protocol_error", True))
+
+    def test_an_empty_answer_is_still_a_success(self):
+        self.assertEqual(self.p.parse(line(type="result", subtype="success", is_error=False, result=""))[0]["payload"],
+                         {"code": None, "detail": ""})
         self.assertEqual(self.p.final_text, "")
 
     def test_only_the_first_result_counts(self):
@@ -374,6 +468,21 @@ class ResultTest(unittest.TestCase):
         self.assertEqual(self.p.parse(line(type="result", subtype="error", is_error=True)), [])
         self.assertEqual((self.p.final_text, self.p.result_code), ("first", None))
         self.assertEqual(self.p.counts["result_repeated"], 1)
+
+    def test_nothing_after_the_result_drafts_anything(self):
+        """Review 1 of #388, Sol R3: the result is terminal; later lines are counted and give no draft."""
+        self.p.wrote("dlv-late", "turn-late", "Late.")
+        self.p.parse(line(type="result", subtype="success", is_error=False, result="done"))
+        late = [started("call-late"), completed("call-late"), user("Late."), line(type="assistant", message={}),
+                line(type="system", subtype="init", model="m", apiKeySource="env")]
+        for text in late:
+            self.assertEqual(self.p.parse(text), [])
+        self.assertEqual(self.p.counts["after_result"], len(late))
+        self.assertIsNone(self.p.api_key_source)
+        self.assertEqual(self.p.parse(json.dumps({"type": "tool_call", "session_id": "other"})), [])
+        self.assertEqual(self.p.counts["other_session"], 1)
+        self.assertEqual(self.p.parse(line(type="thinking")), [])
+        self.assertEqual(self.p.counts["unknown_type"], 1)
 
 
 class NeverDraftedTest(unittest.TestCase):

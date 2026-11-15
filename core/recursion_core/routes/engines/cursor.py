@@ -31,12 +31,21 @@ driver's flags ``typed_limits`` and ``usage`` are false. Free text is never read
 WHAT ``StreamParser.parse(line)`` DRAFTS (driver.v2 ``event_draft``; each payload has exactly event.v1's
 keys): ``tool.call`` from tool_call/started, ``tool.result`` from tool_call/completed, ``result`` from the
 terminal line, and ``input.accepted`` from the replay of the one input this worker was given. It drafts
-no ``engine.output``: lane EVENTS' tailer writes a line the driver drafts nothing for as one untrusted
-``engine.output`` event with its byte offsets, which only the tailer knows. A line that is not one strict
-JSON object, belongs to another conversation, has a type or shape this parser does not know, or repeats
-something already drafted, gives no draft and is counted in ``StreamParser.counts``. A forged event.v1
-line is such a line: its ``type`` is none of Cursor's. Model text (assistant content, the answer) is
-model payload and is never inspected.
+no ``engine.output``, whose byte offsets only the reader of the output file knows; that a line the driver
+drafts nothing for (assistant text among them) is still kept as one untrusted ``engine.output`` event is to
+be agreed and tested with lane EVENTS before anything is wired (the lane's questions, Q15). ``parse`` takes
+text (anything else is a ``TypeError``). A line that is not one strict JSON object, has a type this parser
+does not know, belongs to another conversation, has a shape this parser does not know, or repeats something
+already drafted, gives no draft and is counted in ``StreamParser.counts``. A forged event.v1 line is such a
+line: its ``type`` is none of Cursor's. The conversation's id is set by the first line that is neither of an
+unknown type nor assistant text, so neither can bind the parser to another conversation. Model text
+(assistant content, the answer) is model
+payload and is never inspected; the answer is only checked to be text.
+
+THE RESULT IS TERMINAL. Cursor documents the result line as the stream's last: after the first one, a
+second result is counted ``result_repeated`` and any other line ``after_result``, and neither drafts
+anything. A success must carry its answer as text that UTF-8 can write; any other success line is a
+``protocol_error``, never an empty success.
 
 The parser serves ONE worker and one reader of its output, in order, and holds no lock.
 """
@@ -65,6 +74,16 @@ NO_UPDATE = "--disable-auto-update"
 # header). A key reaches Cursor only as CURSOR_API_KEY in the child environment, never in argv.
 CREDENTIAL_OPTIONS = ("--api-key", "--auth-token", "--header")
 CREDENTIAL_SHORT_OPTIONS = ("-H",)
+# Options that widen what a run may do without asking (https://cursor.com/docs/cli/reference/parameters:
+# ``-f``/``--force`` "Force allow commands unless explicitly denied", ``--yolo`` its alias, ``--approve-mcps``
+# "Automatically approve all MCP servers", ``--sandbox disabled``). This lane's builders never add one; an argv
+# carrying one is refused unless full access was acknowledged for the run, the rule the existing launch
+# guards keep (``full_access_acknowledged`` in subscription_routes). The last two are not on Cursor's page;
+# the break-it read of #388 named them, and they are refused in case a build takes them.
+FULL_ACCESS_OPTIONS = ("--force", "--yolo", "--approve-mcps", "--dangerously-skip-permissions", "--auto-approve")
+FULL_ACCESS_SHORT_OPTIONS = ("-f",)
+# Linux takes at most 131072 bytes, its terminating NUL included, for one argument (MAX_ARG_STRLEN).
+MAX_ARG_BYTES = 128 * 1024 - 1
 LAUNCH_REFUSED = "launch_refused"   # routes.contract's code; the detail says which rule
 
 # The bounds of what a draft carries (this lane's choice, not a published limit). An input over the first
@@ -77,13 +96,16 @@ _TURN = re.compile(r"turn-[A-Za-z0-9_-]{1,59}")
 _DELIVERY = re.compile(r"dlv-[A-Za-z0-9_-]{1,60}")
 _CODE_WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _API_KEY_SOURCES = ("env", "flag", "login")
+_TYPES = ("system", "user", "assistant", "tool_call", "result")   # the documented line types
 
 # What the parser counts instead of drafting. Every name is always present.
 COUNTS = (
     "not_json",            # not one strict JSON object (also: duplicate keys, NaN, too deep)
+    "unknown_type",        # a type this parser does not read; it never sets the conversation's id
     "no_session",          # no session_id, or one that is not a string of 1 to 256 characters
-    "other_session",       # a session_id other than the first this worker reported
-    "unknown_type",        # a type this parser does not read (assistant lines are not counted)
+    "other_session",       # a session_id other than the first a known line reported
+    "after_result",        # any line but a result after the terminal result
+    "result_repeated",     # a second terminal result line
     "unknown_subtype",     # a system or tool_call line with a subtype this parser does not read
     "init_repeated",       # a second system/init
     "user_unmatched",      # a user line that is not the replay of the input this worker was given
@@ -92,9 +114,8 @@ COUNTS = (
     "call_repeated",       # a second started, or a second completed, for one call_id
     "call_undigestible",   # a tool input that has no RFC 8785 text, so no input_digest
     "input_withheld",      # a tool input over MAX_INPUT_BYTES: drafted with input null
-    "result_unpaired",     # a completed whose started was not drafted
+    "result_unpaired",     # a completed whose started was not drafted, or names another tool
     "text_invalid",        # a tool result whose text cannot be written as UTF-8 (a lone surrogate)
-    "result_repeated",     # a second terminal result line
 )
 
 
@@ -126,10 +147,15 @@ def oneshot_declaration() -> dict:
 # ------------------------------------------------------------------------------------------- argv
 
 def _executable(binary: object) -> str:
-    """argv[0]: the ``binary`` option composition gave (an absolute path), else DEFAULT_EXECUTABLE."""
+    """argv[0]: the ``binary`` option composition gave, else DEFAULT_EXECUTABLE.
+
+    The option must be a plain absolute path to a file: it starts with ``/``, and no part of it is empty,
+    ``.`` or ``..`` (so ``/``, ``/..``, ``//x`` and ``/opt/agent/`` are refused); no NUL, CR or LF.
+    """
     if binary is None:
         return DEFAULT_EXECUTABLE
-    if not isinstance(binary, str) or not binary.startswith("/") or "\x00" in binary or "\n" in binary:
+    if (not isinstance(binary, str) or not binary.startswith("/") or any(ch in binary for ch in "\x00\r\n")
+            or any(part in ("", ".", "..") for part in binary.split("/")[1:])):
         raise ArgvRefused("binary_not_absolute")
     return binary
 
@@ -150,25 +176,53 @@ def acp_argv(*, binary: object = None) -> list[str]:
     return [_executable(binary), NO_UPDATE, "acp"]
 
 
-def check_argv(argv: object, *, binary: object = None) -> None:
+def check_argv(argv: object, *, binary: object = None, full_access_acknowledged: bool = False) -> None:
     """Refuse an argv that breaks one of this lane's rules. ``ArgvRefused`` names the first broken.
 
-    argv[0] is the vouched executable (``executable_mismatch``); the updater flag is present
-    (``updater_not_disabled``); no option carries a credential (``credential_in_argv:<option>``), in either
-    spelling (``--api-key K`` or ``--api-key=K``; ``-H V`` or ``-HV``).
+    The options are the arguments before the first ``--``; what follows it is positional text (the prompt)
+    and is never read as an option. In this order:
+
+    * ``argv_invalid``: not a non-empty list of text; an empty argument; an argument holding a NUL or longer
+      than MAX_ARG_BYTES (neither can be passed); an option holding a CR or LF.
+    * ``executable_mismatch``: argv[0] is not the vouched executable.
+    * ``credential_in_argv:<option>``: an option carries a credential, in any spelling: ``--api-key K``,
+      ``--api-key=K``, ``-H V``, ``-HV``, or ``H`` among bundled short options (``-vH V``).
+    * ``full_access_not_acknowledged:<option>``: a full-access option (FULL_ACCESS_OPTIONS, ``-f`` alone or
+      bundled, ``--sandbox disabled``) without ``full_access_acknowledged``.
+    * ``updater_not_disabled``: the updater flag is not among the options, or stands after the ``acp``
+      command instead of before it as a global option.
     """
-    if not isinstance(argv, (list, tuple)) or not argv or not all(isinstance(a, str) for a in argv):
+    if (not isinstance(argv, (list, tuple)) or not argv
+            or not all(isinstance(a, str) and a and "\x00" not in a and len(a.encode("utf-8", "surrogatepass"))
+                       <= MAX_ARG_BYTES for a in argv)):
         raise ArgvRefused("argv_invalid")
     if argv[0] != _executable(binary):
         raise ArgvRefused("executable_mismatch")
-    for arg in argv[1:]:
+    rest = list(argv[1:])
+    options = rest[:rest.index("--")] if "--" in rest else rest
+    if any("\r" in arg or "\n" in arg for arg in options):
+        raise ArgvRefused("argv_invalid")
+    bundles = [arg[1:] for arg in options if arg.startswith("-") and not arg.startswith("--")]
+    for arg in options:
         for option in CREDENTIAL_OPTIONS:
             if arg == option or arg.startswith(option + "="):
                 raise ArgvRefused(f"credential_in_argv:{option}")
+    for letters in bundles:
         for option in CREDENTIAL_SHORT_OPTIONS:
-            if arg.startswith(option):
+            if option[1] in letters:
                 raise ArgvRefused(f"credential_in_argv:{option}")
-    if NO_UPDATE not in argv[1:]:
+    if not full_access_acknowledged:
+        for i, arg in enumerate(options):
+            for option in FULL_ACCESS_OPTIONS:
+                if arg == option or arg.startswith(option + "="):
+                    raise ArgvRefused(f"full_access_not_acknowledged:{option}")
+            if arg == "--sandbox=disabled" or (arg == "--sandbox" and options[i + 1:i + 2] == ["disabled"]):
+                raise ArgvRefused("full_access_not_acknowledged:--sandbox")
+        for letters in bundles:
+            for option in FULL_ACCESS_SHORT_OPTIONS:
+                if option[1] in letters:
+                    raise ArgvRefused(f"full_access_not_acknowledged:{option}")
+    if NO_UPDATE not in options or ("acp" in options and options.index(NO_UPDATE) > options.index("acp")):
         raise ArgvRefused("updater_not_disabled")
 
 
@@ -199,8 +253,9 @@ def unattended_switch() -> dict:
 def unattended_refusal() -> dict:
     """What an unattended turn will carry while the switch is off: a start error (run.record.v1's shape).
 
-    It is refused before any spawn; who calls this, and on which turns, waits on Lucas's answer to what
-    "attended" means and on the turn's origin field (lane SESSIONS), neither of which exists yet.
+    Nothing calls this yet. The driver is to refuse such a turn with it before any spawn; who calls it, and
+    on which turns, waits on Lucas's answer to what "attended" means and on the turn's origin field (lane
+    SESSIONS), neither of which exists yet.
     """
     return {"code": UNATTENDED_OFF,
             "detail": "unattended Cursor turns are off until counsel clears Cursor's acceptable-use terms"}
@@ -260,9 +315,12 @@ def input_digest(value: object) -> str:
 class StreamParser:
     """Cursor's one-shot stream-json, one stdout line at a time, to driver.v2 event drafts.
 
-    State the driver reads after the stream: ``engine_session_id``, ``model`` and ``api_key_source`` (from
-    system/init), ``final_text`` and ``result_code`` (from the terminal result; None until then), and
-    ``counts``.
+    State the driver reads after the stream: ``engine_session_id`` (from the first line of a known type
+    other than assistant text),
+    ``model`` and ``api_key_source`` (from the first system/init; None when absent or not one of the three
+    documented sources), ``result_seen``, ``result_code`` (None on success and before a result),
+    ``final_text`` (the answer of a successful result, else None), and ``counts`` (``COUNTS``, every name
+    always present).
     """
 
     def __init__(self) -> None:
@@ -276,7 +334,7 @@ class StreamParser:
         self._init_seen = False
         self._input: tuple[str, str, str] | None = None   # (delivery_id, turn_id, text), until replayed
         self._wrote = False
-        self._calls: dict[str, tuple[str, bool]] = {}     # call_id -> (tool key, completed)
+        self._calls: dict[str, tuple[str, str, bool]] = {}   # call_id -> (tool key, tool name, completed)
 
     # -- the one input ---------------------------------------------------------------------------------
     def wrote(self, delivery_id: object, turn_id: object, text: object) -> None:
@@ -303,20 +361,23 @@ class StreamParser:
         message = _strict_object(line)
         if message is None:
             return self._count("not_json")
+        kind = message.get("type")
+        if kind not in _TYPES:
+            return self._count("unknown_type")   # before the session: an unknown line never sets it
         session = message.get("session_id")
         if not isinstance(session, str) or not 1 <= len(session) <= 256 or _has_surrogate(session):
             return self._count("no_session")
         if self.engine_session_id is None:
-            self.engine_session_id = session
+            if kind != "assistant":   # model text never sets the conversation (break-it read, F4)
+                self.engine_session_id = session
         elif session != self.engine_session_id:
             return self._count("other_session")
-        kind = message.get("type")
+        if self.result_seen:
+            return self._count("result_repeated" if kind == "result" else "after_result")
         if kind == "assistant":
-            return []   # model payload; the tailer keeps the line as engine output
+            return []   # model payload, never inspected
         reader = {"system": self._system, "user": self._user, "tool_call": self._tool_call,
-                  "result": self._result}.get(kind) if isinstance(kind, str) else None
-        if reader is None:
-            return self._count("unknown_type")
+                  "result": self._result}[kind]
         return reader(message)
 
     def _count(self, name: str) -> list:
@@ -396,16 +457,18 @@ class StreamParser:
         if carried is not None and len(text.encode("utf-8")) > MAX_INPUT_BYTES:
             self.counts["input_withheld"] += 1
             carried = None
-        self._calls[call_id] = (key, False)
+        self._calls[call_id] = (key, name, False)
         return [{"type": "tool.call", "payload": {
             "call_id": call_id, "name": name, "input_digest": digest,
             "input": dict(carried) if carried is not None else None}}]
 
     def _completed(self, call_id: str, key: str, inner: Mapping) -> list:
         known = self._calls.get(call_id)
-        if known is None or known[0] != key:
+        # The completion names the same tool as its start: the same typed key, and for a function call the
+        # same function name.
+        if known is None or known[0] != key or (key == "function" and inner.get("name") != known[1]):
             return self._count("result_unpaired")
-        if known[1]:
+        if known[2]:
             return self._count("call_repeated")
         result = inner.get("result")
         if not isinstance(result, Mapping) or len(result) != 1:
@@ -424,19 +487,21 @@ class StreamParser:
         if _has_surrogate(text):
             return self._count("text_invalid")
         text, cut = _cut(text, MAX_RESULT_BYTES)
-        self._calls[call_id] = (key, True)
+        self._calls[call_id] = (key, known[1], True)
         return [{"type": "tool.result", "payload": {
             "call_id": call_id, "status": "ok" if outcome == "success" else "error", "text": text,
             "output_ref": None, "truncated": cut or body.get("exceededLimit") is True}}]
 
     def _result(self, message: dict) -> list:
-        if self.result_seen:
-            return self._count("result_repeated")
         subtype, is_error = message.get("subtype"), message.get("is_error")
+        answer = message.get("result")
         if is_error is False and subtype == "success":
-            code, detail = None, ""
-            answer = message.get("result")
-            self.final_text = answer if isinstance(answer, str) else ""
+            if isinstance(answer, str) and not _has_surrogate(answer):
+                code, detail = None, ""
+                self.final_text = answer   # an empty answer is still an answer
+            else:
+                # Absent, not text, or not writable as UTF-8: the answer is lost, so this is no success.
+                code, detail = "protocol_error", "result answer is not text"
         elif is_error is True:
             # Cursor documents no error envelope; its subtype word is kept when it is a plain code word,
             # and no text of the line is read (it may be the engine's words).

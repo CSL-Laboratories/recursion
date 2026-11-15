@@ -7,11 +7,16 @@ test can hold argv to this lane's rules (``cursor.check_argv``) without running 
 
 * ``OneShotProcess`` replays a one-shot stream fixture (``oneshot/*.jsonl``) line by line, then end of file.
 * ``AcpProcess`` plays one side of an ACP transcript (``acp/*.jsonl``, lines ``{"dir", "msg"}``): each message
-  the client sends must be the transcript's next client message (the same method, or for an answer to the
-  agent's own request the same id); the agent messages after it are then readable. The ids of the client's
-  requests are the client's own: an agent answer carries the id the client actually used.
-  ``read_line`` raises ``ReadTimeout`` while the agent is waiting for the client, and gives end of file
-  when the transcript is done.
+  the client sends must be the transcript's next client message EXACTLY, but for a request's own id: the
+  same method, the same params (session, prompt, working directory), request or notification as scripted;
+  an answer to the agent's own request must be the scripted answer whole (its id and the option chosen).
+  The agent messages after it are then readable. The ids of the client's requests are the client's own: an
+  agent answer carries the id the client actually used. ``read_line`` raises ``ReadTimeout`` while the agent
+  is waiting for the client, and gives end of file when the transcript is done. A message the transcript
+  does not have raises ``FakeScriptError`` and is not taken.
+
+What the fakes do NOT do: run anything, time anything, or answer anything a transcript does not hold; a
+client that asks in another order, or for other things, fails rather than being answered.
 
 A fixture's first line, ``{"type": "_fixture", ...}``, names who wrote it and that it is synthetic; the
 fakes never replay it, so what a parser sees is what an engine would print.
@@ -105,18 +110,22 @@ class AcpProcess(_Process):
         got = json.loads(line)
         if not self._script:
             raise FakeScriptError(f"the transcript is done; the client sent {line!r}")
-        want = self._script.popleft()["msg"]
+        want = self._script[0]["msg"]
         if "method" in want:
             if got.get("method") != want["method"]:
                 raise FakeScriptError(f"expected {want['method']}, got {got.get('method')!r}")
+            if ("id" in want) != ("id" in got):
+                raise FakeScriptError(f"{want['method']} must be a {'request' if 'id' in want else 'notification'}")
+            # Everything but the request's own id is the script's: method, params (the session, the prompt,
+            # the working directory) and the envelope.
+            if {k: v for k, v in got.items() if k != "id"} != {k: v for k, v in want.items() if k != "id"}:
+                raise FakeScriptError(f"{want['method']} differs from the transcript: {line!r}")
             if "id" in want:
-                if "id" not in got:
-                    raise FakeScriptError(f"{want['method']} must be a request")
                 self._ids[want["id"]] = got["id"]
-            elif "id" in got:
-                raise FakeScriptError(f"{want['method']} must be a notification")
-        elif got.get("id") != want.get("id") or "method" in got:
-            raise FakeScriptError(f"expected the answer to request {want.get('id')!r}")
+        elif got != want:
+            # An answer to the agent's own request: its id, and its whole result or error (the option chosen).
+            raise FakeScriptError(f"expected the answer {json.dumps(want)}, got {line!r}")
+        self._script.popleft()
         self._release()
 
     def read_line(self, timeout_s: float) -> str | None:

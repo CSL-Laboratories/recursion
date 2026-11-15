@@ -43,21 +43,105 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(cursor.oneshot_argv("m", binary="/opt/c/agent")[0], "/opt/c/agent")
 
     def test_a_binary_must_be_an_absolute_path(self):
-        for binary in ("agent", "./agent", "", 3, "/opt/a\x00b", "/opt/a\nb"):
+        for binary in ("agent", "./agent", "", 3, "/opt/a\x00b", "/opt/a\nb", "/opt/a\rb"):
             with self.assertRaises(cursor.ArgvRefused) as caught:
                 cursor.acp_argv(binary=binary)
             self.assertEqual(caught.exception.detail, "binary_not_absolute")
 
+    def test_a_binary_must_be_a_plain_path_to_a_file(self):
+        """Break-it read of #388, F9: a directory or an unnormalised path is not the vouched executable."""
+        for binary in ("/", "/..", "/.", "//x", "/opt/cursor/", "/opt/./agent", "/opt/../agent", "/opt//agent"):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.acp_argv(binary=binary)
+            self.assertEqual(caught.exception.detail, "binary_not_absolute", binary)
+        self.assertEqual(cursor.acp_argv(binary="/opt/cursor/bin/agent.v2")[0], "/opt/cursor/bin/agent.v2")
+
     def test_a_model_that_could_be_read_as_an_option_is_refused(self):
-        for model in ("", "-p", "--api-key", "m\nx", "m\x00", None, 4):
+        for model in ("", "-p", "--api-key", "m\nx", "m\rx", "m\x00", None, 4):
             with self.assertRaises(cursor.ArgvRefused) as caught:
                 cursor.oneshot_argv(model)
             self.assertEqual(caught.exception.detail, "model_invalid")
 
+    def test_an_ordinary_model_name_is_taken_as_given(self):
+        self.assertEqual(cursor.oneshot_argv("gpt-5.1 codex")[-1], "gpt-5.1 codex")
+
 
 class CheckTest(unittest.TestCase):
+    def test_the_updater_flag_stands_before_the_acp_command(self):
+        """Break-it read of #388, F1: after ``acp`` it is the command's argument, not the global option."""
+        for argv in (["agent", "acp", "--disable-auto-update"], ["agent", "acp", "--disable-auto-update", "x"]):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(argv)
+            self.assertEqual(caught.exception.detail, "updater_not_disabled")
+        cursor.check_argv(["agent", "--disable-auto-update", "acp"])
+        cursor.check_argv(["agent", "-p", "--model", "m", "--disable-auto-update"])   # no command: any option place
+
+    def test_a_credential_under_bundled_short_options_is_refused(self):
+        """Break-it read of #388, F2: ``-vH V`` is ``-v`` and ``-H V``."""
+        for bundle in ("-vH", "-pH", "-Hv", "-vpH"):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(["agent", "--disable-auto-update", bundle, "Authorization: Bearer made-up", "acp"])
+            self.assertEqual(caught.exception.detail, "credential_in_argv:-H", bundle)
+
+    def test_full_access_needs_its_acknowledgement(self):
+        """Break-it read of #388, F3: refused unless the run's full access was acknowledged."""
+        cases = {("--force",): "--force", ("--force=true",): "--force", ("--yolo",): "--yolo",
+                 ("--approve-mcps",): "--approve-mcps", ("-f",): "-f", ("-pf",): "-f",
+                 ("--dangerously-skip-permissions",): "--dangerously-skip-permissions",
+                 ("--auto-approve",): "--auto-approve",
+                 ("--sandbox", "disabled"): "--sandbox", ("--sandbox=disabled",): "--sandbox"}
+        for extra, option in cases.items():
+            argv = ["agent", "--disable-auto-update", "-p", *extra, "--", "say hi"]
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(argv)
+            self.assertEqual(caught.exception.detail, f"full_access_not_acknowledged:{option}", extra)
+            cursor.check_argv(argv, full_access_acknowledged=True)
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--sandbox", "enabled", "--", "--force"])
+        for credential in (["--api-key", "k"], ["-vH", "X: y"], ["--header=X: y"]):   # never acknowledged away
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(["agent", "--disable-auto-update", *credential, "--force"],
+                                  full_access_acknowledged=True)
+            self.assertTrue(caught.exception.detail.startswith("credential_in_argv:"), credential)
+
+    def test_an_argument_that_cannot_be_passed_is_refused(self):
+        """Break-it read of #388, F8: empty, over the one-argument limit, or a line break among the options."""
+        self.assertEqual(cursor.MAX_ARG_BYTES, 131072 - 1)
+        for argv in (["agent", "--disable-auto-update", "", "acp"],
+                     ["agent", "--disable-auto-update", "-p", "--", "x" * 131072],
+                     ["agent", "--disable-auto-update", "--model", "a\nb", "-p"],
+                     ["agent", "--disable-auto-update", "--model", "a\rb", "-p"]):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(argv)
+            self.assertEqual(caught.exception.detail, "argv_invalid")
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--", "x" * 131071])
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--", "line one\nline two\r\n"])
+
+    def test_the_updater_flag_counts_only_among_the_options(self):
+        """Review 1 of #388, R1 (both reads): after ``--`` it is positional text, not the option."""
+        for argv in (["agent", "-p", "--", "--disable-auto-update"],
+                     ["agent", "-p", "--output-format", "stream-json", "--model", "m", "--", "--disable-auto-update"]):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(argv)
+            self.assertEqual(caught.exception.detail, "updater_not_disabled")
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--", "say hi"])
+        cursor.check_argv([*cursor.oneshot_argv("m"), "--", "say hi"])
+
+    def test_what_follows_the_double_dash_is_the_prompt_not_options(self):
+        self.assertEqual(len(ARGV["accepted"]), 3)
+        for argv in ARGV["accepted"]:
+            cursor.check_argv(argv)
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(["agent", "--api-key", "k", "--", "x", "--disable-auto-update"])
+        self.assertEqual(caught.exception.detail, "credential_in_argv:--api-key")
+
+    def test_an_argument_with_a_nul_is_refused(self):
+        for argv in (["agent\x00", "--disable-auto-update", "acp"], ["agent", "--disable-auto-update", "--", "a\x00"]):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(argv)
+            self.assertEqual(caught.exception.detail, "argv_invalid")
+
     def test_every_refused_argv_of_the_fixture(self):
-        self.assertEqual(len(ARGV["refused"]), 9)
+        self.assertEqual(len(ARGV["refused"]), 20)
         for case in ARGV["refused"]:
             with self.subTest(argv=case["argv"]):
                 with self.assertRaises(cursor.ArgvRefused) as caught:

@@ -156,6 +156,7 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(set(record), set(driver["required"]))
         self.assertEqual(record["driver"], driver["properties"]["driver"]["const"])
         self.assertRegex(record["engine"], schema("common.v1.json")["$defs"]["engine_name"]["pattern"])
+        self.assertEqual(record["engine"], "cursor")   # review 1 of #388 (Sol R5): this engine, not any name
         self.assertEqual(set(record["flags"]), set(driver["$defs"]["flags"]["required"]))
         self.assertEqual(set(record["flags"].values()), {False})
         self.assertIs(record["input_ack"], False)
@@ -201,6 +202,142 @@ class AcpTranscriptTest(unittest.TestCase):
             sessions = {item["msg"]["params"]["sessionId"] for item in entries
                         if isinstance(item["msg"].get("params"), dict) and "sessionId" in item["msg"]["params"]}
             self.assertEqual(len(sessions), 1, name)
+
+    def test_the_acp_schema_revision_is_named(self):
+        pin = INDEX["acp_schema"]
+        self.assertEqual(pin["commit"], "13b765828f961812f0c78ae577220e994209fa2f")
+        self.assertRegex(pin["sha256"], r"^[0-9a-f]{64}$")
+        for name, _ in self.transcripts():
+            self.assertIn(pin["commit"], fake_agent.fixture_header(name)["shapes_from"], name)
+
+    def test_every_body_has_its_methods_shape_in_acp_v1(self):
+        """Review 1 of #388 (Astra R3, Sol R4): each request, notification and answer, by method, by hand.
+
+        The required fields and the closed values are those of the ACP v1 schema at the revision
+        ``index.json`` names (``acp_schema``); the core's interpreter has no JSON Schema library.
+        """
+        problems = []
+        for name, entries in self.transcripts():
+            asked = {}   # (side, id) -> (method, params)
+            for n, item in enumerate(entries, 2):   # line numbers in the file, after its header
+                msg, side = item["msg"], item["dir"]
+                where = f"{name}:{n}"
+                if "method" in msg:
+                    problems += [f"{where} {p}" for p in acp_params_problems(side, msg["method"], msg.get("params"))]
+                    if "id" in msg:
+                        asked[(side, msg["id"])] = (msg["method"], msg.get("params"))
+                else:
+                    method, params = asked.pop(("agent" if side == "client" else "client", msg["id"]))
+                    problems += [f"{where} {p}" for p in acp_answer_problems(method, params, msg.get("result"))]
+        self.assertEqual(problems, [])
+
+    def test_the_shape_check_refuses_what_the_reads_found(self):
+        self.assertEqual(acp_answer_problems("session/load", {}, None), ["session/load answer is not an object"])
+        self.assertEqual(acp_answer_problems("session/load", {}, "ok"), ["session/load answer is not an object"])
+        offered = {"options": [{"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}]}
+        self.assertEqual(acp_answer_problems("session/request_permission", offered,
+                                             {"outcome": {"outcome": "selected", "optionId": "allow-always"}}),
+                         ["the option chosen was not offered"])
+        self.assertEqual(acp_answer_problems("session/prompt", {}, {"stopReason": "done"}), ["stopReason not in ACP v1"])
+
+    def test_the_permission_transcript_denies(self):
+        """Review 1 of #388 (Sol M25): the denial transcript must stay a denial."""
+        entries = dict(self.transcripts())["acp/prompt_turns.jsonl"]
+        answers = [e["msg"] for e in entries if e["dir"] == "client" and "result" in e["msg"]]
+        self.assertEqual(answers, [{"jsonrpc": "2.0", "id": 100,
+                                    "result": {"outcome": {"outcome": "selected", "optionId": "reject-once"}}}])
+        updates = [e["msg"]["params"]["update"] for e in entries if e["msg"].get("method") == "session/update"]
+        self.assertIn({"sessionUpdate": "tool_call_update", "toolCallId": "call-acp-1", "status": "failed"}, updates)
+
+
+# ACP v1's closed values, at the revision index.json names.
+STOP_REASONS = ("end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled")
+OPTION_KINDS = ("allow_once", "allow_always", "reject_once", "reject_always")
+UPDATES = ("user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
+           "plan", "available_commands_update", "current_mode_update", "config_option_update",
+           "session_info_update", "usage_update", "notice", "compaction_update", "compaction_summary_chunk")
+CLIENT_METHODS = ("initialize", "authenticate", "session/new", "session/load", "session/prompt", "session/cancel")
+AGENT_METHODS = ("session/update", "session/request_permission")
+
+
+def _text(value) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def acp_params_problems(side: str, method: str, params) -> list:
+    """What a request's or notification's params lack, by its method (ACP v1)."""
+    if method not in (CLIENT_METHODS if side == "client" else AGENT_METHODS):
+        return [f"{method} is not a {side} method"]
+    if not isinstance(params, dict):
+        return [f"{method} params are not an object"]
+    out = []
+    if method == "initialize":
+        if type(params.get("protocolVersion")) is not int:
+            out.append("protocolVersion is not an integer")
+    elif method == "authenticate":
+        if not _text(params.get("methodId")):
+            out.append("methodId missing")
+    elif method in ("session/new", "session/load"):
+        if not (isinstance(params.get("cwd"), str) and params["cwd"].startswith("/")):
+            out.append("cwd is not an absolute path")
+        if not isinstance(params.get("mcpServers"), list):
+            out.append("mcpServers is not a list")
+    if method in ("session/load", "session/prompt", "session/cancel", "session/update", "session/request_permission"):
+        if not _text(params.get("sessionId")):
+            out.append("sessionId missing")
+    if method == "session/prompt":
+        prompt = params.get("prompt")
+        if not (isinstance(prompt, list) and prompt and all(isinstance(b, dict) and _text(b.get("type")) for b in prompt)):
+            out.append("prompt is not a list of content blocks")
+    elif method == "session/update":
+        update = params.get("update")
+        kind = update.get("sessionUpdate") if isinstance(update, dict) else None
+        if kind not in UPDATES:
+            out.append("sessionUpdate not in ACP v1")
+        elif kind == "tool_call" and not (_text(update.get("toolCallId")) and _text(update.get("title"))):
+            out.append("tool_call lacks toolCallId or title")
+        elif kind == "tool_call_update" and not _text(update.get("toolCallId")):
+            out.append("tool_call_update lacks toolCallId")
+        elif kind.endswith("_chunk") and not (isinstance(update.get("content"), dict) and _text(update["content"].get("type"))):
+            out.append(f"{kind} lacks content")
+    elif method == "session/request_permission":
+        call, options = params.get("toolCall"), params.get("options")
+        if not (isinstance(call, dict) and _text(call.get("toolCallId"))):
+            out.append("toolCall lacks toolCallId")
+        if not (isinstance(options, list) and options and all(
+                isinstance(o, dict) and _text(o.get("optionId")) and _text(o.get("name")) and o.get("kind") in OPTION_KINDS
+                for o in options)):
+            out.append("options are not ACP v1 permission options")
+    return out
+
+
+def acp_answer_problems(method: str, params, result) -> list:
+    """What an answer lacks, by the method it answers (ACP v1). Every answer here is a result object."""
+    if not isinstance(result, dict):
+        return [f"{method} answer is not an object"]
+    if method == "initialize":
+        methods = result.get("authMethods", [])
+        if type(result.get("protocolVersion")) is not int:
+            return ["protocolVersion is not an integer"]
+        if not (isinstance(methods, list) and all(isinstance(m, dict) and _text(m.get("id")) and _text(m.get("name"))
+                                                  for m in methods)):
+            return ["authMethods are not ACP v1 auth methods"]
+    elif method == "session/new":
+        if not _text(result.get("sessionId")):
+            return ["sessionId missing"]
+    elif method == "session/prompt":
+        if result.get("stopReason") not in STOP_REASONS:
+            return ["stopReason not in ACP v1"]
+    elif method == "session/request_permission":
+        outcome = result.get("outcome")
+        offered = [o.get("optionId") for o in (params or {}).get("options", [])]
+        if outcome == {"outcome": "cancelled"}:
+            return []
+        if not (isinstance(outcome, dict) and outcome.get("outcome") == "selected" and set(outcome) == {"outcome", "optionId"}):
+            return ["outcome is neither selected nor cancelled"]
+        if outcome["optionId"] not in offered:
+            return ["the option chosen was not offered"]
+    return []
 
 
 if __name__ == "__main__":

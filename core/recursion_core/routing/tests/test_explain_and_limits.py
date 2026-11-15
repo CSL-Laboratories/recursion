@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import re
 import unittest
 from collections.abc import Mapping
@@ -758,6 +759,10 @@ class ReviewSixRegressionTests(unittest.TestCase):
         self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
         out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable, self.word]}})
         self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
+        # Round 7, F3: a list or tuple that cannot be iterated is dropped like an entry, not the limit with it.
+        for attempts in (_EvilIterList([self.word]), _EvilIterTuple((self.word,))):
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
+            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), type(attempts))
 
     def test_a_wait_until_is_finite(self) -> None:  # ds F3
         cfg = with_limits({"on_limit": "wait"})
@@ -773,6 +778,7 @@ class ReviewSixRegressionTests(unittest.TestCase):
             self.assertIsNone(until(odd, float("nan")), type(odd))
             self.assertIsNone(until(None, odd), type(odd))
         self.assertEqual(until(5000, None), 5000)
+        self.assertEqual(until(-5.0, 7000.0), -5.0)  # round 7, F4: a time already past is passed through as given
 
     def test_route_decision_needs_the_connections_kind_and_id(self) -> None:  # ds F5
         for connection in ({}, {"kind": "subscription"}, {"id": "claude-main"}):
@@ -819,6 +825,163 @@ class ReviewSixRegressionTests(unittest.TestCase):
             self.assertIsNone(router.route_decision(decision), odd)
             self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), {"action": "none", "reason": "no_decision"},
                              odd)
+
+
+class _EvilHashStr(str):
+    """A str whose hashing raises."""
+
+    def __hash__(self):
+        raise RuntimeError("hash")
+
+
+class _EvilIterList(list):
+    """A list whose iterating raises."""
+
+    def __iter__(self):
+        raise RuntimeError("iter")
+
+
+class _EvilIterTuple(tuple):
+    """A tuple whose iterating raises."""
+
+    def __iter__(self):
+        raise RuntimeError("iter")
+
+
+class _LikeAMapping:
+    """Not a mapping: it iterates the names it is given and indexes every one of them to the same word."""
+
+    def __init__(self, names, word):
+        self.names, self.word = names, word
+
+    def __iter__(self):
+        return iter(self.names)
+
+    def __getitem__(self, key):
+        return self.word
+
+
+class ReviewSevenRegressionTests(unittest.TestCase):
+    """The seventh read of #399 (ece6c127): DeepSeek V4.1 Flash F1-F5 (F3 and F4 are also in the round-6 tests above;
+    F5 is a comment)."""
+
+    def setUp(self) -> None:
+        self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        self.d = router.decide(self.cfg, SENTRY, {})
+        self.word = route_limits.describe(CODEX)["connection"]
+
+    def assert_plain(self, value) -> None:
+        """Every str in ``value``, a key or a member at any depth, is a plain str."""
+        if isinstance(value, Mapping):
+            for key, member in value.items():
+                self.assert_plain(key)
+                self.assert_plain(member)
+        elif isinstance(value, (list, tuple)):
+            for member in value:
+                self.assert_plain(member)
+        elif isinstance(value, str):
+            self.assertIs(type(value), str, repr(value))
+
+    # F1: round 6's class one entry point further out, the task's own words.
+    def test_a_task_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:  # ds F1
+        cfg = config()
+        for odd_type in (_EvilHashStr, _EvilEqStr, _AlwaysEqStr):
+            for plain, odd in (({"task_kind": "review"}, {"task_kind": odd_type("review")}),
+                               ({"tags": ["cheap"]}, {"tags": [odd_type("cheap")]}),
+                               ({"task_kind": "search", "tags": ["x", "cheap"]},
+                                {"task_kind": odd_type("search"), "tags": [odd_type("x"), odd_type("cheap")]}),
+                               ({"hand_pick": {"engine": "codex", "model": None}},
+                                {"hand_pick": {"engine": odd_type("codex"), "model": None}}),
+                               ({"hand_pick": {"engine": "opencode", "model": "m-1"}},
+                                {"hand_pick": {"engine": "opencode", "model": odd_type("m-1")}})):
+                with self.subTest(odd_type=odd_type.__name__, task=plain):
+                    decision = router.decide(cfg, SENTRY, odd)
+                    self.assertTrue(decision["ok"])
+                    self.assertEqual(decision, router.decide(cfg, SENTRY, plain))
+                    self.assert_plain(decision)
+                    self.assertEqual(router.explain(cfg, SENTRY, odd), router.explain(cfg, SENTRY, plain))
+                    answer = router.explain_answer(cfg, SENTRY, odd)
+                    self.assertEqual(answer, router.explain_answer(cfg, SENTRY, plain))
+                    self.assert_plain(answer)
+
+    def test_tags_that_cannot_be_read_are_refused(self) -> None:  # ds F1
+        cfg, task = config(), {"tags": _EvilIterList(["cheap"])}
+        decision = router.decide(cfg, SENTRY, task)
+        self.assertEqual((decision["ok"], decision["code"], decision["reason"]), (False, "bad_task", "tags"))
+        self.assertEqual(router.explain(cfg, SENTRY, task)["decision"], decision)
+        self.assertEqual(router.explain_answer(cfg, SENTRY, task), {"code": "request_invalid", "detail": "bad_task:tags"})
+
+    def test_explain_answer_never_compares_a_name_or_an_engine_it_has_not_checked(self) -> None:  # ds F1
+        cfg, hand = config(), {"engine": "codex", "model": None}
+        want = router.explain_answer(cfg, SENTRY, {"engine": "codex", "hand_pick": hand})
+        self.assertEqual(want["code"], "ok")
+        self.assertEqual(router.explain_answer(cfg, SENTRY, {"engine": _EvilEqStr("codex"), "hand_pick": hand}), want)
+        self.assertEqual(router.explain_answer(cfg, SENTRY, {"engine": "codex",
+                                                             "hand_pick": {"engine": _EvilEqStr("codex"), "model": None}}),
+                         want)
+        for engine in (_EvilEq(), 5, None):
+            self.assertEqual(router.explain_answer(cfg, SENTRY, {"engine": engine, "hand_pick": hand}),
+                             {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"}, engine)
+        self.assertEqual(router.explain_answer(cfg, SENTRY, {_EvilEq(): 1}), {"code": "request_invalid", "detail": "params"})
+        answer = router.explain_answer(cfg, SENTRY, {_EvilEqStr("zz"): 1})
+        self.assertEqual(answer, {"code": "request_invalid", "detail": "zz"})
+        self.assert_plain(answer)
+
+    def test_a_detection_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:  # ds F1
+        cfg = config()
+        others = {engine: entry for engine, entry in SENTRY["engines"].items() if engine != "pi"}
+        self.assertEqual(SENTRY["engines"]["pi"], {"routable": False, "reason": "not_on_path"})
+        for odd_type in (_EvilEqStr, _EvilFormatStr):
+            odd = {"engines": {**others, odd_type("pi"): {"routable": False, "reason": odd_type("not_on_path")}}}
+            with self.subTest(odd_type.__name__):
+                self.assertEqual(router.snapshot(odd), router.snapshot(SENTRY))
+                self.assert_plain(router.snapshot(odd))
+                for task in ({"task_kind": "search"}, {}):
+                    decision = router.decide(cfg, odd, task)
+                    self.assertEqual(decision, router.decide(cfg, SENTRY, task))
+                    self.assert_plain(decision)
+                    json.dumps(router.route_decision(decision))
+        signed_out = {"engines": {**SENTRY["engines"],
+                                  "claude_code": {"routable": False, "reason": _EvilFormatStr("signed_out")}}}
+        self.assertEqual(router.explain_answer(cfg, signed_out, {"task_kind": "chat"}),
+                         {"code": "request_invalid", "detail": "default_engine_unavailable:signed_out"})
+
+    # F2: the record route_decision publishes is what the run record keeps and the event carries.
+    def test_route_decision_publishes_only_what_json_takes(self) -> None:  # ds F2
+        cfg = config()
+        for task in ({}, {"task_kind": "search"}, {"hand_pick": {"engine": "opencode", "model": "m-1"}},
+                     {"hand_pick": {"engine": "codex", "model": None}}):
+            record = router.route_decision(router.decide(cfg, SENTRY, task))
+            self.assertIsNotNone(record, task)
+            self.assertEqual(json.loads(json.dumps(record)), record)
+        # A candidate passed over for having no model is decide's own row, its model null: it is published.
+        routes, raw = copy.deepcopy(ROUTES), copy.deepcopy(CONFIG)
+        del routes["codex"]["route"]["model"]
+        del raw["rules"][0]["route"]["model"]
+        decision = router.decide(config(raw, routes=routes), SENTRY, {"task_kind": "review"})
+        self.assertEqual((decision["candidates"][0]["model"], decision["candidates"][0]["skipped"]), (None, "route_no_model"))
+        record = router.route_decision(decision)
+        self.assertEqual(json.loads(json.dumps(record)), record)
+        conn, row = self.d["connection"], self.d["candidates"][0]
+        for label, odd in (("a connection with another member", {"connection": {**conn, "extra": "x"}}),
+                           ("a connection key that is not a str", {"connection": {**conn, (1, 2): 3}}),
+                           ("a connection that only iterates and indexes", {"connection": _LikeAMapping(("kind", "id"), "x")}),
+                           ("a candidate skipped that is not a word", {"candidates": [{**row, "skipped": object()}]}),
+                           ("a candidate model that is not a word", {"candidates": [{**row, "model": 5}]}),
+                           ("a candidate engine that is a str subclass", {"candidates": [{**row, "engine": _EvilEqStr("x")}]}),
+                           ("a candidate skipped that is a str subclass", {"candidates": [{**row, "skipped": _EvilFormatStr("x")}]}),
+                           ("a hand pick with another member", {"hand_pick": {"engine": "codex", "model": "m", "x": object()}}),
+                           ("a hand pick without its model", {"hand_pick": {"engine": "codex"}}),
+                           ("a hand pick model that is not a word", {"hand_pick": {"engine": "codex", "model": object()}}),
+                           ("a hand pick engine that is a str subclass", {"hand_pick": {"engine": _EvilEqStr("codex"), "model": None}}),
+                           ("a hand pick that only iterates and indexes", {"hand_pick": _LikeAMapping(("engine", "model"), "codex")})):
+            self.assertIsNone(router.route_decision({**self.d, **odd}), label)
+
+    # F3's neighbour: what is not a list or tuple names no attempt, whatever it holds.
+    def test_attempts_in_a_mapping_or_a_set_are_no_attempts(self) -> None:  # ds F3
+        for attempts in ({self.word: 1}, {self.word}, frozenset({self.word})):
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
+            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), attempts)
 
 
 if __name__ == "__main__":

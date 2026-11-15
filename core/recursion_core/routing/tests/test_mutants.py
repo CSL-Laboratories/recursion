@@ -153,7 +153,7 @@ MUTANTS = {
     # providers routing does not list.
     "M25 an engine with a hand pick of another engine: the hand pick taken silently": (
         ROUTER,
-        '        if hand_engine != given["engine"]:\n'
+        "        if type(engine) is not str or type(hand_engine) is not str or hand_engine != engine:\n"
         '            return {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"}\n',
         "",
         {"test_an_engine_and_a_hand_pick"}),
@@ -237,8 +237,8 @@ MUTANTS = {
         {"test_explain_reads_the_task_once"}),
     "M40 a present null tags read as absent": (
         ROUTER,
-        '    if present["tags"] and not (',
-        "    if tags is not None and not (",
+        '    if present["tags"]:\n',
+        "    if tags is not None:\n",
         {"test_a_present_null_condition_is_refused_not_read_as_absent"}),
     "M41 a hand pick without its model member taken": (
         ROUTER,
@@ -287,11 +287,13 @@ MUTANTS = {
         '    if not present["hand_pick"]:\n',
         "    if hand is None:\n",
         {"test_a_null_hand_pick_is_refused_alike_everywhere", "test_a_present_null_condition_is_refused_not_read_as_absent"}),
-    "M49 a null attempts list raising": (
+    # Round 7 re-expressed M49: the attempts list is now copied in a guard of its own, so a null one cannot raise
+    # either way; what the type check still decides is that a mapping or a set names no attempt.
+    "M49 attempts that are not a list or tuple read as one": (
         ROUTER,
-        "tried if isinstance(tried, (list, tuple)) else ()",
-        "tried",
-        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+        "list(tried) if isinstance(tried, (list, tuple)) else []",
+        "list(tried)",
+        {"test_attempts_in_a_mapping_or_a_set_are_no_attempts"}),
     "M50 a decision routed in name only used": (
         ROUTER,
         '            return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide\'s answer\n',
@@ -399,9 +401,9 @@ MUTANTS = {
     # The fifth read of #399 (30073846): DeepSeek A-G (A and B are pinned by M66's wider killers).
     "M69 a connection that is not a mapping published": (
         ROUTER,
-        "            return None  # a connection that is not a mapping (a list of pairs would pass dict())\n",
+        "            return None  # not a mapping: one that only iterates and indexes like one is not decide's\n",
         "            pass\n",
-        {"test_route_decision_refuses_members_dict_would_accept"}),
+        {"test_route_decision_publishes_only_what_json_takes"}),
     "M70 candidates that are not a list published": (
         ROUTER,
         "            return None  # candidates that are not a list (a generator would be used up and read as [])\n",
@@ -414,9 +416,9 @@ MUTANTS = {
         {"test_route_decision_refuses_members_dict_would_accept"}),
     "M72 a hand pick that is not a mapping published": (
         ROUTER,
-        "            return None  # a hand pick that is neither null nor a mapping (a list of pairs would pass dict())\n",
+        "            return None  # a hand pick that is neither null nor a mapping (nor one that only iterates and indexes)\n",
         "            pass\n",
-        {"test_route_decision_refuses_members_dict_would_accept"}),
+        {"test_route_decision_publishes_only_what_json_takes"}),
     "M73 a bare connection word in attempts not counted as tried": (
         ROUTER,
         "    if isinstance(entry, str):\n        return (_ANY, _ANY, _plain(entry))\n",
@@ -460,9 +462,9 @@ MUTANTS = {
         {"test_a_wait_until_is_finite"}),
     "M81 route_decision publishing a connection without kind and id": (
         ROUTER,
-        '        if (not isinstance(connection, Mapping) or type(connection.get("kind")) is not str\n'
-        '                or type(connection.get("id")) is not str):\n',
-        "        if not isinstance(connection, Mapping):\n",
+        '        if conn is None or type(conn["kind"]) is not str or type(conn["id"]) is not str:\n'
+        "            return None  # a connection without its kind and id, with another member, or not plain words\n",
+        "",
         {"test_route_decision_needs_the_connections_kind_and_id", "test_route_decision_needs_plain_words"}),
     "M82 an attempt naming only its connection not counted as tried": (
         ROUTER,
@@ -526,6 +528,73 @@ MUTANTS = {
         "        if type(reason) is not str or reason not in REASONS or type(engine) is not str or type(model) is not str:\n",
         "        if reason not in REASONS or not isinstance(engine, str) or not isinstance(model, str):\n",
         {"test_route_decision_needs_plain_words"}),
+    # Round 7 (ece6c127): DeepSeek F1-F3, each rule this answer adds removed one at a time.
+    "M94 a task kind that is a str subclass kept as it is": (
+        ROUTER,
+        '    kind = _plain(kind) if present["task_kind"] else None\n',
+        '    kind = kind if present["task_kind"] else None\n',
+        {"test_a_task_word_that_is_a_str_subclass_is_read_as_its_text"}),
+    "M95 a tag that is a str subclass kept as it is": (
+        ROUTER,
+        "words = [_plain(t) for t in tags] if isinstance(tags, list) else None",
+        "words = list(tags) if isinstance(tags, list) else None",
+        {"test_a_task_word_that_is_a_str_subclass_is_read_as_its_text"}),
+    "M96 tags that cannot be read raising": (
+        ROUTER,
+        "        except Exception:  # noqa: BLE001 - tags that cannot be read are refused, never raised through\n",
+        "        except ZeroDivisionError:\n",
+        {"test_tags_that_cannot_be_read_are_refused"}),
+    "M97 a hand pick's words that are str subclasses kept as they are": (
+        ROUTER,
+        'engine, model = _plain(hand.get("engine")), _plain(hand.get("model"))',
+        'engine, model = hand.get("engine"), hand.get("model")',
+        {"test_a_task_word_that_is_a_str_subclass_is_read_as_its_text"}),
+    "M98 a detection engine that is a str subclass compared as it is": (
+        ROUTER,
+        "            eng = _plain(eng)\n",
+        "",
+        {"test_a_detection_word_that_is_a_str_subclass_is_read_as_its_text"}),
+    "M99 a detection reason that is a str subclass kept as it is": (
+        ROUTER,
+        '"reason": _plain(entry.get("reason"))',
+        '"reason": entry.get("reason")',
+        {"test_a_detection_word_that_is_a_str_subclass_is_read_as_its_text"}),
+    "M100 explain_answer's names compared as they are": (
+        ROUTER,
+        "names = [_plain(name) for name in params]",
+        "names = list(params)",
+        {"test_explain_answer_never_compares_a_name_or_an_engine_it_has_not_checked"}),
+    "M101 explain_answer comparing an engine it has not checked": (
+        ROUTER,
+        "        if type(engine) is not str or type(hand_engine) is not str or hand_engine != engine:\n",
+        '        if hand_engine != given["engine"]:\n',
+        {"test_explain_answer_never_compares_a_name_or_an_engine_it_has_not_checked"}),
+    "M102 explain_answer's hand-pick engine kept as it is": (
+        ROUTER,
+        'hand_engine = _plain(hand["engine"]) if',
+        'hand_engine = hand["engine"] if',
+        {"test_explain_answer_never_compares_a_name_or_an_engine_it_has_not_checked"}),
+    "M103 route_decision publishing a connection or hand pick with another member": (
+        ROUTER,
+        "    if len(keys) != len(names) or not all(type(key) is str for key in keys) or set(keys) != set(names):\n",
+        "    if not set(names) <= set(keys):\n",
+        {"test_route_decision_publishes_only_what_json_takes"}),
+    "M104 route_decision publishing a candidate row that is not plain words": (
+        ROUTER,
+        '        if not all(type(r["engine"]) is str and _word_or_null(r["model"]) and _word_or_null(r["skipped"])\n'
+        "                   for r in rows):\n",
+        "        if False:\n",
+        {"test_route_decision_publishes_only_what_json_takes"}),
+    "M105 route_decision publishing a hand pick that is not plain words": (
+        ROUTER,
+        '            if hand is None or type(hand["engine"]) is not str or not _word_or_null(hand["model"]):\n',
+        "            if hand is None:\n",
+        {"test_route_decision_publishes_only_what_json_takes"}),
+    "M106 an attempts list that cannot be read discarding the limit": (
+        ROUTER,
+        "        except Exception:  # noqa: BLE001 - a list or tuple subclass whose iterating raises holds no attempt\n",
+        "        except ZeroDivisionError:\n",
+        {"test_an_unreadable_attempts_entry_is_dropped_not_the_limit"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

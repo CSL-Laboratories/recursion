@@ -64,11 +64,12 @@ def held_hook(store, answer=None):
     return hook, entered, leave, seen
 
 
-def close_waits(case, made, store, close, entered, leave):
+def close_waits(case, made, store, close, entered, leave, admitted=1):
     """Lane code is inside (``entered``) on a thread that no client call's admission covers. ``close`` is called
     now, on a thread of its own. It moves on in one of two ways: it WAITS in the drain (right), or it finishes
     (wrong). Either sets one event, and what is true at that moment is what is asserted, so no schedule decides
-    the test. Then the lane code is let go, and the close ends with the store closed."""
+    the test. Then the lane code is let go, and the close ends with the store closed. ``admitted`` is how many
+    references are inside at that moment."""
     case.assertTrue(entered.wait(HELD_BOUND_S), 'the lane code is inside')
     moved_on, finished, wait = threading.Event(), [], made.gate._changed.wait
 
@@ -86,7 +87,7 @@ def close_waits(case, made, store, close, entered, leave):
     closer = threading.Thread(target=closing, daemon=True)
     closer.start()
     case.assertTrue(moved_on.wait(HELD_BOUND_S), 'the close moved on, one way or the other')
-    case.assertEqual((finished, store.closed, made.gate.admitted), ([], False, 1),
+    case.assertEqual((finished, store.closed, made.gate.admitted), ([], False, admitted),
                      'it WAITS: the store is open and the close has not ended while the lane code is inside')
     leave.set()
     closer.join(HELD_BOUND_S)
@@ -790,6 +791,42 @@ class LaunchSeamTest(Composed):
         self.stop(composed.control, run_id)
 
     @quiet
+    def test_a_launch_refused_as_closing_began_is_recorded_by_its_start_before_the_close_can_end(self):
+        """A launch that was inside its check when closing began is refused when the check returns. Its record is
+        not written on the run's own thread: the start that asked for the launch is still waiting for it, inside
+        its own admission, and writes ``start_failed`` itself before it answers. The close waits for every
+        admitted call, and the registry is closed only after the close (``daemon/__main__.py``), so that write
+        cannot lose to it: no record is left ``starting`` for a run that never launched. The client is answered
+        ``start_failed`` with the refusal under ``start_error``, never a bare ``launch_refused``."""
+        store = FakeStore()
+        check, entered, leave, seen = held_hook(store)
+        self.addCleanup(leave.set)
+        daemon, composed = self.boot(hooks_of(launch_check=check, event_store=lambda state_dir: store))
+        registry, writes, answers = composed.control.api._registry, [], []
+        put = registry.put
+
+        def watched(rec):
+            writes.append((rec.get('state'), store.closed))
+            return put(rec)
+        user = threading.Thread(target=lambda: answers.append(composed.control.call('run.start', self.request(client_key='k1'))),
+                                daemon=True)
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        with mock.patch.object(registry, 'put', watched):
+            user.start()
+            # Two references are inside: the start's own admission, and the launcher's around its hook.
+            close_waits(self, composed.hooks, store, composed.close, entered, leave, admitted=2)
+            user.join(HELD_BOUND_S)
+        answer, = answers
+        self.assertEqual((answer['code'], answer['start_error'], answer['recorded']),
+                         ('start_failed', {'code': 'launch_refused', 'detail': 'daemon_closing'}, True))
+        self.assertEqual(writes, [('starting', False), ('start_failed', False)],
+                         'both writes of the start were made with the store open: the close had not ended')
+        self.assertEqual(registry.get(answer['run_id'])['state'], 'start_failed')
+        self.assertEqual((seen, self.units.started), ([False], []))
+        self.assertFalse((self.state / 'runs' / answer['run_id']).exists())
+
+    @quiet
     def test_a_folder_that_fails_or_cannot_sit_in_a_unit_refuses_the_launch(self):
         answers = [RuntimeError('worktree add failed'), self.tmp / 'has space', 'relative/path', 7]
 
@@ -1394,10 +1431,13 @@ class RunThreadLifetimeTest(unittest.TestCase):
     def test_a_close_waits_for_a_launch_that_is_inside_one_of_its_hooks_and_that_launch_then_starts_nothing(self):
         for hook in ('launch_check', 'working_directory'):
             with self.subTest(hook=hook):
-                store = FakeStore()
+                store, folders = FakeStore(), []
                 held, entered, leave, seen = held_hook(store)
                 self.addCleanup(leave.set)
-                made = self.made(store, **{hook: held})
+                hooks = {hook: held}
+                if hook == 'launch_check':  # the folder's provider comes after the check: it must not be asked
+                    hooks['working_directory'] = lambda ctx: folders.append(ctx.run_id)
+                made = self.made(store, **hooks)
                 ctx, manager, state, call, outcome = self.launch(made)
                 user = threading.Thread(target=call, daemon=True)
                 user.start()
@@ -1405,6 +1445,7 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 user.join(HELD_BOUND_S)
                 self.assertEqual((seen, outcome), ([False], [(c.LAUNCH_REFUSED, 'daemon_closing')]),
                                  'the store was open while the hook was inside; closing had begun when it returned, so nothing is launched')
+                self.assertEqual(folders, [], 'refused as the check returned: no folder is asked for, which a provider may have to make')
                 manager.prepare.assert_not_called()
 
     def test_once_closing_has_begun_nothing_is_launched_and_no_launch_hook_is_asked(self):
@@ -2088,6 +2129,97 @@ class ServicesSeamTest(Composed):
                 composed.close()                        # it is closed: a later close does nothing
                 self.assertEqual(counts, ['plugins'])
                 self.assertEqual((lock._is_owned(), answered_from_another_thread(self, made.gate)), (False, [False]))
+
+    def about_to_close(self):
+        """A composition with a service and a store, about to be closed by the test itself, and what its close
+        closed of the things that come after the drain. ``(made, store, composed, counts)``."""
+        made, store, events = self.registered([], threading.Event(), threading.Event())
+        daemon, composed = self.boot(made)
+        self.open.remove((daemon, composed))
+        self.addCleanup(daemon.close)
+        self.addCleanup(composed.close)  # nothing to do once the test has closed it; a test that fails leaves nothing open
+        counts, close_plugins = [], composed.plugins.close
+        composed.plugins.close = lambda: (counts.append('plugins'), close_plugins())[1]
+        return made, store, composed, counts
+
+    def test_a_step_of_the_close_that_is_interrupted_before_it_did_anything_is_taken_again(self):
+        """An interruption can land in a step before the step has done anything. Closing the admission, the wait
+        for the admitted calls and the transport's stop are each interrupted so, once. The step is taken again:
+        the gate is shut when the transport is asked to stop, everything is closed once, and the interruption is
+        raised only then. (The wait for the admitted calls closes the admission again itself, hence its count.)"""
+        for step, taken in (('begin_close', 3), ('finish_close', 2), ('transport', 2)):
+            made, store, composed, counts = self.about_to_close()
+            target, name = (composed.server, 'close') if step == 'transport' else (made, step)
+            calls, shut, real = [], [], getattr(target, name)
+
+            def once_interrupted(*args, calls=calls, real=real):
+                calls.append(args)
+                if len(calls) == 1:
+                    raise KeyboardInterrupt
+                return real(*args)
+            setattr(target, name, once_interrupted)
+            stop_transport = composed.server.close
+
+            def stopping(shut=shut, made=made, stop_transport=stop_transport):
+                shut.append(made.gate.closed)
+                return stop_transport()
+            composed.server.close = stopping
+            with self.subTest(step=step):
+                with self.assertRaises(KeyboardInterrupt):
+                    composed.close()
+                self.assertEqual((len(calls), set(shut), store.closed, counts), (taken, {True}, True, ['plugins']))
+                composed.close()                        # it is closed: a later close does nothing, and raises nothing
+                self.assertEqual((len(calls), counts), (taken, ['plugins']))
+
+    def test_an_interruption_between_two_steps_of_the_close_does_not_end_it(self):
+        """Not every interruption lands inside a step. One that lands between two of them is kept too, and the
+        same owner goes on: the close ends only when its last step has been taken."""
+        made, store, composed, counts = self.about_to_close()
+
+        class Transport:
+            """Stands where the server stood. The first READING of its ``close`` is interrupted: that is outside
+            any step of the close."""
+            read = 0
+
+            def __init__(inner, server):
+                inner.server = server
+
+            @property
+            def close(inner):
+                inner.read += 1
+                if inner.read == 1:
+                    raise KeyboardInterrupt
+                return inner.server.close
+        composed.server = Transport(composed.server)
+        with self.assertRaises(KeyboardInterrupt):
+            composed.close()
+        self.assertEqual((store.closed, counts, made.gate.closed), (True, ['plugins'], True))
+        composed.close()
+        self.assertEqual(counts, ['plugins'])
+
+    def test_a_step_that_must_return_is_taken_once_more_after_a_failure_and_never_without_end(self):
+        """The wait for the admitted calls must return before anything after it is touched. After an ordinary
+        failure it is taken once more. If it fails a second time running it cannot return on this thread (a
+        close entered from inside a lifecycle method is refused each time it asks): the close stops there, raises,
+        and has closed nothing that comes after. It is not taken again without end. A later close goes on from
+        that step."""
+        for failures, outcome in ((1, (RuntimeError, 2, True, ['plugins'])), (2, (H.HookError, 2, False, []))):
+            made, store, composed, counts = self.about_to_close()
+            calls, real = [], made.finish_close
+
+            def failing(context, calls=calls, real=real, failures=failures):
+                calls.append(context)
+                if len(calls) <= failures:
+                    raise (RuntimeError('lost') if failures == 1 else H.HookError('a lifecycle method was called from inside another one'))
+                return real(context)
+            made.finish_close = failing
+            with self.subTest(failures=failures):
+                raised, taken, closed, after = outcome
+                with self.assertRaises(raised):
+                    composed.close()
+                self.assertEqual((len(calls), store.closed, counts), (taken, closed, after))
+                composed.close()                        # goes on from that step, or finds it all closed
+                self.assertEqual((len(calls), store.closed, counts), (taken + (0 if closed else 1), True, ['plugins']))
 
     def test_a_failure_inside_the_close_is_raised_once_after_everything_was_closed(self):
         log, entered, leave = [], threading.Event(), threading.Event()

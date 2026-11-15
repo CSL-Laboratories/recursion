@@ -1048,13 +1048,17 @@ class Composition:
 
         The close is complete only when its last step has been taken. Whatever interrupts it, at its first step
         as at any other, is kept, and the same owner goes on from the step that was interrupted: an interruption
-        never leaves the composition marked closed with calls still admitted."""
+        never leaves the composition marked closed with calls still admitted.
+
+        One case ends it unfinished: a step that must return and cannot (see ``_close``). The close then raises
+        with the composition NOT closed and nothing after that step touched; a later close goes on from it."""
         kept = []
         control_hooks.own_teardown(self._closing, kept)
         try:
             while not self._closed:
                 try:
-                    self._close(kept)
+                    if not self._close(kept):
+                        break  # a step that must return cannot, on this thread: unfinished, and raised below
                 except BaseException as exc:  # noqa: BLE001 - between two steps: kept, and the close goes on
                     kept.append(exc)
         finally:
@@ -1067,10 +1071,14 @@ class Composition:
         stores alive; only then are the services stopped, in reverse, and the store closed. With nothing
         registered the first and third steps do nothing, and this is the close it always was.
 
-        The steps are taken in that order, each once it is reached. Closing the admission and the wait for the
-        admitted calls must RETURN before anything after them is touched: such a step is taken again for as
-        long as it raises. An interruption of any other step takes that step again too (each can be taken
-        twice). An ordinary failure of one of the others is kept and the close goes on, as it always did."""
+        The steps are taken in that order, each once it is reached. An interruption of a step, whichever step,
+        is kept and the step is taken again (each can be taken twice). Closing the admission and the wait for
+        the admitted calls must RETURN before anything after them is touched. Both are complete before they
+        raise what they kept, so after an ordinary failure such a step is taken once more and then returns.
+        If it fails a second time running it cannot return on this thread (a close entered from inside a
+        lifecycle method is refused each time it asks): the close stops there, and says so by returning False.
+        It is never taken again without end. An ordinary failure of one of the other steps is kept and the
+        close goes on, as it always did. True when the last step has been taken."""
         def begin():
             if self.hooks is not None:
                 self.hooks.begin_close()
@@ -1085,16 +1093,23 @@ class Composition:
 
         steps = [(begin, True), (self.server.close, False), (finish, True), (unmark, False), (self.door.close, False)]
         steps.extend((item.close, False) for item in (self.plugins, self.breaker) if item is not None)
+        failed = None  # the step that must return and has failed once, ordinarily, in this pass
         while self._close_step < len(steps):
             action, must_return = steps[self._close_step]
             try:
                 action()
             except BaseException as exc:  # noqa: BLE001 - kept; raised once the whole close is over
                 kept.append(exc)
-                if must_return or not isinstance(exc, Exception):
+                if not isinstance(exc, Exception):
+                    continue  # an interruption: the step is taken again
+                if must_return:
+                    if failed == self._close_step:
+                        return False  # twice running: nothing after it is touched
+                    failed = self._close_step
                     continue
             self._close_step += 1
         self._closed = True
+        return True
 
 
 def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.monotonic,

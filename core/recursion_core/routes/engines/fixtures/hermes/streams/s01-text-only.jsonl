@@ -1,0 +1,5 @@
+{"type": "system", "subtype": "init", "model": "", "session_id": "", "timestamp": 1794700000000}
+{"type": "text", "text": "hel", "timestamp": 1794700000100}
+{"type": "text", "text": "\n  ", "timestamp": 1794700000101}
+{"type": "text", "text": "lo", "timestamp": 1794700000102}
+{"type": "result", "session_id": "20261114_170000_a1b2c3", "exit_code": 0, "text": "hel\n  lo", "tokens": {"input": 1824, "output": 356, "total": 2180, "cache_read": 0, "cache_write": 0}, "duration_ms": 2100, "timestamp": 1794700002100}

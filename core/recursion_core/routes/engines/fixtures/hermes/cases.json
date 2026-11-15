@@ -1,0 +1,84 @@
+{
+ "synthetic": true,
+ "source": "written by hand in the shapes of hermes_cli/stream_json.py at NousResearch/hermes-agent@2f7e62bad99052055d1db9213b81eaab26174bc4; not captured",
+ "cases": [
+  {
+   "stream": "streams/s01-text-only.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "a completed answer in three deltas, one of them whitespace only"
+  },
+  {
+   "stream": "streams/s02-tools.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "two parallel calls of one tool, each with its id, ending out of order; one output cut at 5000 characters"
+  },
+  {
+   "stream": "streams/s03-tools-without-ids.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "calls with no tool_call_id: one pairs by name; two open calls of one name leave a result that pairs with nothing; args that are not an object carry no input"
+  },
+  {
+   "stream": "streams/s04-failed.jsonl",
+   "exit_status": 1,
+   "synthetic": true,
+   "what": "a turn that failed after some output"
+  },
+  {
+   "stream": "streams/s05-start-failed.jsonl",
+   "exit_status": 1,
+   "synthetic": true,
+   "what": "credentials could not be resolved: init then result, no session, every count written as 0"
+  },
+  {
+   "stream": "streams/s06-interrupted.jsonl",
+   "exit_status": 130,
+   "synthetic": true,
+   "what": "the client was interrupted (the work may go on at the Hermes gateway)"
+  },
+  {
+   "stream": "streams/s07-detached-input-required.jsonl",
+   "exit_status": 3,
+   "synthetic": true,
+   "what": "one-shot detached because a prompt needs a human (the turn is left parked at the gateway, not cancelled)"
+  },
+  {
+   "stream": "streams/s08-exit-75.jsonl",
+   "exit_status": 75,
+   "synthetic": true,
+   "what": "NOT WRITTEN BY THE PINNED stream-json PATH (it never exits 75); here to show that an exit 75 types no limit"
+  },
+  {
+   "stream": "streams/s09-replay-gap.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "the viewer fell behind: text stops at the gap and the result carries the whole reply"
+  },
+  {
+   "stream": "streams/s10-not-the-protocol.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "lines that are not the protocol (some the pinned emitter never writes), a second init, and lines after the result"
+  },
+  {
+   "stream": "streams/s11-cut-off.jsonl",
+   "exit_status": -9,
+   "synthetic": true,
+   "what": "the process was killed mid-line: no result record"
+  },
+  {
+   "stream": "streams/s12-ids-and-inputs.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "call ids that are not valid call ids or use this parser's prefixes; an input with no RFC 8785 text; an input too large to carry"
+  },
+  {
+   "stream": "streams/s13-text-outside-ascii.jsonl",
+   "exit_status": 0,
+   "synthetic": true,
+   "what": "text outside ASCII, for byte offsets"
+  }
+ ]
+}

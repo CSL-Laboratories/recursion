@@ -295,6 +295,17 @@ class DeliveryOrderTest(unittest.TestCase):
         self.lane.settle()
         self.assertEqual(self.lane.units.sent, [], 'the steer waits behind the message queued before it')
 
+    def test_a_second_steer_waits_until_the_first_has_its_answer(self):
+        live = self.running('codex')
+        for number, text in enumerate(('one', 'two'), 1):
+            self.lane.call('session.steer', {'command_id': f'cmd-steer-000{number}', 'session_id': live['session_id'],
+                                             'text': text, 'expected_turn_id': live['active_turn_id']})
+        self.lane.settle()
+        self.assertEqual([order.text for order in self.lane.units.sent], ['one'], 'one delivery in flight at a time')
+        self.assertEqual(self.lane.accept_input(live['session_id']), 'delivered')
+        self.lane.settle()
+        self.assertEqual([order.text for order in self.lane.units.sent], ['one', 'two'])
+
     def test_a_launch_that_definitely_did_not_start_fails_the_turn_and_nothing_is_retried(self):
         self.lane.units.then = [UnitRefused('engine_missing', 'no such binary')]
         session = self.lane.start(prompt='first')['session']

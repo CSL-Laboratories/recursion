@@ -6,6 +6,10 @@ fails it writes one JSON line to stderr, ``{"code": "socket_check_failed", "reas
 writes nothing to stdout and exits 1. Otherwise it serves until the client ends stdin, or until stdout
 fails, and exits 0. It reads fd 0 and writes fd 1 directly (``stdio.py``), so a client that stops reading
 ends the process cleanly instead of leaving a buffered stdout for the interpreter's final flush to fail on.
+While serving, its diagnostics go to fd 2 directly too, from the diagnostics thread (``server.py``,
+DIAGNOSTICS): that thread then holds no lock of ``sys.stderr`` while it waits on a stderr nobody reads (a
+daemon thread holding that lock keeps the interpreter from ending, or makes it abort, after an interrupt
+too).
 
 Exit statuses: 0 end of input or stdout failed; 1 the socket check failed; 2 usage (an argument was given);
 3 an unexpected error while serving (one JSON line on stderr, ``{"code": "internal_error", ...}``); 130
@@ -33,9 +37,17 @@ def _stderr_line(stream: Any, event: dict) -> None:
         pass
 
 
+def _fd_line(writer: FdWriter, event: dict) -> None:
+    try:
+        writer.write((json.dumps(event, sort_keys=True, ensure_ascii=True) + "\n").encode("ascii"))
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = None, stdin: Any = None,
          stdout: Any = None, stderr: Any = None, check=socket_check.check) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    events = FdWriter(2) if stderr is None else None  # the process's own stderr: serve logs to fd 2
     stderr = sys.stderr if stderr is None else stderr
     if argv:
         _stderr_line(stderr, {"code": "usage", "detail": "python -m recursion_core.control.mcp takes no arguments"})
@@ -48,8 +60,15 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     instream = FdReader(0) if stdin is None else stdin
     outstream = FdWriter(1) if stdout is None else stdout
     _stderr_line(stderr, {"event": "serving", "protocol": server.LEGACY_PROTOCOL})
+
+    def log(event: dict) -> None:
+        if events is not None:
+            _fd_line(events, event)
+        else:
+            _stderr_line(stderr, event)
+
     try:
-        return server.serve(api, instream, outstream, log=lambda event: _stderr_line(stderr, event))
+        return server.serve(api, instream, outstream, log=log)
     except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
         return EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - one diagnostic line, an exit status of its own

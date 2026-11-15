@@ -10,15 +10,18 @@ there and fails it.
 
 from __future__ import annotations
 
+import copy
 import threading
 import unittest
 from unittest import mock
 
 from recursion_core.control.mcp import server
-from recursion_core.control.mcp.framing import NOT_JSON, Frame, FrameWriter, encode
+from recursion_core.control.mcp.framing import (NOT_JSON, NOT_UTF8, NUMBER_TOO_LONG, TOO_LARGE, Frame, FrameWriter,
+                                                encode)
 from recursion_core.control.mcp.replies import ReplyQueue
-from recursion_core.control.mcp.tests.support import HANG_GUARD_S, Capture, GateAPI, QueueWriter, Served, Stalling
-from recursion_core.control.mcp.tests.test_session import INIT, START, STATUS, STOP, call, cancel, ping
+from recursion_core.control.mcp.tests.support import (HANG_GUARD_S, Capture, Events, GateAPI, QueueWriter, Served,
+                                                      Stalling)
+from recursion_core.control.mcp.tests.test_session import INIT, SHORT, START, STATUS, STOP, call, cancel, ping
 
 
 def pong(request_id) -> dict:
@@ -29,9 +32,9 @@ SIZE = len(encode(pong(1)))  # the same for the ids 1 to 9
 
 
 class ReplyQueueTest(unittest.TestCase):
-    def queue(self, out, **kwargs) -> tuple[ReplyQueue, list[dict]]:
-        events: list[dict] = []
-        replies = ReplyQueue(FrameWriter(out), log=events.append, **kwargs)
+    def queue(self, out, **kwargs) -> tuple[ReplyQueue, Events]:
+        events = Events()  # the queue delivers its events from a diagnostics thread of its own
+        replies = ReplyQueue(FrameWriter(out), log=events, **kwargs)
         replies.start()
         return replies, events
 
@@ -59,7 +62,7 @@ class ReplyQueueTest(unittest.TestCase):
         replies.close()
         self.assertEqual([1, 2, 3, 4, 5], [m["id"] for m in out.drain()])
         self.assertEqual([False], self.offers(replies, [6]))  # closed
-        self.assertEqual([], events)
+        self.assertEqual([], events.all)
 
     def test_taking_an_answer_never_waits_for_a_stalled_stdout(self) -> None:
         out = Stalling({1})
@@ -78,16 +81,16 @@ class ReplyQueueTest(unittest.TestCase):
         self.assertEqual([True], self.offers(replies, [1]))
         self.assertTrue(out.stalled.wait(HANG_GUARD_S))
         self.assertEqual([True, False, False], self.offers(replies, [2, 3, 4]))  # answer 1 counts until written
-        self.assertEqual([{"event": "replies_dropped", "pending_bytes": 2 * SIZE}], events)
+        self.assertEqual([{"event": "replies_dropped", "pending_bytes": 2 * SIZE}], events.wait(1))
         out.release.set()
         self.assertEqual([1, 2], [out.next()["id"], out.next()["id"]])
         self.assertEqual([True], self.offers(replies, [5]))  # answer 1 is out: room for one more at least
-        self.assertEqual({"event": "replies_resumed", "dropped": 2}, events[-1])
+        self.assertEqual({"event": "replies_resumed", "dropped": 2}, events.wait(2)[-1])
         self.assertEqual(5, out.next()["id"])
         self.assertEqual([True], self.offers(replies, [6]))  # the stretch is over: nothing more is logged
         replies.close()
         self.assertEqual([6], [m["id"] for m in out.drain()])
-        self.assertEqual(2, len(events))
+        self.assertEqual(2, len(events.all))  # close() has delivered every event
 
     def test_an_answer_over_the_bound_is_taken_into_an_empty_queue_only(self) -> None:
         out = Stalling({1})
@@ -102,7 +105,7 @@ class ReplyQueueTest(unittest.TestCase):
         replies.close()
         self.assertEqual([3], [m["id"] for m in out.drain()])
         self.assertEqual([{"event": "replies_dropped", "pending_bytes": SIZE},
-                          {"event": "replies_resumed", "dropped": 1}], events)
+                          {"event": "replies_resumed", "dropped": 1}], events.all)
 
     def test_after_a_failed_write_what_is_queued_is_discarded_and_nothing_more_is_taken(self) -> None:
         out = Stalling({1}, fail=True)
@@ -115,7 +118,7 @@ class ReplyQueueTest(unittest.TestCase):
         self.assertEqual([False], self.offers(replies, [3]))  # refused for the failure, before close()
         replies.close()    # returns: answer 2 was discarded
         self.assertEqual([], out.drain())
-        self.assertEqual([], events)
+        self.assertEqual([], events.all)
 
     def test_a_writer_another_write_broke_discards_what_is_queued(self) -> None:
         # A call's answer, written by its worker through the same writer, found stdout failed: the queue's
@@ -156,6 +159,53 @@ class SessionReplyTest(unittest.TestCase):
         session.close()
         self.assertEqual(["init", 2, 4, 5, 6, None, 7], [m["id"] for m in replies.drain()])
         self.assertEqual([3], [m["id"] for m in answers.drain()])
+
+    def test_every_kind_of_answer_the_reader_owes_goes_to_reply(self) -> None:
+        def request(request_id, method, params=None) -> Frame:
+            return Frame(message={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
+
+        no_capabilities = copy.deepcopy(INIT)
+        del no_capabilities["params"]["capabilities"]
+        cases = [  # (name, initialized before, frame)
+            ("too large", True, Frame(error=TOO_LARGE)),
+            ("integer too long", True, Frame(error=NUMBER_TOO_LONG)),
+            ("not UTF-8", True, Frame(error=NOT_UTF8)),
+            ("invalid request", True, Frame(message={"id": True})),
+            ("second initialize", True, Frame(message=INIT)),
+            ("initialize refused", False, Frame(message=no_capabilities)),
+            ("not initialized", False, request(2, "tools/list")),
+            ("unknown cursor", True, request(3, "tools/list", {"cursor": "c"})),
+            ("tools/list", True, request(4, "tools/list")),
+            ("name not a string", True, request(5, "tools/call", {"name": 42})),
+            ("arguments refused", True, Frame(message=call(6, STATUS[0], {}))),
+            ("unknown method", True, request(7, "no/such")),
+        ]
+        for name, initialized, frame in cases:
+            with self.subTest(case=name):
+                replies, answers = QueueWriter(), QueueWriter()
+                session = server.LegacySession(GateAPI(), answers, reply=replies)
+                session.initialized = initialized
+                session.receive(frame)
+                self.assertEqual((1, []), (len(replies.drain()), answers.drain()))
+        with self.subTest(case="schema check raises"):
+            replies, answers = QueueWriter(), QueueWriter()
+            session = server.LegacySession(GateAPI(), answers, reply=replies)
+            session.initialized = True
+            with mock.patch.object(server, "check_arguments", side_effect=ValueError("the checker broke")):
+                session.receive(Frame(message=call(8, *STATUS)))
+            self.assertEqual((1, []), (len(replies.drain()), answers.drain()))
+        with self.subTest(case="id still in flight"):
+            api, replies, answers = GateAPI(), QueueWriter(), QueueWriter()
+            session = server.LegacySession(api, answers, reply=replies)
+            session.initialized = True
+            session.receive(Frame(message=call(9, *STATUS)))
+            gate = api.next_entered()
+            try:
+                session.receive(Frame(message=ping(9)))
+                self.assertEqual((1, []), (len(replies.drain()), answers.drain()))
+            finally:
+                gate[2].set()
+                session.close()
 
     def test_a_dropped_initialize_answer_leaves_the_session_uninitialized(self) -> None:
         take = [False]
@@ -243,6 +293,16 @@ class StalledStdoutTest(unittest.TestCase):
         self.assertIn({"event": "cancelled", "outcome": "never_sent"}, served.events)
         self.assertIn({"event": "replies_dropped", "pending_bytes": 2 * size}, served.events)
         self.assertIn({"event": "replies_resumed", "dropped": 1}, served.events)
+
+    def test_end_of_input_waits_until_the_reader_answers_are_written(self) -> None:
+        out = Stalling({"p"})
+        served = Served(GateAPI(), out=out)
+        served.send(ping("p"))
+        self.assertTrue(out.stalled.wait(HANG_GUARD_S))
+        served.end_input()
+        self.assertFalse(served.join(SHORT), "serve returned before the answer to p was written")
+        out.release.set()
+        self.assertEqual(["p"], [m["id"] for m in served.finish(self)])
 
     def test_a_reader_answer_still_queued_when_stdout_fails_is_never_written(self) -> None:
         api = GateAPI()

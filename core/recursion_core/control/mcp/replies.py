@@ -19,14 +19,17 @@ goes on writing fills the queue. Stop calls and cancellations need no answer fro
 admitted, so they are read, admitted and sent whatever the queue holds (a Stop refused ``Server busy``
 because its own queue is full is refused like any other call). The first answer dropped after one was
 taken logs ``{"event": "replies_dropped", "pending_bytes": n}``; the next answer taken logs
-``{"event": "replies_resumed", "dropped": count}``: two lines per stretch of drops, however long.
+``{"event": "replies_resumed", "dropped": count}``: two lines per stretch of drops, however long. Both go
+to ``log`` through a ``diagnostics.DiagnosticQueue`` of the reply queue's own, so ``offer`` never waits for
+``log`` either (a client that stops reading stderr too).
 
 OUTPUT FAILURE. When a write returns ``False`` (stdout failed, at this write or at an earlier one, a
 call's answer included: the writer is one), the answers still queued are discarded and every later
 ``offer`` returns ``False``; nothing is logged for them (``server.py``, OUTPUT FAILURE, logs the failure
 once).
 
-``close()`` waits until every answer taken has been written, or discarded, and ends the thread.
+``close()`` waits until every answer taken has been written, or discarded, and ends the thread; then it
+closes the queue's diagnostics (``DiagnosticQueue.close``).
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import collections
 import threading
 from collections.abc import Callable
 
+from .diagnostics import DiagnosticQueue
 from .framing import FrameWriter, encode
 
 MAX_PENDING_REPLY_BYTES = 1024 * 1024
@@ -53,7 +57,7 @@ class ReplyQueue:
             raise ValueError("max_bytes must be positive")
         self._writer = writer
         self._max_bytes = max_bytes
-        self._log = log or _quiet
+        self._diagnostics = DiagnosticQueue(log or _quiet)
         self._cond = threading.Condition()
         # (message, encoded size); the first is the one being written
         self._pending: collections.deque[tuple[dict, int]] = collections.deque()
@@ -64,6 +68,7 @@ class ReplyQueue:
         self._thread = threading.Thread(target=self._run, name="mcp-replies", daemon=True)
 
     def start(self) -> None:
+        self._diagnostics.start()
         self._thread.start()
 
     def offer(self, message: dict) -> bool:
@@ -88,7 +93,7 @@ class ReplyQueue:
                 self._cond.notify_all()
                 taken = True
         if event is not None:
-            self._log(event)
+            self._diagnostics.offer(event)  # never waits for log (EXHAUSTION)
         return taken
 
     def _run(self) -> None:
@@ -117,3 +122,4 @@ class ReplyQueue:
                 self._cond.wait()
             self._closing = True
             self._cond.notify_all()
+        self._diagnostics.close()

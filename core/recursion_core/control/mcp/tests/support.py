@@ -156,6 +156,30 @@ class QueueWriter:
                 return out
 
 
+class Events:
+    """A ``log`` that keeps every event; ``wait(n)`` waits until there are ``n`` (they may come from a thread)."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._events: list[dict] = []
+
+    def __call__(self, event: dict) -> None:
+        with self._cond:
+            self._events.append(event)
+            self._cond.notify_all()
+
+    def wait(self, count: int) -> list[dict]:
+        with self._cond:
+            if not self._cond.wait_for(lambda: len(self._events) >= count, HANG_GUARD_S):
+                raise AssertionError(f"{count} events were expected; there are {self._events}")
+            return list(self._events)
+
+    @property
+    def all(self) -> list[dict]:
+        with self._cond:
+            return list(self._events)
+
+
 def write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -186,11 +210,12 @@ class Stalling(Capture):
 class Served:
     """``server.serve`` on a thread, reading a real pipe and writing to a ``Capture`` (or to ``out``)."""
 
-    def __init__(self, api: Any, out: Capture | None = None, **kwargs: Any) -> None:
+    def __init__(self, api: Any, out: Capture | None = None, log: Any = None, **kwargs: Any) -> None:
         read_fd, self._write_fd = os.pipe()
         self._instream = os.fdopen(read_fd, "rb")
         self.out = out if out is not None else Capture()
-        self.events: list[dict] = []
+        self.events: list[dict] = []  # what serve logged, unless the test gives its own log
+        self._log = log if log is not None else self.events.append
         self.status: int | None = None
         self._thread = threading.Thread(target=self._serve, args=(api, kwargs), name="mcp-test-serve", daemon=True)
         self._thread.start()
@@ -198,7 +223,7 @@ class Served:
     def _serve(self, api: Any, kwargs: dict) -> None:
         # stdin is not closed here: after stdout fails, serve returns while its reader still waits on
         # stdin, and closing a buffered stream another thread is reading waits for that read.
-        self.status = server.serve(api, self._instream, self.out, log=self.events.append, **kwargs)
+        self.status = server.serve(api, self._instream, self.out, log=self._log, **kwargs)
 
     def send(self, message: Any) -> None:
         self.send_bytes(encode(message) if isinstance(message, dict) else message)

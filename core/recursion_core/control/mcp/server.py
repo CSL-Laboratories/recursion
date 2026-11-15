@@ -67,6 +67,13 @@ received: each of those requests sent nothing to the daemon, and a dropped ``ini
 the session uninitialized (``replies.py``, EXHAUSTION). An in-process session given no ``reply`` writes
 those answers with ``write``.
 
+DIAGNOSTICS. Nor does any thread of ``serve`` wait for stderr. Every event for ``log`` (a cancellation, a
+response the client sent, ``initialize``, a stretch of dropped answers, ``output_lost``, the last line)
+goes to a ``diagnostics.DiagnosticQueue``, which takes it without waiting and delivers it on a thread of
+its own; it is bounded, and an event that does not fit is dropped and counted. So a client that captures
+stderr and stops reading it never stops the reader either. An in-process session calls its ``log``
+directly.
+
 OUTPUT FAILURE. When a write to stdout fails, the session stops forwarding: no frame read afterwards and no
 waiting call is sent, a call that has been admitted but not yet sent is not sent, the reader's answers not
 yet written are discarded, calls already sent are left to finish at the daemon (no Stop is sent in their
@@ -88,6 +95,7 @@ from recursion_core.control import mcp_tools
 
 from . import jsonrpc
 from .framing import MAX_INT_DIGITS, NOT_JSON, NOT_UTF8, NUMBER_TOO_LONG, TOO_LARGE, Frame, FrameWriter, read_frames
+from .diagnostics import MAX_PENDING_DIAGNOSTIC_BYTES, DiagnosticQueue
 from .replies import MAX_PENDING_REPLY_BYTES, ReplyQueue
 from .tools import Tool, check_arguments, tool_table
 
@@ -455,15 +463,18 @@ class LegacySession:
 def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None = None,
           max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP,
           max_waiting: int = MAX_WAITING, max_waiting_stops: int = MAX_WAITING_STOPS,
-          max_pending_reply_bytes: int = MAX_PENDING_REPLY_BYTES) -> int:
+          max_pending_reply_bytes: int = MAX_PENDING_REPLY_BYTES,
+          max_pending_diagnostic_bytes: int = MAX_PENDING_DIAGNOSTIC_BYTES) -> int:
     """Serve one client until end of input or until stdout fails; returns the process exit status (0).
 
     Reading runs on a thread of its own, so that a failure of stdout ends the session even while the
-    reader waits for input; the reader's answers are written by the reply queue's thread (REPLIES). An
-    exception raised while reading (an interrupt included) is raised here.
+    reader waits for input; the reader's answers are written by the reply queue's thread (REPLIES), and
+    every event for ``log`` is delivered by a diagnostics thread (DIAGNOSTICS). An exception raised while
+    reading (an interrupt included) is raised here at once; diagnostics not yet delivered then may be lost.
     """
 
-    log = log or _quiet
+    diagnostics = DiagnosticQueue(log or _quiet, max_bytes=max_pending_diagnostic_bytes)
+    log = diagnostics.offer
     done = threading.Event()
     failure: list[BaseException] = []
     writer = FrameWriter(outstream)
@@ -477,6 +488,7 @@ def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None 
         done.set()
 
     writer.on_broken = output_failed
+    diagnostics.start()
     replies.start()
 
     def read() -> None:
@@ -494,5 +506,6 @@ def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None 
         raise failure[0]
     session.close()
     replies.close()
-    log({"event": "end_of_input" if not writer.broken else "output_failed", "stdout_broken": writer.broken})
+    diagnostics.close(last={"event": "end_of_input" if not writer.broken else "output_failed",
+                            "stdout_broken": writer.broken})
     return 0

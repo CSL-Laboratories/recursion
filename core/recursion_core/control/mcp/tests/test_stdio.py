@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -272,6 +273,38 @@ class StdioTest(unittest.TestCase):
         self.assertEqual(0, child.end()[0])
         with changed:
             self.assertEqual((24, 1), (entered.count("run.status"), entered.count("run.stop")))
+
+    def test_with_stderr_full_the_reader_goes_on_and_an_interrupt_exits_130(self) -> None:
+        # The client never reads stderr. Six thousand cancellation lines (about 300 KB) fill that pipe and
+        # the diagnostics queue; the reader still reads all of them, a ping is answered and a stop is sent.
+        # An interrupt then ends the process with 130 and no fatal error at the interpreter's end: the
+        # diagnostics thread waits in a write to fd 2 and holds no lock of sys.stderr.
+        stop_seen = threading.Event()
+
+        class Stops:
+            def call(self, method, params=None):
+                if method == "run.stop":
+                    stop_seen.set()
+                    return {"code": "pending", "run_id": params["run_id"], "state": "pending"}
+                return {"code": "ok", "runs": []}
+
+        self.daemon(Stops())
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        note = encode({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 999}})
+        child.proc.stdin.write(note * 6000)  # returns only once the reader has read nearly all of it
+        child.proc.stdin.flush()
+        self.assertEqual({}, child.request(2, "ping")["result"])
+        stopped = child.tool(3, "recursion_run_stop", {"run_id": "r"})
+        self.assertEqual("pending", stopped["structuredContent"]["code"])
+        self.assertTrue(stop_seen.is_set())
+        child.proc.send_signal(signal.SIGINT)
+        status = child.proc.wait(timeout=HANG_GUARD_S)
+        child._guard.cancel()
+        stderr = child.proc.stderr.read().decode("ascii", "replace")
+        self.assertEqual(130, status, stderr[-2000:])
+        self.assertNotIn("Fatal Python error", stderr)
+        self.assertNotIn("Traceback", stderr)
 
     def test_stdout_that_fails_ends_the_process_with_status_0_and_sends_nothing_more(self) -> None:
         release, status_seen = threading.Event(), threading.Event()

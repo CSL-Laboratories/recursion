@@ -50,12 +50,16 @@ stops reading ends the process with status 0, not with a failed final flush.
   is held until the call's answer is written, so slow stdout cannot pile up workers.
 - The reader never writes to stdout, so slow stdout never stops it reading: a Stop behind a busy answer is
   still sent and a cancellation still applied. The answers it owes (refusals, `ping`, `initialize`,
-  `tools/list`) go to a reply queue written by a thread of its own (`replies.py`), holding at most 1 MiB.
-  A client that stops reading stdout and goes on writing fills it; an answer that does not fit is dropped
-  and its request treated as never received (each such request sent nothing to the daemon; a dropped
-  `initialize` answer leaves the session uninitialized). The client times out, as 2025-06-18 says it
-  should, and may send it again. Stderr gets two lines per stretch of drops (`replies_dropped`,
-  `replies_resumed`).
+  `tools/list`) go to a reply queue written by a thread of its own (`replies.py`), holding at most 1 MiB
+  (or one answer larger than that, taken only into an empty queue). A client that stops reading stdout
+  and goes on writing fills it; an answer that does not fit is dropped and its request treated as never
+  received (each such request sent nothing to the daemon; a dropped `initialize` answer leaves the
+  session uninitialized). The client times out, as 2025-06-18 says it should, and may send it again.
+  Stderr gets two lines per stretch of drops (`replies_dropped`, `replies_resumed`).
+- Nothing waits for stderr either. Every diagnostic goes to a queue delivered by a thread of its own
+  (`diagnostics.py`, 64 KiB; the process writes fd 2 directly). A client that captures stderr and stops
+  reading it loses lines, counted in a `diagnostics_dropped` line once stderr moves again, but the reader
+  goes on reading and answering. The last line (`end_of_input` or `output_failed`) is never dropped.
 - `notifications/cancelled`: a waiting call is dropped unsent; a running call's answer is dropped; an
   answer already being written goes out (the cancellation came too late). Nothing is ever sent to the
   daemon for a cancellation.

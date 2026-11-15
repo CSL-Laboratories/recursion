@@ -158,7 +158,9 @@ def check_dirs(root: str, path: str) -> None:
 
 def check_private_dir(root: str, path: str) -> None:
     """``check_dirs``, and ``path`` itself, if it is there, open to nobody else at all (no bit of
-    0o077): the route homes' custody root, which ``setup.route_home.check`` holds to that rule."""
+    0o077) and usable by its owner (read, write and search): the route homes' custody root, which
+    ``setup.route_home.check`` holds to the first rule and the launcher's ``private_dir`` needs the
+    second for."""
 
     check_dirs(root, path)
     try:
@@ -167,6 +169,8 @@ def check_private_dir(root: str, path: str) -> None:
         return
     if info.st_mode & 0o077:
         raise InstallRefused("folder_untrusted", f"{path} is open to group or world; route homes need it owner-only: `chmod 700` it")
+    if (info.st_mode & stat.S_IRWXU) != stat.S_IRWXU:
+        raise InstallRefused("folder_untrusted", f"{path} must be readable, writable and searchable by its owner; `chmod 700` it")
 
 
 def _folders_below(root: str, path: str) -> list[str]:

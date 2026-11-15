@@ -13,13 +13,14 @@ runs none of them: it starts no process, opens no socket and touches no system u
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 from dataclasses import dataclass
 
 from .errors import InstallRefused
 from .layout import (Owned, Roots, check_dirs, check_private_dir, ensure_dir, file_untrusted, held_regular,
-                     owned_paths, read_regular_and_stat, replace_regular, unlink_regular, write_exclusive)
+                     owned_paths, replace_regular, still_names, unlink_regular, write_exclusive)
 from .unit import MARKER, UNIT_NAME, render_unit
 
 _UNIT_MODE = 0o644
@@ -68,6 +69,8 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
     # Imported here, not with this module: ``recursiond --help`` builds its parser from this package.
     from recursion_core.plugin_security import Refused, stores
 
+    if type(paths) is not Owned:
+        raise InstallRefused("paths", "ensure_stores takes owned_paths(roots)")
     ensure_dir(paths.home, paths.store_dir, mode=_DIR_MODE)
     done = []
     for path, magic, create in ((paths.breaker_store, stores.BREAKER_MAGIC, stores.create_breaker_store),
@@ -89,49 +92,57 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
 def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Create the stores and the route homes' custody root, then write the unit. The same bytes
     already there change nothing; other bytes, a unit another user could change (another user's, or
-    writable by group or world) and a custody root open to anyone else are refused before anything
-    is made, so a refused install leaves everything as it was."""
+    writable by group or world) and a custody root open to anyone else or unusable by its owner are
+    refused before anything is made. A unit found is held open until the answer and checked against
+    its path last: one removed or replaced meanwhile is ``unit_missing`` or ``unit_changed``. A refusal
+    after the stores are begun (that, or a store refused after the other was made) leaves what was
+    made; each store made is a whole, valid store, and the command run again finds it."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
-    present = os.path.lexists(paths.unit)
-    why = ""
-    if present:
-        current, info = read_regular_and_stat(paths.unit)  # the file read, checked against the path while open
-        if current != unit:
-            raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
-        why = file_untrusted(paths.unit, info)
-    if why:
-        raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
-    check_private_dir(paths.home, paths.homes)  # before anything is made
-    made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
-    homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
-    if not present:
-        ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
-        write_exclusive(paths.unit, unit, _UNIT_MODE)
-    return _plan("install", not present or _any_created(made) or homes, paths, made)
+    with contextlib.ExitStack() as held:  # a unit found stays open until the answer: its inode is not reused
+        present = os.path.lexists(paths.unit)
+        if present:
+            current, info = held.enter_context(held_regular(paths.unit))  # checked against the path while open
+            if current != unit:
+                raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
+            why = file_untrusted(paths.unit, info)
+            if why:
+                raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
+        check_private_dir(paths.home, paths.homes)  # before anything is made
+        made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
+        homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
+        if present:
+            still_names(paths.unit, info)  # the unit answered for is still the one at its path
+        else:
+            ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
+            write_exclusive(paths.unit, unit, _UNIT_MODE)
+        return _plan("install", not present or _any_created(made) or homes, paths, made)
 
 
 def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Make any missing store and the route homes' custody root, and rewrite the unit to what
-    ``install`` would write now. A missing unit, and a custody root open to anyone else, are refused
-    before anything is made. The same bytes are not written again unless another user could change
-    the file."""
+    ``install`` would write now. A missing unit, and a custody root open to anyone else or unusable by
+    its owner, are refused before anything is made. The same bytes are not written again unless
+    another user could change the file; a unit kept is held open until the answer and checked
+    against its path last, as in ``install``, whose words on a refusal after the stores apply."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    data, info = read_regular_and_stat(paths.unit)  # the file read, checked against the path while open
-    current = data == unit and not file_untrusted(paths.unit, info)
-    check_private_dir(paths.home, paths.homes)  # before anything is made
-    made = ensure_stores(paths)
-    homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
-    if not current:
-        replace_regular(paths.unit, unit, _UNIT_MODE)
-    return _plan("upgrade", not current or _any_created(made) or homes, paths, made)
+    with held_regular(paths.unit) as (data, info):  # held open until the answer: its inode is not reused
+        current = data == unit and not file_untrusted(paths.unit, info)
+        check_private_dir(paths.home, paths.homes)  # before anything is made
+        made = ensure_stores(paths)
+        homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
+        if current:
+            still_names(paths.unit, info)  # the unit kept is still the one at its path
+        else:
+            replace_regular(paths.unit, unit, _UNIT_MODE)
+        return _plan("upgrade", not current or _any_created(made) or homes, paths, made)
 
 
 def uninstall(roots: Roots) -> Plan:

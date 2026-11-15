@@ -239,6 +239,95 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(upgrade(self.roots, EXEC).changed)
         self.assertEqual(stat.S_IMODE(os.lstat(self.homes).st_mode), 0o700)
 
+    def test_a_unit_gone_or_replaced_while_the_stores_are_made_is_refused_not_answered(self) -> None:
+        # Review 1 of #410, DeepSeek F1: between the read and the answer install and upgrade make the stores
+        # and the custody root; a unit removed (or replaced) then was answered "changed: false" with no
+        # unit on disk. The unit found is held open until the answer and checked against its path last.
+        module = importlib.import_module("recursion_core.daemon_install.install")
+        real_ensure_stores = module.ensure_stores
+
+        def removing(paths):
+            os.unlink(self.unit)
+            return real_ensure_stores(paths)
+
+        def replacing(paths):
+            os.unlink(self.unit)
+            with open(self.unit, "wb") as handle:
+                handle.write(render_unit(EXEC).encode())  # the same bytes, another file
+            return real_ensure_stores(paths)
+        for change, code in ((removing, "unit_missing"), (replacing, "unit_changed")):
+            for step in (install, upgrade):
+                with self.subTest(step=step.__name__, code=code):
+                    if os.path.lexists(self.unit):
+                        os.unlink(self.unit)
+                    install(self.roots, EXEC)
+                    with self.assertRaises(InstallRefused) as caught, \
+                            mock.patch.object(module, "ensure_stores", side_effect=change):
+                        step(self.roots, EXEC)
+                    self.assertEqual(caught.exception.kind, code)
+        # The last look at the unit's path comes before the unit is let go (so its inode cannot be reused).
+        if os.path.lexists(self.unit):
+            os.unlink(self.unit)
+        install(self.roots, EXEC)
+        real_open, real_close, real_lstat = os.open, os.close, os.lstat
+        events, unit_fds = [], set()
+
+        def opening(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == self.unit:
+                unit_fds.add(fd)
+                events.append("open")
+            return fd
+
+        def closing(fd):
+            if fd in unit_fds:
+                unit_fds.discard(fd)
+                events.append("close")
+            return real_close(fd)
+
+        def looking(path, *args, **kwargs):
+            if os.fspath(path) == self.unit:
+                events.append("lstat")
+            return real_lstat(path, *args, **kwargs)
+        for step in (install, upgrade):
+            with self.subTest(step=step.__name__, check="held"):
+                events.clear()
+                with mock.patch("os.open", side_effect=opening), mock.patch("os.close", side_effect=closing), \
+                        mock.patch("os.lstat", side_effect=looking):
+                    self.assertFalse(step(self.roots, EXEC).changed)
+                self.assertEqual(events.count("close"), 1, events)
+                self.assertEqual(events[-1], "close", events)
+                self.assertEqual(events[-2], "lstat", events)  # the look at the answer, with the unit still held
+
+    def test_a_custody_root_its_owner_cannot_use_is_refused(self) -> None:
+        # Review 1 of #410, DeepSeek F3: a custody root at 0000 has no group or world bit and was accepted,
+        # yet neither the launcher nor route_home.check can use it. Its owner needs read, write and search.
+        os.mkdir(self.homes, 0o700)
+        self.addCleanup(os.chmod, self.homes, 0o700)
+        for mode in (0o000, 0o600, 0o500, 0o300, 0o100):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.homes, mode)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    install(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "folder_untrusted")
+                self.assertEqual(caught.exception.detail, f"{self.homes} must be readable, writable and searchable "
+                                 "by its owner; `chmod 700` it")
+                self.assertEqual(_tree(self.home), before)  # no store, no unit
+        os.chmod(self.homes, 0o700)
+        self.assertTrue(install(self.roots, EXEC).changed)
+
+    def test_ensure_stores_refuses_what_is_not_owned_paths(self) -> None:
+        # Review 1 of #410, DeepSeek F5: every other entry refuses a wrong argument typed; this one raised
+        # AttributeError (a Roots is the easy mistake: every other entry takes one).
+        module = importlib.import_module("recursion_core.daemon_install.install")
+        for wrong in (self.roots, None, self.home):
+            with self.subTest(argument=type(wrong).__name__):
+                with self.assertRaises(InstallRefused) as caught:
+                    module.ensure_stores(wrong)
+                self.assertEqual(caught.exception.kind, "paths")
+        self.assertFalse(os.path.lexists(self.store_dir))
+
     def test_a_custody_root_open_to_anyone_else_is_refused_before_anything_is_made(self) -> None:
         os.mkdir(self.homes, 0o700)
         for mode in (0o740, 0o720, 0o710, 0o704, 0o702, 0o701):  # each bit alone

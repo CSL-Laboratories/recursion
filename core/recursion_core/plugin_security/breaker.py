@@ -15,9 +15,10 @@ plugin whose run faulted cannot borrow another healthy run's id.
 
 Runs outlive a daemon restart (grill Q38), so bindings, faults and trips are kept in a
 SQLite store (WAL, ``synchronous=FULL``) and survive a restart; losing them would remove
-a refusal. Probe leases stay in memory: a restart only means probing again. Like the
-authority ledger, the daemon never creates the store; ``create_breaker_store`` is the
-installer's step, and a missing store refuses. The store is opened through
+a refusal. Probe leases stay in memory: a restart only means probing again. This class never
+creates the store and refuses a missing one; ``create_breaker_store`` is the installer's step.
+The daemon itself still makes a missing one at start (``daemon/breaker.py``,
+``open_breaker_store``) until PLUGIN-HOST's half of the handoff lands. The store is opened through
 ``stores.open_store``, which also refuses a store, a folder or a ``-wal``, ``-shm`` or
 ``-journal`` beside it that is a link, is not ours, or can be written by group or world
 (``breaker_store_untrusted``), and opens with SQLite's ``mode=rw``, so a store removed after

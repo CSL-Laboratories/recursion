@@ -472,11 +472,13 @@ class Install:
 # `$(...)` and backticks, whose commands are read too), after GitHub's `${{ }}` expressions,
 # whose values are known only at run time. A command that runs an installer program, or
 # whose words hold installer text, must be a pip install of hash-locked files, in a job this
-# check found, in a bash step. A `$NAME` expansion is tried with every literal value the
-# script or the job's `env:` gives it; an expansion it cannot resolve before an installer
-# verb, `eval` or `bash -c` of such text, and `source` or `.` of any file are problems. What
-# the shell computes at run time beyond that (text assembled from pieces, files written and
-# then run) is not read.
+# check found, in a bash step. The scripts a command gives to `eval` or to a shell (`-c`, a
+# here-document or here-string) are read the same way, after the `command` and `builtin`
+# prefixes. A `$NAME` expansion is tried with every literal value the script or the job's
+# `env:` gives it; an expansion it cannot resolve before an installer verb, a script for
+# `eval` or a shell built at run time, a shell reading its script from a pipe, and `source`
+# or `.` of any file are problems. What the shell computes at run time beyond that (text
+# assembled from pieces, files written and then run) is not read.
 
 YAML_BREAKS = re.compile("[" + "".join(chr(c) for c in (0x0D, 0x85, 0x2028, 0x2029)) + "]")
 CONTROL = re.compile("[" + "".join(chr(c) for c in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F)) + "]")
@@ -734,6 +736,7 @@ def _block_text(style: str, chomping: str, body: list[str], unbroken: bool = Fal
 class Word:
     text: str
     dynamic: bool  # it holds an expansion or a substitution, whose value is known only at run time
+    stdin: bool = False  # text for the command's standard input: a here-document or here-string
 
 
 SHELL_OPERATORS_BY_LENGTH = (";;&", "&>>", "<<-", "<<<", "&&", "||", ";;", ";&", "|&", ">>", "<<",
@@ -766,23 +769,23 @@ class _Bash:
         self.commands.append(command)
         word: list[str] = []
         plain: list[str] = []  # the word's unquoted characters, for pathname and brace expansion
-        dynamic = started = drop = False
+        dynamic = started = drop = herestring = False
         depth = 0
 
         def end_word() -> None:
-            nonlocal word, plain, dynamic, started, drop
+            nonlocal word, plain, dynamic, started, drop, herestring
             if GLOB_OR_BRACE.search("".join(plain)):
                 dynamic = True
             if started and not drop:
-                command.append(Word("".join(word), dynamic))
+                command.append(Word("".join(word), dynamic, herestring))
             if started:
-                drop = False
+                drop = herestring = False
             word, plain, dynamic, started = [], [], False, False
 
         def new_command() -> None:
-            nonlocal command, drop
+            nonlocal command, drop, herestring
             end_word()
-            drop = False
+            drop = herestring = False
             command = []
             self.commands.append(command)
 
@@ -815,6 +818,12 @@ class _Bash:
             elif c == "`":
                 self.backtick(word)
                 started = dynamic = True
+            elif c in "<>" and s[self.i + 1:self.i + 2] == "(" and not started:
+                start = self.i  # process substitution: a word (a /dev/fd path) whose commands run
+                self.i += 2
+                self.script(stop=")")
+                word.append(s[start:self.i])
+                started = dynamic = True
             elif c == "#" and not started:
                 end = s.find("\n", self.i)
                 self.i = len(s) if end < 0 else end
@@ -838,10 +847,12 @@ class _Bash:
                 if op in REDIRECTIONS:
                     if op in ("<<", "<<-"):
                         self.heredoc(op == "<<-", command)
-                    elif op != "<<<":
+                    elif op == "<<<":
+                        herestring = True  # the next word is text for the command's standard input
+                    else:
                         drop = True  # the target of a redirection is no word of the command
                     continue
-                depth += {"(": 1, ")": -1}.get(op, 0)  # `<(` and `>(`: the redirection, then `(`
+                depth += {"(": 1, ")": -1}.get(op, 0)
                 new_command()
                 if op == "\n":
                     self.read_heredocs()
@@ -942,35 +953,49 @@ class _Bash:
         return False
 
     def ansi_c(self) -> str:
-        s, out = self.s, []
-        while self.i < len(s):
-            c = s[self.i]
-            if c == "'":
-                self.i += 1
-                return "".join(out)
+        """Bash's `$'...'`: the closing quote is found first (a backslash escapes any character),
+        then the escapes are decoded as bash decodes them. A NUL byte is refused: bash cuts the
+        word there."""
+        s, end = self.s, self.i
+        while end < len(s) and s[end] != "'":
+            end += 2 if s[end] == "\\" else 1
+        if end >= len(s):
+            raise LockError("an unterminated $'...'")
+        content, self.i = s[self.i:end], end + 1
+        if "\x00" in content:
+            raise LockError("a ${{ }} expression inside $'...', which this check does not read")
+        out, i = [], 0
+        while i < len(content):
+            c, e = content[i], content[i + 1:i + 2]
             if c != "\\":
                 out.append(c)
-                self.i += 1
-                continue
-            e = s[self.i + 1:self.i + 2]
-            if e in ANSI_C:
+                i += 1
+            elif e in ANSI_C:
                 out.append(ANSI_C[e])
-                self.i += 2
-                continue
-            for pattern, base in ((r"[0-7]{1,3}", 8), (r"x([0-9A-Fa-f]{1,2})", 16), (r"u([0-9A-Fa-f]{1,4})", 16),
-                                  (r"U([0-9A-Fa-f]{1,8})", 16), (r"c(.)", 0)):
-                m = re.compile(pattern, re.S).match(s, self.i + 1)
-                if m:
-                    if base == 0:
-                        out.append(chr(ord(m.group(1).upper()) ^ 0x40))
-                    else:
-                        out.append(chr(int(m.group(1) if m.groups() else m.group(0), base) % 0x110000))
-                    self.i = m.end()
-                    break
+                i += 2
+            elif m := re.compile(r"[0-7]{1,3}").match(content, i + 1):
+                out.append(chr(int(m.group(0), 8) & 0xFF))  # an eight-bit character: 0o560 is "p"
+                i = m.end()
+            elif m := re.compile(r"x([0-9A-Fa-f]{1,2})").match(content, i + 1):
+                out.append(chr(int(m.group(1), 16)))
+                i = m.end()
+            elif m := re.compile(r"u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})").match(content, i + 1):
+                value = int(m.group(1) or m.group(2), 16)
+                if value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+                    raise LockError(f"a $'...' escape for U+{value:X}, which is no character")
+                out.append(chr(value))
+                i = m.end()
+            elif e == "c" and i + 2 < len(content):
+                x = content[i + 2]
+                out.append(chr(0x7F if x == "?" else ord(x.upper()) & 0x1F))
+                i += 4 if x == "\\" and content[i + 3:i + 4] == "\\" else 3
             else:
                 out.append("\\" + e)
-                self.i += 2
-        raise LockError("an unterminated $'...'")
+                i += 2
+        text = "".join(out)
+        if "\x00" in text:
+            raise LockError("a $'...' escape that makes a NUL byte (bash cuts the word there)")
+        return text
 
     def backtick(self, word: list[str]) -> None:
         s, i, inner = self.s, self.i + 1, []
@@ -992,6 +1017,8 @@ class _Bash:
         m = re.compile(r"[ \t]*(?:'([^'\n]*)'|\"([^\"\\$`\n]*)\"|(\\?)([A-Za-z0-9_.+-]+))").match(self.s, self.i)
         if not m:
             raise LockError("a here-document delimiter this check cannot read")
+        if self.s[m.end():m.end() + 1] not in ("", " ", "\t", "\n", ";", "&", "|", "<", ">", "(", ")"):
+            raise LockError("a here-document delimiter this check cannot read")
         quoted = m.group(4) is None or bool(m.group(3))
         delimiter = m.group(1) if m.group(1) is not None else m.group(2) if m.group(2) is not None else m.group(4)
         self.heredocs.append((delimiter, strip_tabs, quoted, command))
@@ -1011,10 +1038,13 @@ class _Bash:
                     break
                 body.append(line)
             text = "\n".join(body)
-            if not quoted and re.search(r"\$\(|`", text):
-                raise LockError("a command substitution in an unquoted here-document, which this check does not read")
+            if not quoted:
+                if re.search(r"\$\(|`", text):
+                    raise LockError("a command substitution in an unquoted here-document, which this check does not read")
+                # bash drops a backslash before $, `, \ and a line break (joining the two lines)
+                text = re.sub(r"\\([$`\\\n])", lambda m: "" if m.group(1) == "\n" else m.group(1), text)
             command.append(Word(re.sub(r"\x00(\d+)\x01", lambda m: self.expressions[int(m.group(1))], text),
-                                "\x00" in text or (not quoted and "$" in text)))
+                                "\x00" in text or (not quoted and "$" in text), True))
         self.heredocs = []
 
 
@@ -1036,6 +1066,91 @@ def shell_commands(script: str) -> list[list[Word]]:
 
 
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=", re.S)
+SHELLS = {"bash", "sh", "dash", "zsh", "ksh", "mksh", "ash"}
+NESTING = 8
+
+
+def _named(words: list[Word]) -> tuple[list[Word], int | None]:
+    """A command's words other than its standard input, and where its own name is among them:
+    after assignments, reserved words and the `command` and `builtin` prefixes (with their
+    options and `--`), which run the builtin named after them."""
+    args = [w for w in words if not w.stdin]
+    index = 0
+    while index < len(args):
+        text = args[index].text
+        if ASSIGNMENT.match(text) or text in RESERVED_WORDS:
+            index += 1
+        elif text in ("command", "builtin"):
+            index += 1
+            while index < len(args) and (args[index].text == "--"
+                                         or (text == "command" and re.fullmatch(r"-[pvV]+", args[index].text))):
+                index += 1
+        else:
+            return args, index
+    return args, None
+
+
+def _nested_scripts(words: list[Word]) -> list[str]:
+    """The scripts a command runs as bash: an `eval`'s words, a shell's `-c` argument, or the
+    here-document or here-string a shell reads. `source` and `.`, a script built at run time,
+    and a shell reading its script from a pipe are refused; a script file is not read."""
+    args, index = _named(words)
+    if index is None:
+        return []
+    name = args[index].text
+    if name in ("source", "."):
+        raise LockError(f"{name} runs a file's text as the script, which this check does not read")
+    if name == "eval":
+        if any(w.dynamic for w in args[index + 1:]):
+            raise LockError("eval of text built at run time, which this check does not read")
+        return [" ".join(w.text for w in args[index + 1:])]
+    stdin = [w for w in words if w.stdin]
+    for at, word in enumerate(args):
+        shell = Path(word.text).name
+        if shell not in SHELLS:
+            continue
+        k, from_option, from_stdin = at + 1, False, False
+        while k < len(args):
+            text = args[k].text
+            if text in ("--", "-"):
+                k += 1
+                break
+            if text in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+                k += 2
+            elif len(text) > 1 and text[0] in "-+":
+                if text[0] == "-" and not text.startswith("--"):
+                    from_option |= "c" in text[1:]
+                    from_stdin |= "s" in text[1:]
+                k += 1
+            else:
+                break
+        if from_option:
+            if k >= len(args) or args[k].dynamic:
+                raise LockError(f"{shell} of text built at run time, which this check does not read")
+            return [args[k].text]
+        if k < len(args) and not from_stdin:
+            return []  # a script file (`bash x.sh`, `bash <(curl ...)`): not read, as the pull request says
+        if not stdin:
+            raise LockError(f"{shell} reading its script from a pipe or a file, which this check does not read")
+        if any(w.dynamic for w in stdin):
+            raise LockError(f"{shell} of text built at run time, which this check does not read")
+        return [w.text for w in stdin]
+    return []
+
+
+def script_commands(script: str) -> list[list[Word]]:
+    """Every simple command a `run:` value runs: its own, and those of every script it gives to
+    `eval` or to a shell, read in turn."""
+    pending = [(command, 0) for command in shell_commands(script)]
+    commands: list[list[Word]] = []
+    while pending:
+        command, depth = pending.pop(0)
+        commands.append(command)
+        for text in _nested_scripts(command):
+            if depth >= NESTING:
+                raise LockError("scripts nested deeper than this check reads")
+            pending.extend((sub, depth + 1) for sub in shell_commands(text))
+    return commands
 
 
 def _resolve(path: str, env: dict[str, set[str]]) -> str:
@@ -1061,6 +1176,18 @@ def _pip_install_args(command: list[str]) -> list[str] | None:
         if Path(before).name in ("pip", "pip3") or before == "-mpip":
             return command[index + 1:]
     return None
+
+
+def _installer_before_pip(command: list[str]) -> str | None:
+    """An installer program that runs this pip install (`uvx pip install`, `pipx run pip
+    install`, `uv run pip install`), which may install packages of its own; `uv pip install` is
+    uv's own pip, a spelling this check reads."""
+    at = next(index for index, token in enumerate(command) if token == "install" and index
+              and (Path(command[index - 1]).name in ("pip", "pip3") or command[index - 1] == "-mpip"))
+    before = command[:at - 1]
+    if before and Path(before[-1]).name == "uv":
+        before = before[:-1]
+    return next((token for token in before if INSTALLER_PROGRAM.fullmatch(token)), None)
 
 
 def _requirement_files(args: list[str], env: dict[str, set[str]]) -> list[str]:
@@ -1097,7 +1224,7 @@ def shell_variables(commands: list[list[Word]], env: dict[str, set[str]]) -> dic
                                           for name, texts in env.items()}
     for words in commands:
         for word in words:
-            match = ASSIGNMENT.match(word.text)
+            match = None if word.stdin else ASSIGNMENT.match(word.text)
             if not match:
                 continue
             name = word.text[:match.end()].rstrip("+=")
@@ -1139,9 +1266,6 @@ def unread_command(words: list[Word], variables: dict[str, set[str] | None]) -> 
     literal value the script or the job gives them; other run-time values are not read."""
     texts = [w.text for w in words]
     why = _literal_refusal(texts)
-    named = [t for t in texts if not ASSIGNMENT.match(t) and t not in RESERVED_WORDS]
-    if not why and named and named[0] in ("source", "."):
-        why = f"{named[0]} runs a file's text as the script, which this check does not read"
     if why or not any(w.dynamic for w in words):
         return why
     options: list[list[str]] = [[]]
@@ -1159,8 +1283,6 @@ def unread_command(words: list[Word], variables: dict[str, set[str] | None]) -> 
     verb = next((i for i, t in enumerate(texts) if t in INSTALLER_VERBS), None)
     if verb is not None and any(i < verb for i in unresolved):
         return "an installer verb after an expansion this check cannot resolve"
-    if unresolved and named and (named[0] == "eval" or (Path(named[0]).name in ("bash", "sh") and "-c" in texts)):
-        return f"{named[0]} of text built at run time, which this check does not read"
     for option in options:
         if _pip_install_args(option) is not None:
             return "a pip install through a variable, which this check does not read"
@@ -1211,7 +1333,7 @@ def workflow_installs(source: str, text: str) -> tuple[list[Install], list[str]]
                 problems.append(f"{line}: installer text in {what} this check does not read")
             continue
         try:
-            commands = shell_commands(scalar.text)
+            commands = script_commands(scalar.text)
         except LockError as exc:
             problems.append(f"{line}: a run step this check cannot read as bash: {exc}")
             continue
@@ -1237,6 +1359,9 @@ def workflow_installs(source: str, text: str) -> tuple[list[Install], list[str]]
                     if why:
                         raise LockError(f"{why}: {' '.join(texts)!r}")
                     continue
+                runner_program = _installer_before_pip(texts)
+                if runner_program:
+                    raise LockError(f"a pip install run through {runner_program!r}, which may install packages itself")
                 if shell.split()[:1] != ["bash"]:
                     raise LockError(f"a pip install in a step whose shell is {shell!r}; this check reads bash")
                 files = _requirement_files(args, env)

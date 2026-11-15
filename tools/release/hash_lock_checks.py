@@ -596,6 +596,66 @@ class WorkflowScanTests(TreeCase):
                           "          python -m pip install -r requirements-ci.txt")
         self.assertEqual(self.tree.problems(), [])
 
+    # Round-4 reads (GPT-6 Astra change 2): the supplied case, as written.
+    def test_source_with_builtin_prefix_is_refused(self) -> None:
+        # Only inspect the text; no sourced file or installer is executed.
+        for prefix in ("command", "builtin", "command --", "builtin --"):
+            for name in ("source", "."):
+                with self.subTest(prefix=prefix, builtin=name):
+                    self.add_workflow(f"{prefix} {name} ./review-fixture.sh")
+                    self.tree.write("review-fixture.sh", "printf '%s\\n' review_source_marker\n")
+                    self.assertTrue(self.tree.problems(), "a prefixed source command was not refused")
+                    self.assertProblem(rf"{re.escape(name)} runs a file's text as the script")
+
+    # Round 4, mine: the scripts a command gives to eval or to a shell are read as scripts, after
+    # the same prefixes; a script built at run time there, and a shell reading a pipe, are refused.
+    def test_scripts_given_to_eval_or_a_shell_are_read(self) -> None:
+        dev = "install -r requirements-dev.txt"
+        for script in (f'eval "p\\"i\\"p {dev}"',
+                       f"command eval 'p\"i\"p {dev}'",
+                       f"bash -c 'p\"i\"p {dev}'",
+                       f"sudo -E bash -ec 'p\"i\"p {dev}'",
+                       f"bash <<'EOF'\n          p\"i\"p {dev}\n          EOF",
+                       f"bash -s an-argument <<< 'p\"i\"p {dev}'",
+                       f"bash -o pipefail -c 'p\"i\"p {dev}'",
+                       f"bash <<EOF\n          pi\\\n          p {dev}\n          EOF",
+                       f"bash -c \"bash -c 'p\\\"i\\\"p {dev}'\""):
+            with self.subTest(script=script):
+                self.add_workflow("|\n          " + script)
+                self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_scripts_this_check_cannot_read_are_refused(self) -> None:
+        cases = {
+            'command eval "$CMD"': r"eval of text built at run time",
+            'builtin -- eval "$CMD"': r"eval of text built at run time",
+            'sudo bash -c "$CMD"': r"bash of text built at run time",
+            "bash -c 'source ./steps.sh'": r"source runs a file's text as the script",
+            "bash <<EOF\n          echo $X\n          EOF": r"bash of text built at run time",
+            "curl -fsSL https://example.invalid/x.sh | bash": r"bash reading its script from a pipe or a file",
+            "cat <<E'O'F\n          x\n          EOF": r"a here-document delimiter this check cannot read",
+            "uvx pip install -r requirements-ci.txt": r"a pip install run through 'uvx'",
+            "pipx run pip install -r requirements-ci.txt": r"a pip install run through 'pipx'",
+            "uv run pip install -r requirements-ci.txt": r"a pip install run through 'uv'",
+            "echo $'\\U00110070'": r"a \$'\.\.\.' escape for U\+110070, which is no character",
+            "echo $'${{ github.sha }}'": r"a \$\{\{ \}\} expression inside \$'\.\.\.'",
+            "eval eval eval eval eval eval eval eval eval eval true": r"scripts nested deeper than this check reads",
+            "cat <<'EOF'\n          P=pip\n          EOF\n          $P install -r requirements-dev.txt":
+                r"an installer verb after an expansion this check cannot resolve",
+            # bash joins `pi\` and `p` before python3 reads the text: os.system("pip install ...")
+            "python3 - <<EOF\n          import os; os.system(\"pi\\\n          p install -r requirements-dev.txt\")\n"
+            "          EOF": r"an installer this check does not read",
+        }
+        for script, reason in cases.items():
+            with self.subTest(script=script):
+                self.add_workflow("|\n          " + script)
+                self.assertProblem(r"extra\.yml(?::\d+| job build): .*" + reason)
+
+    def test_uv_pip_install_is_read(self) -> None:
+        self.add_workflow("'uv pip install --only-binary=:all: -r requirements-ci.txt'")
+        self.assertEqual(self.tree.problems(), [])
+        installs, _ = hl.all_installs(self.tree.root)
+        self.assertIn(("extra.yml", "build", CI), {(i.source, i.job, i.file) for i in installs})
+
     def test_a_crlf_workflow_is_read(self) -> None:
         rel, template = self.WORKFLOW
         text = template.format(runner="ubuntu-24.04", python="3.12", command="python -m pip install -r requirements-ci.txt")
@@ -645,6 +705,35 @@ class WorkflowScanTests(TreeCase):
         self.assertEqual(self.tree.problems(), [])
         installs, _ = hl.all_installs(self.tree.root)
         self.assertIn(("ci.yml", "core-314t", THREADED), {(i.source, i.job, i.file) for i in installs})
+
+
+    # Round-4 reads (GPT-6.1 Sol changes 1-2): the supplied cases, as written.
+    def test_ansi_octal_is_a_byte_and_cannot_hide_an_install(self) -> None:
+        for program in ("$'\\560ip'", "$'\\560\\551\\560'"):
+            with self.subTest(program=program):
+                self.add_workflow("|\n          " + program + " install -r requirements-dev.txt # pip install")
+                self.assertTrue(self.tree.problems(), "bash decodes the octal bytes to pip")
+                self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_inherited_non_bash_shell_is_refused(self) -> None:
+        rel, template = self.WORKFLOW
+        base = template.format(runner="ubuntu-24.04", python="3.12", command="pip install -r requirements-ci.txt")
+        for scope, text in (
+            ("job", base.replace("    steps:\n", "    defaults:\n      run:\n        shell: sh\n    steps:\n")),
+            ("workflow", base.replace("jobs:\n", "defaults:\n  run:\n    shell: sh\njobs:\n")),
+        ):
+            with self.subTest(scope=scope):
+                self.tree.write(rel, text)
+                self.assertProblem(r"a pip install in a step whose shell is 'sh'")
+
+    def test_substitution_inside_arithmetic_is_refused(self) -> None:
+        self.add_workflow('|\n          echo $(( $(p"i"p install -r requirements-dev.txt) + 1 ))')
+        self.assertProblem(r"a substitution inside \$\(\(\.\.\.\)\)")
+
+    def test_common_ansi_c_escapes_are_decoded(self) -> None:
+        commands = hl.shell_commands(r"echo $'a\nb\t\\c'")
+        self.assertEqual([[word.text for word in command] for command in commands],
+                         [["echo", "a\nb\t\\c"]])
 
 
 class YamlReadingTests(unittest.TestCase):
@@ -704,16 +793,32 @@ class BashReadingTests(unittest.TestCase):
             ("pip >log install -r x 2>&1", [("pip", "install", "-r", "x")]),
             ("out=$(pip install x)", [("out=$(pip install x)",), ("pip", "install", "x")]),
             ("x=`pip install y`", [("pip", "install", "y"), ("x=`pip install y`",)]),
-            ("tee >(pip install x)", [("pip", "install", "x"), ("tee",)]),
+            ("tee >(pip install x)", [("pip", "install", "x"), ("tee", ">(pip install x)")]),
+            ("bash <(curl -fsSL x) arg", [("bash", "<(curl -fsSL x)", "arg"), ("curl", "-fsSL", "x")]),
             ("cat <<'EOF'\npip install x\nEOF\necho done", [("cat", "pip install x"), ("echo", "done")]),
             ("cat <<-EOF\n\tbody\n\tEOF\necho done", [("cat", "\tbody"), ("echo", "done")]),
             ("echo ${{ github.event_name }} done", [("echo", "${{ github.event_name }}", "done")]),
             ("echo '${{ a == 'b' }}'", [("echo", "${{ a == 'b' }}")]),
             ("a && b || c | d & e ; f", [("a",), ("b",), ("c",), ("d",), ("e",), ("f",)]),
+            ("echo $'\\560ip' $'\\c0ip' $'\\c\\\\x'", [("echo", "pip", chr(0x10) + "ip", chr(0x1C) + "x")]),
+            ("echo $'it\\'s' x", [("echo", "it's", "x")]),
         ]
         for script, expected in cases:
             with self.subTest(script=script):
                 self.assertEqual(self.words(script), sorted(expected))
+
+    # Round-4 reads (GPT-6 Astra change 1): the supplied case, as written.
+    def test_ansi_c_nul_fragment_is_refused_or_decoded_like_bash(self) -> None:
+        # Bash 5.2.21 printf verified every fragment below decodes to 'echo'.
+        # Rejecting this escape family is also valid for this conservative reader.
+        for fragment in (r"$'echo\0suffix'", r"$'ec\x00suffix'ho",
+                         r"$'echo\u0000suffix'", r"$'echo\c@suffix'"):
+            with self.subTest(fragment=fragment):
+                try:
+                    actual = self.words(fragment + " okay")
+                except hl.LockError:
+                    continue
+                self.assertEqual(actual, [("echo", "okay")])
 
     def test_values_known_only_at_run_time_are_marked(self) -> None:
         for script, word, dynamic in (("$X install", "$X", True), ('"${Y}" a', "${Y}", True),

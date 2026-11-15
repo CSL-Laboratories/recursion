@@ -108,9 +108,11 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
     the hand-over, in the owner's own worker, is the driver's own try/finally, and the fallback is no
     promise to record a final result or to call ``fault_run``.
     A hand-over is all or nothing. ``owner.run`` either raises with no worker holding the run, or
-    returns with the worker holding it. It never raises once the worker has the run: the fallback
-    would settle a run that a worker is still driving. The finish step runs on the worker, never
-    inside ``owner.run``.
+    returns with the worker holding it: a hand-over that raises leaves no worker behind that still
+    owns the run. It never raises once the worker has the run: the fallback would settle a run that
+    a worker is still driving. The finish step runs on the worker, never inside ``owner.run``. After
+    a hand-over that returned, the worker is the registered service's. The lane that drives Claude
+    Code registers that service under the name ``routes.driver_cc``.
     On today's path (no owner, or one that declined) no lifetime reference is held for the whole of
     an engine's stream: closing the daemon leaves the run alive.
 S10 ``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's
@@ -520,14 +522,24 @@ class Admission:
 
     def close(self) -> None:
         """No call is admitted from here on. An interruption while the condition is being taken is kept: the gate
-        is closed all the same, the condition is released, and only then is the interruption raised. The condition
-        is never left owned by a closer that was interrupted."""
+        is closed all the same, the condition is released, and only then is the interruption raised.
+
+        The taking, the way back from it and the closing are ONE protected region: an interruption anywhere in
+        it is kept, a condition this thread then owns is released, and the closing is tried again until the gate
+        IS closed. So this method does not raise with the gate open, and an interruption on the return from the
+        taking does not leave the condition owned. (What is not claimed: an interruption that lands inside the
+        release itself.)"""
         kept: list = []
-        take_once(self._lock, kept)
-        try:
-            self._closed = True
-        finally:
-            self._lock.release()
+        while True:
+            try:
+                take_once(self._lock, kept)
+                self._closed = True
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the gate is not known to be closed yet
+                kept.append(exc)
+            finally:
+                if self._lock._is_owned():
+                    self._lock.release()
         raise_kept(kept)
 
     @property
@@ -542,14 +554,17 @@ class Admission:
         """Return when no admitted call is left, and not before. An interruption while the condition is being
         taken, or while it is waited on, is kept and the drain goes on; the first one is raised once every call
         has left. So an exception from this method is raised only AFTER the last call left, and a caller that
-        wants to be sure calls it until it returns. Whichever way it ends, the condition is free again: an
-        interruption that lands just after the condition was taken does not leave it owned."""
+        wants to be sure calls it until it returns. Whichever way it ends, the condition is free again.
+
+        As in ``close``, the taking of the condition, the way back from it and the wait are one protected
+        region: an interruption on the return from the taking is kept like any other, a condition this thread
+        then owns is released, and the wait starts again."""
         if not self.enabled:
             return
         kept: list = []
         while True:
-            take_once(self._lock, kept)         # held once, also when the taking itself was interrupted
             try:
+                take_once(self._lock, kept)     # held once; the taking and its return are inside the region
                 while self._admitted > 0:
                     if not self._changed.wait(self.stall_log_s):
                         log.warning('closing waits for %d admitted call(s); services and stores stay alive',
@@ -559,7 +574,8 @@ class Admission:
                 kept.append(exc)
                 log.warning('the wait for admitted calls was interrupted (%s); it goes on', type(exc).__name__)
             finally:
-                self._lock.release()            # once for the one taking: the condition is never left owned
+                if self._lock._is_owned():      # once for the one taking; none where the taking never got it
+                    self._lock.release()
         raise_kept(kept)
 
 

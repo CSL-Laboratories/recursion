@@ -334,12 +334,13 @@ class ShutdownFenceTest(unittest.TestCase):
         app = TuiApp(FakeDriver().api, clock=clock, environ={"NO_COLOR": "1"}, stale_after_s=10.0)
         app.open()
         app.close()
-        count = len(app.log)
+        count, shown = len(app.log), dict(app.shown)
         clock.now += 60  # the snapshot is stale now: a frame would say STALE, but the log has ended
         app.frame()
         app.live_rows()
         self.assertEqual(len(app.log), count)
         self.assertEqual(list(app.log)[-1].event_type, "close")
+        self.assertEqual(app.shown, shown, "the conditions said stay as they were at the end")
 
 
 if __name__ == "__main__":

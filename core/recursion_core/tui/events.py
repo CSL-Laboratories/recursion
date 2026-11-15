@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import collections
 import json
+import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 
@@ -42,14 +43,32 @@ class Event:
 
 
 class EventLog:
-    """Append-only, bounded. Readers keep the last ``seq`` they rendered and ask for what is newer."""
+    """Append-only, bounded. Readers keep the last ``seq`` they rendered and ask for what is newer.
+
+    ``append_last`` appends the final event and seals the log in one step: any append after it, even one
+    that a busy thread had already started, is refused (it returns None), so the final event stays last."""
 
     def __init__(self, cap: int = LOG_CAP) -> None:
         self._events: collections.deque[Event] = collections.deque(maxlen=cap)
         self.last_seq = 0
+        self.sealed = False
+        self._lock = threading.Lock()
 
     def append(self, time_rel_ms: int, event_type: str, source: str, state: str, text: str, speech: str,
-               focus: str) -> Event:
+               focus: str) -> Event | None:
+        with self._lock:
+            return self._append(time_rel_ms, event_type, source, state, text, speech, focus)
+
+    def append_last(self, time_rel_ms: int, event_type: str, source: str, state: str, text: str, speech: str,
+                    focus: str) -> Event | None:
+        with self._lock:
+            event = self._append(time_rel_ms, event_type, source, state, text, speech, focus)
+            self.sealed = True
+            return event
+
+    def _append(self, time_rel_ms, event_type, source, state, text, speech, focus) -> Event | None:
+        if self.sealed:
+            return None
         self.last_seq += 1
         event = Event(self.last_seq, time_rel_ms, event_type, source,
                       "untrusted" if source == "engine" else "trusted", state, text, speech, focus)

@@ -19,9 +19,11 @@ EIO that a hung-up terminal gives on restoring its mode or on the last writes is
 any other error is raised.
 
 The terminal is put in raw input mode, with output processing left as it was: no echo, no line
-editing, and no control character acts by itself (no signal from Ctrl-C, Ctrl-Z or Ctrl-\\, no Ctrl-S
-flow control, no Ctrl-V literal), so a control character inside a paste stays inside it. Ctrl-C
-arrives as the key ``ctrl+c``, which closes the TUI as before.
+editing, no input translation (CR, LF, parity, stripping, break), and no control character acts by
+itself (no signal from Ctrl-C, Ctrl-Z or Ctrl-\\, no Ctrl-S flow control, no Ctrl-V literal), so every
+byte of a paste reaches the decoder as sent. Ctrl-C arrives as the key ``ctrl+c``, which ends the TUI as
+before. A hangup is the EIO a hung-up terminal gives, after the end of input was read or when the
+terminal reports POLLHUP (a ``q`` already read, then the hangup).
 
 Keys come from ``keys.KeyDecoder``: every character of a read, in order, CSI and SS3 keys by name, a
 lone Esc after ``keys.ESC_WAIT_S``, and a bracketed paste (turned on while the TUI runs) as one
@@ -135,7 +137,11 @@ class Tty:
 
         saved = termios.tcgetattr(self.fd)
         mode = list(saved)
-        mode[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK | termios.ISTRIP | termios.IXON)  # iflag
+        # iflag: every input translation off, as tty.cfmakeraw does: an inherited IGNCR or INLCR would drop
+        # or rewrite a pasted CR or LF (review of a1f16a20, C2).
+        mode[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.IGNPAR | termios.PARMRK | termios.INPCK
+                     | termios.ISTRIP | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON
+                     | termios.IXANY | termios.IXOFF)
         mode[2] = (mode[2] & ~(termios.CSIZE | termios.PARENB)) | termios.CS8  # cflag
         mode[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)  # lflag
         mode[6] = list(mode[6])
@@ -147,8 +153,20 @@ class Tty:
             try:
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
             except termios.error as err:  # a hung-up terminal has no mode to restore: that is its EIO
-                if not (self.eof and err.args and err.args[0] == errno.EIO):
+                eio = bool(err.args and err.args[0] == errno.EIO)
+                # The hangup may come after the last read (q was already read): ask the terminal itself.
+                if not (eio and (self.eof or self._hung_up())):
                     raise
+
+    def _hung_up(self) -> bool:
+        """The terminal reports a hangup now (POLLHUP), whether or not a read has seen it yet."""
+
+        poll = getattr(select, "poll", None)
+        if poll is None:
+            return False
+        poller = poll()
+        poller.register(self.fd, select.POLLIN)
+        return any(flags & select.POLLHUP for _, flags in poller.poll(0))
 
     def read_key(self, timeout: float) -> Key | None:
         """The next key, waiting up to ``timeout`` for input; None when there is none (or at the end)."""
@@ -177,7 +195,8 @@ class Tty:
         """One read, plus the short waits that tell a lone Esc from the start of a sequence."""
 
         decoder, keys = self._decoder, []
-        held_before = decoder.holding
+        held_before = decoder.holding  # part of a key held from an earlier read
+        dropped = False  # an unfinished sequence that the wait ended without a key (review of a1f16a20, C3)
         data = self._read(timeout)
         while data is not None:
             if not data:
@@ -189,9 +208,12 @@ class Tty:
                 break
             data = self._read(self.esc_wait_s)
             if data is None:
-                keys += decoder.timeout()
-        # Other input in the same read: another key, or part of one still held (before or after).
-        burst = len(keys) > 1 or bool(keys) and (held_before or decoder.holding)
+                timed_out = decoder.timeout()  # a lone ESC becomes esc; a longer unfinished sequence is dropped
+                dropped = not timed_out
+                keys += timed_out
+        # Other input in the same read: another key, part of one held before or after it, or a sequence
+        # the wait dropped. (A lone Esc, or one key split over the wait, is one key, not a burst.)
+        burst = len(keys) > 1 or bool(keys) and (held_before or dropped or decoder.holding)
         self._ready.extend((key, burst) for key in keys)
 
 

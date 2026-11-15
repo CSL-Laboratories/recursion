@@ -71,13 +71,16 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   burst Enter, or the first Enter on a line that took burst input, does not send it (the next Enter on
   its own does). The TUI says so each time. Input that arrives one key per read cannot be told from
   typing, so a slow unbracketed paste still acts as keys; bracketed paste is the protection.
-- The terminal is in raw input mode while the TUI runs (output processing unchanged): no control
-  character acts by itself, so a Ctrl-C, Ctrl-Z or Ctrl-S inside a paste stays inside it. Ctrl-C
-  arrives as a key and closes the TUI from any mode; Ctrl-Z no longer suspends it.
-- The end: a hangup (a read of nothing, or EIO) closes the TUI with exit 0 through restoring the mode
-  and the last writes, where the hung-up terminal's EIO is expected; any other error is raised. After
-  close the app takes no key, answer or output, and once `Loop.shutdown()` returns no frame is painted,
-  so `close` is the last event even if a loop thread is still busy.
+- The terminal is in raw input mode while the TUI runs (output processing unchanged): no input
+  translation (an inherited IGNCR or INLCR is turned off, then restored) and no control character acts
+  by itself, so every byte of a paste, CR, LF and Ctrl-C included, arrives as sent. Ctrl-C arrives as a
+  key and ends the TUI from any mode; Ctrl-Z no longer suspends it.
+- The end: a hangup ends the TUI with exit 0 through restoring the mode and the last writes. The
+  hung-up terminal's EIO is expected there, whether a read saw the end of input or the terminal reports
+  POLLHUP (a `q` already read, then the hangup); any other error is raised. Ending takes the app's state
+  lock, so a state change already under way finishes first and none starts after it; the event log
+  appends the final event and seals itself in one step, so an append another thread had already begun
+  is refused; and once `Loop.shutdown()` returns no frame is painted. The final event is the last.
 - Stop: `s` fixes the target, and `y` sends `run.stop`. `stop RUN` on the command line also works. The
   screen shows the API's own answer: `status=stopped`, or `status=pending` plus an `UNCERTAIN` line.
   Stop needs no input lease and has its own request lane, so it never waits behind a slow read. Keys are

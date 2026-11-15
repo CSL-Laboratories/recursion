@@ -124,6 +124,9 @@ class TuiApp:
         self._line_burst = self._stop_burst = False
         self.notice = ""
         self.closed = False
+        # Held while the app's state changes, and by close(); never while reading a caller's answer or
+        # logging engine output, so close() cannot wait on a stalled thread (reviews of a1f16a20, C4).
+        self._lock = threading.RLock()
         self._state = "live"
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
         self.outputs: dict[str, _Output] = {}
@@ -132,11 +135,12 @@ class TuiApp:
     # -- the event log --------------------------------------------------------------------------
     def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
               state: str | None = None) -> Event | None:
-        if self.closed and event_type != "close":
-            return None  # close is the last event, whatever a late answer, output or frame does after it
         ms = int(round((self._clock() - self._t0) * 1000))
-        return self.log.append(ms, event_type, source, state or self._view_state(), text,
-                               text if speech is None else speech, self._focus())
+        # The final event seals the log in the same step: any later append, even one a busy thread had
+        # already begun, is refused by the log itself, so the final event stays last.
+        append = self.log.append_last if event_type == "close" else self.log.append
+        return append(ms, event_type, source, state or self._view_state(), text,
+                      text if speech is None else speech, self._focus())
 
     @property
     def transcript(self) -> list[str]:
@@ -174,33 +178,37 @@ class TuiApp:
         """Closing sends nothing. After it the app takes no key, answer or output: nothing is logged,
         sent or changed, so a thread that is still busy cannot add to the log or send a request."""
 
-        if self.closed:
-            return
-        self.closed = True
-        self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
+        with self._lock:  # a state change already under way finishes first; none starts after this
+            self.closed = True  # a second call changes nothing: the sealed log refuses its event
+            self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
 
     # -- requests -------------------------------------------------------------------------------
     def request(self, method: str, params: dict) -> None:
         if method not in p.ALLOWED_METHODS:  # defensive: nothing outside the CLI's method set leaves the TUI
             raise ValueError(method)
-        if self.closed:
-            return
-        if method == "run.start" and self.watch_only:
-            self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
-            return
-        self.in_flight[method] += 1
-        self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
-        self.dispatch(method, params, self.on_answer)
+        with self._lock:
+            if self.closed:
+                return
+            if method == "run.start" and self.watch_only:
+                self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
+                return
+            self.in_flight[method] += 1
+            self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
+            self.dispatch(method, params, self.on_answer)
 
     def _inline(self, method: str, params: dict, done: Callable[[str, dict, dict], None]) -> None:
         done(method, params, call_api(self._api, method, params))
 
     def on_answer(self, method: str, params: dict, answer: dict) -> None:
-        if self.closed:
-            return
+        code = answer.get("code")  # read before taking the lock: the answer is the caller's object
+        with self._lock:
+            if self.closed:  # the TUI ended while the answer was read: it changes nothing
+                return
+            self._apply_answer(method, params, answer, code)
+
+    def _apply_answer(self, method: str, params: dict, answer: dict, code) -> None:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
         self.last, self.last_method = answer, method
-        code = answer.get("code")
         # A Stop answer confirms only the run it was sent for (ADV2-11): one that names another run,
         # or none, changes no run and is shown as a mismatch, never as this run's Stop.
         mismatch = (method == "run.stop" and code in ("stopped", "pending")
@@ -281,16 +289,18 @@ class TuiApp:
 
     # -- engine output (no control API stream exists yet; the caller feeds events here) ----------
     def on_event(self, event: Mapping) -> None:
-        if self.closed:
-            return
-        run_id = str(event.get("run_id"))
-        out = self.outputs.get(run_id)
-        if out is None:
-            out = self.outputs[run_id] = _Output(self._output_lines, run_id)
-        chunk, done = out.feed(event.get("text", ""))
-        # Logged already sanitized; the linear renderer says each finished line once, marked as output.
-        self._emit("output", "engine", chunk, speech="\n".join(out.label + line for line in done),
-                   state=self._state)
+        run_id, text = str(event.get("run_id")), event.get("text", "")  # the caller's object, read unlocked
+        with self._lock:
+            if self.closed:
+                return
+            out = self.outputs.get(run_id)
+            if out is None:
+                out = self.outputs[run_id] = _Output(self._output_lines, run_id)
+            chunk, done = out.feed(text)
+            speech, state = "\n".join(out.label + line for line in done), self._state
+        # Logged already sanitized, outside the lock; the linear renderer says each finished line once,
+        # marked as output. If the TUI ended meanwhile, the sealed log refuses it.
+        self._emit("output", "engine", chunk, speech=speech, state=state)
 
     # -- keys -----------------------------------------------------------------------------------
     def press(self, key: Key, *, burst: bool = False) -> None:
@@ -300,6 +310,10 @@ class TuiApp:
         can the next key, when the Stop was armed or the line typed with burst input. This is a heuristic
         for an unbracketed paste: input that arrives one key per read cannot be told from typing."""
 
+        with self._lock:
+            self._press(key, burst)
+
+    def _press(self, key: Key, burst: bool) -> None:
         if self.closed:
             return
         if key == "ctrl+c":  # the terminal sends Ctrl-C as a key (raw mode); it closes, from any mode
@@ -459,6 +473,11 @@ class TuiApp:
     def sync_conditions(self) -> None:
         """Log each condition that appeared, changed or cleared since the last sync; nothing else."""
 
+        with self._lock:
+            if not self.closed:
+                self._sync_conditions()
+
+    def _sync_conditions(self) -> None:
         now = self._current()
         for key, (label, text) in self.shown.items():
             if key not in now:

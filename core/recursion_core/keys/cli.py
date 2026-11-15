@@ -253,15 +253,16 @@ def run(args, out=None, err=None, *, store: KeyStore | None = None, terminal: Te
         print('refused: value_from_argv: the command line holds words this command does not take, and a key is never '
               'taken from the command line; nothing was done (and what was typed is not repeated here)', file=err)
         return 2
-    refused = 3 if args.key_action == 'audit' else 1
+    action = getattr(args, 'key_action', None)
+    refused = 3 if action == 'audit' else 1
     try:
-        if args.key_action == 'add':
+        if action == 'add':
             return _add(args, out, err, store, terminal, stdin)
-        if args.key_action == 'list':
+        if action == 'list':
             return _list(args, out, store)
-        if args.key_action == 'remove':
+        if action == 'remove':
             return _remove(args, out, err, store, terminal)
-        if args.key_action == 'audit':
+        if action == 'audit':
             return _audit(args, out, err, store)
     except KeyStoreError as exc:
         return _refused(err, exc, refused)

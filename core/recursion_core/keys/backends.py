@@ -1,20 +1,27 @@
 """Where a key's VALUE is kept: the Secret Service (through ``secret-tool``) or the owner-only file.
 
-Each backend has ``get(key_id, folder, save_id)``, ``put(key_id, value, folder, keep, save_id=...)``,
-``delete(key_id, folder, keep)`` and ``holds(key_id, folder)``. ``folder`` is the store's open, checked folder
-(only the owner-only file uses it); ``keep`` is the set of ids the store's index will hold once the call is
-done, so the owner-only file also drops a value whose id the index no longer has. ``save_id`` is the random id
-the index records for one save of a key. ``holds`` says whether a value for the id is there: True, False only
-when that is verified, None when it cannot be told. A missing value is ``secret_missing``; any other failure is
-a typed ``KeyStoreError``. No error, repr or log line of a backend carries a value.
+Each backend is made for one store (its random id, from the index) and has ``get(key_id, folder, record)``,
+``put(key_id, value, folder, keep, record=...)``, ``delete(key_id, folder, keep)`` and ``holds(key_id, folder)``.
+``folder`` is the store's open, checked folder (only the owner-only file uses it); ``keep`` is the set of ids the
+store's index will hold once the call is done, so the owner-only file also drops a value whose id the index no
+longer has. ``holds`` says whether a value for the id is there: True, False only when that is verified, None when
+it cannot be told. A missing value is ``secret_missing``; any other failure is a typed ``KeyStoreError``. No
+error, repr or log line of a backend carries a value.
+
+THE BINDING. A value is stored WITH what authorizes it: the store's id, the save id of the record that saved it
+and that record's provider. ``get`` given a record returns the value only when all three match the record and
+the store; anything else is ``secret_missing``, on both backends. So no index (an older one put back, one copied
+in, one edited) can pair one save's provider and opt-in with another save's value. ``get`` with no record (the
+audit's read of an interrupted add, never a release) returns any value of the id; ``delete`` and ``holds`` act on
+every value of the id. A stored value with no binding beside it is refused, never guessed at.
 
 SECRET SERVICE. ``secret-tool`` is given the value on its standard input (``store``) and gives it back on its
-standard output (``lookup``). An item carries four attributes: ``application recursion``, ``recursion_store
+standard output (``lookup``). An item carries five attributes: ``application recursion``, ``recursion_store
 <the store's id>`` (a random id the store's index records at its first save, so every spelling of the store's
-folder names one store, and two stores of one user never share an item), ``recursion_key_id <id>`` and
-``recursion_save <the save's id>``. A value is looked up with all four, so it is returned only to the index
-record of the save that stored it; ``clear`` and the presence check use the first three, so a removal reaches
-every value ever saved for the id in this store. Neither the value nor anything derived from it is ever in the
+folder names one store, and two stores of one user never share an item), ``recursion_key_id <id>``,
+``recursion_save <the save's id>`` and ``recursion_provider <the record's provider>``. A value is looked up
+with all five, so it is returned only to the record of the save that stored it; ``clear`` and the presence
+check use the first three, so a removal reaches every value ever saved for the id in this store. Neither the value nor anything derived from it is ever in the
 helper's arguments or its environment. ``lookup`` exits 1 with nothing on its standard error when it finds no
 unlocked item; anything else that is not success is a failure, ``keychain_locked`` when its message says the
 collection is locked or the unlock prompt was dismissed, else ``keychain_failed``. A failure's detail is fixed
@@ -26,17 +33,20 @@ when ``lookup`` (which unlocks, prompting if it must) finds nothing AND ``search
 items too, exits 0 and lists none (``presence``). A removal succeeds only then; an add whose helper failed drops
 its intent only then.
 
-OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "secrets": {id: value}}``, read and
-written through ``files.Folder`` (0600, owner and mode checked on every read, temp file, fsync, rename).
+OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "store_id": <the store's id>,
+"secrets": {id: {"save_id", "provider", "value"}}}``, read and written through ``files.Folder`` (0600, owner and
+mode checked on every read, temp file, fsync, rename). A file whose store id is not the index's belongs to
+another store and is refused (``owner_file_invalid``), as is any other shape.
 """
 from __future__ import annotations
 
 import json
+import re
 
 from recursion_core.keys import system as sysmod
 from recursion_core.keys.errors import KeyStoreError
 from recursion_core.keys.files import Folder
-from recursion_core.keys.validate import decode_value, valid_key_id, valid_value
+from recursion_core.keys.validate import decode_value, valid_key_id, valid_provider, valid_value
 
 OWNER_FILE_NAME = 'secrets.json'
 OWNER_FILE_MAX = 4 << 20
@@ -62,9 +72,11 @@ class SecretService:
         """Every item saved for ``key_id`` in this store, whichever save stored it."""
         return ['application', 'recursion', 'recursion_store', self._store_id, 'recursion_key_id', key_id]
 
-    def _item(self, key_id: str, save_id: str | None) -> list:
-        """The item of one save; with no ``save_id``, any item of the id (an interrupted add has no record yet)."""
-        return self._attributes(key_id) + (['recursion_save', save_id] if save_id is not None else [])
+    def _item(self, key_id: str, record) -> list:
+        """The item a record saved: its store, id, save and provider. With no record, any item of the id."""
+        if record is None:
+            return self._attributes(key_id)
+        return self._attributes(key_id) + ['recursion_save', record.save_id, 'recursion_provider', record.provider]
 
     def _run(self, argv: list, *, input: bytes | None = None) -> sysmod.Completed:
         code = None
@@ -81,8 +93,8 @@ class SecretService:
         """``lookup`` and ``clear`` exit 1 with nothing on standard error when they found no unlocked item."""
         return done.returncode == 1 and not done.stderr.strip()
 
-    def get(self, key_id: str, folder: Folder, save_id: str | None = None) -> str:
-        done = self._run([self._tool(), 'lookup', *self._item(key_id, save_id)])
+    def get(self, key_id: str, folder: Folder, record=None) -> str:
+        done = self._run([self._tool(), 'lookup', *self._item(key_id, record)])
         if done.returncode == 0:
             value = decode_value(done.stdout)
             if value is None:
@@ -92,8 +104,8 @@ class SecretService:
             raise KeyStoreError('secret_missing', f'the Secret Service has no item for {key_id}')
         raise _failure('lookup', done)
 
-    def put(self, key_id: str, value: str, folder: Folder, keep: frozenset, *, save_id: str) -> None:
-        argv = [self._tool(), 'store', f'--label=Recursion API key {key_id}', *self._item(key_id, save_id)]
+    def put(self, key_id: str, value: str, folder: Folder, keep: frozenset, *, record) -> None:
+        argv = [self._tool(), 'store', f'--label=Recursion API key {key_id}', *self._item(key_id, record)]
         done = self._run(argv, input=value.encode('ascii'))
         if done.returncode != 0:
             raise _failure('store', done)
@@ -155,35 +167,50 @@ def _failure(action: str, done: sysmod.Completed) -> KeyStoreError:
 class OwnerFile:
     name = 'owner_file'
 
+    def __init__(self, store_id: str | None) -> None:
+        self._store_id = store_id
+
     def __repr__(self) -> str:
         return 'OwnerFile()'
 
-    def _load(self, folder: Folder) -> dict:
+    def _load(self, folder: Folder, *, any_store: bool = False) -> dict:
+        """``{id: (save_id, provider, value)}``. A file of another store is refused unless ``any_store`` (the
+        audit, which only searches for the values)."""
         raw = folder.read(OWNER_FILE_NAME, OWNER_FILE_MAX)
         if raw is None:
             return {}
-        secrets = _parse(raw)
-        if secrets is None:
+        parsed = _parse(raw)
+        if parsed is None:
             raise KeyStoreError('owner_file_invalid', f'{folder.path / OWNER_FILE_NAME} is not a file this store wrote')
-        return secrets
+        store_id, entries = parsed
+        if store_id != self._store_id and not any_store:
+            raise KeyStoreError('owner_file_invalid', f'{folder.path / OWNER_FILE_NAME} belongs to another store')
+        return entries
 
-    def _save(self, folder: Folder, secrets: dict) -> None:
+    def _save(self, folder: Folder, entries: dict) -> None:
         """Write the file, refusing ``store_full`` BEFORE writing when it would be larger than a read accepts."""
-        body = json.dumps({'version': 1, 'secrets': dict(sorted(secrets.items()))}, indent=1, ensure_ascii=True)
+        secrets = {kid: {'save_id': save_id, 'provider': provider, 'value': value}
+                   for kid, (save_id, provider, value) in sorted(entries.items())}
+        body = json.dumps({'version': 1, 'store_id': self._store_id, 'secrets': secrets}, indent=1, ensure_ascii=True)
         data = (body + '\n').encode('ascii')
-        body = None
+        body = secrets = None
         if len(data) > OWNER_FILE_MAX:
             raise KeyStoreError('store_full', f'the owner-only file would be larger than {OWNER_FILE_MAX} bytes; '
                                 'remove a key first')
         folder.write(OWNER_FILE_NAME, data)
 
-    # The file sits in the store's own folder, beside the index and under its lock, so no other index can reach
-    # it and it keeps one value per id: ``save_id`` needs no place in it.
-    def get(self, key_id: str, folder: Folder, save_id: str | None = None) -> str:
-        value = self._load(folder).get(key_id)
-        if value is None:
+    def get(self, key_id: str, folder: Folder, record=None) -> str:
+        entry = self._load(folder).get(key_id)
+        if entry is None:
             raise KeyStoreError('secret_missing', f'the owner-only file has no value for {key_id}')
+        save_id, provider, value = entry
+        if record is not None and (save_id != record.save_id or provider != record.provider):
+            raise KeyStoreError('secret_missing', f'the owner-only file holds no value saved by this record of {key_id}')
         return value
+
+    def values(self, folder: Folder) -> dict:
+        """For the audit only: every value the file holds, by id, whatever store or record it names."""
+        return {kid: value for kid, (_, _, value) in self._load(folder, any_store=True).items()}
 
     def holds(self, key_id: str, folder: Folder) -> bool | None:
         try:
@@ -191,20 +218,29 @@ class OwnerFile:
         except Exception:  # noqa: BLE001 - a file that cannot be read cannot tell
             return None
 
-    def put(self, key_id: str, value: str, folder: Folder, keep: frozenset, *, save_id: str) -> None:
-        secrets = {kid: v for kid, v in self._load(folder).items() if kid in keep}
-        secrets[key_id] = value
-        self._save(folder, secrets)
+    def put(self, key_id: str, value: str, folder: Folder, keep: frozenset, *, record) -> None:
+        entries = {kid: entry for kid, entry in self._load(folder).items() if kid in keep}
+        entries[key_id] = (record.save_id, record.provider, value)
+        self._save(folder, entries)
 
     def delete(self, key_id: str, folder: Folder, keep: frozenset) -> None:
-        secrets = self._load(folder)
-        kept = {kid: v for kid, v in secrets.items() if kid in keep and kid != key_id}
-        if kept != secrets:
+        entries = self._load(folder)
+        kept = {kid: entry for kid, entry in entries.items() if kid in keep and kid != key_id}
+        if kept != entries:
             self._save(folder, kept)
 
 
-def _parse(raw: bytes) -> dict | None:
-    """The secrets of an owner-only file, or None when it is not exactly what ``_save`` writes.
+_RANDOM_ID = re.compile(r'[0-9a-f]{32}')
+_ENTRY_FIELDS = {'save_id', 'provider', 'value'}
+
+
+def _random_id(text: object) -> bool:
+    return isinstance(text, str) and text.isascii() and _RANDOM_ID.fullmatch(text) is not None
+
+
+def _parse(raw: bytes) -> tuple | None:
+    """``(store_id, {id: (save_id, provider, value)})`` of an owner-only file, or None when it is not exactly what
+    ``_save`` writes: a value with no save id, provider and store id beside it is refused, never guessed at.
 
     Nothing here raises with the file's text attached: a decoding or parsing error is caught and turned into
     None BEFORE any exception is raised, so no traceback, ``__context__`` or exception attribute holds a value.
@@ -213,15 +249,17 @@ def _parse(raw: bytes) -> dict | None:
         doc = json.loads(raw.decode('ascii'), object_pairs_hook=_pairs, parse_constant=_constant)
     except (ValueError, _Duplicate):
         doc = None
-    if not isinstance(doc, dict) or set(doc) != {'version', 'secrets'} or type(doc['version']) is not int \
-            or doc['version'] != 1 or not isinstance(doc['secrets'], dict):
+    if not isinstance(doc, dict) or set(doc) != {'version', 'store_id', 'secrets'} or type(doc['version']) is not int \
+            or doc['version'] != 1 or not _random_id(doc['store_id']) or not isinstance(doc['secrets'], dict):
         return None
     out = {}
-    for key_id, value in doc['secrets'].items():
-        if not valid_key_id(key_id) or not valid_value(value):
+    for key_id, entry in doc['secrets'].items():
+        if not valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != _ENTRY_FIELDS:
             return None
-        out[key_id] = value
-    return out
+        if not (_random_id(entry['save_id']) and valid_provider(entry['provider']) and valid_value(entry['value'])):
+            return None
+        out[key_id] = (entry['save_id'], entry['provider'], entry['value'])
+    return doc['store_id'], out
 
 
 class _Duplicate(Exception):

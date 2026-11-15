@@ -205,7 +205,8 @@ class StoreIdentityTest(TempStoreCase):
         (key,) = self.chain.items
         self.assertEqual(attribute_pairs(key)['recursion_save'], record.save_id)
         self.assertNotIn('save_id', record.as_json())                       # list --json keeps its shape
-        self.chain.items[key[:-1] + ('0' * 32,)] = self.chain.items.pop(key)
+        pairs = dict(attribute_pairs(key), recursion_save='0' * 32)
+        self.chain.items[tuple(w for pair in pairs.items() for w in pair)] = self.chain.items.pop(key)
         with self.assertRaises(KeyRefused) as refused:
             store.credential('codex-key', 'CODEX_API_KEY')
         self.assertEqual(refused.exception.code, 'secret_missing')
@@ -350,13 +351,14 @@ class UncertainSaveTest(TempStoreCase):
     def test_the_owner_file_says_whether_it_holds_a_value(self) -> None:
         store = self.store()
         self.add(store)
+        backend = OwnerFile(store.list().store_id)
         with open_folder(self.root, create=False) as folder:
-            self.assertIs(OwnerFile().holds('codex-key', folder), True)
-            self.assertIs(OwnerFile().holds('nobody', folder), False)
+            self.assertIs(backend.holds('codex-key', folder), True)
+            self.assertIs(backend.holds('nobody', folder), False)
             (self.root / 'secrets.json').write_text('not json')
-            self.assertIsNone(OwnerFile().holds('codex-key', folder))
+            self.assertIsNone(backend.holds('codex-key', folder))
             (self.root / 'secrets.json').unlink()
-            self.assertIs(OwnerFile().holds('codex-key', folder), False)
+            self.assertIs(backend.holds('codex-key', folder), False)
 
 
 _SIGNALLED = r'''#!{python} -I

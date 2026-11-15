@@ -36,7 +36,8 @@ class SaveTest(TempStoreCase):
                           'save_id': record.save_id}}, 'pending': {}})
         self.assertNotIn(MARKER.encode(), (self.root / 'index.json').read_bytes())
         self.assertEqual(json.loads((self.root / 'secrets.json').read_text()),
-                         {'version': 1, 'secrets': {'codex-key': MARKER}})
+                         {'version': 1, 'store_id': index['store_id'], 'secrets': {
+                             'codex-key': {'save_id': record.save_id, 'provider': 'openai', 'value': MARKER}}})
 
     def test_a_keychain_host_keeps_the_value_in_the_keychain_and_writes_no_owner_file(self) -> None:
         system, chain = keychain_system()
@@ -67,7 +68,8 @@ class SaveTest(TempStoreCase):
         self.add(store, key_id='claude-key', value=OTHER, env='ANTHROPIC_API_KEY', provider='anthropic')
         store.remove('codex-key')
         self.assertEqual(sorted(store.list().keys), ['claude-key'])
-        self.assertEqual(json.loads((self.root / 'secrets.json').read_text())['secrets'], {'claude-key': OTHER})
+        self.assertEqual({kid: e['value'] for kid, e in json.loads((self.root / 'secrets.json').read_text())['secrets'].items()},
+                         {'claude-key': OTHER})
 
     def test_an_index_write_that_fails_takes_the_value_out_again(self) -> None:
         system, chain = keychain_system()

@@ -315,7 +315,7 @@ class ProcessTest(TempStoreCase):
         index = json.loads((self.base / 'config' / 'recursion' / 'keys' / 'index.json').read_text())
         self.assertEqual(index['keys']['codex-key']['cap_usd'], 5)
         secrets = json.loads((self.base / 'config' / 'recursion' / 'keys' / 'secrets.json').read_text())
-        self.assertEqual(secrets['secrets'], {'codex-key': MARKER})
+        self.assertEqual({kid: e['value'] for kid, e in secrets['secrets'].items()}, {'codex-key': MARKER})
 
     def test_stdin_flag_on_a_terminal_is_refused(self) -> None:
         if not LINUX:
@@ -333,7 +333,7 @@ class ProcessTest(TempStoreCase):
         status, seen = self.pty_run([*self.ADD], [('(input is hidden): ', key + '\n'), ('[y/N] ', 'n\n')])
         self.assertEqual(status, 0, seen[-300:])
         secrets = json.loads((self.base / 'config' / 'recursion' / 'keys' / 'secrets.json').read_text())
-        self.assertEqual(secrets['secrets'], {'codex-key': key})
+        self.assertEqual({kid: e['value'] for kid, e in secrets['secrets'].items()}, {'codex-key': key})
 
     def test_a_key_longer_than_the_maximum_is_refused_not_cut_down(self) -> None:
         # R7 (sol): a 5000-character paste used to be cut to 4095 characters by the terminal and saved.

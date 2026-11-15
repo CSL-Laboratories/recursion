@@ -57,9 +57,9 @@ class SecretToolTest(TempStoreCase):
         stored = calls[0]
         self.assertEqual(stored['stdin_sha256'], hashlib.sha256(MARKER.encode()).hexdigest())
         namespace = ['application', 'recursion', 'recursion_store', store_id, 'recursion_key_id', 'codex-key']
-        self.assertEqual(stored['argv'], ['store', '--label=Recursion API key codex-key', *namespace,
-                                          'recursion_save', save_id])
-        self.assertEqual(calls[1]['argv'], ['lookup', *namespace, 'recursion_save', save_id])
+        bound = [*namespace, 'recursion_save', save_id, 'recursion_provider', 'openai']
+        self.assertEqual(stored['argv'], ['store', '--label=Recursion API key codex-key', *bound])
+        self.assertEqual(calls[1]['argv'], ['lookup', *bound])
         self.assertEqual([c['argv'] for c in calls[2:]], [['clear', *namespace], ['lookup', *namespace],
                                                           ['search', '--all', *namespace]])
         self.assertRegex(store_id, r'^[0-9a-f]{32}$')

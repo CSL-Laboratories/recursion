@@ -12,7 +12,8 @@ It fetches each saved value from the pinned backend and searches, as bytes:
 - the user's journal (``journalctl --user -o cat``), where the daemon's log lines go when it runs as a user
   service, unless ``--no-journal``.
 
-It also searches for the value of an interrupted add that the backend still holds. Each value is looked for as
+It also searches for the value of an interrupted add that the backend still holds, and for every value the
+owner-only file holds that no record of the index reaches (the index lost, replaced, or naming another save). Each value is looked for as
 it was saved and as JSON would write it inside a string. Symlinks are not followed and only regular files are
 read (a FIFO cannot block the search). The report names files and key ids only: no value, no part of one, no
 surrounding text. Two ids that hold one value are both named, once per place.

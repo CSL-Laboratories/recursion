@@ -396,17 +396,19 @@ class CapacityTest(TempStoreCase):
         self.add(store)
         index = json.loads((self.root / 'index.json').read_text())
         meta = copy.deepcopy(index['keys']['codex-key'])
-        secrets = {'codex-key': MARKER}
+        owner = json.loads((self.root / 'secrets.json').read_text())
+        secrets = owner['secrets']
         value = 'madeup-' + 'x' * (4096 - 7)
         for n in range(1100):                               # written directly: thousands of fsyncs are not needed
-            candidate = dict(secrets, **{f'key-{n}': value})
-            raw = (json.dumps({'version': 1, 'secrets': dict(sorted(candidate.items()))}, indent=1) + '\n').encode()
+            save_id = f'{n:032x}'
+            candidate = dict(secrets, **{f'key-{n}': {'save_id': save_id, 'provider': 'openai', 'value': value}})
+            raw = (json.dumps(dict(owner, secrets=dict(sorted(candidate.items()))), indent=1) + '\n').encode()
             if len(raw) > OWNER_FILE_MAX:
                 break
             secrets = candidate
-            index['keys'][f'key-{n}'] = copy.deepcopy(meta)
+            index['keys'][f'key-{n}'] = dict(copy.deepcopy(meta), save_id=save_id)
         (self.root / 'secrets.json').write_bytes(
-            (json.dumps({'version': 1, 'secrets': dict(sorted(secrets.items()))}, indent=1) + '\n').encode())
+            (json.dumps(dict(owner, secrets=dict(sorted(secrets.items()))), indent=1) + '\n').encode())
         (self.root / 'index.json').write_text(json.dumps(index))
         self.assertEqual(store.credential('codex-key', 'CODEX_API_KEY'), MARKER)
         with self.assertRaises(KeyStoreError) as caught:
@@ -425,13 +427,10 @@ class CapacityTest(TempStoreCase):
         meta.update(store='owner_file')
         n = 0
         while True:
-            index['keys'][f'k{n:06d}'] = meta
+            index['keys'][f'k{n:06d}'] = dict(meta, save_id=f'{n:032x}')
             if len((json.dumps(index, indent=1) + '\n').encode()) > INDEX_MAX - 200:
                 break
             n += 1
-        secrets = {'codex-key': MARKER}
-        (self.root / 'secrets.json').write_bytes(
-            (json.dumps({'version': 1, 'secrets': secrets}, indent=1) + '\n').encode())
         (self.root / 'index.json').write_text(json.dumps(index, indent=1) + '\n')
         self.assertEqual(store.credential('codex-key', 'CODEX_API_KEY'), MARKER)
         with self.assertRaises(KeyStoreError) as caught:
@@ -574,10 +573,14 @@ class CoverageTest(TempStoreCase):
 
     def test_the_owner_file_must_be_exactly_what_the_store_writes(self) -> None:
         self.add(self.store())
-        for text in ('{"version":1,"secrets":{"codex-key":' + json.dumps(MARKER) + ',"codex-key":' + json.dumps(OTHER) + '}}',
-                     json.dumps({'version': 2, 'secrets': {'codex-key': MARKER}}),
-                     json.dumps({'version': True, 'secrets': {'codex-key': MARKER}}),
-                     json.dumps({'version': 1, 'secrets': {'codex-key': MARKER, 'bad/id': OTHER}})):
+        good = json.loads((self.root / 'secrets.json').read_text())
+        entry = good['secrets']['codex-key']
+        twice = json.dumps(entry)
+        for text in ('{"version":1,"store_id":' + json.dumps(good['store_id']) + ',"secrets":{"codex-key":' + twice
+                     + ',"codex-key":' + twice + '}}',
+                     json.dumps(dict(good, version=2)),
+                     json.dumps(dict(good, version=True)),
+                     json.dumps(dict(good, secrets={'codex-key': entry, 'bad/id': entry}))):
             with self.subTest(text=text[:40]):
                 self.write_secrets(text)
                 self.assert_secrets_refused()

@@ -61,8 +61,10 @@ ID_SAVE_MAX = 64
 ID_WORD_MAX = 16             # letters and digits between two of . _ : -
 ID_DIGITS_MAX = 8            # digits in a row (a date, 20261114, is 8)
 ID_CLASS_CHANGES_MAX = 4     # changes between lower case, upper case and digit inside the words, in all
+ID_MIXED_WORD_MAX = 11       # a word holding both letters and digits
 _ID_WORD = re.compile(r'[A-Za-z0-9]+')
 _DIGITS = re.compile(r'[0-9]+')
+_LETTER = re.compile(r'[A-Za-z]')
 
 
 def _kind(ch: str) -> int:
@@ -74,11 +76,16 @@ def looks_like_a_key(text: str) -> bool:
 
     A connection id is a name: a few words of letters and digits between ``. _ : -``, as route files spell them
     (``codex-key``, ``login-B``, ``gpt4o-mini``, ``OpenAI-prod``). A key is long runs of mixed characters, split
-    or not. So an id is key-shaped when a word is longer than 16 characters, when more than 8 digits stand in a
-    row, or when its words change between lower case, upper case and digits more than 4 times in all
-    (``Ab3d-Ef5h`` changes 6 times, ``OpenAI-prod`` twice, ``gpt4o-mini`` twice)."""
+    or not. So an id is key-shaped when a word is longer than 16 characters, when a word of more than 11
+    characters mixes letters and digits (``abcdefgh12345678``, hex with a digit), when more than 8 digits stand
+    in a row, or when its words change between lower case, upper case and digits more than 4 times in all
+    (``Ab3d-Ef5h`` changes 6 times, ``OpenAI-prod`` twice, ``gpt4o-mini`` twice). A key made of one case of
+    letters only, in words of at most 16 (``qwertyuiopasdfgh``, ``abcdefabcdefabcd``), still passes: no rule
+    tells it from a name."""
     words = _ID_WORD.findall(text)
     if any(len(word) > ID_WORD_MAX for word in words):
+        return True
+    if any(len(word) > ID_MIXED_WORD_MAX and _LETTER.search(word) and _DIGITS.search(word) for word in words):
         return True
     if any(len(run) > ID_DIGITS_MAX for run in _DIGITS.findall(text)):
         return True

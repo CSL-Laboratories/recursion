@@ -17,10 +17,13 @@ keychain all of the user's stores share, is random and is recorded in the index 
 spelling that reaches the folder (``..``, a symlinked parent, a trailing or doubled separator, a bind mount,
 another letter case on a file system that ignores case) opens the same index, so it reads the same id, takes the
 same lock and reaches the same values. A relative folder is refused, so the working directory never matters.
-Each save also gets a random ``save_id``, recorded with its key and given to the backend: a value is handed out
-only to the index record of the save that stored it, so a copy of the folder, or anything else that makes two
-indexes name one store, can never pair one save's provider and opt-in with another save's value. A removal
-deletes every value saved for the id in the store, whichever save stored it.
+THE BINDING. Each save also gets a random ``save_id``, recorded with its key. The backend stores the value WITH
+the store's id, that save id and the record's provider (a Secret Service item's attributes; the owner-only file's
+entry and its header), and ``credential`` asks for the value of exactly that record: a value is released only
+when all three match the record being used and the store. So an older index put back, an index copied in from
+another folder or a copy of the whole folder, or an edited record, can never pair one save's provider and opt-in
+with another save's value; it gets ``secret_missing``. A removal deletes every value saved for the id in the
+store, whichever save stored it.
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
 {"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending":
@@ -100,6 +103,7 @@ SHOWN = ('key_id', 'provider', 'env_name', 'created_at', 'store', 'metered_spend
 PENDING_FIELDS = ('op', 'started_at')
 OPS = ('add', 'remove')
 RANDOM_ID = re.compile(r'[0-9a-f]{32}')
+UNBOUND = '(a value in the owner-only file that no record of this index reaches)'
 
 
 def _random_id() -> str:
@@ -235,7 +239,7 @@ class KeyStore:
                                 'they are removed only where that keychain answers, then added again here')
         name = pinned or offered
         if name == 'owner_file':
-            return OwnerFile()
+            return OwnerFile(store_id)
         if name == 'secret_service':
             return SecretService(self.system, store_id)
         raise KeyStoreError('backend_not_built',
@@ -244,7 +248,7 @@ class KeyStore:
 
     def _removal_backend(self, pinned: str | None, store_id: str | None):
         """The backend a removal uses: the owner-only file is always reachable, whatever the host offers now."""
-        return OwnerFile() if pinned == 'owner_file' else self._backend(pinned, store_id)
+        return OwnerFile(store_id) if pinned == 'owner_file' else self._backend(pinned, store_id)
 
     def _recover(self, folder: Folder, index: Index, backend, *, but: str | None = None) -> Index:
         """Finish or undo what earlier writes left pending (not ``but``). An entry that still cannot be reached stays."""
@@ -313,7 +317,7 @@ class KeyStore:
             self._sized(replace(intent, keys=keys))                     # both states fit, before anything changes
             self._write_index(folder, intent)                           # 1. the intent, before the outside effect
             try:
-                backend.put(key_id, value, folder, frozenset(keys), save_id=record.save_id)     # 2. the value
+                backend.put(key_id, value, folder, frozenset(keys), record=record)     # 2. the value, bound to its record
             except KeyStoreError:
                 if backend.holds(key_id, folder) is False:              # verified: nothing of the id was saved
                     with contextlib.suppress(Exception):
@@ -378,32 +382,42 @@ class KeyStore:
         Includes the value of an interrupted add the backend still holds, so that the audit looks for it too. A
         saved key whose value cannot be read (gone, or a keychain that does not answer now) is in the second
         mapping, with the code, and makes the audit incomplete. A file of the store that is not what it wrote is
-        refused, as every command refuses it.
+        refused, as every command refuses it. Every value the owner-only file holds is searched for too, under its
+        own id and the ``UNBOUND`` label, when no record of the index reaches it (an index lost or replaced, or a
+        record naming another save).
         """
         folder = self._folder(create=False)
         if folder is None:
             return {}, {}
         with folder, folder.locked(shared=True) as held:
             index = self._read_index(folder)
-            if not index.live():
-                return {}, {}
-            if not held:
+            if index.live() and not held:
                 raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
-            try:
-                backend = self._backend(index.backend, index.store_id)
-            except KeyStoreError as exc:
-                return {}, dict.fromkeys(index.keys, exc.code)
-            found, missing = {}, {}
-            for kid in sorted(set(index.keys) | set(index.pending)):
-                record = index.keys.get(kid)
-                try:
-                    found[kid] = backend.get(kid, folder, record.save_id if record is not None else None)
-                except KeyStoreError as exc:
-                    if exc.code in ('owner_file_invalid', 'file_invalid'):
-                        raise
-                    if record is not None:
-                        missing[kid] = exc.code
+            found, missing = self._bound_values(folder, index)
+            for kid, value in OwnerFile(index.store_id).values(folder).items():
+                if found.get(kid) != value:
+                    found[f'{kid} {UNBOUND}'] = value
             return found, missing
+
+    def _bound_values(self, folder: Folder, index: Index) -> tuple:
+        """The values the index's records (and its unfinished adds) reach on the pinned backend."""
+        if not index.live():
+            return {}, {}
+        try:
+            backend = self._backend(index.backend, index.store_id)
+        except KeyStoreError as exc:
+            return {}, dict.fromkeys(index.keys, exc.code)
+        found, missing = {}, {}
+        for kid in sorted(set(index.keys) | set(index.pending)):
+            record = index.keys.get(kid)
+            try:
+                found[kid] = backend.get(kid, folder, record)
+            except KeyStoreError as exc:
+                if exc.code in ('owner_file_invalid', 'file_invalid'):
+                    raise
+                if record is not None:
+                    missing[kid] = exc.code
+        return found, missing
 
     def owner_file(self) -> Path:
         """Where the owner-only file is, or would be."""
@@ -440,7 +454,7 @@ class KeyStore:
                                         'this key has no metered-spend opt-in and cap; remove it and add it again '
                                         'with one')
                 # The value of this record's own save, and no other: see IDENTITY.
-                return self._backend(index.backend, index.store_id).get(connection_id, folder, record.save_id)
+                return self._backend(index.backend, index.store_id).get(connection_id, folder, record)
         except KeyRefused:
             raise
         except KeyError:
@@ -474,6 +488,8 @@ def _parse_index(raw: bytes) -> Index | None:
     if (backend not in STORES) if live else (backend is not None):
         return None
     keys = {}
+    if len({entry.get('save_id') for entry in doc['keys'].values() if isinstance(entry, dict)}) != len(doc['keys']):
+        return None                      # two records naming one save: an index this store never writes
     for key_id, entry in doc['keys'].items():
         if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != set(FIELDS):
             return None

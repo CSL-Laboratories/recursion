@@ -700,10 +700,12 @@ class RestartTest(ComposedBase):
         seen = []
         gate = threading.Event()
 
-        def slow(self_, params):
+        def slow(self_, *args, **kwargs):
+            # Both call forms reach the starter: (params) on master, and (params, record) once a lane's start
+            # registrant is on the start path (control/api.py _launch, seam S6). Pass on what was given.
             gate.set()
             time.sleep(0.5)
-            return original(self_, params)
+            return original(self_, *args, **kwargs)
 
         def reconcile_in_window():
             gate.wait(10)

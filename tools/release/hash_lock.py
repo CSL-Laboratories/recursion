@@ -18,10 +18,13 @@ fails (exit 1, one line per problem) unless each one:
 - has, for every job that installs it (its runner and Python version), a wheel of every pin
   that applies there.
 
-It reads every command of every shell line (`&&`, `||`, `;`, pipes, command substitution)
-and every spelling of pip it knows; a line that may install packages but cannot be read as
-pip installs of requirements files, or that sits outside a job it can read, is a problem,
-never "nothing installed". The gate (tools/ci_gate.py) installs nothing; the check makes
+Workflow values are decoded as YAML reads them before any matching (block `|` and `>`
+scalars, multi-line plain and quoted values), so a folded `run:` is read as the shell sees
+it. It reads every command of every shell line (`&&`, `||`, `;`, pipes, command
+substitution) and every spelling of pip it knows; a `run:` line that may install packages
+but cannot be read as pip installs of requirements files, one outside a job it can read,
+and installer text in any other value or in a line that is no `key: value`, are each a
+problem, never "nothing installed". The gate (tools/ci_gate.py) installs nothing; the check makes
 sure it stays that way.
 Stdlib only and offline; tools/release/relock.py is the one script that reads PyPI.
 """
@@ -455,12 +458,13 @@ class Install:
 
 JOBS_HEADER = re.compile(r"jobs:\s*(?:#.*)?")
 JOB_KEY = r"([A-Za-z0-9_-]+|\"[^\"]+\"|'[^']+'):\s*(?:#.*)?"
+KEY_LINE = re.compile(r"^(\s*)((?:-\s+)*)([^\s#:\-][^:#]*?|\"[^\"]*\"|'[^']*'):(?:\s+(.*?))?\s*$")
+BLOCK = re.compile(r"[|>][0-9+-]*\s*(?:#.*)?")
 
 
-def _jobs(text: str) -> tuple[dict[str, str], list[str]]:
-    """The job blocks under a block-style top-level `jobs:`, at whatever indentation the first
-    job uses, and problems for what this reader cannot follow. Lines are the file's, LF."""
-    lines = text.replace("\r\n", "\n").split("\n")
+def _jobs(lines: list[str]) -> tuple[dict[str, list[int]], list[str]]:
+    """The line numbers (0-based, into the LF lines) of each job under a block-style top-level
+    `jobs:`, at whatever indentation the first job uses, and what this reader cannot follow."""
     problems: list[str] = []
     headers = [i for i, line in enumerate(lines) if JOBS_HEADER.fullmatch(line)]
     if any(re.match(r"jobs:\s*[^\s#]", line) for line in lines):
@@ -469,13 +473,14 @@ def _jobs(text: str) -> tuple[dict[str, str], list[str]]:
         if len(headers) > 1:
             problems.append(f"{len(headers)} top-level `jobs:` lines")
         return {}, problems
-    out: dict[str, list[str]] = {}
+    out: dict[str, list[int]] = {}
     current: str | None = None
     indent: int | None = None
-    for line in lines[headers[0] + 1:]:
+    for index in range(headers[0] + 1, len(lines)):
+        line = lines[index]
         if not line.strip() or line.lstrip().startswith("#"):
             if current is not None:
-                out[current].append(line)
+                out[current].append(index)
             continue
         lead = len(line) - len(line.lstrip(" "))
         if lead == 0:
@@ -487,28 +492,11 @@ def _jobs(text: str) -> tuple[dict[str, str], list[str]]:
             current = key.group(1).strip("\"'")
             out[current] = []
         elif lead > indent and current is not None:
-            out[current].append(line)
+            out[current].append(index)
         else:
             problems.append(f"a line under `jobs:` this check cannot place in a job: {line.strip()!r}")
             current = None
-    return {job: "\n".join(body) for job, body in out.items()}, problems
-
-
-def _shell_lines(block: str) -> list[str]:
-    """Each line with its backslash continuations joined; YAML comment lines dropped."""
-    out: list[str] = []
-    pending = ""
-    for line in block.replace("\r\n", "\n").split("\n"):
-        if not pending and line.lstrip().startswith("#"):
-            continue
-        if line.rstrip().endswith("\\"):
-            pending += line.rstrip()[:-1] + " "
-            continue
-        out.append(pending + line)
-        pending = ""
-    if pending:
-        out.append(pending)
-    return out
+    return out, problems
 
 
 def _yaml_scalar(text: str) -> str:
@@ -523,6 +511,83 @@ def _yaml_scalar(text: str) -> str:
             return inner.replace("''", "'") if quote == "'" else inner
         return text
     return re.split(r"\s+#", text, maxsplit=1)[0].strip()
+
+
+def _fold(lines: list[str]) -> str:
+    """YAML folding: a line break between two plain lines is a space, an empty line is a line
+    break, and a more-indented line keeps its own line."""
+    out = ""
+    previous_plain = False
+    for line in lines:
+        if not line.strip():
+            out += "\n"
+            previous_plain = False
+        elif line[:1] in (" ", "\t"):
+            out += ("\n" if out and not out.endswith("\n") else "") + line + "\n"
+            previous_plain = False
+        else:
+            out += (" " if previous_plain else "") + line
+            previous_plain = True
+    return out
+
+
+def _scalars(lines: list[str]) -> tuple[list[tuple[int, str, str]], set[int]]:
+    """Every scalar value written as `key: value`, decoded as YAML reads it: (line of the key,
+    key, text). Block scalars (`|`, `>`) and multi-line plain or quoted values are joined the
+    way YAML joins them. Also the set of lines those values take up."""
+    found: list[tuple[int, str, str]] = []
+    used: set[int] = set()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = KEY_LINE.match(line)
+        if not match or line.lstrip().startswith("#"):
+            index += 1
+            continue
+        key = match.group(3).strip("\"'")
+        column = len(match.group(1)) + len(match.group(2))
+        value = match.group(4) or ""
+        following = []
+        scan = index + 1
+        while scan < len(lines) and (not lines[scan].strip()
+                                     or len(lines[scan]) - len(lines[scan].lstrip(" ")) > column):
+            following.append(scan)
+            scan += 1
+        while following and not lines[following[-1]].strip():
+            following.pop()
+        if not value or value.startswith("#"):
+            index += 1  # a mapping or sequence follows; its own keys are read in turn
+            continue
+        if BLOCK.fullmatch(value):
+            body = [lines[i] for i in following]
+            indent = min((len(l) - len(l.lstrip(" ")) for l in body if l.strip()), default=0)
+            body = [l[indent:] for l in body]
+            text = _fold(body) if value.startswith(">") else "\n".join(body) + "\n"
+        elif following:
+            text = _yaml_scalar(_fold([value] + [lines[i].strip() for i in following]))
+        else:
+            text = _yaml_scalar(value)
+        found.append((index, key, text))
+        used.update([index, *following])
+        index = following[-1] + 1 if following else index + 1
+    return found, used
+
+
+def _shell_lines(script: str) -> list[str]:
+    """Each line with its backslash continuations joined; shell comment lines dropped."""
+    out: list[str] = []
+    pending = ""
+    for line in script.replace("\r\n", "\n").split("\n"):
+        if not pending and line.lstrip().startswith("#"):
+            continue
+        if line.rstrip().endswith("\\"):
+            pending += line.rstrip()[:-1] + " "
+            continue
+        out.append(pending + line)
+        pending = ""
+    if pending:
+        out.append(pending)
+    return out
 
 
 def _resolve(path: str, env: dict[str, set[str]]) -> str:
@@ -587,36 +652,52 @@ def _requirement_files(args: list[str], env: dict[str, set[str]]) -> list[str]:
     return files
 
 
+def _job_settings(block: str) -> tuple[str | None, set[str], dict[str, set[str]]]:
+    child = min((len(line) - len(line.lstrip(" ")) for line in block.split("\n")
+                 if line.strip() and not line.lstrip().startswith("#")), default=0)
+    runner = re.search(rf"(?m)^ {{{child}}}runs-on:\s*(.+?)\s*$", block)
+    versions = {_yaml_scalar(v) for v in re.findall(r"(?m)^\s+python-version:\s*(.+?)\s*$", block)}
+    env: dict[str, set[str]] = {}
+    for key, value in re.findall(r"(?m)^\s+([A-Z_][A-Z0-9_]*):\s*(.+?)\s*$", block):
+        env.setdefault(key, set()).add(_yaml_scalar(value))
+    return (_yaml_scalar(runner.group(1)) if runner else None), versions, env
+
+
 def workflow_installs(source: str, text: str) -> tuple[list[Install], list[str]]:
-    """Every pip install in a workflow and the job it runs in, and a problem for every line that
-    may install something but cannot be read as pip installs of requirements files."""
+    """Every pip install in a workflow and the job it runs in. Values are decoded as YAML reads
+    them before any matching, so a folded or multi-line `run:` is read as the shell sees it. A
+    `run:` line that may install packages but cannot be read as pip installs of requirements
+    files, one outside a job this reader found, and installer text in any other value or in a
+    line that is no `key: value` at all, are each a problem."""
     installs: list[Install] = []
-    jobs, layout = _jobs(text)
+    lines = text.replace("\r\n", "\n").split("\n")
+    jobs, layout = _jobs(lines)
     problems = [f"{source}: {problem}" for problem in layout]
-    candidates = sum(1 for line in _shell_lines(text) if INSTALLER.search(line))
-    placed = 0
-    for job, block in jobs.items():
-        where = f"{source} job {job}"
-        child = min((len(line) - len(line.lstrip(" ")) for line in block.split("\n")
-                     if line.strip() and not line.lstrip().startswith("#")), default=0)
-        runner = re.search(rf"(?m)^ {{{child}}}runs-on:\s*(.+?)\s*$", block)
-        runner_label = _yaml_scalar(runner.group(1)) if runner else None
-        versions = {_yaml_scalar(v) for v in re.findall(r"(?m)^\s+python-version:\s*(.+?)\s*$", block)}
-        env: dict[str, set[str]] = {}
-        for key, value in re.findall(r"(?m)^\s+([A-Z_][A-Z0-9_]*):\s*(.+?)\s*$", block):
-            env.setdefault(key, set()).add(_yaml_scalar(value))
-        for line in _shell_lines(block):
+    owner = {index: job for job, indexes in jobs.items() for index in indexes}
+    settings = {job: _job_settings("\n".join(lines[i] for i in indexes)) for job, indexes in jobs.items()}
+    scalars, used = _scalars(lines)
+    for index, line in enumerate(lines):
+        if index not in used and not line.lstrip().startswith("#") and INSTALLER.search(line):
+            problems.append(f"{source}:{index + 1}: a line that may install packages, outside any `key: value` "
+                            "this check reads")
+    for index, key, value in scalars:
+        if key != "run":
+            if INSTALLER.search(value):
+                problems.append(f"{source}:{index + 1}: installer text in a `{key}:` value this check does not read")
+            continue
+        job = owner.get(index)
+        for line in _shell_lines(value):
             if not INSTALLER.search(line):
                 continue
-            placed += 1
-            command = line.strip()
-            if command.startswith("- "):
-                command = command[2:].strip()
-            if command.startswith("run:"):
-                command = _yaml_scalar(command[4:])
+            if job is None:
+                problems.append(f"{source}:{index + 1}: a run step that may install packages sits outside any job "
+                                "this check can read")
+                continue
+            where = f"{source} job {job}"
+            runner_label, versions, env = settings[job]
             try:
                 found = False
-                for simple in _commands(command):
+                for simple in _commands(line.strip()):
                     args = _pip_install_args(simple)
                     if args is None:
                         if INSTALLER.search(" ".join(simple)):
@@ -632,12 +713,9 @@ def workflow_installs(source: str, text: str) -> tuple[list[Install], list[str]]
                     target.python_match()
                     installs.extend(Install(source, job, path, target) for path in files)
                 if not found:
-                    raise LockError(f"an installer this check does not read: {command!r}")
+                    raise LockError(f"an installer this check does not read: {line.strip()!r}")
             except (LockError, ValueError) as exc:
                 problems.append(f"{where}: {exc}")
-    if placed != candidates:
-        problems.append(f"{source}: {candidates - placed} line(s) that may install packages sit outside any job "
-                        "this check can read")
     return installs, problems
 
 

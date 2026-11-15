@@ -367,7 +367,57 @@ class WorkflowScanTests(TreeCase):
         self.tree.write(".github/workflows/extra.yml", 'name: x\non: push\njobs: {build: {runs-on: ubuntu-24.04, '
                         'steps: [{run: "python -m pip install -r requirements-dev.txt"}]}}\n')
         self.assertProblem(r"extra\.yml: `jobs:` is written inline")
-        self.assertProblem(r"extra\.yml: 1 line\(s\) that may install packages sit outside any job")
+        self.assertProblem(r"extra\.yml:3: installer text in a `jobs:` value this check does not read")
+
+    # Round-2 reads (GPT-6 Astra change 1, GPT-6.1 Sol changes 1-2): values are decoded as YAML
+    # reads them before any matching, and every installer the check cannot read is refused.
+    def test_a_folded_install_cannot_disappear(self) -> None:
+        self.add_workflow(">-\n          python -m pip\n          install -r requirements-dev.txt")
+        self.assertTrue(self.tree.problems(), "folded run silently hides an unlocked install")
+
+    def test_folded_and_multi_line_installs_are_read_as_installs(self) -> None:
+        for command in (">-\n          python -m pip\n          install -r requirements-dev.txt",
+                        ">\n          python -m pip\n          install -r requirements-dev.txt",
+                        "python -m pip\n          install -r requirements-dev.txt",
+                        "\"python -m pip\n          install -r requirements-dev.txt\""):
+            with self.subTest(command=command):
+                self.add_workflow(command)
+                self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\] but is not hash-locked")
+
+    def test_a_literal_block_is_read_line_by_line(self) -> None:
+        self.add_workflow("|\n          python -m pip install -r requirements-ci.txt\n"
+                          "          python -m pip install -r requirements-dev.txt")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_a_folded_locked_install_passes(self) -> None:
+        self.add_workflow(">-\n          python -m pip\n          install --only-binary=:all: -r requirements-ci.txt")
+        self.assertEqual(self.tree.problems(), [])
+        installs, _ = hl.all_installs(self.tree.root)
+        self.assertIn(("extra.yml", "build", CI), {(i.source, i.job, i.file) for i in installs})
+
+    def test_an_unread_second_installer_is_refused(self) -> None:
+        self.add_workflow("pip install -r requirements-ci.txt; uv sync")
+        self.assertProblem(r"an installer this check does not read: 'uv sync'")
+
+    def test_installer_text_in_another_value_fails(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="ubuntu-24.04", python="3.12", command="echo")
+        self.tree.write(rel, text + "      - uses: some/action@v1\n        with:\n          script: >-\n"
+                                    "            pip\n            install requests\n")
+        self.assertProblem(r"extra\.yml:\d+: installer text in a `script:` value this check does not read")
+
+    def test_an_installer_line_that_is_no_key_value_fails(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="ubuntu-24.04", python="3.12", command="echo")
+        self.tree.write(rel, text + "      - pip install requests\n")
+        self.assertProblem(r"extra\.yml:\d+: a line that may install packages, outside any `key: value`")
+
+    def test_a_run_step_outside_a_readable_job_fails(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="ubuntu-24.04", python="3.12",
+                               command=">-\n          python -m pip\n          install -r requirements-dev.txt")
+        self.tree.write(rel, text.replace("jobs:\n", '"jobs":\n'))
+        self.assertProblem(r"extra\.yml:\d+: a run step that may install packages sits outside any job")
 
     def test_a_crlf_workflow_is_read(self) -> None:
         rel, template = self.WORKFLOW

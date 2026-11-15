@@ -339,13 +339,13 @@ MUTANTS = {
         {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
     "M58 a non-mapping connection accepted": (
         ROUTER,
-        'not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)',
-        'connection is None or not {"kind", "id"} <= set(connection)',
+        'not isinstance(connection, Mapping) or any(conn[key] is _MISSING for key in ("kind", "id"))',
+        'connection is None or any(conn[key] is _MISSING for key in ("kind", "id"))',
         {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
     "M59 connection kind missing from a routed decision accepted": (
         ROUTER,
-        'not {"kind", "id"} <= set(connection)',
-        'not {"id"} <= set(connection)',
+        'any(conn[key] is _MISSING for key in ("kind", "id"))',
+        'any(conn[key] is _MISSING for key in ("id",))',
         {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
     "M60 an unreadable hand pick raises": (
         ROUTER,
@@ -436,8 +436,8 @@ MUTANTS = {
         {"test_ok_must_be_exactly_true_or_false"}),
     "M76 next_after_limit taking ok by truthiness": (
         ROUTER,
-        "(ok is not True or any(key not in decision",
-        "(any(key not in decision",
+        "(ok is not True or any(read[key] is _MISSING",
+        "(any(read[key] is _MISSING",
         {"test_ok_must_be_exactly_true_or_false"}),
     "M77 one attempts word read as its characters": (
         ROUTER,
@@ -607,6 +607,22 @@ MUTANTS = {
         '                return None, "detection_malformed"\n',
         "",
         {"test_two_keys_that_read_as_one_engine_make_the_snapshot_unusable"}),
+    # The fifth Codex read (gpt-6.1-sol, 477fa308..8984581e): its changes 1-3.
+    "M109 a member's presence asked again after its value was read": (
+        ROUTER,
+        'any(read[key] is _MISSING for key in ("reason", "rule", "engine", "model"))',
+        'any(key not in decision for key in ("reason", "rule", "engine", "model"))',
+        {"test_a_primary_cannot_be_reoffered_when_a_member_disappears"}),
+    "M110 route_decision publishing a connection id that is a str subclass": (
+        ROUTER,
+        'or type(conn["id"]) is not str:',
+        'or not isinstance(conn["id"], str):',
+        {"test_route_decision_refuses_a_connection_id_str_subclass"}),
+    "M111 next_after_limit taking a reason decide never gives": (
+        ROUTER,
+        '(type(read["reason"]) is not str or read["reason"] not in REASONS)',
+        '(type(read["reason"]) is not str)',
+        {"test_next_after_limit_refuses_unknown_reason"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

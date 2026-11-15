@@ -539,7 +539,9 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     never switched away from on its own: the user chose that route for this task, so the answer is ask.
     """
     # The decision, read inside one guard into plain data (each member once for presence and once for its value):
-    # nothing below reads the caller's object again.
+    # nothing below reads the caller's object again, and the checks read these copies, never the object. A member
+    # that goes between its presence and its value raises inside the guard (no_decision); it never reads as absent.
+    # The connection's members are walked once (a connection that cannot be walked is not decide's).
     # A member it does not have reads as _MISSING; the presence check and the type check each answer for
     # their own rule, so each one is what refuses the decision it is about.
     try:
@@ -549,12 +551,12 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
         if ok is False:
             return {"action": "none", "reason": "no_route"}
         connection = decision.get("connection")
-        if (ok is not True or any(key not in decision for key in ("reason", "rule", "engine", "model"))
-                or not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)):
-            return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
         read = {key: decision[key] if key in decision else _MISSING for key in ("engine", "model", "reason", "rule")}
-        conn = ({key: connection[key] if key in connection else _MISSING for key in ("kind", "id")}
-                if isinstance(connection, Mapping) else {"kind": _MISSING, "id": _MISSING})
+        names = set(connection) if connection is not None else set()  # the connection's members, walked once
+        conn = {key: connection[key] if key in names else _MISSING for key in ("kind", "id")}
+        if (ok is not True or any(read[key] is _MISSING for key in ("reason", "rule", "engine", "model"))
+                or not isinstance(connection, Mapping) or any(conn[key] is _MISSING for key in ("kind", "id"))):
+            return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
         # The values compared or formatted below must be decide's own words, plain str (a subclass could raise, or
         # answer anything, when compared or formatted), checked here, where comparing one that raises is still
         # inside the guard.

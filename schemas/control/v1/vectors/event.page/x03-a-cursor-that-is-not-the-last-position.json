@@ -1,0 +1,59 @@
+{
+  "method": "events.read",
+  "params": {
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 41
+    },
+    "projection": "raw"
+  },
+  "page": {
+    "code": "ok",
+    "projection": "raw",
+    "events": [
+      {
+        "seq": 42,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:02.074Z",
+        "type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "payload": {
+          "stream": "stdout",
+          "text": "line 42\n",
+          "offset_start": 420,
+          "offset_end": 428
+        }
+      },
+      {
+        "seq": 43,
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "time": "2026-11-13T07:34:02.074Z",
+        "type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "payload": {
+          "stream": "stdout",
+          "text": "line 43\n",
+          "offset_start": 430,
+          "offset_end": 438
+        }
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 45
+    },
+    "more": false,
+    "epoch_advanced": false
+  },
+  "expect": [
+    "cursor"
+  ]
+}

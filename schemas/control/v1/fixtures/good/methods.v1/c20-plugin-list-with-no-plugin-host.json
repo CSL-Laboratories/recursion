@@ -1,0 +1,8 @@
+{
+  "answer": {
+    "code": "unavailable",
+    "detail": "no plugin host is composed"
+  },
+  "method": "plugin.list",
+  "params": {}
+}

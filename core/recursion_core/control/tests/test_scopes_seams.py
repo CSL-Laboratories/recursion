@@ -733,6 +733,48 @@ class RoundSixSeamsTest(unittest.TestCase):
         self.assertIsNone(auth(principal, "run.stop", {"run_id": "run-beta"}))
 
 
+class RoundSevenSeamsTest(unittest.TestCase):
+    """The round-7 read of #385 by DeepSeek V4.1 Flash. F1: the Stop compared the record's owner and session_id
+    with their own __eq__, so a str subclass in the record let a plugin stop a host-owned run and one session
+    stop another's. F2: a subclass overriding held() does not change what a call decides."""
+
+    class Sneaky(str):
+        """Text that answers both equal and unequal to anything (DeepSeek's SneakyOwner and SneakySession)."""
+
+        def __eq__(self, other):
+            return True
+
+        def __ne__(self, other):
+            return True
+
+        __hash__ = str.__hash__
+
+    def authorizer(self, runs):
+        return scopes.Authorizer(scope_of=SCOPE_COLUMN.get, credentials=RoundSixSeamsTest.Store(), run_record=runs.get)
+
+    def test_record_fields_that_are_str_subclasses_open_no_stop(self) -> None:
+        runs = {"run-host": {"launch": {"owner": self.Sneaky("host"), "session_id": None}},
+                "run-s9": {"launch": {"owner": "host", "session_id": self.Sneaky("s9")}}}
+        auth = self.authorizer(runs)
+        plugin = RoundSixSeamsTest.answering(("plugin",), ("plugin.beta",))
+        session = RoundSixSeamsTest.answering(("session",), ("s1",), grant="g-s1")
+        self.assertEqual(auth(plugin, "run.stop", {"run_id": "run-host"}), ("scope_refused", "run_not_owned"))
+        self.assertEqual(auth(session, "run.stop", {"run_id": "run-s9"}), ("scope_refused", "run_outside_session"))
+        honest = self.authorizer({"run-beta": {"launch": {"owner": "plugin.beta", "session_id": None}},
+                                  "run-s1": {"launch": {"owner": "host", "session_id": "s1"}}})
+        self.assertIsNone(honest(plugin, "run.stop", {"run_id": "run-beta"}))
+        self.assertIsNone(honest(session, "run.stop", {"run_id": "run-s1"}))
+
+    def test_overriding_held_changes_only_what_held_answers(self) -> None:
+        class Refusing(scopes.Authorizer):
+            def held(self, principal):
+                return frozenset()
+
+        auth = Refusing(scope_of=SCOPE_COLUMN.get)
+        self.assertEqual(auth.held(H.OWNER), frozenset())
+        self.assertIsNone(auth(H.OWNER, "run.list", {}))      # the call decides from _held, as documented
+
+
 @NEEDS_POSIX
 class BearerWithoutGrantTest(unittest.TestCase):
     """Until SPINE's Principal carries ``grant``, a device, session or agent principal holds nothing, live grants

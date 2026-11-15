@@ -166,8 +166,9 @@ _ABSENT = object()   # nothing named grant declared, told apart from a declared 
 
 
 def _get(mapping, key):
-    """``mapping.get(key)`` for a dict; None for anything else, and None when the read raises (a dict subclass
-    can): a target that cannot be read is not shown to be owned."""
+    """``mapping.get(key)`` for a mapping that is exactly a ``dict``; None for anything else, a ``dict`` subclass
+    included (an ``OrderedDict`` too), so a run reader must answer plain dicts, as the control registry's
+    ``get`` does. A target that cannot be read is not shown to be owned."""
 
     if type(mapping) is not dict:   # exactly a dict: no get of a subclass picks the target (round 6, DeepSeek F2)
         return None
@@ -234,7 +235,11 @@ def _read_declared_grant(principal):
 
 
 class Authorizer:
-    """``authorizer(principal, method, params) -> None | ("scope_refused", detail)``. See the module text."""
+    """``authorizer(principal, method, params) -> None | ("scope_refused", detail)``. See the module text.
+
+    Not meant to be subclassed. A call reads the principal's kind and id once and decides through ``_held`` and
+    ``_stop`` from those two values (round 6 of #385, DeepSeek F1), so overriding ``held`` changes only what
+    ``held`` answers to a caller that asks it, never what a call decides (round 7, DeepSeek F2)."""
 
     def __init__(self, *, scope_of: Callable[[str], str | None], credentials: CredentialStore | None = None,
                  run_record: Callable[[str], dict | None] | None = None,
@@ -346,15 +351,18 @@ class Authorizer:
             except Exception:  # noqa: BLE001 - a target that cannot be read is not shown to be owned
                 record = None
         launch = _get(record, "launch")
-        if not isinstance(launch, dict) or not isinstance(pid, str) or not pid:
+        # pid is exact text or None (_identity), and every record field the rule decides from is read once as
+        # exact text: a str subclass in the record cannot answer host, a plugin's id or another session as it
+        # pleases (round 7 of #385, DeepSeek F1).
+        if type(launch) is not dict or not pid:
             return (SCOPE_REFUSED, "run_not_owned")
         if kind == "plugin":
-            owner = _get(launch, "owner")
-            if isinstance(owner, str) and owner and owner != HOST_OWNER and owner == pid:
+            owner = _exact(_get(launch, "owner"))
+            if owner and owner != HOST_OWNER and owner == pid:
                 return None
             return (SCOPE_REFUSED, "run_not_owned")
-        session = _get(launch, "session_id")
-        if isinstance(session, str) and session:
+        session = _exact(_get(launch, "session_id"))
+        if session:
             try:
                 if self._in_subtree(session, pid) is True:
                     return None

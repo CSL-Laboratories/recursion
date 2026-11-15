@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import copy
 import itertools
+import re
 import unittest
+from collections.abc import Mapping
 
+from recursion_core import routing
 from recursion_core.routes import contract as c
 from recursion_core.routes import limits as route_limits
 from recursion_core.routing import config as rc
-from recursion_core.routing import router
+from recursion_core.routing import detect, router
 from recursion_core.routing.tests.fixtures import CONFIG, ROUTES, SENTRY, config, detection
+
+CODE_WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 TASKS = [{"task_kind": "chat"}, {"task_kind": "review"}, {"task_kind": "search"}, {"task_kind": "search", "tags": ["cheap"]},
          {"task_kind": "review", "tags": ["cheap"]}, {}, {"tags": ["cheap"]}, None, {"tags": "x"},
@@ -224,6 +229,124 @@ class ExplainAnswerTests(unittest.TestCase):
                                ({"hand_pick": "codex"}, "hand_pick"), ({"Task Kind": "x"}, "params")):
             with self.subTest(params):
                 self.assertEqual(router.explain_answer(self.cfg, SENTRY, params), {"code": "request_invalid", "detail": detail})
+
+
+class _ReadCounting(Mapping):
+    """A task whose task_kind reads "review" the first time and "chat" after (a caller still writing it)."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __getitem__(self, key):
+        if key != "task_kind":
+            raise KeyError(key)
+        self.reads += 1
+        return "review" if self.reads == 1 else "chat"
+
+    def __contains__(self, key) -> bool:  # asking whether a member is there is not a read of its value
+        return key == "task_kind"
+
+    def __iter__(self):
+        return iter(("task_kind",))
+
+    def __len__(self) -> int:
+        return 1
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """The first reads of #399 (05a5d13d): Codex gpt-6.1-sol R1-R2, DeepSeek V4.1 Flash F1-F10."""
+
+    def test_wait_uses_breaker_retry_when_vendor_reset_is_null(self) -> None:  # sol R1, ds F1
+        cfg = with_limits({"on_limit": "wait"})
+        decision = router.decide(cfg, SENTRY, {})
+        result = c.result("review", c.PLAN_LIMIT, limit=c.limit_signal("connection", "review.typed"), retry_at=7000.0)
+        self.assertEqual(router.next_after_limit(cfg, decision, result)["until"], 7000.0)
+        zero = c.result("review", c.PLAN_LIMIT, limit=c.limit_signal("connection", "review.typed", reset_at=0.0),
+                        retry_at=7000.0)
+        self.assertEqual(router.next_after_limit(cfg, decision, zero)["until"], 0.0)  # an explicit zero is kept
+
+    def test_primary_not_reoffered_without_notice(self) -> None:  # sol R2
+        primary = copy.deepcopy(ROUTES["claude_code"]["route"])
+        cfg = with_limits({"on_limit": "fallback", "fallback": [primary, CODEX]})
+        decision = router.decide(cfg, SENTRY, {})
+        answer = router.next_after_limit(cfg, decision, LIMIT)
+        self.assertEqual(answer["route"]["engine"], "codex")
+        self.assertEqual(answer["skipped"][0]["skipped"], "already_tried")
+
+    def test_same_engine_and_connection_other_model_still_allowed(self) -> None:  # sol R2
+        other = copy.deepcopy(ROUTES["claude_code"]["route"])
+        other["model"] = "claude-model-b"
+        cfg = with_limits({"on_limit": "fallback", "fallback": [other, CODEX]})
+        decision = router.decide(cfg, SENTRY, {})
+        self.assertEqual(router.next_after_limit(cfg, decision, LIMIT)["route"], other)
+
+    def test_a_route_with_no_model_anywhere_is_not_routable(self) -> None:  # ds F2
+        routes = copy.deepcopy(ROUTES)
+        del routes["claude_code"]["route"]["model"]
+        cfg = config(routes=routes)
+        d = router.decide(cfg, SENTRY, {"task_kind": "chat"})
+        self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "default_engine_unavailable", "route_no_model"))
+        self.assertIsNone(router.route_decision(d))
+        self.assertEqual(router.explain_answer(cfg, SENTRY, {"task_kind": "chat"}),
+                         {"code": "request_invalid", "detail": "default_engine_unavailable:route_no_model"})
+        self.assertEqual(router.decide(cfg, SENTRY, {"hand_pick": {"engine": "claude_code", "model": None}})["reason"],
+                         "route_no_model")
+        picked = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "claude_code", "model": "m-picked"}})
+        self.assertEqual((picked["ok"], picked["model"]), (True, "m-picked"))
+        raw = copy.deepcopy(CONFIG)
+        raw["default"]["model"] = "m-default"
+        self.assertEqual(router.decide(config(raw, routes=routes), SENTRY, {})["model"], "m-default")
+
+    def test_every_refusal_detail_is_code_words(self) -> None:  # ds F3
+        cases = [{"hand_pick": {"engine": "bogus", "model": None}}, {"hand_pick": {"engine": "pi", "model": ""}},
+                 {"hand_pick": {"engine": "pi", "model": "two words"}}, {"task_kind": 5}, {"tags": ["a", ""]},
+                 {"task_kind": None}, {"hand_pick": {"engine": "pi", "model": None}},
+                 {"hand_pick": {"engine": "recursion_loop", "model": None}}, {"engine": "codex"},
+                 {"engine": "codex", "hand_pick": {"engine": "opencode", "model": None}}, {"repo": "x"}, {1: "x"}]
+        for params in cases:
+            with self.subTest(params):
+                answer = router.explain_answer(config(), SENTRY, params)
+                self.assertEqual(answer["code"], "request_invalid")
+                self.assertTrue(all(CODE_WORD.fullmatch(part) for part in answer["detail"].split(":")), answer["detail"])
+
+    def test_explain_reads_the_task_once(self) -> None:  # ds F4
+        task = _ReadCounting()
+        out = router.explain(config(), SENTRY, task)
+        self.assertEqual(task.reads, 1)
+        self.assertEqual((out["decision"]["rule"], out["decision"]["engine"]), ("review-to-codex", "codex"))
+        chosen = [r["id"] for r in out["rules"] if r["outcome"] == "chosen"]
+        self.assertEqual((chosen, out["default"]["outcome"]), (["review-to-codex"], "not_reached"))
+
+    def test_a_bad_hand_pick_is_explained_as_not_reached(self) -> None:  # ds F5
+        out = router.explain(config(), SENTRY, {"hand_pick": {"engine": "codex", "model": None, "x": 1}})
+        rows = {(r["outcome"], r["reason"]) for r in out["rules"]} | {(out["default"]["outcome"], out["default"]["reason"])}
+        self.assertEqual(rows, {("not_reached", "bad_hand_pick")})
+
+    def test_next_after_limit_takes_decides_answer_only(self) -> None:  # ds F6
+        cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        d = router.decide(cfg, SENTRY, {})
+        for wrong in (router.route_decision(d), None, {}, "decision"):
+            self.assertEqual(router.next_after_limit(cfg, wrong, LIMIT), {"action": "none", "reason": "no_decision"}, wrong)
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "switch")
+
+    def test_a_snapshot_that_cannot_be_walked_is_malformed(self) -> None:  # ds F10
+        class Hostile(Mapping):
+            def __getitem__(self, key):
+                raise KeyError(key)
+
+            def __iter__(self):
+                raise RuntimeError("cannot walk")
+
+            def __len__(self):
+                return 1
+        self.assertEqual(router.snapshot({"engines": Hostile()}), (None, "detection_malformed"))
+        d = router.decide(config(), {"engines": Hostile()}, {})
+        self.assertEqual((d["ok"], d["reason"]), (False, "detection_malformed"))
+
+    def test_small_interface_gaps(self) -> None:  # ds F10
+        self.assertEqual(routing.EXPLAIN_PARAMS, ("session_id", "engine", "hand_pick", "task_kind", "tags"))
+        with self.assertRaises(TypeError):
+            detect.detect(config(), active="codex")
 
 
 if __name__ == "__main__":

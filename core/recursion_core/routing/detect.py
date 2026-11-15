@@ -7,7 +7,8 @@ An engine is ROUTABLE when (my brief, step 3):
   starter read);
 * its connection's breaker is not open (the breaker's own read-only view, read the way ``route.list``
   reads it: a trip kept in the store from an earlier daemon counts as open, and a store that cannot be
-  read is ``breaker_unknown``, because a start on it is refused until the store reads);
+  read is ``breaker_unknown``, because a start on it is refused until the store reads; a breaker whose
+  ``state()`` raises is ``detection_source_failed``, like any source that raises: unroutable either way);
 * for a key route (``connection.kind`` ``api_key``) and for ``recursion_loop``, its key is present in the
   key store and opted in to spending (grill Q44: a key route with no opt-in never spends).
 
@@ -100,6 +101,8 @@ def detect(config: Config, *, route_refusal: Callable | None = None, breaker_sta
     A source left out (None) is not consulted, except the key state: a key route with no key source is
     ``key_state_unknown``, never routable, because spending needs a positive opt-in.
     """
+    if isinstance(active, (str, bytes)):
+        raise TypeError("active is an iterable of engine ids, not one string")
     active_set = None if active is None else frozenset(active)
     engines: dict[str, dict] = {}
     for engine in ENGINES:

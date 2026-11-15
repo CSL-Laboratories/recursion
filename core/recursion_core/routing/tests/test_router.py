@@ -95,9 +95,19 @@ class HandPickTests(unittest.TestCase):
                            ({"hand_pick": {"engine": ["codex"]}}, "bad_hand_pick")):
             d = router.decide(self.cfg, SENTRY, task)
             self.assertEqual((d["ok"], d["code"]), (False, code), task)
-        # A hand pick with no model key reads as model null: the model routes.json configures.
+        # A hand pick has both members, as common.v1 says (second read of #399, F7): one with no model key is
+        # refused, as explain_answer refuses it; model null is the model routes.json configures.
         d = router.decide(self.cfg, SENTRY, {"hand_pick": {"engine": "codex"}})
+        self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_hand_pick", "hand_pick"))
+        d = router.decide(self.cfg, SENTRY, {"hand_pick": {"engine": "codex", "model": None}})
         self.assertEqual((d["engine"], d["model"], d["hand_pick"]), ("codex", "codex-model-a", {"engine": "codex", "model": None}))
+
+    def test_a_present_null_condition_is_refused_not_read_as_absent(self) -> None:
+        # Second read of #399, F7: a caller that sends null meant to set the filter; a null hand_pick is none.
+        for task, reason in (({"task_kind": None}, "task_kind"), ({"tags": None}, "tags")):
+            d = router.decide(self.cfg, SENTRY, task)
+            self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_task", reason), task)
+        self.assertEqual(router.decide(self.cfg, SENTRY, {"hand_pick": None})["reason"], "default")
 
 
 class DetectedOnlyTests(unittest.TestCase):

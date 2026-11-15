@@ -50,8 +50,8 @@ MUTANTS = {
         {"test_fallback_routes_are_only_configured_logins_of_their_engine", "test_loader_cross_field_rules"}),
     "M4 the snapshot filtered entry by entry, not validated as a whole": (
         ROUTER,
-        '        if not _entry_ok(eng, entry):\n            return None, "detection_malformed"\n',
-        '        if not _entry_ok(eng, entry):\n            continue\n',
+        '            if not _entry_ok(eng, entry):\n                return None, "detection_malformed"\n',
+        '            if not _entry_ok(eng, entry):\n                continue\n',
         {"test_adversarial_snapshots_refuse_everything_without_raising"}),
     "M6 vendor and kind taken from the operator's label, the catalog not checked": (
         CONFIG,
@@ -175,6 +175,66 @@ MUTANTS = {
         '            raise ConfigError("key_metadata_invalid", key_id)\n'
         '        put(key_id, meta["provider"], "api_key", "key store")\n',
         {"test_a_key_of_a_provider_outside_the_vendor_list_leaves_loading_alone"}),
+    # The first reads of #399 (05a5d13d): each guard they found unprotected or missing.
+    "M34 a null vendor reset read as no deadline": (
+        ROUTER,
+        '        until = signal.get("reset_at")\n        if until is None:\n            until = limit.get("retry_at")\n',
+        '        until = signal.get("reset_at", limit.get("retry_at"))\n',
+        {"test_wait_uses_breaker_retry_when_vendor_reset_is_null"}),
+    "M35 the decided primary not counted as tried": (
+        ROUTER,
+        '    attempts.append({"engine": decision["engine"]',
+        '    (lambda _: None)({"engine": decision["engine"]',
+        {"test_primary_not_reoffered_without_notice"}),
+    "M36 the model left out of a tried route's identity": (
+        ROUTER,
+        '    mine = (route["engine"], route["model"], contract.connection_key(route))\n'
+        '    return mine == (seen.get("engine"), seen.get("model"), seen.get("connection"))\n',
+        '    mine = (route["engine"], contract.connection_key(route))\n'
+        '    return mine == (seen.get("engine"), seen.get("connection"))\n',
+        {"test_same_engine_and_connection_other_model_still_allowed"}),
+    "M37 a route with no model anywhere routed": (
+        ROUTER,
+        '        return "route_no_model" if why is None and model is None else why\n',
+        "        return why\n",
+        {"test_a_route_with_no_model_anywhere_is_not_routable"}),
+    "M38 a bad hand pick explained as rule rows": (
+        ROUTER,
+        'bad_task = decision.get("code") in ("bad_task", "bad_hand_pick")',
+        'bad_task = decision.get("code") in ("bad_task",)',
+        {"test_a_bad_hand_pick_is_explained_as_not_reached"}),
+    "M39 explain reading the task a second time": (
+        ROUTER,
+        "    else:\n        decision = _decide(config, detection, kind, tags, hp)\n",
+        "    else:\n        decision = decide(config, detection, task)\n",
+        {"test_explain_reads_the_task_once"}),
+    "M40 a present null tags read as absent": (
+        ROUTER,
+        '    if "tags" in task and not (',
+        "    if tags is not None and not (",
+        {"test_a_present_null_condition_is_refused_not_read_as_absent"}),
+    "M41 a hand pick without its model member taken": (
+        ROUTER,
+        'set(hand) != {"engine", "model"}',
+        'not set(hand) <= {"engine", "model"}',
+        {"test_bad_task_or_hand_pick_is_refused"}),
+    "M42 a snapshot that cannot be walked raising instead of refusing": (
+        ROUTER,
+        "    except Exception:  # noqa: BLE001 - a snapshot that cannot be read is malformed, never partly used\n",
+        "    except ZeroDivisionError:\n",
+        {"test_a_snapshot_that_cannot_be_walked_is_malformed"}),
+    "M43 a decision that is not decide's answered as no route": (
+        ROUTER,
+        '    if not isinstance(decision, Mapping) or "ok" not in decision:\n'
+        '        return {"action": "none", "reason": "no_decision"}\n'
+        '    if not decision["ok"]:\n',
+        '    if not decision.get("ok"):\n',
+        {"test_next_after_limit_takes_decides_answer_only"}),
+    "M44 a refusal detail that is not a code word": (
+        ROUTER,
+        'raise _Refuse("bad_hand_pick", "hand_pick_model")',
+        'raise _Refuse("bad_hand_pick", "hand_pick.model")',
+        {"test_every_refusal_detail_is_code_words"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

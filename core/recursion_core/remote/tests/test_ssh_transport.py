@@ -156,6 +156,22 @@ class HostKeyPinTests(unittest.TestCase):
                 SshRelayClient(target_for(support.write_known_hosts(self.dir, lines)), spawn=spawn)
         self.assertEqual(spawned, [])
 
+    def test_bad_client_arguments_are_refused_before_ssh_starts(self) -> None:
+        spawned: list[list[str]] = []
+
+        def spawn(argv, **kwargs):
+            spawned.append(argv)
+            raise AssertionError("ssh must not start")
+
+        pinned = support.write_known_hosts(self.dir, [f"far.example {TYPE} {BLOB}"])
+        for size in ("x", 0, -1, 1.5, True, None):
+            with self.subTest(max_frame_bytes=size), self.assertRaises(ValueError):
+                SshRelayClient(target_for(pinned), spawn=spawn, max_frame_bytes=size)  # type: ignore[arg-type]
+        for target in (7, "far.example", None):
+            with self.subTest(target=target), self.assertRaises(TypeError):
+                SshRelayClient(target, spawn=spawn)  # type: ignore[arg-type]
+        self.assertEqual(spawned, [])
+
 
 HELLO = {"ok": True, "op": "relay_hello", "relay": {"version": 1, "transport": "ssh"}}
 
@@ -663,6 +679,11 @@ class RelayAPIDecisionTests(unittest.TestCase):
     def test_a_connect_that_is_not_a_function_is_refused_at_once(self) -> None:
         with self.assertRaises(TypeError):
             RelayAPI(connect=7)
+
+    def test_a_target_that_is_not_an_ssh_target_is_refused_at_once(self) -> None:
+        for target in (7, "far.example", {"host": "far.example"}):
+            with self.subTest(target=target), self.assertRaises(TypeError):
+                RelayAPI(target)  # type: ignore[arg-type]
 
 
 @unittest.skipUnless(POSIX, "the end-to-end path needs the AF_UNIX control socket (POSIX)")

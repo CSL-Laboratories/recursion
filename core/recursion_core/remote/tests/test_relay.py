@@ -286,6 +286,16 @@ class RelayRefusesTests(unittest.TestCase):
         self.assertIs(reply["error"]["delivered"], False)
         self.assertEqual(connects, [])
 
+    def test_a_request_that_is_not_an_object_is_refused_unsent(self) -> None:
+        # serve() hands handle() only objects; a direct caller may not, and nothing can have been sent.
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ)
+        for request in ([1, 2], "run.list", None, 7):
+            with self.subTest(request=request):
+                self.assertEqual(relay.handle(request),  # type: ignore[arg-type]
+                                 codec.relay_error("bad_frame", delivered=False, detail="frame_not_object"))
+        self.assertEqual(daemon.seen, [])
+
 
 @unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
 class RelayStreamTests(unittest.TestCase):
@@ -388,6 +398,17 @@ class RelayMainTests(unittest.TestCase):
         self.assertEqual(main(["shell"], environ={}, stdin=io.BytesIO(), stdout=out, stderr=err), EXIT_REFUSED)
         self.assertEqual(out.getvalue(), b"")
         self.assertIn("usage error", err.getvalue())
+
+    def test_a_runtime_directory_that_is_a_file_is_refused_not_raised(self) -> None:
+        runtime = os.path.join(support.scratch_dir(self), "runtime-file")
+        with open(runtime, "w", encoding="ascii"):
+            pass
+        out, err = io.BytesIO(), io.StringIO()
+        code = main(["relay"], environ={"XDG_RUNTIME_DIR": runtime}, stdin=io.BytesIO(frames({"op": "ping"})),
+                    stdout=out, stderr=err)
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertEqual(out.getvalue(), b"")
+        self.assertIn("recursion relay: refused: NotADirectoryError", err.getvalue())
 
 
 class Trickle(io.RawIOBase):

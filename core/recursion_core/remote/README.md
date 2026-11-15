@@ -63,7 +63,9 @@ same-uid process can claim anything in a frame, so the relay puts no label into 
 | `delivered: "unknown"` | the request may have been written whole and no complete answer came back: read the run's status before retrying |
 
 The request's deadline covers both writing it and waiting for the answer (each wait gets only what is
-left of it), and `close()` ends a session at once, also while a request is blocked in it.
+left of it). `SshRelayClient.close()` ends its session at once, also while a request is blocked in it.
+`RelayAPI.close()` ends only the shared session of `persistent=True`, after a call in it has returned;
+the session of a call of its own ends when that call returns.
 
 A Stop never waits behind another call: each call gets a fresh SSH session, as the socket client
 makes one connection per call. With `persistent=True` ordinary calls share one session and `run.stop`

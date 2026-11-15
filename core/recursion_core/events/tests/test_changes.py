@@ -46,6 +46,22 @@ def record(text='a', **launch):
     return json.dumps(doc)
 
 
+class OddMarker:
+    """SPINE's marker, handing back the values in ``extra`` with its next batch (DeepSeek r3, L7)."""
+
+    def __init__(self, inner) -> None:
+        self.inner, self.extra = inner, []
+
+    @property
+    def poll_interval_s(self):
+        return self.inner.poll_interval_s
+
+    def take(self):
+        ids, dropped = self.inner.take()
+        extra, self.extra = self.extra, []
+        return [*extra, *ids], dropped
+
+
 @unittest.skipUnless(POSIX, 'the daemon registry is Linux only')
 class ChangeReaderTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -1202,6 +1218,167 @@ class ChangeReaderTest(unittest.TestCase):
                     self.reader.step()
                     waits.append(round(self.reader._deferred[RUN][1] - self.now[0], 6))
         self.assertEqual((waits[:3], waits[-2:]), ([0.2, 0.4, 0.8], [60.0, 60.0]))
+
+    # -- round 3 (DeepSeek's read of 1290fbce)
+
+    def test_a_run_the_registry_refuses_to_read_is_listed_until_it_is_read(self) -> None:
+        # DeepSeek r3, M: ready and unlogged said the log was complete while a refused run was in neither.
+        self.put('a', RUN)
+        self.put('b', RUN2)
+        real = self.registry.snapshot
+
+        def refuse_run2(run_id):
+            if run_id == RUN2:
+                raise OSError('unreadable row')
+            return real(run_id)
+        with mock.patch.object(self.registry, 'snapshot', refuse_run2), self.assertLogs(C.LOG, 'WARNING'):
+            for _ in range(10):
+                self.reader.step()
+                if self.reader.ready:
+                    break
+        self.assertTrue(self.reader.ready)
+        self.assertEqual((self.reader.unlogged, self.unlogged_table()), ({RUN2: 'registry_refused'},) * 2)
+        self.assertEqual(self.notes(RUN2), [], 'the log lacks it, and unlogged says so')
+        restarted = self.new_reader(page=1)
+        self.assertTrue(restarted.step())                      # the scan state, then a page of one run: RUN alone
+        self.assertEqual(restarted.unlogged, {RUN2: 'registry_refused'}, 'a restart reads the listing back')
+        self.drain()
+        self.assertEqual((self.reader.unlogged, self.unlogged_table(), self.notes(RUN2)), ({}, {}, ['b']))
+
+    def test_a_refused_run_whose_listing_fails_ends_the_step_and_is_listed_later(self) -> None:
+        # DeepSeek r3, M: listing a run the registry refused is a transaction, and can fail like any other.
+        self.drain()
+        self.put('a')
+        self.put('b', RUN2)
+        real, reads = self.registry.snapshot, []
+
+        def refuse_run(run_id):
+            reads.append(run_id)
+            if run_id == RUN:
+                raise OSError('unreadable row')
+            return real(run_id)
+        self.store.fail_commit = True
+        with mock.patch.object(self.registry, 'snapshot', refuse_run), self.assertLogs(C.LOG, 'WARNING'):
+            self.assertFalse(self.reader.step())
+            self.assertEqual((reads, self.reader.unlogged, self.reader._pending), ([RUN], {}, {RUN, RUN2}))
+            self.store.fail_commit = False
+            self.now[0] = self.reader._wait_until
+            refusals, _, reason = self.reader._deferred[RUN]
+            self.reader._deferred[RUN] = (refusals, self.now[0] + 50, reason)   # its own wait outlasts the store's
+            self.reader._scan_wanted = True
+            self.reader.step()
+        self.assertEqual(reads.count(RUN), 1, 'the scan met it before its own wait had passed and did not read it')
+        self.assertEqual((self.reader.unlogged, self.unlogged_table()), ({RUN: 'registry_refused'},) * 2, 'but listed it')
+        self.assertEqual(self.notes(RUN2), ['b'])
+        self.drain()
+        self.assertEqual((self.reader.unlogged, self.unlogged_table(), self.notes()), ({}, {}, ['a']))
+
+    def test_a_poll_interval_too_large_for_a_float_is_read_by_its_sign(self) -> None:
+        # DeepSeek r3, L1: float(10**400) raised OverflowError out of step().
+        for value, expected in ((10 ** 400, 60.0), (-10 ** 400, C.MIN_POLL_S)):
+            with self.subTest(positive=value > 0):
+                self.marker.poll_interval_s = value
+                self.assertEqual(self.reader._poll_s(), expected)
+        self.marker.poll_interval_s = 10 ** 400
+        self.registry.add(RUN, 'boot-1')
+        self.drain()
+        self.assertEqual(len(self.changed(RUN)), 1)
+
+    def test_a_listed_run_back_at_its_last_logged_image_leaves_the_listing_and_logs_nothing(self) -> None:
+        # DeepSeek r3, L2: the listing leaves in the transaction that reads a typed image, new to the log or not.
+        self.put('A')
+        self.drain()
+        self.registry.control_put(RUN, 'not json')
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.assertEqual(self.unlogged_table(), {RUN: 'control_text_not_json'})
+        self.put('A')
+        self.drain()
+        self.assertEqual((self.unlogged_table(), self.reader.unlogged, self.notes()), ({}, {}, ['A']))
+
+    def test_a_listed_run_the_registry_holds_nothing_for_leaves_the_listing(self) -> None:
+        # DeepSeek r3, L2: nothing is missing from the log for a run the registry does not hold and it never saw.
+        with self.store.transaction() as tx:
+            tx.execute("INSERT INTO events_unlogged (run_id, code) VALUES ('run-ghost', 'control_text_not_json')")
+        self.drain()
+        self.assertEqual(self.reader.unlogged, {'run-ghost': 'control_text_not_json'})
+        self.marker.mark('run-ghost')
+        self.drain()
+        self.assertEqual((self.unlogged_table(), self.reader.unlogged, self.store.events), ({}, {}, []))
+
+    def test_a_store_another_reader_has_started_is_refused(self) -> None:
+        # DeepSeek r3, L3: two readers on one store could leave the log's last image behind the registry's.
+        first, second = C.ChangeReader(self.marker), C.ChangeReader(H.ChangeMarker())
+        first._run = second._run = lambda stopping=None: None
+        context = self.context()
+        first.start(context)
+        with self.assertRaisesRegex(RuntimeError, 'another change reader'):
+            second.start(context)
+        self.assertIsNone(second._thread)
+        with self.assertRaisesRegex(RuntimeError, 'another change reader'):
+            second.bind(self.registry, self.store)
+        first.stop(context)
+        second.start(context)
+        second.stop(context)
+        first.bind(self.registry, self.store)                  # free again after second's stop
+
+    def test_log_id_of_and_image_digest_refuse_what_is_not_a_post_image(self) -> None:
+        # DeepSeek r3, L4.
+        for image in ([1], None, 'text', {}, {'daemon_row': [], 'control_record': None},
+                      {'daemon_row': 5, 'control_record': 'x'}, {'daemon_row': None, 'control_record': None, 'x': 1}):
+            with self.subTest(image=image):
+                with self.assertRaisesRegex(C.BadImage, 'not_a_post_image'):
+                    C.log_id_of(RUN, image)
+                with self.assertRaisesRegex(C.BadImage, 'not_a_post_image'):
+                    C.image_digest(image)
+
+    def test_a_clock_that_cannot_be_called_is_refused_with_the_options(self) -> None:
+        # DeepSeek r3, L5: it was accepted, and step() then raised on the service thread.
+        for clock in (None, 'later'):
+            with self.subTest(clock=clock):
+                with self.assertRaisesRegex(ValueError, 'monotonic'):
+                    C.ChangeReader(self.marker, monotonic=clock)
+        hooks = H.Hooks()
+        with self.assertRaisesRegex(ValueError, 'monotonic'):
+            C.register(hooks, monotonic=None)
+        C.register(hooks)
+
+    def test_a_store_refused_for_its_version_is_closed_and_refused_the_same_way_again(self) -> None:
+        # DeepSeek r3, L6: without the close, the second open said store_in_use.
+        state = self.folder / 'old-twice'
+        state.mkdir()
+        old = D.EventStore(str(state / C.STORE_FILE))
+        old.register_tables(C.LANE, 1, C.LANE_DDL.rsplit('; CREATE TABLE events_unlogged', 1)[0])
+        old.close()
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                with self.assertRaisesRegex(D.StoreError, 'tables of version 1'):
+                    C.open_store(state)
+
+    def test_a_store_whose_declaration_is_interrupted_is_closed(self) -> None:
+        # DeepSeek r3, L6: without the close, every later open of the folder said store_in_use.
+        state = self.folder / 'interrupted'
+        state.mkdir()
+        with mock.patch.object(D.EventStore, 'register_tables', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                C.open_store(state)
+        C.open_store(state).close()
+
+    def test_a_value_from_the_marker_that_is_not_a_run_id_is_dropped_and_asks_for_a_scan(self) -> None:
+        # DeepSeek r3, L7: one such value stopped the marked runs' slice for good.
+        marker = OddMarker(self.marker)
+        reader = C.ChangeReader(marker, monotonic=lambda: self.now[0])
+        reader.bind(self.registry, self.store)
+        self.drain(reader)
+        marker.extra = [5, '', None]
+        self.put('a')
+        self.put('b', RUN2)
+        with self.assertLogs(C.LOG, 'ERROR') as logged:
+            reader.step()
+        self.assertIn('3 values that are not run ids', logged.output[0])
+        self.assertTrue(reader._scanning, 'a scan is asked for, as for a dropped mark')
+        self.drain(reader)
+        self.assertEqual((self.notes(), self.notes(RUN2), reader._pending), (['a'], ['b'], set()))
 
 
 class RealStore(D.EventStore):

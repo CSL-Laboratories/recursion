@@ -13,24 +13,30 @@ service (S13). The marker's text is the protocol; this module follows it:
 - Dedupe is against the LAST image logged for that run, kept in this lane's own table: a run seen as A,
   then B, then A gives three events. The event and the run's new last digest commit in ONE transaction;
   there is no other checkpoint and nothing is acknowledged to the registry.
-- One consumer owns the order from snapshot to commit. An image whose transaction fails is HELD, and its
-  transaction is retried before any later image of that run is read. At most one image is held: no other
-  work is done after a failed transaction until the held image commits. There is no queue of old texts.
+- One consumer owns the order from snapshot to commit: ``start`` claims the store for its reader until its
+  ``stop``, and another reader's ``start`` or ``bind`` on that store is refused. An image whose transaction
+  fails is HELD, and its transaction is retried before any later image of that run is read. At most one image
+  is held: no other work is done after a failed transaction until the held image commits. There is no queue
+  of old texts.
 - Waiting. After a refused page or a failed transaction the reader does nothing but take marks until a
   wait has passed: the marker's poll interval at first, doubling at each further refusal of the same thing
   (the registry's pages, or the store's transactions) up to ``scan_interval_s``, and none again once that
   thing has succeeded: a page read does not end the backoff of a store that keeps failing. The poll
   interval is read through ``_poll_s``: SPINE's marker keeps it as a plain attribute, so the reader takes it
   as a number from ``MIN_POLL_S`` to ``scan_interval_s``. A run the registry refuses to read waits on a
-  backoff of its own and stays pending; it holds up neither the scan
-  (the cursor moves past it) nor the other runs, and no scan reads it before its time, nor under any reason
-  but the one it was first read for. ``failing`` is true while anything is held or waited for.
-- A taken batch stays pending until its runs are logged or listed in ``unlogged``. Scans page with
+  backoff of its own, stays pending, and is listed in ``unlogged`` as ``registry_refused`` until it is read;
+  it holds up neither the scan (the cursor moves past it) nor the other runs, and no scan reads it before its
+  time, nor under any reason but the one it was first read for. ``failing`` is true while anything is held or
+  waited for.
+- A taken batch stays pending until its runs are read and logged, or listed in ``unlogged``. A value the
+  marker hands back that is not a run id (a non-empty string) is dropped, logged at ERROR, and asks for a
+  scan, as a dropped mark does. Scans page with
   ``Registry.run_ids(after, page)``, one page per step, interleaved with one slice of at most
   ``slice_size`` marked runs, so new marks never put off a scan that is due. A scan begins at the first step
   after a start, and again no later than ``scan_interval_s`` after a pass completes; a dropped mark asks for
   a scan and does not send a scan in progress back to its first page. ``ready`` is true once the first pass
-  of this start has completed; the runs the log lacks then are exactly those in ``unlogged``.
+  of this start has completed. Every run that pass read is then logged as the pass read it, or listed in
+  ``unlogged``; a change made after the pass read a run is logged by its mark or by the next scan.
 - ``reason``: ``commit`` for a run read because it was marked; ``snapshot`` for a run's first record in
   this log made by the first pass ever made on this store (logging began after the run existed);
   ``reconcile`` for a run found by any other scan, and for a run this log already holds when a first pass
@@ -45,14 +51,17 @@ service (S13). The marker's text is the protocol; this module follows it:
   no RFC 8785 text: an integer past 2**53, a lone surrogate, nesting past 64), or whose event the store
   refuses, is NOT logged: event.v1 has no typed form for it (the lane's ``questions.md``, Q12). It is listed,
   with its code, in this lane's table ``events_unlogged`` (durable: a restart reads it back at its first
-  scan) and in ``unlogged``, logged at ERROR, and read again at every scan; it leaves both in the
-  transaction that logs it, as soon as its record has a typed post-image. A code is ``<kind>`` or
-  ``<kind>:<detail>``: the kind is one of ``BadImage``'s codes, ``no_canonical_text`` or ``store_refused``,
-  and the detail is the refusal's own code when it has one.
+  scan) and in ``unlogged``, logged at ERROR, and read again at every scan. So is a run the registry refuses
+  to read (``registry_refused``, logged at WARNING), until it is read. A run leaves both in the transaction
+  that reads it with a typed post-image: the one that logs it, or that finds the log already holds that
+  image, or that finds the registry holds nothing for a run this log never saw (nothing is missing then). A
+  code is ``<kind>`` or ``<kind>:<detail>``: the kind is one of ``BadImage``'s codes, ``no_canonical_text``,
+  ``store_refused`` or ``registry_refused``, and the detail is the refusal's own code when it has one
+  (``registry_refused`` has none: the registry's refusal is in the WARNING line).
 
 What this gives, and what it does not. Replay of the log reaches the registry's durable state for every
 run not listed in ``unlogged``: the last image logged for a run equals what the registry holds once the
-reader has caught up. Changes between two reads appear as the last image: the log does NOT claim every
+reader (one per store) has caught up. Changes between two reads appear as the last image: the log does NOT claim every
 intermediate transition (a transition-exact log would need a write inside Stop's durable path, which is
 lane STOP's to propose). Its source reads take the registry's lock, so a paused reader CAN delay a Stop;
 SPINE's S12 text states that cost, and nothing here adds a registry write.
@@ -68,6 +77,7 @@ import os
 import re
 import threading
 import time
+import weakref
 
 from recursion_core.control.methods import canonical_text
 from recursion_core.events import db as events_db
@@ -93,12 +103,17 @@ _SESSION_ID = re.compile(r'ses-[A-Za-z0-9_-]{1,60}')
 _TURN_ID = re.compile(r'turn-[A-Za-z0-9_-]{1,59}')
 _DETAIL = re.compile(r'[A-Za-z0-9_.:-]{1,80}')
 _RUN_FIELDS = ('run_id', 'unit', 'stop_requested', 'state', 'boot_id', 'detail')
+_REGISTRY_REFUSED = 'registry_refused'
+
+# The store each started reader holds, from its ``start`` to its ``stop``: one reader per store.
+_CLAIMS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_CLAIMS_LOCK = threading.Lock()
 
 # What logging one run came to.
 _DONE = 'done'            # logged, unchanged, or listed in ``unlogged``: the run leaves the pending set
-_DEFERRED = 'deferred'    # the registry refused to read it, or its own wait has not passed: it stays pending
+_DEFERRED = 'deferred'    # the registry refused to read it, or its own wait has not passed: listed, it stays pending
 _HELD = 'held'            # its transaction failed: the image is held and nothing more is done this step
-_FAILED = 'failed'        # the transaction listing it as unlogged failed: it stays pending; nothing more this step
+_FAILED = 'failed'        # the transaction listing it in unlogged failed: it stays pending; nothing more this step
 
 
 class BadImage(ValueError):
@@ -133,13 +148,20 @@ def post_image(row, control_text) -> dict:
     return {'daemon_row': daemon_row, 'control_record': None if control_text is None else _strict_object(control_text)}
 
 
+def _checked_image(image) -> dict:
+    """``image`` when it has a run's post-image shape: exactly ``daemon_row`` and ``control_record``, each an
+    object or null. Anything else is ``BadImage('not_a_post_image')``."""
+    if (not isinstance(image, dict) or set(image) != {'daemon_row', 'control_record'}
+            or not all(half is None or isinstance(half, dict) for half in image.values())):
+        raise BadImage('not_a_post_image')
+    return image
+
+
 def image_digest(image: dict) -> str:
     """SHA-256 of the post-image's RFC 8785 text (digest form rfc8785/v1, as event.v1 names it). A value that
     is not a run's post-image is ``BadImage``; one with no RFC 8785 text is ``NoCanonicalText`` (both are
     ``ValueError``)."""
-    if not isinstance(image, dict) or set(image) != {'daemon_row', 'control_record'}:
-        raise BadImage('not_a_post_image')
-    return hashlib.sha256(canonical_text(image).encode('utf-8')).hexdigest()
+    return hashlib.sha256(canonical_text(_checked_image(image)).encode('utf-8')).hexdigest()
 
 
 def _launch(image: dict) -> dict:
@@ -150,10 +172,11 @@ def _launch(image: dict) -> dict:
 
 def log_id_of(run_id: str, image: dict) -> str:
     """The session the run's record names, when it names one that is a log id; otherwise ``run:<run_id>``.
-    A run id that is not a non-empty string is a ``TypeError``."""
+    A run id that is not a non-empty string is a ``TypeError``; an image that is not a run's post-image is
+    ``BadImage('not_a_post_image')``."""
     if not isinstance(run_id, str) or not run_id:
         raise TypeError('run_id')
-    session = _launch(image).get('session_id')
+    session = _launch(_checked_image(image)).get('session_id')
     return session if isinstance(session, str) and _SESSION_ID.fullmatch(session) else f'run:{run_id}'
 
 
@@ -168,15 +191,38 @@ def _code(exc: ValueError, kind: str) -> str:
 
 def _check_options(*, scan_interval_s: float = 60.0, page: int = PAGE, slice_size: int = SLICE,
                    monotonic=time.monotonic) -> tuple:
-    """The reader's options, checked: ``(scan_interval_s, page, slice_size, monotonic)``. ``register`` calls it
-    before it sets any hook, so a refused option leaves the hooks as they were."""
+    """The reader's options, checked: ``(scan_interval_s, page, slice_size, monotonic)``; a refused one is a
+    ``ValueError`` naming it (an option this does not know is the language's own ``TypeError``). ``register``
+    calls it before it sets any hook, so a refused option leaves the hooks as they were."""
     for field, value in (('page', page), ('slice_size', slice_size)):
         if type(value) is not int or value < 1:
             raise ValueError(field)
     if (isinstance(scan_interval_s, bool) or not isinstance(scan_interval_s, (int, float))
             or not math.isfinite(scan_interval_s) or scan_interval_s <= 0):
         raise ValueError('scan_interval_s')
+    if not callable(monotonic):
+        raise ValueError('monotonic')
     return float(scan_interval_s), page, slice_size, monotonic
+
+
+def _claim(store, reader, *, take: bool) -> None:
+    """Refuses ``store`` when another reader's ``start`` holds it; with ``take``, ``reader`` then holds it."""
+    if store is None:
+        return
+    with _CLAIMS_LOCK:
+        holder = _CLAIMS.get(store)
+        if holder is not None and holder is not reader:
+            raise RuntimeError('the event store has another change reader')
+        if take:
+            _CLAIMS[store] = reader
+
+
+def _release(store, reader) -> None:
+    if store is None:
+        return
+    with _CLAIMS_LOCK:
+        if _CLAIMS.get(store) is reader:
+            del _CLAIMS[store]
 
 
 class ChangeReader:
@@ -215,7 +261,8 @@ class ChangeReader:
 
     @property
     def ready(self) -> bool:
-        """True once the first pass of this start has completed. The runs the log lacks then are ``unlogged``."""
+        """True once the first pass of this start has completed: every run it read is then logged as it read it,
+        or listed in ``unlogged``."""
         return self._ready
 
     @property
@@ -226,20 +273,26 @@ class ChangeReader:
 
     @property
     def unlogged(self) -> dict:
-        """``{run_id: code}``: the runs this reader cannot log as the registry holds them (a copy). The lane's
-        table ``events_unlogged`` holds the same; a start reads it back at its first scan."""
+        """``{run_id: code}``: the runs this reader cannot log as the registry holds them, or cannot read
+        (``registry_refused``), as a copy. The lane's table ``events_unlogged`` holds the same; a start reads it
+        back at its first scan."""
         return dict(self._unlogged)
 
     def bind(self, registry, store) -> None:
-        """The two things the reader reads and writes. ``start`` binds them from the service context."""
+        """The two things the reader reads and writes. ``start`` binds them from the service context. A store
+        another reader's ``start`` holds (until its ``stop``) is refused."""
+        _claim(store, self, take=False)
         self._registry, self._store = registry, store
 
     def start(self, context) -> None:
+        """Claims the context's store for this reader (another reader's start or bind on it is refused until
+        this reader's ``stop``), binds, and starts the thread."""
         if self._thread is not None:
             raise RuntimeError('the change reader is already started')
-        self.bind(context.registry, context.store)
-        if self._store is None:
+        if context.store is None:
             raise RuntimeError('the change reader needs the event store')
+        _claim(context.store, self, take=True)
+        self.bind(context.registry, context.store)
         self._reset()
         stopping = self._stopping = threading.Event()
         thread = threading.Thread(target=self._run, args=(stopping,), name='events-change-reader', daemon=True)
@@ -249,14 +302,16 @@ class ChangeReader:
         thread.start()
 
     def stop(self, context) -> None:
-        """Ends the current start's thread and joins it. A thread whose start raised before it began is not
-        joined: when it runs, it reads its own stop signal, set here, before anything else, and does nothing."""
+        """Ends the current start's thread, joins it, and gives up the store's claim. A thread whose start raised
+        before it began is not joined: when it runs, it reads its own stop signal, set here, before anything else,
+        and does nothing."""
         self._stopping.set()
         thread = self._thread
         if thread is not None:
             if thread.is_alive():
                 thread.join()
             self._thread = None
+        _release(self._store, self)
 
     def _run(self, stopping=None) -> None:
         stopping = self._stopping if stopping is None else stopping
@@ -278,7 +333,13 @@ class ChangeReader:
         if self._registry is None or self._store is None:
             raise RuntimeError('the change reader is not bound')
         ids, dropped = self._marker.take()
-        self._pending |= set(ids)
+        ids = list(ids)
+        runs = [run_id for run_id in ids if isinstance(run_id, str) and run_id]
+        if len(runs) != len(ids):              # not run ids: dropped, and a scan asked for, as for a dropped mark
+            LOG.error('the change marker handed back %d values that are not run ids; they are dropped and a scan '
+                      'is asked for', len(ids) - len(runs))
+            dropped = True
+        self._pending.update(runs)
         if dropped:
             self._scan_wanted = True
         now = self._monotonic()
@@ -358,11 +419,18 @@ class ChangeReader:
 
     def _poll_s(self) -> float:
         """The marker's poll interval as the reader waits on it: from ``MIN_POLL_S`` to the scan interval. A value
-        that is not a number (or is a bool, NaN or missing) is read as ``MIN_POLL_S``, and so is one of 0 or less."""
+        that is not a number (or is a bool, NaN or missing) is read as ``MIN_POLL_S``, and so is one of 0 or less;
+        an int too large for a float is read as infinity is, by its sign."""
         value = getattr(self._marker, 'poll_interval_s', None)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             return MIN_POLL_S
-        return min(max(float(value), MIN_POLL_S), self._interval)
+        try:
+            number = float(value)
+        except OverflowError:                 # an int past a float's range
+            number = math.inf if value > 0 else -math.inf
+        if math.isnan(number):
+            return MIN_POLL_S
+        return min(max(number, MIN_POLL_S), self._interval)
 
     def _wait(self, what: str) -> None:
         """``what`` ('registry' or 'store') refused: no work until the wait has passed. The wait is the poll
@@ -387,11 +455,12 @@ class ChangeReader:
 
     def _log_run(self, run_id: str, reason: str) -> str:
         """Read one image and log it if it differs from the last one logged. A run the registry refused to read
-        is read again only once its own wait has passed, and then for the reason it was first read for."""
+        is listed as ``registry_refused``, read again only once its own wait has passed, and then for the reason
+        it was first read for."""
         deferred = self._deferred.get(run_id)
         if deferred is not None:
             if deferred[1] > self._monotonic():
-                return _DEFERRED
+                return self._refused(run_id)
             reason = deferred[2]
         events_db.require_no_transaction('daemon.registry')
         try:
@@ -399,7 +468,7 @@ class ChangeReader:
         except Exception:                     # noqa: BLE001 - e.g. a publish whose directory sync is unfinished
             LOG.warning('the change reader could not read run %s; it tries again later', run_id, exc_info=True)
             self._defer(run_id, reason)
-            return _DEFERRED
+            return self._refused(run_id)
         self._deferred.pop(run_id, None)
         # The registry's lock is released: parse, canonicalise and hash now.
         try:
@@ -429,10 +498,18 @@ class ChangeReader:
         self._unlogged.pop(run_id, None)
         return _DONE
 
+    def _refused(self, run_id: str) -> str:
+        """A deferred run, listed as ``registry_refused``: ``_DEFERRED``, or ``_FAILED`` when listing it failed."""
+        return _FAILED if self._list(run_id, _REGISTRY_REFUSED) is _FAILED else _DEFERRED
+
     def _unlog(self, run_id: str, code: str) -> str:
-        """List a run that cannot be logged, in ``events_unlogged`` and in ``unlogged``. The row is written only
-        when the run's code is new; a transaction that fails leaves the run pending, and the reader waits."""
+        """A run that cannot be logged: logged at ERROR, and listed."""
         LOG.error('run %s cannot be logged as the registry holds it (%s); every scan reads it again', run_id, code)
+        return self._list(run_id, code)
+
+    def _list(self, run_id: str, code: str) -> str:
+        """List a run in ``events_unlogged`` and in ``unlogged``. The row is written only when the run's code is
+        new; a transaction that fails leaves the run pending, and the reader waits."""
         if self._unlogged.get(run_id) == code:
             return _DONE
         try:
@@ -451,7 +528,8 @@ class ChangeReader:
     def _commit(self, run_id: str, image: dict, digest: str, reason: str) -> None:
         both_null = image['daemon_row'] is None and image['control_record'] is None
         with self._store.transaction() as tx:
-            tx.execute('DELETE FROM events_unlogged WHERE run_id = ?', (run_id,))   # it has a typed image now
+            # Read with a typed image: it leaves the list, whether that image is new to the log or not.
+            tx.execute('DELETE FROM events_unlogged WHERE run_id = ?', (run_id,))
             last = tx.execute('SELECT log_id, digest, route_logged FROM events_run_images WHERE run_id = ?', (run_id,))
             if last and last[0][1] == digest:
                 return

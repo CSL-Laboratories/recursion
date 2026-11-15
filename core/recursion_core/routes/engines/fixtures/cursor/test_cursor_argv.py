@@ -209,6 +209,43 @@ class CheckTest(unittest.TestCase):
                 cursor.check_argv(longer)
             self.assertEqual(caught.exception.detail, "argv_invalid")
 
+    def test_the_whole_argv_bound_counts_utf8_bytes_not_characters(self):
+        """Review 6 of #388 (Astra change 1, Sol change 1): each argument 120,000 UTF-8 bytes, within its own
+        limit. Eight pass; nine are over 1 MiB in bytes, though well under it in characters, and are refused.
+        Both reads' forms: two-byte characters (Sol) and four-byte characters (Astra)."""
+        head = ["agent", "--disable-auto-update", "-p", "--"]
+        for part in (chr(0xE9) * 60000, chr(0x1F642) * 30000):
+            with self.subTest(width=len(part[0].encode("utf-8"))):
+                self.assertEqual(len(part.encode("utf-8")), 120000)
+                self.assertLess(len(part.encode("utf-8")), cursor.MAX_ARG_BYTES)
+                cursor.check_argv(head + [part] * 8)
+                nine = head + [part] * 9
+                self.assertLess(sum(len(a) + 1 for a in nine), cursor.MAX_ARGV_BYTES)
+                self.assertGreater(sum(len(a.encode("utf-8")) + 1 for a in nine), cursor.MAX_ARGV_BYTES)
+                with self.assertRaises(cursor.ArgvRefused) as caught:
+                    cursor.check_argv(nine)
+                self.assertEqual(caught.exception.detail, "argv_invalid")
+
+    def test_the_bound_holds_only_over_the_argv_it_is_given(self):
+        """Break-it read 6 of #388, F6-1: the builder's argv stops before the prompt, so the driver checks the
+        complete argv, ``--`` and the prompt included. The builder's part alone passes; with a prompt that takes
+        it over MAX_ARGV_BYTES it is refused."""
+        built = cursor.oneshot_argv("synthetic-model")
+        cursor.check_argv(built)
+        used = sum(len(a.encode("utf-8")) + 1 for a in [*built, "--"])
+        prompts = []
+        room = cursor.MAX_ARGV_BYTES - used + 1   # one byte over, in arguments within their own limit
+        while room > 0:
+            size = min(cursor.MAX_ARG_BYTES, room - 1) or 1
+            prompts.append("p" * size)
+            room -= size + 1
+        complete = [*built, "--", *prompts]
+        self.assertGreater(sum(len(a.encode("utf-8")) + 1 for a in complete), cursor.MAX_ARGV_BYTES)
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(complete)
+        self.assertEqual(caught.exception.detail, "argv_invalid")
+        self.assertIn("complete argv", cursor.check_argv.__doc__)
+
     def test_the_drive_stands_right_after_the_updater_flag(self):
         """Break-it read 5 of #388, F5-3: an argv that names no drive would start the interactive agent."""
         self.assertEqual(cursor.DRIVES, ("-p", "acp"))

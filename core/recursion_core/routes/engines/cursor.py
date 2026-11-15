@@ -173,7 +173,8 @@ def _executable(binary: object) -> str:
 
 
 def oneshot_argv(model: object, *, binary: object = None) -> list[str]:
-    """The one-shot drive's options, up to the prompt (the driver adds ``--`` and the prompt).
+    """The one-shot drive's options, up to the prompt (the driver adds ``--`` and the prompt, then checks the
+    complete argv with ``check_argv``).
 
     The updater flag stands first, right after argv[0], on both drives, and the drive (``-p``) right after
     it. No ``--force``, ``--api-key`` or header is added. A model that is empty, starts with a dash, or holds
@@ -192,6 +193,10 @@ def acp_argv(*, binary: object = None) -> list[str]:
 
 def check_argv(argv: object, *, binary: object = None, full_access_acknowledged: bool = False) -> None:
     """Refuse an argv that breaks one of this lane's rules. ``ArgvRefused`` names the first broken.
+
+    Call it on the complete argv, as it will be launched: ``oneshot_argv`` stops before the prompt, so the
+    driver checks after it appends ``--`` and the prompt. The rules hold over what is passed here and nothing
+    else (MAX_ARGV_BYTES above all; the sixth break-it read of #388, F6-1).
 
     The options are the arguments before the first ``--``; what follows it is positional text (the prompt)
     and is never read as an option. In this order:

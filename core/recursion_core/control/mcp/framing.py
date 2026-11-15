@@ -131,7 +131,9 @@ class FrameWriter:
         self.on_broken = on_broken
 
     def write(self, message: dict) -> bool:
-        """Write one message; ``False`` when it was not written (the stream failed now or earlier)."""
+        """Write one message; ``False`` when it was not written (the stream failed now or earlier). A stream
+        that raises any ``Exception`` has failed: a pipe the client stopped reading, a stream already shut, a
+        text stream given bytes. A message ``encode`` refuses raises before anything is written."""
 
         data = encode(message)
         with self._lock:
@@ -141,7 +143,7 @@ class FrameWriter:
                 self._stream.write(data)
                 self._stream.flush()
                 return True
-            except (OSError, ValueError):  # a pipe the client stopped reading, or a stream already shut
+            except Exception:  # noqa: BLE001 - whatever the stream raises, it took no whole message
                 self.broken = True
         if self.on_broken is not None:
             self.on_broken()

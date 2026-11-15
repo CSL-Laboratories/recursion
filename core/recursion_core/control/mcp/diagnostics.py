@@ -15,12 +15,13 @@ that does not fit is dropped and counted; the next event taken is preceded by
 effort (the 2025-06-18 stdio transport lets a client capture, forward or ignore stderr): nothing the
 session does depends on one being delivered.
 
-A ``log`` that raises ends delivery: what is queued is discarded, every later ``offer`` returns ``False``,
+A ``log`` that raises, whatever it raises, ends delivery: what is queued is discarded, every later ``offer`` returns ``False``,
 and ``close`` takes no ``last`` (that log takes nothing more).
 
 ``close(last, timeout)`` takes ``last`` whatever the bound (``serve``'s last line, so the bound never drops
 it), then nothing more, and waits until every event taken has been delivered (or discarded) or until
-``timeout`` seconds have passed, whichever comes first; it returns whether everything was delivered.
+``timeout`` seconds have passed, whichever comes first (``None``, the default, is no limit); it returns
+whether everything was delivered.
 ``serve`` gives it ``DIAGNOSTIC_DRAIN_S``, so a client that never reads stderr does not keep the process
 alive after end of input: what stderr has not taken by then is lost with the queue's thread, a daemon
 thread. ``close`` starts the thread if ``start`` was never called, so events offered before it are still
@@ -118,7 +119,7 @@ class DiagnosticQueue:
             try:
                 self._log(event)
                 delivered = True
-            except Exception:  # noqa: BLE001 - a log that cannot take events gets no more of them
+            except BaseException:  # noqa: BLE001 - a log that cannot take events gets no more of them
                 delivered = False
             with self._cond:
                 self._pending.popleft()
@@ -131,7 +132,8 @@ class DiagnosticQueue:
 
     def close(self, last: dict | None = None, timeout: float | None = None) -> bool:
         """Take ``last`` whatever the bound, then nothing more; wait until every event taken has been
-        delivered (or discarded), at most ``timeout`` seconds. ``True`` when nothing is left."""
+        delivered (or discarded), at most ``timeout`` seconds (``None``: no limit). ``True`` when nothing
+        is left."""
 
         check_seconds(timeout, "timeout")  # before anything changes
         self.start()  # a queue never started still delivers what it took

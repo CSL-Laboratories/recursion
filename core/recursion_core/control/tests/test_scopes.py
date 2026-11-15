@@ -506,6 +506,60 @@ class RoundTwoScopesTest(unittest.TestCase):
                          ("scope_refused", "run_outside_session"))
 
 
+class RoundThreeScopesTest(unittest.TestCase):
+    """The round-3 reads of #377 (Codex GPT-6 Astra 1 and 4, GPT-6.1 Sol 1 and 2)."""
+
+    def test_a_declared_grant_accessor_raising_attributeerror_is_unreadable(self) -> None:
+        # Astra 1, Sol 1 (STRICT): getattr(..., None) took the accessor's AttributeError for an absent field.
+        class Declared:
+            in_run_unit = False
+
+            def __init__(self, kind, principal_id):
+                self.kind, self.id = kind, principal_id
+
+            @property
+            def grant(self):
+                raise AttributeError("the trusted grant context is unavailable")
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        for kind, principal_id in (("plugin", "plugin.alpha"), ("owner", "local"), ("device", "page")):
+            with self.subTest(kind=kind):
+                principal = Declared(kind, principal_id)
+                self.assertEqual(auth.held(principal), frozenset())
+                self.assertEqual(auth(principal, "run.start", {}), ("scope_refused", "needs_run"))
+
+    def test_a_grant_that_is_truly_absent_is_still_absent(self) -> None:
+        import types as _types
+
+        class Dynamic:
+            kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+            def __getattr__(self, name):
+                raise AttributeError(name)        # nothing declared: a genuinely missing field
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        for principal in (_types.SimpleNamespace(kind="plugin", id="plugin.alpha", in_run_unit=False), Dynamic(),
+                          Principal("plugin", "plugin.alpha")):
+            with self.subTest(principal=type(principal).__name__):
+                self.assertEqual(auth.held(principal), frozenset({"read", "run"}))
+        self.assertEqual(auth.held(_types.SimpleNamespace(kind="owner", id="local", in_run_unit=False)),
+                         scopes.ALL_SCOPES)
+
+    @unittest.skipUnless(POSIX, "the credential store needs uids and O_NOFOLLOW (POSIX)")
+    def test_a_bearer_sees_another_store_s_revocation_at_its_first_check(self) -> None:
+        # Astra 4, Sol 2 (STRICT proof): no other reader of this store runs between the revocation and the check.
+        base = tempfile.mkdtemp(prefix="scopes-r3-")
+        self.addCleanup(shutil.rmtree, base, True)
+        path = os.path.join(base, "state", "credentials.json")
+        writer = CredentialStore(path)
+        _, grant = writer.mint("plugin", "plugin.alpha", ["read", "run"])
+        auth = authorizer(credentials=CredentialStore(path))
+        principal = Principal("plugin", "plugin.alpha", grant=grant.token_id)
+        self.assertIsNone(auth(principal, "run.start", {}))
+        writer.revoke(grant.token_id)
+        self.assertEqual(auth(principal, "run.start", {}), ("scope_refused", "needs_run"))
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

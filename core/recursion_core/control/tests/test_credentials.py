@@ -772,6 +772,130 @@ class RoundTwoTest(unittest.TestCase):
                     os.fstat(opened[0])
 
 
+
+@NEEDS_POSIX
+class RoundThreeTest(unittest.TestCase):
+    """The round-3 reads of #377 (Codex GPT-6 Astra 2-4 and its later coverage, GPT-6.1 Sol 2), and Sol's NUL path
+    from the round-2 read of #385."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-r3-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.path = os.path.join(self.base, "state", "credentials.json")
+        self.wall = Clock(1000.0)
+        self.events: list[tuple[str, dict]] = []
+
+    def store(self, **kwargs) -> CredentialStore:
+        kwargs.setdefault("emit", lambda kind, payload: self.events.append((kind, payload)))
+        kwargs.setdefault("wall", self.wall)
+        return CredentialStore(self.path, **kwargs)
+
+    def revoked_notices(self) -> list[dict]:
+        return [payload for kind, payload in self.events if kind == "credential.revoked"]
+
+    def test_a_lock_that_cannot_be_opened_still_leaves_the_grant_refused_at_once(self) -> None:
+        # Astra 2: the writers' lock came before the revocation in memory, so its failure left the grant live.
+        store = self.store()
+        token, cred = store.mint("device", "one", ["read"])
+        real_open = creds.os.open
+
+        def no_lock(path, flags, *args, **kwargs):
+            if path.endswith(".lock"):
+                raise OSError("EMFILE")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(creds.os, "open", side_effect=no_lock):
+            with self.assertRaises(CredentialStoreError):
+                store.revoke(cred.token_id)
+            with self.assertRaises(CredentialRefused) as caught:
+                store.verify(token, peer="p")      # the file is unchanged, so this check reads memory
+        self.assertEqual(caught.exception.detail, "token_revoked")
+        self.assertEqual(self.revoked_notices(), [])
+        self.wall.now += 60
+        self.assertEqual(store.revoke(cred.token_id).revoked_at, 1000)   # the retry writes the first time
+        self.assertEqual(self.store().grants()[0].revoked_at, 1000)
+        self.assertEqual([p["revoked_at"] for p in self.revoked_notices()], [1000])
+
+    def test_a_pending_revocation_keeps_its_first_time_after_another_store_revokes(self) -> None:
+        # Astra 3: the other store's later time (1100) replaced this store's first one (1000).
+        store = self.store()
+        _, cred = store.mint("device", "one", ["read"])
+        with mock.patch.object(store, "_write", side_effect=CredentialStoreError("disk full")):
+            with self.assertRaises(CredentialStoreError):
+                store.revoke(cred.token_id)
+        self.store(wall=lambda: 1100.0).revoke(cred.token_id)
+        self.wall.now = 1200
+        self.assertEqual(store.revoke(cred.token_id).revoked_at, 1000)
+        self.assertEqual(self.store().grants()[0].revoked_at, 1000)
+
+    def test_revoking_from_a_stale_memory_what_another_store_revoked_writes_and_notifies_nothing_here(self) -> None:
+        store = self.store()
+        _, cred = store.mint("device", "one", ["read"])
+        self.events.clear()
+        self.store(wall=lambda: 900.0, emit=None).revoke(cred.token_id)   # 900 is clamped to issue: 1000
+        self.wall.now = 1500
+        with mock.patch.object(store, "_write", wraps=store._write) as writer:
+            self.assertEqual(store.revoke(cred.token_id).revoked_at, 1000)
+        self.assertEqual(writer.call_count, 0)
+        self.assertEqual(self.revoked_notices(), [])
+        self.assertEqual(store._unpersisted, frozenset())
+
+    def test_each_reader_is_the_first_to_see_another_store_s_write(self) -> None:
+        # Astra 4, Sol 2 (STRICT proof): grant_scopes rereads a changed file itself, not through another reader.
+        store = self.store()
+        _, cred = store.mint("plugin", "plugin.alpha", ["read"])
+        other = self.store()
+        self.assertEqual(store.grant_scopes(cred.token_id, "plugin", "plugin.alpha"), frozenset({"read"}))
+        other.revoke(cred.token_id)
+        self.assertEqual(store.grant_scopes(cred.token_id, "plugin", "plugin.alpha"), frozenset())
+        other.mint("device", "late", ["read"])
+        self.assertEqual(sorted(c.id for c in store.grants()), ["late", "plugin.alpha"])   # grants() first
+        other.mint("plugin", "plugin.beta", ["run"])
+        self.assertEqual(store.held("plugin", "plugin.beta"), frozenset({"run"}))           # held() first
+
+    def test_without_fcntl_the_store_refuses_to_open(self) -> None:
+        with mock.patch.object(creds, "fcntl", None):
+            with self.assertRaises(CredentialStoreError) as caught:
+                self.store()
+        self.assertTrue(str(caught.exception).startswith("platform_unsupported"))
+
+    def test_a_lock_timeout_that_is_not_a_finite_positive_number_is_refused(self) -> None:
+        for value in (0, -1, True, float("nan"), float("inf"), "1", None):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(CredentialStoreError):
+                    self.store(lock_timeout_s=value)
+        self.store(lock_timeout_s=0.5)
+
+    def test_a_lock_owned_by_another_user_is_refused_on_its_own(self) -> None:
+        self.store()
+        lock = os.path.join(self.base, "state", ".credentials.json.lock")
+        real_open, real_fstat = creds.os.open, creds.os.fstat
+        lock_fds: list[int] = []
+
+        def record(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if path == lock:
+                lock_fds.append(fd)
+            return fd
+
+        def foreign_lock(fd):
+            st = real_fstat(fd)
+            if fd in lock_fds:
+                return types.SimpleNamespace(st_mode=st.st_mode, st_uid=os.getuid() + 1)
+            return st
+
+        with mock.patch.object(creds.os, "open", side_effect=record), \
+                mock.patch.object(creds.os, "fstat", side_effect=foreign_lock):
+            with self.assertRaises(CredentialStoreError) as caught:
+                self.store()
+        self.assertIn("lock", str(caught.exception))
+
+    def test_a_store_path_holding_a_nul_is_a_typed_refusal(self) -> None:
+        with self.assertRaises(CredentialStoreError) as caught:
+            CredentialStore(os.path.join(self.base, "sta\x00te", "credentials.json"))
+        self.assertIn("NUL", str(caught.exception))
+
+
 @NEEDS_POSIX
 class TwoStoresTest(unittest.TestCase):
     """The audited read of #377 by DeepSeek V4.1 Flash, F4: two stores on one file each wrote their own memory,

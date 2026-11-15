@@ -1,0 +1,110 @@
+{
+ "engine_session_id": "019a5b2e-1111-7000-8000-00000000e801",
+ "drafts": [
+  {
+   "type": "input.accepted",
+   "payload": {
+    "delivery_id": "dlv-1",
+    "turn_id": "turn-1",
+    "how": "new_turn"
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "api_key:openai-key-1",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "output_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_write_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cost_usd": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    }
+   }
+  },
+  {
+   "type": "usage",
+   "payload": {
+    "connection_id": "api_key:openai-key-1",
+    "model": "openai/model-synthetic",
+    "bucket": null,
+    "span": "call",
+    "input_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "output_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "reasoning_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_read_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cache_write_tokens": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    },
+    "cost_usd": {
+     "value": null,
+     "quality": "unknown",
+     "provenance": "unavailable"
+    }
+   }
+  },
+  {
+   "type": "result",
+   "payload": {
+    "code": "short_fault",
+    "detail": "error: 429 Too Many Requests: rate limit reached for requests"
+   }
+  }
+ ],
+ "signals": [
+  {
+   "signal": "session",
+   "engine_session_id": "019a5b2e-1111-7000-8000-00000000e801"
+  },
+  {
+   "signal": "settled",
+   "aborted": false,
+   "stop_reason": "error",
+   "text": ""
+  }
+ ]
+}

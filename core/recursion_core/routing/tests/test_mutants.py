@@ -239,13 +239,13 @@ MUTANTS = {
         {"test_explain_reads_the_task_once"}),
     "M40 a present null tags read as absent": (
         ROUTER,
-        '    if "tags" in task and not (',
+        '    if present["tags"] and not (',
         "    if tags is not None and not (",
         {"test_a_present_null_condition_is_refused_not_read_as_absent"}),
     "M41 a hand pick without its model member taken": (
         ROUTER,
-        'set(hand) != {"engine", "model"}',
-        'not set(hand) <= {"engine", "model"}',
+        'shaped = set(hand) == {"engine", "model"} and',
+        'shaped = set(hand) <= {"engine", "model"} and',
         {"test_bad_task_or_hand_pick_is_refused"}),
     "M42 a snapshot that cannot be walked raising instead of refusing": (
         ROUTER,
@@ -264,6 +264,59 @@ MUTANTS = {
         'raise _Refuse("bad_hand_pick", "hand_pick_model")',
         'raise _Refuse("bad_hand_pick", "hand_pick.model")',
         {"test_every_refusal_detail_is_code_words"}),
+    # The second reads of #399 (d857ebb5): sol C1-C3 (their M45-M47 as proposed), DeepSeek R1-R7.
+    "M45 a matching rule with no model routed": (
+        ROUTER,
+        "        eng, model = rule.route.engine, model_of(rule.route.model, rule.route.engine)\n"
+        "        why = why_not(eng, model)\n",
+        "        eng, model = rule.route.engine, model_of(rule.route.model, rule.route.engine)\n"
+        "        why = _state(config, entries, err, eng)\n",
+        {"test_a_rule_without_model_is_skipped_or_refused"}),
+    "M46 bytes accepted as active engine ids": (
+        DETECT,
+        "    if isinstance(active, (str, bytes)):",
+        "    if isinstance(active, str):",
+        {"test_small_interface_gaps"}),
+    "M47 EXPLAIN_PARAMS missing from star exports": (
+        "recursion_core.routing",
+        '    "EXPLAIN_PARAMS",\n',
+        "",
+        {"test_small_interface_gaps"}),
+    "M48 a present null hand pick read as none": (
+        ROUTER,
+        '    if not present["hand_pick"]:\n',
+        "    if hand is None:\n",
+        {"test_a_null_hand_pick_is_refused_alike_everywhere", "test_a_present_null_condition_is_refused_not_read_as_absent"}),
+    "M49 a null attempts list raising": (
+        ROUTER,
+        'attempts = [a for a in (notice.get("attempts") or ()) if isinstance(a, Mapping)]',
+        'attempts = [a for a in notice.get("attempts", ()) if isinstance(a, Mapping)]',
+        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+    "M50 a decision routed in name only used": (
+        ROUTER,
+        '        return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide\'s answer\n',
+        "        pass\n",
+        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+    "M51 an invalid routes.json limits block used as it is": (
+        ROUTER,
+        '            return route_limits.validate_limits(raw), "routes"\n',
+        '            return raw, "routes"\n',
+        {"test_an_invalid_routes_json_limits_block_falls_back_to_ask"}),
+    "M52 a listed route walked twice": (
+        ROUTER,
+        '    for place, route in enumerate(limits["fallback"], 1):\n',
+        '    for place, route in enumerate(limits["fallback"] + limits["fallback"][:1], 1):\n',
+        {"test_an_exhausted_list_names_each_listed_route_once_in_order"}),
+    "M53 a task that cannot be read raising instead of refusing": (
+        ROUTER,
+        "    except Exception:  # noqa: BLE001 - a task that cannot be read is refused, never raised through\n",
+        "    except ZeroDivisionError:\n",
+        {"test_a_task_that_cannot_be_read_is_refused"}),
+    "M54 route_decision of None raising": (
+        ROUTER,
+        '    if not isinstance(decision, Mapping) or not decision.get("ok"):\n        return None\n',
+        '    if not decision.get("ok"):\n        return None\n',
+        {"test_route_decision_of_anything_but_a_routed_decision_is_none"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

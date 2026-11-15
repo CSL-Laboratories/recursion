@@ -103,11 +103,13 @@ class HandPickTests(unittest.TestCase):
         self.assertEqual((d["engine"], d["model"], d["hand_pick"]), ("codex", "codex-model-a", {"engine": "codex", "model": None}))
 
     def test_a_present_null_condition_is_refused_not_read_as_absent(self) -> None:
-        # Second read of #399, F7: a caller that sends null meant to set the filter; a null hand_pick is none.
-        for task, reason in (({"task_kind": None}, "task_kind"), ({"tags": None}, "tags")):
+        # First reads of #399, F7: a caller that sends null meant to set the filter. Second reads, R1: a present
+        # null hand_pick is refused too, as explain_answer refuses it (common.v1's hand_pick is an object).
+        for task, code, reason in (({"task_kind": None}, "bad_task", "task_kind"), ({"tags": None}, "bad_task", "tags"),
+                                   ({"hand_pick": None}, "bad_hand_pick", "hand_pick")):
             d = router.decide(self.cfg, SENTRY, task)
-            self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_task", reason), task)
-        self.assertEqual(router.decide(self.cfg, SENTRY, {"hand_pick": None})["reason"], "default")
+            self.assertEqual((d["ok"], d["code"], d["reason"]), (False, code, reason), task)
+        self.assertEqual(router.decide(self.cfg, SENTRY, {"task_kind": "chat"})["reason"], "default")
 
 
 class DetectedOnlyTests(unittest.TestCase):
@@ -345,7 +347,7 @@ class PurityTests(unittest.TestCase):
     def test_decide_leaves_its_inputs_unchanged_and_shares_nothing(self) -> None:
         cfg = config()
         det = copy.deepcopy(SENTRY)
-        task = {"task_kind": "search", "tags": ["cheap"], "hand_pick": None}
+        task = {"task_kind": "search", "tags": ["cheap"]}  # a present null hand_pick is refused (second reads, R1)
         before = (copy.deepcopy(det), copy.deepcopy(task), copy.deepcopy(dict(cfg.routes)))
         d = router.decide(cfg, det, task)
         self.assertEqual((det, task, dict(cfg.routes)), before)

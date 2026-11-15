@@ -56,6 +56,14 @@ class ReadFramesTest(unittest.TestCase):
             with self.subTest(data=data[:20]):
                 self.assertEqual([Frame(error=error)], frames(data))
 
+    def test_an_integer_longer_than_the_limit_is_its_own_refusal(self) -> None:
+        at_limit = "9" * framing.MAX_INT_DIGITS
+        self.assertEqual([Frame(message={"id": int(at_limit)})], frames(f'{{"id":{at_limit}}}\n'.encode()))
+        for digits in ("9" * (framing.MAX_INT_DIGITS + 1), "-" + "9" * (framing.MAX_INT_DIGITS + 1)):
+            self.assertEqual([Frame(error=framing.NUMBER_TOO_LONG)], frames(f'{{"id":{digits}}}\n'.encode()))
+        long_fraction = frames(b'{"x":1.' + b"5" * 5000 + b"}\n")  # a fraction is not an integer: read as it is
+        self.assertIsNone(long_fraction[0].error)
+
     def test_any_json_value_is_a_frame_the_session_classifies(self) -> None:
         self.assertEqual([Frame(message=[1]), Frame(message="s"), Frame(message=None)], frames(b'[1]\n"s"\nnull\n'))
 
@@ -152,6 +160,27 @@ class WriterTest(unittest.TestCase):
         self.assertFalse(writer.write({"a": 2}))
         self.assertEqual(1, Failing.writes)
 
+    def test_on_broken_is_called_once_outside_the_lock(self) -> None:
+        calls = []
+
+        class Failing(io.RawIOBase):
+            def writable(self):
+                return True
+
+            def write(self, data):
+                raise BrokenPipeError()
+
+        writer = FrameWriter(Failing())
+
+        def on_broken():
+            calls.append(writer.broken)
+            self.assertFalse(writer.write({"from": "the callback"}))  # would deadlock if the lock were held
+
+        writer.on_broken = on_broken
+        self.assertFalse(writer.write({"a": 1}))
+        self.assertFalse(writer.write({"a": 2}))
+        self.assertEqual([True], calls)
+
     def test_a_shut_stream_breaks_the_writer(self) -> None:
         stream = io.BytesIO()
         stream.close()
@@ -166,9 +195,9 @@ class WriterTest(unittest.TestCase):
 
 class JsonRpcTest(unittest.TestCase):
     def test_valid_ids(self) -> None:
-        for value in ("", "a", 0, -1, 2**70, 1.5):
+        for value in ("", "a", 0, -1, 2**70):
             self.assertTrue(jsonrpc.valid_id(value), value)
-        for value in (None, True, False, float("nan"), float("inf"), [], {}, b"x"):
+        for value in (None, True, False, 1.5, 1.0, float("nan"), float("inf"), [], {}, b"x"):
             self.assertFalse(jsonrpc.valid_id(value), value)
 
     def test_classify(self) -> None:

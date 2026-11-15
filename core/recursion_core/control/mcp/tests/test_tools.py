@@ -60,6 +60,22 @@ class TableTest(unittest.TestCase):
                 with self.assertRaises(SchemaUnsupported):
                     tool_table()
 
+    def test_a_known_keyword_with_a_value_the_checker_cannot_read_is_refused(self) -> None:
+        refused = [
+            {"type": "object", "properties": {"run_id": {"type": "string", "minLength": "x"}}},
+            {"type": "object", "properties": {"run_id": {"type": "string", "maxLength": -1}}},
+            {"type": "object", "properties": {"run_id": {"type": "string", "minLength": True}}},
+            {"type": "object", "properties": {"n": {"type": "integer", "maximum": [1]}}},
+            {"type": "object", "properties": {"n": {"type": "integer", "minimum": False}}},
+            {"type": "object", "properties": [{"run_id": {"type": "string"}}]},
+            {"type": "object", "properties": {}, "required": "run_id"},
+            {"type": "object", "properties": {}, "required": [1]},
+        ]
+        for schema in refused:
+            with self.subTest(schema=schema), self.with_schema(schema):
+                with self.assertRaises(SchemaUnsupported):
+                    tool_table()
+
 
 class CheckArgumentsTest(unittest.TestCase):
     SCHEMA = {"type": "object",

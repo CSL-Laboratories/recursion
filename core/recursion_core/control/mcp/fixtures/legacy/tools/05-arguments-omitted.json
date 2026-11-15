@@ -2,8 +2,8 @@
   "format": "mcp-stdio-fixture/1",
   "name": "tools/05-arguments-omitted",
   "protocol": "2025-06-18",
-  "summary": "A call with no arguments, or arguments null, forwards an empty object.",
-  "source": "MCP 2025-06-18 server/tools (Listing Tools, Calling Tools, Error Handling)",
+  "summary": "A call that leaves arguments out forwards an empty object; arguments present must be an object, so arguments null is refused and reaches nothing.",
+  "source": "MCP 2025-06-18 server/tools (Listing Tools, Calling Tools, Error Handling); MCP 2025-06-18 schema, CallToolRequest (arguments, when present, is an object)",
   "api": [
     {
       "method": "run.list",
@@ -197,6 +197,30 @@
         {
           "jsonrpc": "2.0",
           "id": 3,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: arguments must be an object",
+            "data": {
+              "tool": "recursion_run_list"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_list",
+          "arguments": {}
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 4,
           "result": {
             "content": [
               {

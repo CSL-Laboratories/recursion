@@ -63,7 +63,10 @@ class Child:
         self.proc.wait()
         for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
             if stream is not None and not stream.closed:
-                stream.close()
+                try:
+                    stream.close()
+                except OSError:  # a line still buffered for a child that has ended
+                    pass
 
     def send(self, message: dict) -> None:
         self.proc.stdin.write(encode(message))
@@ -218,6 +221,84 @@ class StdioTest(unittest.TestCase):
         self.assertEqual(0, child.end()[0])
         self.assertEqual(["run.list", "methods.list"], [m["method"] for m in self.seen])  # the probe and the choice only
         self.assertEqual(([], []), (kill.requests, starter.calls))
+
+    def test_a_stop_is_sent_while_eight_starts_hang_and_a_ninth_waits(self) -> None:
+        release, stop_seen = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        changed = threading.Condition()
+        entered: list[str] = []
+
+        class Hanging:
+            def call(self, method, params=None):
+                with changed:
+                    entered.append(method)
+                    changed.notify_all()
+                if method == "run.start":
+                    release.wait(HANG_GUARD_S)
+                    return {"code": "started", "run": {"run_id": "r"}}
+                if method == "run.stop":
+                    stop_seen.set()
+                    return {"code": "pending", "run_id": params["run_id"], "state": "pending"}
+                if method == "methods.list":  # a daemon from before the method table: the legacy four
+                    return {"code": "method_unknown", "detail": "methods.list"}
+                return {"code": "ok", "runs": []}
+
+        self.daemon(Hanging())
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        start = {"tenant": "t1", "engine": "codex", "prompt": "p"}
+        for n in range(1, 9):  # eight fill the default slots
+            child.send({"jsonrpc": "2.0", "id": n, "method": "tools/call",
+                        "params": {"name": "recursion_run_start", "arguments": start}})
+        with changed:
+            self.assertTrue(changed.wait_for(lambda: entered.count("run.start") == 8, HANG_GUARD_S))
+        child.send({"jsonrpc": "2.0", "id": 9, "method": "tools/call",  # the ninth waits for a slot
+                    "params": {"name": "recursion_run_start", "arguments": start}})
+        child.send({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                    "params": {"name": "recursion_run_stop", "arguments": {"run_id": "r"}}})
+        self.assertTrue(stop_seen.wait(HANG_GUARD_S), "the stop was not sent while the starts hung")
+        with changed:
+            self.assertEqual(8, entered.count("run.start"))
+        self.assertEqual(10, child.recv()["id"])  # the stop's answer comes first: the starts still hang
+        release.set()
+        self.assertEqual(set(range(1, 10)), {child.recv()["id"] for _ in range(9)})
+        self.assertEqual(0, child.end()[0])
+
+    def test_stdout_that_fails_ends_the_process_with_status_0_and_sends_nothing_more(self) -> None:
+        release, status_seen = threading.Event(), threading.Event()
+        seen: list[str] = []
+
+        class Gated:
+            def call(self, method, params=None):
+                seen.append(method)
+                if method == "run.status":
+                    status_seen.set()
+                    release.wait(HANG_GUARD_S)
+                    return {"code": "ok", "run": {"run_id": "r"}}  # small: a buffered stdout would keep it
+                if method == "methods.list":  # a daemon from before the method table: the legacy four
+                    return {"code": "method_unknown", "detail": "methods.list"}
+                return {"code": "started", "run": {"run_id": "r"}} if method == "run.start" else {"code": "ok", "runs": []}
+
+        self.daemon(Gated())
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        child.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "recursion_run_status", "arguments": {"run_id": "r"}}})
+        self.assertTrue(status_seen.wait(HANG_GUARD_S))
+        child.proc.stdout.close()  # the client stops reading: the status answer's write fails
+        release.set()
+        status = child.proc.wait()  # ends with stdin still open
+        child._guard.cancel()
+        try:  # a start sent now finds nobody reading it
+            child.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": "recursion_run_start", "arguments": {"tenant": "t", "engine": "e", "prompt": "p"}}})
+        except (BrokenPipeError, OSError):
+            pass
+        stderr = child.proc.stderr.read().decode()
+        events = [json.loads(line) for line in stderr.splitlines()]  # every line is JSON: no traceback
+        self.assertEqual(0, status, stderr)
+        self.assertIn({"event": "output_failed", "stdout_broken": True}, events)
+        self.assertNotIn("run.start", seen)
 
     def test_no_socket_refuses_to_start(self) -> None:
         child = Child(self, self.runtime)  # nothing listens under this runtime folder

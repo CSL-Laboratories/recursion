@@ -3,6 +3,7 @@ fixture replayer. Nothing here opens a socket or starts a process.
 
 Hang guard: every wait below gives up after ``HANG_GUARD_S`` so that a server that never answers fails
 the test instead of hanging the suite. No test passes or fails by timing; the guard only ends a hang.
+(``SHORT`` waits in the test modules only ever show that something has NOT happened.)
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from typing import Any
 from recursion_core.control.mcp import server
 from recursion_core.control.mcp.framing import encode
 
-HANG_GUARD_S = 60.0
+# A mutation run may shorten it (MCP_TEST_HANG_GUARD_S); a broken mutant then fails sooner, never a correct run.
+HANG_GUARD_S = float(os.environ.get("MCP_TEST_HANG_GUARD_S", "60"))
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "legacy"
 
 

@@ -6,11 +6,12 @@ fails it writes one JSON line to stderr, ``{"code": "socket_check_failed", "reas
 writes nothing to stdout and exits 1. Then it chooses its tools (``projection.choose_tools``): the legacy
 four for a daemon from before the method table, else the published table's exposed rows that the daemon
 implements; a refused choice writes ``{"code": "tools_unavailable", "reason": ..., "detail": ...}`` and
-exits 1. Otherwise it serves until the client closes stdin and exits 0.
+exits 1. Otherwise it serves until the client ends stdin, or until stdout fails, and exits 0. It reads fd 0 and writes fd 1 directly (``stdio.py``), so a client that stops reading
+ends the process cleanly instead of leaving a buffered stdout for the interpreter's final flush to fail on.
 
-Exit statuses: 0 end of input; 1 the socket check failed or no tools could be chosen; 2 usage (an argument
-was given); 130 interrupted. This is a client entry, not a kernel one: it registers nothing and starts no
-daemon service.
+Exit statuses: 0 end of input or stdout failed; 1 the socket check failed or no tools could be chosen; 2 usage (an argument was given);
+3 an unexpected error while serving (one JSON line on stderr, ``{"code": "internal_error", ...}``); 130
+interrupted. This is a client entry, not a kernel one: it registers nothing and starts no daemon service.
 """
 
 from __future__ import annotations
@@ -21,8 +22,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from . import projection, server, socket_check
+from .stdio import FdReader, FdWriter
 
-EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 130
+EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_INTERNAL, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 
 
 def _stderr_line(stream: Any, event: dict) -> None:
@@ -54,14 +56,17 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     except (OSError, ValueError) as exc:  # published files that cannot be read as JSON
         _stderr_line(stderr, {"code": "tools_unavailable", "reason": "published_unreadable", "detail": type(exc).__name__})
         return EXIT_REFUSED
-    instream = sys.stdin.buffer if stdin is None else stdin
-    outstream = sys.stdout.buffer if stdout is None else stdout
+    instream = FdReader(0) if stdin is None else stdin
+    outstream = FdWriter(1) if stdout is None else stdout
     _stderr_line(stderr, {"event": "serving", "protocol": server.LEGACY_PROTOCOL})
     _stderr_line(stderr, chosen)
     try:
         return server.serve(api, instream, outstream, tools=tools, log=lambda event: _stderr_line(stderr, event))
     except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
         return EXIT_INTERRUPTED
+    except Exception as exc:  # noqa: BLE001 - one diagnostic line, an exit status of its own
+        _stderr_line(stderr, {"code": "internal_error", "detail": f"{type(exc).__name__}: {exc}"})
+        return EXIT_INTERNAL
 
 
 if __name__ == "__main__":

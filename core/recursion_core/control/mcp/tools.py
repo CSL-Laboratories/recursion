@@ -140,6 +140,8 @@ def require_supported(schema: Any, where: str) -> None:
         raise SchemaUnsupported(f"{where}: enum must be a non-empty list")
     if "pattern" in schema:
         ecma_pattern(schema["pattern"])
+    if not isinstance(schema.get("properties", {}), Mapping):
+        raise SchemaUnsupported(f"{where}: properties must be an object")
     for name, sub in schema.get("properties", {}).items():
         require_supported(sub, f"{where}.{name}")
     for key in ("not", "items"):

@@ -10,25 +10,28 @@ Reading (``read_frames``):
 * a line is everything up to and including ``\\n``; a ``\\r`` before it is JSON whitespace, so CRLF lines
   are read as they are;
 * a line holding only whitespace is skipped;
-* a line longer than ``MAX_LINE_BYTES`` (terminator included) is drained to its newline without being
-  kept in memory and yields ``Frame(error=TOO_LARGE)``; the next line is read normally;
+* a line longer than ``MAX_LINE_BYTES`` (terminator included) yields ``Frame(error=TOO_LARGE)``: its first
+  ``MAX_LINE_BYTES + 1`` bytes are read, the rest is drained to the newline without being kept, and the
+  next line is read normally;
 * bytes that are not strict UTF-8 yield ``NOT_UTF8``; text that is not one JSON value yields ``NOT_JSON``.
   ``NaN``, ``Infinity`` and ``-Infinity`` are not JSON and are refused, and so is nesting deep enough to
   exhaust the parser;
+* a JSON integer longer than ``MAX_INT_DIGITS`` digits is valid JSON that this server does not read (it is
+  CPython's own limit for turning digits into an int): it yields ``NUMBER_TOO_LONG``, not ``NOT_JSON``;
 * a last line with no newline before end of input is still read as a message.
 
 Writing (``encode``, ``FrameWriter``): compact JSON, ASCII only (every non-ASCII character escaped), so a
 message can never carry a raw newline or depend on the console's encoding; one ``write`` and one
 ``flush`` per message under one lock, so concurrent answers never interleave. A write that fails (the
-client stopped reading) marks the writer broken; later messages are dropped and reading goes on until
-end of input.
+client stopped reading) marks the writer broken and calls ``on_broken`` once; later messages are dropped,
+and the server stops forwarding (``server.py``, OUTPUT FAILURE).
 """
 
 from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO
 
@@ -37,7 +40,9 @@ from typing import Any, BinaryIO
 MAX_LINE_BYTES = 2 * 1024 * 1024
 _DRAIN_CHUNK = 64 * 1024
 
-TOO_LARGE, NOT_UTF8, NOT_JSON = "too_large", "not_utf8", "not_json"
+MAX_INT_DIGITS = 4300
+
+TOO_LARGE, NOT_UTF8, NOT_JSON, NUMBER_TOO_LONG = "too_large", "not_utf8", "not_json", "number_too_long"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +57,16 @@ def _refuse_constant(name: str) -> Any:
     raise ValueError(f"{name} is not JSON")
 
 
+class _NumberTooLong(Exception):
+    pass
+
+
+def _parse_int(digits: str) -> int:
+    if len(digits.lstrip("-")) > MAX_INT_DIGITS:
+        raise _NumberTooLong()
+    return int(digits)
+
+
 def decode_line(line: bytes) -> Frame | None:
     """One line (terminator included or not) as a ``Frame``; ``None`` for a blank line."""
 
@@ -64,7 +79,9 @@ def decode_line(line: bytes) -> Frame | None:
     if not text.strip():
         return None
     try:
-        return Frame(message=json.loads(text, parse_constant=_refuse_constant))
+        return Frame(message=json.loads(text, parse_constant=_refuse_constant, parse_int=_parse_int))
+    except _NumberTooLong:
+        return Frame(error=NUMBER_TOO_LONG)
     except (ValueError, RecursionError):
         return Frame(error=NOT_JSON)
 
@@ -100,12 +117,17 @@ def encode(message: dict) -> bytes:
 
 
 class FrameWriter:
-    """Writes whole messages to a binary stream, one at a time."""
+    """Writes whole messages to a binary stream, one at a time.
 
-    def __init__(self, stream: BinaryIO) -> None:
+    ``on_broken``, when set, is called once, outside the writer's lock, by the write that finds the stream
+    failed; ``broken`` is already true when it is called.
+    """
+
+    def __init__(self, stream: BinaryIO, on_broken: Callable[[], None] | None = None) -> None:
         self._stream = stream
         self._lock = threading.Lock()
         self.broken = False
+        self.on_broken = on_broken
 
     def write(self, message: dict) -> bool:
         """Write one message; ``False`` when it was not written (the stream failed now or earlier)."""
@@ -117,7 +139,9 @@ class FrameWriter:
             try:
                 self._stream.write(data)
                 self._stream.flush()
+                return True
             except (OSError, ValueError):  # a pipe the client stopped reading, or a stream already shut
                 self.broken = True
-                return False
-        return True
+        if self.on_broken is not None:
+            self.on_broken()
+        return False

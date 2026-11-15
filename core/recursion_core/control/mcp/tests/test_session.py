@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import queue
 import threading
 import unittest
+from unittest import mock
 
 from recursion_core.control.mcp import server
 from recursion_core.control.mcp.framing import Frame, encode
-from recursion_core.control.mcp.tests.support import GateAPI, QueueWriter, Served, assert_json_equal
+from recursion_core.control.mcp.tools import Tool
+from recursion_core.control.mcp.tests.support import HANG_GUARD_S, GateAPI, QueueWriter, Served, assert_json_equal
 from recursion_core.control.registry import EMPTY, POPULATED
 from recursion_core.control.tests.fakes import FakeKillTree, make_api
 
@@ -171,6 +175,131 @@ class CancellationTest(SessionCase):
         self.assertEqual(1, len(api.calls))
 
 
+class IdentityTest(SessionCase):
+    def test_a_fraction_never_names_an_integer_request(self) -> None:
+        api = GateAPI()
+        session, writer = self.session(api)
+        self.feed(session, call(1, *STATUS))
+        _, _, release = api.next_entered()
+        self.feed(session, cancel(1.0))  # not an id: ignored, request 1 keeps its answer
+        self.feed(session, call(7.0, *STATUS))
+        self.assertEqual({"jsonrpc": "2.0", "id": None, "error": {
+            "code": -32600, "message": "Invalid Request: id must be a string or an integer, never null"}}, writer.next())
+        release.set()
+        self.assertEqual(1, writer.next()["id"])
+        session.close()
+        self.assertEqual(1, len(api.calls))
+
+    def test_a_schema_the_checker_cannot_apply_answers_an_internal_error_and_sends_nothing(self) -> None:
+        broken = Tool("recursion_run_status", "run.status", {
+            "name": "recursion_run_status", "inputSchema": {"type": "object", "properties": {
+                "run_id": {"type": "string", "minLength": "x"}}}})
+        api = GateAPI()
+        session, writer = self.session(api, tools=[broken])
+        self.feed(session, call(2, *STATUS))
+        self.assertEqual({"jsonrpc": "2.0", "id": 2, "error": {
+            "code": -32603, "message": "Internal error: the tool's input schema could not be applied",
+            "data": {"tool": "recursion_run_status"}}}, writer.next())
+        self.feed(session, ping(3))  # the reader goes on
+        self.assertEqual({"jsonrpc": "2.0", "id": 3, "result": {}}, writer.next())
+        api.assert_nothing_entered(self)
+        session.close()
+
+
+class OutputLostTest(SessionCase):
+    def test_no_worker_is_started_for_a_call_after_output_failure(self) -> None:
+        api = GateAPI()
+        session, writer = self.session(api)
+        session.output_lost()
+        with mock.patch.object(server.threading.Thread, "start") as start:
+            self.feed(session, call(2, *STATUS))
+        start.assert_not_called()
+        self.assertEqual((0, []), (session.in_flight(), writer.drain()))
+        api.assert_nothing_entered(self)
+
+    def test_a_closed_output_is_seen_at_admission_too(self) -> None:
+        api = GateAPI()
+        session, writer = self.session(api, output_open=lambda: False)
+        with mock.patch.object(server.threading.Thread, "start") as start:
+            self.feed(session, call(2, *STATUS))
+        start.assert_not_called()
+        self.assertEqual(0, session.in_flight())
+
+    def test_a_call_admitted_before_output_failure_is_not_sent_after_it(self) -> None:
+        api = GateAPI()
+        open_ = [True]
+        writer = QueueWriter()
+        session = server.LegacySession(api, writer, output_open=lambda: open_[0])
+        self.feed(session, INIT)
+        writer.next()
+        workers: list[threading.Thread] = []
+        with mock.patch.object(server.threading.Thread, "start", autospec=True, side_effect=workers.append):
+            self.feed(session, call(2, *STATUS))
+        self.assertEqual(1, len(workers))
+        open_[0] = False  # stdout fails after the call was admitted and before its worker sends it
+        workers[0].run()  # the worker's body, on this thread
+        api.assert_nothing_entered(self)
+        self.assertEqual((0, []), (session.in_flight(), writer.drain()))
+
+
+class CancellationWindowTest(SessionCase):
+    """Whether a cancelled call's answer goes out is decided under the session's lock: never both."""
+
+    def test_a_cancellation_while_the_answer_is_being_written_is_too_late_and_says_so(self) -> None:
+        writing, release = threading.Event(), threading.Event()
+
+        class SlowWriter(QueueWriter):
+            def __call__(self, message):
+                if message.get("id") == 2:
+                    writing.set()
+                    release.wait(HANG_GUARD_S)
+                return super().__call__(message)
+
+        events: list[dict] = []
+        api = GateAPI()
+        writer = SlowWriter()
+        session = server.LegacySession(api, writer, log=events.append)
+        self.feed(session, INIT)
+        writer.next()
+        self.feed(session, call(2, *STATUS))
+        api.next_entered()[2].set()
+        self.assertTrue(writing.wait(HANG_GUARD_S))
+        self.feed(session, cancel(2))
+        release.set()
+        self.assertEqual(2, writer.next()["id"])  # it was committed before the cancellation came
+        session.close()
+        self.assertEqual({"event": "cancelled", "outcome": "answer_already_written"}, events[-1])
+
+    def test_a_cancellation_while_the_call_runs_drops_the_answer_and_says_so(self) -> None:
+        events: list[dict] = []
+        api = GateAPI()
+        session, writer = self.session(api, log=events.append)
+        self.feed(session, call(2, *STATUS))
+        _, _, release = api.next_entered()
+        self.feed(session, cancel(2))
+        release.set()
+        session.close()
+        self.assertEqual([], writer.drain())
+        self.assertEqual({"event": "cancelled", "outcome": "answer_dropped"}, events[-1])
+
+    def test_a_cancelled_waiting_call_is_never_sent(self) -> None:
+        events: list[dict] = []
+        api = GateAPI()
+        session, writer = self.session(api, max_in_flight=1, reserved_stop=0, log=events.append)
+        self.feed(session, call(2, *START))
+        start = api.next_entered()
+        self.feed(session, call(3, *STATUS))
+        self.feed(session, cancel(3))
+        self.assertEqual({"event": "cancelled", "outcome": "never_sent"}, events[-1])
+        start[2].set()
+        self.assertEqual(2, writer.next()["id"])
+        session.close()
+        self.assertEqual([], writer.drain())
+        self.assertEqual(["run.start"], [m for m, _ in api.calls])
+        self.feed(session, cancel(99))
+        self.assertEqual({"event": "cancelled", "outcome": "not_in_flight"}, events[-1])
+
+
 class SlotTest(SessionCase):
     def test_stop_runs_on_a_reserved_slot_while_every_ordinary_slot_is_busy(self) -> None:
         api = GateAPI()
@@ -186,48 +315,203 @@ class SlotTest(SessionCase):
         self.assertEqual(2, writer.next()["id"])
         session.close()
 
-    def test_a_call_over_the_limit_waits_for_a_slot_and_is_not_refused(self) -> None:
+    def test_a_call_over_the_limit_waits_in_the_queue_and_the_reader_goes_on(self) -> None:
         api = GateAPI()
         session, writer = self.session(api, max_in_flight=1, reserved_stop=1)
         self.feed(session, call(2, *START))
         first = api.next_entered()
-        reader = self.feed_in_thread(session, call(3, *STATUS))  # a read gets no reserved slot
-        reader.join(SHORT)
-        self.assertTrue(reader.is_alive(), "the reader should wait for a slot")
+        self.feed(session, call(3, *STATUS))  # returns at once: the call waits, the reader does not
+        self.feed(session, ping(4))
+        self.assertEqual({"jsonrpc": "2.0", "id": 4, "result": {}}, writer.next())
         api.assert_nothing_entered(self)
         first[2].set()
         self.assertEqual(2, writer.next()["id"])
         second = api.next_entered()
         self.assertEqual("run.status", second[0])
-        reader.join()
         second[2].set()
         self.assertEqual(3, writer.next()["id"])
         session.close()
 
-    def test_a_stop_waits_when_the_reserved_slots_are_busy_too(self) -> None:
+    def test_a_stop_waits_when_the_reserved_slots_are_busy_too_and_goes_before_waiting_calls(self) -> None:
         api = GateAPI()
         session, writer = self.session(api, max_in_flight=1, reserved_stop=1)
         self.feed(session, call(2, *START))
         start = api.next_entered()
         self.feed(session, call(3, *STOP))
         stop = api.next_entered()
-        reader = self.feed_in_thread(session, call(4, "recursion_run_stop", {"run_id": "run-2"}))
-        reader.join(SHORT)
-        self.assertTrue(reader.is_alive())
-        stop[2].set()
-        self.assertEqual(3, writer.next()["id"])
-        reader.join()
+        self.feed(session, call(4, *STATUS))                                       # waits (ordinary)
+        self.feed(session, call(5, "recursion_run_stop", {"run_id": "run-2"}))    # waits (stop), sent first
+        api.assert_nothing_entered(self)
+        start[2].set()  # an ordinary slot frees: the waiting stop takes it before the earlier status
+        self.assertEqual(2, writer.next()["id"])
         second_stop = api.next_entered()
         self.assertEqual(("run.stop", {"run_id": "run-2"}), second_stop[:2])
+        api.assert_nothing_entered(self)
+        stop[2].set()  # the reserved slot frees: a status cannot use it
+        self.assertEqual(3, writer.next()["id"])
+        api.assert_nothing_entered(self)
         second_stop[2].set()
-        start[2].set()
-        self.assertEqual({2, 4}, {writer.next()["id"], writer.next()["id"]})
+        self.assertEqual(5, writer.next()["id"])
+        status = api.next_entered()
+        self.assertEqual("run.status", status[0])
+        status[2].set()
+        self.assertEqual(4, writer.next()["id"])
         session.close()
 
+    def test_with_the_default_limits_a_stop_is_sent_behind_eight_busy_calls_and_a_waiting_one(self) -> None:
+        api = GateAPI()
+        session, writer = self.session(api)  # MAX_IN_FLIGHT 8, RESERVED_STOP 2
+        for n in range(8):
+            self.feed(session, call(f"s{n}", *START))
+        busy = [api.next_entered() for _ in range(8)]
+        self.feed(session, call("ninth", *START))   # an ordinary call over the limit, before the stop
+        self.feed(session, call("stop", *STOP))
+        stop = api.next_entered()
+        self.assertEqual("run.stop", stop[0])  # sent while all eight starts are still held
+        stop[2].set()
+        self.assertEqual("stop", writer.next()["id"])
+        for each in busy:
+            each[2].set()
+        ninth = api.next_entered()
+        self.assertEqual("run.start", ninth[0])
+        ninth[2].set()
+        self.assertEqual(9, len([writer.next() for _ in range(9)]))
+        session.close()
+        self.assertEqual((server.MAX_IN_FLIGHT, server.RESERVED_STOP), (8, 2))
+
+    def test_a_full_queue_refuses_at_once_and_sends_nothing(self) -> None:
+        api = GateAPI()
+        session, writer = self.session(api, max_in_flight=1, reserved_stop=1, max_waiting=1, max_waiting_stops=0)
+        self.feed(session, call(2, *START))
+        start = api.next_entered()
+        self.feed(session, call(3, *STATUS))  # waits
+        busy = {"code": -32000, "message": "Server busy: this call was not sent; it may be sent again",
+                "data": {"delivered": False}}
+        self.feed(session, call(4, *STATUS))
+        self.assertEqual({"jsonrpc": "2.0", "id": 4, "error": busy}, writer.next())
+        self.feed(session, call(5, *STOP))    # takes the reserved slot
+        stop = api.next_entered()
+        self.feed(session, call(6, "recursion_run_stop", {"run_id": "run-2"}))  # no stop place left
+        self.assertEqual({"jsonrpc": "2.0", "id": 6, "error": busy}, writer.next())
+        for gate in (start, stop):
+            gate[2].set()
+        self.assertEqual({2, 5}, {writer.next()["id"], writer.next()["id"]})
+        api.next_entered()[2].set()
+        self.assertEqual(3, writer.next()["id"])
+        session.close()
+        self.assertEqual(["run.start", "run.stop", "run.status"], [m for m, _ in api.calls])
+
+    def test_a_slot_is_held_until_the_answer_is_written(self) -> None:
+        written, release = threading.Event(), threading.Event()
+
+        class SlowWriter(QueueWriter):
+            def __call__(self, message):
+                if message.get("id") == 2:
+                    written.set()
+                    release.wait(HANG_GUARD_S)  # stdout is full: the answer waits
+                return super().__call__(message)
+
+        api = GateAPI()
+        writer = SlowWriter()
+        session = server.LegacySession(api, writer, max_in_flight=1, reserved_stop=0)
+        self.feed(session, INIT)
+        writer.next()
+        self.feed(session, call(2, *STATUS))
+        api.next_entered()[2].set()
+        self.assertTrue(written.wait(HANG_GUARD_S))
+        self.feed(session, call(3, *STATUS))
+        api.assert_nothing_entered(self)  # the first call still holds its slot while its answer waits
+        release.set()
+        self.assertEqual(2, writer.next()["id"])
+        api.next_entered()[2].set()
+        self.assertEqual(3, writer.next()["id"])
+        session.close()
+
+    def test_slow_stdout_bounds_api_calls_workers_and_waiting_calls_together(self) -> None:
+        stalled, release = threading.Event(), threading.Event()
+
+        class SlowWriter(QueueWriter):
+            def __call__(self, message):
+                if message.get("id") == 0:
+                    stalled.set()
+                    release.wait(HANG_GUARD_S)  # the client has stopped reading
+                return super().__call__(message)
+
+        class Counting:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def call(self, method, params=None):
+                self.calls += 1
+                return {"code": "ok"}
+
+        api, writer = Counting(), SlowWriter()
+        session = server.LegacySession(api, writer, max_in_flight=1, reserved_stop=0, max_waiting=3, max_waiting_stops=0)
+        self.feed(session, INIT)
+        writer.next()
+        for n in range(10):
+            self.feed(session, call(n, *STATUS))
+        self.assertTrue(stalled.wait(HANG_GUARD_S))
+        # The bound is max_in_flight + max_waiting: one call answering, three waiting unsent, six refused unsent.
+        self.assertEqual((1, 4), (api.calls, session.in_flight()))
+        refused = [writer.next() for _ in range(6)]
+        self.assertEqual(list(range(4, 10)), [m["id"] for m in refused])
+        self.assertEqual({-32000}, {m["error"]["code"] for m in refused})
+        release.set()
+        self.assertEqual(list(range(4)), sorted(writer.next()["id"] for _ in range(4)))
+        session.close()
+        self.assertEqual(4, api.calls)
+
     def test_limits_must_be_sane(self) -> None:
-        for kwargs in ({"max_in_flight": 0}, {"reserved_stop": -1}):
+        for kwargs in ({"max_in_flight": 0}, {"reserved_stop": -1}, {"max_waiting": -1}, {"max_waiting_stops": -1}):
             with self.assertRaises(ValueError):
                 server.LegacySession(GateAPI(), QueueWriter(), **kwargs)
+
+
+class WorkerStartFailureTest(SessionCase):
+    """A worker thread that cannot be started: nothing is sent, the slot and the id are given back."""
+
+    def test_an_ordinary_call(self) -> None:
+        api = GateAPI()
+        session, writer = self.session(api, max_in_flight=1, reserved_stop=0)
+        with mock.patch.object(server.threading.Thread, "start", side_effect=RuntimeError("no thread")):
+            self.feed(session, call(2, *STATUS))
+        self.assertEqual({"jsonrpc": "2.0", "id": 2, "error": {"code": -32603, "message": "Internal error: no worker for this call"}},
+                         writer.next())
+        api.assert_nothing_entered(self)
+        self.assertEqual(0, session.in_flight())
+        self.feed(session, call(2, *STATUS))  # the same id again, on the slot given back
+        api.next_entered()[2].set()
+        self.assertEqual(2, writer.next()["id"])
+        session.close()
+
+    def test_a_stop_on_a_reserved_slot(self) -> None:
+        api = GateAPI()
+        session, writer = self.session(api, max_in_flight=1, reserved_stop=1)
+        self.feed(session, call(2, *START))
+        start = api.next_entered()
+        with mock.patch.object(server.threading.Thread, "start", side_effect=RuntimeError("no thread")):
+            self.feed(session, call("stop", *STOP))
+        self.assertEqual(-32603, writer.next()["error"]["code"])
+        self.feed(session, call("stop", *STOP))  # the reserved slot and the id were given back
+        stop = api.next_entered()
+        self.assertEqual("run.stop", stop[0])
+        stop[2].set()
+        self.assertEqual("stop", writer.next()["id"])
+        start[2].set()
+        self.assertEqual(2, writer.next()["id"])
+        session.close()
+        self.assertEqual(["run.start", "run.stop"], [m for m, _ in api.calls])
+
+
+class LogTest(SessionCase):
+    def test_initialize_and_ignored_responses_are_logged(self) -> None:
+        events: list[dict] = []
+        session, writer = self.session(GateAPI(), log=events.append)
+        self.feed(session, {"jsonrpc": "2.0", "id": 9, "result": {}})
+        self.assertEqual([{"event": "initialize", "requested": "2025-06-18", "answered": "2025-06-18", "client": "t"},
+                          {"event": "ignored_response"}], events)
+        self.assertEqual([], writer.drain())
 
 
 class AnswerTest(SessionCase):
@@ -300,6 +584,66 @@ class EndOfInputTest(unittest.TestCase):
         self.assertEqual(1, len(starter.calls))
         self.assertEqual("running", api.call("run.status", {"run_id": "run-1"})["run"]["state"])
 
+    def test_waiting_calls_are_still_run_and_answered_after_end_of_input(self) -> None:
+        api = GateAPI()
+        served = Served(api, max_in_flight=1, reserved_stop=0)
+        served.send(INIT)
+        served.out.next()
+        served.send(call(2, *START))
+        first = api.next_entered()
+        served.send(call(3, *STATUS))
+        served.end_input()
+        first[2].set()
+        self.assertEqual(2, served.out.next()["id"])
+        api.next_entered()[2].set()
+        self.assertEqual(3, served.out.next()["id"])
+        self.assertTrue(served.join())
+        self.assertEqual(0, served.status)
+
+    def test_after_stdout_fails_nothing_more_is_sent_and_serve_ends_without_more_input(self) -> None:
+        class FailsOnTwo(io.RawIOBase):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lines: queue.Queue = queue.Queue()
+
+            def writable(self):
+                return True
+
+            def write(self, data):
+                message = json.loads(data)
+                if message.get("id") == 2:
+                    raise BrokenPipeError("the client stopped reading")
+                self.lines.put(message)
+                return len(data)
+
+        api = GateAPI()
+        events: list[dict] = []
+        read_fd, write_fd = os.pipe()
+        instream = os.fdopen(read_fd, "rb")
+        self.addCleanup(instream.close)
+        out = FailsOnTwo()
+        status: list[int] = []
+        serving = threading.Thread(target=lambda: status.append(server.serve(
+            api, instream, out, log=events.append, max_in_flight=1, reserved_stop=0)), daemon=True)
+        serving.start()
+        for message in (INIT, call(2, *STATUS), call(3, *START), ping(4)):
+            os.write(write_fd, encode(message))
+        entered = api.next_entered()
+        self.assertEqual("run.status", entered[0])
+        self.assertEqual("init", out.lines.get(timeout=HANG_GUARD_S)["id"])
+        self.assertEqual(4, out.lines.get(timeout=HANG_GUARD_S)["id"])  # so call 3 has been read: it waits
+        entered[2].set()  # its answer is the write that fails; call 3 is waiting and must never be sent
+        serving.join(HANG_GUARD_S)
+        self.assertFalse(serving.is_alive(), "serve should end when stdout fails, with stdin still open")
+        self.assertEqual([0], status)
+        os.write(write_fd, encode(call(4, *START)))
+        os.close(write_fd)
+        with self.assertRaises(queue.Empty):
+            api.entered.get(timeout=SHORT)  # time only shows that nothing was sent after the failure
+        self.assertEqual(["run.status"], [m for m, _ in api.calls])
+        self.assertIn({"event": "output_lost", "dropped_unsent": 1}, events)
+        self.assertEqual({"event": "output_failed", "stdout_broken": True}, events[-1])
+
     def test_once_stdout_breaks_no_further_call_is_forwarded(self) -> None:
         class Broken(io.RawIOBase):
             def write(self, data):
@@ -320,6 +664,15 @@ class EndOfInputTest(unittest.TestCase):
         lines = raw.split(b"\n")
         self.assertEqual(b"", lines[-1])
         self.assertEqual([odd, 2], [json.loads(line)["id"] for line in lines[:-1]])
+
+    def test_an_over_long_integer_is_answered_as_such_and_serving_goes_on(self) -> None:
+        served = Served(GateAPI())
+        served.send_bytes(b'{"jsonrpc":"2.0","id":' + b"7" * 4301 + b',"method":"ping"}\n')
+        self.assertEqual({"jsonrpc": "2.0", "id": None, "error": {
+            "code": -32600, "message": "Invalid Request: an integer longer than 4300 digits"}}, served.out.next())
+        served.send(ping(2))
+        self.assertEqual({"jsonrpc": "2.0", "id": 2, "result": {}}, served.out.next())
+        self.assertEqual([], served.finish(self))
 
     def test_a_line_over_the_limit_is_refused_and_serving_goes_on(self) -> None:
         served = Served(GateAPI())

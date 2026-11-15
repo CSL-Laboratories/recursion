@@ -560,6 +560,53 @@ class RoundThreeScopesTest(unittest.TestCase):
         self.assertEqual(auth(principal, "run.start", {}), ("scope_refused", "needs_run"))
 
 
+class RoundFourScopesTest(unittest.TestCase):
+    """The round-4 read of #377 by Codex GPT-6 Astra, 1 (STRICT): a __getattr__ fallback hid a declared grant's
+    failed read."""
+
+    def test_a_fallback_never_stands_in_for_a_declared_grant_whose_read_failed(self) -> None:
+        def principal(kind, principal_id, fallback):
+            class Declared:
+                in_run_unit = False
+
+                def __init__(self):
+                    self.kind, self.id = kind, principal_id
+
+                @property
+                def grant(self):
+                    raise AttributeError("the trusted grant context is unavailable")
+
+                def __getattr__(self, name):
+                    return fallback                # what Python answers after the accessor's AttributeError
+
+            return Declared()
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        for fallback in (None, g("plugin", "plugin.alpha")):
+            for kind, principal_id in (("plugin", "plugin.alpha"), ("owner", "local"), ("device", "page")):
+                with self.subTest(fallback=fallback, kind=kind):
+                    who = principal(kind, principal_id, fallback)
+                    self.assertEqual(auth.held(who), frozenset())
+                    self.assertEqual(auth(who, "run.start", {}), ("scope_refused", "needs_run"))
+
+    def test_a_grant_nothing_declares_is_read_the_dynamic_way(self) -> None:
+        class Dynamic:
+            kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+            def __init__(self, answer):
+                self.answer = answer
+
+            def __getattr__(self, name):
+                if name == "grant":
+                    return self.answer
+                raise AttributeError(name)
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        self.assertEqual(auth.held(Dynamic(None)), frozenset({"read", "run"}))            # absent: identity grants
+        self.assertEqual(auth.held(Dynamic(g("plugin", "plugin.alpha"))), frozenset({"read", "run"}))   # its grant
+        self.assertEqual(auth.held(Dynamic("g-plugin-other")), frozenset())             # a grant not its own
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

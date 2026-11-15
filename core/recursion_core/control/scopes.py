@@ -27,8 +27,9 @@ recovery Stop never passes here.
    - any other device, session or agent principal with no ``grant`` holds nothing;
    - a principal whose ``grant`` cannot be read holds nothing, whatever its kind: an unreadable grant is
      not an absent one, so it never falls through to a plugin's identity grants. A grant is absent only
-     when nothing named ``grant`` is declared on the principal; a declared accessor that raises, even
-     ``AttributeError``, is unreadable.
+     when nothing named ``grant`` is declared on the principal; a declared one is read through its
+     declaration alone, and if that read raises, even ``AttributeError``, it is unreadable, whatever a
+     ``__getattr__`` fallback would answer.
    Every set is cut to the kind's ceiling (``credentials.CEILING``), so a plugin, session or agent never
    holds ``approve`` and no device ever holds ``manage``, whatever a grant says. SPINE's ``Principal`` has
    no ``grant`` field yet (``questions.md``); until it has, token principals hold nothing.
@@ -88,7 +89,7 @@ def _same_session(run_session: str, principal_session: str) -> bool:
     return run_session == principal_session
 
 
-_ABSENT = object()   # no grant attribute at all, told apart from a grant attribute that cannot be read
+_ABSENT = object()   # nothing named grant declared, told apart from a declared grant that cannot be read
 
 
 def _attr(principal, name: str, default):
@@ -118,14 +119,13 @@ class Authorizer:
 
         kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
         try:
-            grant = getattr(principal, "grant", _ABSENT)
-            if grant is _ABSENT:
-                # Absent (SPINE's Principal today) only if nothing named grant is declared: a declared accessor
-                # whose AttributeError getattr took for absence is unreadable (the round-3 reads of #377,
-                # Astra 1 and Sol 1).
-                if inspect.getattr_static(principal, "grant", _ABSENT) is not _ABSENT:
-                    return frozenset()
-                grant = None
+            if inspect.getattr_static(principal, "grant", _ABSENT) is not _ABSENT:
+                # Declared: read through the declaration alone, so neither a default nor a __getattr__ fallback
+                # can stand in for a read that failed; such a failure, AttributeError included, is unreadable
+                # (the round-3 reads of #377, Astra 1 and Sol 1, and the round-4 read by Astra, 1).
+                grant = object.__getattribute__(principal, "grant")
+            else:
+                grant = getattr(principal, "grant", None)   # not declared: absent (SPINE's Principal today)
         except Exception:  # noqa: BLE001 - unreadable is not absent: such a principal holds nothing at all
             return frozenset()   # (the round-2 read of #377 by Sol, 2: it fell through to the plugin's grants)
         if kind in ("owner", "internal"):

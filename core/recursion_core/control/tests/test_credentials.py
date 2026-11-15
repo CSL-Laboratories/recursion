@@ -896,6 +896,124 @@ class RoundThreeTest(unittest.TestCase):
         self.assertIn("NUL", str(caught.exception))
 
 
+
+@NEEDS_POSIX
+class RoundFourTest(unittest.TestCase):
+    """The round-4 reads of #377 (Codex GPT-6 Astra 2 and 3, GPT-6.1 Sol 1)."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-r4-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.path = os.path.join(self.base, "state", "credentials.json")
+        self.wall = Clock(1000.0)
+        self.events: list[tuple[str, dict]] = []
+
+    def store(self, **kwargs) -> CredentialStore:
+        kwargs.setdefault("emit", lambda kind, payload: self.events.append((kind, payload)))
+        kwargs.setdefault("wall", self.wall)
+        return CredentialStore(self.path, **kwargs)
+
+    def pending_at_1200_then_another_writer_at_1100(self) -> tuple[CredentialStore, str]:
+        store = self.store()
+        _, cred = store.mint("device", "one", ["read"])
+        self.wall.now = 1200
+        with mock.patch.object(store, "_write", side_effect=CredentialStoreError("disk full")):
+            with self.assertRaises(CredentialStoreError):
+                store.revoke(cred.token_id)
+        self.store(wall=lambda: 1100.0, emit=None).revoke(cred.token_id)   # its clock is behind
+        self.wall.now = 1300
+        return store, cred.token_id
+
+    def test_a_pending_revocation_keeps_the_time_first_recorded_when_the_next_writer_s_clock_is_behind(self) -> None:
+        # Astra 2, Sol 1: the earlier of the two times (1100, the other store's) replaced the first recorded here.
+        for path in ("retry", "refresh, then another write"):
+            with self.subTest(path=path):
+                store, token_id = self.pending_at_1200_then_another_writer_at_1100()
+                if path == "retry":
+                    self.assertEqual(store.revoke(token_id).revoked_at, 1200)
+                else:
+                    self.assertEqual([c.revoked_at for c in store.grants()], [1200])   # rereads the file
+                    store.mint("device", "two", ["read"])
+                self.assertEqual({c.id: c.revoked_at for c in self.store().grants()}["one"], 1200)
+                self.assertEqual([p["revoked_at"] for k, p in self.events if k == "credential.revoked"], [1200])
+                shutil.rmtree(os.path.join(self.base, "state"))
+                self.events.clear()
+                self.wall.now = 1000
+
+    def test_a_grant_this_store_first_finds_under_the_lock_is_revoked(self) -> None:
+        # Astra 3 (STRICT proof): with the mark under the lock removed, such a grant was written back live and all
+        # the lane's tests still passed.
+        here, there = self.store(), self.store()
+        token, cred = there.mint("device", "theirs", ["read"])     # here has not read the file since
+        revoked = here.revoke(cred.token_id)
+        self.assertEqual(revoked.revoked_at, 1000)
+        with self.assertRaises(CredentialRefused) as caught:
+            self.store().verify(token, peer="p")
+        self.assertEqual(caught.exception.detail, "token_revoked")
+        self.assertEqual([p["token_id"] for k, p in self.events if k == "credential.revoked"], [cred.token_id])
+
+
+
+@NEEDS_POSIX
+class StoreFailureGuardsTest(unittest.TestCase):
+    """The round-3 read of #385 by Codex GPT-6 Astra, 4 (coverage of PR 1's store): each guard below was correct,
+    and removing it left every lane test green."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-guards-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.path = os.path.join(self.base, "state", "credentials.json")
+
+    def test_a_file_whose_identity_cannot_be_read_is_a_typed_refusal(self) -> None:
+        store = CredentialStore(self.path)
+        store.mint("device", "d1", ["read"])
+        real_stat = creds.os.stat
+
+        def stat(path, *args, **kwargs):
+            if path == self.path:
+                raise OSError("EIO")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(creds.os, "stat", side_effect=stat):
+            with self.assertRaises(CredentialStoreError):
+                store.grants()
+
+    def test_a_mint_stays_issued_when_the_file_cannot_be_reread_after_its_write(self) -> None:
+        store = CredentialStore(self.path)
+        with mock.patch.object(store, "_identity", side_effect=CredentialStoreError("EIO")):
+            token, cred = store.mint("device", "d1", ["read"])
+        self.assertEqual([c.token_id for c in store.grants()], [cred.token_id])
+        self.assertEqual(CredentialStore(self.path).verify(token, peer="p").id, "d1")
+
+    def test_a_lock_that_cannot_be_taken_for_another_reason_is_a_typed_refusal(self) -> None:
+        with mock.patch.object(creds.fcntl, "flock", side_effect=OSError("ENOLCK")):
+            with self.assertRaises(CredentialStoreError) as caught:
+                CredentialStore(self.path)
+        self.assertIn("lock", str(caught.exception))
+
+    def test_a_directory_that_cannot_be_listed_still_opens(self) -> None:
+        with mock.patch.object(creds.os, "listdir", side_effect=OSError("EACCES")):
+            store = CredentialStore(self.path)
+        self.assertEqual(store.grants(), [])
+
+    def test_an_orphan_that_cannot_be_removed_still_opens(self) -> None:
+        CredentialStore(self.path)
+        orphan = os.path.join(self.base, "state", ".credentials.json.0123456789abcdef.tmp")
+        with open(orphan, "w", encoding="ascii") as handle:
+            handle.write("{}")
+        real_unlink = creds.os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == orphan:
+                raise PermissionError("EPERM")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(creds.os, "unlink", side_effect=unlink):
+            store = CredentialStore(self.path)
+        self.assertTrue(os.path.exists(orphan))
+        self.assertEqual(store.grants(), [])
+
+
 @NEEDS_POSIX
 class TwoStoresTest(unittest.TestCase):
     """The audited read of #377 by DeepSeek V4.1 Flash, F4: two stores on one file each wrote their own memory,

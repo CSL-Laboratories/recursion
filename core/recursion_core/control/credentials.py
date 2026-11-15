@@ -343,8 +343,9 @@ class CredentialStore:
             raise CredentialStoreError(f"the store cannot be read ({type(exc).__name__})") from None
 
     def _reload(self) -> dict:
-        """Memory becomes what the file says, plus this store's revocations not yet written, each with its first
-        time. Returns the pending ones the file already holds as revoked, with the file's time. Lock held."""
+        """Memory becomes what the file says, plus this store's revocations not yet written, each with the time
+        first recorded here. Returns the pending ones the file already holds as revoked, with the file's time.
+        Lock held."""
 
         records, identity = self._load()
         grants = {record["token_id"]: record for record in records}
@@ -353,13 +354,12 @@ class CredentialStore:
             mine, theirs = self._grants.get(token_id), grants.get(token_id)
             if mine is None or theirs is None or mine["revoked_at"] is None:
                 continue
-            if theirs["revoked_at"] is None:
-                theirs["revoked_at"] = mine["revoked_at"]
-            else:
+            if theirs["revoked_at"] is not None:
                 durable[token_id] = theirs["revoked_at"]
-                # The first revocation keeps its time, whichever store made it (the round-3 read of #377 by
-                # Astra, 3: a later revocation by another store replaced it).
-                theirs["revoked_at"] = min(theirs["revoked_at"], mine["revoked_at"])
+            # The time first recorded here stays, whatever another store wrote since: not its later time (the
+            # round-3 read of #377 by Astra, 3), and not the earlier of the two, which a clock that stepped back
+            # gets wrong (the round-4 reads by Astra, 2, and Sol, 1).
+            theirs["revoked_at"] = mine["revoked_at"]
         self._grants = grants
         self._by_digest = {record["token_sha256"]: token_id for token_id, record in grants.items()}
         self._seen = identity

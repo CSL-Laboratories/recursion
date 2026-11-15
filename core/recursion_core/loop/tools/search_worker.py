@@ -2,7 +2,8 @@
 
 It reads one JSON request on standard input and writes one JSON answer on standard output. It runs in a child
 process so that a pattern that backtracks without end, or a huge tree, can be stopped (the parent kills it at
-its deadline or when the turn is interrupted) without stopping the loop.
+its deadline or when the turn is interrupted) without stopping the loop. It also bounds its own life, for the
+case where the parent dies first (``bound_own_life``).
 
 Files: inside a git work tree, ``git ls-files --cached --others --exclude-standard`` (tracked files and
 untracked files that .gitignore does not exclude); elsewhere a walk that skips version-control and cache
@@ -16,6 +17,7 @@ import fnmatch
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 
@@ -107,7 +109,13 @@ def search(req: dict) -> dict:
         scanned += 1
         text = data.decode("utf-8", "replace")
         hit = False
-        for no, line in enumerate(text.splitlines(), 1):
+        # Lines as read numbers them: split at LF only, a CR before it dropped (U+2028 and the like are text).
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        for no, line in enumerate(lines, 1):
+            if line.endswith("\r"):
+                line = line[:-1]
             if rx.search(line):
                 hit = True
                 if files_only:
@@ -128,8 +136,31 @@ def search(req: dict) -> dict:
             "skipped_binary": skipped_binary, "skipped_large": skipped_large, "skipped_outside": skipped_outside}
 
 
+def bound_own_life(req: dict) -> None:
+    """If the loop dies (a crash, kill -9) nothing would stop this process, so it bounds its own life. An alarm
+    left at its default action ends the process at the kernel's hand when it rings: a regular expression that
+    backtracks without end never returns to Python, so a timer in Python would never run. On Linux the kernel
+    also ends it the moment its parent dies; if the parent was already gone, it ends now."""
+
+    alarm_s = req.get("alarm_s")
+    if isinstance(alarm_s, int) and alarm_s > 0 and hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.alarm(alarm_s)
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+        except (OSError, AttributeError):
+            pass
+    parent = req.get("parent_pid")
+    if isinstance(parent, int) and os.getppid() != parent:
+        os._exit(3)
+
+
 def main() -> int:
     req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    bound_own_life(req)
     sys.stdout.write(json.dumps(search(req), ensure_ascii=False))
     sys.stdout.flush()
     return 0

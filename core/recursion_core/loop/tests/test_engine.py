@@ -181,7 +181,11 @@ class Endings(unittest.TestCase):
                                  "retry_after_s": 30})
         self.assertEqual((end["outcome"], end["reason"]), ("paused", "limit"))
         self.assertIsNone(end["result"]["code"])
-        self.assertNotIn("usage", kinds(docs), "a call that failed reports no usage, rather than a made-up 0")
+        # The failed call still has its one usage line: all unknown (it measured nothing), never a made-up 0.
+        usage = [d for d in docs if d["type"] == "usage" and d["span"] == "call"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual({k: usage[0][k] for k in b.USAGE_FIELDS}, b.Usage().to_wire())
+        self.assertLess(kinds(docs).index("usage"), kinds(docs).index("limit"))
 
     def test_a_provider_failure_fails_the_turn_with_its_code(self) -> None:
         end, _, _ = self.ended([{"error": {"kind": "auth", "detail": "HTTP 401 authentication_error"}}])
@@ -202,8 +206,11 @@ class Endings(unittest.TestCase):
         self.assertNotIn("tool_call", kinds(docs))
         self.assertEqual((end["outcome"], end["reason"]), ("paused", "max_tokens"))
         h2 = h.session.messages
-        self.assertEqual(h2[-1].parts, (b.ToolResult("toolu_cut", "not run: the reply ended before this call was "
+        self.assertEqual(h2[-2].parts, (b.ToolResult("toolu_cut", "not run: the reply ended before this call was "
                                                                   "complete", True),))
+        # The reply was cut off, so a harness note in the assistant's place keeps the roles alternating.
+        self.assertEqual(h2[-1].parts, (b.TextPart("[harness] The turn ended before a reply was kept: the reply "
+                                                   "reached the output limit."),))
 
     def test_a_refusal_fails_the_turn(self) -> None:
         end, _, _ = self.ended([{"text": "", "stop_reason": "refusal"}])

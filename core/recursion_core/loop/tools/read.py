@@ -7,9 +7,11 @@ a file is binary, and not shown, if its first 8 KiB hold a NUL byte or more than
 not UTF-8. Lines are numbered as ``cat -n`` numbers them (the records recommend no format; this is the one
 Claude Code's read tool uses), so an edit can name its place.
 
-Only regular files and folders are read. The file is opened without blocking (a FIFO cannot hang the loop) and
-checked again after it is open. The whole file is hashed as it is read, and the digest goes into the read
-ledger that the edit tool will check.
+Only regular files and folders are read: anything else is refused before it is opened. The file is opened
+without blocking (a FIFO cannot hang the loop) and checked again after it is open, for being a regular file;
+whether it is inside the workspace is decided before the open, from the path resolved through its links.
+The whole file is hashed as it is read, and the digest goes into the read ledger that the edit tool will
+check.
 """
 
 from __future__ import annotations
@@ -87,6 +89,22 @@ def _list_dir(path: os.PathLike, shown: str) -> ToolOutput:
     return ToolOutput(out)
 
 
+def _render(line_no: int, line: str, budget: int) -> str:
+    """One numbered line. A line longer than MAX_LINE_CHARS, or wider than the page's room, is cut here with a
+    note, so the registry never cuts the page a second time."""
+
+    full = len(line)
+    shown = line[:MAX_LINE_CHARS]
+    note = f" [line cut: {full} characters]" if full > MAX_LINE_CHARS else ""
+    rendered = f"{line_no:>6}\t{shown}{note}\n"
+    if len(rendered.encode("utf-8")) > budget:
+        note = f" [line cut: {full} characters]"
+        room = max(0, budget - len(f"{line_no:>6}\t{note}\n".encode("utf-8")))
+        shown = shown.encode("utf-8")[:room].decode("utf-8", "ignore")
+        rendered = f"{line_no:>6}\t{shown}{note}\n"
+    return rendered
+
+
 def run(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutput:
     ws = ctx.workspace
     path = ws.resolve(args["path"])
@@ -139,9 +157,7 @@ def _read_lines(fh, st: os.stat_result, path, shown: str, offset: int, limit: in
             line_no += 1
             if offset <= line_no < offset + limit and not stopped_for_room:
                 line = line[:-1] if line.endswith("\r") else line
-                if len(line) > MAX_LINE_CHARS:
-                    line = line[:MAX_LINE_CHARS] + f" [line cut: {len(line)} characters]"
-                rendered = f"{line_no:>6}\t{line}\n"
+                rendered = _render(line_no, line, budget)
                 size = len(rendered.encode("utf-8"))
                 if used + size > budget and out:
                     stopped_for_room = True
@@ -158,9 +174,7 @@ def _read_lines(fh, st: os.stat_result, path, shown: str, offset: int, limit: in
             if pending:
                 line_no += 1
                 if offset <= line_no < offset + limit and not stopped_for_room:
-                    line = pending[:MAX_LINE_CHARS] + (f" [line cut: {len(pending)} characters]"
-                                                      if len(pending) > MAX_LINE_CHARS else "")
-                    rendered = f"{line_no:>6}\t{line}\n"
+                    rendered = _render(line_no, pending, budget)
                     if used + len(rendered.encode("utf-8")) > budget and out:
                         stopped_for_room = True
                     else:

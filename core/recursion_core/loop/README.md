@@ -31,12 +31,19 @@ Inputs are driver.v2's inputs plus `interrupt`: `user_message`, `approval_answer
 `request_id`, and optionally the bound input), `interrupt` and `close`. Outputs are `ready`,
 `input_accepted`, `text`, `tool_call`, `permission_request`, `permission_expired`, `tool_result`, `usage`
 (per call, per turn and the session's running total), `limit`, `acceptance`, `turn_ended`, `interrupt`,
-`protocol_error` and `closed`. `protocol.py` gives every field. The payload fields match event.v1's payloads
-of the same name, so the driver adds only the connection id, the bucket, the input digest and the envelope.
+`protocol_error` and `closed`. `protocol.py` gives every field. Where a line shares a name with an event.v1
+payload its fields are that payload's as far as the loop knows them; `protocol.py` lists what the driver maps
+(the connection id, the bucket, the input digest, the stream offsets of text, the envelope; `retry_after_s`
+and `spill` dropped; `turn_ended` is not a driver draft). Text is written when its model call ends, not while
+it streams. Every model call has one `usage` line, a failed or interrupted one included, with what it had
+measured (unknown, never 0, where nothing was).
 
 `input_accepted` is written the moment the loop takes a message, before the model sees it, and never for a
 message it did not take. A turn the model finishes ends `candidate_done`, or `done` once the task's
-acceptance check passes; the harness, not the model, decides when work is done.
+acceptance check passes; the harness, not the model, decides when work is done. An `interrupt` answered
+`delivered: true` always comes before that turn's `turn_ended`, which is `interrupted` unless the model had
+already finished the turn or the loop failed. Standard input is read on its own descriptor, never through
+`sys.stdin`: after `close` the loop writes `closed` and exits 0, whether or not the driver keeps the pipe open.
 
 ## The pieces
 
@@ -47,7 +54,7 @@ acceptance check passes; the harness, not the model, decides when work is done.
 | `providers/fake.py` | A scripted provider |
 | `providers/sse.py` | The event-stream reader the providers share |
 | `tools/registry.py` | Input checks and the one output cap, with spill, that every tool passes through |
-| `tools/read.py`, `tools/search.py` | Reading files and folders; searching contents (in a child process) |
+| `tools/read.py`, `tools/search.py` | Reading files and folders; searching contents (in a child process). A tool runs only through `ToolRegistry.dispatch`, which checks its input, the approval rule and cancellation, scrubs and caps its output; the registry hands out a tool's spec, never its `run`, and a `run` called directly skips all of that |
 | `tools/write.py`, `tools/edit.py`, `tools/files.py` | Changing files: read first, unchanged since, atomic |
 | `tools/shell.py` | One command in its own process group, stopped at its timeout or on an interrupt |
 | `tools/workspace.py` | Path confinement, the spill store, and the record of what was read |

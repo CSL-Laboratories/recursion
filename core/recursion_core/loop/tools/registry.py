@@ -1,18 +1,26 @@
 """The tool registry and the one output cap every tool's result passes through.
 
 Each tool is one immutable entry: its name, description and input schema (sent to the model as they are), the
-function that runs it, and whether it must ask the approval queue first (write, edit and shell will; read and
-search do not). ``dispatch`` is the only way a tool runs:
+function that runs it, and whether it must ask the approval queue first (``True`` or ``False`` and nothing else:
+write, edit and shell will; read and search do not). ``dispatch`` is the only way a tool runs, and the registry
+never hands a tool's ``run`` out (``get`` gives its spec); a ``run`` called directly skips every rule below:
 
 1. the call's input must have arrived as a JSON object and must match the tool's schema (a small, strict subset
    of JSON Schema: object, string, integer, number, boolean, array, enum, required, additionalProperties false,
    minimum and maximum, minLength and maxLength); otherwise the tool does not run and the model gets an error;
-2. the tool runs with the turn's cancel token; an exception becomes an error result naming its type;
+2. the tool runs with the turn's cancel token; an exception becomes an error result naming its type, and so
+   does anything else that goes wrong with one call (input that is not an object, a tool that returns
+   something other than text, a library's ``sys.exit``, something passed in that is not a tool call): one bad
+   call costs one error result, never the turn.
+   ``KeyboardInterrupt`` is the one exception let through: it is how the process itself is interrupted
+   (SIGINT), which stops the loop, not one call;
 3. every secret the loop knows is removed from the output;
 4. the ONE cap applies: at most ``max_bytes`` bytes and ``max_lines`` lines reach the model. A larger output is
    saved whole to the spill store and the model sees its head and its tail around a single marker that names
    the saved copy (``spill:<sha256>``), which the read tool can page through. A tool that pages itself (read,
-   search) keeps under the cap and so is never cut twice; the cap still holds if it does not.
+   search) keeps under the cap and so is never cut twice; the cap still holds if it does not. The cap holds
+   for what is finally shown, marker included (a failure to save is named in at most ERROR_NOTE_MAX characters,
+   scrubbed), and lines are counted as read and search count them: by LF.
 
 Sizes, from the research (vault record 20261028-recursion-frontier-b4-tool-output-spill-04, sections 2, 3
 and 5): OpenCode and Pi cap at 2,000 lines or 50 KiB, Codex at about 10k tokens; this cap is 50 KiB and 2,000
@@ -36,10 +44,15 @@ from recursion_core.loop.tools.workspace import ToolError, Workspace
 DEFAULT_MAX_BYTES = 50 * 1024
 DEFAULT_MAX_LINES = 2000
 MARKER_RESERVE = 600  # bytes kept free for the marker inside the cap
+MIN_LINES = 3  # a head line, the marker and a tail line
+ERROR_NOTE_MAX = 200  # characters of a spill failure's text shown in the marker
 HEAD_SHARE = 0.4
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 OK, ERROR, DENIED, CANCELLED = "ok", "error", "denied", "cancelled"
+STATUSES = (OK, ERROR, DENIED, CANCELLED)
+MARKER_OPEN = "[output truncated:"
+QUOTED_OPEN = "(output truncated:"  # what the tool's own text shows instead: the same length, so sizes hold
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,11 @@ class Tool:
     # Run before a permission request, without side effects; raises ToolError so that a call that would fail
     # (a stale edit, an anchor that is not unique) is refused without asking anyone. ``run`` checks again.
     precheck: CheckFn | None = None
+
+    def __post_init__(self) -> None:
+        # The approval rule reads this flag: 0, "" or None must not quietly mean "runs without approval".
+        if not isinstance(self.needs_approval, bool):
+            raise ValueError("needs_approval is True or False")
 
 
 @dataclass(frozen=True)
@@ -139,6 +157,20 @@ def validate(schema: Mapping[str, Any], value: Any, where: str = "input") -> Non
         raise ToolError(f"schema type {kind!r} is not supported")  # a registry bug, caught by its tests
 
 
+def lf_lines(text: str) -> list[str]:
+    """``text`` split after each LF (the convention read and search use; U+2028 and the like are not breaks)."""
+
+    pieces = text.split("\n")
+    lines = [piece + "\n" for piece in pieces[:-1]]
+    if pieces[-1]:
+        lines.append(pieces[-1])
+    return lines
+
+
+def count_lines(text: str) -> int:
+    return text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+
+
 def _utf8_prefix(data: bytes, limit: int) -> bytes:
     cut = data[:limit]
     return cut.decode("utf-8", errors="ignore").encode("utf-8")
@@ -153,7 +185,7 @@ def cut_head_tail(text: str, max_bytes: int, max_lines: int) -> tuple[str, str, 
     """Split ``text`` into a head and a tail that together fit ``max_bytes`` bytes and ``max_lines`` lines,
     on whole lines where one fits. Returns (head, tail, facts about what was left out)."""
 
-    lines = text.splitlines(keepends=True)
+    lines = lf_lines(text)
     total_lines = len(lines)
     head_room = int(max_bytes * HEAD_SHARE)
     tail_room = max_bytes - head_room
@@ -214,18 +246,20 @@ def marker(facts: dict, total_bytes: int, ref: str | None, error: str | None) ->
                  f"limit), or narrow what you asked for.")
     else:
         where = f"The full output could not be saved ({error}); narrow what you asked for."
-    return f"[output truncated: {shown}. {where}]"
+    return f"{MARKER_OPEN} {shown}. {where}]"
 
 
 class ToolRegistry:
     def __init__(self, tools: Sequence[Tool], *, max_bytes: int = DEFAULT_MAX_BYTES,
                  max_lines: int = DEFAULT_MAX_LINES) -> None:
-        if max_bytes <= MARKER_RESERVE * 2 or max_lines < 2:
+        if max_bytes <= MARKER_RESERVE * 2 or max_lines < MIN_LINES:
             raise ValueError("the output cap is too small to hold a head, a tail and the marker")
         self._tools: dict[str, Tool] = {}
         for tool in tools:
+            if not isinstance(tool, Tool):
+                raise ValueError("a registry holds Tool entries only")
             name = tool.spec.name
-            if not _NAME.fullmatch(name):
+            if not isinstance(name, str) or not _NAME.fullmatch(name):
                 raise ValueError(f"tool name {name!r}")
             if name in self._tools:
                 raise ValueError(f"tool {name!r} registered twice")
@@ -241,11 +275,30 @@ class ToolRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._tools))
 
-    def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
+    def get(self, name: str) -> b.ToolSpec | None:
+        """The spec of the tool of that name, or None. The tool itself is never handed out: its ``run`` called
+        directly would skip the input check, the approval rule, the cancel check, the scrubbing and the cap."""
+
+        tool = self._tools.get(name) if isinstance(name, str) else None
+        return tool.spec if tool is not None else None
 
     def dispatch(self, call: b.ToolCall, ctx: ToolContext) -> Outcome:
-        tool = self._tools.get(call.name)
+        if not isinstance(call, b.ToolCall):
+            # Only a tool call runs a tool: anything else gets an error result, never an exception.
+            ids = [getattr(call, field, "") for field in ("call_id", "name")]
+            call_id, name = (value if isinstance(value, str) else "" for value in ids)
+            text = f"the call could not be run (a {type(call).__name__} is not a tool call)"
+            return Outcome(call_id, name, ERROR, text, False, None, len(text))
+        try:
+            return self._dispatch(call, ctx)
+        except KeyboardInterrupt:
+            raise  # the process is being interrupted (SIGINT): that stops the loop, not one call
+        except BaseException as exc:  # noqa: BLE001 - one bad call costs one error result, never the turn
+            text = f"the call could not be run ({type(exc).__name__})"
+            return Outcome(call.call_id, call.name, ERROR, text, False, None, len(text))
+
+    def _dispatch(self, call: b.ToolCall, ctx: ToolContext) -> Outcome:
+        tool = self._tools.get(call.name) if isinstance(call.name, str) else None
         if ctx.cancel.cancelled:
             return self._finish(call, ToolOutput("not run: the turn was interrupted", CANCELLED), ctx)
         if tool is None:
@@ -254,9 +307,14 @@ class ToolRegistry:
                                 ctx)
         if call.input is None:
             # The documented answer to input that is not JSON: hand the raw text back, built with the JSON
-            # library so quotes in it are escaped, and do not run the tool.
-            text = json.dumps({"INVALID_JSON": call.raw_input}, ensure_ascii=False)
-            return self._finish(call, ToolOutput(text, ERROR), ctx)
+            # library so quotes in it are escaped, and do not run the tool. Input refused for its depth or for a
+            # number JSON cannot write had its raw text dropped; the answer says why beside it.
+            answer = {"INVALID_JSON": call.raw_input}
+            if call.input_error in b.REFUSED_INPUT:
+                answer["error"] = f"{call.input_error}; the tool did not run"
+            return self._finish(call, ToolOutput(json.dumps(answer, ensure_ascii=False), ERROR), ctx)
+        if not isinstance(call.input, Mapping):
+            return self._finish(call, ToolOutput("invalid input: the input must be a JSON object", ERROR), ctx)
         try:
             validate(tool.spec.input_schema, dict(call.input))
         except ToolError as exc:
@@ -288,23 +346,38 @@ class ToolRegistry:
             output = ToolOutput("stopped: the turn was interrupted", CANCELLED)
         except ToolError as exc:
             output = ToolOutput(str(exc), ERROR)
-        except Exception as exc:  # noqa: BLE001 - a tool's failure is the model's to see, not the loop's to die of
+        except KeyboardInterrupt:
+            raise  # the process is being interrupted (SIGINT): that stops the loop, not one call
+        except BaseException as exc:  # noqa: BLE001 - a tool's failure (a library's sys.exit too) is the model's to see
             output = ToolOutput(f"the tool failed: {type(exc).__name__}: {exc}", ERROR)
+        if not isinstance(output, ToolOutput) or not isinstance(output.text, str) or output.status not in STATUSES:
+            output = ToolOutput("the tool failed: it returned no text", ERROR)
         return self._finish(call, output, ctx)
 
     def _finish(self, call: b.ToolCall, output: ToolOutput, ctx: ToolContext) -> Outcome:
         text = ctx.scrub(output.text)
         data = text.encode("utf-8")
-        line_count = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
-        if len(data) <= self.max_bytes and line_count <= self.max_lines:
+        if self._fits(text):
             return Outcome(call.call_id, call.name, output.status, text, False, None, len(data))
         ref, error = None, None
         try:
             ref = ctx.workspace.spill.put(data)
         except (OSError, ToolError) as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            # Scrubbed again (it is new text) and kept short and on one line, so the marker fits its reserve.
+            error = " ".join(ctx.scrub(f"{type(exc).__name__}: {exc}").split())
+            if len(error) > ERROR_NOTE_MAX:
+                error = error[:ERROR_NOTE_MAX] + "..."
+            error = error.replace(MARKER_OPEN, QUOTED_OPEN)  # a marker in it is quoted, like one in the output
         head, tail, facts = cut_head_tail(text, self.max_bytes - MARKER_RESERVE, self.max_lines - 1)
+        # A marker inside the tool's own text (a log it read, a file that quotes one) is shown quoted, so the
+        # model sees one marker, the real one.
+        head, tail = head.replace(MARKER_OPEN, QUOTED_OPEN), tail.replace(MARKER_OPEN, QUOTED_OPEN)
         note = marker(facts, len(data), ref, error)
         joiner = "" if head.endswith("\n") or not head else "\n"
         shown = f"{head}{joiner}{note}\n{tail}"
+        if not self._fits(shown):
+            shown = note + "\n"  # the reserve should make this unreachable; the cap holds regardless
         return Outcome(call.call_id, call.name, output.status, shown, True, ref, len(data))
+
+    def _fits(self, text: str) -> bool:
+        return len(text.encode("utf-8")) <= self.max_bytes and count_lines(text) <= self.max_lines

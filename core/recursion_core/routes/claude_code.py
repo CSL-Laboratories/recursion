@@ -58,11 +58,13 @@ API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_C
 # parent" (its own key comes from custody instead).
 CLAUDE_CREDENTIAL_ENV = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
 API_KEY_HELPER_STATES = ("absent", "present")
-# Passthrough route: the method the user picked gets its own variables for this run, and nothing else from
-# the daemon's environment (no other engine's key, no stray ANTHROPIC_API_KEY that would move the run to the
-# API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude Code's public docs (code.claude.com/docs/en/
-# amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway; retrieved 2026-11-09), not from engine
-# source. A method not listed here is refused, never widened to the whole environment.
+# Passthrough route (refused before launch until credential custody exists: PASSTHROUGH_REFUSED below; these
+# tables are the rules passthrough_env keeps for that day): the method the user picked gets its own variables
+# for this run, and nothing else from the daemon's environment (no other engine's key, no stray
+# ANTHROPIC_API_KEY that would move the run to the API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude
+# Code's public docs (code.claude.com/docs/en/amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway;
+# retrieved 2026-11-09), not from engine source. A method not listed here is refused, never widened to the whole
+# environment.
 PASSTHROUGH_METHOD_ENV = {
     "bedrock": ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_CONFIG_FILE",
@@ -107,6 +109,41 @@ def _method_var_missing(name: str, value: str | None) -> bool:
     return value.lower() in ("", "0", "false")  # a gateway URL or token: set, and not a placeholder off value
 
 
+# Every passthrough route is refused before launch, by the adapter itself and not only by the daemon (R3-8).
+# Lucas, Nov 12, decision sheet A2 ("Yes, as recommended"): "The daemon refuses routes with key_source:
+# api_key_helper and cloud passthrough routes until credential custody is built"; A8 ("Yes, all four"): the
+# gateway passthrough method stays refused with the cloud ones. The words are the daemon's own refusal
+# (daemon/control_adapter.py, route_unsupported), so both layers say the same thing.
+PASSTHROUGH_REFUSED = "no credential custody: a passthrough route is not launched"
+
+
+def passthrough_env(parent_env: dict[str, str], method: object) -> dict[str, str]:
+    """The environment a passthrough route's method would get. NO launch path calls this.
+
+    Every passthrough route is refused before launch until credential custody exists (A2, A8, above), so
+    this function only keeps the method rules (which names, which switch values) tested for that day. Before
+    a launch path calls it again, R3-8's open point has to be settled: a ``gateway`` method still receives
+    the user's ``CLAUDE_CODE_OAUTH_TOKEN`` and an ``ANTHROPIC_BASE_URL`` that may carry credentials, and the
+    daemon's child-environment policy drops the cloud methods' variables. Raises ``RouteError(LAUNCH_REFUSED)``
+    for a method with no listed variables or whose own switch or credential is unset.
+    """
+
+    names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
+    if names is None:
+        raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
+    missing = [n for n in PASSTHROUGH_METHOD_REQUIRED[method] if _method_var_missing(n, parent_env.get(n))]
+    if missing:
+        raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {method} needs {', '.join(missing)} "
+                           "set; without it the run would use the sign-in instead")
+    prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
+    names += tuple(sorted(n for n in parent_env if prefixes and n.startswith(prefixes)))
+    env = child_env(parent_env, extra_names=USER_KEEP_ENV + names)
+    for name in list(env):
+        if name.startswith("CLAUDE_CODE_USE_"):
+            env[name] = env[name].strip().lower()
+    return env
+
+
 class ClaudeCodeAdapter(RouteAdapter):
     engine = "claude_code"
 
@@ -146,25 +183,9 @@ class ClaudeCodeAdapter(RouteAdapter):
             cred = self.credential(request, ("ANTHROPIC_API_KEY",))
             return child_env(self._parent_env, extra_names=USER_KEEP_ENV, never=never, credential=cred)
         if kind == "passthrough":
-            # Cloud providers (Bedrock, Vertex, Foundry) or a gateway the user picked: that method's own
-            # variables pass through for this run, with the user's own sign-in and config location.
-            # CLAUDE_CODE_USE_* is copied as its stripped lowercase spelling so the child sees 1/true/yes/on.
-            method = conn.get("method")
-            names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
-            if names is None:
-                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
-            missing = [n for n in PASSTHROUGH_METHOD_REQUIRED[method]
-                       if _method_var_missing(n, self._parent_env.get(n))]
-            if missing:
-                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {method} needs {', '.join(missing)} "
-                                   "set; without it the run would use the sign-in instead")
-            prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
-            names += tuple(sorted(n for n in self._parent_env if prefixes and n.startswith(prefixes)))
-            env = child_env(self._parent_env, extra_names=USER_KEEP_ENV + names)
-            for name in list(env):
-                if name.startswith("CLAUDE_CODE_USE_"):
-                    env[name] = env[name].strip().lower()
-            return env
+            # Cloud providers (Bedrock, Vertex, Foundry) and a gateway: refused for every method, before any
+            # variable is read (A2, A8; see PASSTHROUGH_REFUSED). passthrough_env keeps the method rules.
+            raise c.RouteError(c.LAUNCH_REFUSED, PASSTHROUGH_REFUSED)
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
 
     @staticmethod
@@ -174,14 +195,15 @@ class ClaudeCodeAdapter(RouteAdapter):
         The surface reports whether the user's settings carry one (``route.api_key_helper``); this adapter
         never opens the settings. Present, or not reported, is a typed question, not a silent override.
         The user answers with ``route.billing_ack = "api_key_helper"`` (run anyway, billing their API key)
-        or by picking the API-key route.
+        or by picking the API-key route. The question offers that answer in both cases, so it works in both
+        (R3-13 part 1): an acknowledgment given while the state was not reported runs the route too.
         """
         state = route.get("api_key_helper")
         if state is not None and state not in API_KEY_HELPER_STATES:
             raise c.RouteError(c.REQUEST_INVALID, "route.api_key_helper")
         if state == "absent":
             return
-        if state == "present" and route.get("billing_ack") == "api_key_helper":
+        if route.get("billing_ack") == "api_key_helper":
             return
         if state == "present":
             why = ("your Claude Code settings carry an apiKeyHelper, which outranks the sign-in: "

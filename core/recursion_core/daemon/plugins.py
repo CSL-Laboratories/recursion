@@ -91,6 +91,7 @@ from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
                                             PERMISSIONS, PluginLoader, Refused, ReservedEffects, TrustStore,
                                             create_revocation_store)
+from recursion_core.plugin_security.loader import module_entry, plain_modules, type_name
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -161,19 +162,21 @@ def _plain_registry(value):
     nested value must be a ``str``, ``int``, ``float``, ``bool``, ``None``, ``dict`` with ``str`` keys,
     ``list`` or ``tuple`` of exactly those types. A subclass is refused before it is iterated or
     compared, so no plugin code runs after the guard's GIL read (review 2 of #380, both reads' C1;
-    PAGE's ``gui.panels/1`` takes plain data the same way).
+    PAGE's ``gui.panels/1`` takes plain data the same way). Types are compared by identity, never by
+    equality: ``kind in (list, tuple)`` asks the metaclass of ``kind``, plugin code that can say yes
+    for a subclass (review 3 of #380, GPT-6 Astra 1 and GPT-6.1 Sol's required 1).
     """
     def plain(item):
         kind = type(item)
-        if kind in _PLAIN_SCALARS:
+        if any(kind is scalar for scalar in _PLAIN_SCALARS):
             return item
         if kind is dict:
             if any(type(key) is not str for key in item):
                 raise ValueError('registry keys must be plain strings')
             return {key: plain(entry) for key, entry in item.items()}
-        if kind in (list, tuple):
+        if kind is list or kind is tuple:
             return kind(plain(entry) for entry in item)
-        raise ValueError(f'registry value is not plain data: {kind.__name__}')
+        raise ValueError(f'registry value is not plain data: {type_name(item)}')
     return plain(_snapshot(value))
 
 
@@ -199,8 +202,11 @@ def _first_imports(before, own=None):
     A finding, not a control: it reads names. A module named like a standard-library one, an import
     the plugin removes from ``sys.modules`` again, and an import made later inside a call are not
     seen, and an import made by another daemon thread during the load is attributed to this plugin.
+    It runs after the plugin's last guard, so it reads ``sys.modules`` as plain data
+    (``plain_modules``): a name that is not a plain ``str`` is not listed, and nothing a plugin put
+    there is hashed, compared or asked for an attribute (review 3 of #380).
     """
-    fresh = {name for name, module in list(sys.modules.items())
+    fresh = {name for name, module in plain_modules().items()
              if name not in before and module is not None and module is not own
              and name.partition('.')[0] not in sys.stdlib_module_names
              and name.partition('.')[0] not in _HOST_PACKAGES}
@@ -519,7 +525,7 @@ class PluginHost:
                   'findings': []}
         # Loads are serial (load_installed's loop; the loader holds its own lock), so the modules
         # that appear between here and the end of this load were first imported for this plugin.
-        before = set(sys.modules)
+        before = set(plain_modules())
         try:
             if not _owned_directory(source):
                 raise PluginRefused('plugin_directory_untrusted',
@@ -549,7 +555,7 @@ class PluginHost:
             if self._gil.gil_enabled():  # plugin code ran outside a guard: read the GIL as a guard would
                 self.health.poison('gil_enabled_after_plugin_call')
             record['findings'].append(_finding('plugin_attach_failed', 'refuse',
-                                               f'{type(exc).__name__}: nothing this plugin offers is used'))
+                                               f'{type_name(exc)}: nothing this plugin offers is used'))
             record['provides'], offer = [], {}
         # After registry() and bind_core(), which are plugin code too. The plugin stays loaded.
         record['findings'] += self._import_findings(before, loaded.module)
@@ -593,7 +599,7 @@ class PluginHost:
                     pass  # the core was poisoned, or the host shut down, before the call: not called
                 except BaseException as exc:  # noqa: BLE001 - a bad registry costs the plugin its panels, not the daemon
                     record['findings'].append(_finding('plugin_registry_invalid', 'refuse',
-                                                       f'{type(exc).__name__}: panels not registered'))
+                                                       f'{type_name(exc)}: panels not registered'))
                 else:
                     offer['panels'] = snapshot
         handler = self._hook(module, 'operator')
@@ -620,7 +626,7 @@ class PluginHost:
                 except (_CorePoisoned, _HostShutDown):
                     pass  # not called: the check below discards everything this plugin offered
                 except BaseException as exc:  # noqa: BLE001 - SystemExit or KeyboardInterrupt included (_guarded)
-                    record['findings'].append(_finding('plugin_bind_core_failed', 'warn', type(exc).__name__))
+                    record['findings'].append(_finding('plugin_bind_core_failed', 'warn', type_name(exc)))
         if self.health.poisoned:  # by one of this plugin's own calls, or by the sweep meanwhile
             return self._poisoned(record)
         record['provides'] += ([name for key, name in (('panels', 'panels'), ('operator', 'operator_reads'))
@@ -633,9 +639,12 @@ class PluginHost:
 
         ``getattr(module, name, None)`` would call a module-level ``__getattr__`` (PEP 562), plugin code
         whose raise escaped the host (review 1 of #380, DeepSeek F1). A hook is a name the plugin's
-        module defines; reading it runs no plugin code.
+        module defines; reading it runs no plugin code. ``module_entry`` walks the namespace instead
+        of looking the name up, since a lookup compares the name with any key of equal hash, and a
+        key the plugin made can be a ``str`` subclass whose ``__eq__`` is plugin code, run here after
+        the registry guard's GIL read (review 3 of #380).
         """
-        return module.__dict__.get(name)
+        return module_entry(module, name)
 
     def _poisoned(self, record):
         record['findings'].append(_finding('core_poisoned_restart_required', 'refuse',
@@ -655,6 +664,12 @@ class PluginHost:
         included: they cost the plugin, not the daemon (ADV2-4). Nothing the daemon needs for its
         own shutdown is raised there: SIGTERM and SIGINT only set the main loop's stop event
         (``daemon/__main__.py``), as the loader's import step already assumes.
+
+        What the host reads after the call runs no plugin code: an answer is plain data before the
+        GIL is read, and an exception is named with ``type_name`` (review 3 of #380, Sol's
+        required 2). Not ordered by any guard: a finalizer (``__del__``) or weakref callback of a
+        plugin object, which runs whenever the garbage collector or a dropped reference runs it;
+        the sweep's GIL read is what sees those (D2).
         """
         if self._closed:  # a read that waited for its turn across the shutdown (review 2 of #380, C2)
             raise _HostShutDown(SHUT_DOWN)
@@ -747,7 +762,7 @@ class PluginHost:
         if isinstance(outcome, tuple):
             return outcome
         if 'error' in outcome:
-            return 502, {'error': f'unavailable: operator plugin failed: {type(outcome["error"]).__name__}'}
+            return 502, {'error': f'unavailable: operator plugin failed: {type_name(outcome["error"])}'}
         if not isinstance(outcome['body'], dict):
             return 502, {'error': 'unavailable: operator plugin answered a non-object'}
         return 200, outcome['body']

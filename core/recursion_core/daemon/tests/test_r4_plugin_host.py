@@ -27,6 +27,8 @@ from recursion_core.daemon import breaker as daemon_breaker
 from recursion_core.daemon import plugins
 from recursion_core.daemon.tests import plugin_fixture as fx
 from recursion_core.gui.client import o7_command
+from recursion_core.plugin_security import loader
+from recursion_core.plugin_security.loader import LoadedPlugin
 from recursion_core.plugin_security.tests.support import FakeGilProbe
 
 LINUX = sys.platform.startswith('linux')
@@ -411,8 +413,9 @@ class ReviewOneTests(HostCase):
         host.health.poison('gil_enabled_during_daemon_run')
         host.load_installed()  # the loader refuses every load on a poisoned core
         self.assertEqual(self.calls, [])
-        loaded = types.SimpleNamespace(plugin_id='fixture.operator', permissions=EVERYTHING,
-                                       module=types.SimpleNamespace(registry=lambda: self.calls.append('registry')))
+        module = types.ModuleType('fixture_operator')  # a module, as the loader makes (review 3: hooks are read
+        module.registry = lambda: self.calls.append('registry')  # through the module type's own slot)
+        loaded = types.SimpleNamespace(plugin_id='fixture.operator', permissions=EVERYTHING, module=module)
         record = {'provides': [], 'findings': []}
         self.assertEqual(host._attach(loaded, record), {})  # _attach itself, reached directly
         self.assertEqual(self.calls, [])
@@ -844,6 +847,325 @@ class ReviewTwoTests(HostCase):
         first.join(WATCHDOG_S)
         self.assertEqual(second, [None])
         self.assertEqual([r['plugin_id'] for r in host.records], ['fixture.operator'])
+
+
+def _recording_failure():
+    """An exception class whose metaclass records every read of the class's attributes (plugin code)."""
+    class Recording(type):
+        def __getattribute__(cls, name):
+            sys._r4_events.append('plugin code')
+            return super().__getattribute__(name)
+
+    class OrdinaryFailure(Exception, metaclass=Recording):
+        pass
+    return OrdinaryFailure
+
+
+def _equal_to(target):
+    """A metaclass whose classes say they equal ``target`` (plugin code, recorded)."""
+    class Equal(type):
+        def __eq__(cls, other):
+            sys._r4_events.append('plugin code')
+            return other is target
+        __hash__ = type.__hash__
+    return Equal
+
+
+def _pairs(record):
+    return [(f['code'], f['detail']) for f in record['findings']]
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class ReviewThreeTests(HostCase):
+    """The round-3 reads of #380 at 5c7e0ce5 (GPT-6 Astra 1 and its key follow-up; GPT-6.1 Sol 1 and 2).
+
+    The SIMULATED GIL probe records each GIL read and the plugin-defined code records each call, in
+    one list (``sys._r4_events``). No plugin code may follow the last GIL read; the names and scans the
+    host makes after a plugin ran call no plugin code at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.events = []
+        sys._r4_events = self.events
+        self.addCleanup(lambda: delattr(sys, '_r4_events'))
+        known = set(sys.modules)
+        self.addCleanup(lambda: [sys.modules.pop(k, None) for k in list(sys.modules) if k not in known])
+
+    def probe(self):
+        return types.SimpleNamespace(gil_enabled=lambda: self.events.append('gil read') or False)
+
+    def bare(self, permissions=('read', 'panel'), **hooks):
+        """A host that has loaded nothing, and a loaded plugin whose module holds ``hooks``."""
+        host = self.host(load=False, gil_probe=self.probe())
+        module = types.ModuleType('r4_review_three')
+        module.__dict__.update(hooks)
+        return host, LoadedPlugin('fixture.operator', '0' * 64, 'unsigned', None, 'unlisted', permissions,
+                                  module, (), '0' * 64)
+
+    def attach(self, **hooks):
+        host, loaded = self.bare(**hooks)
+        record = {'findings': [], 'provides': []}
+        return host._attach(loaded, record), record
+
+    def assert_nothing_after_the_last_gil_read(self):
+        calls = [i for i, event in enumerate(self.events) if event == 'plugin code']
+        reads = [i for i, event in enumerate(self.events) if event == 'gil read']
+        self.assertTrue(reads, 'the GIL was never read')
+        self.assertFalse(calls and max(calls) > max(reads), f'plugin code after the last GIL read: {self.events}')
+
+    def test_a_metaclass_equality_admits_no_str_subclass(self):  # Astra 1, Sol 1
+        events = self.events
+
+        class Title(str, metaclass=_equal_to(str)):
+            def strip(self, *args):
+                events.append('plugin code')
+                return str.strip(self, *args)
+        offer, record = self.attach(registry=lambda: {'panels': [{'id': 'meta.panel', 'title': Title('T'),
+                                                                  'reads': [READ]}]})
+        self.assertEqual(offer, {})
+        self.assertIn(('plugin_registry_invalid', 'ValueError: panels not registered'), _pairs(record))
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_metaclass_equality_admits_no_list_subclass(self):  # Astra 1, Sol 1
+        events = self.events
+
+        class Reads(list, metaclass=_equal_to(list)):
+            def __iter__(self):
+                events.append('plugin code')
+                return list.__iter__(self)
+        offer, record = self.attach(registry=lambda: {'panels': [{'id': 'meta.panel', 'title': 'T',
+                                                                  'reads': Reads([READ])}]})
+        self.assertEqual(offer, {})
+        self.assertIn('plugin_registry_invalid', codes(record))
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_loaded_plugin_with_a_metaclass_title_publishes_no_panel(self):  # Sol 1, through the loader
+        source = (b'import sys\nclass Equal(type):\n    def __eq__(cls, other):\n'
+                  b'        sys._r4_events.append("plugin code")\n        return other is str\n'
+                  b'    __hash__ = type.__hash__\n'
+                  b'class Title(str, metaclass=Equal):\n    def strip(self, *args):\n'
+                  b'        sys._r4_events.append("plugin code")\n        return str.strip(self, *args)\n'
+                  b'def registry():\n    return {"panels": [{"id": "meta.panel", "title": Title("T"), '
+                  b'"reads": ["operator.positions.inspect"]}]}\n')
+        self.install(('a', source, 'fixture.operator', ('read', 'panel')))
+        host = self.host(gil_probe=self.probe())
+        self.assertEqual(host.records[0]['state'], 'loaded')
+        self.assertEqual(host.registries, ())
+        self.assertIn('plugin_registry_invalid', codes(host.records[0]))
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_str_subclass_key_is_refused_and_never_hashed(self):  # Astra's and Sol's key follow-up
+        events = self.events
+
+        class Key(str):
+            def __hash__(self):
+                events.append('plugin code')
+                return str.__hash__(self)
+        panel = {Key('id'): 'key.panel', 'title': 'T', 'reads': [READ]}
+        self.events.clear()  # building the panel above hashed the key once, in the test itself
+        offer, record = self.attach(registry=lambda: {'panels': [panel]})
+        self.assertEqual(offer, {})
+        self.assertIn('plugin_registry_invalid', codes(record))
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_registry_failure_is_named_without_plugin_code(self):  # Sol 2, registry()
+        failure = _recording_failure()
+
+        def panels():
+            raise failure('conversion')
+            yield
+        offer, record = self.attach(registry=lambda: {'panels': panels()})
+        self.assertEqual(offer, {})
+        self.assertIn(('plugin_registry_invalid', 'OrdinaryFailure: panels not registered'), _pairs(record))
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_bind_core_failure_is_named_without_plugin_code(self):  # Sol 2, bind_core()
+        failure = _recording_failure()
+
+        def bind_core(core):
+            raise failure('binding')
+        host, loaded = self.bare(permissions=('order',), bind_core=bind_core)
+        host.loader, host.core = mock.Mock(), mock.Mock()
+        host.loader.permissions.return_value = ('order',)
+        record = {'findings': [], 'provides': []}
+        host._attach(loaded, record)
+        self.assertIn(('plugin_bind_core_failed', 'OrdinaryFailure'), _pairs(record))
+        self.assertNotIn('plugin code', self.events)
+        self.assert_nothing_after_the_last_gil_read()
+
+    def test_a_failed_read_is_named_without_plugin_code(self):  # Sol 2, operator()
+        failure = _recording_failure()
+
+        class Answer(dict):
+            def items(self):
+                raise failure('conversion')
+        host = self.host(load=False, gil_probe=self.probe())
+        host.loader = mock.Mock()
+        host.loader.permissions.return_value = ('read',)
+        host._operators = {'fixture.operator': lambda command: Answer(result={})}
+        self.assertEqual(self.read(host), (502, {'error': 'unavailable: operator plugin failed: OrdinaryFailure'}))
+        self.assertNotIn('plugin code', self.events)
+
+    def test_an_attach_failure_is_named_without_plugin_code(self):  # Sol 2, "the outer attachment diagnostics"
+        failure = _recording_failure()
+
+        def attach(host, loaded, record):
+            raise failure('attach')
+        self.install(('a', b'VALUE = 1\n', 'fixture.operator', ('read',)))
+        with mock.patch.object(plugins.PluginHost, '_attach', new=attach):
+            host = self.host(gil_probe=self.probe())
+        self.assertIn(('plugin_attach_failed', 'OrdinaryFailure: nothing this plugin offers is used'),
+                      _pairs(host.records[0]))
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_type_name_is_a_plain_str_copied_without_plugin_code(self):  # Sol 2: a name can be a str subclass
+        events = self.events
+
+        class Name(str):
+            def __format__(self, spec):
+                events.append('plugin code')
+                return str.__format__(self, spec)
+
+            def __str__(self):
+                events.append('plugin code')
+                return str.__str__(self)
+
+        class Failure(Exception):
+            pass
+        Failure.__name__ = Name('Renamed')
+        name = loader.type_name(Failure('x'))
+        self.assertIs(type(name), str)
+        self.assertEqual(f'{name}: detail', 'Renamed: detail')
+        self.assertNotIn('plugin code', self.events)
+
+    def test_an_import_failure_is_named_without_plugin_code_after_the_gil_read(self):  # Sol 2, the loader's import
+        source = (b'import sys\nclass Recording(type):\n    def __getattribute__(cls, name):\n'
+                  b'        sys._r4_events.append("plugin code")\n        return super().__getattribute__(name)\n'
+                  b'class OrdinaryFailure(Exception, metaclass=Recording):\n    pass\n'
+                  b'raise OrdinaryFailure("import")\n')
+        self.install(('a', source, 'fixture.operator', ('read',)))
+        host = self.host(gil_probe=self.probe())
+        record = host.records[0]
+        self.assertEqual((record['state'], record['code'], record['detail']),
+                         ('refused', 'plugin_import_failed', 'OrdinaryFailure'))
+        self.assert_nothing_after_the_last_gil_read()
+
+    def test_an_odd_sys_modules_entry_neither_runs_nor_skips_the_gil_read(self):  # found probing Sol 2
+        source = (b'import sys\nclass Odd:\n    def __getattribute__(self, name):\n'
+                  b'        sys._r4_events.append("plugin code")\n        raise RuntimeError("odd")\n'
+                  b'sys.modules["r4_odd_entry"] = Odd()\n'
+                  b'import types\nodd_file = types.ModuleType("r4_odd_file")\nodd_file.__file__ = 5\n'
+                  b'sys.modules["r4_odd_file"] = odd_file\n'
+                  b'def operator(command):\n    return {"status_code": "ok", "result": {}}\n')
+        self.install(('a', source, 'fixture.operator', ('read',)))
+        host = self.host(gil_probe=self.probe())
+        record = host.records[0]
+        self.assertEqual((record['state'], record['provides']), ('loaded', ['operator_reads']))
+        self.assertIn((plugins.UNVERIFIED_IMPORTS, 'r4_odd_entry,r4_odd_file'), _pairs(record))
+        self.assertIn('gil read', self.events)
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_str_subclass_name_in_sys_modules_runs_no_plugin_code_after_the_gil_read(self):  # found probing
+        # The name hashes like "sys", so any set or dict holding both compares them: set(sys.modules)
+        # reuses stored hashes and calls nothing for a name that collides with no other.
+        source = (b'import sys\nclass Name(str):\n    def __hash__(self):\n'
+                  b'        sys._r4_events.append("plugin code")\n        return hash("sys")\n'
+                  b'    def __eq__(self, other):\n        sys._r4_events.append("plugin code")\n'
+                  b'        return str.__eq__(self, other)\n'
+                  b'    def partition(self, sep):\n        sys._r4_events.append("plugin code")\n'
+                  b'        return str.partition(self, sep)\n'
+                  b'sys.modules[Name("r4_named_entry")] = sys\n'
+                  b'def operator(command):\n    return {"status_code": "ok", "result": {}}\n')
+        # Plugin b loads after a: the scans around b's import must not touch a's name either.
+        self.install(('a', source, 'fixture.operator', ('read',)), ('b', b'VALUE = 1\n', 'fixture.other', ('read',)))
+        host = self.host(gil_probe=self.probe())
+        self.assertEqual([r['state'] for r in host.records], ['loaded', 'loaded'])
+        self.assertNotIn(plugins.UNVERIFIED_IMPORTS, codes(host.records[0]))  # the name is not a plain str: not read
+        calls = [i for i, event in enumerate(self.events) if event == 'plugin code']
+        reads = [i for i, event in enumerate(self.events) if event == 'gil read']
+        self.assertTrue(calls and len(reads) == 2, self.events)
+        self.assertLess(max(calls), min(reads), f'plugin code after plugin a\'s own GIL read: {self.events}')
+
+    def test_a_hook_is_read_without_comparing_the_plugins_keys(self):  # found probing: _hook after the guard
+        events = self.events
+
+        class Name(str):
+            def __hash__(self):
+                return hash('operator')
+
+            def __eq__(self, other):
+                events.append('plugin code')
+                return False
+        host, loaded = self.bare()
+        loaded.module.__dict__[Name('decoy')] = None  # a key of the same hash as "operator", before it
+        loaded.module.registry = lambda: {'panels': [{'id': 'hook.panel', 'title': 'T', 'reads': [READ]}]}
+        loaded.module.operator = lambda command: {'status_code': 'ok', 'result': {}}
+        self.events.clear()  # setting "operator" above compared it with the decoy once, in the test itself
+        record = {'findings': [], 'provides': []}
+        offer = host._attach(loaded, record)
+        self.assertEqual(sorted(offer), ['operator', 'panels'])
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_module_entry_is_read_through_the_module_slot(self):  # found probing: a module class changed
+        events = self.events
+
+        class Module(types.ModuleType):
+            def __getattribute__(self, name):
+                events.append('plugin code')
+                return super().__getattribute__(name)
+        module = types.ModuleType('r4_changed_class')
+        module.operator = len
+        module.__class__ = Module
+        self.events.clear()
+        self.assertIs(loader.module_entry(module, 'operator'), len)
+        self.assertNotIn('plugin code', self.events)
+
+    def test_a_read_after_shutdown_answers_at_once_without_queueing(self):  # DeepSeek F3's early check
+        # Round 2's dispatch check gives the same answer, so only this tells the early check is there:
+        # without it a read after shutdown waits for its turn behind a read still in the plugin.
+        entered, release = threading.Event(), threading.Event()
+        sys._r4_read = (entered, release)
+        self.addCleanup(lambda: delattr(sys, '_r4_read'))
+        self.addCleanup(release.set)
+        source = (b'import sys\ndef operator(command):\n    entered, release = sys._r4_read\n    entered.set()\n'
+                  b'    release.wait(%d)\n    return {"status_code": "ok", "result": {}}\n' % int(WATCHDOG_S))
+        self.install(('one', source, 'fixture.operator', ('read',)))
+        host = self.host(operator_deadline_s=WATCHDOG_S, operator_turn_wait_s=WATCHDOG_S)
+        first = threading.Thread(target=lambda: self.read(host))
+        first.start()
+        self.addCleanup(lambda: (release.set(), first.join(WATCHDOG_S)))
+        self.assertTrue(entered.wait(WATCHDOG_S))  # a read is in the plugin: the next one would queue for its turn
+        host.close()
+        queued = []
+        host._turn.wait_for = lambda *args, **kwargs: queued.append(1) or False  # never waits, only records
+        self.assertEqual(self.read(host), (503, {'error': plugins.SHUT_DOWN}))
+        self.assertEqual(queued, [], 'a read after shutdown queued for its turn')
+
+    def test_the_gil_is_read_even_if_the_extension_scan_fails(self):  # the loader's GIL read is in a finally
+        source = b'import sys, types\nsys.modules["r4_fresh_entry"] = types.ModuleType("r4_fresh_entry")\n'
+        self.install(('a', source, 'fixture.operator', ('read',)))
+        host = self.host(load=False, gil_probe=self.probe())
+        with mock.patch.object(loader, '_module_file', side_effect=RuntimeError('scan')):
+            with self.assertRaises(RuntimeError):  # a fault of the host's own, injected: it is not hidden
+                host.load_installed()
+        self.assertEqual(self.events, ['gil read'])
+
+    def test_a_namespace_changing_while_it_is_scanned_costs_only_the_finding(self):
+        source = (b'import sys, types\nsys.modules["r4_fresh_entry"] = types.ModuleType("r4_fresh_entry")\n'
+                  b'def operator(command):\n    return {"status_code": "ok", "result": {}}\n')
+        self.install(('a', source, 'fixture.operator', ('read',)))
+        with mock.patch.object(loader, 'module_entry', side_effect=RuntimeError('changed meanwhile')):
+            host = self.host(gil_probe=self.probe())
+        self.assertEqual((host.records[0]['state'], host.records[0]['provides']), ('loaded', ['operator_reads']))
+
+    def test_sys_modules_is_read_again_while_other_threads_import(self):
+        with mock.patch.object(loader, 'plain_items', side_effect=[RuntimeError(), RuntimeError(), [('a', 1)]]):
+            self.assertEqual(loader.plain_modules(), {'a': 1})
+        with mock.patch.object(loader, 'plain_items', side_effect=RuntimeError()):
+            self.assertEqual(loader.plain_modules(), {})
+        with mock.patch.object(loader, 'sys', types.SimpleNamespace(modules=object())):
+            self.assertEqual(loader.plain_modules(), {})
 
 
 def _run_catching(call):

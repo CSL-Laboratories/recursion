@@ -15,7 +15,10 @@ Stages, each reporting findings the developer sees (Q16 accept item 2):
 * ``stage``: the artifact compiles.
 * ``active``: the artifact runs in the daemon's process. After *every* load, including
   one that raised, the loader reads ``sys._is_gil_enabled()``; if the GIL is on, the
-  core is poisoned and refuses every later load and every effect until restart.
+  core is poisoned and refuses every later load and every effect until restart. What the
+  loader reads around that GIL read (the new entries of ``sys.modules``, the name of the
+  exception the import raised) it reads as plain data, so none of it runs plugin code or
+  raises past the GIL read (``type_name``, ``plain_modules``).
 
 What runs before a grant is checked: only the host's own code. The manifest bytes are
 parsed as canonical JSON, the artifact's SHA-256 is compared with the manifest, the
@@ -56,6 +59,73 @@ __all__ = ["CoreHealth", "LoadedPlugin", "NOT_GRANTED", "PluginLoader"]
 
 # The typed refusal of a plugin left with no effective permission (R4 finding 7, PLUGIN-HOST PR 1).
 NOT_GRANTED = "plugin_not_granted"
+
+# Reading what a plugin left behind without running its code (review 3 of #380, GPT-6.1 Sol's
+# required 2). Around and after a GIL read the host names a plugin's exception, scans
+# ``sys.modules`` and reads the plugin module's hooks. Done the ordinary way, each can call code the
+# plugin defined: a metaclass's ``__getattribute__``, a ``str`` subclass's ``__hash__``, ``__eq__``
+# or ``__format__``, an object's ``__getattr__``. These read the interpreter's own slots and walk
+# dictionaries' tables instead, so they call none of it and raise nothing a plugin chose.
+_CLASS_NAME = type.__dict__["__name__"].__get__               # a type's own name slot
+_MODULE_DICT = types.ModuleType.__dict__["__dict__"].__get__  # a module's own namespace dict
+
+
+def type_name(value) -> str:
+    """The name of ``value``'s class, as a plain ``str``, read without running plugin code.
+
+    ``type(value).__name__`` goes through the class's metaclass, and a class's name can be a
+    ``str`` subclass whose formatting is plugin code: this reads the slot and copies the text.
+    """
+    return "".join((_CLASS_NAME(type(value)),))
+
+
+def plain_items(mapping) -> list:
+    """The ``(key, value)`` pairs of a dict whose key is a plain ``str``, read without running plugin code.
+
+    Walks the dict's own table (``dict.items``), so no key is hashed or compared and a dict
+    subclass's ``items`` is not called. ``TypeError`` if ``mapping`` is not a dict; ``RuntimeError``
+    if another thread resizes it meanwhile.
+    """
+    return [(key, value) for key, value in list(dict.items(mapping)) if type(key) is str]
+
+
+def plain_modules() -> dict:
+    """``sys.modules`` as ``{name: module}`` for its plain-``str`` names, read without running plugin code.
+
+    Empty if ``sys.modules`` is not a dict, or if other threads kept importing through three reads.
+    """
+    for _ in range(3):
+        try:
+            return dict(plain_items(sys.modules))
+        except RuntimeError:  # another thread imported meanwhile: read again
+            continue
+        except TypeError:  # sys.modules was rebound to something that is not a dict
+            return {}
+    return {}
+
+
+def module_entry(module, name: str):
+    """``module.__dict__[name]`` for a plain-``str`` key, else ``None``, read without running plugin code.
+
+    Read through the module type's own slot, so a module whose ``__class__`` was changed to a
+    subclass is read the same way. ``TypeError`` if ``module`` is not a module.
+    """
+    for key, value in plain_items(_MODULE_DICT(module)):
+        if key == name:
+            return value
+    return None
+
+
+def _module_file(module) -> str:
+    """A module's ``__file__`` if it is a plain ``str``, else ``""``; never raises for what a plugin put there."""
+    if not issubclass(type(module), types.ModuleType):
+        return ""
+    try:
+        origin = module_entry(module, "__file__")
+    except RuntimeError:  # the module's namespace changed while it was read
+        return ""
+    return origin if type(origin) is str else ""
+
 
 class CoreHealth:
     """Shared poison flag. Once poisoned, only a daemon restart clears it."""
@@ -253,7 +323,7 @@ class PluginLoader:
 
     def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
                   developer: str, generation: int | None) -> LoadedPlugin:
-        before = set(sys.modules)
+        before = set(plain_modules())
         module = types.ModuleType("csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_"))
         failure: BaseException | None = None
         try:
@@ -261,19 +331,24 @@ class PluginLoader:
         except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
             failure = exc
         finally:
-            for name in sorted(set(sys.modules) - before):
-                origin = getattr(sys.modules.get(name), "__file__", None) or ""
-                if origin.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
-                    findings.append(_finding("active", "extension_module_loaded", "warn", name))
-            with self._lock:
-                gil_on = self._gil_gate(manifest.plugin_id, findings)
-                self.last_findings = tuple(findings)
+            try:
+                # Plain data only: nothing a plugin put in sys.modules runs here, and nothing raised
+                # here skips the GIL read below (review 3 of #380: an object in sys.modules whose
+                # __getattr__ raised ended the load here, with the GIL never read).
+                fresh = plain_modules()
+                for name in sorted(set(fresh) - before):
+                    if _module_file(fresh[name]).endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
+                        findings.append(_finding("active", "extension_module_loaded", "warn", name))
+            finally:
+                with self._lock:
+                    gil_on = self._gil_gate(manifest.plugin_id, findings)
+                    self.last_findings = tuple(findings)
         if gil_on:
             raise Refused("core_poisoned_gil_enabled", manifest.plugin_id) from failure
         if failure is not None:
-            findings.append(_finding("active", "plugin_import_failed", "refuse", type(failure).__name__))
+            findings.append(_finding("active", "plugin_import_failed", "refuse", type_name(failure)))
             self.last_findings = tuple(findings)
-            raise Refused("plugin_import_failed", type(failure).__name__) from None
+            raise Refused("plugin_import_failed", type_name(failure)) from None
         with self._lock:
             if "order" in perms and self._trust.generation(developer) != generation:
                 # revoke_key ran while this plugin was importing: the same rule as for an active plugin.

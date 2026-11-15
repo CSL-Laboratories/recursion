@@ -736,6 +736,89 @@ class WorkflowScanTests(TreeCase):
                          [["echo", "a\nb\t\\c"]])
 
 
+    # Round-5 reads (GPT-6 Astra changes 1-3): the supplied cases, as written.
+    def test_eval_option_terminator_does_not_mask_source(self) -> None:
+        self.tree.write('inert-fixture.sh', "printf '%s\\n' review_marker\n")
+        for script in ("eval -- 'source ./inert-fixture.sh'",
+                       "builtin -- eval -- '. ./inert-fixture.sh'",
+                       "eval -- \"eval -- 'source ./inert-fixture.sh'\""):
+            with self.subTest(script=script):
+                self.add_workflow('|\n          ' + script)
+                self.assertTrue(self.tree.problems(), "eval -- must be decoded or explicitly refused")
+
+    def test_shell_names_in_arguments_and_queries_are_not_executed(self) -> None:
+        for script in ('echo bash', "printf '%s\\n' sh", 'command -v bash', 'command -V sh'):
+            with self.subTest(script=script):
+                self.add_workflow('|\n          ' + script)
+                self.assertEqual(self.tree.problems(), [])
+
+    def test_surrogate_ansi_escape_is_refused(self) -> None:
+        for value in (r'\ud800', r'\udfff', r'\U0000D801'):
+            with self.subTest(value=value):
+                with self.assertRaises(hl.LockError):
+                    hl.shell_commands("echo $'" + value + "'")
+
+    def test_control_question_mark_is_del(self) -> None:
+        commands = hl.shell_commands(r"echo $'\c?'")
+        self.assertEqual([[w.text for w in c] for c in commands], [['echo', chr(0x7F)]])
+
+    def test_source_with_command_path_option_is_refused(self) -> None:
+        for name in ('source', '.'):
+            with self.subTest(name=name):
+                self.add_workflow(f'command -p -- {name} ./inert-fixture.sh')
+                self.assertProblem(r"runs a file's text as the script")
+
+    # Round-5 reads (GPT-6.1 Sol changes 1-2): the supplied cases, as written.
+    def test_shell_arguments_and_command_queries_are_not_invocations(self) -> None:
+        for script in ("echo bash", "printf '%s\\n' bash", "command -v bash",
+                       "command -V bash", "command -v source"):
+            with self.subTest(script=script):
+                self.add_workflow("|\n          " + script)
+                self.assertEqual(self.tree.problems(), [])
+
+    def test_unquoted_heredoc_backslash_and_dollar_are_decoded(self) -> None:
+        script = "cat <<EOF\n" + r"\\ \$VALUE" + "\nEOF"
+        commands = hl.shell_commands(script)
+        self.assertEqual([[w.text for w in words] for words in commands],
+                         [["cat", "\\ $VALUE"]])
+        self.add_workflow("|\n          bash <<EOF\n          " + r"p\\ip install -r requirements-dev.txt" + "\n          EOF")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_ansi_c_surrogate_escapes_are_refused(self) -> None:
+        for script in (r"echo $'\ud800'", r"echo $'\U0000DFFF'"):
+            with self.subTest(script=script):
+                with self.assertRaisesRegex(hl.LockError, "which is no character"):
+                    hl.shell_commands(script)
+
+    # Round 5, mine: a shell is found at the command position through every wrapper the check
+    # knows, each with its own options; a lookup or a plain argument runs nothing.
+    def test_shells_run_through_wrappers_are_read(self) -> None:
+        script = "p\"i\"p install -r requirements-dev.txt"
+        for prefix in ("nice -n 5", "timeout -s KILL 5", "exec -a name", "env -u bash -i", "env X=1",
+                       "sudo -u nobody -E", "doas -u nobody", "xargs -0 -n 1", "time -p", "command -p",
+                       "builtin -- command", "stdbuf -oL", "nohup", "setsid -w", "SUDO=/usr/bin/sudo; \"$SUDO\""):
+            for shell in ("bash -c", "bash +c", "sh -ec"):
+                with self.subTest(prefix=prefix, shell=shell):
+                    self.add_workflow(f"|\n          {prefix} {shell} '{script}'")
+                    self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+        self.add_workflow(f"|\n          eval -- '{script}'")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_lookups_and_arguments_run_nothing(self) -> None:
+        for script in ("type bash", "which sh", "command -pv bash", "command -V source", "env -u bash true",
+                       "echo source ./steps.sh", "printf '%s\\n' eval bash", "nice -n 5 echo bash",
+                       'X=echo; "$X" bash'):
+            with self.subTest(script=script):
+                self.add_workflow("|\n          " + script)
+                self.assertEqual(self.tree.problems(), [])
+
+    def test_env_split_string_is_refused(self) -> None:
+        for script in ("env -S 'bash -c true'", "env -iS 'sh -c true'", "env --split-string='bash -c true'"):
+            with self.subTest(script=script):
+                self.add_workflow("|\n          " + script)
+                self.assertProblem(r"env -S, whose string becomes the command")
+
+
 class YamlReadingTests(unittest.TestCase):
     """The values the reader decodes. Each expected value is PyYAML 6.0.1's reading of the same
     text (BaseLoader), taken once; the check itself stays stdlib only. A flow list is kept as

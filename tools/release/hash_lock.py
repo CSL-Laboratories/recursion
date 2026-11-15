@@ -473,8 +473,9 @@ class Install:
 # whose values are known only at run time. A command that runs an installer program, or
 # whose words hold installer text, must be a pip install of hash-locked files, in a job this
 # check found, in a bash step. The scripts a command gives to `eval` or to a shell (`-c`, a
-# here-document or here-string) are read the same way, after the `command` and `builtin`
-# prefixes. A `$NAME` expansion is tried with every literal value the script or the job's
+# here-document or here-string) are read the same way, the command found at its command
+# position: after assignments, reserved words and the wrappers in WRAPPERS (`command -v` looks a
+# command up and runs nothing). A `$NAME` expansion is tried with every literal value the script or the job's
 # `env:` gives it; an expansion it cannot resolve before an installer verb, a script for
 # `eval` or a shell built at run time, a shell reading its script from a pipe, and `source`
 # or `.` of any file are problems. What the shell computes at run time beyond that (text
@@ -747,7 +748,7 @@ ANSI_C = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", 
 GLOB_OR_BRACE = re.compile(r"[*?]|\[[^\]]+\]|\{[^{}]*(?:,|\.\.)[^{}]*\}")
 GITHUB_EXPRESSION = re.compile(r"\$\{\{.*?\}\}", re.S)
 RESERVED_WORDS = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for",
-                  "in", "case", "esac", "select", "function", "time", "coproc", "[[", "]]"}
+                  "in", "case", "esac", "select", "function", "coproc", "[[", "]]"}
 
 
 class _Bash:
@@ -1070,72 +1071,121 @@ SHELLS = {"bash", "sh", "dash", "zsh", "ksh", "mksh", "ash"}
 NESTING = 8
 
 
-def _named(words: list[Word]) -> tuple[list[Word], int | None]:
-    """A command's words other than its standard input, and where its own name is among them:
-    after assignments, reserved words and the `command` and `builtin` prefixes (with their
-    options and `--`), which run the builtin named after them."""
+# Builtins and programs that run the command named after their own options: (the options that
+# take the next word as their value, the words they read between their options and that command).
+WRAPPERS = {
+    "builtin": (set(), 0),
+    "command": (set(), 0),
+    "doas": ({"-u", "-C"}, 0),
+    "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
+    "exec": ({"-a"}, 0),
+    "nice": ({"-n", "--adjustment"}, 0),
+    "nohup": (set(), 0),
+    "setsid": (set(), 0),
+    "stdbuf": ({"-i", "--input", "-o", "--output", "-e", "--error"}, 0),
+    "sudo": ({"-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p",
+              "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user"}, 0),
+    "time": ({"-f", "--format", "-o", "--output"}, 0),
+    "timeout": ({"-k", "--kill-after", "-s", "--signal"}, 1),
+    "xargs": ({"-a", "--arg-file", "-d", "--delimiter", "-E", "-e", "--eof", "-I", "--replace", "-L",
+               "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+               "--process-slot-var"}, 0),
+}
+
+
+def _named(words: list[Word]) -> tuple[list[Word], int | None, bool]:
+    """A command's words other than its standard input; where the command it runs is named
+    among them (after assignments, reserved words and the WRAPPERS with their options), or None
+    when nothing runs there (no command, or `command -v`/`-V`, which looks a command up); and
+    whether that is certain. It is not when a word holding an expansion stands where a wrapper
+    could (`"$SUDO" bash -c ...`) and a shell's name follows it."""
     args = [w for w in words if not w.stdin]
     index = 0
     while index < len(args):
         text = args[index].text
         if ASSIGNMENT.match(text) or text in RESERVED_WORDS:
             index += 1
-        elif text in ("command", "builtin"):
-            index += 1
-            while index < len(args) and (args[index].text == "--"
-                                         or (text == "command" and re.fullmatch(r"-[pvV]+", args[index].text))):
+            continue
+        if args[index].dynamic:
+            following = args[index + 1].text if index + 1 < len(args) else ""
+            if Path(following).name in SHELLS:
+                return args, index + 1, False
+            return args, index, True
+        name = Path(text).name
+        if name not in WRAPPERS:
+            return args, index, True
+        takes_value, positional = WRAPPERS[name]
+        index += 1
+        while index < len(args):
+            option = args[index].text
+            if option == "--":
                 index += 1
-        else:
-            return args, index
-    return args, None
+                break
+            if option in takes_value:
+                index += 2
+            elif len(option) > 1 and option.startswith("-"):
+                short = not option.startswith("--")
+                if name == "command" and short and re.search(r"[vV]", option):
+                    return args, None, True  # a lookup: nothing runs
+                if name == "env" and ((short and "S" in option) or option.startswith("--split-string")):
+                    raise LockError("env -S, whose string becomes the command, which this check does not read")
+                index += 1
+            else:
+                break
+        index += positional  # timeout's duration
+    return args, None, True
 
 
 def _nested_scripts(words: list[Word]) -> list[str]:
-    """The scripts a command runs as bash: an `eval`'s words, a shell's `-c` argument, or the
-    here-document or here-string a shell reads. `source` and `.`, a script built at run time,
-    and a shell reading its script from a pipe are refused; a script file is not read."""
-    args, index = _named(words)
+    """The scripts a command runs as bash: an `eval`'s words, a shell's `-c` (or `+c`) argument,
+    or the here-document or here-string a shell reads, the command found at its command
+    position. `source` and `.`, a script built at run time, and a shell reading its script from
+    a pipe are refused; a script file is not read."""
+    args, index, certain = _named(words)
     if index is None:
         return []
     name = args[index].text
     if name in ("source", "."):
         raise LockError(f"{name} runs a file's text as the script, which this check does not read")
     if name == "eval":
-        if any(w.dynamic for w in args[index + 1:]):
+        rest = args[index + 1:]
+        if rest and rest[0].text == "--":
+            rest = rest[1:]  # eval's own end of options
+        if any(w.dynamic for w in rest):
             raise LockError("eval of text built at run time, which this check does not read")
-        return [" ".join(w.text for w in args[index + 1:])]
+        return [" ".join(w.text for w in rest)]
+    shell = Path(name).name
+    if shell not in SHELLS:
+        return []
     stdin = [w for w in words if w.stdin]
-    for at, word in enumerate(args):
-        shell = Path(word.text).name
-        if shell not in SHELLS:
-            continue
-        k, from_option, from_stdin = at + 1, False, False
-        while k < len(args):
-            text = args[k].text
-            if text in ("--", "-"):
-                k += 1
-                break
-            if text in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
-                k += 2
-            elif len(text) > 1 and text[0] in "-+":
-                if text[0] == "-" and not text.startswith("--"):
-                    from_option |= "c" in text[1:]
-                    from_stdin |= "s" in text[1:]
-                k += 1
-            else:
-                break
-        if from_option:
-            if k >= len(args) or args[k].dynamic:
-                raise LockError(f"{shell} of text built at run time, which this check does not read")
-            return [args[k].text]
-        if k < len(args) and not from_stdin:
-            return []  # a script file (`bash x.sh`, `bash <(curl ...)`): not read, as the pull request says
-        if not stdin:
-            raise LockError(f"{shell} reading its script from a pipe or a file, which this check does not read")
-        if any(w.dynamic for w in stdin):
+    k, from_option, from_stdin = index + 1, False, False
+    while k < len(args):
+        text = args[k].text
+        if text in ("--", "-"):
+            k += 1
+            break
+        if text in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            k += 2
+        elif len(text) > 1 and text[0] in "-+":
+            if not text.startswith("--"):
+                from_option |= "c" in text[1:]  # bash runs the string after `+c` too
+                from_stdin |= "s" in text[1:]
+            k += 1
+        else:
+            break
+    if from_option:
+        if k >= len(args) or args[k].dynamic:
             raise LockError(f"{shell} of text built at run time, which this check does not read")
-        return [w.text for w in stdin]
-    return []
+        return [args[k].text]
+    if k < len(args) and not from_stdin:
+        return []  # a script file (`bash x.sh`, `bash <(curl ...)`): not read, as the pull request says
+    if not stdin:
+        if not certain:
+            return []
+        raise LockError(f"{shell} reading its script from a pipe or a file, which this check does not read")
+    if any(w.dynamic for w in stdin):
+        raise LockError(f"{shell} of text built at run time, which this check does not read")
+    return [w.text for w in stdin]
 
 
 def script_commands(script: str) -> list[list[Word]]:

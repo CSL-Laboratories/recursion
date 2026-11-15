@@ -490,17 +490,18 @@ class EventStore:
         """The database file: made here, 0600, with its directory synced; or one that exists, that is a regular
         file of this user, not a link, and open to nobody else, and so are the WAL and shared-memory files
         beside it if they exist (SQLite gives those the database file's mode). A file open to others is
-        refused, never quietly narrowed: what it held may already have been read."""
+        refused, never quietly narrowed: what it held may already have been read. The sidecars are checked
+        first, whether the database file exists or is about to be made: SQLite would open either."""
+        for suffix in ('-wal', '-shm'):
+            try:
+                info = os.lstat(path + suffix)
+            except FileNotFoundError:
+                continue
+            EventStore._private(info, 'store_sidecar')
         try:
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         except FileExistsError:
             EventStore._private(os.lstat(path), 'store_path')
-            for suffix in ('-wal', '-shm'):
-                try:
-                    info = os.lstat(path + suffix)
-                except FileNotFoundError:
-                    continue
-                EventStore._private(info, 'store_sidecar')
             return
         os.close(fd)
         folder = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | os.O_DIRECTORY)
@@ -798,46 +799,21 @@ class EventStore:
                 raise StoreError('declaration_changed')
             return frozenset(json.loads(rows[0][2]))
         taken = {name for (name,) in self._query("SELECT name FROM sqlite_master")}
-        created: set = set()
-        indexes: set = set()
-
-        prefix = lane + '_'
-        misnamed: list = []
-
-        # A temporary table and an attached file are other action codes, refused by the default below; a name
-        # that exists (the helper's tables among them) is refused here, so CREATE TABLE IF NOT EXISTS cannot
-        # pass quietly; a name beginning sqlite_ SQLite refuses itself. Every table is named <lane>_<name> (the
-        # Liaison's ruling of Nov 14, 4:03 PM, on lane EVENTS' question 1).
-        def declaration_only(action, first, second, database, source) -> int:
-            if action == sqlite3.SQLITE_CREATE_TABLE:
-                if first in taken:
-                    return sqlite3.SQLITE_DENY
-                if not first.startswith(prefix) or first == prefix:
-                    misnamed.append(first)
-                    return sqlite3.SQLITE_DENY
-                created.add(first)
-                return sqlite3.SQLITE_OK
-            if action == sqlite3.SQLITE_CREATE_INDEX:
-                indexes.add(first)          # only on a table of its own: indexing READs the table, refused below
-                return sqlite3.SQLITE_OK
-            if action == sqlite3.SQLITE_REINDEX:          # what creating an index asks for, of that same index
-                return sqlite3.SQLITE_OK if first in indexes else sqlite3.SQLITE_DENY
-            if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE) and first in ('sqlite_master', 'sqlite_schema'):
-                return sqlite3.SQLITE_OK                   # what a CREATE writes, and nothing a statement can name
-            if action == sqlite3.SQLITE_READ and (first in created or first in ('sqlite_master', 'sqlite_schema')):
-                return sqlite3.SQLITE_OK
-            if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
-                return sqlite3.SQLITE_OK
-            return sqlite3.SQLITE_DENY
-
+        rules = _DeclarationRules(taken, lane + '_')
         self._statement('BEGIN IMMEDIATE')
         try:
-            conn.set_authorizer(declaration_only)
-            try:
-                for statement in _statements(ddl):
+            for statement in _statements(ddl):
+                if not _has_sql(statement):
+                    continue                    # a comment or blank text after the last statement
+                (before,), = conn.execute('SELECT count(*) FROM sqlite_master').fetchall()
+                conn.set_authorizer(rules)
+                try:
                     conn.execute(statement)
-            finally:
-                conn.set_authorizer(None)
+                finally:
+                    conn.set_authorizer(None)
+                (after,), = conn.execute('SELECT count(*) FROM sqlite_master').fetchall()
+                if after == before:             # CREATE ... IF NOT EXISTS on a name that exists, or a bare SELECT
+                    raise StoreError('declaration_statement_made_nothing')
             added = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()} - taken
             if not added:
                 raise StoreError('declaration_made_no_table')
@@ -853,8 +829,8 @@ class EventStore:
             if _fatal(exc):
                 self._fail(exc)
             self._rollback(counted=False)       # a declaration is not a transaction of the counts
-            if misnamed and isinstance(exc, sqlite3.DatabaseError):
-                raise StoreError(f'table_not_named_for_lane:{misnamed[0]}') from exc
+            if rules.misnamed and isinstance(exc, sqlite3.DatabaseError):
+                raise StoreError(f'table_not_named_for_lane:{rules.misnamed[0]}') from exc
             raise
         try:
             conn.execute('COMMIT')
@@ -888,6 +864,57 @@ class EventStore:
         if self._lock_fd is not None:
             os.close(self._lock_fd)   # closing the descriptor releases the flock
             self._lock_fd = None
+
+
+class _DeclarationRules:
+    """The SQLite authorizer of one declaration: what each action of its statements may do. A temporary table and
+    an attached file are other action codes, refused by the default; a name that exists (the helper's tables
+    among them) is refused, so CREATE TABLE IF NOT EXISTS cannot pass quietly; a name beginning sqlite_ SQLite
+    refuses itself. Every table is named <lane>_<name> (the Liaison's ruling of Nov 14, 4:03 PM). Its decisions
+    are tested one by one as well as through SQLite, because SQLite does not ask about every object a statement
+    touches (an index of a constant reads no column, review 2 of #373)."""
+
+    _SCHEMA = ('sqlite_master', 'sqlite_schema')
+
+    def __init__(self, taken, prefix: str) -> None:
+        self.taken, self.prefix = frozenset(taken), prefix
+        self.created: set = set()
+        self.indexes: set = set()
+        self.misnamed: list = []
+
+    def __call__(self, action, first, second, database, source) -> int:
+        if action == sqlite3.SQLITE_CREATE_TABLE:
+            if first in self.taken:
+                return sqlite3.SQLITE_DENY
+            if not first.startswith(self.prefix) or first == self.prefix:
+                self.misnamed.append(first)
+                return sqlite3.SQLITE_DENY
+            self.created.add(first)
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_CREATE_INDEX:
+            # Only on a table this declaration made. A name that exists is refused by the statement rule:
+            # CREATE INDEX IF NOT EXISTS on it makes no call here at all, and makes nothing.
+            if second not in self.created:
+                return sqlite3.SQLITE_DENY
+            self.indexes.add(first)
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_REINDEX:              # what creating an index asks for, of that same index
+            return sqlite3.SQLITE_OK if first in self.indexes else sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE) and first in self._SCHEMA:
+            return sqlite3.SQLITE_OK                       # what a CREATE writes, and nothing a statement can name
+        if action == sqlite3.SQLITE_READ and (first in self.created or first in self._SCHEMA):
+            return sqlite3.SQLITE_OK
+        if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+
+def _has_sql(statement: str) -> bool:
+    """Whether a piece of declaration text holds more than comments, blanks and semicolons (an approximation used
+    only to skip such pieces; the text that is executed is never altered)."""
+    text = re.sub(r'/\*.*?\*/', ' ', statement, flags=re.S)
+    text = re.sub(r'--[^\n]*', ' ', text)
+    return bool(text.replace(';', ' ').strip())
 
 
 def _statements(ddl: str):

@@ -605,8 +605,16 @@ class Cases:
             "another lane's table dropped": 'CREATE TABLE queue_mine (id TEXT); DROP TABLE sessions_work',
             "an index on another lane's table": 'CREATE TABLE queue_mine (id TEXT); CREATE INDEX on_work ON sessions_work (state)',
             "an index on the helper's table": 'CREATE TABLE queue_mine (id TEXT); CREATE INDEX on_log ON event_log (seq)',
+            # An index of a constant reads no column, so SQLite asks no READ of the table it indexes (review 2).
+            "an index of a constant on another lane's table":
+                'CREATE TABLE queue_mine (id TEXT); CREATE INDEX on_work ON sessions_work ((1))',
+            "an index of a constant on the helper's table": 'CREATE TABLE queue_mine (id TEXT); CREATE INDEX on_log ON receipts ((1))',
+            'an index name that exists, quietly': 'CREATE TABLE queue_mine (id TEXT); CREATE INDEX IF NOT EXISTS by_owner ON queue_mine (id)',
             'rows written by a declaration': "CREATE TABLE queue_mine (id TEXT); INSERT INTO queue_mine VALUES ('x')",
             "the helper's table read": 'CREATE TABLE queue_mine AS SELECT * FROM receipts',
+            # No rows come out, but whether the declaration passed would tell what the helper's table holds.
+            "the helper's table read, making no rows":
+                "CREATE TABLE queue_mine AS SELECT 1 AS one WHERE NOT EXISTS (SELECT 1 FROM receipts WHERE tenant = 't1')",
             "the helper's table declared again, quietly": 'CREATE TABLE queue_mine (id TEXT); CREATE TABLE IF NOT EXISTS receipts (id TEXT)',
             "the helper's meta table": 'CREATE TABLE store_meta (id TEXT)',
             "the helper's indexes rebuilt": 'CREATE TABLE queue_mine (id TEXT); REINDEX receipts',
@@ -615,6 +623,8 @@ class Cases:
             'a pragma': 'CREATE TABLE queue_mine (id TEXT); PRAGMA foreign_keys=OFF',
             'an attached file': "ATTACH DATABASE ':memory:' AS other; CREATE TABLE other.queue_mine (id TEXT)",
             'no table at all': 'SELECT 1',
+            'a statement that makes nothing': 'CREATE TABLE queue_mine (id TEXT); SELECT 1',
+            'only a comment': '-- nothing is declared here',
         }
         made = {'queue_own', 'queue_leaked', 'queue_seen', 'queue_peek', 'queue_t1', 'queue_sneak', 'queue_mine', 'on_work', 'on_log'}
         for what, ddl in refused.items():
@@ -626,7 +636,7 @@ class Cases:
                 self.assertEqual((committed(store, 'SELECT * FROM receipts'), committed(store, 'SELECT * FROM sessions_work'),
                                   committed_events(store)), before)
         store.register_tables('queue', 1, 'CREATE TABLE queue_items (item_id TEXT PRIMARY KEY, state TEXT); '
-                                          'CREATE INDEX by_state ON queue_items (state);')
+                                          'CREATE INDEX by_state ON queue_items (state); -- a note after the last statement\n')
         with store.transaction() as tx:
             tx.execute('INSERT INTO queue_items VALUES (?, ?)', ('item-1', 'queued'))
             self.assertEqual(tx.execute('SELECT item_id FROM queue_items WHERE state = ?', ('queued',)), [('item-1',)])
@@ -877,6 +887,15 @@ class Cases:
                         tx.execute('INSERT INTO sessions_work VALUES (?, ?, ?)', (CMD2, 'op-2', 'after the fault'))
                 self.assertEqual(str(caught.exception), 'store_failed')
                 self.assertEqual(committed(store, 'SELECT * FROM sessions_work'), [])
+                self.assertEqual(self.refused_entry(store), 'store_failed')
+
+    def test_a_fatal_error_while_a_declaration_reads_the_schema_fails_the_store(self) -> None:
+        for statement in ('SELECT version, ddl_sha256', 'SELECT name FROM sqlite_master'):
+            with self.subTest(statement=statement):
+                store = self.make()
+                store._conn = FetchFailing(store._conn, statement, sqlite_error(11, 'SQLITE_CORRUPT', sqlite3.DatabaseError))
+                with self.assertRaises(sqlite3.DatabaseError), self.assertLogs(D.LOG, 'ERROR'):
+                    store.register_tables('queue', 1, QUEUE)
                 self.assertEqual(self.refused_entry(store), 'store_failed')
 
     def test_a_real_corrupt_page_found_while_fetching_fails_the_store(self) -> None:
@@ -1197,6 +1216,13 @@ class RealStoreTest(Cases, unittest.TestCase):
         pathlib.Path(lock_path + '.lock').touch(0o644)
         os.chmod(lock_path + '.lock', 0o644)
         self.assertEqual(self.refused(lambda: D.EventStore(lock_path)), 'store_lock_not_private')
+        for suffix in ('-wal', '-shm'):                     # beside a path with no store yet (review 2)
+            with self.subTest(fresh_sidecar=suffix):
+                fresh = os.path.join(folder, f'fresh{suffix}.sqlite3')
+                pathlib.Path(fresh + suffix).touch(0o644)
+                os.chmod(fresh + suffix, 0o644)
+                self.assertEqual(self.refused(lambda: D.EventStore(fresh)), 'store_sidecar_not_private')
+                self.assertFalse(os.path.exists(fresh), 'refused before the store file was made')
 
     def test_a_file_of_another_user_is_refused(self) -> None:
         path = os.path.join(self.folder(), 'events.sqlite3')
@@ -1278,6 +1304,45 @@ class ModuleTest(unittest.TestCase):
         self.assertEqual(imported, {'__future__', 'collections', 'contextlib', 'hashlib', 'json', 'logging', 'os', 're',
                                     'shutil', 'sqlite3', 'stat', 'tempfile', 'threading', 'time', 'weakref', 'typing',
                                     'fcntl'})
+
+    def test_each_decision_of_a_declarations_rules_on_its_own(self) -> None:
+        """SQLite does not ask about every object a statement touches, so each rule is held here directly too."""
+        OK, DENY = sqlite3.SQLITE_OK, sqlite3.SQLITE_DENY
+        rules = D._DeclarationRules({'receipts', 'sessions_work', 'by_owner'}, 'queue_')
+        self.assertEqual(rules(sqlite3.SQLITE_CREATE_TABLE, 'queue_mine', None, 'main', None), OK)
+        decisions = [
+            ((sqlite3.SQLITE_CREATE_TABLE, 'receipts', None, 'main', None), DENY),         # a name that exists
+            ((sqlite3.SQLITE_CREATE_TABLE, 'queue_mine', None, 'main', None), OK),
+            ((sqlite3.SQLITE_CREATE_INDEX, 'queue_by_id', 'queue_mine', 'main', None), OK),
+            ((sqlite3.SQLITE_CREATE_INDEX, 'on_work', 'sessions_work', 'main', None), DENY),  # a table it did not make
+            ((sqlite3.SQLITE_CREATE_INDEX, 'on_log', 'receipts', 'main', None), DENY),
+            ((sqlite3.SQLITE_REINDEX, 'queue_by_id', None, 'main', None), OK),               # its own new index
+            ((sqlite3.SQLITE_REINDEX, 'by_owner', None, 'main', None), DENY),
+            ((sqlite3.SQLITE_INSERT, 'sqlite_master', None, 'main', None), OK),              # what a CREATE writes
+            ((sqlite3.SQLITE_UPDATE, 'sqlite_master', None, 'main', None), OK),
+            ((sqlite3.SQLITE_INSERT, 'receipts', None, 'main', None), DENY),
+            ((sqlite3.SQLITE_UPDATE, 'sessions_work', 'state', 'main', None), DENY),
+            ((sqlite3.SQLITE_INSERT, 'queue_mine', None, 'main', None), DENY),               # rows, even its own
+            ((sqlite3.SQLITE_DELETE, 'sqlite_master', None, 'main', None), DENY),
+            ((sqlite3.SQLITE_READ, 'queue_mine', 'id', 'main', None), OK),
+            ((sqlite3.SQLITE_READ, 'sqlite_master', 'name', 'main', None), OK),
+            ((sqlite3.SQLITE_READ, 'receipts', 'answer', 'main', None), DENY),
+            ((sqlite3.SQLITE_READ, 'sessions_work', 'state', 'main', None), DENY),
+            ((sqlite3.SQLITE_SELECT, None, None, None, None), OK),
+            ((sqlite3.SQLITE_FUNCTION, None, 'count', None, None), OK),
+            ((sqlite3.SQLITE_DROP_TABLE, 'sessions_work', None, 'main', None), DENY),
+            ((sqlite3.SQLITE_CREATE_VIEW, 'queue_view', None, 'main', None), DENY),
+            ((sqlite3.SQLITE_CREATE_TRIGGER, 'queue_t', 'queue_mine', 'main', None), DENY),
+            ((sqlite3.SQLITE_CREATE_TEMP_TABLE, 'queue_tmp', None, 'temp', None), DENY),
+            ((sqlite3.SQLITE_PRAGMA, 'foreign_keys', 'OFF', None, None), DENY),
+            ((sqlite3.SQLITE_ATTACH, ':memory:', None, None, None), DENY),
+        ]
+        for call, expected in decisions:
+            with self.subTest(call=call):
+                self.assertEqual(rules(*call), expected)
+        self.assertEqual(rules(sqlite3.SQLITE_CREATE_TABLE, 'other', None, 'main', None), DENY)
+        self.assertEqual(rules(sqlite3.SQLITE_CREATE_TABLE, 'queue_', None, 'main', None), DENY)
+        self.assertEqual(rules.misnamed, ['other', 'queue_'])
 
     def test_the_lock_order_is_published_in_the_module(self) -> None:
         text = D.__doc__

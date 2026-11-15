@@ -65,7 +65,10 @@ A lane registers a handler from its registrant module's ``register(hooks)``::
     before the invoking handler or callback returns. Contexts are not a detached-work admission.
     ``after_commit`` registration belongs to an active handler frame; registering from a callback or
     after that frame returns is rejected. (It raises ``RuntimeError``; so does a registration that
-    arrives after the dispatch whose commit it would wait for has finished.)
+    arrives after the dispatch whose commit it would wait for has finished.) What is checked is the
+    context the registration is made through: one whose handler has returned takes none, so a callback
+    cannot register through the context of its own dispatch. A callback that was handed the context of
+    another handler which is still running registers there, as that handler itself could.
 ``ctx.closing``
     A ``threading.Event`` that is set when the daemon begins to close. A handler that waits (a long
     poll) waits on this and returns when it is set.
@@ -171,7 +174,7 @@ log = logging.getLogger(__name__)
 
 BUILT_IN = ('run.start', 'run.status', 'run.list', 'run.stop', 'route.list', 'plugin.list')
 MANDATORY = (*BUILT_IN, 'methods.list')    # every daemon answers these; none can answer 'unsupported'
-TABLE_VERSION = '1.0-draft.9'              # of the published table these rows are
+TABLE_VERSION = '1.0-draft.10'              # of the published table these rows are
 INSTALL_TENANT = 'install'                 # the receipt namespace of a method whose target is the whole install
 MAX_INT = 2**53 - 1   # the largest whole number every reader of JSON numbers keeps exact
 MAX_DEPTH = 64        # of params, for the payload digest

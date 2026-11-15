@@ -483,13 +483,19 @@ class ProductionLauncher:
             # directory, no FIFO, no output file), so a refusal leaves nothing in the way of a relaunch. A hook
             # that fails refuses the launch; it never lets it through. A hook can take longer than the start
             # waits: after each one, a start that was abandoned meanwhile launches nothing, as after the bind.
+            # And closing can begin while a hook is inside: the close waits for this launch, and the launch, when
+            # its hook returns, prepares and starts nothing.
             try:
                 self._hooks.launch_check(ctx, executable)
                 if ctx.cancelled:
                     raise refused('start_abandoned')
+                if self._hooks.gate.enabled and self._hooks.gate.closed:
+                    raise refused('daemon_closing')
                 working_directory = self._hooks.working_directory(ctx)
                 if ctx.cancelled:
                     raise refused('start_abandoned')
+                if self._hooks.gate.enabled and self._hooks.gate.closed:
+                    raise refused('daemon_closing')
             except HookRefused as exc:
                 raise refused(exc.code + (':' + exc.detail if exc.detail else '')) from None
         run_dir = private_dir(self._state / 'runs' / ctx.run_id)

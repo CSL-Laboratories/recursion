@@ -93,16 +93,32 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
     ``owner.run(ctx, request, service, record_result, fault_run, settle, release)`` is then called and
     the starter returns; the run stays active until the owner calls ``release()``, exactly once. The
     owner learns the session and the turn from ``ctx.launch``. Raises before it accepts: logged, and
-    the run is driven on today's path.
+    the run is driven on today's path. That holds for a typed refusal too: a chooser that raises has
+    not accepted, the ordinary path runs, and so a chooser cannot cancel a run by raising.
     ``owner.run`` is a hand-over: it returns promptly, and closing waits for it. What outlives it is a
     worker of a registered service of the owner's lane, joined by that service's ``stop`` before the
-    store closes.
+    store closes. ``owner.run`` does not wait for that ``stop``, for the end of the engine's stream or
+    for its worker: closing waits for ``owner.run`` first and stops the services only afterwards. A
+    hand-over entered while closing has begun must notice the closing signal and start no new work.
     The seam binds the run to the thread it calls ``owner.run`` on. An owner that calls the route
     service from another thread binds that thread itself, with ``bound_run(ctx)`` (``daemon.launcher``).
     If ``owner.run`` raises, the seam gives the run an engine-error result when it has none, settles
     what was launched unless the daemon is closing, and releases; an owner that wants another end does
-    not raise.
-S10``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's
+    not raise. While the daemon or its composition is closing nothing is settled: the run's
+    descriptors are closed, nothing is fenced, and the unit is left alive for the next daemon. That
+    holds for a settling that is already under way when closing begins, too.
+    That fallback is for an ordinary exception out of ``owner.run`` itself. A failure after
+    the hand-over, in the owner's own worker, is the driver's own try/finally, and the fallback is no
+    promise to record a final result or to call ``fault_run``.
+    A hand-over is all or nothing. ``owner.run`` either raises with no worker holding the run, or
+    returns with the worker holding it: a hand-over that raises leaves no worker behind that still
+    owns the run. It never raises once the worker has the run: the fallback would settle a run that
+    a worker is still driving. The finish step runs on the worker, never inside ``owner.run``. After
+    a hand-over that returned, the worker is the registered service's. The lane that drives Claude
+    Code registers that service under the name ``routes.driver_cc``.
+    On today's path (no owner, or one that declined) no lifetime reference is held for the whole of
+    an engine's stream: closing the daemon leaves the run alive.
+S10 ``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's
     thread, after the executable is resolved and before the run directory's FIFOs and files are made,
     so a refusal leaves nothing in the way of a relaunch. It reads the route and the containment level
     from ``ctx.launch``. Parent side only: nothing is added to the child's environment. Default: None.
@@ -121,7 +137,8 @@ S13 ``hooks.service(service)``, ``hooks.start_services(context)``, ``hooks.stop_
     What is called on a run's own thread (S4, S7, S9, S10) is not covered by the admission of the start
     that made the thread, which may have answered already. Each holds a lifetime reference of its own:
     closing waits for it with the services and the store alive, and once closing has begun the run or
-    the launch is refused ``launch_refused``, ``daemon_closing`` before the hook is asked.
+    the launch is refused ``launch_refused``, ``daemon_closing`` before the hook is asked. A launch that
+    was inside one of its two hooks when closing began is refused the same way when the hook returns.
 
 The after-commit subscription to events is not a hook: it is the event store's own interface, which
 other lanes call from their services.
@@ -427,21 +444,71 @@ class ServiceContext:
     closing: threading.Event | None = None
 
 
-def own_teardown(lock, errors: list) -> None:
-    """Take the ownership of a teardown and return holding it. ``lock`` is a ``threading.RLock``, re-entrant only
-    so that its owner can be told. An interruption while it is waited for is kept in ``errors`` and the wait goes
-    on: a caller that left here would run its own clean-up while the owner is still tearing down. The thread
-    that already owns it is refused: a teardown does not wait for itself. The caller releases the lock."""
-    if lock._is_owned():
-        raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+# OWNERSHIP. Four methods below take a lock for a piece of work that has to be finished and must not leave the lock
+# held, whatever interrupts them: Admission.close and Admission.drain, Hooks.stop_services and Hooks.finish_close.
+# (The composition's own close, in the daemon, has the same form.) Each is ONE protected region, written out in each:
+#
+#     done = False
+#     while True:
+#         try:
+#             if not done:
+#                 if not lock._is_owned():
+#                     take the lock        (take_once, own_teardown)
+#                 the work
+#                 done = True
+#             if lock._is_owned():
+#                 lock.release()
+#             break
+#         except BaseException as exc:
+#             keep it
+#     raise what was kept
+#
+# The taking, the work and the RELEASE are all inside the try, and the loop is left only when the work is done and
+# what this thread held has been released. An interruption at any instruction of the region is kept and the region is gone round
+# again: it takes the lock where it does not have it, does what is not done, and releases what it holds. Each of the
+# four pieces of work can be gone into again (it asks what is left to do).
+#
+# THE WORK IS STRAIGHT-LINE: no loop and no try of its own is written between the try and its except, only calls and
+# plain statements. The interpreter leaves two kinds of instruction inside a try outside that try's handler: the first
+# instruction of a try nested in it, and the jump back of a loop nested in it (CPython 3.12 and 3.14, read from the
+# exception tables). A loop's jump back is also one of the few places where a real signal is delivered. So a piece of
+# work that loops or has a try of its own is a function, called from the region: the call is covered. A test holds
+# that the four regions are written so.
+#
+# What this form cannot cover, and does not claim:
+# (1) the instructions before the region is entered and after it is left. An interruption there is raised at once and
+#     is not kept. Nothing is owned either time. Before, nothing has been done and the call can be made again; after,
+#     everything has;
+# (2) a second interruption that lands while the first is being put away, inside the except clause. Pure Python has
+#     no way to make those instructions uninterruptible;
+# (3) what the lock's own acquire and release do inside themselves (with threading.RLock, single calls into C);
+# (4) on 3.14, the marker instruction the interpreter puts after a conditional jump that is not taken. It is outside
+#     every handler too; no signal is delivered at it.
+# A test walks every instruction of each region and interrupts it there (OwnershipRegionTest).
+def take_once(lock, errors: list) -> None:
+    """Acquire ``lock`` and return holding it EXACTLY ONCE, however the acquiring is interrupted. ``lock`` is a
+    ``threading.RLock`` that the calling thread does not hold yet; it is re-entrant only so that its owner can be
+    told. An interruption is kept in ``errors`` and the acquiring goes on. One that lands after the lock was
+    taken, on the way back from taking it, is told apart by asking who owns the lock: the lock is then held
+    once, and it is not taken a second time. The caller releases it, once."""
     while True:
         try:
             lock.acquire()
             return
-        except BaseException as exc:  # noqa: BLE001 - kept; ownership is still needed
+        except BaseException as exc:  # noqa: BLE001 - kept; the lock is still needed
             errors.append(exc)
             if lock._is_owned():     # taken, and interrupted on the way back from taking it
                 return
+
+
+def own_teardown(lock, errors: list) -> None:
+    """Take the ownership of a teardown and return holding it (``take_once``). An interruption while it is
+    waited for is kept in ``errors`` and the wait goes on: a caller that left here would run its own clean-up
+    while the owner is still tearing down. The thread that already owns it is refused: a teardown does not wait
+    for itself. The caller releases the lock."""
+    if lock._is_owned():
+        raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+    take_once(lock, errors)
 
 
 def raise_kept(errors: list) -> None:
@@ -468,12 +535,20 @@ class Admission:
     interruption of the wait: it is kept, the wait goes on, and it is raised once every call has left.
 
     The gate does nothing until it is ``enabled``, which composition does when a lane has registered a
-    handler, a service or an event store. With nothing registered a call is never refused and closing
-    waits for nothing, as today.
+    handler, a service, an event store or a drive owner. With nothing registered a call is never refused
+    and closing waits for nothing, as today.
+
+    A drive owner turns it on by itself, with no service beside it: the run it accepts is handed over
+    under a lifetime reference (S9), and what S9 says of closing holds for every registered owner. Closing
+    waits for the hand-over, a run is refused once closing has begun, and a settling that is under way
+    fences nothing. Without the gate the reference would count nothing and none of the three would hold.
+    A launch hook or a credential source (S4, S7, S10) registered with none of the four above leaves the
+    gate off: its reference then counts nothing, and a launch during a close is what it is today.
     """
 
     def __init__(self) -> None:
-        self._changed = threading.Condition()
+        self._lock = threading.RLock()       # the condition's own lock, kept so that close and drain can take it once
+        self._changed = threading.Condition(self._lock)
         self._admitted = 0
         self._closed = False
         self.enabled = False
@@ -497,8 +572,28 @@ class Admission:
                 self._changed.notify_all()
 
     def close(self) -> None:
-        with self._changed:
-            self._closed = True
+        """No call is admitted from here on. An interruption while the condition is being taken is kept: the gate
+        is closed all the same, the condition is released, and only then is the interruption raised.
+
+        The taking, the closing AND THE RELEASE are one protected region (see the comment OWNERSHIP above
+        ``take_once`` for the form and for what it cannot cover): an interruption anywhere in it is kept and the
+        region is gone round again, and it is left only when the gate is closed and this thread owns nothing.
+        The calling thread does not hold the condition when it calls this."""
+        kept: list = []
+        done = False
+        while True:
+            try:
+                if not done:
+                    if not self._lock._is_owned():
+                        take_once(self._lock, kept)
+                    self._closed = True
+                    done = True
+                if self._lock._is_owned():
+                    self._lock.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                kept.append(exc)
+        raise_kept(kept)
 
     @property
     def closed(self) -> bool:
@@ -511,24 +606,38 @@ class Admission:
     def drain(self) -> None:
         """Return when no admitted call is left, and not before. An interruption while the condition is being
         taken, or while it is waited on, is kept and the drain goes on; the first one is raised once every call
-        has left. So an exception from this method is raised only AFTER the last call left, and a caller that
-        wants to be sure calls it until it returns."""
+        has left. A caller that needs the drain calls it until it RETURNS: it can raise with a call still inside
+        only when the interruption lands on its first instructions, before its protected region is entered.
+
+        As in ``close``, the taking of the condition, the wait and the release are one protected region
+        (``OWNERSHIP``): an interruption anywhere in it is kept and the region is gone round again, and it is
+        left only when every call has left and this thread owns nothing."""
         if not self.enabled:
             return
-        interrupted = None
+        kept: list = []
+        done = False
         while True:
             try:
-                with self._changed:
-                    while self._admitted > 0:
-                        if not self._changed.wait(self.stall_log_s):
-                            log.warning('closing waits for %d admitted call(s); services and stores stay alive',
-                                        self._admitted)
+                if not done:
+                    if not self._lock._is_owned():
+                        take_once(self._lock, kept)     # held once; the taking and its return are inside the region
+                    self._until_none_is_inside()
+                    done = True
+                if self._lock._is_owned():
+                    self._lock.release()
                 break
-            except BaseException as exc:  # noqa: BLE001 - calls may still be inside: the wait is not over
-                interrupted = interrupted or exc
+            except BaseException as exc:  # noqa: BLE001 - calls may still be inside: the region is gone round again
+                kept.append(exc)
                 log.warning('the wait for admitted calls was interrupted (%s); it goes on', type(exc).__name__)
-        if interrupted is not None:
-            raise interrupted
+        raise_kept(kept)
+
+    def _until_none_is_inside(self) -> None:
+        """The wait of ``drain``, whose caller holds the condition. It is a method of its own because a protected
+        region has no loop written in it (the comment OWNERSHIP says why): an interruption anywhere in here
+        reaches the region as one out of this call, which the region covers, and the wait is gone into again."""
+        while self._admitted > 0:
+            if not self._changed.wait(self.stall_log_s):
+                log.warning('closing waits for %d admitted call(s); services and stores stay alive', self._admitted)
 
 
 # ------------------------------------------------------------------------------------------ the hooks
@@ -650,8 +759,10 @@ class Hooks:
         if self._engines is not None:
             self._engines.freeze()
         self.methods.service_ready = self.service_ready
-        # The gate guards what a lane brought: a handler, a service, a store. With none of them it stays off.
-        self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single)
+        # The gate guards what a lane brought: a handler, a service, a store, or a drive owner, whose hand-over
+        # closing waits for whether or not its lane registered a service. With none of them it stays off.
+        self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single
+                                 or 'drive_owner' in self._single)
 
     # -- S5 ---------------------------------------------------------------------------------------
     def authorize(self, principal: Principal, method, params) -> dict | None:
@@ -866,6 +977,8 @@ class Hooks:
     # same thread, raises HookError.)
     def open_store(self, state_dir):
         """Call the event store's factory, once, before any service starts. None when no lane registered one."""
+        if self._lifecycle._is_owned():
+            raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
         with self._lifecycle:
             if self.closing.is_set() or self._closed:
                 raise HookError('closing has begun: no store is opened')
@@ -878,30 +991,46 @@ class Hooks:
     def start_services(self, context: ServiceContext) -> None:
         """Start the registered services in order. Each is tracked BEFORE its start is attempted, so one that
         started a worker and then raised is stopped like the others: it and the ones already started are
-        stopped in reverse, and the start's own error is raised. No thread is left with a closed store."""
+        stopped in reverse, and the start's own error is raised. No thread is left with a closed store. An
+        interruption of that stopping is kept and raised before the start's own error, once nothing is tracked."""
+        if self._lifecycle._is_owned():
+            raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
         with self._lifecycle:
             for service in self._services:
                 if self.closing.is_set() or self._closed:
                     log.error('closing began while services were starting; stopping the ones that did')
-                    self._stop_all(context, [])
-                    raise HookError('closing has begun: no service is started')
+                    errors: list = [HookError('closing has begun: no service is started')]
+                    self._stop_all(context, errors)
+                    raise_kept(errors)
                 self._started.append(service)
                 try:
                     service.start(context)
-                except BaseException:
+                except BaseException as exc:
                     log.exception('service %s did not start; stopping it and the ones that did', service.name)
-                    self._stop_all(context, [])
-                    raise
+                    errors = [exc]
+                    self._stop_all(context, errors)
+                    raise_kept(errors)
 
     def stop_services(self, context: ServiceContext) -> None:
         """Stop every started service, in reverse order, each until its stop has returned. The first failure
-        is raised after the last service has stopped."""
+        is raised after the last service has stopped. As in ``finish_close``, the taking of the lifecycle, the
+        stopping and the release are one protected region (``OWNERSHIP``)."""
         errors: list = []
-        own_teardown(self._lifecycle, errors)
-        try:
-            self._stop_all(context, errors)
-        finally:
-            self._lifecycle.release()
+        if self._lifecycle._is_owned():
+            raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+        done = False
+        while True:
+            try:
+                if not done:
+                    if not self._lifecycle._is_owned():
+                        own_teardown(self._lifecycle, errors)
+                    self._stop_all(context, errors)
+                    done = True
+                if self._lifecycle._is_owned():
+                    self._lifecycle.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                errors.append(exc)
         raise_kept(errors)
 
     def _stop_all(self, context, errors: list) -> None:
@@ -955,34 +1084,52 @@ class Hooks:
 
         One caller owns the teardown. Another that calls while it runs, or after it, waits for the owner to
         finish and then returns: it closes nothing itself. A caller that is interrupted while it waits for the
-        owner goes on waiting and raises its interruption only once the owner has finished."""
+        owner goes on waiting and raises its interruption only once the owner has finished.
+
+        The taking of the lifecycle, the teardown AND THE RELEASE are one protected region (``OWNERSHIP``): an
+        interruption anywhere in it is kept and the region is gone round again, and it is left only when the
+        teardown is complete and this thread owns nothing. A call from inside a lifecycle method is refused
+        before any of it."""
         errors: list = []
-        own_teardown(self._lifecycle, errors)
-        try:
-            # The owned teardown. Whatever interrupts a step of it is kept and the teardown goes on from that
-            # step: closing admission again changes nothing, the drain is asked again until it RETURNS, the
-            # services still tracked are stopped, and the store is closed while it is still the store.
-            while not self._closed:
-                try:
-                    self.begin_close()
-                    self.gate.drain()               # returns only when every admitted call has left
-                    self._stop_all(context, errors)
-                    store = self.store
-                    close = getattr(store, 'close', None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception as exc:  # noqa: BLE001
-                            log.exception('the event store did not close cleanly')
-                            errors.append(exc)
-                    self.store = None
-                    self.methods.store = None
-                    self._closed = True
-                except BaseException as exc:  # noqa: BLE001 - proves no quiescence: the owned teardown goes on
-                    errors.append(exc)
-        finally:
-            self._lifecycle.release()
+        if self._lifecycle._is_owned():
+            raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+        done = False
+        while True:
+            try:
+                if not done:
+                    if not self._lifecycle._is_owned():
+                        own_teardown(self._lifecycle, errors)
+                    self._teardown(context, errors)
+                    done = True
+                if self._lifecycle._is_owned():
+                    self._lifecycle.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                errors.append(exc)
         raise_kept(errors)
+
+    def _teardown(self, context: ServiceContext, errors: list) -> None:
+        """The owned teardown; the caller holds the lifecycle. Whatever interrupts a step of it is kept and the
+        teardown goes on from that step: closing admission again changes nothing, the drain is asked again until
+        it RETURNS, the services still tracked are stopped, and the store is closed while it is still the store."""
+        while not self._closed:
+            try:
+                self.begin_close()
+                self.gate.drain()               # returns only when every admitted call has left
+                self._stop_all(context, errors)
+                store = self.store
+                close = getattr(store, 'close', None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception('the event store did not close cleanly')
+                        errors.append(exc)
+                self.store = None
+                self.methods.store = None
+                self._closed = True
+            except BaseException as exc:  # noqa: BLE001 - proves no quiescence: the owned teardown goes on
+                errors.append(exc)
 
 
 # ---- the registrants, one guarded static import each -----------------------------------------------------------

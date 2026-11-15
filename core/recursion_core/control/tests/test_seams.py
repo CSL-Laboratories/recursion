@@ -61,6 +61,7 @@ import pathlib
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -197,7 +198,11 @@ class FakeStore:
         A declaration can only declare: ``CREATE TABLE`` and ``CREATE INDEX`` on its own tables. Anything else
         in it (a write to the helper's own tables, a view, a trigger, a change to an existing table) is refused,
         and a declaration that fails leaves NOTHING behind: every statement of it is undone and the lane can
-        declare again. It is made under the same guard as closing, so none is made on a closed store."""
+        declare again. It is made under the same guard as closing, so none is made on a closed store.
+
+        "Its own tables" are the ones this declaration makes. A table that existed before it (the helper's, or
+        another lane's) cannot be declared again, in any spelling of its name and not with IF NOT EXISTS either:
+        declaring it again would make it count as this declaration's own, and an index could then be put on it."""
         with self._guard:
             if self.closed:
                 raise RuntimeError('store_closed')
@@ -205,28 +210,32 @@ class FakeStore:
                 raise RuntimeError('a lane declares its tables once')
             created: set = set()
             indexes: set = set()
+            existing: set = set()   # every table there before this declaration, lower case: names are not case-sensitive
 
             def declaration_only(action, first, second, database, source) -> int:
                 if action == sqlite3.SQLITE_CREATE_TABLE:
-                    if first in ('receipts', 'events'):
-                        return sqlite3.SQLITE_DENY
-                    created.add(first)
+                    if first.lower() in existing:
+                        return sqlite3.SQLITE_DENY      # the fourth reads: not its own, however it is declared
+                    created.add(first.lower())
                     return sqlite3.SQLITE_OK
                 if action == sqlite3.SQLITE_CREATE_INDEX:
-                    indexes.add(first)      # only on a table of its own: indexing a table READs it, refused below
+                    if second.lower() not in created:
+                        return sqlite3.SQLITE_DENY      # an index on a table this declaration did not make. An index
+                    indexes.add(first)                  # on a constant reads no column, so no later check sees it.
                     return sqlite3.SQLITE_OK
                 if action == sqlite3.SQLITE_REINDEX:        # what creating an index asks for, of that same index
                     return sqlite3.SQLITE_OK if first in indexes else sqlite3.SQLITE_DENY
                 if first in ('sqlite_master', 'sqlite_schema'):
                     return sqlite3.SQLITE_OK        # what creating a table writes, and nothing a statement can name
-                if action == sqlite3.SQLITE_READ and first in created:
+                if action == sqlite3.SQLITE_READ and first.lower() in created:
                     return sqlite3.SQLITE_OK
-                if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
-                    return sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_FUNCTION:
+                    return sqlite3.SQLITE_OK        # in a default or a check; a declaration SELECTs nothing
                 return sqlite3.SQLITE_DENY
 
             with contextlib.closing(self._connect()) as db:
                 before = self._names(db)
+                existing.update(name.lower() for name in before)
                 db.execute('BEGIN IMMEDIATE')
                 try:
                     db.set_authorizer(declaration_only)
@@ -365,24 +374,48 @@ class FakeLanes:
     """Registrant modules under their REAL names, for one test. The composition imports its registrants with
     literal statements, so a test cannot hand it a name: it writes the lane's package into a temporary folder
     and puts that folder on the path of the package the lane sits in (``recursion_core`` for a lane's own
-    package), for as long as the test runs."""
+    package), for as long as the test runs.
+
+    A fake STANDS IN for a real module of its name, when a lane's real one is in the tree: its folder is
+    searched first, and a real module that is already imported is set aside for the test and put back after
+    it, the same object. So these tests are about the fakes they install, whatever lanes have landed; each lane
+    tests its own registration."""
 
     def __init__(self, case: unittest.TestCase) -> None:
         self._dir = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._dir.name)
         self._mounted: list = []
         self._names: list = []
+        self._real: dict = {}       # name -> a real module set aside for this test; put back by _clean
         case.addCleanup(self._clean)
 
     def _folder(self, package: str) -> pathlib.Path:
-        """A folder that is searched for the submodules of ``package``, a package of the core that exists."""
+        """A folder that is searched FIRST for the submodules of ``package``, a package of the core that exists."""
         folder = self.root / package
         if not folder.exists():
             module = importlib.import_module(package)
             folder.mkdir()
-            module.__path__.append(str(folder))
+            module.__path__.insert(0, str(folder))      # before the package's own folder: the fake is the one found
             self._mounted.append((module, str(folder)))
         return folder
+
+    def _is_fake(self, module) -> bool:
+        file = getattr(module, '__file__', None)
+        try:
+            return file is not None and pathlib.Path(file).resolve().is_relative_to(self.root.resolve())
+        except (OSError, ValueError):
+            return False
+
+    def _set_aside(self, name: str) -> None:
+        """Forget what is imported under this name and below it, so that the fake is imported in its place. A
+        real module among it is kept, to be put back; an earlier fake of this fixture is simply dropped."""
+        for loaded in [key for key in sys.modules if key == name or key.startswith(name + '.')]:
+            module = sys.modules.pop(loaded)
+            if not self._is_fake(module):
+                self._real.setdefault(loaded, module)
+        parent, _, leaf = name.rpartition('.')
+        if hasattr(sys.modules.get(parent), leaf):
+            delattr(sys.modules[parent], leaf)
 
     def lane(self, name: str, init: str = '', **modules: str) -> str:
         """The package ``recursion_core.<name>`` with this ``__init__`` and these modules; its full name."""
@@ -392,17 +425,32 @@ class FakeLanes:
         (folder / '__init__.py').write_text(init, encoding='utf-8')
         for module, text in modules.items():
             (folder / f'{module}.py').write_text(text, encoding='utf-8')
-        self._names.append(f'{parent}.{leaf}')
-        importlib.invalidate_caches()
-        return f'{parent}.{leaf}'
+        return self._installed(f'{parent}.{leaf}')
 
     def module(self, name: str, text: str) -> str:
         """The module ``recursion_core.<name>`` inside a package of the core that exists; its full name."""
         parent, _, leaf = f'recursion_core.{name}'.rpartition('.')
         (self._folder(parent) / f'{leaf}.py').write_text(text, encoding='utf-8')
-        self._names.append(f'{parent}.{leaf}')
+        return self._installed(f'{parent}.{leaf}')
+
+    def _installed(self, name: str) -> str:
+        """A fake's files are written: from here on it is the one found under ``name``, for a package and for a
+        module alike."""
+        self._set_aside(name)
+        self._names.append(name)
         importlib.invalidate_caches()
-        return f'{parent}.{leaf}'
+        return name
+
+    def stand_in_for_the_installed(self) -> None:
+        """Every registrant that is REALLY in this tree gets a stand-in that registers nothing, for this test.
+        With no lane landed this does nothing."""
+        for name in H.REGISTRANTS:
+            try:
+                there = importlib.util.find_spec(name) is not None
+            except ModuleNotFoundError:     # a package above it is not there
+                there = False
+            if there:
+                self.module(name.removeprefix('recursion_core.'), REGISTERS_NOTHING)
 
     def _clean(self) -> None:
         for module, folder in self._mounted:
@@ -413,6 +461,13 @@ class FakeLanes:
             parent, _, leaf = name.rpartition('.')
             if hasattr(sys.modules.get(parent), leaf):
                 delattr(sys.modules[parent], leaf)
+        for name, module in self._real.items():     # the real ones: the same objects, where they were
+            sys.modules[name] = module
+        for name, module in self._real.items():     # then each as its parent's attribute: a child may have been set
+            parent, _, leaf = name.rpartition('.')  # aside before its parent, and the parent has to be back first
+            if parent in sys.modules:
+                setattr(sys.modules[parent], leaf, module)
+        self._mounted, self._names, self._real = [], [], {}
         self._dir.cleanup()
         importlib.invalidate_caches()
 
@@ -421,11 +476,128 @@ CORE_PACKAGES = ('recursion_core', 'recursion_core.control', 'recursion_core.rou
 REGISTERS_NOTHING = 'def register(hooks):\n    pass\n'
 
 
+def landed(case: unittest.TestCase, text: str):
+    """A module that plays a lane's REAL ``control.scopes``, for one test, already imported. It is put before
+    whatever this tree has under that name (and before a stand-in a fixture gave that), so the test is the same
+    whether or not a lane's real module has landed; a fixture made afterwards mounts its fakes before it in turn.
+    ``(the module, a fixture of its own, the call that cleans that fixture)``. Also used by the daemon-side tests."""
+    folder = tempfile.mkdtemp(prefix='seam-real-registrant-')
+    control = importlib.import_module('recursion_core.control')
+    pathlib.Path(folder, 'scopes.py').write_text(text, encoding='utf-8')
+
+    def unmount() -> None:
+        control.__path__.remove(folder)
+        sys.modules.pop('recursion_core.control.scopes', None)
+        if hasattr(control, 'scopes'):
+            del control.scopes
+        shutil.rmtree(folder, True)
+        importlib.invalidate_caches()
+    sys.modules.pop('recursion_core.control.scopes', None)
+    control.__path__.insert(0, folder)
+    case.addCleanup(unmount)
+    importlib.invalidate_caches()
+    real = importlib.import_module('recursion_core.control.scopes')
+    case.assertTrue(real.REAL, 'the module that plays the real one is the one imported before any fake')
+    calls: list = []
+    fake = FakeLanes(mock.Mock(addCleanup=calls.append))    # cleaned by the test itself, not at its end
+
+    def clean() -> None:
+        while calls:
+            calls.pop()()
+    case.addCleanup(clean)
+    return real, fake, clean
+
+
+LANDED_WITH_AN_ENGINE = "REAL = True\n\n\ndef register(hooks):\n    hooks.engines.register('grok', lambda *a, **k: None)\n"
+
+
 class RegistrationTest(unittest.TestCase):
     """Absent is not broken, and absent is decided before the import."""
 
     def setUp(self) -> None:
         self.fake = FakeLanes(self)
+        self.fake.stand_in_for_the_installed()      # a registrant that has landed registers nothing in these tests
+
+    def landed(self, text: str):
+        return landed(self, text)
+
+    def test_a_fake_registrant_stands_in_for_a_real_module_of_its_name_and_the_real_one_is_put_back(self) -> None:
+        """A registrant can be a module of the core itself (``control.scopes``), and one day a lane's real one is
+        there. A test's fake of that name is still the one composed: it is searched for first, and the real
+        module, already imported, is set aside for the test. Afterwards the real one is back, the same object.
+        A fake that a second fake of its name replaces is dropped: it is not put back as if it had been real."""
+        engine = 'def register(hooks):\n    hooks.engines.register(%r, lambda *a, **k: None)\n'
+        real, fake, clean = self.landed('REAL = True\n\n\ndef register(hooks):\n    pass\n')
+        control = sys.modules['recursion_core.control']
+        fake.module('control.scopes', engine % 'grok')
+        self.assertIn('grok', H.compose().engines.names(), 'the fake was composed, not the real module of its name')
+        other = 'recursion_core.routes.driver_hooks'
+        before = sys.modules.get(other)             # whatever is there under another registrant's name: none today
+        fake.module('routes.driver_hooks', engine % 'opencode')
+        self.assertIn('opencode', H.compose().engines.names())
+        fake.module('routes.driver_hooks', engine % 'pi')
+        names = H.compose().engines.names()
+        self.assertEqual(('pi' in names, 'opencode' in names), (True, False), 'the second fake of a name replaces the first')
+        clean()
+        self.assertIs(sys.modules.get('recursion_core.control.scopes'), real, 'the real module is back, the same object')
+        self.assertIs(control.scopes, real)
+        self.assertIs(sys.modules.get(other), before, 'and no fake is left behind where a fake replaced a fake')
+        self.assertNotIn('grok', H.compose().engines.names())
+
+    def test_a_registrant_that_has_landed_registers_nothing_once_the_fixture_stands_in_for_it(self) -> None:
+        """These tests are about the fakes they install. A lane's real registrant, once it is in the tree, would
+        register into every composition here; the fixture gives each one that is installed a stand-in that
+        registers nothing, and puts the real one back afterwards."""
+        real, fake, clean = self.landed(LANDED_WITH_AN_ENGINE)
+        self.assertIn('grok', H.compose().engines.names(), 'it is installed: a composition finds it')
+        fake.stand_in_for_the_installed()
+        self.assertEqual(H.compose().engines.names(), ('claude_code', 'codex'))
+        clean()
+        self.assertIs(sys.modules.get('recursion_core.control.scopes'), real)
+        self.assertIn('grok', H.compose().engines.names())
+
+    def test_a_real_package_and_its_registrant_are_put_back_whole_whichever_was_set_aside_first(self) -> None:
+        """The fifth reads. A lane's real registrant sits in the lane's real PACKAGE. The stand-ins set the
+        registrant aside first; a test's fake package of the same name then sets the package aside. Afterwards
+        both are back, the same objects, and the package has its registrant as its attribute again: the
+        package is put back before its registrant is hung on it."""
+        engine = 'def register(hooks):\n    hooks.engines.register(%r, lambda *a, **k: None)\n'
+        names = ('recursion_core.events', 'recursion_core.events.hooks')
+        core = importlib.import_module('recursion_core')
+        root = tempfile.mkdtemp(prefix='seam-real-lane-')
+        package = pathlib.Path(root, 'events')
+        package.mkdir()
+        (package / '__init__.py').write_text('REAL = True\n', encoding='utf-8')
+        (package / 'hooks.py').write_text('REAL = True\n\n\n' + engine % 'grok', encoding='utf-8')
+        before = {name: sys.modules.pop(name, None) for name in names}
+        attribute = core.__dict__.pop('events', None)
+
+        def unmount() -> None:
+            core.__path__.remove(root)
+            for name in names:
+                sys.modules.pop(name, None)
+                if before[name] is not None:
+                    sys.modules[name] = before[name]
+            core.__dict__.pop('events', None)
+            if attribute is not None:
+                core.events = attribute
+            shutil.rmtree(root, True)
+            importlib.invalidate_caches()
+        core.__path__.insert(0, root)       # it plays the lane's real package, whatever this tree has under that name
+        self.addCleanup(unmount)
+        importlib.invalidate_caches()
+        real, registrant = (importlib.import_module(name) for name in names)
+        self.assertIs(real.hooks, registrant)
+        calls: list = []
+        fake = FakeLanes(mock.Mock(addCleanup=calls.append))
+        self.addCleanup(lambda: [call() for call in calls])
+        fake.stand_in_for_the_installed()               # the registrant is set aside: a stand-in in the real package
+        fake.lane('events', hooks=engine % 'pi')        # then the package: a whole fake package in its place
+        self.assertEqual(H.compose().engines.names(), ('claude_code', 'codex', 'pi'))
+        calls.pop()()
+        self.assertEqual([sys.modules.get(name) is module for name, module in zip(names, (real, registrant))], [True, True])
+        self.assertIs(getattr(real, 'hooks', None), registrant, 'the real package has its registrant as its attribute again')
+        self.assertIs(core.events, real)
 
     def test_nothing_is_installed_today_and_the_hooks_compose_with_their_defaults(self) -> None:
         composed = H.compose()
@@ -448,6 +620,42 @@ class RegistrationTest(unittest.TestCase):
         called = {node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, 'id', None)
                   for node in ast.walk(tree) if isinstance(node, ast.Call)}
         self.assertEqual(called & {'import_module', '__import__', 'exec', 'eval', 'reload'}, set())
+        # The whole module, not only its sixteen loaders (the third read): nothing is imported FROM importlib under
+        # another name, no builtin that imports or evaluates is named at all, and the one thing importlib is used
+        # for anywhere is importlib.util.find_spec with literal text.
+        # The fourth reads: the same under an ordinary alias. importlib comes in as ``import importlib.util`` and in
+        # no other way; ``builtins`` does not come in at all; an importer or an evaluator is not reached as an
+        # attribute of anything; and every ``find_spec`` call is spelled ``importlib.util.find_spec``.
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotEqual(alias.name.split('.')[0], 'builtins', 'the builtins module is not imported')
+                    if alias.name.split('.')[0] == 'importlib':
+                        self.assertEqual((alias.name, alias.asname), ('importlib.util', None), 'importlib under its own name only')
+            if isinstance(node, ast.ImportFrom):
+                self.assertNotIn((node.module or '').split('.')[0], ('importlib', 'builtins'),
+                                 'no importer is brought in under another name')
+            if isinstance(node, ast.Attribute):
+                self.assertNotIn(node.attr, {'import_module', '__import__', 'exec', 'eval', 'reload', '__builtins__'})
+            if isinstance(node, ast.Attribute) and node.attr == 'find_spec':    # the fifth reads: not kept under a name
+                call = parents.get(node)
+                self.assertTrue(isinstance(call, ast.Call) and call.func is node,
+                                'find_spec is called where it is named, and never kept under another name')
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'find_spec':
+                self.assertEqual(ast.unparse(node.func), 'importlib.util.find_spec', 'find_spec is called under its own name')
+            if isinstance(node, ast.Name):
+                self.assertNotIn(node.id, {'__import__', 'exec', 'eval', 'reload', '__builtins__'})
+                if node.id == 'importlib':
+                    util = parents.get(node)
+                    spec = parents.get(util)
+                    call = parents.get(spec)
+                    self.assertTrue(isinstance(util, ast.Attribute) and util.attr == 'util'
+                                    and isinstance(spec, ast.Attribute) and spec.attr == 'find_spec'
+                                    and isinstance(call, ast.Call) and call.func is spec,
+                                    'importlib is used for a guarded find_spec and nothing else')
+                    self.assertTrue(len(call.args) == 1 and not call.keywords and isinstance(call.args[0], ast.Constant)
+                                    and isinstance(call.args[0].value, str), 'every find_spec in the module takes literal text')
         functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
         for package in CORE_PACKAGES:
             self.assertIsNotNone(importlib.util.find_spec(package), 'a package of the core itself is always there')
@@ -468,11 +676,74 @@ class RegistrationTest(unittest.TestCase):
                 self.assertEqual(imports, [name], 'one literal import statement, of exactly this module')
                 self.assertEqual([s for s in ast.walk(node) if isinstance(s, ast.ImportFrom)], [])
 
+    def test_the_guard_on_computed_imports_refuses_each_form_under_an_alias_too(self) -> None:
+        """The fourth reads' finding E: the guard above is itself held. With nothing added to the module's text it
+        passes; with any of these forms added it fails. A module, an importer or a builtin that comes in under
+        another name is as refused as under its own."""
+        source = pathlib.Path(H.__file__).read_text(encoding='utf-8')
+        forms = {
+            'importlib under another name': 'import importlib as _lib\n_load = _lib.import_module\n',
+            'importlib.util under another name': 'import importlib.util as _specs\n\n\ndef _find(name):\n    return _specs.find_spec(name)\n',
+            'an importer from builtins under another name': 'from builtins import __import__ as _load\n',
+            'builtins under another name': 'import builtins as _b\n_load = _b.__import__\n',
+            'builtins under its own name': 'import builtins\n_load = builtins.__import__\n',
+            'find_spec through another object': '_specs = importlib.util\n\n\ndef _find(name):\n    return _specs.find_spec(name)\n',
+            # One form for each rule of the guard that no other rule also refuses.
+            'another part of importlib': 'import importlib.machinery\n',
+            'builtins asked for a name it is given as text': "import builtins\n_load = getattr(builtins, '__imp' + 'ort__')\n",
+            'an importer reached through the table of modules': "import sys\n_load = sys.modules['builtins'].__import__\n",
+            'find_spec on a module taken from the table of modules':
+                "import sys\n_specs = sys.modules['importlib.util']\n\n\ndef _find(name):\n    return _specs.find_spec(name)\n",
+            'find_spec taken from the table of modules and kept under a local name':
+                "import sys\n\n\ndef _find(name):\n    _spec = sys.modules['importlib.util'].find_spec\n    return _spec(name)\n",
+            # The third read's three spellings stay refused.
+            'an importer imported from importlib': 'from importlib import import_module as _load\n',
+            'a find_spec that is not literal': 'def _find(name):\n    return importlib.util.find_spec(name)\n',
+            'a builtin importer under another name': '_load = __import__\n',
+        }
+        guard = 'test_the_registrants_are_guarded_static_imports_and_nothing_is_imported_by_a_computed_name'
+
+        def passes(text) -> bool:
+            result = unittest.TestResult()
+            with mock.patch.object(pathlib.Path, 'read_text', lambda path, *args, **kwargs: text):
+                type(self)(guard).run(result)
+            return result.wasSuccessful()
+        self.assertTrue(passes(source), 'the module as it is passes its guard')
+        for what, added in forms.items():
+            with self.subTest(form=what):
+                self.assertFalse(passes(source + '\n\n' + added))
+
+    def test_the_drive_owners_contract_says_a_hand_over_is_all_or_nothing_and_names_the_drivers_service(self) -> None:
+        """Text that other lanes build against, so that it cannot go missing unseen (the fourth reads)."""
+        text = ' '.join(H.__doc__.split())
+        for sentence in ('A hand-over is all or nothing.',
+                         'a hand-over that raises leaves no worker behind that still owns the run',
+                         'registers that service under the name ``routes.driver_cc``'):
+            self.assertIn(sentence, text)
+
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
-        self.assertIsNone(importlib.util.find_spec('recursion_core.keys'), 'no keys lane is installed in this tree')
-        composed = H.compose()
-        self.assertEqual(composed.methods.registered(), ())
-        self.assertNotIn('recursion_core.keys', sys.modules)
+        """Whatever lanes this tree has, now or later: the absence is made for the test. Where the composition
+        asks whether a package or a module outside the core is there, it is told no. Each registrant is then
+        asked for once, at the outermost thing it needs that is not part of the core, and no further; nothing
+        of it is imported; and nothing registers. (It used to rely on one lane's package not being in the
+        tree, which stops being true the day that lane lands.)"""
+        find_spec, asked = importlib.util.find_spec, []
+
+        def absent(name, package=None):
+            asked.append(name)
+            return find_spec(name, package) if name in CORE_PACKAGES else None
+        before = set(sys.modules)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            composed = H.compose()
+        outermost = []
+        for name in H.REGISTRANTS:
+            parts = name.split('.')
+            above = ['.'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+            outermost.append(next(item for item in above if item not in CORE_PACKAGES))
+        self.assertEqual(asked, outermost, 'absent is decided at the first thing that is not there, before any import')
+        self.assertEqual(set(sys.modules) - before, set(), 'nothing was imported for a registrant that is not there')
+        self.assertEqual((composed.methods.registered(), composed.commands.names(), composed.engines.names()),
+                         ((), (), ('claude_code', 'codex')))
 
     def test_a_package_with_no_hooks_module_is_skipped(self) -> None:
         package = self.fake.lane('keys')
@@ -873,7 +1144,7 @@ class MethodTableTest(unittest.TestCase):
         table = methods.MethodTable()
         table.register('session.list', lambda ctx, params: {'code': 'ok', 'sessions': []})
         answer = table.dispatch('methods.list', {}, H.DEVICE, None)
-        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.9'))
+        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.10'))
         self.assertEqual([row['name'] for row in answer['methods']], list(methods.METHODS), 'every row, in the table\'s order')
         self.assertEqual([row['name'] for row in answer['methods'] if row['implemented']],
                          [*methods.BUILT_IN, 'session.list', 'methods.list'])
@@ -1450,6 +1721,23 @@ class ServicesTest(unittest.TestCase):
                          ['daemon', 'registry', 'control_registry', 'control', 'store', 'state_dir', 'clock', 'closing'])
 
 
+def watch(gate):
+    """Put a lock that can be made to interrupt its next taker under the gate's condition, and return it."""
+    lock = WatchedLock()
+    gate._lock, gate._changed = lock, threading.Condition(lock)
+    return lock
+
+
+def answered_from_another_thread(case, gate):
+    """What ``gate.enter()`` answers a thread that never held the condition. A condition left owned by somebody
+    else makes that thread wait for ever; the bound only ends the test then, and the answer is missing."""
+    answers = []
+    other = threading.Thread(target=lambda: answers.append(gate.enter()), daemon=True)
+    other.start()
+    other.join(BOUND_S)
+    return answers
+
+
 class AdmissionTest(unittest.TestCase):
     def test_with_nothing_registered_the_gate_refuses_nobody_and_waits_for_nothing(self) -> None:
         made = H.bare()
@@ -1472,6 +1760,27 @@ class AdmissionTest(unittest.TestCase):
         made.set('authorize', lambda principal, method, params: None)
         made.freeze()
         self.assertFalse(made.gate.enabled, 'a hook that holds no resource does not need the gate')
+
+    def test_a_drive_owner_turns_the_gate_on_by_itself_and_the_other_single_hooks_do_not(self) -> None:
+        """A drive owner with no service beside it: the run it accepts is handed over under a lifetime reference,
+        which counts only where the gate is on. The other single hooks registered alone leave it off; that is
+        the gate's text, held here so that a change of it is a decision and not an accident."""
+        made = H.Hooks()
+        made.set('drive_owner', lambda ctx, request: None)
+        made.freeze()
+        self.assertTrue(made.gate.enabled)
+        self.assertTrue(made.gate.enter())
+        made.gate.leave()
+        made.begin_close()
+        self.assertFalse(made.gate.enter(), 'once closing has begun nothing is admitted, with the owner alone')
+        others = [name for name in H.SINGLE if name not in ('drive_owner', 'event_store')]
+        self.assertEqual(len(others), 6, 'every single hook is on one side or the other of this test')
+        for name in others:
+            with self.subTest(hook=name):
+                made = H.Hooks()
+                made.set(name, lambda *args: None)
+                made.freeze()
+                self.assertFalse(made.gate.enabled)
 
     def test_no_call_is_admitted_after_closing_began(self) -> None:
         gate = H.Admission()
@@ -1547,34 +1856,86 @@ class AdmissionTest(unittest.TestCase):
         gate.enabled = True
         gate.enter()
         gate.close()
-        condition = gate._changed
-        first, second = KeyboardInterrupt('as it takes the condition'), KeyboardInterrupt('while it waits')
-        seen = []
+        lock = watch(gate)
+        second, seen = KeyboardInterrupt('while it waits'), []
 
-        class Interrupted:
-            def __enter__(self):
-                seen.append(('take', gate.admitted))
-                if len(seen) == 1:
-                    raise first
-                return condition.__enter__()
-
-            def __exit__(self, *exc):
-                return condition.__exit__(*exc)
-
-            def wait(self, timeout=None):
-                seen.append(('wait', gate.admitted))
-                if [what for what, _ in seen].count('wait') == 1:
-                    raise second
-                gate._changed = condition      # the call leaves while the drain waits, as another thread's would
-                gate.leave()
-                return True
-        gate._changed = Interrupted()
+        def waiting(timeout=None):
+            seen.append((gate.admitted, lock._is_owned()))
+            if len(seen) == 1:
+                raise second
+            gate.leave()                    # the call leaves while the drain waits, as another thread's would
+            return True
+        gate._changed.wait = waiting
+        lock.interrupt_next = 'before'      # the first: as the drain asks for the condition
         with self.assertRaises(KeyboardInterrupt) as raised:
             gate.drain()
-        self.assertEqual(seen, [('take', 1), ('take', 1), ('wait', 1), ('take', 1), ('wait', 1)],
-                         'after each interruption it asked again, with the call still inside')
+        self.assertEqual(seen, [(1, True), (1, True)], 'after each interruption it waited again, with the call still inside')
         self.assertEqual(gate.admitted, 0, 'it raised only after the last call had left')
-        self.assertIs(raised.exception, first, 'and what it raises is the first interruption')
+        self.assertIsNot(raised.exception, second, 'and what it raises is the first interruption')
+        self.assertEqual((lock._is_owned(), answered_from_another_thread(self, gate)), (False, [False]))
+
+    @quiet
+    def test_an_interruption_that_lands_as_the_condition_is_taken_does_not_leave_it_owned(self) -> None:
+        """The third read's finding C. A close and a drain are interrupted as they take the admission condition:
+        before it is taken, and after it was taken, on the way back from taking it. Either way the gate does its
+        work, raises the interruption after it, and the condition is free: a call from another thread is
+        answered at once, where a condition left owned would make it wait for ever."""
+        for step in ('close', 'drain'):
+            for when in ('before', 'after'):
+                gate = H.Admission()
+                gate.enabled = True
+                lock = watch(gate)
+                if step == 'drain':
+                    gate.close()
+                lock.interrupt_next = when
+                with self.subTest(step=step, interrupted=when):
+                    with self.assertRaises(KeyboardInterrupt):
+                        getattr(gate, step)()
+                    self.assertEqual((gate.closed, lock._is_owned()), (True, False))
+                    self.assertEqual(answered_from_another_thread(self, gate), [False])
+
+    @quiet
+    def test_an_interruption_on_the_way_back_from_taking_the_condition_is_inside_the_protected_region(self) -> None:
+        """The fourth reads' finding C. The taking of the condition, the return from it and what follows are one
+        protected region. A close and a drain are interrupted as the helper that takes the condition is entered
+        (nothing is taken yet), at its return (the condition is taken), and at the first line after it. Each
+        time the gate does its work first (it is closed; the drain's one call has left), raises the interruption
+        only then, and leaves the condition free: released where it was taken, and not released where it was
+        not."""
+        for step, first_line in (('close', 'self._closed = True'), ('drain', 'self._until_none_is_inside()')):
+            method = getattr(H.Admission, step)
+            lines, start = inspect.getsourcelines(method)
+            target = start + next(index for index, line in enumerate(lines) if first_line in line)
+            for where in ('the call of the taking', 'the return of the taking', 'the first line after it'):
+                gate = H.Admission()
+                gate.enabled = True
+                if step == 'drain':
+                    gate.enter()
+                    gate.close()
+                    gate._changed.wait = lambda timeout=None, gate=gate: (gate.leave(), True)[1]   # the call leaves meanwhile
+                fired = []
+
+                def trace(frame, event, arg, code=method.__code__, target=target, where=where, fired=fired):
+                    if not fired and (
+                            (where == 'the call of the taking' and event == 'call'
+                             and frame.f_code is H.take_once.__code__ and frame.f_back.f_code is code)
+                            or (where == 'the return of the taking' and event == 'return'
+                                and frame.f_code is H.take_once.__code__ and frame.f_back.f_code is code)
+                            or (where == 'the first line after it' and event == 'line'
+                                and frame.f_code is code and frame.f_lineno == target)):
+                        fired.append(where)
+                        raise KeyboardInterrupt(where)
+                    return trace
+                with self.subTest(step=step, interrupted_at=where):
+                    before = sys.gettrace()
+                    sys.settrace(trace)
+                    try:
+                        with self.assertRaises(KeyboardInterrupt):
+                            getattr(gate, step)()
+                    finally:
+                        sys.settrace(before)
+                    self.assertEqual((fired, gate.closed, gate.admitted, gate._lock._is_owned()), ([where], True, 0, False))
+                    self.assertEqual(answered_from_another_thread(self, gate), [False])
 
     @quiet
     def test_a_teardown_error_is_raised_only_after_everything_was_stopped_and_closed(self) -> None:
@@ -1905,7 +2266,7 @@ class FakeStoreTest(unittest.TestCase):
         store = work_store()
         with self.assertRaises(RuntimeError):
             store.register_tables('sessions', 2, 'CREATE TABLE more (a TEXT)')
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises((RuntimeError, sqlite3.Error)):
             store.register_tables('queue', 1, 'SELECT 1')
         store.register_tables('queue', 1, 'CREATE TABLE queue_items (item_id TEXT PRIMARY KEY, state TEXT)')
         with store.transaction() as tx:
@@ -2039,9 +2400,24 @@ class FakeStoreBoundaryTest(unittest.TestCase):
             "the helper's own table declared again, quietly, and indexed":
                 'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS receipts (id TEXT); '
                 'CREATE INDEX on_receipts ON receipts (tenant)',
+            # The third read's witnesses. An index on a constant reads no column of the table it is put on.
+            "a unique index on a constant over the helper's receipts": 'CREATE TABLE mine (id TEXT); CREATE UNIQUE INDEX sabotage ON receipts (1)',
+            "the same over the helper's events": 'CREATE TABLE mine (id TEXT); CREATE UNIQUE INDEX sabotage ON events (NULL)',
+            "the same over another lane's table": 'CREATE TABLE mine (id TEXT); CREATE UNIQUE INDEX sabotage ON work ((1 + 1))',
+            'a table made with rows in it': 'CREATE TABLE mine AS SELECT 1 AS id',
             'no table at all': 'SELECT 1',
+            # The fourth reads' witnesses. A table that was there before is not the declaration's own, however
+            # it is declared again: the index after it would otherwise count as an index on its own table.
+            "another lane's table declared again, quietly, and given a unique index on a column":
+                'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS work (id TEXT); CREATE UNIQUE INDEX sabotage ON work (state)',
+            'the same with a unique index on a constant':
+                'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS work (id TEXT); CREATE UNIQUE INDEX sabotage ON work (1)',
+            'the same under another spelling of its name':
+                'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS WORK (id TEXT); CREATE UNIQUE INDEX sabotage ON WORK (1)',
+            "another lane's table declared again and nothing else": 'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS work (id TEXT)',
+            "the helper's events declared again under another spelling": 'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS Events (id TEXT)',
         }
-        made = {'own', 'leaked', 'seen', 'peek', 't1', 'sneak', 'mine', 'on_work', 'on_receipts'}
+        made = {'own', 'leaked', 'seen', 'peek', 't1', 'sneak', 'mine', 'on_work', 'on_receipts', 'sabotage'}
         for what, ddl in refused.items():
             with self.subTest(declaration=what):
                 with self.assertRaises((sqlite3.Error, RuntimeError)):
@@ -2055,6 +2431,12 @@ class FakeStoreBoundaryTest(unittest.TestCase):
         with store.transaction() as tx:
             tx.execute('INSERT INTO queue_items VALUES (?, ?)', ('item-1', 'queued'))
             self.assertEqual(tx.execute('SELECT item_id FROM queue_items WHERE state = ?', ('queued',)), [('item-1',)])
+            # And two unrelated receipts are both kept: no declaration left a constraint on the helper's table.
+            tx.receipt_put('t1', 'session.turn', 'c2', 'digest-2', {'code': 'ok'})
+            tx.receipt_put('t2', 'session.start', 'c3', 'digest-3', {'code': 'ok'})
+            # Nor on the other lane's: two more of its rows in the state its first row is in are both kept.
+            tx.execute('INSERT INTO work VALUES (?, ?, ?)', ('c2', 'op-2', 'pending'))
+            tx.execute('INSERT INTO work VALUES (?, ?, ?)', ('c3', 'op-3', 'pending'))
 
     def test_a_foreign_key_a_declaration_states_is_enforced(self) -> None:
         store = FakeStore()
@@ -2703,6 +3085,9 @@ class WatchedLock:
     def _is_owned(self) -> bool:
         return self._inner._is_owned()
 
+    def locked(self) -> bool:             # a Condition of Python 3.14 asks its lock for this name when it is made
+        return self._held.is_set()
+
     def __enter__(self):
         self.acquire()
         return self
@@ -2750,6 +3135,253 @@ class WorkerService:
             self._thread.join(BOUND_S)
             if self._thread.is_alive():
                 raise AssertionError('the test worker did not stop within BOUND_S')
+
+
+class RegionWalk:
+    """The walk of ``OwnershipRegionTest``, for any test case that names its regions: ``REGIONS`` maps a name to
+    ``(make, call, lock_of, finished)``, and ``FILES`` are the source files whose code is walked. The daemon's
+    own close has the same form and is walked with this from its own test file."""
+
+    FILES = (H.__file__,)
+    EVENTS, INSTRUCTIONS = ('call', 'line', 'return'), ('opcode',)
+
+    def traced(self, run, kinds, codes=None, at=None, cut=None) -> int:
+        """Run with every point of ``kinds`` counted, in the code of ``FILES`` or in the given code objects;
+        ``cut`` is raised at point number ``at``. How many were counted."""
+        counted = [0]
+
+        def points(frame, event, arg):
+            if event in kinds:
+                counted[0] += 1
+                if counted[0] - 1 == at:
+                    raise cut
+            return points
+
+        def calls(frame, event, arg):
+            if event == 'call' and (frame.f_code in codes if codes is not None else frame.f_code.co_filename in self.FILES):
+                if kinds == self.INSTRUCTIONS:
+                    frame.f_trace_opcodes = True
+                    frame.f_trace_lines = False
+                return points(frame, event, arg)
+            return None
+        before = sys.gettrace()
+        sys.settrace(calls)
+        try:
+            run()
+        finally:
+            sys.settrace(before)
+        return counted[0]
+
+    def lost_at_instructions(self) -> tuple:
+        """``(how many instruction events a small function has, at how many of them an exception raised from the
+        event did not reach the function)`` on this interpreter."""
+        def helper(box):
+            box.append('h')
+
+        def subject(box):
+            while True:
+                try:
+                    helper(box)
+                    box.append('b')
+                    break
+                except BaseException as exc:  # noqa: BLE001 - the probe's own
+                    box.append(exc)
+            return len(box)
+        codes = (subject.__code__, helper.__code__)
+        self.traced(lambda: subject([]), self.INSTRUCTIONS, codes)        # the first run sees none
+        total = self.traced(lambda: subject([]), self.INSTRUCTIONS, codes)
+        lost = 0
+        for at in range(total):
+            box, cut = [], KeyboardInterrupt(at)
+            try:
+                self.traced(lambda: subject(box), self.INSTRUCTIONS, codes, at, cut)
+                lost += cut not in box
+            except KeyboardInterrupt:
+                pass
+        return total, lost
+
+    def walk(self, region, kinds) -> None:
+        make, call, lock_of, finished = self.REGIONS[region]
+        counts = []
+        for _ in range(3):                  # the first run of a function sees no instruction events
+            subject = make(self)            # made before the tracing starts, as in every run below
+            counts.append(self.traced(lambda: call(subject), kinds))
+        total = counts[-1]
+        self.assertEqual(counts[1], total, 'the count is the same from one run to the next')
+        self.assertGreater(total, 8, 'the walk saw the region')
+        unfinished = []
+        for at in range(total):
+            subject = make(self)
+            lock, cut, raised = lock_of(subject), KeyboardInterrupt(f'{region}, point {at}'), None
+            try:
+                self.traced(lambda: call(subject), kinds, None, at, cut)
+            except BaseException as exc:  # noqa: BLE001 - what the region raised is what is looked at
+                raised = exc
+            with self.subTest(region=region, by=kinds[-1], point=at):
+                self.assertIs(raised, cut, 'the interruption reaches the caller, the same object')
+                self.assertFalse(lock._is_owned(), 'this thread owns nothing when the call ends')
+                taken: list = []
+                other = threading.Thread(target=lambda: taken.append(lock.acquire(timeout=BOUND_S) and (lock.release() or True)),
+                                         daemon=True)
+                other.start()
+                other.join(BOUND_S)
+                self.assertEqual(taken, [True], 'another thread can take the lock')
+                if not finished(subject):
+                    unfinished.append(at)
+                call(subject)               # uninterrupted: it returns, and the work is done
+                self.assertEqual((finished(subject), lock._is_owned()), (True, False))
+        # The work was left undone only by an interruption that landed before the region was entered: on the
+        # first points of the run, with none in between that finished it.
+        self.assertEqual(unfinished, list(range(len(unfinished))), 'only the first points leave the work to be done again')
+        self.assertLess(len(unfinished), total // 2, 'and they are few: once entered, the region always finishes')
+
+    def straight(self, module, owner, name) -> None:
+        """The region ``owner.name`` of ``module`` is written as OWNERSHIP says: one loop, the region's own, with
+        nothing in it but one try; and between that try and its one except no loop, no try and no with, because
+        the interpreter leaves the first instruction of a nested try and a nested loop's jump back outside the
+        handler."""
+        tree = ast.parse(pathlib.Path(module.__file__).read_text(encoding='utf-8'))
+        function, = [node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == owner
+                     for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        loop, = [node for node in function.body if isinstance(node, ast.While)]
+        self.assertEqual([type(node) for node in loop.body], [ast.Try], "the region's loop holds the try and nothing else")
+        region = loop.body[0]
+        nested = [type(node).__name__ for part in region.body for node in ast.walk(part)
+                  if isinstance(node, (ast.While, ast.For, ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith))]
+        self.assertEqual(nested, [], 'no loop, no try and no with is written between the try and its except')
+        self.assertEqual((len(region.handlers), region.orelse, region.finalbody), (1, [], []), 'one except; no else, no finally')
+
+    def by_instruction(self, region) -> None:
+        total, lost = self.lost_at_instructions()
+        if lost:
+            self.skipTest(f'this interpreter does not deliver an exception raised at an instruction event at {lost} of '
+                          f'{total} instructions of a small function; the walk by event covers this region')
+        self.walk(region, self.INSTRUCTIONS)
+
+
+class OwnershipRegionTest(RegionWalk, unittest.TestCase):
+    """Every traceable point of each protected region, interrupted there once (the comment OWNERSHIP in
+    ``control/hooks.py``). Three reads in a row found the point just past the last repair; this walks them all,
+    so that the next one is found here.
+
+    For each of the four regions a run with no interruption is traced, counting what executes in the module's own
+    code between the region's entry and its return: the region itself, the helpers that take an ownership and
+    raise what was kept, and for the lifecycle the whole teardown under it, the gate's close and drain included.
+    Then the region is run once for each point counted, with a KeyboardInterrupt raised exactly there. Each time:
+
+    - the interruption is raised to the caller, the same object: never swallowed;
+    - this thread owns nothing when the call ends, and another thread can take the lock;
+    - the work is finished, or nothing of it was done and the call can simply be made again. The second happens
+      only where the interruption landed before the region was entered, which is asserted: those points are the
+      first ones of the run, with none in between that finished the work;
+    - a second call, uninterrupted, returns and leaves the work done.
+
+    HOW THE INTERRUPTION IS DELIVERED, which is the standard a region is held to: by the trace function
+    (``sys.settrace``). The KeyboardInterrupt is raised from the trace callback of the event or instruction it is
+    aimed at, and so appears in the traced frame exactly there. That is stricter than a real signal, which the
+    interpreter delivers only where it looks for one (a call, a loop's jump back, a function's first
+    instruction): a point that nothing but a trace callback reaches is walked and held like every other, so the
+    standard does not depend on where an interpreter happens to look.
+
+    The points are walked twice. Once by EVENT (every call, line and return), on every interpreter. Once by
+    INSTRUCTION (every bytecode instruction), where the interpreter delivers an exception raised at an instruction
+    event at all of them; that is measured here first, on a small function, and where it is not so the walk by
+    instruction is skipped and says how many it would have lost. (Measured on Nov 14, 2026: 3.12.3 delivers all;
+    free-threaded 3.14.8 does not deliver 9 of the small function's 24.) The first traced run of a function sees no instruction events
+    on either, so every count is taken on a later run.
+
+    WHAT PURE PYTHON CANNOT PROTECT, and this test therefore does not visit: a second interruption that lands
+    while the first is being put away (the instructions of the ``except`` clause and the way back to the top of
+    the loop execute only after an interruption); and whatever the lock's own acquire and release do inside
+    themselves (one call into C each, for ``threading.RLock``). The release CALL is inside the region and is
+    walked like every other point."""
+
+    def lifecycle(self):
+        """Hooks with a store open and two services started (two, so that every loop of the teardown goes round
+        and its jump back is walked), cheap enough to make a few hundred times."""
+        class Store:
+            closed = False
+
+            def close(inner) -> None:
+                inner.closed = True
+        made, store = H.Hooks(), Store()
+        made.service(Service('events', []))
+        made.service(Service('sessions', []))
+        made.set('event_store', lambda state_dir: store)
+        made.freeze()
+        made.open_store('/state')
+        made.start_services(H.ServiceContext())
+        return made, store
+
+    def draining(self):
+        """A gate that is closed with one call inside, which leaves the second time the drain waits for it: the
+        wait goes round once, so its jump back is walked."""
+        gate = H.Admission()
+        gate.enabled = True
+        gate.enter()
+        gate.close()
+        waits: list = []
+
+        def waiting(timeout=None):      # the call leaves, as another thread's would: the test's own stand-in
+            waits.append(timeout)
+            if len(waits) > 1:
+                gate._admitted = 0
+            return True
+        gate._changed.wait = waiting
+        return gate
+
+    REGIONS = {
+        'Admission.close': (lambda self: self.gate(), lambda gate: gate.close(), lambda gate: gate._lock, lambda gate: gate.closed),
+        'Admission.drain': (lambda self: self.draining(), lambda gate: gate.drain(), lambda gate: gate._lock,
+                            lambda gate: gate.admitted == 0),
+        'Hooks.stop_services': (lambda self: self.lifecycle(), lambda pair: pair[0].stop_services(H.ServiceContext()),
+                                lambda pair: pair[0]._lifecycle, lambda pair: pair[0]._started == []),
+        'Hooks.finish_close': (lambda self: self.lifecycle(), lambda pair: pair[0].finish_close(H.ServiceContext()),
+                               lambda pair: pair[0]._lifecycle,
+                               lambda pair: pair[1].closed and pair[0]._started == [] and pair[0].gate.closed),
+    }
+
+    def gate(self):
+        gate = H.Admission()
+        gate.enabled = True
+        return gate
+
+    def test_the_four_regions_have_no_loop_and_no_try_written_in_them(self) -> None:
+        for owner, name in (('Admission', 'close'), ('Admission', 'drain'), ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
+            with self.subTest(region=f'{owner}.{name}'):
+                self.straight(H, owner, name)
+
+    @quiet
+    def test_the_gates_close_at_every_event(self) -> None:
+        self.walk('Admission.close', self.EVENTS)
+
+    @quiet
+    def test_the_gates_drain_at_every_event(self) -> None:
+        self.walk('Admission.drain', self.EVENTS)
+
+    @quiet
+    def test_stopping_the_services_at_every_event(self) -> None:
+        self.walk('Hooks.stop_services', self.EVENTS)
+
+    @quiet
+    def test_the_close_of_the_lifecycle_at_every_event(self) -> None:
+        self.walk('Hooks.finish_close', self.EVENTS)
+
+    @quiet
+    def test_the_gates_close_at_every_instruction(self) -> None:
+        self.by_instruction('Admission.close')
+
+    @quiet
+    def test_the_gates_drain_at_every_instruction(self) -> None:
+        self.by_instruction('Admission.drain')
+
+    @quiet
+    def test_stopping_the_services_at_every_instruction(self) -> None:
+        self.by_instruction('Hooks.stop_services')
+
+    @quiet
+    def test_the_close_of_the_lifecycle_at_every_instruction(self) -> None:
+        self.by_instruction('Hooks.finish_close')
 
 
 class LifecycleTest(unittest.TestCase):
@@ -2933,59 +3565,61 @@ class LifecycleTest(unittest.TestCase):
 
     @quiet
     def test_an_interruption_while_the_drain_takes_its_condition_does_not_end_the_wait(self) -> None:
-        """The second reads' witness. The drain is interrupted as it TAKES the admission condition, not while it
-        waits on it, with one call inside. The close goes on waiting: nothing is stopped and the store stays
-        open until the call has left. (The close used to take the interruption as the end of the drain.)"""
-        made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store))
-        context = H.ServiceContext()
-        made.open_store('/state')
-        made.start_services(context)
-        self.assertTrue(made.gate.enter())                 # a call is inside
-        condition, drain, stop = made.gate._changed, made.gate.drain, events.stop
-        moved_on, admitted_at_teardown, state = threading.Event(), [], {'draining': False, 'taken': 0}
+        """The second reads' witness, and the third's. The drain is interrupted as it TAKES the admission
+        condition, not while it waits on it, with one call inside: before the condition is taken, and after it
+        was taken. The close goes on waiting: nothing is stopped and the store stays open until the call has
+        left. Afterwards the condition is free. (The close once took the interruption as the end of the drain,
+        and then left the condition owned.)"""
+        for when in ('before', 'after'):
+            made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store))
+            context = H.ServiceContext()
+            made.open_store('/state')
+            made.start_services(context)
+            self.assertTrue(made.gate.enter())                 # a call is inside
+            lock = watch(made.gate)
+            drain, stop, wait = made.gate.drain, events.stop, made.gate._changed.wait
+            # No schedule decides this. After the interruption the close moves on in one of two ways: it waits
+            # (right) or it begins to tear down (wrong). Either sets ``moved_on``, and what the teardown saw is
+            # written down at the moment it begins.
+            moved_on, admitted_at_teardown, outcome, armed = threading.Event(), [], [], [when]
 
-        class InterruptedOnce:
-            def __enter__(self):
-                if state['draining']:
-                    state['taken'] += 1
-                    if state['taken'] == 1:
-                        raise KeyboardInterrupt        # as a signal would, while the drain asks for the condition
-                    moved_on.set()                     # the drain asked again: it went on
-                return condition.__enter__()
+            def draining():
+                if armed:                                       # once: as a signal would, while the drain asks for the condition
+                    lock.interrupt_next = armed.pop()
+                return drain()
 
-            def __exit__(self, *exc):
-                return condition.__exit__(*exc)
+            def waiting(timeout=None):
+                moved_on.set()
+                return wait(timeout)
 
-            def __getattr__(self, name):
-                return getattr(condition, name)
+            def stopping(context):
+                admitted_at_teardown.append(made.gate.admitted)
+                moved_on.set()
+                return stop(context)
 
-        def draining():
-            state['draining'] = True
-            return drain()
-
-        def stopping(context):
-            admitted_at_teardown.append(made.gate.admitted)
-            moved_on.set()
-            return stop(context)
-        made.gate._changed, made.gate.drain, events.stop = InterruptedOnce(), draining, stopping
-        outcome = []
-
-        def close():
-            try:
-                made.finish_close(context)
-                outcome.append('returned')
-            except KeyboardInterrupt:
-                outcome.append('interrupted')
-        closer = threading.Thread(target=close, daemon=True)
-        closer.start()
-        self.assertTrue(moved_on.wait(BOUND_S), 'the close went on after the interruption, one way or the other')
-        self.assertEqual((admitted_at_teardown, store.closed, outcome), ([], False, []),
-                         'it went on WAITING: nothing is torn down while the call is inside')
-        state['draining'] = False                          # the test's own leave is not the drain
-        made.gate.leave()
-        closer.join(BOUND_S)
-        self.assertEqual((outcome, admitted_at_teardown, events.stop_calls, alive_at_close, store.closed),
-                         (['interrupted'], [0], 1, [[]], True), 'the interruption is raised once everything is torn down')
+            def close():
+                try:
+                    made.finish_close(context)
+                    outcome.append('returned')
+                except KeyboardInterrupt:
+                    outcome.append('interrupted')
+            made.gate.drain, made.gate._changed.wait, events.stop = draining, waiting, stopping
+            closer = threading.Thread(target=close, daemon=True)
+            with self.subTest(interrupted=when):
+                closer.start()
+                self.assertTrue(moved_on.wait(BOUND_S), 'the close went on after the interruption, one way or the other')
+                self.assertEqual((admitted_at_teardown, store.closed, outcome), ([], False, []),
+                                 'it went on WAITING: nothing is torn down while the call is inside')
+                # The call leaves from a thread of its own, with a bound: a condition that the interrupted drain
+                # left owned would hold the leaving for ever, and that must fail this test, not stop the run.
+                leaver = threading.Thread(target=made.gate.leave, daemon=True)
+                leaver.start()
+                leaver.join(BOUND_S)
+                self.assertFalse(leaver.is_alive(), 'the call could leave: the drain waits with the condition free')
+                closer.join(BOUND_S)
+                self.assertEqual((outcome, admitted_at_teardown, events.stop_calls, alive_at_close, store.closed),
+                                 (['interrupted'], [0], 1, [[]], True), 'the interruption is raised once everything is torn down')
+                self.assertEqual((lock._is_owned(), answered_from_another_thread(self, made.gate)), (False, [False]))
 
     def test_a_second_close_that_is_interrupted_while_it_waits_for_the_first_goes_on_waiting(self) -> None:
         made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
@@ -3033,12 +3667,85 @@ class LifecycleTest(unittest.TestCase):
         again.join(BOUND_S)
         self.assertFalse(again.is_alive(), 'another caller is not left waiting for a lifecycle nobody holds')
 
+    def test_the_two_helpers_that_take_an_ownership_keep_their_own_word(self) -> None:
+        """``take_once`` and ``own_teardown`` are called inside their callers' protected regions, which would by
+        themselves make up for a helper that let an interruption through or forgot to refuse. Their own word is
+        held here, directly: the lock comes back held exactly once however the taking is interrupted, with the
+        interruption kept; and the thread that already owns a teardown is refused, with nothing taken."""
+        for helper in (H.take_once, H.own_teardown):
+            for when in ('before', 'after'):
+                lock, kept = WatchedLock(), []
+                lock.interrupt_next = when
+                with self.subTest(helper=helper.__name__, interrupted=when):
+                    helper(lock, kept)
+                    self.assertEqual(([type(exc) for exc in kept], lock._is_owned()), ([KeyboardInterrupt], True))
+                    lock.release()
+                    self.assertFalse(lock._is_owned(), 'held once: one release frees it')
+        lock = WatchedLock()
+        lock.acquire()
+        with self.assertRaises(H.HookError):
+            H.own_teardown(lock, [])
+        lock.release()
+        self.assertFalse(lock._is_owned(), 'the refusal took nothing')
+
+    @quiet
+    def test_an_interruption_on_the_way_back_from_taking_the_lifecycle_is_inside_the_protected_region(self) -> None:
+        """The third reads of the calls. ``finish_close`` and ``stop_services`` are interrupted as the helper that
+        takes the lifecycle is entered (nothing is taken yet), at its return (the lifecycle is taken), and at the
+        first line after it. Each time the teardown is complete before the interruption is raised (the service has
+        stopped; for the close, the store is closed too), and the lifecycle is free: a later call from another
+        thread returns. Before, the interruption escaped with the lifecycle owned, and every later close was
+        refused on this thread and waited for ever on any other."""
+        for step, first_line in (('finish_close', 'self._teardown(context, errors)'),
+                                 ('stop_services', 'self._stop_all(context, errors)')):
+            method = getattr(H.Hooks, step)
+            lines, start = inspect.getsourcelines(method)
+            target = start + next(index for index, line in enumerate(lines) if first_line in line)
+            for where in ('the call of the taking', 'the return of the taking', 'the first line after it'):
+                log: list = []
+                store = FakeStore(log)
+                made = H.Hooks()
+                made.service(Service('events', log))
+                made.set('event_store', lambda state_dir, store=store: store)
+                made.freeze()
+                context = H.ServiceContext()
+                made.open_store('/state')
+                made.start_services(context)
+                fired: list = []
+
+                def trace(frame, event, arg, code=method.__code__, target=target, where=where, fired=fired):
+                    taking = frame.f_code is H.own_teardown.__code__ and frame.f_back.f_code is code
+                    if not fired and ((where == 'the call of the taking' and event == 'call' and taking)
+                                      or (where == 'the return of the taking' and event == 'return' and taking)
+                                      or (where == 'the first line after it' and event == 'line'
+                                          and frame.f_code is code and frame.f_lineno == target)):
+                        fired.append(where)
+                        raise KeyboardInterrupt(where)
+                    return trace
+                with self.subTest(step=step, interrupted_at=where):
+                    before = sys.gettrace()
+                    sys.settrace(trace)
+                    try:
+                        with self.assertRaises(KeyboardInterrupt):
+                            getattr(made, step)(context)
+                    finally:
+                        sys.settrace(before)
+                    done = [(what, name) for what, name, _ in log if what in ('stop', 'close')]
+                    self.assertEqual((fired, made._lifecycle._is_owned()), ([where], False))
+                    self.assertEqual(done, [('stop', 'events'), ('close', 'store')] if step == 'finish_close' else [('stop', 'events')],
+                                     'the teardown was complete when the interruption was raised')
+                    later: list = []
+                    other = threading.Thread(target=lambda: later.append(made.finish_close(context)), daemon=True)
+                    other.start()
+                    other.join(BOUND_S)
+                    self.assertEqual((later, store.closed), ([None], True), 'a later close from another thread returns')
+
     @unittest.skipUnless(hasattr(signal, 'pthread_kill'), 'needs a signal that can be aimed at one thread')
     def test_a_real_interrupt_while_a_close_waits_for_the_lifecycle_is_kept_until_the_owner_has_finished(self) -> None:
         """The same with a real SIGINT, sent to this thread while it waits for the lifecycle that another close
-        owns. On a runtime where a blocked lock is interrupted by a signal, the interruption is kept and the
-        wait begins again; on one where it is not (free-threaded 3.14 on this machine), the interruption
-        arrives once the lock has been taken. Either way it is raised only after the owner has finished."""
+        owns. The signal may interrupt the blocked wait, and the wait then begins again; or it may arrive once
+        the lock has been taken. The test does not depend on which: either way the interruption is raised only
+        after the owner has finished."""
         if threading.current_thread() is not threading.main_thread():
             self.skipTest('a signal is handled by the main thread only')
         made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
@@ -3114,6 +3821,77 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual((events.stop_calls, alive_at_close, store.closed), (3, [[]], True))
 
     @quiet
+    def test_the_clean_up_of_a_failed_start_keeps_what_interrupts_it(self) -> None:
+        """The third read's finding B. A service's start fails, or closing begins while the services start. The
+        ones already started are stopped, and the stop of one is interrupted once. Every service is stopped all
+        the same, and what the start raises is the interruption, before the start's own ordinary error."""
+        for why in ('a start that fails', 'closing that begins'):
+            log = []
+
+            class Closes(Service):
+                def start(inner, context):
+                    super().start(context)
+                    made.begin_close()
+            first = WorkerService('events', FakeStore(), fail_stops=1, failure=KeyboardInterrupt)
+            second = Service('sessions', log, fail_start=True) if why == 'a start that fails' else Closes('sessions', log)
+            made = H.Hooks()
+            for service in (first, second, Service('queue', log)):
+                made.service(service)
+            made.freeze()
+            made.stop_retry_s = 0
+            self.addCleanup(first._quit.set)
+            with self.subTest(why=why):
+                with self.assertRaises(KeyboardInterrupt):
+                    made.start_services(H.ServiceContext())
+                self.assertEqual((first.stop_calls, first.alive(), made._started), (2, False, []),
+                                 'the interrupted stop was tried again, and nothing is left tracked')
+                self.assertNotIn(('start', 'queue'), [(what, name) for what, name, _ in log], 'and no later service was started')
+
+    def test_every_lifecycle_entry_refuses_the_thread_that_is_already_inside_one(self) -> None:
+        """The third read's finding D. A store's factory, a service's start and a service's stop each call the
+        two entries the refusal had been left off, ``open_store`` and ``start_services``, from inside a
+        lifecycle method. Each is refused: no second store is made and no service is started twice."""
+        seen, stores, asked = [], [], set()
+
+        def reenter(where):
+            if where in asked:           # once from each place, whatever comes of it: an entry that did re-enter ends, and is seen
+                return
+            asked.add(where)
+            for entry, argument in ((made.open_store, '/again'), (made.start_services, H.ServiceContext())):
+                try:
+                    entry(argument)
+                    seen.append((where, entry.__name__, 'ran'))
+                except H.HookError:
+                    seen.append((where, entry.__name__, 'refused'))
+
+        def factory(state_dir):
+            reenter('factory')
+            stores.append(FakeStore())
+            return stores[-1]
+
+        class Reenters(Service):
+            def start(inner, context):
+                reenter('start')
+                super().start(context)
+
+            def stop(inner, context):
+                reenter('stop')
+                super().stop(context)
+        log = []
+        made = H.Hooks()
+        made.service(Reenters('events', log))
+        made.set('event_store', factory)
+        made.freeze()
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        made.finish_close(context)
+        self.assertEqual(seen, [(where, entry, 'refused') for where in ('factory', 'start', 'stop')
+                                for entry in ('open_store', 'start_services')])
+        self.assertEqual((len(stores), stores[0].closed, [(what, name) for what, name, _ in log]),
+                         (1, True, [('start', 'events'), ('stop', 'events')]), 'one store, one start, one stop')
+
+    @quiet
     def test_a_service_whose_stop_failed_is_still_tracked_while_its_stop_is_tried_again(self) -> None:
         tracked = []
 
@@ -3156,10 +3934,32 @@ class AncestorDiscoveryTest(unittest.TestCase):
     """A registrant whose parent's own parent is not installed is absent, not broken (the read's note 4)."""
 
     def test_an_absent_ancestor_is_absence_and_a_broken_installed_one_fails(self) -> None:
+        """Whatever lanes this tree has, now or later. Every registrant that is really here gets a stand-in that
+        registers nothing, and the ancestor's absence is made for the test: where the composition asks whether
+        that package, or anything below it, is there, it is told no. (It used to rely on that package not being
+        in the tree, and on no lane having landed at all: a real registrant's methods made it fail.) Then the
+        ancestor is installed and broken, as a fake under its real name, and the composition fails.
+
+        So that the stand-ins are held by this test itself, a module that plays another lane's real registrant
+        is in the tree before the fixture is made: without the stand-ins its engine would be composed."""
+        ancestor = 'recursion_core.control.mcp'
+        landed(self, LANDED_WITH_AN_ENGINE)
         fake = FakeLanes(self)
-        self.assertIsNone(importlib.util.find_spec('recursion_core.control.mcp'), 'that ancestor is absent in this tree')
-        made = H.compose()
-        self.assertEqual(made.methods.registered(), ())
+        fake.stand_in_for_the_installed()
+        find_spec, asked = importlib.util.find_spec, []
+
+        def absent(name, package=None):
+            asked.append(name)
+            return None if name == ancestor or name.startswith(ancestor + '.') else find_spec(name, package)
+        before = set(sys.modules)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            made = H.compose()
+        self.assertEqual((made.methods.registered(), made.commands.names(), made.engines.names()),
+                         ((), (), ('claude_code', 'codex')))
+        self.assertEqual([name for name in asked if name.startswith(ancestor)], [ancestor],
+                         'absent is decided at the ancestor: the module below it is not asked for')
+        self.assertEqual({name for name in set(sys.modules) - before if name.startswith(ancestor)}, set(),
+                         'and nothing of it is imported')
         fake.lane('control.mcp', init='raise RuntimeError("this package does not import")\n')
         with self.assertRaises(H.HookError):
             H.compose()
@@ -3330,6 +4130,7 @@ class CliSeamTest(unittest.TestCase):
         five = (['list'], ['status', 'run-1'], ['stop', 'run-1'],
                 ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p'], ['conditions'])
         self.assertEqual(tuple(argv[0] for argv in five), commands.BUILT_IN)
+        self.assertEqual(cli.BUILT_IN, commands.BUILT_IN, "the CLI's own five are the names no family may register")
         for argv in five:
             with self.subTest(argv=argv):
                 client = Client()
@@ -3349,6 +4150,46 @@ class CliSeamTest(unittest.TestCase):
                     self.assertEqual(cli.run(argv, lambda: client), cli.EXIT_ERROR)
                 self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
                 self.assertEqual(client.calls, [])
+
+
+class CliImportTest(unittest.TestCase):
+    """What importing the CLI loads, in a process of its own: the five commands cost what they cost before the
+    seams, so none of the seam modules is loaded for them. (It is told in a fresh process because this one has
+    them all loaded already.)"""
+
+    SEAM_MODULES = {'recursion_core.control.hooks', 'recursion_core.control.methods', 'recursion_core.control.commands',
+                    'recursion_core.routes.engines'}
+    CODE = (
+        "import contextlib, io, json, sys\n"
+        "from recursion_core.control import cli\n"
+        "class Client:\n"
+        "    def call(self, method, params=None):\n"
+        "        return {'code': 'ok', 'runs': []}\n"
+        "loaded = {'import': sorted(name for name in sys.modules if name.startswith('recursion_core'))}\n"
+        "statuses = []\n"
+        "for argv in (['list'], ['status', 'run-1'], ['stop', 'run-1'],\n"
+        "             ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p'], ['conditions']):\n"
+        "    with contextlib.redirect_stdout(io.StringIO()):\n"
+        "        statuses.append(cli.run(argv, Client))\n"
+        "loaded['five'] = sorted(name for name in sys.modules if name.startswith('recursion_core'))\n"
+        "with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):\n"
+        "    statuses.append(cli.run(['session', 'ses-1'], Client))\n"
+        "loaded['other'] = sorted(name for name in sys.modules if name.startswith('recursion_core'))\n"
+        "print(json.dumps({'loaded': loaded, 'statuses': statuses}))\n")
+
+    def test_the_cli_and_its_five_commands_load_none_of_the_seam_modules(self) -> None:
+        core = str(pathlib.Path(H.__file__).resolve().parents[2])
+        done = subprocess.run([sys.executable, '-B', '-c', self.CODE], capture_output=True, text=True, check=False,
+                              env={**os.environ, 'PYTHONPATH': core})
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        told = json.loads(done.stdout)
+        self.assertEqual(told['statuses'][:5], [cli.EXIT_OK] * 5, 'each of the five ran')
+        for when in ('import', 'five'):
+            self.assertEqual(self.SEAM_MODULES & set(told['loaded'][when]), set(), f'after {when}')
+        self.assertIn('recursion_core.control.cli', told['loaded']['import'])
+        # Anything else needs the families: only then are the seam modules brought in.
+        self.assertEqual(told['statuses'][5], cli.EXIT_USAGE, 'a name nobody registered, with nothing installed')
+        self.assertLessEqual({'recursion_core.control.hooks', 'recursion_core.control.commands'}, set(told['loaded']['other']))
 
 
 KEYED = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'client_key': 'k1'}
@@ -3479,8 +4320,11 @@ class StartPathOnTest(unittest.TestCase):
         made.freeze()
         return made
 
-    def api(self, starter=None, routing=True, ids=None):
-        return control_api(self.registry, starter, start_hooks=self.hooks(routing), ids=ids)
+    def api(self, starter=None, routing=True, ids=None, comparator=lambda entry: True):
+        """``comparator`` stands in for the composition's own word that it would launch exactly the entry a
+        registrant chose (PROVISIONAL: the binary rule). These tests are about the start path, so theirs says yes
+        to every entry; a control API that is given none refuses every chosen entry, which has a test of its own."""
+        return control_api(self.registry, starter, start_hooks=self.hooks(routing), ids=ids, launchable=comparator)
 
     def ran(self) -> list:
         return [name for name, *_ in self.log]
@@ -3643,6 +4487,29 @@ class StartPathOnTest(unittest.TestCase):
         after = registry.get('run-1')
         self.assertEqual((after['launch'], after['principal'], after['start_key']), (kept['launch'], kept['principal'], kept['start_key']))
         self.assertEqual(len(registry.list()), 1)
+
+    def test_with_nobody_to_compare_a_chosen_entry_is_refused_on_a_new_start_and_on_a_relaunch(self) -> None:
+        """PROVISIONAL, with the binary rule. A control API that was given no comparator cannot say that the
+        composition would launch exactly the entry a registrant chose, so it lets none through unchecked: a new
+        start stores nothing, and a relaunch writes no new starting intent and reaches no starter."""
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}
+        refused = {'code': 'unavailable', 'detail': 'start_registrant_failed'}
+        api, registry, starter = self.api(comparator=None)
+        self.assertEqual(api.call('run.start', request), refused)
+        self.assertEqual((registry.list(), starter.calls), ([], []))
+        # A record made while there was a comparator, whose start failed. Its retry comes to an API with none.
+        api, registry, starter = self.api(Recorder(fail=1))
+        self.assertEqual(api.call('run.start', request)['code'], 'start_failed')
+        kept = registry.get('run-1')
+        self.assertEqual(kept['launch']['route_entry'], entry('codex'))
+        later = Recorder()
+        with_none, _, _ = control_api(registry, later, start_hooks=self.hooks(), ids=iter(("run-2",)).__next__)
+        self.assertEqual(with_none.call('run.start', request), refused)
+        self.assertEqual((registry.get('run-1'), later.calls, self.ran()), (kept, [], ['routing', 'workspace'] * 2),
+                         'the stored record is as it was, nothing was launched and no registrant ran again')
+        # A start for which no registrant chose an entry has nothing to compare, and needs nobody.
+        named = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'hand_pick': {'engine': 'none'}}
+        self.assertEqual(with_none.call('run.start', named)['code'], 'started')
 
     def test_a_failed_start_that_was_stopped_and_an_unconfirmed_one_are_answered_as_the_base_answers_them(self) -> None:
         api, registry, starter = self.api(Recorder(fail=2))

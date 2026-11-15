@@ -82,7 +82,6 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
-from recursion_core.control.hooks import INTENT_VERSION, OWNER
 from recursion_core.control.registry import (
     EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
 )
@@ -295,6 +294,9 @@ class ControlAPI:
         nowhere else; nothing of either is copied from the params. A relaunch of a failed start uses the stored
         record as it is: no registrant runs again.
         """
+        # Imported here and not at the top: a client that only reads or stops (the CLI's five commands among them)
+        # never comes this way, and must not pay for the seam modules it does not use.
+        from recursion_core.control.hooks import INTENT_VERSION, OWNER
         hooks = self._start_hooks
         principal = OWNER if principal is None else principal
         key, engine = params.get("client_key"), params.get("engine")
@@ -333,7 +335,9 @@ class ControlAPI:
                 # route entry, a registrant-selected entry whose binary differs from the composed adapter's binary
                 # is rejected before the launch intent is persisted. A selected binary is never persisted while a
                 # different one is launched. It is invalid registrant output, not a launch failure: no run exists.
-                if self._launchable is not None and not self._launchable(entry):
+                # With nobody to compare (no ``launchable`` was given), a selected entry is refused: it is never
+                # let through unchecked.
+                if self._launchable is None or not self._launchable(entry):
                     return {"code": "unavailable", "detail": "start_registrant_failed"}
             if launched_engine is None:
                 return {"code": REQUEST_INVALID, "detail": "engine"}  # none named, and no registrant chose one
@@ -357,7 +361,7 @@ class ControlAPI:
                 # registrant runs again and the stored record is left exactly as it was.
                 stored_launch = rec.get("launch")
                 entry = stored_launch.get("route_entry") if isinstance(stored_launch, dict) else None
-                if entry is not None and self._launchable is not None and not self._launchable(entry):
+                if entry is not None and (self._launchable is None or not self._launchable(entry)):
                     return {"code": "unavailable", "detail": "start_registrant_failed"}
                 rec.update(state="starting", cgroup=None, started_at=self._clock())
             if self._commit(rec) != "ok":

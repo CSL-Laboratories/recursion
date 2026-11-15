@@ -25,8 +25,7 @@ import sys
 from collections.abc import Callable
 from typing import TextIO
 
-from recursion_core.control.commands import BUILT_IN, CommandTableError
-from recursion_core.tui.protocol import answer_conditions, list_all_runs
+from recursion_core.tui.protocol import COMMANDS as BUILT_IN, answer_conditions, list_all_runs
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PENDING, EXIT_UNKNOWN = 0, 1, 2, 3, 4
 _EXIT = {"ok": EXIT_OK, "started": EXIT_OK, "stopped": EXIT_OK, "pending": EXIT_PENDING, "run_unknown": EXIT_UNKNOWN}
@@ -67,19 +66,23 @@ def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = N
     """
 
     out, err = out or sys.stdout, err or sys.stderr
+    command_errors: tuple = ()
+    if commands is not None:  # only a table brings its module in: the five commands import what they did before
+        from recursion_core.control.commands import CommandTableError
+        command_errors = (CommandTableError,)
     try:
         ns = _parser(commands).parse_args(argv)
     except _Usage as exc:
         print(f"usage error: {exc}", file=err)
         return EXIT_USAGE
-    except CommandTableError as exc:  # a family's parser broke the table's rules: no command runs, its own included
+    except command_errors as exc:  # a family's parser broke the table's rules: no command runs, its own included
         print(json.dumps({"code": "control_api_unavailable", "detail": f"commands:{exc}"}), file=out)
         return EXIT_ERROR
     if commands is not None and ns.command in commands:
         ns.out, ns.err = out, err
         try:
             return commands.dispatch(ns, api)
-        except CommandTableError as exc:  # the command gave no exit status
+        except command_errors as exc:  # the command gave no exit status
             print(json.dumps({"code": "control_api_unavailable", "detail": f"commands:{exc}"}), file=out)
             return EXIT_ERROR
     if ns.command == "conditions":  # no state between invocations, so read the list, then show its conditions

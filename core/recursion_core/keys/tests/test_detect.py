@@ -11,12 +11,17 @@ from recursion_core.keys.system import Completed, System, detect
 from recursion_core.keys.tests.support import MARKER, FakeSystem, busctl, needs_posix
 
 
-def dbus_send(owner=False, activatable=False):
+def dbus_send(owner=False, activatable=False, kwallet=False):
+    """A stand-in ``dbus-send --print-reply``: ``ListNames`` and ``ListActivatableNames`` as it prints them."""
     def run(argv, input):
-        if any(a.endswith('NameHasOwner') for a in argv):
-            return Completed(0, f'method return time=1 sender=x\n   boolean {"true" if owner else "false"}\n'.encode(), b'')
-        names = '      string "org.freedesktop.DBus"\n' + ('      string "org.freedesktop.secrets"\n' if activatable else '')
-        return Completed(0, f'method return time=1\n   array [\n{names}   ]\n'.encode(), b'')
+        names = ['org.freedesktop.DBus']
+        listing = argv[-1].endswith('.ListNames')
+        if (listing and owner) or (not listing and activatable):
+            names.append('org.freedesktop.secrets')
+        if listing and kwallet:
+            names.append('org.kde.kwalletd5')
+        body = ''.join(f'      string "{name}"\n' for name in names)
+        return Completed(0, f'method return time=1 sender=x\n   array [\n{body}   ]\n'.encode(), b'')
     return run
 
 
@@ -52,6 +57,23 @@ class DetectTest(unittest.TestCase):
         bus = 'unix:path=/fake/bus'
         self.assertEqual(self.detect(tools={'busctl': busctl()}, bus=bus), 'owner_file')
         self.assertEqual(self.detect(tools={'dbus-send': dbus_send()}, bus=bus), 'owner_file')
+
+    def test_kwallet_without_its_secret_service_interface_is_refused_not_answered_with_the_file(self) -> None:
+        bus = 'unix:path=/fake/bus'
+        for tools in ({'busctl': busctl(kwallet=True)}, {'dbus-send': dbus_send(kwallet=True)}):
+            with self.subTest(tools=sorted(tools)), self.assertRaises(KeyStoreError) as caught:
+                self.detect(tools={**tools, 'secret-tool': failing}, bus=bus)
+            self.assertEqual(caught.exception.code, 'keychain_unsupported')
+        self.assertEqual(self.detect(tools={'busctl': busctl(owner=True, kwallet=True), 'secret-tool': failing},
+                                     bus=bus), 'secret_service')
+
+    def test_a_listing_that_does_not_add_up_is_refused(self) -> None:
+        def wrong_count(argv, input):
+            return Completed(0, b'as 3 "org.freedesktop.DBus" "org.freedesktop.secrets"', b'')
+
+        with self.assertRaises(KeyStoreError) as caught:
+            self.detect(tools={'busctl': wrong_count, 'secret-tool': failing}, bus='unix:path=/fake/bus')
+        self.assertEqual(caught.exception.code, 'keychain_undetermined')
 
     def test_a_keychain_without_secret_tool_is_refused_not_answered_with_the_file(self) -> None:
         with self.assertRaises(KeyStoreError) as caught:

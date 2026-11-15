@@ -11,7 +11,8 @@ owned by that user, with one link. Each is checked on EVERY open, through the de
   refused, and a FIFO planted in a file's place cannot block the open; it is then refused as not regular;
 - a file is written to a fresh temp file (``O_CREAT | O_EXCL``, 0600 whatever the umask), synced, renamed
   over the old one and the folder synced, so a reader without the lock sees the old file or the new one,
-  never a part of either;
+  never a part of either; a temp file an interrupted write left behind is deleted by the next writer
+  (``sweep``);
 - writers take ``flock`` on the folder's ``.lock`` file, so two saves at once do not lose one another.
 
 The folders ABOVE the store's own are not checked. Someone who can write one of them can rename the
@@ -28,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import re
 import secrets
 import stat
 from pathlib import Path
@@ -38,6 +40,7 @@ from recursion_core.keys.errors import KeyStoreError
 FOLDER_MODE = 0o700
 FILE_MODE = 0o600
 LOCK_NAME = '.lock'
+TEMP_NAME = re.compile(r'\.[A-Za-z0-9._-]+\.[0-9a-f]{16}\.tmp')     # what ``Folder.write`` names a temp file
 
 # getattr: these names do not exist on Windows, where nothing below runs (the store refuses first).
 _CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
@@ -94,6 +97,14 @@ class Folder:
         finally:
             os.close(fd)
 
+    def sweep(self) -> None:
+        """Delete the temp files an interrupted ``write`` left behind (they may hold part of a value). Only a writer
+        calls it, holding the exclusive lock, so no write is under way."""
+        for name in os.listdir(self.fd):
+            if TEMP_NAME.fullmatch(name):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=self.fd)
+
     def write(self, name: str, data: bytes) -> None:
         """Replace ``name`` with ``data``: a temp file, fsync, rename, fsync of the folder."""
         temp = f'.{name}.{secrets.token_hex(8)}.tmp'
@@ -115,16 +126,26 @@ class Folder:
         os.fsync(self.fd)
 
     @contextlib.contextmanager
-    def locked(self):
-        """Hold the folder's write lock (``flock`` on ``.lock``) for the block."""
+    def locked(self, *, shared: bool = False):
+        """Hold the folder's lock (``flock`` on ``.lock``) for the block: exclusive for a writer, shared for a reader.
+
+        A writer creates the lock file if it is missing. A reader creates nothing: with no lock file there has never
+        been a save in this folder, and the block runs with no lock held (``yield False``); the reader then finds no
+        index, or refuses one that exists without a lock beside it.
+        """
         import fcntl
 
+        flags = os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC | (0 if shared else os.O_CREAT)
         try:
             # Read-only is enough for flock, and opens a lock a umask left at 0400.
-            fd = os.open(LOCK_NAME, os.O_RDONLY | os.O_CREAT | _NOFOLLOW | _NONBLOCK | _CLOEXEC, FILE_MODE,
-                         dir_fd=self.fd)
+            fd = os.open(LOCK_NAME, flags, FILE_MODE, dir_fd=self.fd)
+        except FileNotFoundError:
+            fd = None
         except OSError as exc:
             raise KeyStoreError('file_invalid', f'{self.path / LOCK_NAME}: cannot be opened ({_why(exc)})') from None
+        if fd is None:
+            yield False
+            return
         try:
             st = os.fstat(fd)
             # The lock holds nothing; a umask may have made it 0400 when it was created, so a lock that is
@@ -134,8 +155,8 @@ class Folder:
                 raise KeyStoreError('file_invalid', f'{self.path / LOCK_NAME}: not an owner-only file')
             if stat.S_IMODE(st.st_mode) != FILE_MODE:
                 os.fchmod(fd, FILE_MODE)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
+            fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            yield True
         finally:
             os.close(fd)        # releases the lock
 

@@ -9,7 +9,10 @@ was started in), started with ``shell=False`` from ``/``, and given a small envi
 ``PATH``, ``HOME``, the session-bus address, the runtime folder and the display names a keychain's unlock
 prompt needs, with ``LC_ALL=C`` so its messages are the ones the store reads. Nothing else of the caller's
 environment reaches it, so no engine's key in the daemon's environment does either. A key goes to a helper
-only on its standard input, never in its arguments or its environment.
+only on its standard input, never in its arguments or its environment. A helper that cannot be started, runs
+out of time or (for a stream) exits with a failure raises ``ToolMissing``, ``ToolTimeout`` or ``ToolFailed``,
+each raised OUTSIDE the handler of the error underneath it, so no exception chain keeps a helper's output
+(``subprocess.TimeoutExpired`` carries what the helper printed).
 
 WHICH BACKEND ANSWERS (``detect``):
 
@@ -18,10 +21,15 @@ WHICH BACKEND ANSWERS (``detect``):
   store refuses there (``backend_not_built``) instead of writing a file.
 - Elsewhere the keychain is the Secret Service, reached over the user's session bus. No session bus (no
   address in the environment and no ``$XDG_RUNTIME_DIR/bus`` socket): there is no keychain, ``owner_file``.
-- With a bus, the bus itself is asked whether ``org.freedesktop.secrets`` has an owner or can be started
-  (``busctl``, else ``dbus-send``). No: ``owner_file``. Yes: ``secret_service``, which needs ``secret-tool``;
-  without it the store refuses (``keychain_tool_missing``) rather than write a file on a host that has a
-  keychain. Neither tool can answer: refused (``keychain_undetermined``), for the same reason.
+- With a bus, the bus itself is asked which names are owned or can be started (``ListNames`` and
+  ``ListActivatableNames``, through ``busctl``, else ``dbus-send``):
+  - ``org.freedesktop.secrets``: ``secret_service``, which needs ``secret-tool``; without it the store refuses
+    (``keychain_tool_missing``) rather than write a file on a host that has a keychain;
+  - no Secret Service but KWallet (``org.kde.kwalletd5`` or ``org.kde.kwalletd6``): refused
+    (``keychain_unsupported``): a keychain is there, and this store reaches KWallet only through its Secret
+    Service interface, which is off;
+  - neither: ``owner_file``.
+  Neither tool can answer: refused (``keychain_undetermined``), for the same reason.
 
 A host where KWallet and the Secret Service both answer uses the Secret Service, the only Linux keychain this
 store speaks to (Lucas's "Yes, fixed order" for the sibling product, Nov 12, 2026; this lane's brief asks the
@@ -40,6 +48,7 @@ from pathlib import Path
 from recursion_core.keys.errors import KeyStoreError
 
 SECRET_SERVICE_NAME = 'org.freedesktop.secrets'
+KWALLET_NAMES = ('org.kde.kwalletd5', 'org.kde.kwalletd6')
 HELPER_ENV_NAMES = ('PATH', 'HOME', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'DISPLAY', 'WAYLAND_DISPLAY')
 BUS_TIMEOUT_S = 10.0
 KEYCHAIN_TIMEOUT_S = 120.0     # an unlock prompt waits for the user
@@ -63,6 +72,10 @@ class ToolMissing(Exception):
 
 class ToolTimeout(Exception):
     """The helper program ran out of time and was killed."""
+
+
+class ToolFailed(Exception):
+    """A streamed helper exited with a failure. Its argument is the exit status, nothing it printed."""
 
 
 class System:
@@ -111,35 +124,50 @@ class System:
 
     def run(self, argv: list, *, input: bytes | None = None, timeout: float) -> Completed:
         """Run a helper with its own small environment. Raises ``ToolMissing`` or ``ToolTimeout``."""
+        name = os.path.basename(str(argv[0]))
+        failure = None
         try:
             done = subprocess.run(argv, input=input, stdin=None if input is not None else subprocess.DEVNULL,
                                   capture_output=True, env=self.helper_env(), cwd='/', timeout=timeout,
                                   shell=False, close_fds=True, check=False)
         except subprocess.TimeoutExpired:
-            raise ToolTimeout(os.path.basename(str(argv[0]))) from None
+            failure = ToolTimeout          # the expired error holds the helper's output: it is not kept
         except OSError:
-            raise ToolMissing(os.path.basename(str(argv[0]))) from None
+            failure = ToolMissing
+        if failure is not None:
+            raise failure(name)            # outside the handler: no __context__
         return Completed(done.returncode, done.stdout, done.stderr)
 
     def stream(self, argv: list):
-        """Yield a helper's standard output in chunks (the journal can be large). Raises ``ToolMissing``."""
+        """Yield a helper's standard output in chunks (the journal can be large).
+
+        Raises ``ToolMissing`` when it cannot be started and, once its output is exhausted, ``ToolFailed`` when it
+        exited with a failure, so a reader can tell a search that ended from one that broke.
+        """
+        name = os.path.basename(str(argv[0]))
         try:
             process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, env=self.helper_env(), cwd='/', shell=False,
                                        close_fds=True)
         except OSError:
-            raise ToolMissing(os.path.basename(str(argv[0]))) from None
+            process = None
+        if process is None:
+            raise ToolMissing(name)
+        finished = False
         try:
             while True:
                 chunk = process.stdout.read(1 << 16)
                 if not chunk:
                     break
                 yield chunk
+            finished = True
         finally:
             process.stdout.close()
-            if process.poll() is None:
-                process.kill()
-            process.wait()
+            if not finished and process.poll() is None:
+                process.kill()             # the reader stopped early
+            status = process.wait()
+        if status != 0:
+            raise ToolFailed(status)
 
     def __repr__(self) -> str:
         return f'System(platform={self.platform!r})'
@@ -161,12 +189,16 @@ def detect(system: System) -> str:
         return 'windows_credential'
     if system.session_bus() is None:
         return 'owner_file'
-    answer = secret_service_on_bus(system)
-    if answer is None:
+    names = bus_names(system)
+    if names is None:
         raise KeyStoreError('keychain_undetermined',
                             'the session bus could not be asked whether a Secret Service is there '
                             '(neither busctl nor dbus-send answered); no key is written to a file on such a host')
-    if not answer:
+    if SECRET_SERVICE_NAME not in names:
+        if names & set(KWALLET_NAMES):
+            raise KeyStoreError('keychain_unsupported',
+                                'KWallet answers on the session bus without its Secret Service interface, which '
+                                'this store needs; turn that interface on. No key is written to a file on such a host')
         return 'owner_file'
     if system.which('secret-tool') is None:
         raise KeyStoreError('keychain_tool_missing',
@@ -175,17 +207,16 @@ def detect(system: System) -> str:
     return 'secret_service'
 
 
-def secret_service_on_bus(system: System) -> bool | None:
-    """True when ``org.freedesktop.secrets`` has an owner or can be started, False when neither, None when
-    no tool could ask."""
+def bus_names(system: System) -> set | None:
+    """The names owned on the session bus or that it can start, or None when no tool could ask."""
     busctl = system.which('busctl')
     if busctl is not None:
-        answer = _ask_busctl(system, busctl)
-        if answer is not None:
-            return answer
+        names = _ask(system, busctl, _busctl_names)
+        if names is not None:
+            return names
     dbus_send = system.which('dbus-send')
     if dbus_send is not None:
-        return _ask_dbus_send(system, dbus_send)
+        return _ask(system, dbus_send, _dbus_send_names)
     return None
 
 
@@ -205,29 +236,37 @@ def _call(system: System, argv: list) -> str | None:
 _BUS = ('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus')
 
 
-def _ask_busctl(system: System, tool: str) -> bool | None:
-    owner = _call(system, [tool, '--user', 'call', *_BUS, 'NameHasOwner', 's', SECRET_SERVICE_NAME])
-    if owner is None or owner.strip() not in ('b true', 'b false'):
-        return None
-    if owner.strip() == 'b true':
-        return True
-    names = _call(system, [tool, '--user', 'call', *_BUS, 'ListActivatableNames'])
-    if names is None or not names.startswith('as '):
-        return None
-    return f'"{SECRET_SERVICE_NAME}"' in names.split()
+def _ask(system: System, tool: str, parse) -> set | None:
+    names = set()
+    for method in ('ListNames', 'ListActivatableNames'):
+        part = parse(system, tool, method)
+        if part is None:
+            return None
+        names |= part
+    return names
 
 
-def _ask_dbus_send(system: System, tool: str) -> bool | None:
-    base = [tool, '--session', '--print-reply', '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus']
-    owner = _call(system, [*base, 'org.freedesktop.DBus.NameHasOwner', f'string:{SECRET_SERVICE_NAME}'])
-    if owner is None:
+def _busctl_names(system: System, tool: str, method: str) -> set | None:
+    """``busctl --user call ... ListNames`` prints ``as <n> "name" "name" ...``."""
+    text = _call(system, [tool, '--user', 'call', *_BUS, method])
+    if text is None:
         return None
-    words = owner.split()
-    if words[-2:] == ['boolean', 'true']:
-        return True
-    if words[-2:] != ['boolean', 'false']:
+    words = text.split()
+    if len(words) < 2 or words[0] != 'as' or not words[1].isdigit():
         return None
-    names = _call(system, [*base, 'org.freedesktop.DBus.ListActivatableNames'])
-    if names is None or 'array' not in names.split():
+    names = {word[1:-1] for word in words[2:] if len(word) >= 2 and word[0] == word[-1] == '"'}
+    return names if len(names) == int(words[1]) else None
+
+
+def _dbus_send_names(system: System, tool: str, method: str) -> set | None:
+    """``dbus-send --print-reply`` prints a ``method return`` line, then ``array [``, ``string "name"`` lines, ``]``."""
+    text = _call(system, [tool, '--session', '--print-reply', '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus',
+                          f'org.freedesktop.DBus.{method}'])
+    if text is None or 'array [' not in text:
         return None
-    return f'"{SECRET_SERVICE_NAME}"' in names.split()
+    names = set()
+    for line in text.splitlines():
+        words = line.split()
+        if len(words) == 2 and words[0] == 'string' and len(words[1]) >= 2 and words[1][0] == words[1][-1] == '"':
+            names.add(words[1][1:-1])
+    return names

@@ -286,7 +286,9 @@ class ProcessTest(TempStoreCase):
                     seen += chunk
                     idle = 0.0
                     if pending and pending[0][0].encode() in seen.split(b'\n')[-1]:
-                        os.write(master, pending.pop(0)[1].encode())
+                        data = pending.pop(0)[1].encode()
+                        while data:                    # a pty may take a long paste in parts
+                            data = data[os.write(master, data):]
                     continue
                 if process.poll() is not None:
                     break
@@ -313,7 +315,7 @@ class ProcessTest(TempStoreCase):
         index = json.loads((self.base / 'config' / 'recursion' / 'keys' / 'index.json').read_text())
         self.assertEqual(index['keys']['codex-key']['cap_usd'], 5)
         secrets = json.loads((self.base / 'config' / 'recursion' / 'keys' / 'secrets.json').read_text())
-        self.assertEqual(secrets['secrets'], {'codex-key': MARKER})
+        self.assertEqual({kid: e['value'] for kid, e in secrets['secrets'].items()}, {'codex-key': MARKER})
 
     def test_stdin_flag_on_a_terminal_is_refused(self) -> None:
         if not LINUX:
@@ -322,3 +324,36 @@ class ProcessTest(TempStoreCase):
         self.assertEqual(status, 1, seen)
         self.assertIn(b'refused: stdin_is_terminal', seen)
         self.assertFalse((self.base / 'config').exists())
+
+    def test_a_key_of_the_maximum_length_is_saved_whole(self) -> None:
+        # R7 (sol): read past the kernel's 4095-byte canonical line, so nothing is cut off.
+        if not LINUX:
+            self.skipTest('the pty wrapper relies on Linux acquiring a controlling terminal on open')
+        key = 'madeup-' + 'x' * (4096 - 7)
+        status, seen = self.pty_run([*self.ADD], [('(input is hidden): ', key + '\n'), ('[y/N] ', 'n\n')])
+        self.assertEqual(status, 0, seen[-300:])
+        secrets = json.loads((self.base / 'config' / 'recursion' / 'keys' / 'secrets.json').read_text())
+        self.assertEqual({kid: e['value'] for kid, e in secrets['secrets'].items()}, {'codex-key': key})
+
+    def test_a_key_longer_than_the_maximum_is_refused_not_cut_down(self) -> None:
+        # R7 (sol): a 5000-character paste used to be cut to 4095 characters by the terminal and saved.
+        if not LINUX:
+            self.skipTest('the pty wrapper relies on Linux acquiring a controlling terminal on open')
+        for length in (4097, 5000, 9000):
+            with self.subTest(length=length):
+                key = 'madeup-' + 'x' * (length - 7)
+                status, seen = self.pty_run([*self.ADD], [('(input is hidden): ', key + '\n')])
+                self.assertEqual(status, 1, seen[-300:])
+                self.assertIn(b'refused: value_invalid', seen)
+                self.assertFalse((self.base / 'config').exists())
+
+    def test_answers_typed_ahead_of_the_questions_are_kept(self) -> None:
+        # F4 (DeepSeek): the key, the opt-in and the cap pasted in one go.
+        if not LINUX:
+            self.skipTest('the pty wrapper relies on Linux acquiring a controlling terminal on open')
+        status, seen = self.pty_run([*self.ADD], [('(input is hidden): ', MARKER + '\ny\n7\n')])
+        self.assertEqual(status, 0, seen[-300:])
+        self.assertNotIn(MARKER.encode(), seen)
+        index = json.loads((self.base / 'config' / 'recursion' / 'keys' / 'index.json').read_text())
+        self.assertEqual((index['keys']['codex-key']['metered_spend_allowed'], index['keys']['codex-key']['cap_usd']),
+                         (True, 7))

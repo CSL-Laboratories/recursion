@@ -159,19 +159,50 @@ class FileRefusalTest(TempStoreCase):
         self.assertEqual(refused.exception.code, 'file_invalid')
 
     def test_files_owned_by_someone_else_are_refused(self) -> None:
+        # Only the named file looks like another user's: the folder and the lock stay ours, so it is the file's
+        # own owner check that refuses, not the lock's.
         real = os.geteuid()
         original_fstat = os.fstat
+        for name, code in (('index.json', 'file_invalid'), ('secrets.json', 'file_invalid')):
+            with self.subTest(file=name):
+                target = os.stat(self.root / name).st_ino
+
+                def fstat(fd, target=target):
+                    st = original_fstat(fd)
+                    if st.st_ino == target:
+                        values = list(st)
+                        values[4] = real + 1
+                        return os.stat_result(values)
+                    return st
+
+                with mock.patch('os.fstat', fstat), self.assertRaises(KeyRefused) as refused:
+                    self.store().credential('codex-key', 'CODEX_API_KEY')
+                self.assertEqual(refused.exception.code, code)
+                self.assertIn('not owned by this user', str(refused.exception) + self._last_detail(name))
+        self.assertEqual(self.store().credential('codex-key', 'CODEX_API_KEY'), MARKER)
+
+    def _last_detail(self, name: str) -> str:
+        """The detail a direct read of ``name`` gives under the same fake (KeyRefused carries only the code)."""
+        from recursion_core.keys.files import open_folder
+
+        real = os.geteuid()
+        original_fstat = os.fstat
+        target = os.stat(self.root / name).st_ino
 
         def fstat(fd):
             st = original_fstat(fd)
-            if stat.S_ISREG(st.st_mode):        # the folder stays ours; its files look like another user's
+            if st.st_ino == target:
                 values = list(st)
                 values[4] = real + 1
                 return os.stat_result(values)
             return st
 
-        with mock.patch('os.fstat', fstat):
-            self.assert_refused()
+        with mock.patch('os.fstat', fstat), open_folder(self.root, create=False) as folder:
+            try:
+                folder.read(name, 1 << 22)
+            except KeyStoreError as exc:
+                return str(exc)
+        return ''
 
     def test_a_lock_wider_than_0600_is_refused(self) -> None:
         (self.root / '.lock').chmod(0o644)
@@ -226,8 +257,8 @@ class WriteTest(TempStoreCase):
             real_fsync(fd)
 
         with mock.patch('os.fsync', fsync):
-            self.add(store, key_id='second', value=OTHER)         # the owner-only file, then the index
-        self.assertEqual(synced, [stat.S_IFREG, stat.S_IFDIR, stat.S_IFREG, stat.S_IFDIR])
+            self.add(store, key_id='second', value=OTHER)         # the intent, the owner-only file, the index
+        self.assertEqual(synced, [stat.S_IFREG, stat.S_IFDIR] * 3)
 
     def test_no_temp_file_is_left_after_saves_and_removals(self) -> None:
         store = self.store()

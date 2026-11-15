@@ -28,12 +28,16 @@ class SaveTest(TempStoreCase):
                          ('codex-key', 'openai', 'CODEX_API_KEY', 'owner_file'))
         self.assertEqual(record.created_at, '2025-11-14T22:40:00.250Z')
         index = json.loads((self.root / 'index.json').read_text())
-        self.assertEqual(index, {'version': 1, 'backend': 'owner_file', 'keys': {'codex-key': {
-            'provider': 'openai', 'env_name': 'CODEX_API_KEY', 'created_at': '2025-11-14T22:40:00.250Z',
-            'store': 'owner_file', 'metered_spend_allowed': True, 'cap_usd': 5}}})
+        self.assertRegex(index['store_id'], r'^[0-9a-f]{32}$')
+        self.assertRegex(record.save_id, r'^[0-9a-f]{32}$')
+        self.assertEqual(index, {'version': 1, 'store_id': index['store_id'], 'backend': 'owner_file', 'keys': {
+            'codex-key': {'provider': 'openai', 'env_name': 'CODEX_API_KEY', 'created_at': '2025-11-14T22:40:00.250Z',
+                          'store': 'owner_file', 'metered_spend_allowed': True, 'cap_usd': 5,
+                          'save_id': record.save_id}}, 'pending': {}})
         self.assertNotIn(MARKER.encode(), (self.root / 'index.json').read_bytes())
         self.assertEqual(json.loads((self.root / 'secrets.json').read_text()),
-                         {'version': 1, 'secrets': {'codex-key': MARKER}})
+                         {'version': 1, 'store_id': index['store_id'], 'secrets': {
+                             'codex-key': {'save_id': record.save_id, 'provider': 'openai', 'value': MARKER}}})
 
     def test_a_keychain_host_keeps_the_value_in_the_keychain_and_writes_no_owner_file(self) -> None:
         system, chain = keychain_system()
@@ -64,7 +68,8 @@ class SaveTest(TempStoreCase):
         self.add(store, key_id='claude-key', value=OTHER, env='ANTHROPIC_API_KEY', provider='anthropic')
         store.remove('codex-key')
         self.assertEqual(sorted(store.list().keys), ['claude-key'])
-        self.assertEqual(json.loads((self.root / 'secrets.json').read_text())['secrets'], {'claude-key': OTHER})
+        self.assertEqual({kid: e['value'] for kid, e in json.loads((self.root / 'secrets.json').read_text())['secrets'].items()},
+                         {'claude-key': OTHER})
 
     def test_an_index_write_that_fails_takes_the_value_out_again(self) -> None:
         system, chain = keychain_system()
@@ -178,7 +183,7 @@ class ValidationTest(TempStoreCase):
                 self.refused('id_invalid', key_id=bad)
 
     def test_providers_and_variable_names(self) -> None:
-        for bad in ('', 'OpenAI', 'Anthropic', 'openai\n', ' openai', 'acme', 'deepseek', 'github', 'copilot', 7, None):
+        for bad in ('', 'OpenAI', 'Anthropic', 'openai\n', ' openai', '-x', 'a' * 65, 'open ai', 7, None):
             with self.subTest(provider=bad):
                 self.refused('provider_invalid', provider=bad)
         for bad in ('', 'codex_api_key', '1KEY', 'KEY-NAME', 'KEY\n', 'A' * 129):
@@ -196,6 +201,36 @@ class ValidationTest(TempStoreCase):
             with self.subTest(provider=provider):
                 record = self.add(store, key_id=f'key-{number}', provider=provider)
                 self.assertEqual(store.list().keys[record.key_id].provider, provider)
+
+    def test_any_vendor_can_be_saved_and_only_published_ids_are_known(self) -> None:
+        # "API keys are configurable for every vendor" (CONTRACT 275); ROUTING routes the published ids only.
+        from recursion_core.keys import validate
+
+        store = self.store()
+        for number, provider in enumerate(('mistral', 'deepseek', 'acme.ai', 'z-ai')):
+            with self.subTest(provider=provider):
+                record = self.add(store, key_id=f'other-{number}', provider=provider)
+                self.assertEqual(store.list().keys[record.key_id].provider, provider)
+                self.assertFalse(validate.known_provider(provider))
+                # Kept and listed, and handed to no engine (the Liaison's 6:03 PM ruling on K14).
+                with self.assertRaises(KeyRefused) as refused:
+                    store.credential(record.key_id, 'CODEX_API_KEY')
+                self.assertEqual(refused.exception.code, 'provider_unrouted')
+        self.assertTrue(validate.known_provider('anthropic'))
+
+    def test_a_key_typed_in_the_ids_place_is_refused_and_not_repeated(self) -> None:
+        for bad in (MARKER.replace('-', '') + 'X9', 'sk-proj-Ab3dEf5hIj7kLm9nOp1qRs', 'x' * 65):
+            with self.subTest(key_id=bad[:12]):
+                store = self.store()
+                with self.assertRaises(KeyStoreError) as caught:
+                    store.add(bad, 'openai', 'CODEX_API_KEY', OTHER, metered_spend_allowed=True, cap_usd=5)
+                self.assertEqual(caught.exception.code, 'id_invalid')
+                self.assertNotIn(bad, str(caught.exception))
+                with self.assertRaises(KeyStoreError) as removed:
+                    store.remove(bad)
+                self.assertEqual(removed.exception.code, 'id_invalid')
+                self.assertNotIn(bad, str(removed.exception))
+        self.add(self.store(), key_id='codex-key-2026-11')       # an ordinary id with digits is fine
 
     def test_values(self) -> None:
         for bad in ('short', 'has space inside it', 'tab\tinside-it', 'newline\ninside', 'nul\x00inside-it',
@@ -247,7 +282,19 @@ class IndexShapeTest(TempStoreCase):
             'cap as text': self.entry(cap_usd='5'),
             'bad timestamp': self.entry(created_at='2025-11-14 22:40:00Z'),
             'bad variable': self.entry(env_name='codex_api_key'),
-            'unpublished provider': self.entry(provider='acme'),
+            'malformed provider': self.entry(provider='Acme'),
+            'backend and store both unknown': good.replace('"owner_file"', '"kwallet"'),
+            'no such day': self.entry(created_at='2025-02-31T22:40:00.250Z'),
+            'year zero': self.entry(created_at='0000-11-14T22:40:00.250Z'),
+            'cap far too large': self.entry(cap_usd=10 ** 500),
+            'no pending field': json.dumps({k: v for k, v in self.good.items() if k != 'pending'}),
+            'pending with another op': json.dumps({**self.good, 'pending': {'x': {'op': 'move',
+                                                                                  'started_at': '2025-11-14T22:40:00.250Z'}}}),
+            'pending with no time': json.dumps({**self.good, 'pending': {'x': {'op': 'add'}}}),
+            'pending under a bad id': json.dumps({**self.good, 'pending': {'-x': {'op': 'add',
+                                                                                    'started_at': '2025-11-14T22:40:00.250Z'}}}),
+            'pending with no backend': json.dumps({'version': 1, 'backend': None, 'keys': {}, 'pending': {
+                'x': {'op': 'add', 'started_at': '2025-11-14T22:40:00.250Z'}}}),
             'missing field': json.dumps({**self.good, 'keys': {'codex-key': {'provider': 'openai'}}}),
             'not JSON': '{"version": 1,',
             'not ASCII': good.replace('openai', 'open\u00e4i'),

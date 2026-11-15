@@ -56,19 +56,22 @@ RFC 8785 form, when there were any, so such a run never looks complete.
 Usage is never 0 because it was not known (event.v1, ``token_count``): a per-response ``usage`` line
 or turn totals with no count above 0 are unknown, not free; the turn's counts are a lower bound when
 ``usage_is_incomplete`` is set; the cost is known only from ``total_cost_usd_ticks`` or a finite
-``total_cost_usd`` when neither withholding flag is set. Two things print a ``usage`` line
+``total_cost_usd`` when neither withholding flag is set (a flag is set when present and neither
+``false`` nor ``null``, so a malformed value withholds). Two things print a ``usage`` line
 (``headless/reducer/acp.rs:147-169``): one model response (``ResponseCompleted``, with an optional
 ``messageId``, ``stopReason`` and ``signature``) and the whole turn summed over every model call
 (``TurnUsage``, ``extensions/notification.rs:1188-1190``, with none of them). A line that carries any of
 the three is one call (span ``call``). A line with none of them may be either, so it gets no draft (it
 is counted in ``ignored``; its raw line is in ``engine.output``): the totals on ``end`` or ``error``
 cover the turn (span ``turn``), drafted once per run (a second line with totals is counted, not
-drafted). Neither names the model, except the totals when ``modelUsage`` names exactly one.
+drafted); a line that says its usage is incomplete and carries none drafts the turn as unknown, once,
+without taking the place of a later line's totals. Neither names the model, except the totals when
+``modelUsage`` names exactly one, and not one whose name held a lone surrogate.
 
 A ``tool.call`` carries ``input_digest``, the SHA-256 of the input as RFC 8785 writes it, taken with
 the core's own writer (``control.methods.canonical_text``); the input itself is carried only when it
 is an object whose RFC 8785 text is at most ``MAX_TOOL_INPUT_BYTES`` UTF-8 bytes. An input with no
-RFC 8785 form (an integer beyond 2**53, a lone surrogate) gets no ``tool.call`` draft; its raw line is
+RFC 8785 form (an integer beyond 2**53; a lone surrogate is cleaned first, below) gets no ``tool.call`` draft; its raw line is
 still in ``engine.output``, the case is counted in ``OneShotParser.ignored`` and named in the
 result's detail. A tool line whose ``toolCallId`` is not a string, or whose ``status`` is present,
 not null and not a string, is a protocol fault; a string id that is empty, too long, holds a line
@@ -90,8 +93,8 @@ exactly as it stands in that file, with its newline; the parser counts UTF-8 byt
 Text no UTF-8 writer can write. A lone surrogate (from a JSON escape such as ``\\ud800``, or a byte that
 is not UTF-8 kept by the reader) is written as U+FFFD before anything is read from the line, in the
 ``engine.output`` text and in every string of the decoded line; so a digest is of the cleaned input.
-A name that must be exact is not cleaned but refused: a ``toolCallId`` (above) or a ``sessionId``
-(not kept) that held a lone surrogate.
+A name that must be exact is not cleaned but refused when it held a lone surrogate: a ``toolCallId``
+(above), a ``sessionId`` or a ``requestId`` (not kept), a ``modelUsage`` name (no model is named).
 A count or a tick total above 2**53 - 1 has no exact RFC 8785 form and is unknown.
 """
 
@@ -176,12 +179,12 @@ def oneshot_argv(*, prompt_file: str, model: str | None, binary: str | None = No
     ``-p`` does (headless guide, "Basic Usage"). ``model`` None leaves the engine's default.
 
     Refusals, each a ``contract.RouteError`` raised before anything is launched: ``launch_refused`` for an
-    executable that is empty or holds NUL; ``request_invalid`` for a prompt path or a model that is empty,
+    executable that is empty or holds NUL, CR or LF; ``request_invalid`` for a prompt path or a model that is empty,
     holds NUL, CR or LF, or begins with ``-`` (it would be read as a flag).
     """
 
     executable = DEFAULT_EXECUTABLE if binary is None else binary
-    if not isinstance(executable, str) or not executable or "\x00" in executable:
+    if not isinstance(executable, str) or not _ONE_LINE.fullmatch(executable) or "\x00" in executable:
         raise c.RouteError(c.LAUNCH_REFUSED, "grok: no executable")
     if (not isinstance(prompt_file, str) or not _ONE_LINE.fullmatch(prompt_file) or "\x00" in prompt_file
             or prompt_file.startswith("-")):
@@ -204,7 +207,7 @@ def decode_line(line: str) -> dict:
 
 # Fields that name something exactly (a tool call to pair with its result; the conversation to resume).
 # Cleaning one would make two different names the same, so a name that held a lone surrogate is refused.
-_IDENTITY_KEYS = ("toolCallId", "sessionId")
+_IDENTITY_KEYS = ("toolCallId", "sessionId", "requestId")
 
 
 def _decode(line: str) -> tuple[dict, bool, frozenset]:
@@ -224,9 +227,12 @@ def _decode(line: str) -> tuple[dict, bool, frozenset]:
     kind = message.get("type")
     if not isinstance(kind, str) or not kind:
         raise GrokProtocolError("stdout line has no type")
-    altered = frozenset(key for key in _IDENTITY_KEYS
-                        if isinstance(raw.get(key), str) and _clean_text(raw[key]) is not raw[key])
-    return message, cleaned, altered
+    altered = {key for key in _IDENTITY_KEYS
+               if isinstance(raw.get(key), str) and _clean_text(raw[key]) is not raw[key]}
+    model_usage = raw.get("modelUsage")
+    if isinstance(model_usage, dict) and any(_clean_text(name) is not name for name in model_usage):
+        altered.add("modelUsage")   # a model name that held a lone surrogate is no model name
+    return message, cleaned, frozenset(altered)
 
 
 def _refuse_constant(name: str) -> object:
@@ -260,8 +266,9 @@ def _clean_value(value: object) -> object:
 class OneShotParser:
     """Parse one run of the one-shot drive, line by line, into driver.v2 event drafts.
 
-    ``parse(line)`` gives the drafts of one stdout line: always one ``engine.output`` (the raw line and
-    its byte span), then any ``tool.call``, ``tool.result`` and ``usage`` it carries. ``finish(code)``
+    ``parse(line)`` gives the drafts of one stdout line: always one ``engine.output`` (the line, with any
+    lone surrogate written as U+FFFD, and its byte span in the file), then any ``tool.call``,
+    ``tool.result`` and ``usage`` it carries. ``line`` must be a ``str`` (``TypeError`` otherwise). ``finish(code)``
     gives the run's ``result`` draft from what was seen and the process's return code. Not shared
     between threads: one parser per run, and ``finish`` is called by the thread that calls ``parse``,
     after the last line (a Stop or a watchdog on another thread ends the process, not the parser).
@@ -288,6 +295,7 @@ class OneShotParser:
         self._undrafted_calls = 0                # tool calls whose input has no RFC 8785 form
         self._altered: frozenset = frozenset()   # identity fields of the current line that held a lone surrogate
         self._turn_spend_drafted = False         # the turn's totals are drafted once
+        self._turn_unknown_drafted = False       # and an incomplete line with none, once, beside them
         self._open_calls: set[str] = set()       # tool calls drafted and not yet given a result
         self._done_calls: set[str] = set()
         self._finished = False
@@ -439,8 +447,8 @@ class OneShotParser:
         return True
 
     def _well_typed_tool_line(self, message: dict) -> bool:
-        """A tool line's ``toolCallId`` must be a string and its ``status``, when present, a string:
-        anything else is a malformed record, a protocol fault."""
+        """A tool line's ``toolCallId`` must be a string and its ``status``, when present and not null,
+        a string: anything else is a malformed record, a protocol fault."""
 
         if not isinstance(message.get("toolCallId"), str):
             self._fault(f"{message['type']} line whose toolCallId is not a string")
@@ -497,7 +505,9 @@ class OneShotParser:
         elif _is_one_line(session, 256):
             self.engine_session_id = session
         request = message.get("requestId")
-        if isinstance(request, str) and request:
+        if "requestId" in self._altered:
+            self._count("request_id_not_utf8")   # a cleaned id could match another request's
+        elif isinstance(request, str) and request:
             self.request_id = request
         self._spend(message, drafts)
 
@@ -513,25 +523,32 @@ class OneShotParser:
     def _spend(self, message: dict, drafts: list) -> None:
         """The turn's totals on ``end`` or ``error``, when the engine sent any, drafted once: a second
         line that carries totals (a second ``error``, or ``end`` after ``error``) is counted, so a
-        consumer that sums span ``turn`` never counts the turn twice."""
+        consumer that sums span ``turn`` never counts the turn twice. A line that says its usage is
+        incomplete and carries none drafts the turn as unknown (once) and does not take the place of
+        totals a later line carries: the consumer then sees one unknown and at most one number."""
 
         usage = message.get("usage")
-        incomplete = message.get("usage_is_incomplete") is True
-        if not isinstance(usage, Mapping) and not incomplete:
+        incomplete = _flag_set(message, "usage_is_incomplete")
+        if not isinstance(usage, Mapping):
+            if not incomplete:
+                return
+            if self._turn_spend_drafted or self._turn_unknown_drafted:
+                self._count("turn_usage_already_drafted")
+                return
+            # incomplete and no tokens recorded: say unknown, never 0
+            self._turn_unknown_drafted = True
+            drafts.append(_usage_draft(self.connection_id, None, "turn", None, lower_bound=False, cost=None))
             return
         if self._turn_spend_drafted:
             self._count("turn_usage_already_drafted")
             return
         self._turn_spend_drafted = True
-        if not isinstance(usage, Mapping):
-            # incomplete and no tokens recorded: say unknown, never 0
-            drafts.append(_usage_draft(self.connection_id, None, "turn", None, lower_bound=False, cost=None))
-            return
         counts = [_count_of(usage.get(key)) for key in _RESPONSE_KEYS]
         if _nothing_reported(counts):
             counts = None   # no bucket above 0: nothing was reported, which is not "free" (as for a call)
-        withheld = incomplete or message.get("cost_is_partial") is True
-        drafts.append(_usage_draft(self.connection_id, _single_model(message.get("modelUsage")), "turn",
+        withheld = incomplete or _flag_set(message, "cost_is_partial")
+        model = None if "modelUsage" in self._altered else _single_model(message.get("modelUsage"))
+        drafts.append(_usage_draft(self.connection_id, model, "turn",
                                    counts, lower_bound=incomplete, cost=None if withheld else _cost(message)))
 
     # -- bookkeeping --------------------------------------------------------------------------------
@@ -601,6 +618,14 @@ def _canonical_text(value: object) -> str:
     return canonical_text(value)
 
 
+def _flag_set(message: dict, name: str) -> bool:
+    """A withholding flag (``usage_is_incomplete``, ``cost_is_partial``) is set when it is present and is
+    neither ``false`` nor ``null``: a malformed value such as ``1`` or ``"true"`` withholds, so the
+    number is never claimed as more than the engine said."""
+    value = message.get(name)
+    return value is not None and value is not False
+
+
 def _nothing_reported(counts: list) -> bool:
     """No bucket above 0 (each is 0 or not a count): the engine reported nothing, which is not "free"."""
     return all(value is None or value == 0 for value in counts)
@@ -651,9 +676,10 @@ def _single_model(model_usage: object) -> str | None:
 
 
 def _result_text(content: object, raw_output: object) -> tuple[str, bool, bool]:
-    """``(text, truncated, written)`` for a tool result: its text content blocks, else its raw output as
-    RFC 8785 writes it. Raw output with no RFC 8785 form gives ``("", True, False)``: an empty text that
-    says it is shorter than the output, never a spelling RFC 8785 would refuse."""
+    """``(text, truncated, written)`` for a tool result: its text content blocks; else a string raw
+    output as it stands; else the raw output as RFC 8785 writes it. Raw output with no RFC 8785 form
+    gives ``("", True, False)``: an empty text that says it is shorter than the output, never a
+    spelling RFC 8785 would refuse."""
 
     parts = []
     if isinstance(content, list):

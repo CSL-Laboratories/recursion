@@ -159,6 +159,11 @@ class CaseReplayTest(unittest.TestCase):
         self.assertIsNone(parser.engine_session_id)
         self.assertEqual(parser.ignored["session_id_not_utf8"], 1)
 
+    def test_a_request_id_that_held_a_lone_surrogate_is_not_kept(self):
+        _, parser = run([escaped({"type": "end", "stopReason": "end_turn", "requestId": "r" + LONE})], 0)
+        self.assertIsNone(parser.request_id)
+        self.assertEqual(parser.ignored["request_id_not_utf8"], 1)
+
     def test_a_session_id_is_kept_only_when_it_is_one_line_of_at_most_256(self):
         for session, kept in (("s" * 256, True), ("s" * 257, False), ("a\rb", False), ("", False), (7, False)):
             with self.subTest(session=str(session)[:20]):
@@ -382,6 +387,13 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(parser.text, "A")
         self.assertEqual(parser.ignored["text_after_end"], 1)
 
+    def test_parse_takes_a_str_line_only(self):
+        parser = grok.OneShotParser(CONN)
+        for bad in (None, b"x\n", 5, ["x"]):
+            with self.subTest(line=bad), self.assertRaises(TypeError):
+                parser.parse(bad)
+        self.assertEqual(parser.offset, 0)
+
     def test_parse_after_finish_and_finish_twice_are_refused(self):
         parser = grok.OneShotParser(CONN)
         parser.finish(0)
@@ -538,7 +550,7 @@ class UsageTest(unittest.TestCase):
         totals = {"input_tokens": 1, "output_tokens": 1}
         (usage,) = of_type(run([end(usage=totals, total_cost_usd=0.5)], 0)[0], "usage")
         self.assertEqual(usage["cost_usd"]["value"], 0.5)
-        for bad in (-1, True, "1"):
+        for bad in (-1, -1.25, True, "1"):
             with self.subTest(cost=bad):
                 (usage,) = of_type(run([end(usage=totals, total_cost_usd=bad)], 0)[0], "usage")
                 self.assertEqual(usage["cost_usd"]["quality"], "unknown")
@@ -580,8 +592,8 @@ class UsageTest(unittest.TestCase):
         error = {"type": "error", "message": "boom"}
         for lines, first in (([line({**error, "usage": {"input_tokens": 4}}), line({**error, "usage": {"input_tokens": 5}})], 4),
                              ([line({**error, "usage": {"input_tokens": 4}}), end(usage={"input_tokens": 9})], 4),
-                             ([line({**error, "usage_is_incomplete": True}), end(usage={"input_tokens": 3})], None)):
-            with self.subTest(first=first):
+                             ([end(usage={"input_tokens": 4}), line({**error, "usage_is_incomplete": True})], 4)):
+            with self.subTest(first=first, lines=len(lines)):
                 drafts, parser = run(lines, 1)
                 turns = [u["input_tokens"]["value"] for u in of_type(drafts, "usage") if u["span"] == "turn"]
                 self.assertEqual(turns, [first])
@@ -589,6 +601,41 @@ class UsageTest(unittest.TestCase):
         drafts, parser = run([line(error), end(usage={"input_tokens": 9})], 1)   # the first carried no totals
         self.assertEqual([u["input_tokens"]["value"] for u in of_type(drafts, "usage")], [9])
         self.assertNotIn("turn_usage_already_drafted", parser.ignored)
+
+    def test_an_incomplete_line_with_no_totals_does_not_take_the_place_of_later_totals(self):
+        error = {"type": "error", "message": "boom", "usage_is_incomplete": True}
+        drafts, parser = run([line(error), end(usage={"input_tokens": 9, "output_tokens": 3},
+                                               total_cost_usd_ticks=10 ** 10)], 1)
+        turns = [(u["input_tokens"]["value"], u["cost_usd"]["value"]) for u in of_type(drafts, "usage")]
+        self.assertEqual(turns, [(None, None), (9, 1.0)])
+        self.assertNotIn("turn_usage_already_drafted", parser.ignored)
+        drafts, parser = run([line(error), line(error)], 1)   # two with none: unknown once
+        self.assertEqual(len(of_type(drafts, "usage")), 1)
+        self.assertEqual(parser.ignored["turn_usage_already_drafted"], 1)
+
+    def test_a_withholding_flag_withholds_unless_it_is_false_or_null(self):
+        totals = {"input_tokens": 7}
+        for value in (True, 1, "true", "yes", {}):
+            with self.subTest(usage_is_incomplete=value):
+                (usage,) = of_type(run([end(usage=totals, usage_is_incomplete=value, total_cost_usd=0.5)], 0)[0], "usage")
+                self.assertEqual((usage["input_tokens"]["quality"], usage["cost_usd"]["quality"]), ("lower_bound", "unknown"))
+            with self.subTest(cost_is_partial=value):
+                (usage,) = of_type(run([end(usage=totals, cost_is_partial=value, total_cost_usd=0.5)], 0)[0], "usage")
+                self.assertEqual((usage["input_tokens"]["quality"], usage["cost_usd"]["quality"]), ("known", "unknown"))
+        for value in (False, None):
+            with self.subTest(both=value):
+                (usage,) = of_type(run([end(usage=totals, usage_is_incomplete=value, cost_is_partial=value,
+                                            total_cost_usd=0.5)], 0)[0], "usage")
+                self.assertEqual((usage["input_tokens"]["quality"], usage["cost_usd"]["value"]), ("known", 0.5))
+
+    def test_a_model_name_that_held_a_lone_surrogate_names_no_model(self):
+        for model_usage, expected in (({"a" + LONE: {}, "a" + chr(0xD801): {}}, None), ({LONE: {}}, None),
+                                      ({"grok-4": {}}, "grok-4")):
+            with self.subTest(names=len(model_usage), expected=expected):
+                (usage,) = of_type(run([escaped({"type": "end", "stopReason": "end_turn",
+                                                 "usage": {"input_tokens": 1}, "modelUsage": model_usage})], 0)[0],
+                                   "usage")
+                self.assertEqual(usage["model"], expected)
 
     def test_a_cost_that_is_not_finite_is_unknown(self):
         # 1e400 is valid JSON and reads as an infinite float.
@@ -836,7 +883,9 @@ class ArgvTest(unittest.TestCase):
                              ({"prompt_file": "/p", "model": "a\rb"}, c.REQUEST_INVALID),
                              ({"prompt_file": "/p", "model": ""}, c.REQUEST_INVALID),
                              ({"prompt_file": "/p", "model": None, "binary": ""}, c.LAUNCH_REFUSED),
-                             ({"prompt_file": "/p", "model": None, "binary": "/g\x00"}, c.LAUNCH_REFUSED)):
+                             ({"prompt_file": "/p", "model": None, "binary": "/g\x00"}, c.LAUNCH_REFUSED),
+                             ({"prompt_file": "/p", "model": None, "binary": "/g\nx"}, c.LAUNCH_REFUSED),
+                             ({"prompt_file": "/p", "model": None, "binary": "/g\r"}, c.LAUNCH_REFUSED)):
             with self.subTest(kwargs=kwargs), self.assertRaises(c.RouteError) as caught:
                 grok.oneshot_argv(**kwargs)
             self.assertEqual(caught.exception.code, code)

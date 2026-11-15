@@ -7,19 +7,24 @@ and the object the method handlers and the engine drivers call:
   record, the private binding of an engine's request and ``approval.requested``. After the commit, and only
   then, the deadline worker is woken and the subscribers are told (so a surface draws it). A request that
   does not commit is never drawn. Returns the core-minted approval id; nothing after the commit can make it
-  fail. ``ask(effect, binding)`` is the same for a driver's tool call (the brief's ``request(effect,
-  binding)``).
+  fail. A request that cannot be made whole is refused with ``ApprovalRefused`` and nothing is written; a
+  store that fails the insert is ``store_unavailable``. ``ask(effect, binding)`` is the same for a driver's
+  tool call (the brief's ``request(effect, binding)``).
 * A request counts as SHOWN only once a subscriber took it without raising. One that no subscriber took
-  (none was subscribed, or each one failed) is offered again by ``recover`` at the next start.
+  (none was subscribed, or each one failed) is offered again by the next start, once its worker runs.
 * ``wait(approval_id)`` blocks until the request is no longer pending and returns its record: approved,
-  denied or expired (expired means denied). It works for a request made before a restart too.
+  denied or expired (expired means denied). It works for a request made before a restart too. The expiry is
+  written by the deadline worker of a started queue (or an answer resolves it); on a queue that is attached
+  but not started a pending request stays pending, so a caller that must not wait past a moment passes
+  ``timeout``.
 * ``sweep()`` writes ``expired`` and ``approval.answered`` for every pending request whose deadline has come.
   The worker started by ``start`` calls it at each deadline. A failure of the worker withdraws ``ready``
   and the worker tries again; a row that cannot be read is set aside, never retried for ever.
 * ``recover()`` at start: an engine's request still pending belonged to a driver that died with the daemon,
   so it ends as expired, never approved; an engine's request approved but not carried out loses its
-  binding, so nothing can carry it out through the dead driver; a request never shown is offered again;
-  deadlines that passed while the daemon was down are written.
+  binding, so nothing can carry it out through the dead driver; deadlines that passed while the daemon was
+  down are written. While a start runs no surface is offered anything: the start offers what no surface
+  took to every surface subscribed then, once its worker runs, and nothing at all if it fails.
 * ``open_in`` / ``answer_in`` run inside the dispatcher's transaction for approval.open and approval.answer;
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
@@ -40,6 +45,7 @@ from __future__ import annotations
 import copy
 import datetime
 import logging
+import math
 import secrets
 import sqlite3
 import threading
@@ -120,18 +126,23 @@ class ApprovalQueue:
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
         with self._lock:
-            self._late = []  # a surface that subscribes while this start runs is offered the backlog after it
+            # Held back until the worker runs: every surface subscribed now, and each one that subscribes while
+            # this start runs (subscribe_requested adds it), so no surface is offered anything during the start.
+            self._late = list(self._requested)
         try:
             self.recover()
-            self._closing.clear()
             generation = object()
             worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines",
                                       daemon=True)
-            self._generation = generation
-            self._worker = worker
-            # Ready before the worker runs: from here only the worker withdraws it (on a failure) and restores
-            # it (after a sweep), so start never overwrites a failure the worker has already reported.
-            self.ready = True
+            with self._lock:
+                # Ready before the worker runs, in one step with its generation: from here only this worker
+                # withdraws ready (on a failure) and restores it (after a sweep), so start never overwrites a
+                # failure the worker has already reported, and a worker whose generation has ended changes
+                # nothing.
+                self._closing.clear()
+                self._generation = generation
+                self._worker = worker
+                self.ready = True
             try:
                 worker.start()
             except BaseException:
@@ -144,15 +155,13 @@ class ApprovalQueue:
             with self._lock:
                 self._late = None  # a failed start offers nothing to anybody
             raise
-        # Recovery has retired what a dead driver left, and the worker runs: from here a surface that subscribes
-        # is offered what no surface took, and so is each one that subscribed during this start.
+        # Recovery has retired what a dead driver left, and the worker runs: every surface subscribed now (before
+        # the start or during it, unless it unsubscribed) is offered what no surface took, once, here; from here
+        # a surface that subscribes is offered it when it subscribes.
         with self._lock:
-            late, self._late = self._late, None
+            self._late = None
             self._running = True
-            subscribed = {token for token, _ in self._requested}
-        for token, fn in late:
-            if token in subscribed:
-                self._offer_late(fn)
+        self._offer_backlog()
 
     def stop(self, context=None) -> None:
         """Signal the worker and return only once it has joined. Interrupted, the worker is kept, and a
@@ -166,22 +175,21 @@ class ApprovalQueue:
             self._worker = None
 
     def _withdraw(self) -> None:
-        """Withdraw ``ready`` and signal the worker to return. ``ready`` and the closing signal change together
-        under the lock, so a sweep that ends now cannot publish ready again; then the worker's generation goes
-        and it is woken."""
+        """Withdraw ``ready`` and signal the worker to return. ``ready``, the closing signal and the worker's
+        generation change together under the lock, so a sweep that ends now cannot publish ready again and its
+        worker changes ``ready`` no more; then it is woken."""
         with self._lock:
             self.ready = False
             self._running = False
             self._closing.set()
-        self._generation = None
+            self._generation = None
         self._wake.set()
 
     def subscribe_requested(self, fn: Callable[[dict], None]) -> Callable[[], None]:
-        """``fn(record)`` after a request commits. Recovery at start offers again every pending request no
-        surface took; a surface that subscribes once the queue has started is offered those at once, and one
-        that subscribes while a start runs is offered them once that start has launched its worker (nothing
-        before, and nothing at all if the start fails). So a surface can be offered one request more than
-        once, always under the same approval id."""
+        """``fn(record)`` after a request commits. A start offers every pending request no surface took to each
+        surface subscribed before it or during it, once its worker has launched (nothing before, and nothing at
+        all if the start fails); a surface that subscribes once the queue has started is offered those at once.
+        So a surface can be offered one request more than once, always under the same approval id."""
         token = object()
         with self._lock:
             self._requested.append((token, fn))
@@ -189,15 +197,16 @@ class ApprovalQueue:
             if self._late is not None:
                 self._late.append((token, fn))
         if running:
-            self._offer_late(fn)
+            self._offer_backlog(fn)
         return self._unsubscriber(self._requested, token)
 
-    def _offer_late(self, fn) -> None:
-        """Offer one surface that subscribed late what no surface took; a failure keeps the subscription."""
+    def _offer_backlog(self, only=None) -> None:
+        """Offer what no surface took, to every subscriber or only to ``only``. A failure is logged and changes
+        no subscription; the next start offers it again."""
         try:
-            self._offer_unshown(only=fn)
-        except Exception as exc:  # noqa: BLE001 - the subscription stands; the next start offers them
-            log.error("pending approvals could not be offered to a new surface: %s", type(exc).__name__)
+            self._offer_unshown(only=only)
+        except Exception as exc:  # noqa: BLE001 - the subscriptions stand; the next start offers them
+            log.error("pending approvals could not be offered: %s", type(exc).__name__)
 
     def subscribe_answered(self, fn: Callable[[dict, object], None]) -> Callable[[], None]:
         """``fn(record, binding)`` after a request is resolved: a driver answers its engine from this."""
@@ -230,6 +239,8 @@ class ApprovalQueue:
         approval_id = self._mint()
         if source not in self._deadlines:
             raise ApprovalRefused("source")
+        if type(display) not in (list, tuple) or any(type(item) is not dict for item in display):
+            raise ApprovalRefused("display")
         record = model.new_request(approval_id=approval_id, source=source, effect=effect, session_id=session_id,
                                    run_id=run_id, turn_id=turn_id, requested_at=timestamp_of(now),
                                    expires_at=timestamp_of(now + self._deadlines[source]), display=list(display))
@@ -247,9 +258,11 @@ class ApprovalQueue:
         try:
             with self._store.transaction() as tx:
                 rows.insert(tx, record, binding)
-        except BaseException:
+        except BaseException as exc:
             with self._lock:
                 self._done.pop(approval_id, None)
+            if isinstance(exc, Exception) and not isinstance(exc, ApprovalRefused):
+                raise ApprovalRefused("store_unavailable") from exc  # nothing was written
             raise
         # Committed. Nothing below can fail this request: wake the deadline worker first, then tell.
         self._wake.set()
@@ -266,9 +279,9 @@ class ApprovalQueue:
 
     def _offer(self, record: dict, *, only=None) -> bool:
         """Tell the subscribers of a committed request (or only ``only``); remember it as shown only if one
-        took it. A surface that subscribed while a start runs is not told here until that start has launched
-        its worker: recovery's own offering, and a request committed meanwhile, leave it out, and ``start``
-        offers it what no surface took once the worker runs."""
+        took it. While a start runs every surface is held back (those subscribed when it began and each one
+        that subscribes during it): recovery's own offering, and a request committed meanwhile, reach none of
+        them, and ``start`` offers them what no surface took once its worker runs."""
         with self._lock:
             if only is None:
                 waiting = {token for token, _ in self._late or ()}
@@ -290,8 +303,12 @@ class ApprovalQueue:
         """The record once it is resolved, or ``None`` if ``timeout`` passed first or the id is unknown.
 
         The waiter is registered BEFORE the record is read, so a resolution that commits in between still
-        wakes it. A request made before a restart can be waited for too.
+        wakes it. A request made before a restart can be waited for too. The deadline is the worker's: a
+        pending request is resolved by an answer or by the deadline worker of a started queue, so with none
+        running only ``timeout`` (a finite number of seconds, or ``None``) ends the wait.
         """
+        if timeout is not None and (type(timeout) not in (int, float) or not math.isfinite(timeout)):
+            raise ApprovalRefused("timeout")
         with self._lock:
             done = self._done.setdefault(approval_id, threading.Event())
         with self._store.transaction() as tx:
@@ -368,7 +385,8 @@ class ApprovalQueue:
 
     def _run(self, generation=None) -> None:
         """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, try again.
-        It returns once the queue closes or its generation is no longer the queue's."""
+        It returns once the queue closes or its generation is no longer the queue's; a sweep it is in when that
+        happens is finished, and from then on it changes ``ready`` no more."""
         while not self._closing.is_set() and self._generation is generation:
             try:
                 with self._store.transaction() as tx:
@@ -380,10 +398,12 @@ class ApprovalQueue:
                     break
                 self.sweep()
                 with self._lock:
-                    if not self._closing.is_set():
+                    if not self._closing.is_set() and self._generation is generation:
                         self.ready = True
             except Exception as exc:  # noqa: BLE001 - the worker must outlive a failed transaction
-                self.ready = False
+                with self._lock:
+                    if self._generation is generation:  # a worker whose generation has ended changes nothing
+                        self.ready = False
                 log.error("the approval deadline worker failed (%s); trying again", type(exc).__name__)
                 self._closing.wait(self._retry)
 
@@ -405,7 +425,8 @@ class ApprovalQueue:
 
     def recover(self) -> dict:
         """At start: end engine requests whose driver died, retire the bindings of approved ones not yet
-        carried out, write due expiries, offer again the requests never shown."""
+        carried out, write due expiries, offer again the requests never shown (during a start that offering
+        reaches no surface: the start makes it once its worker runs)."""
         closed, retired = [], []
         now = self.now()
         with self._store.transaction() as tx:
@@ -441,7 +462,11 @@ class ApprovalQueue:
     # -- the methods ---------------------------------------------------------------------------------------
 
     def open_in(self, tx, principal: dict, params: dict) -> dict:
-        """approval.open inside the dispatcher's transaction."""
+        """approval.open inside the dispatcher's transaction. A principal that may not approve is refused
+        here too (``scope_refused``), whoever calls it."""
+        refusal = model.principal_refusal(principal)
+        if refusal is not None:
+            return refusal
         held = rows.load(tx, params["approval_id"])
         if held is None:
             return {"code": "approval_unknown", "approval_id": params["approval_id"]}
@@ -451,7 +476,11 @@ class ApprovalQueue:
         return answer
 
     def answer_in(self, tx, principal: dict, params: dict, after_commit: Callable) -> dict:
-        """approval.answer inside the dispatcher's transaction; waiters and drivers are told after commit."""
+        """approval.answer inside the dispatcher's transaction; waiters and drivers are told after commit. A
+        principal that may not approve is refused here too (``scope_refused``), whoever calls it."""
+        refusal = model.principal_refusal(principal)
+        if refusal is not None:
+            return refusal
         held = rows.load(tx, params["approval_id"])
         if held is None:
             return {"code": "approval_unknown", "approval_id": params["approval_id"]}

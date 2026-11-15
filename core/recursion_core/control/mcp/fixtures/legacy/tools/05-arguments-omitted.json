@@ -1,0 +1,250 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "tools/05-arguments-omitted",
+  "protocol": "2025-06-18",
+  "summary": "A call with no arguments, or arguments null, forwards an empty object.",
+  "source": "MCP 2025-06-18 server/tools (Listing Tools, Calling Tools, Error Handling)",
+  "api": [
+    {
+      "method": "run.list",
+      "params": {},
+      "answer": {
+        "code": "ok",
+        "runs": [
+          {
+            "cgroup": "/sys/fs/cgroup/fake/run-1",
+            "cgroup_marker": "cg-1",
+            "engine": "codex",
+            "generation": 4,
+            "members": [],
+            "run_id": "run-1",
+            "start_key": {
+              "client_key": "k-1",
+              "engine": "codex",
+              "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+            },
+            "started_at": 1000.0,
+            "state": "stopped",
+            "stop": {
+              "cgroup": "/sys/fs/cgroup/fake/run-1",
+              "cgroup_marker": "cg-1",
+              "checks": 2,
+              "reason": null,
+              "requested": true,
+              "requested_at": 1000.0
+            },
+            "stop_attestation": {
+              "cgroup": "/sys/fs/cgroup/fake/run-1",
+              "cgroup_marker": "cg-1",
+              "generation": 3,
+              "member_ids": [],
+              "proof": "empty"
+            },
+            "tenant": "t1"
+          }
+        ]
+      }
+    },
+    {
+      "method": "run.list",
+      "params": {},
+      "answer": {
+        "code": "ok",
+        "runs": [
+          {
+            "cgroup": "/sys/fs/cgroup/fake/run-1",
+            "cgroup_marker": "cg-1",
+            "engine": "codex",
+            "generation": 4,
+            "members": [],
+            "run_id": "run-1",
+            "start_key": {
+              "client_key": "k-1",
+              "engine": "codex",
+              "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+            },
+            "started_at": 1000.0,
+            "state": "stopped",
+            "stop": {
+              "cgroup": "/sys/fs/cgroup/fake/run-1",
+              "cgroup_marker": "cg-1",
+              "checks": 2,
+              "reason": null,
+              "requested": true,
+              "requested_at": 1000.0
+            },
+            "stop_attestation": {
+              "cgroup": "/sys/fs/cgroup/fake/run-1",
+              "cgroup_marker": "cg-1",
+              "generation": 3,
+              "member_ids": [],
+              "proof": "empty"
+            },
+            "tenant": "t1"
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "fixture-client",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {
+              "tools": {
+                "listChanged": false
+              }
+            },
+            "serverInfo": {
+              "name": "recursion-control",
+              "title": "Recursion control",
+              "version": "0.0.0"
+            },
+            "instructions": "Starts, reads and stops agent runs on this machine's Recursion daemon. recursion_run_stop answers \"stopped\" only when cleanup is confirmed and \"pending\" otherwise; read recursion_run_status before retrying a stop or a start."
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_list"
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"ok\", \"runs\": [{\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"engine\": \"codex\", \"generation\": 4, \"members\": [], \"run_id\": \"run-1\", \"start_key\": {\"client_key\": \"k-1\", \"engine\": \"codex\", \"prompt_sha256\": \"3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7\"}, \"started_at\": 1000.0, \"state\": \"stopped\", \"stop\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"checks\": 2, \"reason\": null, \"requested\": true, \"requested_at\": 1000.0}, \"stop_attestation\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"generation\": 3, \"member_ids\": [], \"proof\": \"empty\"}, \"tenant\": \"t1\"}]}"
+              }
+            ],
+            "structuredContent": {
+              "code": "ok",
+              "runs": [
+                {
+                  "cgroup": "/sys/fs/cgroup/fake/run-1",
+                  "cgroup_marker": "cg-1",
+                  "engine": "codex",
+                  "generation": 4,
+                  "members": [],
+                  "run_id": "run-1",
+                  "start_key": {
+                    "client_key": "k-1",
+                    "engine": "codex",
+                    "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+                  },
+                  "started_at": 1000.0,
+                  "state": "stopped",
+                  "stop": {
+                    "cgroup": "/sys/fs/cgroup/fake/run-1",
+                    "cgroup_marker": "cg-1",
+                    "checks": 2,
+                    "reason": null,
+                    "requested": true,
+                    "requested_at": 1000.0
+                  },
+                  "stop_attestation": {
+                    "cgroup": "/sys/fs/cgroup/fake/run-1",
+                    "cgroup_marker": "cg-1",
+                    "generation": 3,
+                    "member_ids": [],
+                    "proof": "empty"
+                  },
+                  "tenant": "t1"
+                }
+              ]
+            },
+            "isError": false
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_list",
+          "arguments": null
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"ok\", \"runs\": [{\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"engine\": \"codex\", \"generation\": 4, \"members\": [], \"run_id\": \"run-1\", \"start_key\": {\"client_key\": \"k-1\", \"engine\": \"codex\", \"prompt_sha256\": \"3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7\"}, \"started_at\": 1000.0, \"state\": \"stopped\", \"stop\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"checks\": 2, \"reason\": null, \"requested\": true, \"requested_at\": 1000.0}, \"stop_attestation\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"generation\": 3, \"member_ids\": [], \"proof\": \"empty\"}, \"tenant\": \"t1\"}]}"
+              }
+            ],
+            "structuredContent": {
+              "code": "ok",
+              "runs": [
+                {
+                  "cgroup": "/sys/fs/cgroup/fake/run-1",
+                  "cgroup_marker": "cg-1",
+                  "engine": "codex",
+                  "generation": 4,
+                  "members": [],
+                  "run_id": "run-1",
+                  "start_key": {
+                    "client_key": "k-1",
+                    "engine": "codex",
+                    "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+                  },
+                  "started_at": 1000.0,
+                  "state": "stopped",
+                  "stop": {
+                    "cgroup": "/sys/fs/cgroup/fake/run-1",
+                    "cgroup_marker": "cg-1",
+                    "checks": 2,
+                    "reason": null,
+                    "requested": true,
+                    "requested_at": 1000.0
+                  },
+                  "stop_attestation": {
+                    "cgroup": "/sys/fs/cgroup/fake/run-1",
+                    "cgroup_marker": "cg-1",
+                    "generation": 3,
+                    "member_ids": [],
+                    "proof": "empty"
+                  },
+                  "tenant": "t1"
+                }
+              ]
+            },
+            "isError": false
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

@@ -1,0 +1,46 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "negotiation/04-initialize-older-revision",
+  "protocol": "2025-06-18",
+  "summary": "A client that asks for 2024-11-05 is offered 2025-06-18; whether to go on is the client's decision.",
+  "source": "MCP 2025-06-18 basic/lifecycle (Initialization, Version Negotiation)",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2024-11-05",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "fixture-client",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {
+              "tools": {
+                "listChanged": false
+              }
+            },
+            "serverInfo": {
+              "name": "recursion-control",
+              "title": "Recursion control",
+              "version": "0.0.0"
+            },
+            "instructions": "Starts, reads and stops agent runs on this machine's Recursion daemon. recursion_run_stop answers \"stopped\" only when cleanup is confirmed and \"pending\" otherwise; read recursion_run_status before retrying a stop or a start."
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

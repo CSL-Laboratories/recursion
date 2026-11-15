@@ -1,0 +1,64 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/04-non-json-constants",
+  "protocol": "2025-06-18",
+  "summary": "NaN, Infinity and -Infinity are not JSON and get a parse error.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send_text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"x\":NaN}}\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "Parse error: not JSON"
+          }
+        }
+      ]
+    },
+    {
+      "send_text": "{\"jsonrpc\":\"2.0\",\"id\":Infinity,\"method\":\"ping\"}\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "Parse error: not JSON"
+          }
+        }
+      ]
+    },
+    {
+      "send_text": "{\"jsonrpc\":\"2.0\",\"id\":-Infinity,\"method\":\"ping\"}\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "Parse error: not JSON"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {}
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

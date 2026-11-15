@@ -1,0 +1,51 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/05-batches-refused",
+  "protocol": "2025-06-18",
+  "summary": "2025-06-18 removed batching: an array is one invalid request.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5; MCP 2025-06-18 changelog (JSON-RPC batching removed)",
+  "api": [],
+  "steps": [
+    {
+      "send_text": "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: JSON-RPC batches are not supported in 2025-06-18"
+          }
+        }
+      ]
+    },
+    {
+      "send_text": "[]\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: JSON-RPC batches are not supported in 2025-06-18"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {}
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

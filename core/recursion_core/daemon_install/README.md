@@ -12,7 +12,7 @@ calls `%h`; never `$HOME`, never `os.environ`):
 
 | path | install | upgrade | uninstall |
 | --- | --- | --- | --- |
-| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`; a unit another user owns or that group or world can write refuses `unit_untrusted` | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing` | removes it if its first line is this installer's marker (`unit_not_ours` otherwise); refuses `unit_enabled` while `default.target.wants/` links it |
+| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`; a unit another user owns or that group or world can write refuses `unit_untrusted` (owner and mode bits of the file read; POSIX ACLs are not read) | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing` | removes it if its first line is this installer's marker (`unit_not_ours` otherwise); refuses `unit_enabled` while `default.target.wants/` links it |
 | `~/.config`, `~/.config/systemd`, `~/.config/systemd/user` | creates the missing ones (0700); existing ones stay as they are | - | stay: other units share them |
 | the daemon's state folder (`$XDG_STATE_HOME/recursion`: the run registry, and from slice 2 the stores) | - | - | stays |
 

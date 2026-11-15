@@ -268,16 +268,16 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(_read(self.unit), render_unit(EXEC))
                 self.assertFalse(install(self.roots, EXEC).changed)
                 self.assertEqual(sorted(os.listdir(self.unit_dir)), [UNIT_NAME])
-        real_lstat = os.lstat
+        real_fstat, inode = os.fstat, os.stat(self.unit).st_ino
 
-        def other_owner(path, *args, **kwargs):
-            info = real_lstat(path, *args, **kwargs)
-            if os.fspath(path) == self.unit:
+        def other_owner(fd, *args, **kwargs):  # the owner is read from the descriptor the unit was read through
+            info = real_fstat(fd, *args, **kwargs)
+            if info.st_ino == inode:
                 fields = list(info[:10])
                 fields[4] = info.st_uid + 1
                 return os.stat_result(fields)
             return info
-        with mock.patch("os.lstat", side_effect=other_owner):
+        with mock.patch("os.fstat", side_effect=other_owner):
             with self.assertRaises(InstallRefused) as caught:
                 install(self.roots, EXEC)
             self.assertEqual(caught.exception.kind, "unit_untrusted")
@@ -289,6 +289,30 @@ class InstallTests(unittest.TestCase):
                 self.assertFalse(install(self.roots, EXEC).changed)
                 self.assertFalse(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), mode)
+
+    def test_a_unit_removed_after_it_is_read_is_answered_not_raised(self) -> None:
+        # Review 4 of #382, DeepSeek L4-1: a concurrent uninstall removes the unit between install's (or
+        # upgrade's) read and its owner-and-mode check. The check uses the descriptor's fstat, so nothing
+        # is looked up again: the answer is the one for the file that was read, never a raw error.
+        real_read = os.read
+
+        def read_then_remove(fd, size):
+            data = real_read(fd, size)
+            if not data and os.path.lexists(self.unit):
+                os.unlink(self.unit)
+            return data
+        for step in (install, upgrade):
+            with self.subTest(step=step.__name__):
+                install(self.roots, EXEC)
+                with mock.patch("os.read", side_effect=read_then_remove):
+                    plan = step(self.roots, EXEC)
+                self.assertEqual((plan.action, plan.changed), (step.__name__, False))
+                self.assertFalse(os.path.lexists(self.unit))
+        install(self.roots, EXEC)
+        os.chmod(self.unit, 0o666)
+        with self.assertRaises(InstallRefused) as caught, mock.patch("os.read", side_effect=read_then_remove):
+            install(self.roots, EXEC)  # the file read could be changed by others: still refused, typed
+        self.assertEqual(caught.exception.kind, "unit_untrusted")
 
     def test_uninstall_removes_the_unit_and_nothing_else(self) -> None:
         before = _tree(self.home)

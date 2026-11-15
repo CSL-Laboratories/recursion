@@ -15,8 +15,8 @@ import os
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, owned_paths, read_regular, replace_regular,
-                     unlink_regular, write_exclusive)
+from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, owned_paths, read_regular,
+                     read_regular_and_stat, replace_regular, unlink_regular, write_exclusive)
 from .unit import MARKER, UNIT_NAME, render_unit
 
 _UNIT_MODE = 0o644
@@ -56,9 +56,10 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     if os.path.lexists(paths.unit):
-        if read_regular(paths.unit) != unit:
+        current, info = read_regular_and_stat(paths.unit)  # owner and mode of the file read, not looked up again
+        if current != unit:
             raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
-        why = file_untrusted(paths.unit)
+        why = file_untrusted(paths.unit, info)
         if why:
             raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
         return _plan("install", False, paths)
@@ -76,7 +77,8 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    if read_regular(paths.unit) == unit and not file_untrusted(paths.unit):
+    current, info = read_regular_and_stat(paths.unit)
+    if current == unit and not file_untrusted(paths.unit, info):
         return _plan("upgrade", False, paths)
     replace_regular(paths.unit, unit, _UNIT_MODE)
     return _plan("upgrade", True, paths)

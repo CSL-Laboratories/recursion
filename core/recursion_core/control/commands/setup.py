@@ -105,11 +105,12 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
 
 def _filesystem_detail(exc: OSError, roots: Roots) -> str:
     """The error and the path. A call on an open file or folder (``fsync``, ``read``, ``write``) names
-    no path, so the unit's folder, where every file these commands write or remove is, is named."""
+    no path, so the unit's folder, where every file these commands write or remove is, is named, under
+    the home resolved as every other message names it."""
 
     detail = f"{type(exc).__name__}: {exc}"
     if exc.filename is None:
-        detail += f" (in {os.path.join(roots.home, '.config', 'systemd', 'user')})"
+        detail += f" (in {os.path.join(os.path.realpath(roots.home), '.config', 'systemd', 'user')})"
     return detail
 
 

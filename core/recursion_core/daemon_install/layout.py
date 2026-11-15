@@ -173,12 +173,21 @@ def read_regular(path: str) -> bytes:
     the type check after it instead of holding the command at the open. Regular files ignore the flag.
     """
 
+    return read_regular_and_stat(path)[0]
+
+
+def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
+    """``read_regular``, with the ``fstat`` of the descriptor the bytes were read through: the owner
+    and mode of the very file that was read. A second lookup by name could find another file, or
+    none (a concurrent ``uninstall``), and raise where a refusal is due."""
+
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise InstallRefused("not_regular", path) from exc
     try:
-        if not _is_reg(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not _is_reg(info.st_mode):
             raise InstallRefused("not_regular", path)
         chunks, size = [], 0
         while True:
@@ -189,17 +198,19 @@ def read_regular(path: str) -> bytes:
             if size > 1 << 20:
                 raise InstallRefused("too_large", path)
             chunks.append(block)
-        return b"".join(chunks)
+        return b"".join(chunks), info
     finally:
         os.close(fd)
 
 
-def file_untrusted(path: str) -> str:
-    """Why another user could change the file at ``path``: it is another user's, or group or world can
-    write it. ``""`` when only we can. The folder rule above, held for a file this package accepts
-    as it is (the unit ``install`` finds already in place)."""
+def file_untrusted(path: str, info: os.stat_result) -> str:
+    """Why another user could change the file ``info`` describes (take it from
+    ``read_regular_and_stat``, so it is the file that was read; ``path`` only names it): it is
+    another user's, or group or world can write it. ``""`` when only we can. The folder rule above,
+    held for a file this package accepts as it is (the unit ``install`` finds already in place). Owner
+    and mode bits only: POSIX ACLs are not read, as for the folders and the stores. No lookup, so it
+    raises nothing."""
 
-    info = os.lstat(path)
     if info.st_uid != os.geteuid():
         return f"{path} is owned by another user"
     if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):

@@ -77,7 +77,7 @@ _SAME_BYTE = {"h": "backspace", "i": "tab", "j": "enter", "m": "enter"}
 _CTRL = {"ctrl+space", "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_", *(f"ctrl+{chr(c)}" for c in range(ord("a"), ord("z") + 1))}
 ALIASES = {**{f"ctrl+{c}": key for c, key in _SAME_BYTE.items()},
            **{f"ctrl+alt+{c}": f"alt+{key}" for c, key in _SAME_BYTE.items()},
-           "alt+space": "alt+ "}  # ESC and a space; a file cannot write the space (review 3 of #404, DeepSeek F5)
+           "alt+space": "alt+ "}  # ESC and a space; a binding cannot write the space (review 3 of #404, DeepSeek F5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,8 +241,8 @@ class Unbound:
 class Keymap:
     """Bindings by context, after the defaults, the binding file and the safety rules, and one client's
     matching state (``pending``, ``last``). That state belongs to one client's keys: a client takes its own
-    with ``for_client()``, so several clients can share one set of bindings. ``never_bind`` holds keys as a
-    terminal sends them: a name given for one (``ctrl+i``) is kept as that key (``tab``)."""
+    with ``for_client()``, so several clients can share one set of bindings. ``leader`` and ``never_bind`` hold
+    keys as a terminal sends them: a name given for one (``ctrl+i``) is kept as that key (``tab``)."""
 
     leader: str = LEADER
     bindings: dict[str, dict[tuple[str, ...], str]] = field(default_factory=dict)
@@ -252,7 +252,8 @@ class Keymap:
     last: tuple[str, ...] = ()  # the sequence that chose the last action ``feed`` returned
 
     def __post_init__(self) -> None:
-        # However a consumer spelled them (review 3 of #404, DeepSeek F4).
+        # However a consumer spelled them (review 3 of #404, DeepSeek F4; review 4, N2 for the leader).
+        self.leader = key_name(self.leader) or self.leader
         self.never_bind = frozenset(key_name(k) or k for k in self.never_bind)
 
     @classmethod
@@ -331,8 +332,8 @@ class Keymap:
         for key in seq:
             if key in RESERVED:
                 return f"{key} is kept: it ends the TUI from any mode"
-            if key in self.never_bind:
-                return f"{key} is bound nowhere ([safety] never_bind)"
+            if key in self.never_bind:  # "alt+ " is said as Alt+Space (review 4 of #404, DeepSeek N3)
+                return f"{show_sequence((key,)) if ' ' in key else key} is bound nowhere ([safety] never_bind)"
             if context == "global" and key in NEVER_BIND_GLOBAL:
                 return f"{key} is not bound globally"
         return None
@@ -406,7 +407,7 @@ def load(text: str, base: Keymap | None = None) -> Keymap:
     held = {key for context in LEADER_CONTEXTS for seq in km.bindings.get(context, {})
             for key in (seq[1:] if seq[0] == km.leader else seq)}
     if leader != km.leader and leader in held:  # a binding in force would shadow the leader's sequences
-        km.notes.append(f"binding file not used: leader {doc['leader']!r} is a key the bindings in force use "
+        km.notes.append(f"binding file not used: leader {doc.get('leader', km.leader)!r} is a key the bindings in force use "
                         f"where a leader is typed; choose one they do not (review 3 of #404, DeepSeek F3)")
         return km
     if leader != km.leader:

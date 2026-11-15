@@ -257,7 +257,9 @@ class CredentialStore:
             raise CredentialStoreError("the store path must be a str")
         if not os.path.isabs(path):
             raise CredentialStoreError("the store path must be absolute")
-        if type(lock_timeout_s) not in (int, float) or not lock_timeout_s > 0:
+        if "\x00" in path:   # the OS would raise ValueError (the round-2 read of #385 by Sol, a later item)
+            raise CredentialStoreError("the store path holds a NUL character")
+        if type(lock_timeout_s) not in (int, float) or not 0 < lock_timeout_s < float("inf"):
             raise CredentialStoreError("lock_timeout_s must be a positive number of seconds")
         self._path, self._emit, self._wall = path, emit, wall
         self._lock_path = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.lock")
@@ -341,18 +343,28 @@ class CredentialStore:
         except OSError as exc:
             raise CredentialStoreError(f"the store cannot be read ({type(exc).__name__})") from None
 
-    def _reload(self) -> None:
-        """Memory becomes what the file says, plus this store's revocations not yet written. Lock held."""
+    def _reload(self) -> dict:
+        """Memory becomes what the file says, plus this store's revocations not yet written, each with the time
+        first recorded here. Returns the pending ones the file already holds as revoked, with the file's time.
+        Lock held."""
 
         records, identity = self._load()
         grants = {record["token_id"]: record for record in records}
+        durable = {}
         for token_id in self._unpersisted:   # refused here from the first revoke on, whatever the file says
             mine, theirs = self._grants.get(token_id), grants.get(token_id)
-            if mine is not None and theirs is not None and theirs["revoked_at"] is None:
-                theirs["revoked_at"] = mine["revoked_at"]
+            if mine is None or theirs is None or mine["revoked_at"] is None:
+                continue
+            if theirs["revoked_at"] is not None:
+                durable[token_id] = theirs["revoked_at"]
+            # The time first recorded here stays, whatever another store wrote since: not its later time (the
+            # round-3 read of #377 by Astra, 3), and not the earlier of the two, which a clock that stepped back
+            # gets wrong (the round-4 reads by Astra, 2, and Sol, 1).
+            theirs["revoked_at"] = mine["revoked_at"]
         self._grants = grants
         self._by_digest = {record["token_sha256"]: token_id for token_id, record in grants.items()}
         self._seen = identity
+        return durable
 
     def _refresh(self) -> None:
         """Read the file again if another store has written it since this one last read or wrote it. Lock held."""
@@ -554,29 +566,46 @@ class CredentialStore:
         write. The ``credential.revoked`` notice goes out once, after the write that made it durable.
         """
 
-        with self._lock, self._file_lock():
-            self._reload()   # what another store wrote is kept, its revocations included
-            record = self._grants.get(token_id) if isinstance(token_id, str) else None
-            if record is None:
-                raise CredentialRefused("token_unknown")
-            if record["revoked_at"] is not None and token_id not in self._unpersisted:
-                return self._credential(record)
-            if record["revoked_at"] is None:
-                # Refused from here on, whatever the file write does. Never dated before the grant's issue: after
-                # a wall clock that stepped back, the store this writes must still load (the round-2 reads of
-                # #377, Astra 1 and Sol 1). A retry keeps this first time.
-                record["revoked_at"] = max(record["issued_at"], self._now())
-            self._unpersisted = self._unpersisted | {token_id}
-            try:
-                self._write(self._grants.values())
-            except CredentialStoreUncertain:
+        with self._lock:
+            pending_before = isinstance(token_id, str) and token_id in self._unpersisted
+            known = self._grants.get(token_id) if isinstance(token_id, str) else None
+            if known is not None and known["revoked_at"] is None:
+                # Refused at once, before the writers' lock or the file can fail (the round-3 read of #377 by
+                # Astra, 2: a lock that could not be opened left the grant live in memory).
+                self._revoke_here(known)
+            with self._file_lock():
+                durable = self._reload()   # what another store wrote is kept, its revocations included
+                record = self._grants.get(token_id) if isinstance(token_id, str) else None
+                if record is None:
+                    raise CredentialRefused("token_unknown")
+                if token_id in durable and not pending_before:
+                    # Revoked here only just now, from a stale memory: the file already holds another store's
+                    # revocation, written and notified there, so there is nothing to write or notify here.
+                    record["revoked_at"] = durable[token_id]
+                    self._unpersisted = self._unpersisted - {token_id}
+                if record["revoked_at"] is not None and token_id not in self._unpersisted:
+                    return self._credential(record)
+                if record["revoked_at"] is None:
+                    self._revoke_here(record)
+                self._unpersisted = self._unpersisted | {token_id}
+                try:
+                    self._write(self._grants.values())
+                except CredentialStoreUncertain:
+                    self._wrote()
+                    raise
                 self._wrote()
-                raise
-            self._wrote()
-            settled = self._settle()
-            credential = self._credential(record)
+                settled = self._settle()
+                credential = self._credential(record)
         self._notify_revoked(settled)
         return credential
+
+    def _revoke_here(self, record: dict) -> None:
+        """Refused from here on, whatever the file write does. Never dated before the grant's issue: after a wall
+        clock that stepped back, the store this writes must still load (the round-2 reads of #377, Astra 1 and
+        Sol 1). A retry keeps this first time. Lock held."""
+
+        record["revoked_at"] = max(record["issued_at"], self._now())
+        self._unpersisted = self._unpersisted | {record["token_id"]}
 
     def _settle(self) -> tuple[Credential, ...]:
         """After a write that succeeded fully: every revocation in memory is now durable. Returns the ones that

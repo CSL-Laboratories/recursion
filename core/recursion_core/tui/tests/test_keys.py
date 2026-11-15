@@ -17,7 +17,7 @@ from unittest import mock
 from recursion_core.tui import keys, term
 from recursion_core.tui.app import TuiApp
 from recursion_core.tui.keys import KeyDecoder, Paste
-from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI
+from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI, ScriptedAPI
 from recursion_core.tui.tests.test_inline import ALT_SCREEN, FakeTerminal, TtyOut
 
 # (bytes a terminal sends, the keys they decode to)
@@ -355,6 +355,154 @@ class InteractiveInputTest(unittest.TestCase):
         self.assertEqual(list(apps[0].log)[-1].event_type, "close", "nothing is logged after the close")
         self.assertTrue(out.endswith(term.PASTE_OFF + "\x1b[?25h\x1b[?1049l"))
         self.assertNotIn("run.stop", [m for m, _ in api.calls])
+
+
+class BurstProvenanceTest(unittest.TestCase):
+    """The reviews of #372: a burst is not forgotten at a read boundary (Sol R1), and unfinished input
+    in the same read counts as other input (Astra R3). The rule is a heuristic: input that arrives one
+    key per read cannot be told from typing, and the last test says so."""
+
+    def setUp(self) -> None:
+        self.driver = FakeDriver()
+        self.driver.start_run()
+        self.api = RecordingAPI(self.driver.api)
+        self.app = TuiApp(self.api, clock=Clock(), environ={"NO_COLOR": "1"})
+        self.app.open()
+        self.api.calls.clear()
+
+    def drive(self, chunks: list[bytes], read_bytes: int | None = None) -> None:
+        """Each chunk is one OS write; every key read so far reaches the app before the next write."""
+
+        r_fd, w_fd = os.pipe()
+        tty = object.__new__(term.Tty)
+        tty.fd = r_fd
+        tty.esc_wait_s = 0
+        try:
+            with mock.patch.object(term, "READ_BYTES", read_bytes or term.READ_BYTES):
+                for chunk in chunks:
+                    os.write(w_fd, chunk)
+                    for _ in range(len(chunk) + 4):
+                        key = tty.read_key(0)
+                        if key is None:
+                            break
+                        self.app.press(key, burst=tty.burst)
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_a_line_padded_past_one_read_is_not_sent_by_its_lone_newline(self) -> None:
+        # Sol's decisive probe: one write, the newline at byte READ_BYTES + 1.
+        data = b":stop run-1" + b" " * (term.READ_BYTES - len(b":stop run-1")) + b"\n"
+        self.drive([data])
+        self.assertEqual(self.api.calls, [])
+        self.assertIn("press Enter to send it", self.app.notice)
+
+    def test_a_split_unbracketed_paste_does_not_submit(self) -> None:
+        self.drive([b":stop run-1", b"\n"])
+        self.assertEqual((self.api.calls, self.app.mode), ([], "command"))
+        self.app.press("enter")
+        self.assertEqual(self.api.calls, [("run.stop", {"run_id": "run-1"})], "the next Enter on its own sends")
+
+    def test_a_burst_s_cannot_be_confirmed_by_a_lone_y(self) -> None:
+        self.drive([b" sy"], read_bytes=2)
+        self.assertEqual(self.api.calls, [])
+        self.assertIn("the s or the y came in one read", self.app.notice)
+        self.drive([b"s", b"y"])
+        self.assertEqual(self.api.calls, [("run.stop", {"run_id": "run-1"})], "separately typed s and y still stop")
+
+    def test_enter_with_part_of_another_character_in_its_read_is_burst(self) -> None:
+        # Astra R3: Enter and the first byte of a UTF-8 character in one read.
+        for ch in ":list":
+            self.app.press(ch)
+        tty = object.__new__(term.Tty)
+        tty.fd = -1
+        with mock.patch.object(tty, "_read", return_value=b"\n\xc3"):
+            key = tty.read_key(0)
+        self.app.press(key, burst=tty.burst)
+        self.assertEqual((key, tty.burst, self.api.calls), ("enter", True, []))
+        with mock.patch.object(tty, "_read", return_value=b"\xa9"):
+            self.assertEqual((tty.read_key(0), tty.burst), (chr(0xE9), True), "the key that completes it too")
+
+    def test_esc_lookahead_is_marked_conservatively(self) -> None:
+        tty = object.__new__(term.Tty)
+        tty.fd = -1
+        with mock.patch.object(tty, "_read", side_effect=[b"s\x1b", b"[999~\x1b[A"]):
+            self.assertEqual((tty.read_key(0), tty.burst), ("s", True))
+            self.assertEqual((tty.read_key(0), tty.burst), ("up", True))
+
+    def test_a_bracketed_paste_split_anywhere_stays_inert(self) -> None:
+        data = b"\x1b[200~:stop run-1\nsy\x1b[201~"
+        for cut in range(len(data) + 1):
+            with self.subTest(cut=cut):
+                driver = FakeDriver()
+                driver.start_run()
+                api = RecordingAPI(driver.api)
+                app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+                app.open()
+                api.calls.clear()
+                tty = object.__new__(term.Tty)
+                tty.fd = -1
+                chunks = [c for c in (data[:cut], data[cut:]) if c] + [None] * 4
+                with mock.patch.object(tty, "_read", side_effect=chunks):
+                    for _ in range(4):
+                        key = tty.read_key(0)
+                        if key is not None:
+                            app.press(key, burst=tty.burst)
+                self.assertEqual((api.calls, app.mode, app.line), ([], "keys", ""))
+
+    def test_a_burst_typed_into_a_line_opened_on_its_own_marks_it(self) -> None:
+        self.drive([b":", b"stop run-1", b"\n"])
+        self.assertEqual((self.api.calls, self.app.mode), ([], "command"))
+
+    def test_esc_clears_the_mark_of_a_line(self) -> None:
+        self.drive([b":lis"])
+        self.app.press("esc")
+        for key in (":", *"list", "enter"):
+            self.app.press(key)
+        self.assertEqual(self.api.calls, [("run.list", {})])
+
+    def test_input_that_arrives_one_key_per_read_is_typing(self) -> None:
+        # The limit both reviews name: nothing at this interface tells it from a person typing.
+        self.drive([b":", b"l", b"i", b"s", b"t", b"\n"])
+        self.assertEqual(self.api.calls, [("run.list", {})])
+
+
+class ReviewCoverageTest(unittest.TestCase):
+    """Rules that every lane test survived without (the reviews' mutation passes): each fails without it."""
+
+    def test_the_cursor_never_goes_left_of_the_start(self) -> None:
+        app = TuiApp(ScriptedAPI({"run.list": {"code": "ok", "runs": []}}), clock=Clock(), environ={})
+        app.open()
+        app.press(":")
+        app.press("left")
+        self.assertEqual(app.cursor, 0)
+        for key in ("a", "home", "left", "b"):
+            app.press(key)
+        self.assertEqual((app.line, app.cursor), ("ba", 1))
+
+    def test_an_overlong_sequence_is_dropped_even_when_it_would_name_a_key(self) -> None:
+        d = KeyDecoder()
+        self.assertEqual(d.feed(b"\x1b[" + b"1" * (keys.MAX_SEQ + 1)), [])
+        self.assertLessEqual(len(d._seq), keys.MAX_SEQ, "the parameters kept stay bounded")
+        self.assertEqual(d.feed(b"Ax"), ["x"])
+        self.assertEqual(decode(b"\x1b[1;" + b"0" * keys.MAX_SEQ + b"5C" + b"j"), ["j"], "leading zeros past the cap")
+
+    def test_every_xterm_modifier(self) -> None:
+        for number, prefix in ((1, ""), (2, "shift+"), (3, "alt+"), (4, "alt+shift+"), (5, "ctrl+"),
+                               (6, "ctrl+shift+"), (7, "ctrl+alt+"), (8, "ctrl+alt+shift+")):
+            with self.subTest(modifier=number):
+                self.assertEqual(decode(f"\x1b[1;{number}C".encode()), [prefix + "right"])
+                self.assertEqual(decode(f"\x1b[3;{number}~".encode()), [prefix + "delete"])
+
+    def test_f6_keypad_enter_and_a_triple_modifier(self) -> None:
+        self.assertEqual(decode(b"\x1b[17~\x1bOM\x1b[1;8A"), ["f6", "enter", "ctrl+alt+shift+up"])
+
+    def test_a_crlf_in_a_paste_is_one_space(self) -> None:
+        app = TuiApp(ScriptedAPI({"run.list": {"code": "ok", "runs": []}}), clock=Clock(), environ={})
+        app.open()
+        app.press(":")
+        app.press(Paste("a\r\nb\tc"))
+        self.assertEqual(app.line, "a b c")
 
 
 if __name__ == "__main__":

@@ -266,6 +266,19 @@ class StaleWatchOnlyTest(unittest.TestCase):
         self.assertIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
         self.assertFalse(any("UNCERTAIN cleared" in e.text for e in app.log))
 
+    def test_an_unconfirmed_stop_stays_uncertain_when_the_run_ends_any_other_way(self) -> None:
+        # Review of #372 (Astra, M01): only an attested stop clears it; ended and lost_reboot do not.
+        api = ScriptedAPI({"run.list": {"code": "ok", "runs": []}})
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        app.on_answer("run.stop", {"run_id": "run-1"}, {"code": "pending", "run_id": "run-1", "recorded": False})
+        for state in ("ended", "lost_reboot", "unknown", "running"):
+            with self.subTest(state=state):
+                app.on_answer("run.list", {}, {"code": "ok", "runs": [{"run_id": "run-1", "state": state}]})
+                self.assertIn("run=run-1", app._uncertain)
+        app.on_answer("run.list", {}, {"code": "ok", "runs": [{"run_id": "run-1", "state": "stopped"}]})
+        self.assertNotIn("run=run-1", app._uncertain)
+
     def test_stale_list_stays_stale_after_a_fresh_status(self) -> None:
         # 4503920848: attaching replaced the stale list answer and watch_only turned off.
         run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}

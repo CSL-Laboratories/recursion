@@ -119,6 +119,9 @@ class TuiApp:
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
         self.cursor = 0  # the command line's insertion point, 0..len(line)
+        # Burst input seen since the line was opened, or on the s that armed a Stop (review of #372, R1):
+        # the next Enter or y does not act on it, however it arrives itself.
+        self._line_burst = self._stop_burst = False
         self.notice = ""
         self.closed = False
         self._state = "live"
@@ -128,7 +131,9 @@ class TuiApp:
 
     # -- the event log --------------------------------------------------------------------------
     def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
-              state: str | None = None) -> Event:
+              state: str | None = None) -> Event | None:
+        if self.closed and event_type != "close":
+            return None  # close is the last event, whatever a late answer, output or frame does after it
         ms = int(round((self._clock() - self._t0) * 1000))
         return self.log.append(ms, event_type, source, state or self._view_state(), text,
                                text if speech is None else speech, self._focus())
@@ -166,6 +171,11 @@ class TuiApp:
             self.request("run.status", {"run_id": self.attached})
 
     def close(self) -> None:
+        """Closing sends nothing. After it the app takes no key, answer or output: nothing is logged,
+        sent or changed, so a thread that is still busy cannot add to the log or send a request."""
+
+        if self.closed:
+            return
         self.closed = True
         self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
 
@@ -173,6 +183,8 @@ class TuiApp:
     def request(self, method: str, params: dict) -> None:
         if method not in p.ALLOWED_METHODS:  # defensive: nothing outside the CLI's method set leaves the TUI
             raise ValueError(method)
+        if self.closed:
+            return
         if method == "run.start" and self.watch_only:
             self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
             return
@@ -184,6 +196,8 @@ class TuiApp:
         done(method, params, call_api(self._api, method, params))
 
     def on_answer(self, method: str, params: dict, answer: dict) -> None:
+        if self.closed:
+            return
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
         self.last, self.last_method = answer, method
         code = answer.get("code")
@@ -267,6 +281,8 @@ class TuiApp:
 
     # -- engine output (no control API stream exists yet; the caller feeds events here) ----------
     def on_event(self, event: Mapping) -> None:
+        if self.closed:
+            return
         run_id = str(event.get("run_id"))
         out = self.outputs.get(run_id)
         if out is None:
@@ -280,15 +296,23 @@ class TuiApp:
     def press(self, key: Key, *, burst: bool = False) -> None:
         """One key (a name from ``keys.KeyDecoder``, or a ``Paste``). ``burst`` means it came in one
         read with other input: an unbracketed paste, or typing faster than the client reads. Such a
-        key cannot confirm a Stop or send the command line, because pasted text would otherwise act."""
+        key cannot confirm a Stop or send the command line, because pasted text would otherwise act; nor
+        can the next key, when the Stop was armed or the line typed with burst input. This is a heuristic
+        for an unbracketed paste: input that arrives one key per read cannot be told from typing."""
 
+        if self.closed:
+            return
+        if key == "ctrl+c":  # the terminal sends Ctrl-C as a key (raw mode); it closes, from any mode
+            self.close()
+            return
         if self.mode == "confirm_stop":
             target, self.mode, self.stop_target = self.stop_target, "keys", None
-            if key in ("y", "Y") and not burst:
+            armed_by_burst, self._stop_burst = self._stop_burst, False
+            if key in ("y", "Y") and not (burst or armed_by_burst):
                 self.stop(target)
             elif key in ("y", "Y"):
-                self._notice(f"stop of {field(target)} cancelled: the y came in one read with other input "
-                             f"(a paste?); nothing sent; press s and then y again")
+                self._notice(f"stop of {field(target)} cancelled: the s or the y came in one read with other "
+                             f"input (a paste?); nothing sent; press s and then y again")
             else:
                 self._notice(f"stop of {field(target)} cancelled; nothing sent")
             return
@@ -307,11 +331,11 @@ class TuiApp:
             self.refresh()
         elif key == "s":
             if self.selected:  # the target is fixed now; a later refresh or output cannot change it
-                self.mode, self.stop_target = "confirm_stop", self.selected
+                self.mode, self.stop_target, self._stop_burst = "confirm_stop", self.selected, burst
             else:
                 self._notice("no run selected; nothing to stop")
         elif key == ":":
-            self.mode, self.line, self.cursor = "command", "", 0
+            self.mode, self.line, self.cursor, self._line_burst = "command", "", 0, burst
         elif key == "q":
             self.close()
 
@@ -320,19 +344,22 @@ class TuiApp:
         and Delete at it; typed and pasted text goes in at it; Esc leaves the line; Enter sends it."""
 
         line, at = self.line, self.cursor
+        if burst and key != "enter":
+            self._line_burst = True
         if isinstance(key, Paste):
             text = printable_only(key.text)  # a pasted line break is a space: a paste never sends the line
             self.line, self.cursor = line[:at] + text + line[at:], at + len(text)
             if key.dropped:
                 self._notice(f"paste cut: {key.dropped} characters past the first {len(key.text)} were not kept")
-        elif key == "enter" and burst:
-            self._notice("the command line was not sent: Enter came in one read with other input (a paste?); "
-                         "press Enter to send it")
+        elif key == "enter" and (burst or self._line_burst):
+            self._line_burst = False  # said once; the next Enter, on its own, sends the line
+            self._notice("the command line was not sent: it or its Enter came in one read with other input "
+                         "(a paste?); press Enter to send it")
         elif key == "enter":
             self.mode, self.line, self.cursor = "keys", "", 0
             self.command(line)
         elif key == "esc":
-            self.mode, self.line, self.cursor = "keys", "", 0
+            self.mode, self.line, self.cursor = "keys", "", 0  # the next ":" starts a line with a fresh mark
         elif key == "backspace":
             if at:
                 self.line, self.cursor = line[:at - 1] + line[at:], at - 1
@@ -719,6 +746,8 @@ class Loop:
         self.dropped_events = 0
         self._wake = threading.Event()
         self._halt = threading.Event()
+        self._paint_lock = threading.Lock()  # a paint and shutdown() never overlap; none starts after it
+        self.join_timeout_s = 5.0
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
         self.frame: list[Row] = []
@@ -758,13 +787,18 @@ class Loop:
         t.start()
         self._threads.append(t)
 
-    def shutdown(self) -> None:
-        self._halt.set()
+    def shutdown(self) -> bool:
+        """Stop painting at once, then stop the threads. When this returns no paint is under way and
+        none will start, even if a thread is still inside a slow call; True when every thread ended."""
+
+        with self._paint_lock:
+            self._halt.set()
         self._wake.set()
         for lane in self._lanes.values():
             lane.put(None)
         for t in self._threads:
-            t.join(timeout=5)
+            t.join(timeout=self.join_timeout_s)
+        return not any(t.is_alive() for t in self._threads)
 
     def run(self) -> None:
         self.app.open()
@@ -804,4 +838,6 @@ class Loop:
         self.frame = self._render()
         self.frames += 1
         if self._sink is not None:
-            self._sink(self.frame)
+            with self._paint_lock:
+                if not self._halt.is_set():  # after shutdown() nothing is painted over the restored terminal
+                    self._sink(self.frame)

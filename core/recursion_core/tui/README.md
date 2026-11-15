@@ -65,9 +65,19 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   Bracketed paste is on while the TUI runs: a paste goes into the command line whole, at the cursor,
   with each line break or tab as a space and every other control or invisible character dropped, so a
   paste never sends the line. A paste on the run list or at a Stop confirmation is refused (the
-  confirmation is cancelled). A key that came in one read with other input (a terminal without
-  bracketed paste, or typing faster than the client reads) cannot confirm a Stop or send the command
-  line: the TUI says so and waits for that key on its own.
+  confirmation is cancelled). A paste keeps at most 65,536 characters and says how many it dropped.
+- Unbracketed paste (a heuristic, not a proof): a key is "burst" when it came in one read with other
+  input, or with part of another key. A burst `y`, or any `y` after a burst `s`, cancels the Stop; a
+  burst Enter, or the first Enter on a line that took burst input, does not send it (the next Enter on
+  its own does). The TUI says so each time. Input that arrives one key per read cannot be told from
+  typing, so a slow unbracketed paste still acts as keys; bracketed paste is the protection.
+- The terminal is in raw input mode while the TUI runs (output processing unchanged): no control
+  character acts by itself, so a Ctrl-C, Ctrl-Z or Ctrl-S inside a paste stays inside it. Ctrl-C
+  arrives as a key and closes the TUI from any mode; Ctrl-Z no longer suspends it.
+- The end: a hangup (a read of nothing, or EIO) closes the TUI with exit 0 through restoring the mode
+  and the last writes, where the hung-up terminal's EIO is expected; any other error is raised. After
+  close the app takes no key, answer or output, and once `Loop.shutdown()` returns no frame is painted,
+  so `close` is the last event even if a loop thread is still busy.
 - Stop: `s` fixes the target, and `y` sends `run.stop`. `stop RUN` on the command line also works. The
   screen shows the API's own answer: `status=stopped`, or `status=pending` plus an `UNCERTAIN` line.
   Stop needs no input lease and has its own request lane, so it never waits behind a slow read. Keys are

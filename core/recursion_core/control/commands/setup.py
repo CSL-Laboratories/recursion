@@ -93,7 +93,7 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
         _print(out, {"code": exc.kind, "action": action, "detail": exc.detail})
         return EXIT_REFUSED
     except OSError as exc:
-        _print(out, {"code": "filesystem_error", "action": action, "detail": f"{type(exc).__name__}: {exc}"})
+        _print(out, {"code": "filesystem_error", "action": action, "detail": _filesystem_detail(exc, roots)})
         return EXIT_REFUSED
     answer = {"code": "ok", "action": action, "changed": plan.changed, "unit": plan.unit,
               "next": [list(command) for command in plan.commands]}
@@ -101,6 +101,16 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
         answer["interpreter"] = interpreter
     _print(out, answer)
     return EXIT_OK
+
+
+def _filesystem_detail(exc: OSError, roots: Roots) -> str:
+    """The error and the path. A call on an open file or folder (``fsync``, ``read``, ``write``) names
+    no path, so the unit's folder, where every file these commands write or remove is, is named."""
+
+    detail = f"{type(exc).__name__}: {exc}"
+    if exc.filename is None:
+        detail += f" (in {os.path.join(roots.home, '.config', 'systemd', 'user')})"
+    return detail
 
 
 def probe_interpreter(interpreter: str) -> dict:

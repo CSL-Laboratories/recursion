@@ -2,8 +2,9 @@
 
 A root is resolved once (links above it are the administrator's, such as ``/home`` pointing at
 ``/var/home``). Under a root, every folder this package creates and every file it writes or removes
-is reached without following a link: a link there is refused (``symlink_refused``), and so is a
-folder there that another user owns or that group or world can write (``folder_untrusted``). Nothing
+is reached without following a link: a link there is refused (``symlink_refused`` at a folder,
+``not_regular`` at a file), and so is a folder there that another user owns or that group or world
+can write (``folder_untrusted``). Nothing
 here reads ``os.environ`` or the process's home folder; the caller passes the roots.
 """
 
@@ -191,6 +192,19 @@ def read_regular(path: str) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def file_untrusted(path: str) -> str:
+    """Why another user could change the file at ``path``: it is another user's, or group or world can
+    write it. ``""`` when only we can. The folder rule above, held for a file this package accepts
+    as it is (the unit ``install`` finds already in place)."""
+
+    info = os.lstat(path)
+    if info.st_uid != os.geteuid():
+        return f"{path} is owned by another user"
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{path} can be written by group or world"
+    return ""
 
 
 def write_exclusive(path: str, data: bytes, mode: int) -> None:

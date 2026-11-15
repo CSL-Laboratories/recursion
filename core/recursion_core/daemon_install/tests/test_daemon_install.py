@@ -247,6 +247,49 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(caught.exception.kind, "unit_missing")
         self.assertFalse(os.path.lexists(self.unit_dir))
 
+    def test_an_existing_unit_another_user_could_change_is_refused_by_install_and_rewritten_by_upgrade(self) -> None:
+        # Review 3 of #382, DeepSeek L1: the same bytes are not enough. A unit group or world can
+        # write, or another user owns, is refused by install (unit_untrusted, left as it is); upgrade
+        # writes it again, ours and 0644. Owner-only modes are fine: only another user's write counts.
+        install(self.roots, EXEC)
+        for mode in (0o664, 0o646, 0o666, 0o620, 0o602):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.unit, mode)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    install(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_untrusted")
+                self.assertEqual(caught.exception.detail, f"{self.unit} can be written by group or world; "
+                                 "`recursiond upgrade` writes it again, ours and 0644")
+                self.assertEqual(_tree(self.home), before)
+                plan = upgrade(self.roots, EXEC)
+                self.assertEqual((plan.action, plan.changed), ("upgrade", True))
+                self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), 0o644)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+                self.assertFalse(install(self.roots, EXEC).changed)
+                self.assertEqual(sorted(os.listdir(self.unit_dir)), [UNIT_NAME])
+        real_lstat = os.lstat
+
+        def other_owner(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if os.fspath(path) == self.unit:
+                fields = list(info[:10])
+                fields[4] = info.st_uid + 1
+                return os.stat_result(fields)
+            return info
+        with mock.patch("os.lstat", side_effect=other_owner):
+            with self.assertRaises(InstallRefused) as caught:
+                install(self.roots, EXEC)
+            self.assertEqual(caught.exception.kind, "unit_untrusted")
+            self.assertIn(f"{self.unit} is owned by another user", caught.exception.detail)
+            self.assertTrue(upgrade(self.roots, EXEC).changed)
+        for mode in (0o600, 0o644, 0o640, 0o604):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.unit, mode)
+                self.assertFalse(install(self.roots, EXEC).changed)
+                self.assertFalse(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), mode)
+
     def test_uninstall_removes_the_unit_and_nothing_else(self) -> None:
         before = _tree(self.home)
         install(self.roots, EXEC)

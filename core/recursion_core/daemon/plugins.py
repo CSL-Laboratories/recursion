@@ -147,6 +147,36 @@ class _CorePoisoned(Exception):
     """Raised by ``PluginHost._guarded`` instead of calling plugin code once the core is poisoned."""
 
 
+class _HostShutDown(Exception):
+    """Raised by ``PluginHost._guarded`` instead of calling plugin code once the host has shut down."""
+
+
+_PLAIN_SCALARS = (str, int, float, bool, type(None))
+
+
+def _plain_registry(value):
+    """A ``registry()`` answer as plain data, built-in types exactly, or ``ValueError``.
+
+    Runs inside the guard. ``_snapshot`` first reads one-shot iterables (plugin code); then every
+    nested value must be a ``str``, ``int``, ``float``, ``bool``, ``None``, ``dict`` with ``str`` keys,
+    ``list`` or ``tuple`` of exactly those types. A subclass is refused before it is iterated or
+    compared, so no plugin code runs after the guard's GIL read (review 2 of #380, both reads' C1;
+    PAGE's ``gui.panels/1`` takes plain data the same way).
+    """
+    def plain(item):
+        kind = type(item)
+        if kind in _PLAIN_SCALARS:
+            return item
+        if kind is dict:
+            if any(type(key) is not str for key in item):
+                raise ValueError('registry keys must be plain strings')
+            return {key: plain(entry) for key, entry in item.items()}
+        if kind in (list, tuple):
+            return kind(plain(entry) for entry in item)
+        raise ValueError(f'registry value is not plain data: {kind.__name__}')
+    return plain(_snapshot(value))
+
+
 class _View(collections.namedtuple('_View', 'records panels operators')):
     """The host's published state: records (tuple), panels ((plugin id, registry) tuple), operators (dict).
 
@@ -550,7 +580,7 @@ class PluginHost:
                 try:
                     # Copied to plain values inside the guard: a generator or a dict subclass in the answer
                     # is plugin code too, and the GIL is read after it (review 1 of #380, Sol R2).
-                    snapshot = self._guarded(lambda: _snapshot(factory()))
+                    snapshot = self._guarded(lambda: _plain_registry(factory()))
                     required = snapshot.get('required', {})
                     if not all(isinstance(cls, str) and all(isinstance(s, str) for s in subjects)
                                for cls, subjects in required.items()):
@@ -559,8 +589,8 @@ class PluginHost:
                     # The GUI's own validation, over every panel already accepted plus these.
                     accepted = [p for _, entry in self._view.panels for p in entry.get('panels', ())]
                     panel_registry(accepted + list(snapshot.get('panels', ())))
-                except _CorePoisoned:
-                    pass  # the core was poisoned before the call: registry() was not called
+                except (_CorePoisoned, _HostShutDown):
+                    pass  # the core was poisoned, or the host shut down, before the call: not called
                 except BaseException as exc:  # noqa: BLE001 - a bad registry costs the plugin its panels, not the daemon
                     record['findings'].append(_finding('plugin_registry_invalid', 'refuse',
                                                        f'{type(exc).__name__}: panels not registered'))
@@ -587,7 +617,7 @@ class PluginHost:
                 try:
                     self._guarded(bind, self.core.client_for(loaded.plugin_id))
                     client = True
-                except _CorePoisoned:
+                except (_CorePoisoned, _HostShutDown):
                     pass  # not called: the check below discards everything this plugin offered
                 except BaseException as exc:  # noqa: BLE001 - SystemExit or KeyboardInterrupt included (_guarded)
                     record['findings'].append(_finding('plugin_bind_core_failed', 'warn', type(exc).__name__))
@@ -626,6 +656,8 @@ class PluginHost:
         own shutdown is raised there: SIGTERM and SIGINT only set the main loop's stop event
         (``daemon/__main__.py``), as the loader's import step already assumes.
         """
+        if self._closed:  # a read that waited for its turn across the shutdown (review 2 of #380, C2)
+            raise _HostShutDown(SHUT_DOWN)
         if self.health.poisoned:
             raise _CorePoisoned(self.health.poisoned)
         try:
@@ -707,6 +739,8 @@ class PluginHost:
             return 503, {'error': 'unavailable: more than one loaded plugin serves the operator contract'}
         plugin_id = providers[0]
         outcome = self._call_operator(plugin_id, operators[plugin_id], json.loads(json.dumps(command)))
+        if self._closed:  # the host shut down while this read ran or waited: its answer is not used
+            return 503, {'error': SHUT_DOWN}
         if self.health.poisoned:
             # D2: the call that turned the GIL on answers 503, as every later read does; its answer is not used.
             return 503, {'error': POISONED}

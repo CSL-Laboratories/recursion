@@ -703,6 +703,149 @@ class ReviewOneDeepSeekTests(HostCase):
         self.assertEqual(host.health.poisoned, 'gil_enabled_after_plugin_call')
 
 
+def _pause_at(function, text):
+    """A tracer that holds the calling thread at the line of ``function`` containing ``text``.
+
+    Returns ``(tracer, entered, release)``: install ``tracer`` with ``sys.settrace`` in the thread to hold.
+    """
+    import inspect
+    lines, start = inspect.getsourcelines(function)
+    line = start + next(i for i, source in enumerate(lines) if text in source)
+    code, entered, release = function.__code__, threading.Event(), threading.Event()
+
+    def local(frame, event, arg):
+        if event == 'line' and frame.f_lineno == line:
+            entered.set()
+            release.wait(WATCHDOG_S)
+        return local
+
+    def tracer(frame, event, arg):
+        return local if event == 'call' and frame.f_code is code else None
+    return tracer, entered, release
+
+
+class ReviewTwoTests(HostCase):
+    """The round-2 reads of #380 at d2eddb0e (Codex GPT-6 Astra C1-C3 and T1, GPT-6.1 Sol C1-C4)."""
+
+    def nested(self, raises):
+        sys._r4_nested_gil = False
+        self.addCleanup(lambda: delattr(sys, '_r4_nested_gil'))
+        probe = types.SimpleNamespace(gil_enabled=lambda: sys._r4_nested_gil)
+        body = b'        raise ValueError("conversion")\n' if raises else b'        return super().__iter__()\n'
+        source = (b'import sys\nclass Reads(list):\n    def __iter__(self):\n        sys._r4_nested_gil = True\n' + body +
+                  b'def registry():\n    return {"panels": [{"id": "nested.panel", "title": "Nested", '
+                  b'"reads": Reads(["operator.positions.inspect"])}]}\n')
+        self.install(('a', source, 'fixture.operator', ('read', 'panel')))
+        host = self.host(gil_probe=probe)
+        record = host.records[0]
+        self.assertEqual(host.registries, ())
+        self.assertIn('plugin_registry_invalid', codes(record))
+        # No plugin code after the last GIL read: either the nested value never ran, or the guard saw it.
+        self.assertTrue(not sys._r4_nested_gil or host.health.poisoned, 'a nested callback ran after the guard')
+
+    def test_a_nested_registry_value_runs_no_plugin_code_after_the_guard(self):  # both reads' C1
+        self.nested(raises=False)
+
+    def test_a_nested_registry_value_that_raises_runs_no_plugin_code_after_the_guard(self):  # both reads' C1
+        self.nested(raises=True)
+
+    def test_registry_values_are_built_in_types_exactly(self):  # C1: a str subclass is refused, plain data passes
+        source = (b'class Title(str):\n    pass\n'
+                  b'def registry():\n    return {"panels": [{"id": "sub.panel", "title": Title("T"), '
+                  b'"reads": ["operator.positions.inspect"]}]}\n')
+        self.install(('a', source, 'fixture.operator', ('read', 'panel')))
+        host = self.host()
+        self.assertEqual(host.registries, ())
+        self.assertIn('plugin_registry_invalid', codes(host.records[0]))
+
+    def test_a_read_queued_across_shutdown_is_not_dispatched(self):  # both reads' C2
+        entered, release, queued = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        sys._r4_read = (entered, release, calls)
+        self.addCleanup(lambda: delattr(sys, '_r4_read'))
+        self.addCleanup(release.set)
+        source = (b'import sys\ndef operator(command):\n    entered, release, calls = sys._r4_read\n'
+                  b'    calls.append(1)\n    if len(calls) == 1:\n        entered.set()\n'
+                  b'        release.wait(%d)\n    return {"status_code": "ok", "result": {}}\n' % int(WATCHDOG_S))
+        self.install(('one', source, 'fixture.operator', ('read',)))
+        host = self.host(operator_deadline_s=WATCHDOG_S, operator_turn_wait_s=WATCHDOG_S)
+        real_wait = host._turn.wait_for
+
+        def wait_for(*args, **kwargs):
+            queued.set()
+            return real_wait(*args, **kwargs)
+        host._turn.wait_for = wait_for
+        answers = []
+        first = threading.Thread(target=lambda: answers.append(('first', self.read(host))))
+        second = threading.Thread(target=lambda: answers.append(('second', self.read(host))))
+        first.start()
+        self.addCleanup(lambda: (release.set(), first.join(WATCHDOG_S)))
+        self.assertTrue(entered.wait(WATCHDOG_S))
+        second.start()
+        self.addCleanup(lambda: (release.set(), second.join(WATCHDOG_S)))
+        self.assertTrue(queued.wait(WATCHDOG_S))
+        host.close()
+        release.set()
+        first.join(WATCHDOG_S)
+        second.join(WATCHDOG_S)
+        self.assertEqual(calls, [1], 'a read queued before the shutdown ran plugin code after it')
+        self.assertEqual(sorted(answers), [('first', (503, {'error': plugins.SHUT_DOWN})),
+                                           ('second', (503, {'error': plugins.SHUT_DOWN}))])
+
+    def test_shutdown_waits_for_a_store_being_handed_to_the_host(self):  # Astra T1, Sol C4
+        self.install(('a', b'VALUE = 1\n', 'fixture.operator', ('read',)))
+        host = self.host(load=False)
+        tracer, entered, release = _pause_at(plugins.PluginHost._own, 'setattr(self, attribute, store)')
+        self.addCleanup(release.set)
+
+        def load():
+            sys.settrace(tracer)
+            try:
+                host.load_installed()
+            finally:
+                sys.settrace(None)
+        loader = threading.Thread(target=load)
+        loader.start()
+        self.addCleanup(lambda: (release.set(), loader.join(WATCHDOG_S)))
+        self.assertTrue(entered.wait(WATCHDOG_S))  # the trust store is open and being handed over
+        shut = threading.Event()
+        closer = threading.Thread(target=lambda: (host.close(), shut.set()))
+        closer.start()
+        self.addCleanup(lambda: (release.set(), closer.join(WATCHDOG_S)))
+        self.assertFalse(shut.wait(0.5), 'shutdown returned while a store was being handed over')  # not yet
+        release.set()
+        self.assertTrue(shut.wait(WATCHDOG_S))
+        loader.join(WATCHDOG_S)
+        self.assertIsNone(host._trust._db, 'the handed-over store was left open after shutdown')
+
+    def test_two_loads_started_at_once_admit_one(self):  # Sol C4
+        self.install(('a', b'VALUE = 1\n', 'fixture.operator', ('read',)))
+        host = self.host(load=False)
+        tracer, entered, release = _pause_at(plugins.PluginHost._admit_load, 'self._load_started = True')
+        self.addCleanup(release.set)
+
+        def load():
+            sys.settrace(tracer)
+            try:
+                host.load_installed()
+            finally:
+                sys.settrace(None)
+        first = threading.Thread(target=load)
+        first.start()
+        self.addCleanup(lambda: (release.set(), first.join(WATCHDOG_S)))
+        self.assertTrue(entered.wait(WATCHDOG_S))  # the first load has seen "not started" and not yet said so
+        second, done = [], threading.Event()
+        starter = threading.Thread(target=lambda: (second.append(host.start_loading()), done.set()))
+        starter.start()
+        self.addCleanup(lambda: (release.set(), starter.join(WATCHDOG_S)))
+        self.assertFalse(done.wait(0.5), 'a second load was admitted while the first was being admitted')  # not yet
+        release.set()
+        self.assertTrue(done.wait(WATCHDOG_S))
+        first.join(WATCHDOG_S)
+        self.assertEqual(second, [None])
+        self.assertEqual([r['plugin_id'] for r in host.records], ['fixture.operator'])
+
+
 def _run_catching(call):
     try:
         call()

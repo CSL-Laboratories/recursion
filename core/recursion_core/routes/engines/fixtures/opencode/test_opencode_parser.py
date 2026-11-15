@@ -12,9 +12,12 @@ The shape checks below follow event.v1 (SPINE's ``schemas/control/v1/event.v1.js
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
+import sys
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -367,6 +370,14 @@ class LimitTests(Shape, unittest.TestCase):
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ GMT"}, None),     # an unknown zone cannot hide
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ +0000"}, None),   # behind an allowed last word
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 GMT (UTC)"}, None),   # nor before a comment
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ 00:06:00 GMT"}, None),   # a second time cannot
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ00:06:00 GMT"}, None),    # move where the zone
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 00:06:00 GMT"}, None),       # is looked for
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ 9:06 +0000"}, None),
+                 ({"retry-after": "Sat, 14 Nov 26 00:05:00 GMT"}, None),            # a two-digit year
+                 ({"retry-after": "Saturday, 14 Nov 2026 00:05:00 GMT"}, "2026-11-14T00:05:00.000Z"),
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 GMT\t"}, "2026-11-14T00:05:00.000Z"),
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00 utc  "}, "2026-11-14T00:05:00.000Z"),
                  ({"retry-after": "Sat, 14 Nov 2026 00:05 GMT"}, "2026-11-14T00:05:00.000Z"),       # no seconds
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 -2500"}, "2026-11-15T01:05:00.000Z"),  # as JS reads it
                  ({"retry-after": "Sat, 32 Nov 2026 00:05:00 GMT"}, None),  # impossible dates and times are
@@ -926,6 +937,111 @@ class ReviewOneTests(Shape, unittest.TestCase):
             with self.subTest(kwargs):
                 with self.assertRaises(ValueError):
                     oc.Parser(connection_id=CONN, model=MODEL, **kwargs)
+
+    # Round 3 (Codex GPT-6.1 Sol C1 above, in the waits table; DeepSeek V4.1 Flash F1-F3)
+    def state(self, p) -> tuple:
+        return (p._offset, p._lines, p.engine_session_id, list(p.anomalies), list(p._text), list(p._usage),
+                list(p._errors), p._limit)
+
+    def test_f1_an_interruption_wherever_it_lands_leaves_the_line_unread(self):
+        class Exploding(list):
+            def append(self, item):
+                super().append(item)
+                raise KeyboardInterrupt
+
+        text = line({"type": "text", "sessionID": "ses_x", "part": {"type": "text", "text": "hello "}})
+        usage = line(step({"input": 5}))
+        error = line(v1_error({"message": "x", "statusCode": 500, "isRetryable": True}))
+        for attribute, raw in (("_text", text), ("_usage", usage), ("_errors", error), ("anomalies", line("[1]"))):
+            with self.subTest(attribute):
+                p = parser()
+                p.feed(line({"type": "step_start", "sessionID": "ses_x"}))
+                before = self.state(p)
+                setattr(p, attribute, Exploding(getattr(p, attribute)))
+                with self.assertRaises(KeyboardInterrupt):
+                    p.feed(raw)
+                self.assertEqual(self.state(p), before)
+                setattr(p, attribute, list(getattr(p, attribute)))
+                drafts = p.feed(raw)                                      # the retry reads it once
+                self.assertEqual(drafts[0]["payload"]["offset_start"], before[0])
+        p = parser()
+        p.feed(text)
+        p.feed(text)
+        self.assertEqual(p.text, "hello hello ")                         # two real lines are two
+
+    def test_f1_an_interruption_after_the_limit_was_kept_puts_the_earlier_limit_back(self):
+        p = parser()
+        first = line(v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                               "responseHeaders": {"retry-after": "60"}}))
+        p.feed(first)
+        before = self.state(p)
+        real_draft = oc._draft
+
+        def draft(kind, payload):
+            if kind == "limit":
+                raise KeyboardInterrupt
+            return real_draft(kind, payload)
+
+        second = line(v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                                "responseHeaders": {"retry-after": "120"}}))
+        with mock.patch.object(oc, "_draft", draft):
+            with self.assertRaises(KeyboardInterrupt):
+                p.feed(second)
+        self.assertEqual(self.state(p), before)
+        self.assertEqual(p._limit["reset_at"], CLOCK + 60)
+
+    def test_f1_an_interruption_before_the_first_draft_moves_no_offset(self):
+        p = parser()
+        with mock.patch.object(oc, "_draft", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                p.feed(line({"type": "step_start"}))
+        self.assertEqual((p._offset, p._lines), (0, 0))
+        self.assertEqual(p.feed(line({"type": "step_start"}))[0]["payload"]["offset_start"], 0)
+
+    def test_f1_an_interruption_just_after_the_offset_moved_is_put_back(self):
+        # A signal can land between any two lines; a line tracer raises one exactly before the line count moves,
+        # after the offset has.
+        lines, first = inspect.getsourcelines(oc.Parser.feed)
+        target = first + next(i for i, text in enumerate(lines) if text.strip() == "self._lines += 1")
+
+        def local(frame, event, arg):
+            if event == "line" and frame.f_lineno == target:
+                raise KeyboardInterrupt
+            return local
+
+        def tracer(frame, event, arg):
+            return local if frame.f_code is oc.Parser.feed.__code__ else None
+
+        p = parser()
+        sys.settrace(tracer)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                p.feed(line({"type": "step_start"}))
+        finally:
+            sys.settrace(None)
+        self.assertEqual((p._offset, p._lines), (0, 0))
+
+    def test_f2_a_reset_before_the_year_1_is_none_and_every_year_has_four_digits(self):
+        for wall in (-1e12, -1e18):
+            with self.subTest(wall):
+                p = parser(wall=wall)
+                (limit,) = typed(p.feed(line(v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                                                       "responseHeaders": {"retry-after": "60"}}))), "limit")
+                self.assertIsNone(limit["reset_at"])
+        p = parser(wall=-5e10)                                            # in the year 385
+        (limit,) = typed(p.feed(line(v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                                               "responseHeaders": {"retry-after": "60"}}))), "limit")
+        self.assertRegex(limit["reset_at"], r"^0385-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]{3}Z$")
+        self.check({"type": "limit", "payload": limit})
+
+    def test_annotating_a_usage_draft_changes_nothing_the_route_books(self):
+        p = parser()
+        (usage,) = typed(p.feed(line(step({"input": 3, "output": 9, "reasoning": 1}, cost=0.25))), "usage")
+        usage["input_tokens"]["value"] = -999
+        usage["cost_usd"]["quality"] = "unknown"
+        p.end(0)
+        data = p.route_result("r1")["events"][0]["data"]
+        self.assertEqual((data["input_tokens"], data["cost_usd"]), (known(3), known(0.25, "modelled")))
 
     # NITs
     def test_the_flags_cannot_be_changed_from_outside(self):

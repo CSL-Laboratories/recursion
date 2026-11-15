@@ -24,9 +24,10 @@ lines differ in two shapes, and the parser tells them apart on each line from th
 
 Every fixture beside this module is SYNTHETIC: written by hand from those source reads, not captured from a run.
 
-WHAT A LINE GIVES. Every line gives one ``engine.output`` draft first: the line exactly as printed, with its byte
-offsets in the run's stdout, so a reader that restarts resumes without losing or repeating a line (an empty chunk
-is not a line and gives nothing). Then:
+WHAT A LINE GIVES. Every line gives one ``engine.output`` draft first: the line as UTF-8 text (a byte that is not
+UTF-8 is written U+FFFD, so only then does the text differ from what was printed), with its exact byte offsets in the
+run's stdout, so a reader that restarts resumes without losing or repeating a line (an empty chunk is not a line and
+gives nothing). Then:
 
     tool_use      ``tool.call`` and ``tool.result``: OpenCode prints a call once, after it completed or failed
     step_finish   ``usage``, span ``call``: one step is one model call
@@ -92,7 +93,7 @@ import math
 import re
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_tz
 from types import MappingProxyType
 
@@ -130,10 +131,14 @@ MAX_TOOL_NAME = 256   # event.v1 tool.call name
 MAX_SESSION_ID = 256  # driver.v2 engine_session_id
 MAX_EXACT = 2 ** 53 - 1
 _LAST_EPOCH = 253402300798.0   # 9999-12-31T23:59:58Z: rounded up, still in the year 9999
+_FIRST_EPOCH = -62135596800.0  # 0001-01-01T00:00:00Z
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 _CONNECTION = re.compile(r"(subscription|api_key|passthrough):.+")
-_ZONE = re.compile(r"GMT|UTC|UT|Z|[+-][0-9]{4}", re.IGNORECASE)   # Date.parse reads zone names in any case
-_ZONE_AFTER_TIME = re.compile(r"[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\s+(\S+)\s*$")   # the one word after the time
+# The whole HTTP date, in the form RFC 9110 sends: an optional weekday, day, month, four-digit year, one time, and one
+# zone Date.parse names (in any case). Nothing else may stand before, between or after.
+_HTTP_DATE = re.compile(r"\s*(?:[A-Za-z]+,\s*)?[0-9]{1,2}\s+[A-Za-z]{3}\s+[0-9]{4}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?"
+                        r"\s+(?:GMT|UTC|UT|Z|[+-][0-9]{4})\s*", re.IGNORECASE)
 _SURROGATE = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + "]")
 REPLACEMENT = chr(0xFFFD)
 _JS_FLOAT = re.compile(r"\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
@@ -222,22 +227,23 @@ class Parser:
             raise ValueError("one line at a time")
         if not raw:
             return []
-        start, lines = self._offset, self._lines
-        session, anomalies = self.engine_session_id, len(self.anomalies)
-        self._offset += len(raw)
-        self._lines += 1
-        drafts = [_draft("engine.output", {"stream": "stdout", "text": raw.decode("utf-8", errors="replace"),
-                                           "offset_start": start, "offset_end": self._offset})]
+        # What the line may change, taken before anything moves: if reading it raises (an injected clock, an
+        # interruption, a memory error), all of it is put back, so the line counts as not read and feeding it again
+        # gives the same drafts at the same offsets, with no text, usage, error or anomaly counted twice.
+        start, lines, session, limit = self._offset, self._lines, self.engine_session_id, self._limit
+        kept = [(kept_list, len(kept_list)) for kept_list in (self.anomalies, self._text, self._usage, self._errors)]
         try:
+            self._offset += len(raw)
+            self._lines += 1
+            drafts = [_draft("engine.output", {"stream": "stdout", "text": raw.decode("utf-8", errors="replace"),
+                                               "offset_start": start, "offset_end": self._offset})]
             event = self._load(raw)
             if event is not None:
                 drafts.extend(self._typed(event))
         except BaseException:
-            # Only an injected clock can raise here. Everything the line had changed is put back (the offsets, the
-            # line count, the session id, its anomalies; an error and a limit are kept only after the clocks were
-            # read), so the line counts as not read and feeding it again gives the same drafts at the same offsets.
-            self._offset, self._lines, self.engine_session_id = start, lines, session
-            del self.anomalies[anomalies:]
+            self._offset, self._lines, self.engine_session_id, self._limit = start, lines, session, limit
+            for kept_list, length in kept:
+                del kept_list[length:]
             raise
         return drafts
 
@@ -488,11 +494,11 @@ def _retry_after_s(headers: object, now: float) -> float | None:
     ``now`` is the wall clock's reading for this line. ``retry-after-ms`` when it holds a number (then nothing else
     is read, as in OpenCode, even when that number is not a usable wait), else ``retry-after`` as seconds, else as
     an HTTP date. A wait that is not a positive number is None. Header names are matched in any case. An HTTP date
-    counts only when the ONE word after its time, and the last word of the value, is the zone ``GMT``, ``UT``,
-    ``UTC``, ``Z`` or a numeric offset (``parsedate_tz`` reads an unknown zone, no zone, and a zone with a word
-    between it and the time as offset 0; ``Date.parse`` refuses the first and the third and reads the second in the
-    machine's own zone), and only with a real calendar day and time (``Date.parse`` refuses "32 Nov" or "25:00",
-    which ``calendar.timegm`` would roll forward).
+    counts only when the WHOLE value has the shape ``_HTTP_DATE`` gives (one time, then one zone ``GMT``, ``UT``,
+    ``UTC``, ``Z`` or a numeric offset, then nothing): ``parsedate_tz`` reads an unknown zone, no zone, a word between
+    the time and the zone, and a second time as offset 0 or skips them, where ``Date.parse`` refuses them or reads
+    them in the machine's own zone. And only with a real calendar day and time (``Date.parse`` refuses "32 Nov" or
+    "25:00", which ``calendar.timegm`` would roll forward).
     """
     if not isinstance(headers, Mapping):
         return None
@@ -510,8 +516,7 @@ def _retry_after_s(headers: object, now: float) -> float | None:
         return number if number > 0 else None
     try:
         parts = parsedate_tz(after)
-        zone = _ZONE_AFTER_TIME.search(after)
-        if parts is None or zone is None or not _ZONE.fullmatch(zone.group(1)):
+        if parts is None or not _HTTP_DATE.fullmatch(after):
             return None
         year, month, day, hour, minute, second = parts[:6]
         # parsedate_tz has already refused a month it does not name.
@@ -528,13 +533,14 @@ def _retry_after_s(headers: object, now: float) -> float | None:
 def _timestamp(epoch: float) -> str | None:
     """common.v1's timestamp, rounded UP to the millisecond (a reset is never earlier than asked).
 
-    None when it cannot be written: after the last second of the year 9999, infinite, or not a number.
+    None when it cannot be written: before the first second of the year 1, after the last of the year 9999 (only an
+    injected wall clock gets that far), infinite, or not a number. The year is always written with four digits.
     """
-    if not epoch <= _LAST_EPOCH:
+    if not _FIRST_EPOCH <= epoch <= _LAST_EPOCH:
         return None
     millis = math.ceil(epoch * 1000)
-    moment = datetime.fromtimestamp(millis // 1000, timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H:%M:%S") + f".{millis % 1000:03d}Z"
+    m = _UNIX_EPOCH + timedelta(seconds=millis // 1000)
+    return f"{m.year:04d}-{m.month:02d}-{m.day:02d}T{m.hour:02d}:{m.minute:02d}:{m.second:02d}.{millis % 1000:03d}Z"
 
 
 def _one_line(value: object, limit: int) -> bool:

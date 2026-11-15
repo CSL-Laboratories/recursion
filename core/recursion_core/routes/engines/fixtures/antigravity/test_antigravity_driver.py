@@ -458,7 +458,7 @@ class ReviewRoundOne408Test(unittest.TestCase):
                                                                ("result", None, None)])   # c0 reused: afresh
 
     def test_f3_a_call_refused_at_its_draft_is_not_counted_as_drafted(self) -> None:
-        calls = acp.ToolCalls(ag.input_digest)
+        calls = acp.ToolCalls(ag.tool_input_digest)
         with self.assertRaises(acp.AcpProtocolError):
             calls.update({"sessionId": "s", "update": {"sessionUpdate": "tool_call", "toolCallId": "c1",
                                                        "status": "in_progress", "rawInput": {"n": float("nan")}}})
@@ -738,7 +738,7 @@ class ReviewRoundTwo408Test(unittest.TestCase):
         self.assertEqual(drafts.drafts, [])                                  # an id no draft could carry
 
     def test_r2_f12_a_digest_not_of_sha256_form_is_refused(self) -> None:
-        for digest in (lambda v: "not-a-digest", lambda v: "A" * 64, lambda v: None):
+        for digest in (lambda v: "not-a-digest", lambda v: "A" * 64, lambda v: 5):
             with self.subTest(digest=digest(None)), self.assertRaises(acp.AcpInvalid):
                 acp.ToolCalls(digest).update(tool_update({}, "ok"))
         good = acp.ToolCalls(ag.input_digest).update(tool_update({}, "ok"))                   # guard
@@ -836,21 +836,26 @@ class ReviewRoundThree408Test(unittest.TestCase):
     def test_exit_the_agent_stops_the_turn_itself(self) -> None:
         self.answered([C0_OPEN, ("end", "cancelled")], None, "cancelled")
 
-    def test_exit_without_turn_end_wired_the_answer_ends_the_calls_before_the_next_turn(self) -> None:
-        # callbacks wrapped (not bound): no turn_end comes along; the abandoned turn's answer, read as the next
-        # prompt drains it, ends c0 before any line of the next turn
+    def test_exit_wrapped_callbacks_end_the_turn_through_the_drivers_abandoned(self) -> None:
+        # callbacks wrapped (not bound): no turn_end comes along, so the driver's documented abandoned() in its
+        # except ends c0 at the raise, before the next prompt
         drafts = ag.AcpDrafts()
         agent = FakeAcpAgent([[C0_OPEN, UNPARSEABLE, ("wait_cancel",), ("end", "cancelled")], NEXT_TURN])
         s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR,
                         on_line=lambda line: drafts.on_line(line), on_update=lambda p: drafts.on_update(p),
                         on_ask=lambda ask: drafts.on_ask(ask))
-        with self.assertRaises(acp.AcpProtocolError):
+        try:
             s.prompt("first", FAR)
+        except acp.AcpProtocolError as err:
+            drafts.abandoned(err.code, "the driver's except")
+        self.assertEqual(unanswered(drafts.drafts), [])
+        mark = len(drafts.drafts)
         drafts.ended(s.prompt("second", FAR), "turn-2", "dlv-2")
+        self.assertEqual(orphans(drafts.drafts[mark:]), [])
         self.assertEqual(unanswered(drafts.drafts), [])
         self.assertEqual(pairs(drafts.drafts), [("tool.call", "c0", None), ("tool.result", "c0", "cancelled"),
-                                                ("tool.call", "c0", None), ("tool.result", "c0", "ok"),
-                                                ("result", None, None)])
+                                                ("result", None, None), ("tool.call", "c0", None),
+                                                ("tool.result", "c0", "ok"), ("result", None, None)])
 
     def test_exit_the_deadline(self) -> None:
         self.answered([C0_OPEN, ("wait_cancel",), ("end", "cancelled")], 10.0, "cancelled")
@@ -926,6 +931,192 @@ class ReviewRoundThree408Test(unittest.TestCase):
 
         with self.assertRaises(acp.AcpInvalid):
             acp.ToolCalls(failing).update(tool_update({}, "ok"))
+
+
+STRAY = ("raw", '{"jsonrpc":"2.0","id":9999,"result":{"stopReason":"end_turn"}}')
+C0_DONE = ("update", {"sessionUpdate": "tool_call_update", "toolCallId": "c0", "status": "completed",
+                      "content": [{"type": "content", "content": {"type": "text", "text": "out"}}]})
+
+
+class SubStr(str):
+    """A str subclass that lies about what it holds."""
+
+    def __contains__(self, item):
+        return False
+
+    def find(self, *args, **kwargs):
+        return -1
+
+
+class ReviewRoundFour408Test(unittest.TestCase):
+    """DeepSeek's round-4 read of #408 at ee885aed (MED 1, MED 2, LOW 3 to 7, the two green guards), and what
+    the lane's own attack on the answer found (the report lists each). Each fails on that head."""
+
+    def test_m1_one_drafts_across_two_sessions_drafts_each_sessions_result(self) -> None:
+        drafts = ag.AcpDrafts()
+        for start_turn in (False, True):
+            with self.subTest(start_turn=start_turn):
+                before = len([d for d in drafts.drafts if d["type"] == "result"])
+                for _session in range(2):
+                    agent = FakeAcpAgent([[("chunk", "hi"), ("end", "end_turn")]])
+                    s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+                    if start_turn:
+                        drafts.start_turn()
+                    out = s.prompt("x", FAR)
+                    self.assertEqual(out.turn, 1)                       # numbers start again in each session
+                    self.assertEqual(len(drafts.ended(out, "turn-1", "dlv-1")), 2)
+                self.assertEqual(len([d for d in drafts.drafts if d["type"] == "result"]) - before, 2)
+
+    def test_m2_a_stray_response_line_ends_nothing(self) -> None:
+        for wiring in ("drafts=", "wrapped"):
+            with self.subTest(wiring=wiring):
+                drafts = ag.AcpDrafts()
+                agent = FakeAcpAgent([[C0_OPEN, STRAY, ("stale_response",), C0_DONE, ("end", "end_turn")]])
+                if wiring == "drafts=":
+                    s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+                else:
+                    s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR,
+                                    on_line=lambda line: drafts.on_line(line), on_update=lambda p: drafts.on_update(p))
+                out = s.prompt("x", FAR)
+                drafts.ended(out, "turn-1", "dlv-1")
+                self.assertEqual(pairs(drafts.drafts), [("tool.call", "c0", None), ("tool.result", "c0", "ok"),
+                                                        ("result", None, None)])
+                self.assertEqual(s.connection.stray_responses, 2)
+
+    def test_low3_ended_after_abandoned_drafts_no_second_result(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.on_update({"sessionId": "s", "update": C0_OPEN[1]})
+        drafts.abandoned(c.ENGINE_ERROR, "x")
+        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "")
+        self.assertEqual(drafts.ended(out, "turn-1", "dlv-1"), [])
+        self.assertEqual([d["type"] for d in drafts.drafts if d["type"] == "result"], ["result"])
+
+    def test_low4_a_callback_that_is_not_callable_is_refused(self) -> None:
+        agent = FakeAcpAgent()
+        for name in ("on_turn_end", "on_line", "on_update", "on_ask"):
+            with self.subTest(callback=name), self.assertRaises(acp.AcpInvalid):
+                acp.AcpSession(agent, agent.clock, **{name: 1})
+
+    def test_low5_two_draft_makers_are_refused_not_left_with_no_turn_end(self) -> None:
+        one, two = ag.AcpDrafts(), ag.AcpDrafts()
+        agent = FakeAcpAgent()
+        with self.assertRaises(acp.AcpInvalid):
+            acp.AcpSession(agent, agent.clock, on_line=one.on_line, on_update=two.on_update)
+        s = acp.AcpSession(agent, agent.clock, on_line=one.on_line, on_update=two.on_update,
+                           on_turn_end=one.turn_end)                       # guard: given, it is taken
+        self.assertIsNotNone(s)
+
+    def test_low6_a_tool_input_with_a_lone_surrogate_is_the_agents_protocol_error(self) -> None:
+        drafts = ag.AcpDrafts()
+        params = json.loads('{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"c1",'
+                            '"status":"in_progress","rawInput":{"t":"a' + chr(92) + 'ud800"}}}')
+        with self.assertRaises(acp.AcpProtocolError) as ctx:
+            drafts.on_update(params)
+        self.assertEqual(ctx.exception.code, c.PROTOCOL_ERROR)
+        self.assertIn("unpaired surrogate", acp.ToolCalls._call.__doc__)
+
+    def test_low7_a_digest_that_raises_value_error_is_the_callers_failure(self) -> None:
+        def raising(value):
+            raise ValueError("synthetic")
+
+        with self.assertRaises(acp.AcpInvalid):
+            acp.ToolCalls(raising).update(tool_update({}, "ok"))
+        with self.assertRaises(acp.AcpProtocolError):                     # None: no canonical text
+            acp.ToolCalls(lambda v: None).update(tool_update({}, "ok"))
+
+    def test_guard6_turn_end_twice_for_one_turn_drafts_one_result(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_end((7, 1), None, c.PROTOCOL_ERROR, "x")
+        drafts.on_line('{"jsonrpc":"2.0","method":"x"}')
+        self.assertEqual(drafts.turn_end((7, 1), None, c.PROTOCOL_ERROR, "x"), [])
+        self.assertEqual(len(drafts.turn_end((8, 1), None, c.PROTOCOL_ERROR, "x")), 1)   # another session
+
+    def test_guard7_a_turn_end_outside_the_contract_is_refused(self) -> None:
+        drafts = ag.AcpDrafts()
+        for code, detail in (("not_a_code", "x"), (None, "x"), (c.ENGINE_ERROR, 5), (SubStr(c.ENGINE_ERROR), "x")):
+            with self.subTest(code=code, detail=detail):
+                for call in (lambda: drafts.turn_end((1, 1), None, code, detail),
+                             lambda: drafts.abandoned(code, detail)):
+                    with self.assertRaises(TypeError):
+                        call()
+        for key in ((1,), (1, "1"), [1, 1], (True, 1), "1"):
+            with self.subTest(key=key), self.assertRaises(TypeError):
+                drafts.turn_end(key, None, c.ENGINE_ERROR, "x")
+        self.assertEqual(drafts.drafts, [])
+
+    def test_m1_one_drafts_across_two_sessions_drafts_each_raised_turns_result(self) -> None:
+        drafts = ag.AcpDrafts()
+        for _session in range(2):
+            agent = FakeAcpAgent([[C0_OPEN, UNPARSEABLE, ("wait_cancel",), ("end", "cancelled")]])
+            s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+            with self.assertRaises(acp.AcpProtocolError):                # turn 1 of each session raises
+                s.prompt("x", FAR)
+        self.assertEqual(len([d for d in drafts.drafts if d["type"] == "result"]), 2)
+        self.assertEqual(unanswered(drafts.drafts), [])
+
+    # -- what the lane's own attack found (the report lists each attempt) --------------------------------------
+    def test_attack_a_line_or_mask_text_that_is_a_str_subclass_is_refused(self) -> None:
+        key = "r4-made-up-key"
+        drafts = ag.AcpDrafts(redact=(key,))
+        with self.assertRaisesRegex(TypeError, "on_line takes"):          # on_line's own refusal, not mask's
+            drafts.on_line(SubStr('{"t":"' + key + '"}'))
+        with self.assertRaises(TypeError):
+            ag.mask(SubStr(key), ag.mask_forms((key,)))
+        self.assertEqual(drafts.drafts, [])
+
+    def test_attack_ids_that_are_str_subclasses_are_refused(self) -> None:
+        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "")
+        drafts = ag.AcpDrafts()
+        for turn_id, delivery_id in ((SubStr("turn-1"), "dlv-1"), ("turn-1", SubStr("dlv-1"))):
+            with self.subTest(turn_id=type(turn_id).__name__), self.assertRaises(TypeError):
+                drafts.ended(out, turn_id, delivery_id)
+
+    def test_attack_an_offset_that_is_not_a_count_is_refused(self) -> None:
+        for offset in (-1, True, 1.0, "0"):
+            with self.subTest(offset=offset), self.assertRaises(TypeError):
+                ag.AcpDrafts(offset=offset)
+
+    def test_attack_every_end_in_every_order_drafts_one_result_per_turn(self) -> None:
+        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "")
+        orders = {
+            "ended, ended": [lambda d: d.ended(out), lambda d: d.ended(out)],
+            "ended, abandoned": [lambda d: d.ended(out), lambda d: d.abandoned(c.ENGINE_ERROR, "x")],
+            "abandoned, ended": [lambda d: d.abandoned(c.ENGINE_ERROR, "x"), lambda d: d.ended(out)],
+            "abandoned, abandoned": [lambda d: d.abandoned(c.ENGINE_ERROR, "x"),
+                                     lambda d: d.abandoned(c.ENGINE_ERROR, "x")],
+            "turn_end raised, abandoned, ended": [lambda d: d.turn_end((0, 1), None, c.ENGINE_ERROR, "x"),
+                                                  lambda d: d.abandoned(c.ENGINE_ERROR, "x"), lambda d: d.ended(out)],
+            "turn_end answered, ended, ended": [lambda d: d.turn_end((0, 1), out, None, ""), lambda d: d.ended(out),
+                                                lambda d: d.ended(out)],
+            "start_turn, start_turn, ended": [lambda d: d.start_turn(), lambda d: d.start_turn(),
+                                              lambda d: d.ended(out)],
+        }
+        for name, steps in orders.items():
+            with self.subTest(order=name):
+                drafts = ag.AcpDrafts()
+                drafts.on_update({"sessionId": "s", "update": C0_OPEN[1]})
+                for step in steps:
+                    step(drafts)
+                self.assertEqual(len([d for d in drafts.drafts if d["type"] == "result"]), 1)
+                self.assertEqual(unanswered(drafts.drafts), [])
+                self.assertEqual(len([d for d in drafts.drafts if d["type"] == "tool.result"]), 1)
+
+    def test_attack_a_repeated_ended_after_new_lines_drafts_nothing(self) -> None:
+        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "")
+        drafts = ag.AcpDrafts()
+        drafts.ended(out)
+        drafts.on_line('{"jsonrpc":"2.0","method":"x"}')                   # read since: the turn is still named
+        self.assertEqual(drafts.ended(out), [])
+        self.assertEqual(len([d for d in drafts.drafts if d["type"] == "result"]), 1)
+
+    def test_attack_a_late_and_a_repeated_answer_line_end_nothing(self) -> None:
+        answer = '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+        drafts = ag.AcpDrafts()
+        drafts.on_update({"sessionId": "s", "update": C0_OPEN[1]})
+        for _ in range(3):
+            drafts.on_line(answer)                                       # repeated: ends nothing by itself
+        drafts.on_update({"sessionId": "s", "update": C0_DONE[1]})
+        self.assertEqual(pairs(drafts.drafts), [("tool.call", "c0", None), ("tool.result", "c0", "ok")])
 
 if __name__ == "__main__":
     unittest.main()

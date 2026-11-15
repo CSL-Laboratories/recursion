@@ -332,6 +332,7 @@ class ToolDraftRedactionTest(unittest.TestCase):
         escaped = json.dumps(json.dumps({"k": TOOL_KEY}).replace("r", chr(92) + "u0072", 1))
         return {"as a value": ({"cmd": "echo " + TOOL_KEY}, "out " + TOOL_KEY),
                 "as a key": ({TOOL_KEY: 1}, "ok"),
+                "in a list": ({"args": ["echo", TOOL_KEY]}, "ok"),
                 "inside JSON in a string": ({"body": nested}, nested),
                 "escaped inside JSON in a string": ({"body": json.loads(escaped)}, json.loads(escaped))}
 
@@ -373,6 +374,146 @@ def _unwrap(value):
         except ValueError:
             return value
     return value
+
+
+R1_TOOL = [
+    ("update", {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Run ls", "kind": "execute",
+                "status": "pending", "rawInput": {}}),
+    ("update", {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "in_progress",
+                "rawInput": {"CommandLine": "ls"}})]
+
+
+def r1_session(agent, drafts, **kwargs):
+    return ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, on_line=drafts.on_line,
+                       on_update=kwargs.pop("on_update", drafts.on_update), on_ask=drafts.on_ask, **kwargs)
+
+
+def pairs(drafts):
+    return [(d["type"], d["payload"].get("call_id"), d["payload"].get("status")) for d in drafts
+            if d["type"] in ("tool.call", "tool.result", "result")]
+
+
+class ReviewRoundOne408Test(unittest.TestCase):
+    """Regressions for DeepSeek's round-1 read of #408 at 0e2c512d (F1-F3 HIGH, F5-F6 MED, F9 LOW). Each fails
+    on that head, except the guards marked as such."""
+
+    def test_f1_a_number_bool_or_null_that_spells_a_value_is_a_protocol_error(self) -> None:
+        for value, key in ((12345, "12345"), (True, "true"), (False, "False"), (None, "null"), (1e10, "1e10"),
+                           (12345.0, "12345")):
+            with self.subTest(value=value, key=key):
+                drafts = ag.AcpDrafts(redact=(key,))
+                with self.assertRaises(acp.AcpProtocolError):
+                    drafts.on_update(tool_update({"n": value}, "ok"))
+                self.assertEqual(drafts.drafts, [])
+        drafts = ag.AcpDrafts(redact=("12345",))                                       # guard
+        drafts.on_update(tool_update({"n": 7, "flag": True}, "ok"))
+        self.assertEqual(drafts.drafts[0]["payload"]["input"], {"n": 7, "flag": True})
+
+    def test_f2_a_value_split_across_content_items_is_not_joined_back(self) -> None:
+        half = len(TOOL_KEY) // 2
+        update = tool_update({}, "unused")
+        update["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": TOOL_KEY[:half]}},
+                                       {"type": "content", "content": {"type": "text", "text": TOOL_KEY[half:]}}]
+        drafts = ag.AcpDrafts(redact=(TOOL_KEY,))
+        drafts.on_update(update)
+        result = [d["payload"] for d in drafts.drafts if d["type"] == "tool.result"][0]
+        self.assertNotIn(TOOL_KEY, result["text"])
+        self.assertEqual(len(result["text"]), len(TOOL_KEY))
+
+    def test_f3_a_turn_that_raised_leaves_no_tool_state_to_the_next(self) -> None:
+        for close in ("abandoned", "start_turn"):
+            with self.subTest(close=close):
+                agent = FakeAcpAgent([
+                    [("update", {"sessionUpdate": "tool_call", "toolCallId": "c0", "status": "in_progress",
+                                 "rawInput": {"ok": 1}}),
+                     ("update", {"sessionUpdate": "tool_call", "toolCallId": "c1", "status": "in_progress",
+                                 "rawInput": {"n": 12345.0}}), ("wait_cancel",), ("end", "cancelled")],
+                    [("update", {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed",
+                                 "rawInput": {"n": 1}}),
+                     ("update", {"sessionUpdate": "tool_call", "toolCallId": "c0", "status": "completed",
+                                 "rawInput": {"ok": 2}}), ("end", "end_turn")]])
+                drafts = ag.AcpDrafts(redact=("12345",))
+                s = r1_session(agent, drafts)
+                with self.assertRaises(acp.AcpProtocolError):
+                    s.prompt("first", FAR)
+                if close == "abandoned":
+                    closed = drafts.abandoned(c.PROTOCOL_ERROR, "an update could not be taken")
+                    self.assertEqual(pairs(closed), [("tool.result", "c0", "cancelled"), ("result", None, None)])
+                else:
+                    closed = drafts.start_turn()
+                    self.assertEqual(pairs(closed), [("tool.result", "c0", "cancelled")])
+                mark = len(drafts.drafts)
+                out = s.prompt("second", FAR)
+                drafts.ended(out, "turn-2", "dlv-2")
+                self.assertEqual(pairs(drafts.drafts[mark:]), [("tool.call", "c1", None), ("tool.result", "c1", "ok"),
+                                                               ("tool.call", "c0", None), ("tool.result", "c0", "ok"),
+                                                               ("result", None, None)])   # c0 reused: afresh
+
+    def test_f3_a_call_refused_at_its_draft_is_not_counted_as_drafted(self) -> None:
+        calls = acp.ToolCalls(ag.input_digest)
+        with self.assertRaises(acp.AcpProtocolError):
+            calls.update({"sessionId": "s", "update": {"sessionUpdate": "tool_call", "toolCallId": "c1",
+                                                       "status": "in_progress", "rawInput": {"n": float("nan")}}})
+        later = calls.update({"sessionId": "s", "update": {"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+                                                           "status": "completed", "rawInput": {"n": 1}}})
+        self.assertEqual([d["type"] for d in later], ["tool.call", "tool.result"])
+
+    def test_f5_every_turn_end_closes_its_open_calls(self) -> None:
+        cases = {"the agent went away": ([R1_TOOL + [("die",)]], c.ENGINE_EXITED, "error"),
+                 "end_turn with a call open": ([R1_TOOL + [("end", "end_turn")]], None, "error"),
+                 "the deadline": ([R1_TOOL + [("wait_cancel",), ("end", "cancelled")]], c.DEADLINE_EXCEEDED,
+                                  "cancelled")}
+        for name, (script, code, status) in cases.items():
+            with self.subTest(case=name):
+                agent = FakeAcpAgent(script)
+                drafts = ag.AcpDrafts()
+                s = r1_session(agent, drafts)
+                deadline = agent.clock.now + 10.0 if code == c.DEADLINE_EXCEEDED else FAR
+                out = s.prompt("x", deadline)
+                self.assertEqual(out.code, code)
+                ended = drafts.ended(out, "turn-1", "dlv-1") if out.stop_reason is not None else drafts.ended(out)
+                results = [(d["payload"]["call_id"], d["payload"]["status"]) for d in ended
+                           if d["type"] == "tool.result"]
+                self.assertEqual(results, [("c1", status)])
+                self.assertEqual(ended[-1]["type"], "result")
+        out, _drafts, ended = self.cancelled_turn()                                         # guard: as before
+        self.assertEqual([(d["payload"]["call_id"], d["payload"]["status"]) for d in ended
+                          if d["type"] == "tool.result"], [("c1", "cancelled")])
+
+    def cancelled_turn(self):
+        agent = FakeAcpAgent([R1_TOOL + [("wait_cancel",), ("end", "cancelled")]])
+        drafts = ag.AcpDrafts()
+        holder = {}
+
+        def on_update(params):
+            drafts.on_update(params)
+            holder["s"].cancel()
+
+        holder["s"] = r1_session(agent, drafts, on_update=on_update)
+        out = holder["s"].prompt("x", FAR)
+        return out, drafts, drafts.ended(out, "turn-1", "dlv-1")
+
+    def test_f6_a_value_given_bare_instead_of_in_a_collection_is_refused(self) -> None:
+        for bad in (TOOL_KEY, TOOL_KEY.encode()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(ValueError):
+                    ag.AcpDrafts(redact=bad)
+                with self.assertRaises(ValueError):
+                    ag.mask_forms(bad)
+                with self.assertRaises(ValueError):
+                    ag.OneShotParser("c", "m", redact=bad)
+
+    def test_f9_an_update_nested_too_deeply_is_a_protocol_error(self) -> None:
+        value = {}
+        for _ in range(5000):
+            value = {"k": value}
+        drafts = ag.AcpDrafts(redact=(TOOL_KEY,))
+        with self.assertRaises(acp.AcpProtocolError):
+            drafts.on_update(tool_update(value, "ok"))
+
+    def test_abandoned_takes_a_route_contract_code(self) -> None:                         # guard
+        with self.assertRaises(TypeError):
+            ag.AcpDrafts().abandoned("not-a-code", "x")
 
 if __name__ == "__main__":
     unittest.main()

@@ -327,6 +327,8 @@ class OneShotParser:
 def mask_forms(values) -> tuple[str, ...]:
     """What ``mask`` looks for: each value, longest first. Every value must be a non-empty str. ``mask`` reads
     every JSON spelling of each, also in JSON written inside a JSON string, so no escaped form is listed."""
+    if isinstance(values, (str, bytes)):   # one value given bare would be read as its characters
+        raise ValueError("values to mask are a collection of str, not one str")
     forms = set()
     for value in values:
         if not isinstance(value, str) or not value:
@@ -834,9 +836,14 @@ class AcpDrafts:
 
     ``on_line``, ``on_update`` and ``on_ask`` are the session's callbacks of the same names (``on_ask`` only
     records the ask; a driver also hands it to the approval queue). ``ended(outcome, turn_id, delivery_id)``
-    gives a ``cancelled`` result for each tool call left open by a turn the caller stopped, the
-    ``input.accepted`` draft of the delivery that began the turn when the agent answered the prompt (a typed
-    answer to the client's own request id), and the result draft. The two ids are given together or not at
+    gives a result for each tool call the turn left open (``cancelled`` when the turn was stopped by the
+    caller's cancel or the deadline, ``error`` otherwise), the ``input.accepted`` draft of the delivery that
+    began the turn when the agent answered the prompt (a typed answer to the client's own request id), and the
+    result draft. A turn whose ``prompt`` RAISED has no outcome: the driver calls ``abandoned(code, detail)``,
+    which closes its open calls ``cancelled`` (the session asked the agent to stop it) and drafts its result.
+    Either way the next turn's tool calls start afresh; ``start_turn()`` does the same before a prompt, and
+    closes, ``cancelled``, any call a turn left open without either. Not thread-safe: the pumping thread
+    calls ``on_line`` and ``on_update``. The two ids are given together or not at
     all, each of common.v1's form (``turn-...``, ``dlv-...``). ``redact`` names the values no draft may carry
     (the route's selected credential): each line is masked as ``mask`` does, and each update's params are
     masked string by string (keys included) before a tool call's input, its digest or its result text is
@@ -846,10 +853,37 @@ class AcpDrafts:
         self.offset = offset
         self.drafts: list[dict] = []
         self._redact = mask_forms(redact)
-        self._tools = acp_module().ToolCalls(input_digest)
+        self._tools = self._new_tools()
+
+    def _new_tools(self):
+        forms = self._redact
+        return acp_module().ToolCalls(input_digest, mask=(lambda text: mask(text, forms)) if forms else None)
+
+    def start_turn(self) -> list[dict]:
+        """Before a prompt: the tool calls start afresh. A call an earlier turn left open (a turn neither
+        ``ended`` nor ``abandoned``) gets its ``cancelled`` result first; those drafts are returned."""
+        out = self._tools.turn_ended(True)
+        self._tools = self._new_tools()
+        self.drafts += out
+        return out
+
+    def abandoned(self, code: str, detail: str) -> list[dict]:
+        """A turn whose ``prompt`` raised (the session abandoned it and asked the agent to stop it): its open
+        calls end ``cancelled``, then its result draft with ``code`` (a route contract code)."""
+        if code not in c.CODES or not isinstance(detail, str):
+            raise TypeError("abandoned takes a route contract code and a str detail")
+        out = self._tools.turn_ended(True)
+        self._tools = self._new_tools()
+        out.append({"type": "result", "payload": {"code": code, "detail": mask(detail, self._redact)}})
+        self.drafts += out
+        return out
 
     def on_update(self, params) -> None:
-        self.drafts += self._tools.update(_masked(params, self._redact))
+        try:
+            masked = _masked(params, self._redact)
+        except RecursionError:      # nested too deeply to read: the agent's protocol error, never a crash
+            raise acp_module().AcpProtocolError("an update nested too deeply to read") from None
+        self.drafts += self._tools.update(masked)
 
     def on_ask(self, ask) -> None:
         self._tools.asked(ask)
@@ -870,8 +904,9 @@ class AcpDrafts:
         if turn_id is not None and not (isinstance(turn_id, str) and TURN_ID.fullmatch(turn_id)
                                         and isinstance(delivery_id, str) and DELIVERY_ID.fullmatch(delivery_id)):
             raise TypeError("ended takes a turn_id of the form turn-<id> and a delivery_id of the form dlv-<id>")
-        out = self._tools.turn_ended(outcome.cancel_requested)
-        self._tools = acp_module().ToolCalls(input_digest)   # the next turn's calls start afresh
+        stopped = outcome.cancel_requested or outcome.code in (c.DEADLINE_EXCEEDED, CANCELLED)
+        out = self._tools.turn_ended(stopped)
+        self._tools = self._new_tools()   # the next turn's calls start afresh
         if outcome.stop_reason is not None and turn_id is not None:
             out.append({"type": "input.accepted",
                         "payload": {"delivery_id": delivery_id, "turn_id": turn_id, "how": "new_turn"}})
@@ -881,8 +916,9 @@ class AcpDrafts:
 
 
 def _masked(value, forms):
-    """A decoded ACP value with every string in it (keys included) masked as ``mask`` does. A float whose text
-    spells a value is the agent's protocol error: it cannot be masked in place."""
+    """A decoded ACP value with every string in it (keys included) masked as ``mask`` does. A number, a bool
+    or null whose text (as JSON writes it, or as Python does) spells a value, or a number equal to a value
+    written as a number, is the agent's protocol error: it cannot be masked in place."""
     if not forms:
         return value
     if isinstance(value, dict):
@@ -891,9 +927,23 @@ def _masked(value, forms):
         return [_masked(v, forms) for v in value]
     if isinstance(value, str):
         return mask(value, forms)
-    if isinstance(value, float) and any(form in repr(value) for form in forms):
+    texts = (json.dumps(value), repr(value))
+    if any(form in text for form in forms for text in texts) or _number_is(value, forms):
         raise acp_module().AcpProtocolError("a value to keep out is still in an update once it is read")
     return value
+
+
+def _number_is(value, forms) -> bool:
+    """Whether a number equals a value written as a number (``1e10`` read back is ``10000000000.0``)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    for form in forms:
+        try:
+            if float(form) == value:
+                return True
+        except (ValueError, OverflowError):
+            continue
+    return False
 
 
 # common.v1 $defs/turn_id and $defs/delivery_id.

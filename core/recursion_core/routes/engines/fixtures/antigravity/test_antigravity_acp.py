@@ -2052,9 +2052,13 @@ class ToolCallsTest(unittest.TestCase):
         calls.update(tool("tool_call", call_id="b", title="t", status="in_progress"))
         calls.update(tool(call_id="b", status="completed"))
         calls.update(tool("tool_call", call_id="c", title="t", status="pending"))   # never ran: no call drafted
-        self.assertEqual(calls.turn_ended(False), [])
         ended = calls.turn_ended(True)
         self.assertEqual([(d["payload"]["call_id"], d["payload"]["status"]) for d in ended], [("a", "cancelled")])
+        self.assertEqual(calls.turn_ended(True), [])                       # one result per call
+        calls = acp.ToolCalls(digest)                                      # #408 round 1, F5: not stopped
+        calls.update(tool("tool_call", call_id="a", title="t", status="in_progress"))
+        ended = calls.turn_ended(False)
+        self.assertEqual([(d["payload"]["call_id"], d["payload"]["status"]) for d in ended], [("a", "error")])
 
     def test_long_text_is_cut_and_marked(self) -> None:
         calls = acp.ToolCalls(digest)

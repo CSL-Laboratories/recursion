@@ -122,8 +122,12 @@ draft per tool call id. The agent's ``rawInput`` arrives late and differs by age
 the call is pending and fills it in later; another sends it whole at once), so the call is drafted ONCE, at
 the first update whose status is past ``pending``, with the latest ``rawInput`` seen; the result when the
 status is ``completed`` or ``failed``. A failed call whose permission ask this client answered ``deny`` or
-``cancelled`` is ``denied``. When a turn the caller asked to stop ends, every call drafted without a result
-gets one with status ``cancelled`` (ACP: the client marks the turn's unfinished calls cancelled). The draft's
+``cancelled`` is ``denied``.
+When a turn ends, every call drafted without a result gets one: ``cancelled`` when the turn was stopped
+(the caller's cancel or Recursion's deadline; ACP: the client marks the turn's unfinished calls cancelled),
+``error`` otherwise (the agent ended the turn, or went away, with the call unfinished), so no tool.call is
+left without its tool.result. A caller that gives ``mask`` has the result text masked after its parts
+are joined, so a value split across two content items cannot be joined back. The draft's
 ``name`` is the call's ``kind`` (ACP's fixed list: read, edit, execute, ...), never its ``title``, which is
 display text, unless the agent sends the call's ``name`` ("programmatic name of the tool", stable since
 schema 1.x): then that. The draft's input is ``rawInput`` when it is an object; when it is another JSON value
@@ -1237,12 +1241,14 @@ class ToolCalls:
     ``digest(value) -> sha256 hex`` is the caller's (RFC 8785 text, then SHA-256): this file writes no canonical
     form of its own. ``update(params)`` takes a session/update's params and gives the drafts it causes;
     ``asked(ask)`` tells it of a permission ask (its final answer is read when the call fails);
-    ``turn_ended(cancel_requested)`` gives a ``cancelled`` result for every call drafted without one when the
-    caller asked to stop the turn. Not thread-safe: one turn's updates arrive on one thread.
+    ``turn_ended(stopped)`` gives a result for every call drafted without one: ``cancelled`` when the turn was
+    stopped, ``error`` otherwise. ``mask(text) -> text``, when given, is applied to each result text once its
+    parts are joined. Not thread-safe: one turn's updates arrive on one thread.
     """
 
-    def __init__(self, digest: Callable[[object], str]) -> None:
+    def __init__(self, digest: Callable[[object], str], mask: Callable[[str], str] | None = None) -> None:
         self._digest = digest
+        self._mask = mask
         self._calls: dict[str, _ToolCall] = {}
         self._asks: dict[str, list] = {}
         self.ignored = 0   # updates with no usable tool call id
@@ -1280,10 +1286,9 @@ class ToolCalls:
             drafts.append(self._result(call, "ok" if call.status == "completed" else self._failed(call)))
         return drafts
 
-    def turn_ended(self, cancel_requested: bool) -> list[dict]:
-        if not cancel_requested:
-            return []
-        return [self._result(call, "cancelled") for call in self._calls.values() if call.called and not call.resulted]
+    def turn_ended(self, stopped: bool) -> list[dict]:
+        status = "cancelled" if stopped else "error"
+        return [self._result(call, status) for call in self._calls.values() if call.called and not call.resulted]
 
     # -- internals ------------------------------------------------------------------------------------------
     def _name(self, call: _ToolCall) -> str:
@@ -1291,12 +1296,12 @@ class ToolCalls:
         return name or call.kind or "other"
 
     def _call(self, call: _ToolCall) -> dict:
-        call.called = True
         value = call.raw_input if call.has_input else None
         try:
             digest = self._digest(value)
         except ValueError:          # no canonical text: the agent's protocol error, never an input dropped
             raise AcpProtocolError("tool input has no RFC 8785 text") from None
+        call.called = True          # only once its draft exists: a refused call is never "drafted"
         payload = {"call_id": call.call_id, "name": self._name(call), "input_digest": digest,
                    "input": dict(value) if isinstance(value, Mapping) else None}
         return {"type": "tool.call", "payload": payload}
@@ -1313,6 +1318,8 @@ class ToolCalls:
             if isinstance(inner, Mapping) and inner.get("type") == "text" and isinstance(inner.get("text"), str):
                 parts.append(inner["text"])
         text = "".join(parts) if parts else (call.raw_output if isinstance(call.raw_output, str) else "")
+        if self._mask is not None:
+            text = self._mask(text)   # after the join: parts masked one by one could spell a value together
         truncated = len(text) > TOOL_TEXT_LIMIT
         payload = {"call_id": call.call_id, "status": status, "text": text[:TOOL_TEXT_LIMIT], "output_ref": None,
                    "truncated": truncated}

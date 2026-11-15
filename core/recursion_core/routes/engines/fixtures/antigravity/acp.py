@@ -346,7 +346,7 @@ class TurnOutcome:
     limit: dict | None
     detail: str
     text: str                     # agent_message_chunk text of the turn; empty when code is not None
-    session: int = 0              # the connection's serial: (session, turn) names one turn across sessions
+    session: int                  # the connection's serial: (session, turn) names one turn across sessions
 
 
 @dataclass
@@ -923,6 +923,8 @@ class AcpSession:
     from it). ``on_update(params)`` gets each session/update of the turn; ``on_ask(ask)`` each new permission
     ask (it must not block: the answer comes back through ``answer_permission``, from any thread). When one
     of them raises, the error reaches the caller of ``prompt`` and the turn is abandoned (item 12).
+    ``on_turn_start(key)`` is told each turn ``prompt`` began, once its prompt is written and before any line
+    of it is read (``key`` as below); when it raises, the turn is abandoned, as for the three above.
     ``on_turn_end(key, outcome, code, detail)`` is told EVERY end of a turn ``prompt`` began, once: the
     answer, the deadline, the agent going away (``outcome`` is the ``TurnOutcome``), and every raise while the
     turn was handled (a protocol error, a line it cannot parse, any callback raising; ``outcome`` is None,
@@ -933,7 +935,9 @@ class AcpSession:
     outcome; an interruption is raised. A callback bound to an object that has a ``turn_end`` method (the
     engine's draft maker) brings that method along as ``on_turn_end`` when none is given, so wiring that
     object's callbacks wires its turn end too; callbacks of two such objects with no ``on_turn_end`` given are
-    refused (``AcpInvalid``), never left with none. A callback that is neither None nor callable is refused.
+    refused (``AcpInvalid``), never left with none. The object that gives ``on_turn_end`` gives ``on_turn_start``
+    too, when it has a ``turn_start`` method and none is given. A callback that is neither None nor callable is
+    refused.
 
     The session reads the clock with its ordering lock held, at the moment a step that starts work is
     serialized (item 11); the connection's own lock is never held while calling out.
@@ -944,9 +948,10 @@ class AcpSession:
                  on_line: Callable[[str], object] | None = None,
                  on_update: Callable[[dict], object] | None = None,
                  on_ask: Callable[[PermissionAsk], object] | None = None,
-                 on_turn_end: Callable[[tuple | None, object, str, str], object] | None = None) -> None:
+                 on_turn_end: Callable[[tuple | None, object, str, str], object] | None = None,
+                 on_turn_start: Callable[[tuple], object] | None = None) -> None:
         for name, cb in (("on_line", on_line), ("on_update", on_update), ("on_ask", on_ask),
-                         ("on_turn_end", on_turn_end)):
+                         ("on_turn_end", on_turn_end), ("on_turn_start", on_turn_start)):
             if cb is not None and not callable(cb):
                 raise AcpInvalid(f"{name} must be callable")
         self.process = process
@@ -969,7 +974,12 @@ class AcpSession:
             if len(owners) > 1:
                 raise AcpInvalid("the callbacks belong to two draft makers: give on_turn_end")
             on_turn_end = owners[0].turn_end if owners else None
+        if on_turn_start is None:
+            owner = getattr(on_turn_end, "__self__", None)
+            if callable(getattr(owner, "turn_start", None)):
+                on_turn_start = owner.turn_start
         self._on_turn_end = on_turn_end
+        self._on_turn_start = on_turn_start
         self.turn_end_failures = 0
 
     # -- writing ------------------------------------------------------------------------------------------
@@ -1123,6 +1133,12 @@ class AcpSession:
         except Exception:   # never replaces the turn's own error or outcome; an interruption still goes up
             self.turn_end_failures += 1
 
+    def _turn_started(self) -> None:
+        """Tells ``on_turn_start`` the turn whose prompt was just written, before any line of it is read."""
+        number = self.connection.turn_in_progress
+        if self._on_turn_start is not None and number is not None:
+            self._on_turn_start((self.connection.serial, number))
+
     def _turn(self, text: str, deadline_at: float) -> TurnOutcome:
         # A prompt that could not be written is seen by the pump's first round (the input is lost): the turn
         # ends engine_exited there, as for any failed write. When the write was interrupted instead, the turn
@@ -1136,6 +1152,7 @@ class AcpSession:
                 self.connection.input_closed()
             raise
         try:
+            self._turn_started()
             while True:
                 outcome = self._pump_one(deadline_at)
                 if isinstance(outcome, TurnOutcome):
@@ -1301,12 +1318,18 @@ class _ToolCall:
     resulted: bool = False
 
 
+class NoCanonicalText(ValueError):
+    """A value that has no RFC 8785 text. A ``ToolCalls`` digest raises it (or returns None) for such a value,
+    and the call is then the agent's protocol error; anything else a digest raises is the caller's failure."""
+
+
 class ToolCalls:
     """One turn's ``tool_call`` and ``tool_call_update`` updates as tool.call and tool.result drafts (driver.v2).
 
     ``digest(value) -> sha256 hex`` is the caller's (RFC 8785 text, then SHA-256): this file writes no canonical
-    form of its own. It returns None when the value has no canonical text (the agent's protocol error); anything
-    it raises, ``ValueError`` included, is the caller's failure (``AcpInvalid``).
+    form of its own. For a value with no canonical text it raises ``NoCanonicalText`` or returns None (the
+    agent's protocol error); anything else it raises, a plain ``ValueError`` included, is the caller's failure
+    (``AcpInvalid``). Antigravity's ``input_digest`` is such a digest, as it stands.
     ``update(params)`` takes a session/update's params and gives the drafts it causes;
     ``asked(ask)`` tells it of a permission ask (its final answer is read when the call fails);
     ``turn_ended(stopped)`` gives a result for every call drafted without one: ``cancelled`` when the turn was
@@ -1380,6 +1403,8 @@ class ToolCalls:
         value = call.raw_input if call.has_input else None
         try:
             digest = self._digest(value)
+        except NoCanonicalText:     # the value has no canonical text: the agent's, below
+            digest = None
         except Exception as err:    # the caller's digest failed: the caller's error, typed (ValueError too)
             raise AcpInvalid(f"the digest function failed: {type(err).__name__}") from None
         if digest is None:          # no canonical text: the agent's protocol error, never an input dropped

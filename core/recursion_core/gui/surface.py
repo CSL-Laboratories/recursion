@@ -165,7 +165,8 @@ class Application:
         if method == "POST" and origin is None:
             return "origin_required"
         site = env.get("HTTP_SEC_FETCH_SITE")
-        if site is not None and site != "same-origin" and not (method == "GET" and site == "none"):
+        if site is not None and (type(site) is not str
+                                 or (site != "same-origin" and not (method == "GET" and site == "none"))):
             return "cross_site_request"
         try:
             admitted = self._door(env) is True
@@ -176,14 +177,16 @@ class Application:
         return None
 
     def __call__(self, env: dict, start_response) -> list[bytes]:
-        refusal = self._refusal(env)
-        if refusal is not None:
-            status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
-            return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))
+        # The request line first, before anything compares it: a method or path that is not a str
+        # exactly could raise in, or lie to, a comparison (DeepSeek rounds 4 and 5).
         method, path = env.get("REQUEST_METHOD"), env.get("PATH_INFO", "")
         if type(method) is not str or type(path) is not str:
             return self._send(start_response, "400 Bad Request",
                               self._page("Bad request", "<p>Bad request: request line</p>"))
+        refusal = self._refusal(env)
+        if refusal is not None:
+            status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
+            return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))
         routes = {("GET", "/"): self._home, ("GET", "/read"): self._read, ("GET", "/panel"): self._panel,
                   ("POST", "/action"): self._action, ("POST", "/stop"): self._stop}
         handler = routes.get((method, path))

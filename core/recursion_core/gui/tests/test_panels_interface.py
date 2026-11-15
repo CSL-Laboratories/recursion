@@ -240,6 +240,45 @@ class InterfaceTests(unittest.TestCase):
                 self.assertIs(type(caught.exception), ValueError)
                 self.assertEqual(caught.exception.args, (NEEDS_KEYS,))
 
+    def test_a_collection_is_refused_at_its_first_bad_declaration_without_reading_on(self):
+        # DeepSeek round 5, F3: each declaration is checked as it is read, so a long or endless
+        # collection whose first declaration is bad is refused after one read.
+        pulled = []
+
+        def declarations():
+            yield {**GOOD, "reads": ["operator.orders.submit"]}
+            for n in range(1000):
+                pulled.append(n)
+                yield {**GOOD, "id": "p%d" % n}
+
+        self.refused_from(declarations(), BAD_READS)
+        self.assertEqual(pulled, [])
+
+    def test_what_an_unreadable_collection_raised_is_kept_as_the_cause(self):
+        # DeepSeek round 5, F5: the text stays the first refusal; the cause says why reading stopped.
+        failure = KeyError("WHY")
+
+        class RaisingNext:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise failure
+
+        with self.assertRaises(ValueError) as caught:
+            panel_registry(RaisingNext())
+        self.assertEqual(caught.exception.args, (NEEDS_KEYS,))
+        self.assertIs(caught.exception.__cause__, failure)
+        with self.assertRaises(ValueError) as caught:
+            panel_registry(None)
+        self.assertIs(type(caught.exception.__cause__), TypeError)
+
+    def refused_from(self, panels_value, text):
+        with self.assertRaises(ValueError) as caught:
+            panel_registry(panels_value)
+        self.assertIs(type(caught.exception), ValueError)
+        self.assertEqual(caught.exception.args, (text,))
+
     def test_the_depth_bound_is_sixty_four_containers_below_the_response_on_every_branch(self):
         # DeepSeek round 4, F5: errors and provenance count from the response as the rest does.
         def chain(levels, leaf):

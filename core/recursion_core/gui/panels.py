@@ -50,13 +50,20 @@ REFUSALS = (
 
 def panel_registry(panels):
     registered = {}
+    # Each declaration is checked as it is read, so the first defect is refused at once, however long
+    # the collection. A value that cannot be iterated, or that raises while it is iterated, is not a
+    # collection of declarations: it gets the first text, with what it raised kept as the cause.
     try:
-        # One copy of the collection: a value that cannot be iterated, or that raises while it is
-        # iterated, is not a collection of declarations.
-        declarations = tuple(panels)
-    except Exception:  # noqa: BLE001 - whatever the iteration raises, the refusal is the first text
-        raise ValueError(_NEEDS_KEYS) from None
-    for panel in declarations:
+        declarations = iter(panels)
+    except Exception as exc:  # noqa: BLE001 - whatever iter() raises, the refusal is the first text
+        raise ValueError(_NEEDS_KEYS) from exc
+    while True:
+        try:
+            panel = next(declarations)
+        except StopIteration:
+            break
+        except Exception as exc:  # noqa: BLE001 - whatever the iteration raises, the refusal is the first text
+            raise ValueError(_NEEDS_KEYS) from exc
         if not isinstance(panel, Mapping) or not REQUIRED_PANEL_KEYS <= panel.keys():
             raise ValueError(_NEEDS_KEYS)
         if set(panel) - PANEL_KEYS:

@@ -827,6 +827,62 @@ class BreakItPins(GuiHarness):
                 self.assertIn(code, body)
         self.assertEqual(self.door.seen, 0)
 
+    def test_round5_no_untrusted_value_is_compared_before_it_is_a_plain_str(self) -> None:
+        # DeepSeek round 5, F1, F2 and F4: the method, the path and Sec-Fetch-Site are checked to be a
+        # str exactly before anything compares them; a value that raises or lies in a comparison is
+        # refused with the page's headers and reaches nothing.
+        class EqRaises:
+            def __eq__(self, other):
+                raise RuntimeError("EQ-BOOM")
+
+            def __ne__(self, other):
+                raise RuntimeError("NE-BOOM")
+
+            def __hash__(self):
+                raise RuntimeError("HASH-BOOM")
+
+        class Lying(str):
+            claim = ""
+
+            def __eq__(self, other):
+                return other == self.claim
+
+            def __ne__(self, other):
+                return other != self.claim
+
+            def __hash__(self):
+                return hash(self.claim)
+
+        class LyingPost(Lying):
+            claim = "POST"
+
+        class LyingStop(Lying):
+            claim = "/stop"
+
+        class LyingSameOrigin(Lying):
+            claim = "same-origin"
+
+        ok_headers = self.headers_without_length(self.request("GET", "/")[1])
+        self.api.calls.clear()
+        stop_form = {"run_id": "run-1", "confirm": "explicit"}
+        allowed = {"HTTP_ORIGIN": ORIGIN, "HTTP_SEC_FETCH_SITE": "same-origin"}
+        cases = (
+            ("GET", "/", None, {"REQUEST_METHOD": EqRaises()}, "400 Bad Request", "request line"),
+            ("GET", "/", None, {"PATH_INFO": EqRaises()}, "400 Bad Request", "request line"),
+            ("GET", "/stop", stop_form, {"REQUEST_METHOD": LyingPost("GET"), **allowed}, "400 Bad Request", "request line"),
+            ("POST", "/", stop_form, {"PATH_INFO": LyingStop("/"), **allowed}, "400 Bad Request", "request line"),
+            ("GET", "/", None, {"HTTP_SEC_FETCH_SITE": EqRaises()}, "403 Forbidden", "cross_site_request"),
+            ("POST", "/stop", stop_form, {"HTTP_SEC_FETCH_SITE": LyingSameOrigin("cross-site")}, "403 Forbidden",
+             "cross_site_request"),
+        )
+        for method, path, form, headers, expected, text in cases:
+            with self.subTest(method=method, path=path, headers=sorted(headers)):
+                status, got, body = self.request(method, path, form, headers=headers)
+                self.assertEqual(status, expected)
+                self.assertIn(text, body)
+                self.assertEqual(self.headers_without_length(got), ok_headers)
+        self.assertEqual(self.api.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

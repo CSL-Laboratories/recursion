@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "api.v1.json",
+  "title": "api.v1: the plugin API's entry points, as plain data ('csl-plugin-api/1')",
+  "x-version": "1.0-draft.1",
+  "description": "SKELETON DRAFT: the lanes that host plugins and draw the page supply the shapes and the fixtures; this file states what holds whatever those shapes become. A plugin gives the daemon plain values and imports nothing from it. Its entry points: registry(), operator() and bind_core() as today; commands(), tools(), on_event(), themes and layouts, and a run the plugin owns, each behind its own appended permission and ignored without it. Nothing here is a record on its own; each definition is what one entry point returns or takes. FROZEN WITH THIS FILE, because nothing else states it: (1) every call a plugin makes into the core carries the principal {kind: plugin, id}, set by the host and never by the plugin ($defs/call_context); (2) on_event names the event types it subscribes to, receives engine output only as untrusted text, and never receives an approval's private binding; (3) a plugin's command or tool is reachable only through the one dispatcher, plugin.call; (4) a run a plugin owns has that plugin as its owner, set by the host, and its effects pass the same approval gate as any other; (5) a theme or a layout never reaches the approval area.",
+  "$defs": {
+    "plugin_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{1,63}$",
+      "not": {"anyOf": [{"const": "host"}, {"pattern": "[\\r\\n]"}]}
+    },
+    "name": {
+      "description": "A name a plugin gives to a command, a tool, a theme or a layout: lower-case letters, digits, '_' and '-', starting with a letter.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "call_context": {
+      "description": "What the host attaches to every call a plugin makes into the core. The plugin cannot set or change it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principal"],
+      "properties": {
+        "principal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {"kind": {"const": "plugin"}, "id": {"$ref": "#/$defs/plugin_id"}}
+        }
+      }
+    },
+    "registry": {
+      "description": "What registry() returns today, with the 'panel' permission: the plugin's panels and what they require. The shape of a panel is the page lane's and goes through the page's own validation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["panels", "required"],
+      "properties": {
+        "panels": {"type": "array", "items": {"type": "object"}},
+        "required": {"type": "object"}
+      }
+    },
+    "command": {
+      "description": "One entry of what commands() returns, with the 'command' permission: a command a user can run through plugin.call.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "summary", "arguments", "permission"],
+      "properties": {
+        "name": {"$ref": "#/$defs/name"},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 200},
+        "arguments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "required", "summary"],
+            "properties": {
+              "name": {"$ref": "#/$defs/name"},
+              "required": {"type": "boolean"},
+              "summary": {"type": "string", "maxLength": 200}
+            }
+          }
+        },
+        "permission": {"const": "command"}
+      }
+    },
+    "tool": {
+      "description": "One entry of what tools() returns, with the 'tool' permission: a tool declared as data. input_schema is a JSON Schema for the tool's input. A call of it waits in the approval queue like any other effect.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "description", "input_schema", "permission"],
+      "properties": {
+        "name": {"$ref": "#/$defs/name"},
+        "description": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "input_schema": {"type": "object"},
+        "permission": {"const": "tool"}
+      }
+    },
+    "subscription": {
+      "description": "What a plugin declares for on_event, with the 'subscribe' permission: the event types it asks for, by their names in the control records' event schema. The approval types can be asked for; what is delivered for them is the public view, never the private binding.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["types", "permission"],
+      "properties": {
+        "types": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z]+(\\.[a-z_]+)?$", "not": {"pattern": "[\\r\\n]"}}
+        },
+        "permission": {"const": "subscribe"}
+      }
+    },
+    "surface": {
+      "description": "One theme or layout a plugin offers, with the 'surface' permission. The page lane supplies what a theme and a layout hold; neither ever reaches the approval area.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "title", "permission"],
+      "properties": {
+        "kind": {"enum": ["theme", "layout"]},
+        "name": {"$ref": "#/$defs/name"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 100},
+        "permission": {"const": "surface"}
+      }
+    },
+    "run_request": {
+      "description": "What a plugin passes to start a run it owns, with the 'run' permission. The host adds the principal and the owner; a request that tries to name either is refused.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant", "prompt", "command_id"],
+      "properties": {
+        "tenant": {"type": "string", "minLength": 1},
+        "prompt": {"type": "string", "minLength": 1},
+        "command_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$", "not": {"pattern": "[\\r\\n]"}},
+        "engine": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "not": {"pattern": "[\\r\\n]"}},
+        "workspace": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {"path": {"type": "string", "minLength": 1}, "mode": {"enum": ["direct", "worktree"]}}
+        }
+      }
+    }
+  }
+}

@@ -284,6 +284,16 @@ class AcpDraftsTest(unittest.TestCase):
         self.assertEqual(calls[0]["input_digest"], ag.input_digest({"CommandLine": "ls", "Cwd": CWD}))
         self.assertEqual([(r["call_id"], r["status"], r["text"]) for r in results], [("c1", "ok", "a\n")])
 
+    def test_each_turn_drafts_its_own_tool_calls_even_under_a_reused_id(self) -> None:
+        agent = FakeAcpAgent([self.TOOL_TURN, self.TOOL_TURN])
+        drafts = ag.AcpDrafts()
+        session = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, on_line=drafts.on_line,
+                              on_update=drafts.on_update, on_ask=drafts.on_ask)
+        for turn in ("turn-1", "turn-2"):
+            drafts.ended(session.prompt("x", FAR), turn, "dlv-" + turn)
+        self.assertEqual(len([d for d in drafts.drafts if d["type"] == "tool.call"]), 2)
+        self.assertEqual(len([d for d in drafts.drafts if d["type"] == "tool.result"]), 2)
+
     def test_a_stopped_turn_ends_its_open_tool_calls_cancelled_before_its_result(self) -> None:
         script = self.TOOL_TURN[:2] + [("wait_cancel",), ("end", "cancelled")]
         out, _drafts, ended = self.run_turn(script, cancel_on_update=True)

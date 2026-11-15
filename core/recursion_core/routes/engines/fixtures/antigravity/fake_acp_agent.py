@@ -76,6 +76,7 @@ class FakeAcpAgent:
         self._prompt_id = None
         self._waiting = None        # ("permission", id) | ("cancel",) | None
         self._next_ask = 0
+        self._idle_reads = 0
         # What the client did, for the tests to read.
         self.received: list = []           # every message the client wrote, parsed
         self.authenticated: list = []      # every methodId the client asked to authenticate with
@@ -117,9 +118,16 @@ class FakeAcpAgent:
                     self._dead = True   # the watchdog: the line the test waited for never came
                     raise AssertionError("fake agent watchdog: nothing to read")
             if self._out:
+                self._idle_reads = 0
                 return self._out.popleft()
             if self._dead:
                 return None
+            # A client that keeps asking with no time left, while nothing can arrive, would spin for ever:
+            # fail it instead of hanging the test.
+            self._idle_reads = self._idle_reads + 1 if timeout_s <= 0 else 0
+            if self._idle_reads > 1000:
+                self._dead = True
+                raise AssertionError("fake agent: the client spins on reads with no time left")
             self.clock.advance(timeout_s)
             raise ReadTimeout()
 
@@ -170,6 +178,7 @@ class FakeAcpAgent:
             if not self._load_session:
                 self._error(rpc_id, -32601, "session/load is not offered")
                 return
+            self._session_id = params.get("sessionId")   # the loaded session is the one the agent speaks for
             for update in self._replay:
                 self._update(update)
             self._answer(rpc_id, {})

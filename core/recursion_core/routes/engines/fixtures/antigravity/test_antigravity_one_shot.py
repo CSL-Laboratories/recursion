@@ -71,6 +71,18 @@ class ParserTest(unittest.TestCase):
                 for one, two in zip(spans, spans[1:]):
                     self.assertEqual(one["offset_end"], two["offset_start"])
 
+    def test_offsets_count_utf8_bytes_not_characters(self) -> None:
+        line = json.dumps({"event": "step_update", "step_update": {"step_index": 1, "state": "DONE",
+                           "step_type": "agent_response", "text_delta": "caf\u00e9 \U0001f600"}}, ensure_ascii=False)
+        parser = ag.OneShotParser(CONN, MODEL, offset=10)
+        span = of_type(parser.parse(line), "engine.output")[0]
+        self.assertEqual(span["offset_start"], 10)
+        self.assertEqual(span["offset_end"], 10 + len(line.encode("utf-8")) + 1)
+        self.assertNotEqual(len(line.encode("utf-8")), len(line))
+        drafts = ag.AcpDrafts(offset=3)
+        drafts.on_line(line)
+        self.assertEqual(drafts.drafts[0]["payload"]["offset_end"], 3 + len(line.encode("utf-8")) + 1)
+
     def test_a_successful_run(self) -> None:
         parser, drafts = parse_all("synthetic-ok.jsonl")
         self.assertEqual(parser.conversation_id, "00000000-0000-4000-8000-00000000e5e5")
@@ -100,6 +112,21 @@ class ParserTest(unittest.TestCase):
                                     "truncated": False}])
         kinds = [d["type"] for d in drafts]
         self.assertLess(kinds.index("tool.call"), kinds.index("tool.result"))
+
+    def test_a_tool_step_is_drafted_once_and_only_when_done(self) -> None:
+        def tool(state: str, output: str | None) -> str:
+            info = {"name": "run_command", "parameters": {"CommandLine": "ls"}}
+            if output is not None:
+                info["output"] = output
+            return json.dumps({"event": "step_update", "step_update": {
+                "step_index": 4, "state": state, "step_type": "tool", "tool_name": "run_command", "tool_info": info}})
+
+        parser = ag.OneShotParser(CONN, MODEL)
+        self.assertEqual(of_type(parser.parse(tool("ACTIVE", None)), "tool.call"), [])   # tool_info, still running
+        first = parser.parse(tool("DONE", "a\n"))
+        again = parser.parse(tool("DONE", "a\n"))
+        self.assertEqual(len(of_type(first, "tool.call")), 1)
+        self.assertEqual(of_type(again, "tool.call") + of_type(again, "tool.result"), [])
 
     def test_a_failed_tool_step(self) -> None:
         _parser, drafts = parse_all("synthetic-tool-error.jsonl")
@@ -167,7 +194,7 @@ class CanonicalTextTest(unittest.TestCase):
     """The RFC 8785 copy agrees with SPINE's rules on the cases its docstring names."""
 
     VALUES = (0, -7, 1.0, 0.5, 1e-7, -2.5e-9, 123456789.125, 2**53 - 1, "", "a\u0001b\"\\", [1, [2, {}]],
-              {"b": 1, "a": None, "\u00e9": True, "\U0001f600": "x", "B": [0.1]})
+              {"b": 1, "a": None, "\u00e9": True, "\U0001f600": "x", "\uff01": 3, "B": [0.1]})
 
     def test_numbers_strings_and_key_order(self) -> None:
         self.assertEqual(ag.canonical_text(1.0), "1")
@@ -176,6 +203,8 @@ class CanonicalTextTest(unittest.TestCase):
         self.assertEqual(ag.canonical_text(123456789.125), "123456789.125")
         with self.assertRaises(ag.NoCanonicalText):     # integral and beyond 2^53 - 1: no text, as SPINE's rule
             ag.canonical_text(1e21)
+        # Keys sort by UTF-16 code units, not code points: U+1F600 (surrogates D83D DE00) before U+FF01.
+        self.assertEqual(ag.canonical_text({"\uff01": 1, "\U0001f600": 2}), '{"\U0001f600":2,"\uff01":1}')
         self.assertEqual(ag.canonical_text({"b": 1, "a": [True, None, "x\n"]}), '{"a":[true,null,"x\\n"],"b":1}')
         self.assertEqual(ag.canonical_text({"\u00e9": 1, "z": 2}), '{"z":2,"\u00e9":1}')
         for bad in (2**53, float("nan"), "\ud800", {1: 2}):

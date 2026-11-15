@@ -40,6 +40,17 @@ class MethodTest(unittest.TestCase):
         for fn in (ag.route_method, ag.open_acp, ag.AntigravityOneShotAdapter.__init__, ag.one_shot_factory):
             self.assertNotIn("personal", " ".join(inspect.signature(fn).parameters))
 
+    def test_an_api_key_route_must_name_the_methods_own_key(self) -> None:
+        for method, cred in (("gemini-api-key", "GOOGLE_API_KEY"), ("agent-platform", "GEMINI_API_KEY"),
+                             ("gemini-api-key", "XAI_API_KEY")):
+            with self.subTest(method=method, cred=cred), self.assertRaises(c.RouteError) as ctx:
+                ag.route_method(route(method, "api_key", cred))
+            self.assertEqual(ctx.exception.code, c.LAUNCH_REFUSED)
+        agent = FakeAcpAgent()
+        with self.assertRaises(c.RouteError):
+            ag.open_acp(agent, agent.clock, route("gemini-api-key", "api_key", "GOOGLE_API_KEY"), CWD, FAR)
+        self.assertEqual(agent.received, [])
+
     def test_each_built_method_is_accepted_with_its_own_connection(self) -> None:
         self.assertIs(ag.route_method(route("gemini-api-key")), ag.GEMINI_API_KEY_METHOD)
         self.assertIs(ag.route_method(route("oauth-business", "subscription", None)), ag.ENTERPRISE_METHOD)

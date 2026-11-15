@@ -490,7 +490,8 @@ class AcpConnection:
             if (turn is None or turn.outcome is not None or not isinstance(params, Mapping)
                     or params.get("sessionId") != self.session_id):
                 # No turn of ours is waiting for it: refuse it, run nothing.
-                fed.replies.append(_line({"jsonrpc": "2.0", "id": rpc_id, "result": {"outcome": {"outcome": "cancelled"}}}))
+                fed.replies.append(_line({"jsonrpc": "2.0", "id": rpc_id,
+                                          "result": {"outcome": {"outcome": "cancelled"}}}))
                 return
             token = f"ask-{len(self._asks) + 1}"
             deadline_at = None
@@ -534,7 +535,8 @@ class AcpConnection:
         pending.done = True
         if "error" in message:
             err = message["error"]
-            if not isinstance(err, Mapping) or type(err.get("code")) is not int or not isinstance(err.get("message"), str):
+            if (not isinstance(err, Mapping) or type(err.get("code")) is not int
+                    or not isinstance(err.get("message"), str)):
                 raise AcpProtocolError("error object without an integer code and a message")
             pending.error = RpcError(err["code"], err["message"], err.get("data"))
         else:
@@ -561,7 +563,8 @@ class AcpConnection:
     def _session_opened(self, pending: _Pending) -> None:
         if pending.method == SESSION_NEW:
             result = pending.result
-            if not isinstance(result, Mapping) or not isinstance(result.get("sessionId"), str) or not result["sessionId"]:
+            if (not isinstance(result, Mapping) or not isinstance(result.get("sessionId"), str)
+                    or not result["sessionId"]):
                 raise AcpProtocolError("session/new answered without a sessionId")
             self.session_id = result["sessionId"]
         else:

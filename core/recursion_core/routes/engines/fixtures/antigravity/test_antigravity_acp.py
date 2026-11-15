@@ -15,7 +15,7 @@ from pathlib import Path
 from recursion_core.routes import contract as c
 from recursion_core.routes.engines.fixtures.antigravity import acp
 from recursion_core.routes.engines.fixtures.antigravity.fake_acp_agent import (
-    OPTIONS_ALL, OPTIONS_ALWAYS_ONLY, TOOL_CALL, FakeAcpAgent, FakeClock,
+    OPTIONS_ALL, OPTIONS_ALWAYS_ONLY, TOOL_CALL, FakeAcpAgent,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -176,6 +176,27 @@ class TurnTest(unittest.TestCase):
         agent = FakeAcpAgent([[("end", "finished")]])
         with self.assertRaises(acp.AcpProtocolError):
             opened(agent).prompt("x", FAR)
+
+    def test_an_update_of_another_session_is_stray_and_reaches_no_one(self) -> None:
+        other = json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "another-session", "update": {
+                "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "not ours"}}}})
+        agent = FakeAcpAgent([[("raw", other), ("chunk", "ours"), ("end", "end_turn")]])
+        updates = []
+        s = opened(agent, on_update=updates.append)
+        out = s.prompt("x", FAR)
+        self.assertEqual(out.text, "ours")
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(s.connection.stray_updates, 1)
+
+    def test_updates_outside_a_turn_reach_no_one(self) -> None:
+        replay = [{"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "earlier answer"}}]
+        agent = FakeAcpAgent([[("chunk", "now"), ("end", "end_turn")]], load_session=True, replay=replay)
+        updates = []
+        s = session(agent, on_update=updates.append)
+        s.open("gemini-api-key", CWD, FAR, load_session_id="old-1")
+        self.assertEqual(updates, [])
+        self.assertEqual(s.prompt("x", FAR).text, "now")
 
     def test_a_response_to_an_id_never_sent_is_counted_and_dropped(self) -> None:
         agent = FakeAcpAgent([[("stale_response",), ("chunk", "ok"), ("end", "end_turn")]])
@@ -340,6 +361,20 @@ class PermissionTest(unittest.TestCase):
                 s = opened(agent, on_ask=on_ask)
                 s.prompt("x", FAR)
                 self.assertEqual(agent.permission_answers["perm-1"], {"outcome": {"outcome": "cancelled"}})
+
+    def test_an_ask_that_arrives_after_a_cancel_is_answered_cancelled_and_never_reaches_the_caller(self) -> None:
+        agent = FakeAcpAgent([[("chunk", "x"), ("wait_cancel",), ("ask", TOOL_CALL, OPTIONS_ALL), ("end", "cancelled")]])
+        asks = []
+        s = None
+
+        def on_update(_params):
+            s.cancel()
+
+        s = opened(agent, permission_timeout_s=30.0, on_update=on_update, on_ask=asks.append)
+        out = s.prompt("x", FAR)
+        self.assertEqual(asks, [])
+        self.assertEqual(agent.permission_answers["perm-1"], {"outcome": {"outcome": "cancelled"}})
+        self.assertTrue(out.cancel_confirmed)
 
     def test_a_cancel_answers_every_open_ask_cancelled(self) -> None:
         agent = FakeAcpAgent([[("ask", TOOL_CALL, OPTIONS_ALL), ("end", "cancelled")]])

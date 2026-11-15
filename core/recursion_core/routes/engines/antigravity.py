@@ -481,8 +481,8 @@ class AcpDrafts:
     def on_line(self, line: str) -> None:
         raw = line + "\n"
         start, self.offset = self.offset, self.offset + len(raw.encode("utf-8"))
-        self.drafts.append({"type": "engine.output",
-                            "payload": {"stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
+        self.drafts.append({"type": "engine.output", "payload": {
+            "stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
 
     def ended(self, outcome, turn_id: str | None = None, delivery_id: str | None = None) -> list[dict]:
         out = []

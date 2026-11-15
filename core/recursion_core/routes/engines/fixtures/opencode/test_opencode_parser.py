@@ -362,6 +362,7 @@ class LimitTests(Shape, unittest.TestCase):
                  ({"retry-after": "Infinity"}, None),
                  ({"retry-after": "not a date"}, None),
                  ({"retry-after": "Fri, 13 Nov 2026 23:00:00 GMT"}, None),  # already past
+                 ({"retry-after": "Sat, 14 Nov 2026 00:00:00 GMT"}, None),  # exactly now: a wait of zero is none
                  ({"retry-after": "Sat, 14 Nov 2026 00:10:00 -0000"}, "2026-11-14T00:10:00.000Z"),
                  ({"retry-after": "Sat, 14 Nov 2026 01:30:00 +0100"}, "2026-11-14T00:30:00.000Z"),
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 UTC"}, "2026-11-14T00:05:00.000Z"),
@@ -1128,6 +1129,31 @@ class ReviewOneTests(Shape, unittest.TestCase):
                 self.assertEqual(self.reset_pair(now, "Monday, 01-Jan-00 00:00:00 GMT"), (None, None))   # past
                 self.assertEqual(self.reset_pair(now, f"Monday, 15-Nov-{year % 100:02d} 00:05:00 GMT"),
                                  (f"{year}-11-15T00:05:00.000Z", CLOCK + 86700))                     # tomorrow
+        # 9949 is the last year whose cutoff (9999) is still built and still decides.
+        new_year = float(calendar.timegm((9949, 1, 1, 0, 0, 0, 0, 0, 0)))
+        self.assertEqual(self.reset_pair(new_year, "Friday, 31-Dec-99 00:00:00 GMT"), (None, None))   # 50 y 364 d
+        year_end = float(calendar.timegm((9949, 12, 31, 0, 0, 0, 0, 0, 0)))
+        fifty = calendar.timegm((9999, 12, 31, 0, 0, 0, 0, 0, 0)) - year_end
+        self.assertEqual(self.reset_pair(year_end, "Friday, 31-Dec-99 00:00:00 GMT"),               # exactly 50 y
+                         ("9999-12-31T00:00:00.000Z", CLOCK + fifty))
+
+    def test_r7_an_interrupted_end_leaves_the_run_open(self):
+        for text in ("code, detail = self._result", 'return [_draft("result", {"code": code, "detail": detail})]'):
+            with self.subTest(text):
+                p = parser()
+                p.feed(line(step({"input": 1})))
+                tracer, fired = self.tracer_at(oc.Parser.end, text)
+                sys.settrace(tracer)
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        p.end(0)
+                finally:
+                    sys.settrace(None)
+                self.assertTrue(fired)
+                self.assertIsNone(p._result)
+                self.assertEqual(p.end(0), [{"type": "result", "payload": {"code": None, "detail": ""}}])
+                with self.assertRaises(RuntimeError):
+                    p.end(0)                                             # and once ended, it stays ended
 
     def test_r4_the_first_and_last_writable_instants(self):
         self.assertEqual(oc._timestamp(oc._FIRST_EPOCH), "0001-01-01T00:00:00.000Z")

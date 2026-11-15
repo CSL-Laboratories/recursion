@@ -265,9 +265,14 @@ class Parser:
             raise RuntimeError("the run has ended")
         if exit_code is not None and (type(exit_code) is not int):
             raise ValueError("exit_code")
-        self._result = self._outcome(exit_code)
-        code, detail = self._result
-        return [_draft("result", {"code": code, "detail": detail})]
+        try:
+            self._result = self._outcome(exit_code)
+            code, detail = self._result
+            return [_draft("result", {"code": code, "detail": detail})]
+        except BaseException:
+            # As in feed: an interruption before end() has returned leaves the run open, so end() can be called again.
+            self._result = None
+            raise
 
     @property
     def text(self) -> str:
@@ -538,8 +543,9 @@ def _http_date(text: str, now: float) -> float | None:
     time ("32 Nov", "25:00", which ``calendar.timegm`` would roll forward) give None. A four-digit year is the year
     written (0068 is the year 68, long past). A two-digit rfc850 year is first put in the century of ``now``; if the
     instant it then names, zone included, is MORE than 50 calendar years after ``now``, it means the same date a
-    century earlier (RFC 9110, 5.6.7: "the most recent year in the past that had the same last two digits"), which is
-    past, so the answer is None, as for any past date. Exactly 50 years ahead stays ahead. Fifty years after a 29
+    century earlier (RFC 9110, 5.6.7: "the most recent year in the past that had the same last two digits"). That is
+    past, and this returns None for it at once; any other past date is returned as its instant, and ``_retry_after_s``
+    gives no wait for it, since the wait is not positive. Exactly 50 years ahead stays ahead. Fifty years after a 29
     February is the 28th.
     """
     match = _IMF_DATE.fullmatch(text) or _RFC850_DATE.fullmatch(text)

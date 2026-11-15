@@ -318,6 +318,10 @@ class Console:
 _NOTHING_YET = object()
 
 
+class _OutputFailed(Exception):
+    """The worker's output was not the protocol's (the RouteError it raised is args[0]): the run ends."""
+
+
 def takes_now(line: str, approval_waiting: bool) -> bool:
     """Whether a command typed while a turn runs is acted on at once (else it waits for the turn to end):
     /interrupt, /stop and /quit always; y and n when an approval waits for them; a message, as a steer, when
@@ -350,7 +354,7 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
     seen = seen if seen is not None else {}
     for key, empty in (("threads", []), ("drafts", []), ("workers", 0)):
         seen.setdefault(key, empty)
-    state = {"handle": None, "turn": 0, "delivery": 0, "eof": False}
+    state = {"handle": None, "turn": 0, "delivery": 0, "eof": False, "exhausted": False}
     source, held = iter(commands), []
 
     def start(esid):
@@ -373,28 +377,43 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
                 on_draft(d)
             say(f"{d['type']}: {json.dumps(d['payload'], sort_keys=True)}")
 
-    def read_once() -> None:
+    def read_once() -> bool:
+        """One read of the worker's output; False when there was nothing to read. Output that is not the
+        protocol's raises _OutputFailed, which ends the run wherever it is read."""
         try:
             drafts = driver.pump(state["handle"], read_s)
         except ReadTimeout:
-            return
+            return False
+        except c.RouteError as err:
+            raise _OutputFailed(err) from None
         if drafts is None:
             state["eof"] = True
             say("the worker ended its output")
-            return
+            return False
         record(drafts)
+        return True
 
     def busy() -> bool:
         handle = state["handle"]
         return not state["eof"] and (handle.live_turn is not None or bool(console.pending))
 
-    def next_command(block: bool):
-        if held:
+    def next_command(during_turn: bool):
+        """The next command to look at, or _NOTHING_YET. Outside a turn the oldest waiting one comes first;
+        during a turn a waiting one is taken only when an approval waits for it, and otherwise a fresh one is
+        read (when the source has one ready), so a waiting message never hides a later /interrupt, /stop or
+        /quit (the #402 reads, round 2: GPT-6 Astra 3, GPT-6.1 Sol 2, DeepSeek R2-6)."""
+        if held and (not during_turn or console.pending):
             return held.pop(0)
-        ready = getattr(source, "ready", None)
-        if not block and ready is not None and not ready():
+        if state["exhausted"]:
             return _NOTHING_YET
-        return next(source, None)
+        ready = getattr(source, "ready", None)
+        if during_turn and ready is not None and not ready():
+            return _NOTHING_YET
+        raw = next(source, None)
+        if raw is None:
+            state["exhausted"] = True
+            return _NOTHING_YET
+        return raw
 
     def step(line: str) -> bool:
         handle = state["handle"]
@@ -408,6 +427,10 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
                 driver.interrupt(handle, handle.live_turn)
         elif line in ("/stop", "/quit"):
             if not handle.closed:
+                # What the worker has written already is read first, so an interrupt still held for the
+                # turn's id goes out before the input ends (the #402 reads, round 2, GPT-6 Astra 3).
+                while not state["eof"] and read_once():
+                    pass
                 driver.send(handle, {"kind": "close"})
             console.pending.clear()
             return line == "/quit"
@@ -428,16 +451,15 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
     try:
         while True:
             during_turn = busy()
-            raw = next_command(block=not during_turn)
-            if raw is None:
-                break  # no more commands
-            if raw is not _NOTHING_YET:
-                line = raw.strip()
-                if during_turn and line and not takes_now(line, bool(console.pending)):
-                    held.insert(0, raw)  # it waits for the turn to end
-                    raw = _NOTHING_YET
+            raw = next_command(during_turn)
             if raw is _NOTHING_YET:
+                if not during_turn:
+                    break  # the source has ended and nothing waits (a waiting command is taken first)
                 read_once()
+                continue
+            line = raw.strip()
+            if during_turn and line and not takes_now(line, bool(console.pending)):
+                held.append(raw)  # it waits for the turn's end, behind the ones already waiting
                 continue
             if not line:
                 continue
@@ -455,8 +477,8 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
             if drafts is None:
                 break
             record(drafts)
-    except c.RouteError as err:
-        say(f"the worker's output failed: {err}; the run ends")
+    except _OutputFailed as failed:
+        say(f"the worker's output failed: {failed.args[0]}; the run ends")
     return seen
 
 
@@ -489,18 +511,26 @@ def run_mode(args: argparse.Namespace) -> int:
     driver = CodexDriver(launcher, time.monotonic, binary=args.codex, approvals=console)
     route = {"engine": "codex", "model": args.model, "connection": {"kind": "subscription", "id": "own-login"}}
     seen: dict = {}
-    # Every worker is ended and every capture closed however the loop ends, an exception or Ctrl-C included;
-    # one worker that cannot be ended does not stop the others (the #402 reads: GPT-6 Astra R7, DeepSeek F2).
+    # Every worker is ended and every capture closed however the loop ends, an exception or Ctrl-C included.
+    # Each step is tried even when one before it fails or is interrupted (the drafts file, a worker); the first
+    # failure is raised afterwards unless the loop's own exception is already on its way (the #402 reads:
+    # GPT-6 Astra R7 and round 2 change 4, DeepSeek F2).
     try:
         session_loop(driver, Typed(), say, console, env=child_env(dict(os.environ)), route=route, seen=seen,
                      on_draft=on_draft)
     finally:
-        drafts.close()
-        for proc in workers:
+        in_flight = sys.exc_info()[1]
+        failure = None
+        steps = [("the drafts file", drafts.close)]
+        steps += [(f"worker pid {proc.proc.pid}", lambda proc=proc: proc.fence("attended_run_over")) for proc in workers]
+        for name, step in steps:
             try:
-                proc.fence("attended_run_over")
-            except Exception as err:  # noqa: BLE001 - say it and go on to the next worker
-                print(f"[worker pid {proc.proc.pid} could not be ended: {type(err).__name__}: {err}]")
+                step()
+            except BaseException as err:  # noqa: BLE001 - say it, go on, raise the first one afterwards
+                print(f"[{name} could not be ended: {type(err).__name__}: {err}]")
+                failure = failure or err
+        if failure is not None and in_flight is None:
+            raise failure
     print(f"captured in {out}: threads {seen.get('threads')}")
     return 0
 

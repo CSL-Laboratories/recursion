@@ -984,6 +984,45 @@ class ExactApprovalTest(Base):
         self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "accept"}}])
         self.assertEqual(len(self.approvals.requests), 1)
 
+    def test_an_approval_id_the_gate_refuses_is_declined_at_once(self):
+        # DeepSeek's round-2 R2-3: such an id could never be answered through approval_answer.
+        for bad in ("apr-1\n", "x" * 65, "not an id"):
+            with self.subTest(bad=bad):
+                self.approvals = FakeApprovals(answer=bad)
+                self.run_turn([ask_command()])
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+                self.assertEqual(self.handle._codex.bindings, {})
+
+    def test_a_request_whose_turn_or_item_is_not_text_is_declined(self):
+        # DeepSeek's round-2 R2-4: no TypeError out of parse.
+        for field, value in (("itemId", []), ("turnId", {"t": 1})):
+            with self.subTest(field=field):
+                self.setUp()
+
+                def ask(tid, field=field, value=value):
+                    note = ask_command()(tid)
+                    note["params"][field] = value
+                    return Raw(note)
+                self.run_turn([ask])
+                self.assertEqual(self.approvals.requests, [])
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_a_binding_minted_after_its_turn_ended_is_not_kept(self):
+        # DeepSeek's round-2 R2-1: the port call straddles the turn's end; nothing is bound or written after.
+        outer = self
+
+        class EndingPort(FakeApprovals):
+            def request(self, effect, binding):
+                approval_id = super().request(effect, binding)
+                outer.driver.parse(outer.handle, json.dumps(done()("trn-1")))  # the turn ends meanwhile
+                return approval_id
+        self.approvals = EndingPort()
+        self.run_turn([ask_command()])
+        self.assertEqual(self.handle._codex.bindings, {})
+        with self.assertRaises(DriverStateError):
+            self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+        self.assertEqual(answers(self.server, 77), [])
+
     def test_a_port_interrupted_by_a_base_exception_declines_then_lets_it_go_on(self):
         for exc in (KeyboardInterrupt, SystemExit):
             with self.subTest(exc=exc.__name__):
@@ -1065,6 +1104,36 @@ class WriteDisciplineTest(unittest.TestCase):
         written = [m["params"]["clientUserMessageId"] for m in server.sent if m.get("method") in ("turn/start",
                                                                                                   "turn/steer")]
         self.assertEqual(written, ["dlv-1", "dlv-2", "dlv-3"])
+
+    def test_close_waits_for_a_port_call_in_progress(self):
+        # DeepSeek's round-2 R2-2: once close has returned, no request is put to the port; one in flight ends
+        # first (and its approval can never be answered: the input has ended).
+        asking, release = threading.Event(), threading.Event()
+
+        class SlowPort(FakeApprovals):
+            def request(self, effect, binding):
+                asking.set()
+                release.wait(5)
+                return super().request(effect, binding)
+        server, port = AppServer(), SlowPort()
+        driver = cx.CodexDriver(Launcher(server), FakeClock(), approvals=port)
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        while server.out:
+            driver.pump(handle, 1)
+        reader = threading.Thread(target=driver.parse, args=(handle, json.dumps(ask_command()("trn-1"))))
+        reader.start()
+        self.assertTrue(asking.wait(5))
+        closer = threading.Thread(target=driver.send, args=(handle, {"kind": "close"}))
+        closer.start()
+        closer.join(0.2)
+        try:
+            self.assertTrue(closer.is_alive(), "close returns only after the port call in progress")
+        finally:
+            release.set()
+            reader.join(5)
+            closer.join(5)
+        self.assertEqual((len(port.requests), answers(server, 77)), (1, []))
 
     def test_a_later_steer_queues_behind_the_held_ones(self):
         ready, release = threading.Event(), threading.Event()

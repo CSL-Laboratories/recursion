@@ -81,6 +81,17 @@ class LateTyping:
         return not self.server.out
 
 
+class SwitchingLateTyping(LateTyping):
+    """LateTyping across a /stop and /resume: ready when every worker's output so far has been read."""
+
+    def __init__(self, servers, commands):
+        super().__init__(servers[0], commands)
+        self.servers = servers
+
+    def ready(self):
+        return all(not s.out for s in self.servers)
+
+
 class SessionLoopTest(unittest.TestCase):
     def setUp(self):
         self.tool = tool()
@@ -101,8 +112,10 @@ class SessionLoopTest(unittest.TestCase):
     def test_two_turns_stop_and_resume(self):
         first = AppServer(script={1: [agent("three files"), done()], 2: [agent("3"), done()]})
         second = AppServer(script={1: [agent("still here"), done()]})
-        seen = self.run_loop([first, second], ["list the files", "count them", "/stop", "/resume", "and now?",
-                                               "/quit"])
+        # The person types each command once the worker's output so far has been read (round 2 of #402: a
+        # command typed during a turn is read at once, and /stop would act before the second message).
+        seen = self.run_loop([first, second], SwitchingLateTyping([first, second], [
+            "list the files", "count them", "/stop", "/resume", "and now?", "/quit"]))
         self.assertEqual(seen["threads"], ["thr-1", "thr-1"])
         self.assertEqual(seen["workers"], 2)
         self.assertEqual(self.accepted(seen), [("dlv-1", "turn-1"), ("dlv-2", "turn-2"), ("dlv-3", "turn-3")])
@@ -113,7 +126,7 @@ class SessionLoopTest(unittest.TestCase):
     def test_deny_then_approve(self):
         server = AnsweringServer({70: [done()], 71: [done()]}, script={1: [ask_command(70, "touch a.txt", "it-1")],
                                                                        2: [ask_command(71, "touch a.txt", "it-2")]})
-        self.run_loop([server], ["create a.txt", "n", "create a.txt again", "y", "/quit"])
+        self.run_loop([server], LateTyping(server, ["create a.txt", "n", "create a.txt again", "y", "/quit"]))
         answers = {m["id"]: m["result"]["decision"] for m in server.sent if "method" not in m and "result" in m}
         self.assertEqual(answers, {70: "decline", 71: "accept"})
         self.assertTrue(any(s.startswith("APPROVAL apr-attended-1") and "touch a.txt" in s for s in self.said))
@@ -194,10 +207,46 @@ class AttendedReviewTest(unittest.TestCase):
 
     def test_a_message_typed_during_a_turn_waits_for_its_end(self):
         server = AppServer(script={1: [agent("a"), done()], 2: [done()]})
-        seen = self.loop(server, iter(["first", "second", "/quit"]))
+        seen = self.loop(server, iter(["first", "second"]))  # the source ends with a message still waiting
         accepted = [(d["payload"]["delivery_id"], d["payload"]["how"]) for d in seen["drafts"]
                     if d["type"] == "input.accepted"]
         self.assertEqual(accepted, [("dlv-1", "new_turn"), ("dlv-2", "new_turn")])
+
+    def test_a_waiting_message_does_not_hide_a_later_interrupt_or_quit(self):
+        # Round 2 of #402 (GPT-6 Astra 3, GPT-6.1 Sol 2, DeepSeek R2-6): the turn never ends by itself.
+        for later, expect in (("/interrupt", "turn/interrupt"), ("/quit", None)):
+            with self.subTest(later=later):
+                server = AppServer(script={2: [done()]})  # turn 1 never ends by itself; the queued one does
+                consumed = []
+
+                def commands(later=later):
+                    for command in ("hello", "queued", later):
+                        consumed.append(command)
+                        yield command
+                self.loop(server, LateTyping(server, commands()))
+                self.assertEqual(consumed, ["hello", "queued", later])
+                if expect:
+                    self.assertIn(expect, [m.get("method") for m in server.sent])
+                else:
+                    self.assertTrue(server.stdin_closed)  # /quit was read and ended the worker's input
+
+    def test_resume_waits_for_the_stopped_workers_turn_to_end(self):
+        # The stopped worker ends its turn only after its input has ended; /resume typed meanwhile waits, so
+        # the old worker's last drafts are kept before the new worker starts.
+        class EndsOnInputEnd(AppServer):
+            def close_stdin(self):
+                super().close_stdin()
+                self.emit({"method": "turn/completed", "params": {"threadId": "thr-1",
+                                                                  "turn": {"id": "trn-1", "items": [],
+                                                                           "status": "interrupted"}}})
+        first, second = EndsOnInputEnd(), AppServer()
+        seen = self.loop([first, second], iter(["hello", "/stop", "/resume"]),  # (a /quit would act at once)
+                         launcher=Launcher(first, second))
+        self.assertEqual(seen["workers"], 2)
+        results = [d["payload"]["code"] for d in seen["drafts"] if d["type"] == "result"]
+        self.assertEqual(results, ["interrupted"])
+        started = self.said.index("worker 2 on thread thr-1")
+        self.assertTrue(any(s.startswith("result:") for s in self.said[:started]))
 
     def test_resume_is_refused_while_the_worker_runs(self):
         first, second = AppServer(), AppServer()

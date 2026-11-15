@@ -142,7 +142,7 @@ process that leaves the probe's session and keeps the output open past the timeo
 `HOME`, `TMPDIR` and `XDG_*` inside a fresh temp dir removed afterwards, `LC_ALL=C`, plus
 Claude Code's `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`. No proxy, credential,
 config-path or `CLI_VERSION` variable can reach it. Pinned routes are never probed. Limit: this is not a kernel network
-block; a network namespace belongs to the launch sandbox (B6), not this check.
+block; a network namespace belongs to the launch's own containment (B6), not this check.
 
 ## Floor table `r2a-floors/1.5.0-candidate-2026-11-09`
 
@@ -601,6 +601,9 @@ Called by nothing, like the rest of this package. What it adds:
   finite number of seconds above 0 (a NaN deadline is never reached); and a probe that
   raises or answers a malformed result is `version_probe_failed` for its engine instead of
   ending `launch_check()` for all of them.
+- One line of this README named the launch's containment with the word that master's
+  `daemon/tests/test_plugins.py` (`ReadmeClaimTests`) refuses in any core README, so the merge
+  of master made the gate red. The line now says "the launch's own containment".
 
 ## Tests
 

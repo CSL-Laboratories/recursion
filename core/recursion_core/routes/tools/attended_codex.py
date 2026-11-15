@@ -297,10 +297,13 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
 
     def start(esid):
         seen["workers"] += 1
-        record = {"session_id": session_id, "run_id": f"attended-{seen['workers']}", "workspace": None,
-                  "route": route, "engine_session_id": esid}
-        call = driver.start if esid is None else driver.resume
-        state["handle"] = call(record, env or {})
+        # #376's PROVISIONAL call forms (driver.py at 5079080c): start(session, workspace, env) and
+        # resume(engine_session_id, session, workspace, env).
+        session = {"session_id": session_id, "run_id": f"attended-{seen['workers']}", "route": route}
+        if esid is None:
+            state["handle"] = driver.start(session, None, env or {})
+        else:
+            state["handle"] = driver.resume(esid, session, None, env or {})
         seen["threads"].append(state["handle"].engine_session_id)
         say(f"worker {seen['workers']} on thread {state['handle'].engine_session_id}")
 

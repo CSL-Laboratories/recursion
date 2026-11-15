@@ -178,6 +178,15 @@ def record(esid=None, model="gpt-5.1-codex", run_id="run-1"):
             "route": {"engine": "codex", "model": model, "connection": {"kind": "subscription", "id": "login-A"}}}
 
 
+def begin(driver, rec, env):
+    """Start or resume through #376's PROVISIONAL call forms (driver.py, 5079080c): ``start(session, workspace,
+    env)`` and ``resume(engine_session_id, session, workspace, env)``. One place to edit if they change again."""
+    session = {key: rec[key] for key in ("session_id", "run_id", "route")}
+    if rec["engine_session_id"] is None:
+        return driver.start(session, rec["workspace"], env)
+    return driver.resume(rec["engine_session_id"], session, rec["workspace"], env)
+
+
 def message(turn_id="turn-1", delivery="dlv-1", text="list the files"):
     return {"kind": "user_message", "turn_id": turn_id, "text": text, "delivery_id": delivery}
 
@@ -204,7 +213,7 @@ class Base(unittest.TestCase):
         self.launcher = Launcher(self.server)
         self.driver = cx.CodexDriver(self.launcher, FakeClock(), approvals=self.approvals,
                                      wall_clock=lambda: 1_763_200_000.0)
-        self.handle = self.driver.start(record(esid), {"PATH": "/usr/bin"})
+        self.handle = begin(self.driver, record(esid), {"PATH": "/usr/bin"})
         return self.handle
 
     def drain(self):
@@ -231,14 +240,14 @@ class StartTest(Base):
     def test_a_model_left_to_the_engine_is_not_sent(self):
         server = AppServer()
         driver = cx.CodexDriver(Launcher(server), FakeClock())
-        driver.start(record(model=None), {})
+        begin(driver, record(model=None), {})
         self.assertEqual(server.sent[2]["params"], {})
 
     def test_eof_during_start_is_engine_exited_and_fences(self):
         server = AppServer(silent=True)
         server.out.append(EOF)
         with self.assertRaises(c.RouteError) as cm:
-            cx.CodexDriver(Launcher(server), FakeClock()).start(record(), {})
+            begin(cx.CodexDriver(Launcher(server), FakeClock()), record(), {})
         self.assertEqual(cm.exception.code, c.ENGINE_EXITED)
         self.assertEqual((server.stdin_closed, server.fenced), (True, ["start_refused"]))
 
@@ -247,7 +256,7 @@ class StartTest(Base):
             with self.subTest(info=info):
                 server = AppServer(refuse={"thread/start": {"code": -32000, "message": "x", "codexErrorInfo": info}})
                 with self.assertRaises(c.RouteError) as cm:
-                    cx.CodexDriver(Launcher(server), FakeClock()).start(record(), {})
+                    begin(cx.CodexDriver(Launcher(server), FakeClock()), record(), {})
                 self.assertEqual(cm.exception.code, code)
                 self.assertTrue(server.stdin_closed)
 
@@ -262,7 +271,7 @@ class ResumeTest(Base):
     def test_an_unknown_id_refuses_cleanly(self):
         server = AppServer(threads=())
         with self.assertRaises(c.RouteError) as cm:
-            cx.CodexDriver(Launcher(server), FakeClock()).resume(record("thr-gone"), {})
+            begin(cx.CodexDriver(Launcher(server), FakeClock()), record("thr-gone"), {})
         self.assertEqual(cm.exception.code, c.REQUEST_INVALID)
         self.assertEqual([m.get("method") for m in server.sent], ["initialize", "initialized", "thread/resume"])
         self.assertEqual((server.stdin_closed, server.fenced), (True, ["start_refused"]))
@@ -271,7 +280,7 @@ class ResumeTest(Base):
         busy = {"code": -32600, "message": "thread thr-1 already has an active writer"}
         server = AppServer(refuse={"thread/resume": busy})
         with self.assertRaises(c.RouteError) as cm:
-            cx.CodexDriver(Launcher(server), FakeClock()).resume(record("thr-1"), {})
+            begin(cx.CodexDriver(Launcher(server), FakeClock()), record("thr-1"), {})
         self.assertEqual(cm.exception.code, c.REQUEST_INVALID)
 
     def test_an_answer_naming_another_thread_is_a_protocol_error(self):
@@ -287,7 +296,7 @@ class ResumeTest(Base):
             orig(line)
         server.send = send
         with self.assertRaises(c.RouteError) as cm:
-            driver.resume(record("thr-1"), {})
+            begin(driver, record("thr-1"), {})
         self.assertEqual(cm.exception.code, c.PROTOCOL_ERROR)
 
 

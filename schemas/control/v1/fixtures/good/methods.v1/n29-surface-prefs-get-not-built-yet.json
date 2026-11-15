@@ -1,0 +1,10 @@
+{
+  "method": "surface.prefs.get",
+  "params": {
+    "surface": "page"
+  },
+  "answer": {
+    "code": "unsupported",
+    "detail": "not_implemented"
+  }
+}

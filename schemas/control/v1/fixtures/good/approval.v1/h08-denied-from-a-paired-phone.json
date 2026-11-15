@@ -1,0 +1,97 @@
+{
+  "approval_id": "apr-00c4",
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "source": "engine_tool",
+  "effect": {
+    "kind": "engine_tool",
+    "engine": "claude_code",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "tool": "Bash",
+    "cwd": "/home/dev/projects/atlas",
+    "input": {
+      "description": "clean build",
+      "command": "rm -rf build && make"
+    }
+  },
+  "digest_form": "rfc8785/v1",
+  "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+  "display": [
+    {
+      "label": "Why the engine says it wants this",
+      "value": "clean build",
+      "trust": "untrusted"
+    }
+  ],
+  "rendered_form": "csl-approval-lines/v0",
+  "rendered": [
+    {
+      "text": "Tool call waiting for an answer",
+      "trust": "trusted"
+    },
+    {
+      "text": "engine: claude_code",
+      "trust": "trusted"
+    },
+    {
+      "text": "session: ses-7f3a9c2e51d04b6a",
+      "trust": "trusted"
+    },
+    {
+      "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "trust": "trusted"
+    },
+    {
+      "text": "tool: \"Bash\"",
+      "trust": "untrusted"
+    },
+    {
+      "text": "directory: \"/home/dev/projects/atlas\"",
+      "trust": "untrusted"
+    },
+    {
+      "text": "input fields: 2",
+      "trust": "trusted"
+    },
+    {
+      "text": "\"command\": \"rm -rf build && make\"",
+      "trust": "untrusted"
+    },
+    {
+      "text": "\"description\": \"clean build\"",
+      "trust": "untrusted"
+    }
+  ],
+  "requested_at": "2026-11-13T07:34:30.000Z",
+  "expires_at": "2026-11-13T07:49:30.000Z",
+  "state": "denied",
+  "opened_by": [
+    {
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "surface": "tui",
+      "revision": 1,
+      "at": "2026-11-13T07:34:31.000Z"
+    },
+    {
+      "principal": {
+        "kind": "device",
+        "id": "phone-2f9c"
+      },
+      "surface": "phone",
+      "revision": 1,
+      "at": "2026-11-13T07:34:50.000Z"
+    }
+  ],
+  "answered_by": {
+    "kind": "device",
+    "id": "phone-2f9c"
+  },
+  "answer": "deny",
+  "answered_at": "2026-11-13T07:35:09.000Z",
+  "revision": 1
+}

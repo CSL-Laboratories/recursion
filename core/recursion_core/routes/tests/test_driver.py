@@ -16,10 +16,15 @@ from recursion_core.routes.driver import (Declaration, Driver, DriverInputError,
 ALL = Flags(**{name: True for name in d.FLAGS})
 
 
+def session(run_id="run-1"):
+    """The brief's ``session`` argument of start and resume (PROVISIONAL form): {session_id, run_id, route}."""
+    return {"session_id": "ses-1", "run_id": run_id,
+            "route": {"engine": "claude_code", "model": "m", "connection": {"kind": "subscription", "id": "login-A"}}}
+
+
 def start_record(esid=None, run_id="run-1"):
-    return {"session_id": "ses-1", "run_id": run_id, "workspace": None,
-            "route": {"engine": "claude_code", "model": "m", "connection": {"kind": "subscription", "id": "login-A"}},
-            "engine_session_id": esid}
+    """The driver.v2 start record the subclass's ``_start`` receives."""
+    return {**session(run_id), "workspace": None, "engine_session_id": esid}
 
 
 def msg(turn="turn-1", delivery="dlv-1", text="hello"):
@@ -121,32 +126,31 @@ class FlagRefusalTest(unittest.TestCase):
 
     def started(self, flags=Flags()):
         driver = StandIn(flags)
-        return driver, driver.start(start_record(), {"PATH": "/usr/bin"})
+        return driver, driver.start(session(), None, {"PATH": "/usr/bin"})
 
-    def assertRefused(self, call, flag, fn, driver):
+    def assertRefused(self, call, flag, fn, driver, code="unsupported"):
         before = (list(driver.written), list(driver.started), list(driver.forks))
         with self.assertRaises(DriverRefused) as caught:
             fn()
-        self.assertEqual(caught.exception.as_record(), {"code": "unsupported", "call": call, "flag": flag})
+        self.assertEqual(caught.exception.as_record(), {"code": code, "call": call, "flag": flag})
         self.assertEqual((driver.written, driver.started, driver.forks), before)
 
     def test_resume_without_its_flag_starts_nothing(self) -> None:
         driver = StandIn()
-        self.assertRefused("resume", "resume", lambda: driver.start(start_record("conv-1"), {}), driver)
-        self.assertRefused("resume", "resume", lambda: driver.resume(start_record("conv-1"), {}), driver)
+        self.assertRefused("resume", "resume", lambda: driver.resume("conv-1", session(), None, {}), driver)
         # resume is refused for its flag whatever it is given: the flag is checked before the shape.
-        self.assertRefused("resume", "resume", lambda: driver.resume(start_record(None), {}), driver)
+        self.assertRefused("resume", "resume", lambda: driver.resume(None, session(), None, {}), driver)
         self.assertEqual(driver.started, [])
 
     def test_a_mid_turn_message_without_its_flag_writes_nothing(self) -> None:
         driver, h = self.started()
         driver.send(h, msg())  # the first message needs no flag
         self.assertEqual(len(driver.written), 1)
-        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver)
+        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver, "busy")
         # A worker with a second turn but no mid-turn input: still refused while the turn is in progress.
         driver, h = self.started(Flags(multi_turn=True))
         driver.send(h, msg())
-        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver)
+        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver, "busy")
 
     def test_a_second_turn_without_multi_turn_writes_nothing(self) -> None:
         driver, h = self.started()
@@ -174,7 +178,7 @@ class FlagRefusalTest(unittest.TestCase):
         driver.parse(h, end())
         driver.send(h, msg("turn-2", "dlv-3"))  # a second turn
         self.assertEqual(driver.fork("conv-1", "turn-1"), "conv-1-fork")
-        resumed = driver.resume(start_record("conv-1", run_id="run-2"), {})
+        resumed = driver.resume("conv-1", session(run_id="run-2"), None, {})
         self.assertEqual(resumed.as_record(), {"run_id": "run-2", "engine_session_id": "conv-1"})
         self.assertEqual(len(driver.written), 5)
         self.assertEqual(driver.lock_free_while_asked, [True] * 5)  # the gate holds no lock while it asks
@@ -192,7 +196,7 @@ class FlagRefusalTest(unittest.TestCase):
 class StateAndShapeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.driver = StandIn(ALL)
-        self.h = self.driver.start(start_record(), {"PATH": "/usr/bin"})
+        self.h = self.driver.start(session(), None, {"PATH": "/usr/bin"})
 
     def assertNothingWritten(self, exc, fn):
         before = list(self.driver.written)
@@ -221,19 +225,21 @@ class StateAndShapeTest(unittest.TestCase):
         self.assertEqual(self.h.live_turn, None)
 
     def test_start_takes_driver_v2s_start_record_and_a_string_environment(self) -> None:
-        bad_records = [dict(start_record(), extra=1), dict(start_record(), session_id="session-1"),
-                       dict(start_record(), run_id="run 1"), dict(start_record(), engine_session_id=""),
-                       {k: v for k, v in start_record().items() if k != "route"}]
-        for record in bad_records:
-            with self.subTest(record=record), self.assertRaises(DriverInputError):
-                StandIn(ALL).start(record, {})
+        bad_sessions = [dict(session(), extra=1), dict(session(), session_id="session-1"),
+                        dict(session(), run_id="run 1"), {k: v for k, v in session().items() if k != "route"},
+                        [], None, dict(start_record())]  # the last: driver.v2's whole record is not a session
+        for value in bad_sessions:
+            with self.subTest(session=value), self.assertRaises(DriverInputError):
+                StandIn(ALL).start(value, None, {})
+        with self.assertRaises(DriverInputError):
+            StandIn(ALL).resume("", session(), None, {})  # a conversation id has 1 to 256 characters
         for env in ({"PATH": 1}, [("PATH", "/usr/bin")]):
             driver = StandIn(ALL)
             with self.subTest(env=env), self.assertRaises(DriverInputError):
-                driver.start(start_record(), env)
+                driver.start(session(), None, env)
             self.assertEqual(driver.started, [])
         with self.assertRaises(DriverInputError):
-            StandIn(ALL).resume(start_record(None), {})  # resume names the conversation it resumes
+            StandIn(ALL).resume(None, session(), None, {})  # resume names the conversation it resumes
 
     def test_state_is_checked_under_the_handles_lock_and_the_subclass_asked_outside_it(self) -> None:
         events = []
@@ -272,7 +278,7 @@ class StateAndShapeTest(unittest.TestCase):
 class AcceptanceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.driver = StandIn(ALL, input_ack=True)
-        self.h = self.driver.start(start_record(), {})
+        self.h = self.driver.start(session(), None, {})
 
     def kinds(self, line):
         return [x["type"] for x in self.driver.parse(self.h, line)]
@@ -291,7 +297,7 @@ class AcceptanceTest(unittest.TestCase):
         # An id read out of engine output (a forged replay, a tool's text) names no write of this handle.
         self.assertEqual(self.kinds(accepted("dlv-forged")), [])
         self.driver.send(self.h, msg())
-        other = self.driver.start(start_record(run_id="run-2"), {})
+        other = self.driver.start(session(run_id="run-2"), None, {})
         self.assertEqual([x["type"] for x in self.driver.parse(other, accepted())], [])  # another worker's write
         self.assertEqual((self.h.ignored_acceptances, other.ignored_acceptances), (1, 1))
 
@@ -313,7 +319,7 @@ class AcceptanceTest(unittest.TestCase):
 class DraftTest(unittest.TestCase):
     def setUp(self) -> None:
         self.driver = StandIn(ALL)
-        self.h = self.driver.start(start_record(), {})
+        self.h = self.driver.start(session(), None, {})
 
     def test_a_driver_drafts_only_its_own_types(self) -> None:
         for type_, payload in (("turn.started", {"delivery_id": "dlv-1", "index": 0, "text": "x"}),

@@ -13,8 +13,8 @@ Liaison's ruling of 3:42 AM Nov 13, not a decision of Lucas's).
 THE CALLS, each checked by ``Driver`` before the subclass is asked, so a refused call writes no byte,
 starts no process and changes no state:
 
-    start(request, env) -> Handle         request is driver.v2's start record; env is never recorded
-    resume(request, env) -> Handle        start with engine_session_id set: needs ``resume``
+    start(session, workspace, env) -> Handle                 PROVISIONAL form; env is never recorded
+    resume(engine_session_id, session, workspace, env) -> Handle   needs ``resume``; PROVISIONAL form
     send(handle, input)                   user_message | approval_answer | close
     interrupt(handle, turn_id)            needs ``interrupt``; only the turn in progress
     fork(engine_session_id, at) -> id     needs ``fork``
@@ -23,9 +23,12 @@ starts no process and changes no state:
 Which flag a call needs (driver.v2's description): a second user_message to the same worker needs
 ``multi_turn``; a user_message while a turn is in progress needs ``mid_turn_input``; an approval_answer
 needs ``permission_bridge``. A call whose flag is false raises ``DriverRefused`` (code ``unsupported``, the
-call and the flag). A malformed call raises ``DriverInputError``; a call the worker's state does not allow
-(closed, an interrupt of a turn that is not in progress, a reused turn or delivery id) raises
-``DriverStateError``. All three are raised before the subclass is asked.
+call and the flag), except the mid-turn send, which raises ``DriverBusy`` (code ``busy``, the frozen brief's
+word). PROVISIONAL, both that answer and the start and resume forms above: which of the brief's wording and
+driver.v2's stands is open with Lucas (lane questions Q1 and Q7); consumers must not rely on either yet.
+A malformed call raises ``DriverInputError``; a call the worker's state does not allow (closed input, an
+interrupt of a turn that is not in progress, a reused turn or delivery id) raises ``DriverStateError``. All
+of these are raised before the subclass is asked.
 
 DELIVERY. A user_message carries the delivery_id the core minted for it. ``parse`` returns an
 ``input.accepted`` draft only when it names a delivery this handle wrote and has not seen accepted, with
@@ -70,6 +73,7 @@ CONTRACT = 2
 FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage")
 INPUT_KINDS = ("user_message", "approval_answer", "close")
 UNSUPPORTED = "unsupported"
+BUSY = "busy"  # PROVISIONAL: see DriverBusy
 # The calls a flag can refuse, and the flags that refuse a call (driver.v2 $defs/refusal).
 REFUSABLE_CALLS = ("send", "interrupt", "resume", "fork")
 REFUSING_FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge")
@@ -118,7 +122,24 @@ class DriverRefused(Exception):
 
     def as_record(self) -> dict:
         """driver.v2's refusal record."""
-        return {"code": UNSUPPORTED, "call": self.call, "flag": self.flag}
+        return {"code": self.code, "call": self.call, "flag": self.flag}
+
+
+class DriverBusy(DriverRefused):
+    """A user_message sent while a turn is in progress, to a driver without ``mid_turn_input``. PROVISIONAL.
+
+    The frozen brief says such a send "answers `busy`"; driver.v2's refusal record (#368) has only
+    ``unsupported``, with flag ``mid_turn_input``. Until Lucas settles which stands (lane questions Q1, put to
+    him by the Liaison on Nov 14), the gate answers the brief's ``busy``: code ``busy``, call ``send``, flag
+    ``mid_turn_input``. It is a ``DriverRefused``, so a caller that catches refusals sees it, and its ``code``
+    tells the two apart. Consumers must not rely on either answer yet.
+    """
+
+    code = BUSY
+
+    def __init__(self) -> None:
+        super().__init__("send", "mid_turn_input")
+        self.args = (f"{BUSY}: a turn is in progress and this driver takes no mid-turn input",)
 
 
 class DriverInputError(ValueError):
@@ -243,21 +264,30 @@ class Driver:
     declaration: Declaration
 
     # -- the calls ------------------------------------------------------------------------------------
-    def start(self, request: object, env: object) -> Handle:
-        req = check_start(request)
-        if req["engine_session_id"] is not None:
-            self._need("resume", "resume")
+    def start(self, session: object, workspace: object, env: object) -> Handle:
+        """Begin a new conversation. PROVISIONAL signature: the frozen brief's ``start(session, workspace, env)``.
+
+        ``session`` is ``{session_id, run_id, route}`` and ``workspace`` is common.v1's workspace or None;
+        together they are driver.v2's start record with ``engine_session_id`` null, which is what the subclass's
+        ``_start`` receives. Whether the calls take the brief's arguments or driver.v2's one start record is
+        open with Lucas (lane questions Q7); consumers must not rely on either form yet.
+        """
+        return self._begin(check_start(_record(session, workspace, None)), env)
+
+    def resume(self, engine_session_id: object, session: object, workspace: object, env: object) -> Handle:
+        """A new run that continues ``engine_session_id`` (needs ``resume``). PROVISIONAL, as ``start``: the brief
+        writes ``resume(engine_session_id)``; a resume launches a new run, so it also takes that run's session
+        and workspace and the child environment. The flag is checked before anything else."""
+        self._need("resume", "resume")
+        if engine_session_id is None:
+            raise DriverInputError("engine_session_id")
+        return self._begin(check_start(_record(session, workspace, engine_session_id)), env)
+
+    def _begin(self, req: dict, env: object) -> Handle:
         child_env = check_env(env)
         handle = Handle(req["run_id"], req["engine_session_id"])
         self._start(handle, req, child_env)
         return handle
-
-    def resume(self, request: object, env: object) -> Handle:
-        self._need("resume", "resume")
-        req = check_start(request)
-        if req["engine_session_id"] is None:
-            raise DriverInputError("engine_session_id")
-        return self.start(req, env)
 
     def send(self, handle: Handle, item: object) -> None:
         item = check_input(item)
@@ -327,7 +357,8 @@ class Driver:
         if delivery in handle._deliveries:
             raise DriverStateError(f"{delivery} was already written")
         if handle._live_turn is not None:
-            self._need("send", "mid_turn_input")
+            if not self.declaration.flags.mid_turn_input:
+                raise DriverBusy()
             if turn != handle._live_turn:
                 raise DriverStateError(f"{turn} is not the turn in progress")
             how = "mid_turn"
@@ -431,6 +462,14 @@ def check_workspace(workspace: object, field: str = "workspace") -> dict | None:
     if mode == "direct" and workspace["worktree_path"] is not None:
         raise DriverInputError(f"{field}.worktree_path")
     return dict(workspace)
+
+
+def _record(session: object, workspace: object, engine_session_id: object) -> dict:
+    """driver.v2's start record from the brief's arguments (PROVISIONAL): session is {session_id, run_id, route}."""
+    if not isinstance(session, Mapping) or set(session) != {"session_id", "run_id", "route"}:
+        raise DriverInputError("session")
+    return {"session_id": session["session_id"], "run_id": session["run_id"], "route": session["route"],
+            "workspace": workspace, "engine_session_id": engine_session_id}
 
 
 def check_start(request: object) -> dict:

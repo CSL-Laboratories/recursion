@@ -24,15 +24,17 @@ to ``log`` through a ``diagnostics.DiagnosticQueue`` of the reply queue's own, s
 ``log`` either (a client that stops reading stderr too).
 
 OUTPUT FAILURE. When a write returns ``False`` (stdout failed, at this write or at an earlier one, a
-call's answer included: the writer is one), the answers still queued are discarded and every later
-``offer`` returns ``False``; nothing is logged for them (``server.py``, OUTPUT FAILURE, logs the failure
+call's answer included: the writer is one), or raises, the answers still queued are discarded and every
+later ``offer`` returns ``False``; nothing is logged for them (``server.py``, OUTPUT FAILURE, logs the failure
 once).
 
 ``close(timeout)`` waits until every answer taken has been written, or discarded, and ends the thread. That
 wait has no limit, since an answer is never dropped: a client that stops reading stdout while keeping it
-open holds it until it reads again or stdout fails. Then it gives the queue's diagnostics at most
-``timeout`` seconds (``DiagnosticQueue.close``; ``DIAGNOSTIC_DRAIN_S`` unless given), so a log that has
-stopped taking events does not hold it. It starts the threads if ``start`` was never called, so answers
+open holds it until it reads again or stdout fails. It always ends with the write under way, since a write
+that raises is a failed write (OUTPUT FAILURE) and the thread never ends with an answer still pending. Then
+it gives the queue's diagnostics at most ``timeout`` seconds (``DiagnosticQueue.close``;
+``DIAGNOSTIC_DRAIN_S`` unless given; ``None`` is no limit), so a log that has stopped taking events does not
+hold it. It starts the threads if ``start`` was never called, so answers
 offered before it are still written.
 """
 
@@ -115,7 +117,10 @@ class ReplyQueue:
                 if self._lost or not self._pending:
                     return
                 message, size = self._pending[0]
-            written = self._writer.write(message)
+            try:
+                written = self._writer.write(message)
+            except BaseException:  # noqa: BLE001 - a writer that raises wrote nothing, and never will
+                written = False
             with self._cond:
                 self._pending.popleft()
                 self._bytes -= size
@@ -127,8 +132,8 @@ class ReplyQueue:
 
     def close(self, timeout: float | None = DIAGNOSTIC_DRAIN_S) -> bool:
         """Wait until every answer taken has been written (or discarded), with no limit: an answer is never
-        dropped. Then give the queue's diagnostics at most ``timeout`` seconds; ``True`` when they were all
-        delivered."""
+        dropped. Then give the queue's diagnostics at most ``timeout`` seconds (``None``: no limit); ``True``
+        when they were all delivered."""
 
         check_seconds(timeout, "timeout")  # before anything changes
         self.start()  # a queue never started still writes what it took

@@ -220,6 +220,26 @@ class DiagnosticQueueTest(unittest.TestCase):
         self.assertTrue(queue.close(timeout=MAX_WAIT_S))  # the bound itself is a timeout (nothing is left)
         self.assertEqual([event(1)], log.all)
 
+    def test_a_log_that_raises_anything_ends_delivery_and_never_holds_the_shutdown(self) -> None:
+        # Round 6 of #395: a log raising past Exception ended the queue's thread with the event still
+        # pending, so a shutdown with no timeout never returned.
+        def log(item):
+            raise SystemExit("a log that raises past Exception")
+
+        hooks: list = []
+        result: list = []
+        with mock.patch.object(threading, "excepthook", hooks.append):
+            queue = DiagnosticQueue(log)
+            queue.start()
+            self.assertTrue(queue.offer(event(1)))
+            shutting = threading.Thread(target=lambda: result.append(queue.close()), daemon=True)
+            shutting.start()
+            shutting.join(HANG_GUARD_S)
+            self.assertFalse(shutting.is_alive(), "the shutdown waited for an event the log never takes")
+        self.assertEqual([True], result)  # nothing left: the failed log's events were discarded
+        self.assertEqual([False], self.offers(queue, [2]))
+        self.assertEqual([], hooks)
+
     def test_a_repeated_close_after_a_timeout_neither_reopens_nor_repeats_the_last_line(self) -> None:
         log = StalledLog()
         queue = self.queue(log, max_bytes=1)
@@ -353,6 +373,49 @@ class ReplyDiagnosticsTest(unittest.TestCase):
         self.assertEqual([1], [m["id"] for m in out.drain()])
         with self.assertRaises(ValueError):
             replies.close(timeout="x")
+
+    def stalled_line(self) -> tuple[ReplyQueue, threading.Event]:
+        """A reply queue whose answer is written and whose drop line waits in a log that has stopped."""
+
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def log(item):
+            entered.set()
+            release.wait(HANG_GUARD_S)
+
+        out = Stalling({1})
+        replies = ReplyQueue(FrameWriter(out), max_bytes=len(encode(answer(1))), log=log)
+        replies.start()
+        self.assertTrue(replies.offer(answer(1)))
+        self.assertTrue(out.stalled.wait(HANG_GUARD_S))
+        self.assertFalse(replies.offer(answer(2)))  # dropped: its line goes to the log, which stops there
+        self.assertTrue(entered.wait(HANG_GUARD_S))
+        out.release.set()
+        return replies, release
+
+    @staticmethod
+    def shut(replies: ReplyQueue, **kwargs) -> tuple[threading.Thread, list]:
+        result: list = []
+        thread = threading.Thread(target=lambda: result.append(replies.close(**kwargs)), daemon=True)
+        thread.start()
+        return thread, result
+
+    def test_by_default_the_shutdown_gives_stalled_diagnostics_two_seconds(self) -> None:
+        replies, release = self.stalled_line()
+        thread, result = self.shut(replies)  # no timeout given: DIAGNOSTIC_DRAIN_S
+        thread.join(HANG_GUARD_S)
+        self.assertEqual([False], result)  # it returned, the line still undelivered
+        self.assertFalse(release.is_set())
+
+    def test_a_shutdown_given_none_waits_for_stalled_diagnostics(self) -> None:
+        replies, release = self.stalled_line()
+        thread, result = self.shut(replies, timeout=None)
+        thread.join(SHORT)  # time only shows that it has not returned yet
+        self.assertEqual([], result)
+        release.set()
+        thread.join(HANG_GUARD_S)
+        self.assertEqual([True], result)
 
     def test_a_refused_timeout_leaves_the_reply_queue_open(self) -> None:
         out = Capture()

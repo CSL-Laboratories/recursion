@@ -11,6 +11,7 @@ there and fails it.
 from __future__ import annotations
 
 import copy
+import io
 import threading
 import unittest
 from unittest import mock
@@ -137,9 +138,46 @@ class ReplyQueueTest(unittest.TestCase):
         replies.close()
         self.assertEqual([1], [m["id"] for m in out.drain()])
 
+    def test_a_stream_that_raises_ends_writing_and_never_holds_the_shutdown(self) -> None:
+        # Round 6 of #395: a reply thread that died on a raising stream left its answer pending for ever, so
+        # the queue's shutdown, and serve with it, never returned.
+        class RaisingPast(FrameWriter):
+            def write(self, message):  # what no writer here does: raise past its own handling
+                raise SystemExit("a writer that raises past its own handling")
+
+        for writer in (FrameWriter(io.StringIO()), RaisingPast(Capture())):
+            with self.subTest(writer=type(writer).__name__):
+                hooks: list = []
+                with mock.patch.object(threading, "excepthook", hooks.append):
+                    replies = ReplyQueue(writer)
+                    replies.start()
+                    self.assertTrue(replies.offer(pong(1)))
+                    self.assertTrue(self.idle(replies))  # discarded, not left pending
+                    self.assertEqual([False], self.offers(replies, [2]))
+                    shutting = threading.Thread(target=replies.close, daemon=True)
+                    shutting.start()
+                    shutting.join(HANG_GUARD_S)
+                    self.assertFalse(shutting.is_alive(), "the shutdown waited for an answer that is never written")
+                self.assertEqual([], hooks)  # no thread ended with a traceback
+
     def test_the_bound_must_be_positive(self) -> None:
         with self.assertRaises(ValueError):
             ReplyQueue(FrameWriter(Capture()), max_bytes=0)
+
+
+class TextStdoutTest(unittest.TestCase):
+    def test_serve_over_a_text_stdout_returns_as_for_a_failed_stdout(self) -> None:
+        # Round 6 of #395 (DeepSeek's F1): a consumer gives serve a text stream for stdout. The first answer
+        # cannot be written, so stdout has failed; serve returns 0 instead of never returning.
+        events = Events()
+        status: list = []
+        serving = threading.Thread(target=lambda: status.append(
+            server.serve(GateAPI(), io.BytesIO(encode(INIT)), io.StringIO(), log=events)), daemon=True)
+        serving.start()
+        serving.join(HANG_GUARD_S)
+        self.assertFalse(serving.is_alive(), "serve never returned")
+        self.assertEqual([0], status)
+        self.assertEqual({"event": "output_failed", "stdout_broken": True}, events.all[-1])
 
 
 class SessionReplyTest(unittest.TestCase):

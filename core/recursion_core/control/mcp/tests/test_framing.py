@@ -188,6 +188,33 @@ class WriterTest(unittest.TestCase):
         self.assertFalse(writer.write({"a": 1}))
         self.assertTrue(writer.broken)
 
+    def test_a_stream_that_raises_anything_else_breaks_the_writer_too(self) -> None:
+        # Round 6 of #395: a text stream given bytes (TypeError) or a wrapper that fails its own way
+        # (RuntimeError) has failed like a pipe nobody reads: broken, on_broken once, nothing raised.
+        class Raising(io.RawIOBase):
+            def writable(self):
+                return True
+
+            def write(self, data):
+                raise RuntimeError("the wrapper failed")
+
+        for stream in (io.StringIO(), Raising()):
+            with self.subTest(stream=type(stream).__name__):
+                calls: list[bool] = []
+                writer = FrameWriter(stream, on_broken=lambda calls=calls: calls.append(True))
+                self.assertFalse(writer.write({"a": 1}))
+                self.assertTrue(writer.broken)
+                self.assertFalse(writer.write({"a": 2}))
+                self.assertEqual([True], calls)
+
+    def test_a_message_json_cannot_hold_raises_and_breaks_nothing(self) -> None:
+        writer = FrameWriter(io.BytesIO())
+        for value in (float("nan"), {"a set"}):
+            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
+                writer.write({"a": value})
+        self.assertFalse(writer.broken)
+        self.assertTrue(writer.write({"a": 1}))
+
     def test_line_limit_leaves_room_for_a_full_control_frame(self) -> None:
         from recursion_core.control_transport.framing import MAX_FRAME_BYTES
         self.assertGreater(framing.MAX_LINE_BYTES, MAX_FRAME_BYTES)

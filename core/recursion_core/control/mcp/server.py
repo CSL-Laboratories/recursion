@@ -497,8 +497,9 @@ def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None 
     every event for ``log`` is delivered by a diagnostics thread (DIAGNOSTICS). An exception raised while
     reading (an interrupt included) is raised here at once; diagnostics not yet delivered then may be lost.
     ``max_diagnostic_drain_s`` is ``None`` for no limit or a number of seconds from 0 to a day
-    (``diagnostics.check_seconds``); anything else is a ``ValueError`` before anything is read, as the queues'
-    bounds and the session's limits are.
+    (``diagnostics.check_seconds``); anything else is a ``ValueError`` before anything is read. The queues'
+    bounds and the session's limits are refused before anything is read too: a ``ValueError`` for a number out
+    of range, a ``TypeError`` for a value that is not a number.
     """
 
     check_seconds(max_diagnostic_drain_s, "max_diagnostic_drain_s")  # refused before anything is read

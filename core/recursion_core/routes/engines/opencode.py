@@ -54,9 +54,9 @@ lines compute them the same way: ``input`` excludes the cached tokens, ``output`
 the provider did not report is written as 0 (1.19.5 packages/opencode/src/session/session.ts:338-372; 2.2.6
 packages/core/src/session/usage.ts:9-19). So a 0 cannot be told from "not reported": it is drafted ``unknown``,
 never 0. A positive count is ``known``, ``observed``. event.v1 counts reasoning inside ``output_tokens``, so
-``output_tokens`` is OpenCode's output plus its reasoning when both are positive, and a ``lower_bound`` (the one that
-is positive) when the other is not known. The
-cost is OpenCode's own figure, from its price table or from what the endpoint reported, and the stream does not say
+``output_tokens`` is OpenCode's output plus its reasoning when both are positive and the sum is still a number every
+JSON reader keeps exact (``MAX_EXACT``), and otherwise a ``lower_bound``: the larger part that is known. The cost
+is OpenCode's own figure, from its price table or from what the endpoint reported, and the stream does not say
 which: a positive cost is ``known``, ``modelled``; 0 is ``unknown``. A step of a sub-agent session is not in the
 stream (1.19.5 run.ts:712 prints only the run's own session), so the calls drafted here are each exact and their
 sum is not the run's whole spend.
@@ -150,7 +150,13 @@ _MONTHS = {name: number for number, name in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
 _SURROGATE = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + "]")
 REPLACEMENT = chr(0xFFFD)
-_JS_FLOAT = re.compile(r"\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
+# Number.parseFloat's grammar. First JavaScript's white space (StrWhiteSpaceChar: tab, line feed, VT, FF, carriage
+# return, the BOM, the Zs spaces, U+2028 and U+2029), not Python's \s, which also takes U+001C-U+001F and U+0085
+# and not the BOM. Then StrDecimalLiteral: ASCII digits only (\d would take any script's digits), and Infinity in
+# that one spelling, signed or not, with nothing read after it.
+_JS_SPACE = ("[" + "".join(map(chr, (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F,
+                                     0x205F, 0x3000, 0xFEFF))) + chr(0x2000) + "-" + chr(0x200A) + "]")
+_JS_FLOAT = re.compile(_JS_SPACE + r"*([+-]?(?:Infinity|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?))")
 _LINE_BREAK = re.compile(r"[\r\n]")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -376,10 +382,11 @@ class Parser:
         tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
         cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
         output, reasoning = _positive_int(tokens.get("output")), _positive_int(tokens.get("reasoning"))
-        if output is not None and reasoning is not None:
+        if output is not None and reasoning is not None and output + reasoning <= MAX_EXACT:
             output_tokens = _known(output + reasoning, "observed")
-        elif output is not None or reasoning is not None:   # the other part is not known: at least this one
-            output_tokens = {"value": output if output is not None else reasoning, "quality": "lower_bound",
+        elif output is not None or reasoning is not None:
+            # One part is not known, or the sum is past what every JSON reader keeps exact: at least the larger part.
+            output_tokens = {"value": max(n for n in (output, reasoning) if n is not None), "quality": "lower_bound",
                              "provenance": "observed"}
         else:
             output_tokens = _UNKNOWN
@@ -500,7 +507,11 @@ def _positive_finite(value: object, *, scale: float = 1.0) -> float | None:
 
 
 def _js_float(text: str) -> float | None:
-    """``Number.parseFloat``: the longest number at the start of the text, or None."""
+    """``Number.parseFloat``: the longest number at the start of the text, or None where it gives NaN.
+
+    The grammar is JavaScript's (``_JS_FLOAT``): its own white space first, ASCII digits only, and ``Infinity``
+    (signed or not) is a number, so a ``retry-after-ms`` of ``Infinity`` is a number and nothing else is read.
+    """
     match = _JS_FLOAT.match(text)
     return float(match.group(1)) if match else None
 

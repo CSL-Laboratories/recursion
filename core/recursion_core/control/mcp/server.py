@@ -311,12 +311,15 @@ class LegacySession:
 
 
 def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None = None,
-          max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP) -> int:
-    """Serve one client until end of input; returns the process exit status (0)."""
+          tools: Iterable[Tool] | None = None, max_in_flight: int = MAX_IN_FLIGHT,
+          reserved_stop: int = RESERVED_STOP) -> int:
+    """Serve one client until end of input; returns the process exit status (0). ``tools`` defaults to the
+    legacy four."""
 
     writer = FrameWriter(outstream)
     log = log or _quiet
-    session = LegacySession(api, writer.write, log=log, max_in_flight=max_in_flight, reserved_stop=reserved_stop)
+    session = LegacySession(api, writer.write, tools=tools, log=log, max_in_flight=max_in_flight,
+                            reserved_stop=reserved_stop)
     for frame in read_frames(instream):
         session.receive(frame)
         if writer.broken:  # the client stopped reading: forward nothing more whose answer it cannot see

@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 
 import recursion_core
+from recursion_core.control.mcp import projection
 from recursion_core.control.mcp.framing import encode
 from recursion_core.control.mcp.tests.support import HANG_GUARD_S
 from recursion_core.control.registry import EMPTY, POPULATED
@@ -151,11 +152,47 @@ class StdioTest(unittest.TestCase):
         status_code, rest, events = child.end()
         self.assertEqual((0, b""), (status_code, rest))
         self.assertEqual({"event": "serving", "protocol": "2025-06-18"}, events[0])
+        self.assertEqual({"event": "tools", "table": "legacy", "reason": "daemon_without_method_table"}, events[1])
         self.assertEqual({"event": "end_of_input", "stdout_broken": False}, events[-1])
         methods = [m["method"] for m in self.seen]
-        self.assertEqual(["run.list", "run.start", "run.start", "run.status", "run.stop", "run.stop", "run.list"],
-                         methods)  # the first is the socket check's probe
+        self.assertEqual(["run.list", "methods.list", "run.start", "run.start", "run.status", "run.stop", "run.stop",
+                          "run.list"], methods)  # the socket check's probe, then the tool choice
         self.assertEqual({"limit": 1}, self.seen[0]["params"])
+
+    def test_a_daemon_with_the_method_table_gets_the_projected_tools(self) -> None:
+        published = projection.default_published()
+        api, _, _, starter = make_api()
+        implemented = {"run.start", "run.status", "run.list", "run.stop"}
+        listing = {"code": "ok", "table_version": published.table_version,
+                   "methods": [{"name": row["name"], "implemented": row["name"] in implemented, "beta": row["beta"]}
+                               for row in published.rows]}
+
+        class WithTable:
+            def call(self, method, params=None):
+                return listing if method == "methods.list" else api.call(method, params)
+
+        self.daemon(WithTable())
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        tools = child.request(2, "tools/list")["result"]["tools"]
+        rows = {row["mcp"]["tool"]: row for row in published.rows if row["mcp"]["exposed"]}
+        self.assertEqual(["recursion_run_start", "recursion_run_status", "recursion_run_list", "recursion_run_stop"],
+                         [t["name"] for t in tools])
+        for tool in tools:
+            self.assertEqual(rows[tool["name"]]["mcp"]["annotations"], tool["annotations"])
+            self.assertNotIn("$ref", json.dumps(tool["inputSchema"]))
+        refused = child.request(3, "tools/call", {"name": "recursion_run_start",
+                                                   "arguments": {"tenant": "t1", "prompt": ""}})  # published: minLength 1
+        self.assertEqual(-32602, refused["error"]["code"])
+        refused = child.request(5, "tools/call", {"name": "recursion_run_status", "arguments": {"run_id": "run 1"}})
+        self.assertEqual("Invalid params: arguments.run_id does not match the pattern ^[A-Za-z0-9_-]{1,64}$",
+                         refused["error"]["message"])
+        started = child.tool(4, "recursion_run_start", {"tenant": "t1", "engine": "codex", "prompt": "p"})
+        self.assertEqual(("started", False), (started["structuredContent"]["code"], started["isError"]))
+        status, _, events = child.end()
+        self.assertEqual(0, status)
+        self.assertEqual(("projected", published.table_version), (events[1]["table"], events[1]["table_version"]))
+        self.assertEqual(1, len(starter.calls))
 
     def test_closing_stdin_detaches_and_the_run_goes_on(self) -> None:
         api, _, kill, _ = make_api(FakeKillTree([EMPTY]))
@@ -179,7 +216,7 @@ class StdioTest(unittest.TestCase):
         refused = child.request(3, "tools/call", {"name": "recursion_run_start", "arguments": {"tenant": "t1"}})
         self.assertEqual(-32602, refused["error"]["code"])
         self.assertEqual(0, child.end()[0])
-        self.assertEqual(["run.list"], [m["method"] for m in self.seen])  # the probe only
+        self.assertEqual(["run.list", "methods.list"], [m["method"] for m in self.seen])  # the probe and the choice only
         self.assertEqual(([], []), (kill.requests, starter.calls))
 
     def test_no_socket_refuses_to_start(self) -> None:

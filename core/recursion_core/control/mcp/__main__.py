@@ -3,10 +3,14 @@
 An MCP client spawns this process and speaks MCP 2025-06-18 over its stdin and stdout. It takes no
 arguments. Before reading anything from stdin it runs the socket check (``socket_check``): if the check
 fails it writes one JSON line to stderr, ``{"code": "socket_check_failed", "reason": ..., "detail": ...}``,
-writes nothing to stdout and exits 1. Otherwise it serves until the client closes stdin and exits 0.
+writes nothing to stdout and exits 1. Then it chooses its tools (``projection.choose_tools``): the legacy
+four for a daemon from before the method table, else the published table's exposed rows that the daemon
+implements; a refused choice writes ``{"code": "tools_unavailable", "reason": ..., "detail": ...}`` and
+exits 1. Otherwise it serves until the client closes stdin and exits 0.
 
-Exit statuses: 0 end of input; 1 the socket check failed; 2 usage (an argument was given); 130 interrupted.
-This is a client entry, not a kernel one: it registers nothing and starts no daemon service.
+Exit statuses: 0 end of input; 1 the socket check failed or no tools could be chosen; 2 usage (an argument
+was given); 130 interrupted. This is a client entry, not a kernel one: it registers nothing and starts no
+daemon service.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import sys
 from collections.abc import Mapping
 from typing import Any
 
-from . import server, socket_check
+from . import projection, server, socket_check
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 130
 
@@ -30,7 +34,8 @@ def _stderr_line(stream: Any, event: dict) -> None:
 
 
 def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = None, stdin: Any = None,
-         stdout: Any = None, stderr: Any = None, check=socket_check.check) -> int:
+         stdout: Any = None, stderr: Any = None, check=socket_check.check,
+         published=projection.default_published) -> int:
     argv = sys.argv[1:] if argv is None else argv
     stderr = sys.stderr if stderr is None else stderr
     if argv:
@@ -41,11 +46,20 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     except socket_check.SocketCheckFailed as exc:
         _stderr_line(stderr, {"code": "socket_check_failed", "reason": exc.reason, "detail": exc.detail})
         return EXIT_REFUSED
+    try:
+        tools, chosen = projection.choose_tools(api, published())
+    except projection.ProjectionRefused as exc:
+        _stderr_line(stderr, {"code": "tools_unavailable", "reason": exc.reason, "detail": exc.detail})
+        return EXIT_REFUSED
+    except (OSError, ValueError) as exc:  # published files that cannot be read as JSON
+        _stderr_line(stderr, {"code": "tools_unavailable", "reason": "published_unreadable", "detail": type(exc).__name__})
+        return EXIT_REFUSED
     instream = sys.stdin.buffer if stdin is None else stdin
     outstream = sys.stdout.buffer if stdout is None else stdout
     _stderr_line(stderr, {"event": "serving", "protocol": server.LEGACY_PROTOCOL})
+    _stderr_line(stderr, chosen)
     try:
-        return server.serve(api, instream, outstream, log=lambda event: _stderr_line(stderr, event))
+        return server.serve(api, instream, outstream, tools=tools, log=lambda event: _stderr_line(stderr, event))
     except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
         return EXIT_INTERRUPTED
 

@@ -57,12 +57,13 @@ same-uid process can claim anything in a frame, so the relay puts no label into 
 | `delivered: false`, `detail: "relay:connect:..."` | the relay could not reach the daemon's socket (not running, wrong directory, foreign uid) |
 | `delivered: false`, `detail: "busy"` or `"daemon:scope_refused"` | the socket's own refusals, as locally |
 | `delivered: false`, `detail: "request:frame_too_large"` | the request does not fit a frame; nothing was written |
-| `delivered: false`, `detail: "request:write_timeout"` or `"request:write:..."` | the request could not be written whole before its deadline (the far side stopped reading) or ssh stopped reading; the relay acts only on whole frames |
+| `delivered: false`, `detail: "request:write_timeout"` or `"request:write:..."` | the write failed with bytes still unsent: the far side stopped reading until the deadline's kill ended the write, or ssh stopped reading; the relay acts only on whole frames |
+| `delivered: "unknown"`, `detail: "request:write_unknown"` | the write did not show its outcome by the deadline: every byte may have gone out, so it is not reported as unsent |
 | `delivered: false`, `detail: "relay:..."` | the relay refused the frame itself (`relay:frame_too_large`, `relay:frame_not_encodable:...`) |
-| `delivered: "unknown"` | the request was written whole and no complete answer came back: read the run's status before retrying |
+| `delivered: "unknown"` | the request may have been written whole and no complete answer came back: read the run's status before retrying |
 
-The request's deadline covers both writing it and waiting for the answer, and `close()` ends a session
-at once, also while a request is blocked in it.
+The request's deadline covers both writing it and waiting for the answer (each wait gets only what is
+left of it), and `close()` ends a session at once, also while a request is blocked in it.
 
 A Stop never waits behind another call: each call gets a fresh SSH session, as the socket client
 makes one connection per call. With `persistent=True` ordinary calls share one session and `run.stop`

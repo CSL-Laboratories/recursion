@@ -13,14 +13,18 @@ import base64
 import io
 import json
 import os
+import queue
+import subprocess
 import threading
+import types
 import unittest
+from unittest import mock
 
 from recursion_core.control import cli
 from recursion_core.control.client import SocketAPI
 from recursion_core.control_transport import UnixControlClient
 from recursion_core.control_transport.framing import encode_frame
-from recursion_core.remote import codec
+from recursion_core.remote import codec, ssh_transport
 from recursion_core.remote.relay import RELAY_COMMAND
 from recursion_core.remote.ssh_transport import (HARDENED_OPTIONS, HostKeyNotPinned, RelayAPI, RelayDeliveryUnknown,
                                                  RelayHandshakeFailed, RelayNotDelivered, SshRelayClient, SshTarget,
@@ -28,6 +32,9 @@ from recursion_core.remote.ssh_transport import (HARDENED_OPTIONS, HostKeyNotPin
 from recursion_core.remote.tests import support
 
 POSIX = os.name != "nt"
+# A hang detector for calls that end in well under a second: a broken guard fails here and the test still
+# exits. Never a claim about speed.
+SHORT_WATCHDOG_S = 15.0
 TYPE, BLOB, FINGERPRINT = support.made_up_key("far-host")
 _, OTHER_BLOB, OTHER_FINGERPRINT = support.made_up_key("someone-else")
 # A keyed method of the pinned method table (#368 methods.v1), its params exactly as the schema allows them.
@@ -175,7 +182,7 @@ class PipeProc:
         self.stdout = os.fdopen(read_end, "rb", buffering=0)
         self.stderr = io.BytesIO(stderr)
         self.stdin = self
-        self.writes, self.written, self._unread = 0, bytearray(), bytearray()
+        self.writes, self.written, self._unread, self.requests = 0, bytearray(), bytearray(), 0
         self.blocked, self._killed = threading.Event(), threading.Event()
         self._stdin_fails, self._block, self._chunk = stdin_fails, block, chunk
         self._answers, self._hello_seen = list(answers), False
@@ -199,7 +206,9 @@ class PipeProc:
             del self._unread[:4 + size]
             if frame.get("op") == "relay_hello":
                 self._hello_seen = True
-            elif self._answers:
+                continue
+            self.requests += 1
+            if self._answers:
                 with self._exit_lock:
                     if self._write_end is not None:
                         os.write(self._write_end, encode_frame(self._answers.pop(0)))
@@ -222,6 +231,61 @@ class PipeProc:
     def kill(self) -> None:
         self._killed.set()
         self.wait()
+
+
+class FakeTime:
+    """Stands in for the ``time`` module inside ssh_transport: a monotonic clock the test moves by hand."""
+
+    def __init__(self, now: float = 100.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def recording_queue_module(waits: list) -> types.SimpleNamespace:
+    """Stands in for the ``queue`` module inside ssh_transport: every wait's timeout is written to ``waits``."""
+
+    class RecordingQueue(queue.Queue):
+        def get(self, block=True, timeout=None):
+            waits.append(timeout)
+            return super().get(block, timeout)
+
+    return types.SimpleNamespace(Queue=RecordingQueue, Empty=queue.Empty, Full=queue.Full)
+
+
+class ClockedPipeProc(PipeProc):
+    """Each write moves the clock on: by ``hello_step`` while writing the hello, by ``request_step`` after."""
+
+    def __init__(self, clock: FakeTime, *, hello_step: float = 0.0, request_step: float = 0.0, **options) -> None:
+        super().__init__(**options)
+        self.clock, self.steps = clock, (hello_step, request_step)
+
+    def write(self, data):
+        self.clock.now += self.steps[1] if self._hello_seen else self.steps[0]
+        return super().write(data)
+
+
+class LateFlush(PipeProc):
+    """Takes every byte of a request; then its flush returns only when the child is killed."""
+
+    def flush(self) -> None:
+        if self.requests:
+            self._killed.wait()
+
+
+class StuckAfterWrite(PipeProc):
+    """Takes every byte of a request, then does not return from that write until ``resume`` (a kill does not)."""
+
+    def __init__(self, **options) -> None:
+        super().__init__(**options)
+        self.resume = threading.Event()
+
+    def write(self, data):
+        taken = super().write(data)
+        if self.requests:
+            self.resume.wait()
+        return taken
 
 
 class SessionEdgeTests(unittest.TestCase):
@@ -269,8 +333,8 @@ class SessionEdgeTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail, "session_ended")
         self.assertEqual(proc.writes, 1)
 
-    def bounded(self, call):
-        """Run ``call`` in a thread; a hang fails the test at the watchdog instead of stopping the suite."""
+    def bounded(self, call, watchdog: float = support.WATCHDOG_S):
+        """Run ``call`` in a daemon thread; a hang fails the test at the watchdog and the process still exits."""
         outcome = []
 
         def run() -> None:
@@ -281,9 +345,48 @@ class SessionEdgeTests(unittest.TestCase):
 
         worker = threading.Thread(target=run, daemon=True)
         worker.start()
-        worker.join(support.WATCHDOG_S)
+        worker.join(watchdog)
         self.assertFalse(worker.is_alive(), "the call outlived its deadline")
         return outcome[0]
+
+    def test_each_wait_gets_only_what_is_left_of_its_deadline(self) -> None:
+        clock, waits = FakeTime(), []
+        proc = ClockedPipeProc(clock, hello_step=1.0, request_step=1.5,
+                               answers=[{"ok": True, "result": {"code": "stopped"}, "id": 1}])
+        with mock.patch.object(ssh_transport, "time", clock), \
+                mock.patch.object(ssh_transport, "queue", recording_queue_module(waits)):
+            client = self.client(proc, hello_timeout_s=1.25, timeout_s=2.0)
+            self.assertEqual(client.request(self.REQUEST)["result"], {"code": "stopped"})
+        # The hello's write took 1.0 of its 1.25; the request's write took 1.5 of its 2.0.
+        self.assertEqual(waits, [0.25, 0.5])
+
+    def test_a_write_that_completes_at_the_deadline_is_never_reported_unsent(self) -> None:
+        client = self.client(LateFlush(), timeout_s=0.2)
+        failure = self.bounded(lambda: client.request(self.REQUEST))
+        self.assertIsInstance(failure, RelayDeliveryUnknown)
+        # The deadline's kill also ends the child's output, so the wait that follows may see the end of the
+        # stream or nothing at all: either way the whole frame went out, and it is never called unsent.
+        self.assertIn(failure.detail, ("request:timeout", "request:eof"))
+        self.assertTrue(client.closed)
+
+    def test_a_write_whose_outcome_is_not_known_is_never_reported_unsent(self) -> None:
+        proc = StuckAfterWrite()
+        client = self.client(proc, timeout_s=0.2)
+        self.addCleanup(proc.resume.set)
+        with mock.patch.object(ssh_transport, "CLOSE_GRACE_S", 0.2):
+            failure = self.bounded(lambda: client.request(self.REQUEST))
+        self.assertIsInstance(failure, RelayDeliveryUnknown)
+        self.assertEqual(failure.detail, "request:write_unknown")
+        self.assertTrue(client.closed)
+
+    def test_a_request_that_cannot_be_serialised_is_refused_before_it_is_written(self) -> None:
+        proc = PipeProc()
+        client = self.client(proc)
+        with self.assertRaises(RelayNotDelivered) as caught:
+            client.request({"op": "control", "method": "run.list", "params": {"x": {1, 2}}, "id": 1})
+        self.assertEqual(caught.exception.detail, "request:frame_not_encodable:TypeError")
+        self.assertEqual(proc.writes, 1)  # the hello only
+        self.assertFalse(client.closed)
 
     def test_an_answer_that_never_comes_ends_the_session_as_delivery_unknown(self) -> None:
         client = self.client(PipeProc(), timeout_s=0.2)
@@ -329,12 +432,12 @@ class SessionEdgeTests(unittest.TestCase):
             except RelayNotDelivered as exc:
                 outcome.append(exc.detail)
 
-        worker = threading.Thread(target=ask)
+        worker = threading.Thread(target=ask, daemon=True)
         worker.start()
-        self.addCleanup(lambda: (proc.kill(), worker.join(support.WATCHDOG_S)))
+        self.addCleanup(lambda: (proc.kill(), worker.join(SHORT_WATCHDOG_S)))  # release, then join: one cleanup
         self.assertTrue(proc.blocked.wait(support.WATCHDOG_S))
-        client.close()
-        worker.join(support.WATCHDOG_S)
+        self.bounded(client.close, SHORT_WATCHDOG_S)  # ending the session must not wait for the blocked request
+        worker.join(SHORT_WATCHDOG_S)
         self.assertFalse(worker.is_alive())
         self.assertEqual(outcome, ["request:write:BrokenPipeError"])
         self.assertTrue(client.closed)
@@ -582,12 +685,27 @@ class EndToEndTests(unittest.TestCase):
 
     def test_a_far_side_that_stops_reading_cannot_hold_a_request_past_its_deadline(self) -> None:
         daemon = support.SocketDaemon(self)
-        api = self.api(daemon, mode="stall", timeout_s=0.5)
+        children = []
+
+        def spawn(argv, **kwargs):
+            child = subprocess.Popen(argv, **kwargs)
+            children.append(child)
+            return child
+
+        api = self.api(daemon, mode="stall", timeout_s=0.5, spawn=spawn)
         answers = []
-        worker = threading.Thread(target=lambda: answers.append(api.call("run.start", {"prompt": "x" * 900_000})))
+        worker = threading.Thread(target=lambda: answers.append(api.call("run.start", {"prompt": "x" * 900_000})),
+                                  daemon=True)
         worker.start()
-        worker.join(support.WATCHDOG_S)
-        self.assertFalse(worker.is_alive(), "the request outlived its deadline")
+        try:
+            worker.join(SHORT_WATCHDOG_S)
+            self.assertFalse(worker.is_alive(), "the request outlived its deadline")
+        finally:  # a broken deadline must fail this test and still leave no child or thread behind
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+            worker.join(SHORT_WATCHDOG_S)
         self.assertEqual(answers, [{"code": codec.UNAVAILABLE, "delivered": False, "detail": "request:write_timeout"}])
         self.assertEqual(daemon.seen, [])
 

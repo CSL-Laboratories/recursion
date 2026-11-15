@@ -86,6 +86,11 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   short fault never hides a real limit on the same connection from that tenant.
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
   request only and the breaker is not told. Other engine failures are request-local too.
+- A started child is fenced on every way out of `RouteAdapter.run`: the three typed exits (deadline,
+  protocol error, engine io) fence with their own reason and answer; any other exception, `BaseException`
+  included, fences the child with the reason `unexpected` and the same exception object leaves. A fence
+  that itself fails is noted on that exception (`add_note`) and never replaces it. A driver does not need
+  to fence for itself (`tests/test_base_fence.py`).
 - Recovery: an open key always has a finite end (`reset_at` on the breaker clock, capped; otherwise a
   300 s cooldown doubling to 3600 s). Vendor `resetsAt` is Unix epoch and is translated onto that clock
   before it is stored, so a monotonic deadline clock does not turn one limit into an 8-day fence.

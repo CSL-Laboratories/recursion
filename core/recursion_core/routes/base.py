@@ -46,28 +46,54 @@ class RouteAdapter:
             argv, env = self.argv(request), self.env(request)
         except c.RouteError as err:
             return c.result(rid, err.code, detail=err.detail)
+        # STARTED CHILDREN ARE FENCED ON EVERY WAY OUT. Once the launcher has returned a process, any
+        # exception that leaves this method, BaseException included, fences that process first; the same
+        # exception object then leaves. The three typed exits below fence with their own reason and answer;
+        # everything else is fenced with UNEXPECTED_FENCE and raised. A fence that itself fails never
+        # replaces the exception: it is noted on it. What this method cannot cover is an asynchronous
+        # exception (a signal handler's) delivered between the launcher's return and the store into
+        # ``process``, or inside this handler before the fence has run; the process then exists only in the
+        # launcher's own record of the run (daemon/launcher.py publishes it with RunContext.launched).
+        process = None
+        fenced = False
         try:
-            process = self._launcher(argv, env=env, shell=False)
-        except c.RouteError as err:
-            # The launcher's own typed refusal (for example the child-environment policy refusing a
-            # value). Nothing was started, so this is a refusal before launch, not an engine fault.
-            return c.result(rid, err.code, detail=err.detail)
-        except OSError as err:
-            return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
-        events: list[dict] = []
-        try:
-            return self.drive(process, request, deadline_at, events)
-        except Deadline:
-            process.fence("deadline")  # fenced for this request only; the breaker never hears of it
-            return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
-        except _Protocol as err:
-            process.fence("protocol_error")
-            return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
-        except OSError as err:
-            # A child that exits before the request is written raises BrokenPipeError. That stays a
-            # typed result, and the process is fenced, instead of escaping the route boundary.
-            process.fence("io_error")
-            return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+            try:
+                process = self._launcher(argv, env=env, shell=False)
+            except c.RouteError as err:
+                # The launcher's own typed refusal (for example the child-environment policy refusing a
+                # value). Nothing was started, so this is a refusal before launch, not an engine fault.
+                return c.result(rid, err.code, detail=err.detail)
+            except OSError as err:
+                return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
+            events: list[dict] = []
+            try:
+                return self.drive(process, request, deadline_at, events)
+            except Deadline:
+                process.fence("deadline")  # fenced for this request only; the breaker never hears of it
+                fenced = True
+                return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
+            except _Protocol as err:
+                process.fence("protocol_error")
+                fenced = True
+                return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
+            except OSError as err:
+                # A child that exits before the request is written raises BrokenPipeError. That stays a
+                # typed result, and the process is fenced, instead of escaping the route boundary.
+                process.fence("io_error")
+                fenced = True
+                return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+        except BaseException as err:
+            # Inline, not a helper: a helper's entry is one more point where an interruption could land
+            # before the fence.
+            if process is not None and not fenced:
+                try:
+                    process.fence(UNEXPECTED_FENCE)
+                except BaseException as fence_err:  # noqa: BLE001 - the exception that reached here is the one that leaves
+                    try:
+                        err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
+                    except BaseException:  # noqa: BLE001 - an exception that takes no note still leaves unchanged
+                        pass
+            raise
 
     # -- subclass hooks -----------------------------------------------------------------------
     def argv(self, request: dict) -> list[str]:
@@ -120,6 +146,11 @@ class RouteAdapter:
 
 class _Protocol(Exception):
     pass
+
+
+# The fence reason for a started child whose run leaves ``RouteAdapter.run`` by an exception that none of
+# the typed exits answers (the same word lane ENGINE-E5's one-shot adapter uses for its own copy of the loop).
+UNEXPECTED_FENCE = "unexpected"
 
 
 def scalar(value: object) -> object:

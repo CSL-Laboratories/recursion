@@ -1,0 +1,12 @@
+{
+  "created_at": "2026-11-14T09:00:09.000Z",
+  "delivery": "next_turn",
+  "delivery_id": null,
+  "item_id": "qi-0000000000000000000000000000000f",
+  "order": 3,
+  "revision": 1,
+  "session_id": "ses-00000000000000000000000000000002",
+  "state": "cancelled",
+  "text": "Never mind.",
+  "turn_id": null
+}

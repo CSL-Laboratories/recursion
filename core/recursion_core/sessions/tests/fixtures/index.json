@@ -1,0 +1,121 @@
+{
+  "model": "Claude Opus 5.5 (claude-opus-5-5), lane SESSIONS",
+  "about": "Records lane SESSIONS writes, made by make_fixtures.py from one scenario; each validates against the schema named (SPINE's, #368).",
+  "fixtures": [
+    {
+      "file": "session.v1/s01-a-new-session-is-idle.json",
+      "schema": "session.v1.json",
+      "shows": "session.start with no prompt: a root session, idle, with no turn and no unit, at revision 1."
+    },
+    {
+      "file": "session.v1/s02-a-turn-dispatched-and-not-yet-taken.json",
+      "schema": "session.v1.json",
+      "shows": "session.start with a prompt: the turn is committed queued with its run already bound, and the session is live with a worker the daemon has not yet seen alive. Nothing has been written to an engine."
+    },
+    {
+      "file": "session.v1/s03-the-engine-took-the-input.json",
+      "schema": "session.v1.json",
+      "shows": "The engine's typed acceptance of the input arrived: the turn is running and the worker is alive."
+    },
+    {
+      "file": "queue.item.v1/q01-a-steer-queued.json",
+      "schema": "queue.item.v1.json",
+      "shows": "session.steer during a running turn: queued, first in the order, with no delivery yet."
+    },
+    {
+      "file": "queue.item.v1/q02-a-steer-delivering-into-the-turn-in-progress.json",
+      "schema": "queue.item.v1.json",
+      "shows": "The steer's delivery began: delivering, with its delivery id, written into the turn in progress."
+    },
+    {
+      "file": "queue.item.v1/b01-the-binding-of-a-mid-turn-steer.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "shows": "The private binding committed with the steer's delivering, before the write: aimed at the turn in progress."
+    },
+    {
+      "file": "queue.item.v1/q03-a-steer-delivered-into-the-turn-in-progress.json",
+      "schema": "queue.item.v1.json",
+      "shows": "The engine took the steer mid-turn: delivered, carrying the turn it went into."
+    },
+    {
+      "file": "queue.item.v1/q04-a-message-for-the-next-turn-edited-once.json",
+      "schema": "queue.item.v1.json",
+      "shows": "session.queue, then queue.update while it is still queued: its revision rose to 2."
+    },
+    {
+      "file": "session.v1/s04-idle-with-a-worker-waiting.json",
+      "schema": "session.v1.json",
+      "shows": "The engine yielded and waits for the user; the worker that takes another message is still alive."
+    },
+    {
+      "file": "queue.item.v1/q05-a-message-delivering-as-the-next-turn.json",
+      "schema": "queue.item.v1.json",
+      "shows": "At the turn's end the message began the next turn: delivering, with the new turn allocated in its binding."
+    },
+    {
+      "file": "queue.item.v1/b02-the-binding-of-a-next-turn-message.json",
+      "schema": "queue.item.v1.json#/$defs/delivery_binding",
+      "shows": "The binding of a message that begins a new turn: the turn id was allocated before the dispatch."
+    },
+    {
+      "file": "queue.item.v1/q06-a-message-delivered-as-a-new-turn.json",
+      "schema": "queue.item.v1.json",
+      "shows": "The engine took it as a new turn: delivered, carrying the turn it began."
+    },
+    {
+      "file": "session.v1/s05-a-stop-pending.json",
+      "schema": "session.v1.json",
+      "shows": "A Stop of the session's unit was asked and answered pending: stop_pending, the turn still open, the worker kept. No new turn starts while it lasts."
+    },
+    {
+      "file": "session.v1/s06-idle-after-the-stop-with-its-turn-stopped.json",
+      "schema": "session.v1.json",
+      "shows": "The Stop was confirmed: the turn in progress is stopped and the session is idle with no unit."
+    },
+    {
+      "file": "queue.item.v1/q07-cancelled.json",
+      "schema": "queue.item.v1.json",
+      "shows": "queue.cancel while it was still queued: cancelled, never delivered."
+    },
+    {
+      "file": "session.v1/s07-a-turn-whose-unit-could-not-start.json",
+      "schema": "session.v1.json",
+      "shows": "The launch definitely did not start: the turn failed with the refusal's code and the session is idle."
+    },
+    {
+      "file": "queue.item.v1/q08-outcome-unknown-after-a-restart.json",
+      "schema": "queue.item.v1.json",
+      "shows": "The daemon stopped after delivering was committed and before anything was written: at the restart its outcome is unknown, and it is never sent again."
+    },
+    {
+      "file": "event.v1/e-steer-queued.json",
+      "schema": "event.v1.json#/$defs/steer.queued",
+      "shows": "The payload of the first steer.queued this scenario appended (filed under session ses-00000000000000000000000000000002, source core, trust trusted)."
+    },
+    {
+      "file": "event.v1/e-steer-sent.json",
+      "schema": "event.v1.json#/$defs/steer.sent",
+      "shows": "The payload of the first steer.sent this scenario appended (filed under session ses-00000000000000000000000000000002, source core, trust trusted)."
+    },
+    {
+      "file": "event.v1/e-input-accepted.json",
+      "schema": "event.v1.json#/$defs/input.accepted",
+      "shows": "The payload of the first input.accepted this scenario appended (filed under session ses-00000000000000000000000000000002, source engine, trust untrusted)."
+    },
+    {
+      "file": "event.v1/e-turn-started.json",
+      "schema": "event.v1.json#/$defs/turn.started",
+      "shows": "The payload of the first turn.started this scenario appended (filed under session ses-00000000000000000000000000000002, source core, trust untrusted)."
+    },
+    {
+      "file": "event.v1/e-turn-ended.json",
+      "schema": "event.v1.json#/$defs/turn.ended",
+      "shows": "The payload of the first turn.ended this scenario appended (filed under session ses-00000000000000000000000000000002, source core, trust untrusted)."
+    },
+    {
+      "file": "event.v1/e-effect-outcome_unknown.json",
+      "schema": "event.v1.json#/$defs/effect.outcome_unknown",
+      "shows": "The payload of the first effect.outcome_unknown this scenario appended (filed under session ses-00000000000000000000000000000010, source core, trust trusted)."
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "item_id": "qi-00000000000000000000000000000007",
+  "session_id": "ses-00000000000000000000000000000002",
+  "order": 1,
+  "text": "Skip the docs.",
+  "revision": 1,
+  "delivery": "steer",
+  "state": "queued",
+  "delivery_id": null,
+  "turn_id": null,
+  "created_at": "2026-11-14T09:00:04.000Z"
+}

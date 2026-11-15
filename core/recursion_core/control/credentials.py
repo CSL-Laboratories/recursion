@@ -301,6 +301,12 @@ class CredentialStore:
             raise CredentialStoreError("the store path holds a NUL character")
         if type(lock_timeout_s) not in (int, float) or not 0 < lock_timeout_s < float("inf"):
             raise CredentialStoreError("lock_timeout_s must be a positive number of seconds")
+        # Refused here, not later as an untyped error out of verify or mint (round 5 of #385, DeepSeek F4).
+        if not callable(wall) or (emit is not None and not callable(emit)):
+            raise CredentialStoreError("wall and emit must be callable")
+        if limit is not None and not (callable(getattr(limit, "blocked", None))
+                                      and callable(getattr(limit, "failed", None))):
+            raise CredentialStoreError("limit must have blocked and failed, like FailedAuthLimit")
         self._path, self._emit, self._wall = path, emit, wall
         self._lock_path = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.lock")
         self._lock_timeout_s = float(lock_timeout_s)

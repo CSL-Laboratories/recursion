@@ -177,6 +177,15 @@ def _get(mapping, key):
         return None
 
 
+def _exact(value):
+    """``value`` if it is exactly a ``str``, else None. A principal's kind and id decide what it holds, so a
+    ``str`` subclass, whose own comparison or hash could answer anything, counts as no kind and no id (the
+    round-5 read of #385 by DeepSeek: F1, a kind comparing equal to ``owner`` held all four scopes; F2, an id
+    comparing equal to ``page`` held the page's)."""
+
+    return value if type(value) is str else None
+
+
 def _attr(principal, name: str, default):
     """A principal's attribute; ``default`` when it is missing or reading it raises (it then counts as unknown)."""
 
@@ -242,7 +251,7 @@ class Authorizer:
         A credential store that cannot be read raises here (``CredentialStoreError``, or whatever the store
         raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``."""
 
-        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
+        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
         try:
             # Each class's own dictionary first, read past any metaclass: a metaclass answering __dict__ hid a
             # declaration from getattr_static (round 7, Sol 1); then the instance and the metaclass as before.
@@ -298,7 +307,7 @@ class Authorizer:
         scope = self._scope_of(method) if type(method) is str else None
         if scope is None:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")
-        if not isinstance(scope, str) or scope not in ALL_SCOPES:
+        if type(scope) is not str or scope not in ALL_SCOPES:   # exactly a str (round 5 of #385, DeepSeek F3)
             return (SCOPE_REFUSED, "scope_unknown")   # a table row naming no known scope opens nothing
         if scope not in held:
             return (SCOPE_REFUSED, f"needs_{scope}")
@@ -310,7 +319,7 @@ class Authorizer:
         return None
 
     def _stop(self, principal, params) -> Verdict:
-        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
+        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
         if kind in ("owner", "device"):
             return None    # with run: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):

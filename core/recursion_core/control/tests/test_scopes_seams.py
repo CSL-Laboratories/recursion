@@ -538,6 +538,87 @@ class RoundFourSeamsTest(unittest.TestCase):
                 self.assertIsNone(hooks.authorize(H.OWNER, "run.list", {}))
 
 
+class RoundFiveSeamsTest(unittest.TestCase):
+    """The round-5 reads of #385. Codex GPT-6.1 Sol, 1 (coverage): reader selection relaxed to cls.__mro__ or
+    base.__dict__ left every test green. DeepSeek V4.1 Flash: F1 (STRICT), a kind that is a str subclass comparing
+    equal to owner or internal held all four scopes; F2, an id comparing equal to page held the page's; F3, a table
+    row whose scope is such a subclass opened a call; F4, a store built with a wrong limit or wall raised untyped."""
+
+    class Liar(str):
+        """Compares equal to anything; hashes as the text it is told to pose as."""
+
+        def __new__(cls, text, poses_as):
+            made = super().__new__(cls, text)
+            made.poses_as = poses_as
+            return made
+
+        def __eq__(self, other):
+            return True
+
+        def __ne__(self, other):
+            return False
+
+        def __hash__(self):
+            return hash(self.poses_as)
+
+    def test_special_lookup_never_asks_the_metaclass_for_mro_or_dict(self) -> None:
+        # Sol's test, as written in its required-coverage.patch.
+        seen = []
+
+        class Meta(type):
+            def __getattribute__(cls, name):
+                if name in ("__mro__", "__dict__"):
+                    seen.append(name)
+                return type.__getattribute__(cls, name)
+
+        def reader(instance, name):
+            return "fixture-marker"
+
+        class Parent(metaclass=Meta):
+            __getattribute__ = reader
+
+        class Child(Parent):
+            pass
+
+        self.assertIs(scopes._special(Child, "__getattribute__"), reader)
+        self.assertEqual(seen, [], "reader selection must use type's own MRO and dictionary descriptors")
+
+    def test_a_kind_or_id_that_is_not_exactly_a_str_holds_nothing(self) -> None:
+        Liar = self.Liar
+        as_registered = composed()
+        authorizer = scopes.Authorizer(scope_of=scopes.table_scope)
+        for kind, principal_id in ((Liar("plugin", "owner"), "local"), (Liar("plugin", "internal"), "quota"),
+                                   ("device", Liar("phone-1", "page")), (Liar("device", "device"), "page")):
+            principal = Granted(kind, principal_id)
+            with self.subTest(kind=str.__str__(kind), id=str.__str__(principal_id)):
+                self.assertEqual(authorizer.held(principal), frozenset())
+                self.assertEqual(as_registered.authorize(principal, "run.list", {}), refused("needs_read"))
+                self.assertEqual(as_registered.authorize(principal, "run.stop", {"run_id": "run-host"}),
+                                 refused("needs_run"))
+        self.assertIsNone(as_registered.authorize(H.OWNER, "workspace.publish", {}))    # exact kinds still hold
+        self.assertIsNone(as_registered.authorize(H.DEVICE, "approval.list", {}))
+
+    def test_a_table_row_whose_scope_is_not_exactly_a_str_opens_nothing(self) -> None:
+        authorizer = scopes.Authorizer(scope_of=lambda method: self.Liar("read", "read"))
+        for principal in (H.DEVICE, H.OWNER):
+            with self.subTest(kind=principal.kind):
+                self.assertEqual(authorizer(principal, "workspace.publish", {}), ("scope_refused", "scope_unknown"))
+
+    @NEEDS_POSIX
+    def test_a_store_built_with_a_wrong_limit_wall_or_emit_is_refused_at_once(self) -> None:
+        from recursion_core.control.credentials import CredentialStoreError, FailedAuthLimit
+        base = tempfile.mkdtemp(prefix="scopes-r5-")
+        self.addCleanup(shutil.rmtree, base, True)
+        path = os.path.join(base, "state", "credentials.json")
+        for kwargs in ({"limit": 5}, {"limit": object()}, {"wall": "x"}, {"emit": 5}):
+            with self.subTest(**{key: repr(value) for key, value in kwargs.items()}):
+                with self.assertRaises(CredentialStoreError):
+                    CredentialStore(path, **kwargs)
+        store = CredentialStore(path, limit=FailedAuthLimit(max_failures=3), wall=lambda: 1000.0, emit=None)
+        token, _ = store.mint("plugin", "p1", ["read"])
+        self.assertEqual(store.verify(token, peer="p").id, "p1")
+
+
 @NEEDS_POSIX
 class BearerWithoutGrantTest(unittest.TestCase):
     """Until SPINE's Principal carries ``grant``, a device, session or agent principal holds nothing, live grants

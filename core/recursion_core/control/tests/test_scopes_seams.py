@@ -318,6 +318,9 @@ class DetachWhileCallingTest(unittest.TestCase):
         self.assertLessEqual({str(a) for a in answers}, {"None", str(refused("needs_read"))})
 
 
+_NO_FALLBACK = object()
+
+
 class _UnreadableGrant:
     """A principal whose grant context cannot be read (Sol's round-2 C2 on #385): not a principal without one."""
     kind, id, in_run_unit = "plugin", "plugin.alpha", False
@@ -352,6 +355,46 @@ class UnreadableGrantThroughS5Test(unittest.TestCase):
         as_registered = composed()
         self.assertIsNone(as_registered.authorize(H.OWNER, "run.list", {}))
         self.assertEqual(as_registered.authorize(_UnreadableOwnerGrant(), "run.list", {}), refused("needs_read"))
+
+    def test_a_declared_grant_failing_with_attributeerror_holds_nothing_through_s5(self) -> None:
+        # The round-3 reads of #385 (Astra 1, Sol 1, STRICT): getattr(..., None) took the accessor's AttributeError
+        # for an absent grant, and a __getattr__ fallback could hand back a normal value in its place.
+        base = tempfile.mkdtemp(prefix="scopes-attributeerror-")
+        self.addCleanup(shutil.rmtree, base, True)
+        state = os.path.join(base, "state")
+        os.mkdir(state, 0o700)
+        store = CredentialStore(os.path.join(state, "control", "credentials.json"))
+        _, grant = store.mint("plugin", "plugin.alpha", ["read", "run"])
+        hooks, service = with_service()
+        service.start(H.ServiceContext(state_dir=state, control_registry=Registry()))
+        as_registered = composed()
+
+        def principal(kind, principal_id, fallback):
+            class Declared:
+                in_run_unit = False
+
+                def __init__(self):
+                    self.kind, self.id = kind, principal_id
+
+                @property
+                def grant(self):
+                    raise AttributeError("the trusted grant context is unavailable")
+
+                if fallback is not _NO_FALLBACK:
+                    def __getattr__(self, name):
+                        return fallback
+
+            return Declared()
+
+        for fallback in (_NO_FALLBACK, None, grant.token_id):
+            for kind, principal_id in (("plugin", "plugin.alpha"), ("owner", "local"), ("device", "page")):
+                with self.subTest(fallback=fallback, kind=kind):
+                    self.assertEqual(hooks.authorize(principal(kind, principal_id, fallback), "run.list", {}),
+                                     refused("needs_read"))
+                    self.assertEqual(as_registered.authorize(principal(kind, principal_id, fallback), "run.list", {}),
+                                     refused("needs_read"))
+        self.assertIsNone(hooks.authorize(H.Principal("plugin", "plugin.alpha"), "run.list", {}))   # absent grant
+        self.assertIsNone(as_registered.authorize(H.DEVICE, "approval.list", {}))                     # the page
 
 
 @NEEDS_POSIX

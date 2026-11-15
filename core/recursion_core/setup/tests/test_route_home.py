@@ -119,7 +119,7 @@ class RouteHomeTests(unittest.TestCase):
         # (review 1 of #401, Codex Astra R2): a check that ignored any one of them would fail here.
         os.makedirs(os.path.join(self.path, "nested"), 0o700)
         for folder in (self.root, self.path, os.path.join(self.path, "nested")):
-            for mode in (0o740, 0o720, 0o710, 0o704, 0o702, 0o701):
+            for mode in (0o740, 0o720, 0o710, 0o704, 0o702, 0o701, 0o750, 0o705):  # each bit alone, and two together (Sol r2)
                 with self.subTest(folder=folder, mode=oct(mode)):
                     os.chmod(folder, mode)
                     error = self.refused("route_home_untrusted", os.path.join(self.path, "nested"))
@@ -171,10 +171,50 @@ class RouteHomeTests(unittest.TestCase):
                 error = self.refused("route_home_untrusted", home)
             finally:
                 os.chmod(hidden, 0o700)
-        self.assertEqual(error.detail, "the operator's home cannot be resolved: PermissionError")
+        self.assertIn("cannot be resolved: PermissionError", error.detail)
         missing = os.path.join(self.root, "not-made-yet")  # a home that does not exist yet still counts
         with mock.patch.dict(os.environ, {"HOME": missing}):
             self.refused("route_home_is_operator_home", missing)
+
+    def test_every_identity_comparison_follows_links_fully_or_refuses(self):
+        # Round 2 of #401 (Astra 1, Sol 1): the root, the route home and the operator's home are each
+        # resolved by hand; a readlink that fails part-way refuses instead of answering.
+        link = os.path.join(self.base, "state-link")
+        os.symlink(self.state, link)
+        linked_root = os.path.join(link, "homes")
+        home_link = os.path.join(self.base, "home-link")
+        os.symlink(self.path, home_link)  # $HOME, through a link, names the route home (not made yet)
+        with mock.patch.dict(os.environ, {"HOME": home_link}):
+            self.refused("route_home_is_operator_home", self.path)
+        dangling = os.path.join(self.base, "dangling")
+        os.symlink(os.path.join(self.root, "later"), dangling)  # a link to a home not made yet
+        with mock.patch.dict(os.environ, {"HOME": dangling}):
+            self.refused("route_home_is_operator_home", os.path.join(self.root, "later"))
+        os.mkdir(os.path.join(self.root, "x"), 0o700)
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.root, "x", "..", "claude_code")}):
+            self.refused("route_home_is_operator_home", self.path)  # ".." taken from where the path is
+        real_readlink = os.readlink
+        for target in (link, home_link):
+            def failing(path, *args, **kwargs):
+                if os.fspath(path) == target:
+                    raise OSError(5, "Input/output error")
+                return real_readlink(path, *args, **kwargs)
+            with self.subTest(failing=os.path.basename(target)), mock.patch("os.readlink", side_effect=failing), \
+                    mock.patch.dict(os.environ, {"HOME": home_link}):
+                error = self.refused("route_home_untrusted", os.path.join(linked_root, "claude_code"), linked_root)
+            self.assertIn("OSError", error.detail)
+        a_file = os.path.join(self.base, "a-file")
+        with open(a_file, "wb"):
+            pass
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(a_file, "home")}):
+            self.assertIn("not a folder", self.refused("route_home_untrusted", self.path).detail)
+        loop = os.path.join(self.base, "home-loop")
+        os.symlink("home-loop", loop)
+        with mock.patch.dict(os.environ, {"HOME": loop}):
+            self.assertIn("more than 40 links", self.refused("route_home_untrusted", self.path).detail)
+        # A home two names below a folder not made yet is that deeper path, not the route home.
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.path, "deeper")}):
+            check(self.path, self.root)
 
     def test_with_no_operators_home_known_the_check_refuses_rather_than_passes(self):
         # DeepSeek F4: an empty set of homes would let any path through the operator's-home rule.

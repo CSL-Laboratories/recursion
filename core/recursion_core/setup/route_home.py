@@ -18,9 +18,12 @@ keeper of this file:
                                  group or world at all (any bit of 0o077), or cannot be looked up; a
                                  folder above the root another user could change (each root's or
                                  ours, not writable by group or world unless sticky, each link root's
-                                 or ours and followed, at most 40 links); or the operator's home is
-                                 unknown (no absolute $HOME and no password entry) or the password
-                                 database cannot be read
+                                 or ours and followed, at most 40 links); a path, the root or the
+                                 operator's home that cannot be followed to the end (a lookup or
+                                 readlink that fails other than "missing", more than 40 links, a
+                                 name below something that is not a folder); or the operator's home
+                                 is unknown (no absolute $HOME and no password entry) or the
+                                 password database cannot be read
     route_home_outside_root      path is the root itself, or not below it (a root of / has nothing below
                                  it: it is root's, never the operator's custodied root)
     route_home_is_operator_home  path, or the root, is the operator's own home (the password
@@ -35,8 +38,9 @@ A route home that does not exist yet is accepted when everything above it passes
 root is ``route_home_missing``): it is made once, owner-only, before the first launch (by
 ``recursiond install`` or ``provision``, lane INSTALL), not by the check's caller on the way. A route home inside the operator's home is
 accepted (the daemon's state folder is ``~/.local/state/recursion``), only the home itself is
-refused. Nothing is created or opened: the file system is asked through ``lstat``, ``readlink`` and
-``realpath``, and the password database through ``pwd.getpwuid`` for this user's home. POSIX ACLs
+refused. Nothing is created or opened: the file system is asked through ``lstat`` and ``readlink``
+only (links are followed by hand, so a lookup that fails part-way is a refusal, never a partial
+answer), and the password database through ``pwd.getpwuid`` for this user's home. POSIX ACLs
 are not read. The answer holds for the moment of the check: code running as the operator can change
 any of it afterwards, before ``private_dir`` makes the folder too (the B17 limit in
 ``plugin_security/authority.py``), which no path check can close. Linux only, as the launcher is.
@@ -70,7 +74,7 @@ def check(path, root) -> None:
         raise RouteHomeRefused("route_home_outside_root", f"{path} is not below {root}")
     _check_above(root)
     homes = _operator_homes()
-    if os.path.realpath(root) in homes:
+    if _resolve(root) in homes:
         raise RouteHomeRefused("route_home_is_operator_home", "the root is the operator's home")
     _owner_only(root, _lstat(root, missing_ok=False))
     names = path[len(root) + 1:].split("/")
@@ -81,7 +85,7 @@ def check(path, root) -> None:
         if info is None:
             break  # the route home itself, not made yet
         _owner_only(current, info)
-    if os.path.realpath(path) in homes:
+    if _resolve(path) in homes:
         raise RouteHomeRefused("route_home_is_operator_home", path)
 
 
@@ -156,10 +160,46 @@ def _check_above(root: str) -> None:
                 current = "/"
             names[:0] = [part for part in target.split("/") if part]
             continue
-        if not stat.S_ISDIR(info.st_mode):
-            raise RouteHomeRefused("route_home_untrusted", f"{candidate} is not a folder")
+        # Not a folder: the next name cannot be under it, and _resolve(root) refuses it so.
         _trusted_folder(candidate, info, trusted)
         current = candidate
+
+
+def _resolve(path: str) -> str:
+    """``path`` with every link followed as the kernel would, ``.`` and ``..`` taken from where the
+    resolution is; from the first name that does not exist, the rest is kept as written (a folder
+    not made yet still has a name to compare). Any other failure refuses ``route_home_untrusted``:
+    a resolution that stopped part-way must never stand in for a path's identity."""
+
+    names = [name for name in path.split("/") if name]
+    current, links = "/", 0
+    while names:
+        name = names.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            current = os.path.dirname(current)  # current holds no link, so this is its parent
+            continue
+        candidate = os.path.join(current, name)
+        try:
+            info = os.lstat(candidate)
+            if stat.S_ISLNK(info.st_mode):
+                links += 1
+                if links > _MAX_LINKS:
+                    raise RouteHomeRefused("route_home_untrusted", f"more than {_MAX_LINKS} links in {path}")
+                target = os.readlink(candidate)
+                if target.startswith("/"):
+                    current = "/"
+                names[:0] = [part for part in target.split("/") if part]
+                continue
+        except FileNotFoundError:  # not made yet (or removed while being followed)
+            return os.path.join(candidate, *(n for n in names if n != "."))
+        except OSError as exc:
+            raise RouteHomeRefused("route_home_untrusted", f"{candidate} cannot be resolved: {type(exc).__name__}") from None
+        if names and not stat.S_ISDIR(info.st_mode):
+            raise RouteHomeRefused("route_home_untrusted", f"{candidate} is not a folder")
+        current = candidate
+    return current
 
 
 def _trusted_folder(path: str, info: os.stat_result, trusted: tuple) -> None:
@@ -186,17 +226,7 @@ def _operator_homes() -> set[str]:
     except OSError as exc:  # the name service (NSS, LDAP) did not answer
         raise RouteHomeRefused("route_home_untrusted",
                                f"the password database cannot be read: {type(exc).__name__}") from None
-    found = set()
-    for home in homes:
-        if not (isinstance(home, str) and home.startswith("/")):
-            continue
-        try:  # strict: a resolution that stops part-way must not stand in for the home
-            found.add(os.path.realpath(home, strict=True))
-        except FileNotFoundError:  # no such folder yet: its name is all there is to compare
-            found.add(os.path.realpath(home))
-        except OSError as exc:  # a folder on the way that cannot be searched, a loop, an I/O error
-            raise RouteHomeRefused("route_home_untrusted",
-                                   f"the operator's home cannot be resolved: {type(exc).__name__}") from None
+    found = {_resolve(home) for home in homes if isinstance(home, str) and home.startswith("/")}
     if not found:
         raise RouteHomeRefused("route_home_untrusted", "the operator's home is unknown: no absolute HOME and "
                                "no password entry")

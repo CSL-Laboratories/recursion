@@ -18,6 +18,7 @@ block; a network namespace belongs to the launch sandbox (B6), not this check.
 
 from __future__ import annotations
 
+import math
 import os
 import select
 import shutil
@@ -136,8 +137,20 @@ class _CappedReader(threading.Thread):
 _POLL_S = 0.01
 
 
+def check_timeout(spec: EngineSpec, timeout: object) -> None:
+    """A probe timeout is an ``int`` or ``float`` (not a bool), finite and above zero.
+
+    A NaN deadline is never reached and an infinite one never ends, so either would let a probe that
+    never exits hold the check for ever: both are refused before anything runs.
+    """
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise LaunchRefused("version_probe_failed", spec.engine,
+                            f"probe timeout must be a finite number of seconds above 0, not {timeout!r}")
+
+
 def run_version_probe(spec: EngineSpec, realpath: str, timeout: float = PROBE_TIMEOUT_S) -> ProbeResult:
     """Run ``realpath --version`` under the zero-egress rules above."""
+    check_timeout(spec, timeout)
     home = tempfile.mkdtemp(prefix="r2a-probe-")
     try:
         t0 = time.monotonic()

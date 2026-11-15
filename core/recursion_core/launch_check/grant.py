@@ -75,7 +75,7 @@ from recursion_core.launch_check.floors import (
     EngineSpec, check_floors, check_identity, check_self_named, other_engine_named, parse_version, spec_for,
     with_note,
 )
-from recursion_core.launch_check.probe import PROBE_TIMEOUT_S, Probe, run_version_probe
+from recursion_core.launch_check.probe import PROBE_TIMEOUT_S, Probe, ProbeResult, check_timeout, run_version_probe
 from recursion_core.launch_check.refusals import REFUSAL_CODES_VERSION, LaunchRefused
 
 # Spawn caps. Linux refuses one string over 128 KiB (MAX_ARG_STRLEN); the total cap keeps
@@ -214,11 +214,36 @@ def _check_only_launcher(g: Grant) -> bool:
     return g.check_only is True
 
 
+def _probe_result(spec: EngineSpec, probe: Probe, real: str, timeout: float) -> ProbeResult:
+    """Run the probe and take only a well-formed answer: anything else is a typed refusal, never a raise.
+
+    A probe (the real one, or one a caller injects) that raises, or answers something other than a
+    ``ProbeResult`` holding exactly a ``str`` line and an ``int`` exit code, is ``version_probe_failed``,
+    so one engine's bad probe cannot end ``launch_check()`` for every engine.
+    """
+    try:
+        result = probe(spec, real, timeout)
+    except LaunchRefused:
+        raise
+    except Exception as e:  # noqa: BLE001 - a probe's failure is this engine's refusal, nothing more
+        raise LaunchRefused("version_probe_failed", spec.engine, f"the probe raised {e.__class__.__name__}") from None
+    if type(result) is not ProbeResult or type(result.raw) is not str or type(result.exit_code) is not int:
+        raise LaunchRefused(
+            "version_probe_failed", spec.engine, f"the probe answered a malformed result ({type(result).__name__})")
+    return result
+
+
 def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Probe | None = None) -> Grant:
-    """Pin one engine. Refuses with a typed code on every failure; never returns after one."""
+    """Pin one engine. Refuses with a typed code on every failure; never returns after one.
+
+    ``engine`` and ``path`` must be exactly ``str`` (a subclass can compare, hash or print as something
+    it does not hold), and ``timeout`` a finite number of seconds above zero.
+    """
     spec = spec_for(engine)
-    if not isinstance(path, str) or not os.path.isabs(path):
-        raise LaunchRefused("path_not_absolute", spec.engine, repr(path))
+    if type(path) is not str or not os.path.isabs(path):
+        shown = repr(path) if type(path) is str else f"<{type(path).__name__}>"
+        raise LaunchRefused("path_not_absolute", spec.engine, shown)
+    check_timeout(spec, timeout)
     if stem(path) not in spec.names:
         if _pinned_windows_launcher(spec, path):  # granted only bound to a pin; else pin_mismatch
             return _grant_pinned(spec, path)
@@ -237,7 +262,7 @@ def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Pr
     digest, size = _hash(spec, real)
     probe_digest = digest if probe_real == real else _hash(spec, probe_real)[0]
 
-    result = (probe or run_version_probe)(spec, probe_real, timeout)
+    result = _probe_result(spec, probe or run_version_probe, probe_real, timeout)
 
     if _hash(spec, real) != (digest, size) or (probe_real != real and _hash(spec, probe_real)[0] != probe_digest):
         raise LaunchRefused("binary_changed", spec.engine, "digest changed during the version probe")
@@ -397,15 +422,16 @@ def verify(g: Grant) -> None:
 
 def _spawn_bytes(spec: EngineSpec, argv: Sequence[str], env: Mapping[str, str]) -> int:
     total = 0
+    # Exactly str, never a subclass: a subclass can lie about its own bytes (``encode``) or its NULs.
     for a in argv:
-        if not isinstance(a, str) or "\x00" in a:
+        if type(a) is not str or "\x00" in a:
             raise LaunchRefused("spawn_too_large", spec.engine, "argv item is not NUL-free text")
         n = len(a.encode("utf-8", "surrogateescape")) + 1
         if n > MAX_ARG_BYTES:
             raise LaunchRefused("spawn_too_large", spec.engine, f"one argv item is {n} bytes > {MAX_ARG_BYTES}")
         total += n
     for k, v in env.items():
-        if not isinstance(k, str) or not isinstance(v, str) or "\x00" in k + v or "=" in k or not k:
+        if type(k) is not str or type(v) is not str or "\x00" in k + v or "=" in k or not k:
             raise LaunchRefused("spawn_too_large", spec.engine, "env item is not NUL-free text")
         n = len(f"{k}={v}".encode("utf-8", "surrogateescape")) + 1
         if n > MAX_ARG_BYTES:
@@ -476,8 +502,8 @@ def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str]) -> int:
     if not argv:
         raise LaunchRefused("argv_empty", spec.engine, "")
     a0 = argv[0]
-    if not isinstance(a0, str):
-        raise LaunchRefused("argv0_mismatch", spec.engine, "argv[0] is not text")
+    if type(a0) is not str:  # a str subclass can compare equal to an engine name it does not hold
+        raise LaunchRefused("argv0_mismatch", spec.engine, "argv[0] is not exactly text")
     if is_wrapper_name(a0):
         raise LaunchRefused("wrapper_refused", spec.engine, f"argv[0] {a0!r} is a wrapper shape")
     if a0 not in spec.names:

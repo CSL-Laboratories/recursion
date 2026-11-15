@@ -27,8 +27,11 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   otherwise the result is "not grantable". A pinned route (pi, hermes, cursor,
   antigravity) is the exception: its first PATH hit is offered whatever its kind, because
   `grant` decides it against the pin table and runs nothing. On Windows each PATH directory
-  is searched for the bare name and `.exe`, and for a pinned route only also `.cmd` then
-  `.ps1`; elsewhere only the bare name is searched.
+  is searched for `.exe`, for a pinned route only also `.cmd` then `.ps1`, and the bare name
+  last (Windows resolves a command through PATHEXT, so npm's extensionless sh shim must not
+  hide the launcher beside it); elsewhere only the bare name is searched. One Codex install
+  seen from two bases (a symlinked optional-dependency folder) is one candidate; two
+  different native files stay ambiguous and fail closed.
 - `grant(engine, path)`: the only issuer of a `Grant`. In order: engine in the table
   (`engine_unknown`); absolute path (`path_not_absolute`); file stem is one of the engine's
   names (`name_mismatch`, or `wrapper_refused` for an interpreter or wrapper name); the path
@@ -195,9 +198,15 @@ the same as in 1.3.0 and 1.4.0).
 | 2.1.321 | `latest`, `next` | passes floors | [`claude-2.1.321-help.txt`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/claude-2.1.321-help.txt) (identical to 2.1.314) | unknown, refused |
 
 npm `stable` is 2.1.311, below the 2.1.314 functional floor, so a user who installs the
-`stable` channel is refused `version_refused` here. Measured 2026-11-09 12:17 PST: this PR's
-`grant("claude_code", …)` on the real npm binaries refused 2.1.311 (`version_refused`) and
-granted 2.1.319 and 2.1.321 (version lines `2.1.319 (Claude Code)`, `2.1.321 (Claude Code)`).
+`stable` channel is refused `version_refused` here. Recorded 2026-11-09 12:17 PST:
+`grant("claude_code", …)` refused 2.1.311 (`version_refused`) and granted 2.1.319 and 2.1.321
+(version lines `2.1.319 (Claude Code)`, `2.1.321 (Claude Code)`). Correction (lane
+LAUNCH-CHECK, answering the #323 review of 7c15fa97, Nov 9 1:56 PM): that result holds for a
+native binary printing those lines, not for the file the npm package publishes as its bin.
+`package/bin/claude.exe` in `@anthropic-ai/claude-code` is a 500-byte stub until the package's
+install script copies the platform binary over it; that stub is neither a script nor native,
+so `grant()` refuses it `wrapper_refused` and never probes it. Which native file the 12:17 run
+granted is not recorded here.
 "Passes floors" for the other rows is `check_floors` on the version line only. A build that
 passes these floors is still refused on the Claude subscription route by #336 until its help
 settles the `--bare` question; that pick is Lucas's.
@@ -346,10 +355,13 @@ Sources: Cursor from `https://cursor.com/install?win32=true`; Antigravity CLI fr
 
 Lucas's owner call of 2026-11-09: "Yes, accept pinned .cmd and
 .ps1 launchers on Windows, bound to the pin." So on Windows, for pinned routes only,
-`detect.path_hits` tries the bare name, `.exe`, `.cmd` and `.ps1`, in that order, in each
-PATH directory (the first hit of each name still counts). That order is why Cursor has a
-`.cmd` row (`.cmd` is tried before `.ps1`) and Pi has a bare `pi` row (the bare name is
-tried first). `grant()` accepts a `<name>.cmd`
+`detect.path_hits` tries `.exe`, `.cmd`, `.ps1` and then the bare name, in that order, in
+each PATH directory (the first hit of each name still counts). The bare name was tried first
+until lane LAUNCH-CHECK's first slice (#323, Devin r4521280830: npm's extensionless sh shim
+beside a pinned `pi.cmd` was offered, and refused, instead of the launcher Windows runs). The
+order is why Cursor has a `.cmd` row (`.cmd` is tried before `.ps1`); Pi's bare `pi` row,
+recorded when the bare name came first, is now reached only where no `.exe`, `.cmd` or
+`.ps1` sits beside it. `grant()` accepts a `<name>.cmd`
 or `<name>.ps1` launcher only when its SHA-256 matches a recorded launcher pin for that
 engine and the pinned tree matches; any other `.cmd`/`.ps1` launcher on a pinned route
 (unpinned, or one byte changed) is `pin_mismatch`, and a byte changed after the grant is
@@ -506,7 +518,13 @@ this package ships.
   process and IPC edge; the MAC stops forged or edited grant objects reaching a plan.
 - A swap between `exec_argv()` and the exec itself is still possible (ledger CX-1402).
   Holding the file open across the spawn (#1087 section 6.4, Windows spike) or `fexecve`
-  on Linux is follow-up work.
+  on Linux is follow-up work; `DECODER.md` designs the child-side re-check that narrows it.
+- The grant hashes a binary of any size, and a whole tree on every plan use. A huge or
+  sparse file at a granted path makes the check slow, not wrong; no size cap is set (open
+  question in the lane's notes).
+- A binary whose output depends on something other than its bytes (time, its arguments'
+  order, the environment the probe gives it) is identified by its bytes only: the version is
+  read once at the grant and a launch re-checks the digest, never the version line.
 - A pin covers the launcher and the package tree or binary, nothing else. An interpreter
   outside the tree is never hashed (post-Nov 11 work): a pin that records one refuses every
   launch (`interpreter_unpinned`). That record is a statement by whoever measures the pin;
@@ -562,6 +580,27 @@ this package ships.
   launcher that is a script and does not resolve to a `.cmd`/`.ps1` name is executed by its
   realpath, so its shebang interpreter runs; that is the existing Linux `launcher+tree`
   behaviour.
+
+## Lane LAUNCH-CHECK, first slice (Nov 15, 2026)
+
+Called by nothing, like the rest of this package. What it adds:
+
+- `hooks.py`, the registrant `recursion_core.launch_check.hooks` that the seams (#369/#370)
+  will import. It registers nothing until they merge; its docstring says what it will set
+  (the single-valued `launch_check` hook, S10).
+- `DECODER.md`, the design of the child-side decoder the launch envelope needs (no code).
+- `tests/fake_binaries.py`: fake-binary hash fixtures (bytes, recorded SHA-256, size, kind;
+  a fixture whose record does not match its bytes is refused) and a version-line table per
+  engine with the parse and the grant outcome each line must reach.
+- Answers to the open review findings of #323 and #335 inside this package, and to its own
+  break-it pass: the Windows search order above; one Codex install seen twice; a `name` key
+  given twice in a `package.json`; a security floor that names a commit (a build of the
+  floor's own day is below it unless it is that commit); a version line that is not
+  printable text (control characters, U+FFFD) is `version_unparsed`; `engine`, `path`,
+  argv items and env names and values must be exactly `str`; a probe timeout must be a
+  finite number of seconds above 0 (a NaN deadline is never reached); and a probe that
+  raises or answers a malformed result is `version_probe_failed` for its engine instead of
+  ending `launch_check()` for all of them.
 
 ## Tests
 

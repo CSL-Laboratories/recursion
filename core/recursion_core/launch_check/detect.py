@@ -8,7 +8,7 @@ any other script, shim or non-native target is reported and left without a candi
 so ``grant()`` is never offered a wrapper. The exception is a pinned route (pi, hermes,
 cursor, antigravity): its first PATH hit is offered whatever its kind, because ``grant()``
 decides it against the pin table and runs nothing. On Windows a pinned route's name is also
-searched as ``.cmd`` and ``.ps1`` (after the bare name and ``.exe``); other engines are not.
+searched as ``.cmd`` and ``.ps1`` (after ``.exe``; the bare name comes last); other engines are not.
 A ``hermes`` hit in the unofficial npm ``hermes-agent`` bridge is named and never offered,
 pinned route or not (B27, CSL-772).
 """
@@ -78,13 +78,14 @@ def codex_vendored_binary(js_realpath: str) -> str | None:
             bases += [os.path.join(parent, d) for d in sorted(os.listdir(parent)) if d.startswith("codex-")]
         except OSError:
             pass
-    found = []
+    found: dict[str, str] = {}  # realpath -> the first path that reached it
     for base in bases:
         for triple in _triples():
             cand = os.path.join(base, "vendor", triple, "codex", "codex")
             if os.path.isfile(cand) and not os.path.islink(cand) and _kind(cand) == "native":
-                found.append(cand)
-    return found[0] if len(found) == 1 else None
+                # One install seen from two bases (a symlinked optional-dependency folder) is one file.
+                found.setdefault(os.path.realpath(cand), cand)
+    return next(iter(found.values())) if len(found) == 1 else None
 
 
 NPM_HERMES_PACKAGE = "hermes-agent"
@@ -135,6 +136,16 @@ def _resolution_paths(path: str) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def _names(pairs: list[tuple[object, object]]) -> dict[object, object]:
+    """``object_pairs_hook``: keep the object, and remember every value its ``name`` key was given."""
+    out = dict(pairs)
+    out[_ALL_NAMES] = [v for k, v in pairs if k == "name"]
+    return out
+
+
+_ALL_NAMES = object()  # a key no JSON text can produce
+
+
 def _package_json_names_bridge(directory: str) -> bool:
     try:
         flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
@@ -142,10 +153,11 @@ def _package_json_names_bridge(directory: str) -> bool:
         with open(fd, "rb") as f:
             if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
                 return False
-            data = json.loads(f.read(_PACKAGE_JSON_MAX))
+            data = json.loads(f.read(_PACKAGE_JSON_MAX), object_pairs_hook=_names)
     except (OSError, ValueError, RecursionError):
         return False
-    return isinstance(data, dict) and data.get("name") == NPM_HERMES_PACKAGE
+    # A ``name`` key given twice is read both times: either value naming the bridge is the bridge.
+    return isinstance(data, dict) and NPM_HERMES_PACKAGE in data[_ALL_NAMES]
 
 
 def npm_hermes_agent_root(path: str) -> str | None:
@@ -160,7 +172,10 @@ def npm_hermes_agent_root(path: str) -> str | None:
     still the bridge). Nothing is executed; each ``package.json`` is size-capped, opened
     non-blocking and read only if it is a regular file, so a FIFO or device named
     ``package.json`` (e.g. ``/usr/package.json`` above ``/usr/bin/hermes``) cannot hang
-    detection, and a read error means "not recognised".
+    detection, and a read error means "not recognised". A ``name`` key given more than once is
+    read every time. This recognition is not the boundary against someone who can write the tree
+    (deleting ``package.json`` defeats any reading of it): since Hermes became a pinned route, the
+    pin table is, and an unpinned tree is ``pin_mismatch`` whatever its ``package.json`` holds.
     """
     views = [os.path.normpath(p) for p in _resolution_paths(path)]
     for view in views:
@@ -192,11 +207,14 @@ def _launcher_pinned(engine: str, realpath: str) -> bool:
 def path_hits(name: str, path_string: str, pinned: bool = False) -> list[str]:
     """Executable files named ``name`` on the PATH string, in search order.
 
-    Windows also tries ``.exe``, and for a pinned route (``pinned``) ``.cmd`` then ``.ps1``.
+    Windows tries ``.exe``, for a pinned route (``pinned``) ``.cmd`` then ``.ps1``, and the bare name
+    last: Windows resolves a command through PATHEXT and never runs an extensionless file found on
+    PATH, so npm's extensionless sh shim must not hide the ``.exe`` or ``.cmd`` beside it (#323, Devin
+    r4521280830). Elsewhere only the bare name is tried.
     """
     exts: tuple[str, ...] = ("",)
     if binary.is_windows():
-        exts = ("", ".exe", *PINNED_LAUNCHER_EXT) if pinned else ("", ".exe")
+        exts = (".exe", *PINNED_LAUNCHER_EXT, "") if pinned else (".exe", "")
     hits: list[str] = []
     for d in path_string.split(os.pathsep):
         if not d or not os.path.isabs(d):  # empty or relative PATH entries are never searched

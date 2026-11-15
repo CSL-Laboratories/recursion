@@ -145,12 +145,15 @@ class ParsedVersion:
     key: tuple[int, ...]  # comparison key
     text: str  # normalised display form, e.g. "2.1.318" or "2026.10.1"
     prerelease: str | None = None
+    commit: str | None = None  # date scheme only: the build's commit, which does not order
 
 
 def spec_for(engine: str) -> EngineSpec:
-    spec = FLOORS.get(engine) if isinstance(engine, str) else None
+    # Exactly str: a subclass can hash and compare like a table key while holding something else.
+    spec = FLOORS.get(engine) if type(engine) is str else None
     if spec is None:
-        raise LaunchRefused("engine_unknown", str(engine), "not in the floor table (detected allow-list)")
+        shown = engine if type(engine) is str else f"<{type(engine).__name__}>"
+        raise LaunchRefused("engine_unknown", shown, "not in the floor table (detected allow-list)")
     return spec
 
 
@@ -167,9 +170,12 @@ def parse_version(scheme: str, raw: str) -> ParsedVersion | None:
 
     The version token is the first whitespace-separated word holding ``digit.digit``;
     it must match the engine's whole format. A prerelease is returned, not accepted:
-    callers refuse it (floors name releases).
+    callers refuse it (floors name releases). The whole line must be printable text: a control
+    character (a terminal escape, a tab, a carriage return, NUL, a bidirectional override) or
+    U+FFFD, which is how the probe reads a byte that is not UTF-8, makes it unparsed, so such a
+    line is never recorded on a grant or shown on a surface.
     """
-    if not isinstance(raw, str) or len(raw) > MAX_VERSION_LINE:
+    if type(raw) is not str or len(raw) > MAX_VERSION_LINE or not raw.isprintable() or "\ufffd" in raw:
         return None
     token = _token(raw)
     if token is None:
@@ -178,7 +184,7 @@ def parse_version(scheme: str, raw: str) -> ParsedVersion | None:
         m = _DATE.fullmatch(token)
         if not m:
             return None
-        y, mo, d, hh, mi, ss, _commit = m.groups()
+        y, mo, d, hh, mi, ss, commit = m.groups()
         year, month, day = int(y), int(mo), int(d)
         h, mn, s = int(hh or 0), int(mi or 0), int(ss or 0)
         if not (h < 24 and mn < 60 and s < 60):
@@ -187,8 +193,9 @@ def parse_version(scheme: str, raw: str) -> ParsedVersion | None:
             datetime.date(year, month, day)
         except ValueError:
             return None
-        # The commit hash does not order; equal dates with no build time compare equal.
-        return ParsedVersion((year, month, day, h, mn, s), f"{year}.{month}.{day}")
+        # The commit hash does not order; equal dates with no build time compare equal (check_floors
+        # then asks for the floor's own commit).
+        return ParsedVersion((year, month, day, h, mn, s), f"{year}.{month}.{day}", None, commit)
     if scheme != "semver":
         return None
     m = _SEMVER.fullmatch(token)
@@ -198,11 +205,21 @@ def parse_version(scheme: str, raw: str) -> ParsedVersion | None:
     return ParsedVersion(key, ".".join(map(str, key)), m.group(4))
 
 
-def _floor_key(spec: EngineSpec, floor: str) -> tuple[int, ...]:
+def _floor(spec: EngineSpec, floor: str) -> ParsedVersion:
     parsed = parse_version(spec.scheme, floor)
     if parsed is None or parsed.prerelease is not None:  # table bug: fail closed
         raise LaunchRefused("floor_unset", spec.engine, f"floor {floor!r} does not parse")
-    return parsed.key
+    return parsed
+
+
+def _below(spec: EngineSpec, found: ParsedVersion, floor: str) -> bool:
+    """``found`` is below ``floor``. On the date scheme a build of the floor's own day and time is not
+    known to contain the floor unless it is the floor's commit, when the floor names one: it counts as
+    below (fail closed; #323 review of 7c15fa97, point 2)."""
+    f = _floor(spec, floor)
+    if found.key != f.key:
+        return found.key < f.key
+    return f.commit is not None and found.commit != f.commit
 
 
 def with_note(spec: EngineSpec, detail: str) -> str:
@@ -233,12 +250,16 @@ def check_floors(spec: EngineSpec, found: ParsedVersion) -> None:
     """
     if found.prerelease is not None:
         raise LaunchRefused("version_refused", spec.engine, f"prerelease {found.prerelease!r}; floors name releases only")
-    if spec.security is not None and found.key < _floor_key(spec, spec.security):
-        raise LaunchRefused("version_refused", spec.engine, f"found {found.text} < security floor {spec.security}")
+    if spec.security is not None and _below(spec, found, spec.security):
+        raise LaunchRefused("version_refused", spec.engine, f"found {_shown(found)} < security floor {spec.security}")
     if spec.functional is None:
         return
-    if found.key < _floor_key(spec, spec.functional):
-        raise LaunchRefused("version_refused", spec.engine, f"found {found.text} < functional floor {spec.functional}")
+    if _below(spec, found, spec.functional):
+        raise LaunchRefused("version_refused", spec.engine, f"found {_shown(found)} < functional floor {spec.functional}")
+
+
+def _shown(found: ParsedVersion) -> str:
+    return f"{found.text}-{found.commit}" if found.commit else found.text
 
 
 def other_engine_named(spec: EngineSpec, raw: str) -> str | None:

@@ -892,15 +892,17 @@ class WindowsPinnedLauncherTests(Base):
                     self.assertEqual(inst.path, grants["pi"].path)
                 self.assertFalse(os.path.exists(inst.ran))
 
-    def test_windows_search_order_is_bare_exe_cmd_ps1(self) -> None:
+    def test_windows_search_order_is_exe_cmd_ps1_then_bare(self) -> None:
+        # The bare name is searched last on Windows (#323, Devin r4521280830): Windows resolves a command
+        # through PATHEXT, so npm's extensionless sh shim must not hide the launcher beside it.
         d = F.dir()
-        names = ["pi", "pi.exe", "pi.cmd", "pi.ps1"]
+        names = ["pi.exe", "pi.cmd", "pi.ps1", "pi"]
         for name in names:
             write(os.path.join(d, name), "x\n", 0o755)
         write(os.path.join(d, "pi.bat"), "x\n", 0o755)
         with windows():
             self.assertEqual([os.path.join(d, n) for n in names], detect_mod.path_hits("pi", d, True))
-            self.assertEqual([os.path.join(d, n) for n in names[:2]], detect_mod.path_hits("pi", d))
+            self.assertEqual([os.path.join(d, n) for n in ("pi.exe", "pi")], detect_mod.path_hits("pi", d))
             while names:  # the first hit is the candidate, in that order
                 self.assertEqual(os.path.join(d, names[0]), detect("pi", d).candidate)
                 os.unlink(os.path.join(d, names.pop(0)))
@@ -1734,15 +1736,16 @@ class SentryShapedInstallTests(Base):
                     hand = grant_mod.LaunchPlan(g, ("pi",), (), 3)
                     self.refused("interpreter_unpinned", hand.exec_argv)
                     self.refused("interpreter_unpinned", hand.exec_env)
-            # detect.path_hits tries the bare name first on Windows for a pinned route, then .cmd, then .ps1.
+            # detect.path_hits tries .exe, .cmd, .ps1, then the bare name on Windows for a pinned route
+            # (#323, Devin r4521280830): the .cmd launcher, which Windows would run, is the first hit.
             bindir = installs["pi"].bindir
-            self.assertEqual([installs[n].path for n in ("pi", "pi.cmd", "pi.ps1")], detect_mod.path_hits("pi", bindir, True))
-            self.assertEqual(installs["pi"].path, detect("pi", bindir).candidate)
+            self.assertEqual([installs[n].path for n in ("pi.cmd", "pi.ps1", "pi")], detect_mod.path_hits("pi", bindir, True))
+            self.assertEqual(installs["pi.cmd"].path, detect("pi", bindir).candidate)
             grants, records = launch_check(bindir, probe=self.never_probe)
-            self.assertEqual(installs["pi"].path, grants["pi"].path)
+            self.assertEqual(installs["pi.cmd"].path, grants["pi"].path)
             self.refused("interpreter_unpinned", launch_plan, grants["pi"], ["pi"], {})
-            # Without the bare launcher's row the first PATH hit matches no pin: the row is needed.
-            with table(*pins[1:]):
+            # Without the .cmd launcher's row the first PATH hit matches no pin: the row is needed.
+            with table(pins[0], pins[2]):
                 self.assertEqual("pin_mismatch", {r["engine"]: r for r in launch_check(bindir, probe=self.never_probe)[1]}["pi"]["refusal"])
         self.assertFalse(os.path.exists(installs["pi"].ran))
 

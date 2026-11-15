@@ -1,0 +1,19 @@
+{
+  "seq": 4,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": "turn-000c",
+  "time": "2026-11-13T07:34:04.148Z",
+  "type": "tool.call",
+  "source": "core",
+  "trust": "untrusted",
+  "payload": {
+    "call_id": "toolu_01H8",
+    "name": "Bash",
+    "input_digest": "7abbd9009aff059b4e24698e31024ef1ec0bda9e7911b5dc4128ee8960c47c9b",
+    "input": {
+      "command": "pytest -q"
+    }
+  },
+  "correlation_id": "toolu_01H8"
+}

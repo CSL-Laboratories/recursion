@@ -1,0 +1,8 @@
+{
+  "type": "turn.started",
+  "payload": {
+    "delivery_id": "dlv-0007",
+    "index": 2,
+    "text": "hello"
+  }
+}

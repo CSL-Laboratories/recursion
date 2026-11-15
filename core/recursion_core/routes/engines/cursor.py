@@ -89,10 +89,12 @@ FULL_ACCESS_SHORT_OPTIONS = ("-f",)
 # Linux takes at most 131072 bytes, its terminating NUL included, for one argument (MAX_ARG_STRLEN).
 MAX_ARG_BYTES = 128 * 1024 - 1
 # Linux also bounds argv and the environment together (ARG_MAX: a quarter of the stack limit, 2 MiB under the
-# usual 8 MiB stack). This lane holds the whole argv, each argument with its terminating NUL, to half of that,
-# leaving the rest for the child's environment (an allowlist) and the pointers. A stack limit under 4 MiB
-# lowers ARG_MAX below this bound, and execve then refuses the launch itself.
+# usual 8 MiB stack), and charges each argument its bytes, its terminating NUL and its pointer (8 bytes on a
+# 64-bit kernel; the pointers of argv and of the environment both count). This lane holds the whole argv,
+# counted that way, to half of ARG_MAX, leaving the other half for the child's environment (an allowlist). A
+# stack limit under 4 MiB lowers ARG_MAX below this bound, and execve then refuses the launch itself.
 MAX_ARGV_BYTES = 1024 * 1024
+ARG_POINTER_BYTES = 8
 # The two drives, as each builder writes it right after the updater flag.
 DRIVES = ("-p", "acp")
 LAUNCH_REFUSED = "launch_refused"   # routes.contract's code; the detail says which rule
@@ -205,7 +207,8 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
       in the existing launch guards (``"true"``, ``1`` and the like are not an acknowledgement).
     * ``argv_invalid``: not a non-empty list of text; an empty argument; an argument holding a NUL or a lone
       surrogate, or longer than MAX_ARG_BYTES UTF-8 bytes; an argv longer than MAX_ARGV_BYTES in all, each
-      argument counted with its NUL (none of these can be passed to execve); an option holding a CR or LF.
+      argument counted with its NUL and its pointer, ARG_POINTER_BYTES (none of these can be passed to
+      execve); an option holding a CR or LF.
     * ``executable_mismatch``: argv[0] is not the vouched executable.
     * ``credential_in_argv:<option>``: an option carries a credential, in any spelling: ``--api-key K``,
       ``--api-key=K``, ``-H V``, ``-HV``, or ``H`` among bundled short options (``-vH V``).
@@ -222,14 +225,14 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
     if (not isinstance(argv, (list, tuple)) or not argv
             or not all(isinstance(a, str) and a and "\x00" not in a and not _has_surrogate(a)
                        and len(a.encode("utf-8")) <= MAX_ARG_BYTES for a in argv)
-            or sum(len(a.encode("utf-8")) + 1 for a in argv) > MAX_ARGV_BYTES):
+            or sum(len(a.encode("utf-8")) + 1 + ARG_POINTER_BYTES for a in argv) > MAX_ARGV_BYTES):
         raise ArgvRefused("argv_invalid")
-    if argv[0] != _executable(binary):
-        raise ArgvRefused("executable_mismatch")
     rest = list(argv[1:])
     options = rest[:rest.index("--")] if "--" in rest else rest
     if any("\r" in arg or "\n" in arg for arg in options):
         raise ArgvRefused("argv_invalid")
+    if argv[0] != _executable(binary):
+        raise ArgvRefused("executable_mismatch")
     bundles = [arg[1:] for arg in options if arg.startswith("-") and not arg.startswith("--")]
     for arg in options:
         for option in CREDENTIAL_OPTIONS:

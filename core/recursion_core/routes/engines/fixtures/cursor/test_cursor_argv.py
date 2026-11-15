@@ -15,6 +15,11 @@ HERE = Path(__file__).resolve().parent
 ARGV = json.loads((HERE / "argv.json").read_text(encoding="utf-8"))
 
 
+def argv_cost(argv) -> int:
+    """What the whole-argv bound counts: each argument's UTF-8 bytes, its NUL and its 8-byte pointer."""
+    return sum(len(a.encode("utf-8")) + 1 + 8 for a in argv)
+
+
 class BuildTest(unittest.TestCase):
     def test_the_one_shot_argv(self):
         self.assertEqual(cursor.oneshot_argv(ARGV["oneshot"]["model"]), ARGV["oneshot"]["argv"])
@@ -190,24 +195,62 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(cursor.acp_argv(binary="/opt/" + astral + "/agent")[0], "/opt/" + astral + "/agent")
 
     def test_the_whole_argv_is_bounded(self):
-        """Break-it read 5 of #388, F5-2: execve also bounds the argv as a whole (ARG_MAX). Each argument is
-        counted with its NUL, exactly at MAX_ARGV_BYTES passes and one byte more is refused."""
+        """Break-it read 5 of #388, F5-2, and 7, F7-2: execve also bounds the argv as a whole (ARG_MAX), and
+        charges each argument its bytes, its NUL and its 8-byte pointer. Exactly at MAX_ARGV_BYTES passes; one
+        byte more is refused."""
         self.assertEqual(cursor.MAX_ARGV_BYTES, 1024 * 1024)
+        self.assertEqual(cursor.ARG_POINTER_BYTES, 8)
         head = ["agent", "--disable-auto-update", "-p", "--"]
-        room = cursor.MAX_ARGV_BYTES - sum(len(a.encode("utf-8")) + 1 for a in head)
+        room = cursor.MAX_ARGV_BYTES - argv_cost(head)
         tail = []
         while room:
-            size = min(cursor.MAX_ARG_BYTES, room - 1)
+            size = min(cursor.MAX_ARG_BYTES, room - 9)
+            self.assertGreater(size, 0)
             tail.append("x" * size)
-            room -= size + 1
+            room -= size + 9
         argv = head + tail
-        self.assertEqual(sum(len(a.encode("utf-8")) + 1 for a in argv), cursor.MAX_ARGV_BYTES)
+        self.assertEqual(argv_cost(argv), cursor.MAX_ARGV_BYTES)
         self.assertTrue(all(len(a) <= cursor.MAX_ARG_BYTES for a in argv))
         cursor.check_argv(argv)
         for longer in (argv[:-1] + [argv[-1] + "x"], argv + ["x"], head + ["x" * cursor.MAX_ARG_BYTES] * 20):
             with self.assertRaises(cursor.ArgvRefused) as caught:
                 cursor.check_argv(longer)
             self.assertEqual(caught.exception.detail, "argv_invalid")
+
+    def test_the_whole_argv_bound_counts_each_arguments_pointer(self):
+        """Break-it read 7 of #388, F7-2: 250,000 one-byte arguments are 500,034 bytes with their NULs but two
+        million more in pointers, and execve refuses them under the default stack. Each argument costs its
+        bytes, its NUL and 8 bytes of pointer, so one-byte arguments fill the bound exactly at 104,851 after the
+        head, and one more is refused."""
+        head = ["agent", "--disable-auto-update", "-p", "--"]
+        self.assertEqual(argv_cost(head), 66)
+        many = head + ["x"] * 250000
+        self.assertLess(sum(len(a) + 1 for a in many), cursor.MAX_ARGV_BYTES)
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(many)
+        self.assertEqual(caught.exception.detail, "argv_invalid")
+        exact = head + ["x"] * 104851
+        self.assertEqual(66 + 10 * 104851, cursor.MAX_ARGV_BYTES)
+        cursor.check_argv(exact)
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(exact + ["x"])
+        self.assertEqual(caught.exception.detail, "argv_invalid")
+
+    def test_every_argv_invalid_case_comes_before_executable_mismatch(self):
+        """Break-it read 7 of #388, F7-1: the docstring lists every ``argv_invalid`` case, a line break among
+        the options included, before ``executable_mismatch``, and the code checks them in that order."""
+        for argv in (["wrong", "--disable-auto-update", "-p", "--model", "a\nb"],
+                     ["wrong", "--disable-auto-update", "-p", "--model", "a\rb"],
+                     ["wrong", "--disable-auto-update", "", "acp"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(cursor.ArgvRefused) as caught:
+                    cursor.check_argv(argv)
+                self.assertEqual(caught.exception.detail, "argv_invalid")
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(["wrong", "--disable-auto-update", "-p", "--", "a\nb"])   # the prompt may break lines
+        self.assertEqual(caught.exception.detail, "executable_mismatch")
+        doc = cursor.check_argv.__doc__
+        self.assertLess(doc.index("* ``argv_invalid``"), doc.index("* ``executable_mismatch``"))
 
     def test_the_whole_argv_bound_counts_utf8_bytes_not_characters(self):
         """Review 6 of #388 (Astra change 1, Sol change 1): each argument 120,000 UTF-8 bytes, within its own
@@ -232,15 +275,14 @@ class CheckTest(unittest.TestCase):
         it over MAX_ARGV_BYTES it is refused."""
         built = cursor.oneshot_argv("synthetic-model")
         cursor.check_argv(built)
-        used = sum(len(a.encode("utf-8")) + 1 for a in [*built, "--"])
         prompts = []
-        room = cursor.MAX_ARGV_BYTES - used + 1   # one byte over, in arguments within their own limit
+        room = cursor.MAX_ARGV_BYTES - argv_cost([*built, "--"]) + 1   # one byte over, each within its own limit
         while room > 0:
-            size = min(cursor.MAX_ARG_BYTES, room - 1) or 1
+            size = max(1, min(cursor.MAX_ARG_BYTES, room - 9))
             prompts.append("p" * size)
-            room -= size + 1
+            room -= size + 9
         complete = [*built, "--", *prompts]
-        self.assertGreater(sum(len(a.encode("utf-8")) + 1 for a in complete), cursor.MAX_ARGV_BYTES)
+        self.assertGreater(argv_cost(complete), cursor.MAX_ARGV_BYTES)
         with self.assertRaises(cursor.ArgvRefused) as caught:
             cursor.check_argv(complete)
         self.assertEqual(caught.exception.detail, "argv_invalid")

@@ -38,6 +38,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
+from recursion_core.approvals.record import effect_problem
 from recursion_core.plugin_security.canonical import canonical as _csl_cj_v0
 from recursion_core.plugin_security.errors import Refused as _PluginRefused
 
@@ -353,6 +354,10 @@ def lines_of(source: str, effect: dict) -> list:
     return lines
 
 
+def _effect_shape_problem(source: str, effect):
+    return effect_problem(source, effect)
+
+
 def _members_ok(source: str, effect) -> bool:
     if type(effect) is not dict or set(effect) != EFFECT_MEMBERS.get(source):
         return False
@@ -398,14 +403,15 @@ def bind(source: object, effect: object) -> Bound:
         except RecursionError:
             raise EffectRefused("too_deep") from None
         held = normalised(held)
-    if not _members_ok(source, held):
-        raise EffectRefused("effect")
-    if source == "engine_tool" and (held["kind"] != "engine_tool" or type(held["engine"]) is not str
-                                    or type(held["run_id"]) is not str
-                                    or not (held["session_id"] is None or type(held["session_id"]) is str)):
+    # The whole published shape of the source's effect, before anything is drawn: the engine, session and
+    # run are drawn as the core's own (trusted) lines, so each must be in its id grammar (no line break,
+    # nothing an engine could use to forge a line), and a plugin's effect must be the gate's own object.
+    if _effect_shape_problem(source, held) is not None:
         raise EffectRefused("effect")
     digest_form = DIGEST_FORMS[source]
     raw = _effect_bytes(digest_form, held)
+    if len(raw) > CALL_MAX:  # a plugin's effect is held to the same cap as an engine's call; never cut
+        raise EffectRefused("too_large")
     lines = lines_of(source, held)
     return Bound(source, digest_form, raw, hashlib.sha256(raw).hexdigest(), held, tuple(lines))
 

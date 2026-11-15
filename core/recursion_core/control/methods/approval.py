@@ -37,7 +37,10 @@ def handlers(queue) -> dict:
 
     def approval_list(ctx, params: dict) -> dict:
         if queue.store is None:
-            return {"code": "unsupported", "detail": "store_absent"}
+            return {"code": "unavailable", "detail": "store_absent"}
+        refusal = model.list_params_refusal(params)
+        if refusal is not None:
+            return refusal
         return queue.list_page(params)
 
     def gate(ctx, method: str, params: dict) -> dict:

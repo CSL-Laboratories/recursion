@@ -24,6 +24,7 @@ store's transaction; the method handlers wrap them; the published lifecycle vect
 from __future__ import annotations
 
 import copy
+import re
 
 from recursion_core.approvals import effects
 from recursion_core.approvals.effects import EffectRefused
@@ -31,7 +32,7 @@ from recursion_core.approvals.record import (APPROVER_KINDS, STATES, SURFACES, T
                                              effect_problem, milliseconds, shape_problem)
 
 __all__ = ["ApprovalRefused", "TARGET_MEMBERS", "answer_prompt", "change", "consume", "expire_if_due",
-           "new_request", "open_prompt", "params_refusal", "principal_refusal", "restored"]
+           "list_params_refusal", "new_request", "open_prompt", "params_refusal", "principal_refusal", "restored"]
 
 TARGET_MEMBERS = {"engine_tool": ("kind", "engine", "session_id", "run_id"),
                   "plugin_effect": ("schema", "plugin_id", "run_id")}
@@ -70,13 +71,41 @@ def principal_refusal(principal: object):
     return None
 
 
+_APPROVAL_ID = re.compile(r"apr-[A-Za-z0-9_-]{1,60}")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+_LOG_ID = re.compile(r"ses-[A-Za-z0-9_-]{1,60}|run:[A-Za-z0-9_-]{1,64}")
+_LIST_PARAMS = ("session_id", "state", "limit", "after")
+
+
 def params_refusal(method: str, params: object):
-    """``request_invalid`` naming the first field that is not whole; ``None`` when the request is whole."""
+    """``request_invalid`` naming the first field that is not whole, or the first member the method does not
+    take; ``None`` when the request is whole. Ids and digests are held to their published grammars."""
     for field in _NEEDS[method]:
         value = params.get(field) if type(params) is dict else None
         whole = (type(value) is int and value >= 1) if field == "expected_revision" else (type(value) is str and bool(value))
         if not whole or (field == "answer" and value not in ("approve", "deny")) \
-                or (field == "surface" and value not in SURFACES):
+                or (field == "surface" and value not in SURFACES) \
+                or (field == "approval_id" and not _APPROVAL_ID.fullmatch(value)) \
+                or (field == "digest" and not _DIGEST.fullmatch(value)):
+            return {"code": "request_invalid", "detail": field}
+    for field in sorted(params):
+        if field not in _NEEDS[method]:
+            return {"code": "request_invalid", "detail": field}
+    return None
+
+
+def list_params_refusal(params: object):
+    """approval.list's parameters: ``session_id`` (a log id), ``state``, ``limit`` (1 to 1000), ``after`` (an
+    approval id), all optional, nothing else."""
+    if type(params) is not dict:
+        return {"code": "request_invalid", "detail": "params"}
+    for field in sorted(params):
+        value = params[field]
+        if field not in _LIST_PARAMS \
+                or (field == "session_id" and not (type(value) is str and _LOG_ID.fullmatch(value))) \
+                or (field == "state" and value not in STATES) \
+                or (field == "limit" and not (type(value) is int and 1 <= value <= 1000)) \
+                or (field == "after" and not (type(value) is str and _APPROVAL_ID.fullmatch(value))):
             return {"code": "request_invalid", "detail": field}
     return None
 

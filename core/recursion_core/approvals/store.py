@@ -22,13 +22,17 @@ path).
 from __future__ import annotations
 
 import json
+import logging
 
 from recursion_core.approvals.effects import text_of
-from recursion_core.approvals.model import restored
+from recursion_core.approvals.model import ApprovalRefused, restored
 from recursion_core.approvals.record import milliseconds, summary_of
 
+log = logging.getLogger(__name__)
+
 __all__ = ["DDL", "LANE", "VERSION", "answered_event", "binding_of", "due", "insert", "list_summaries", "load",
-           "log_of", "mark_shown", "next_deadline", "pending", "requested_event", "save", "unshown"]
+           "log_of", "mark_shown", "next_deadline", "pending", "requested_event", "retire_binding", "save",
+           "set_aside", "unresolved_engine", "unshown"]
 
 LANE = "approvals"
 VERSION = 1
@@ -71,14 +75,34 @@ def insert(tx, record: dict, binding: dict | None) -> None:
 
 
 def load(tx, approval_id: str):
-    """The record as the core holds it (``restored``), or ``None``. A row that is not JSON reads as None."""
+    """The record as the core holds it (``restored``), or ``None`` when there is no such row. A row that is
+    there but is not a JSON object is ``record_invalid``: it is not an unknown approval."""
     rows = tx.execute("SELECT record FROM approvals_records WHERE approval_id = ?", (approval_id,))
     if not rows:
         return None
     try:
-        return restored(json.loads(rows[0][0]))
-    except ValueError:
-        return None
+        held = json.loads(rows[0][0])
+    except (ValueError, TypeError):
+        raise ApprovalRefused("record_invalid") from None
+    if type(held) is not dict:
+        raise ApprovalRefused("record_invalid")
+    return restored(held)
+
+
+def set_aside(tx, approval_id: str) -> None:
+    """A row that cannot be read leaves the pending queries: it is never drawn, answered or swept again."""
+    tx.execute("UPDATE approvals_records SET state = 'unreadable' WHERE approval_id = ?", (approval_id,))
+
+
+def retire_binding(tx, approval_id: str) -> None:
+    """The private binding of an engine request whose driver is gone: nothing can carry it out through it."""
+    tx.execute("DELETE FROM approvals_bindings WHERE approval_id = ?", (approval_id,))
+
+
+def unresolved_engine(tx) -> list:
+    """Engine requests a restart must deal with: still pending, or approved and not carried out."""
+    return [row[0] for row in tx.execute("SELECT approval_id FROM approvals_records WHERE source = 'engine_tool' "
+                                         "AND state IN ('pending', 'approved') ORDER BY approval_id")]
 
 
 def binding_of(tx, approval_id: str):
@@ -138,8 +162,14 @@ def list_summaries(tx, *, session_id=None, state=None, limit: int = 100, after: 
         clauses.append("approval_id > ?")
         params.append(after)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    rows = tx.execute("SELECT record FROM approvals_records" + where + " ORDER BY approval_id LIMIT ?",
+    rows = tx.execute("SELECT approval_id, record FROM approvals_records" + where
+                      + (" AND " if where else " WHERE ") + "state != 'unreadable' ORDER BY approval_id LIMIT ?",
                       (*params, limit + 1))
-    summaries = [summary_of(json.loads(row[0])) for row in rows[:limit]]
+    summaries = []
+    for approval_id, text in rows[:limit]:
+        try:
+            summaries.append(summary_of(json.loads(text)))
+        except (ValueError, TypeError, KeyError):  # an unreadable row cannot be shown or answered
+            log.error("approval %s cannot be read; left out of the list", approval_id)
     more = len(rows) > limit
-    return summaries, (summaries[-1]["approval_id"] if more and summaries else None)
+    return summaries, (rows[limit - 1][0] if more and rows[:limit] else None)

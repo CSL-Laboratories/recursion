@@ -264,6 +264,10 @@ class UnixControlServer:
             raise ValueError("max_connections must be positive")
         if reserved_connections < 0 or (reserved_connections and priority is None):
             raise ValueError("reserved_connections needs a priority test and cannot be negative")
+        # A finite, positive number of seconds: zero, a negative or NaN served nothing, and NaN killed the worker
+        # (the round-2 read of #407 by DeepSeek, F3).
+        if type(reserved_timeout_s) not in (int, float) or not 0 < reserved_timeout_s < float("inf"):
+            raise ValueError("reserved_timeout_s must be a finite, positive number of seconds")
         self.directory = directory
         self._path = refuse_remote_bind(os.path.join(directory, name))
         self._handler = handler
@@ -344,6 +348,11 @@ class UnixControlServer:
             except OSError:
                 pass
         for worker in workers:
+            # A worker the accept loop has added but not yet started cannot be joined (nor can this thread, if a
+            # handler shuts the server down): joining raised, and the listener and its lock were never released
+            # (the round-2 read of #407 by DeepSeek, F2; the same on master). Its connection was shut above.
+            if worker.ident is None or worker is threading.current_thread():
+                continue
             worker.join(timeout=self._idle_timeout_s + 1.0)
         with self._lock:
             sock, self._sock = self._sock, None
@@ -478,12 +487,15 @@ class UnixControlServer:
             # The slot is freed before the connection is closed, so a client that has seen the close finds it
             # free: a Stop sent right after it is served, not refused busy. The worker and its socket stay in
             # the server's sets until the socket is disposed of, so a server shutting down meanwhile still finds,
-            # shuts and joins them (the round-1 reads of #407: Astra R2, Sol R1). The slots bound the handlers
-            # that run; a worker that has freed its slot and not yet disposed of its socket is not counted, so
-            # for a moment there can be several such tails, not only one.
+            # shuts and joins them (the round-1 reads of #407: Astra R2, Sol R1). A disposal that fails is
+            # recorded (``conn_close_failed``), and the worker still leaves the sets (the round-2 read by
+            # DeepSeek, F4). The slots bound the handlers that run; a worker that has freed its slot and not yet
+            # disposed of its socket is not counted, so for a moment there can be several such tails.
             slots.release()
             try:
                 conn.close()
+            except OSError:
+                self._refuse("conn_close_failed")
             finally:
                 with self._lock:
                     self._workers.discard(threading.current_thread())

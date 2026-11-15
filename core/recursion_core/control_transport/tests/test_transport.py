@@ -776,12 +776,110 @@ class ConnectionBoundTests(_TmpCase):
                     self.assertTrue(retiring.wait(limit))
                     closer.start()
                     self.assertEqual(events.get(timeout=limit), "joined the retiring worker")
+                    proceed.set()                                  # the worker may go now; the shutdown then returns
+                    self.assertEqual(events.get(timeout=limit), "the server's shutdown returned")
             finally:
                 proceed.set()
                 for worker in held:
                     real_join(worker, limit)
                 if closer.ident is not None:
                     real_join(closer, limit)
+        # The order, recorded (the round-2 read of #407 by DeepSeek, F6): the join came before the return.
+        self.assertTrue(events.empty())
+
+    def _recording_workers(self, srv) -> list:
+        """Every worker thread the server starts, recorded as it begins serving, so a test can join them all."""
+        started: list[threading.Thread] = []
+        serve = srv._serve
+
+        def recorded(*args):
+            started.append(threading.current_thread())
+            return serve(*args)
+
+        srv._serve = recorded
+        return started
+
+    def test_retired_workers_and_their_sockets_leave_the_server_s_sets(self) -> None:
+        """The round-2 read of #407 by DeepSeek, F1: the two discards that end a worker's membership had no test;
+        without either, the sets grew by one per connection served. Each slot comes back too."""
+        limit = 30.0   # a watchdog only
+        srv = self.server(max_connections=1, idle_timeout_s=30.0, reserved_connections=1,
+                          priority=lambda request: request.get("op") == "stop", reserved_timeout_s=30.0)
+        started = self._recording_workers(srv)
+        for n in range(3):
+            with UnixControlClient(srv.path) as client:              # an ordinary request, then the client ends
+                self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+            started[n].join(limit)                                   # its worker has retired before the next
+        holder = UnixControlClient(srv.path)
+        self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
+        for n in range(3):                                           # reserved Stops, every ordinary slot held
+            reply, after = _one_frame(srv.path, {"op": "stop", "run_id": f"r{n}"})
+            self.assertEqual((reply.get("ok"), after), (True, b""), reply)
+        holder.close()
+        for worker in started:
+            worker.join(limit)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(len(started), 7)
+        with srv._lock:
+            self.assertEqual((srv._workers, srv._conns), (set(), set()))
+        self.assertTrue(srv._slots.acquire(blocking=False))
+        self.assertFalse(srv._slots.acquire(blocking=False))
+        srv._slots.release()
+        self.assertTrue(srv._reserved.acquire(blocking=False))
+        self.assertFalse(srv._reserved.acquire(blocking=False))
+        srv._reserved.release()
+
+    def test_a_worker_whose_socket_release_fails_records_it_and_still_retires(self) -> None:
+        """The round-2 read of #407 by DeepSeek, F4: an OSError from the worker's socket release escaped the
+        worker thread and was recorded nowhere. Now it is recorded, and the worker still leaves the sets."""
+        from unittest import mock
+        limit = 30.0
+        srv = self.server(max_connections=1, idle_timeout_s=30.0)
+        started = self._recording_workers(srv)
+        uncaught: list = []
+        real_close = socket.socket.close
+
+        def failing_close(sock):
+            real_close(sock)
+            if threading.current_thread().name == "control-transport-conn":
+                raise OSError("injected: the release failed")
+
+        previous_hook = threading.excepthook
+        threading.excepthook = uncaught.append
+        self.addCleanup(setattr, threading, "excepthook", previous_hook)
+        with mock.patch.object(socket.socket, "close", failing_close):
+            with UnixControlClient(srv.path) as client:              # the connection ends when the client does
+                self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+            for worker in started:
+                worker.join(limit)
+        self.assertEqual(uncaught, [])
+        self.assertIn("conn_close_failed", srv.refused)
+        with srv._lock:
+            self.assertEqual((srv._workers, srv._conns), (set(), set()))
+        self.assertTrue(srv._slots.acquire(blocking=False))
+        srv._slots.release()
+
+    def test_shutting_down_with_a_worker_added_but_not_started_returns_and_releases_the_listener(self) -> None:
+        """The round-2 read of #407 by DeepSeek, F2 (the same on master): close() joined a worker the accept loop
+        had added but not yet started, raised, and left the listener and its lock in place."""
+        srv = self.server(max_connections=1)
+        unstarted = threading.Thread(target=lambda: None, name="control-transport-conn")
+        with srv._lock:
+            srv._workers.add(unstarted)
+        srv.close()
+        self.assertIsNone(srv._sock)
+        self.assertFalse(os.path.exists(srv.path))
+
+    def test_a_reserved_deadline_that_is_not_a_finite_positive_number_is_refused(self) -> None:
+        """The round-2 read of #407 by DeepSeek, F3: zero, a negative or NaN served nothing, and NaN killed the
+        worker with a ValueError from settimeout."""
+        for bad in (0, 0.0, -1.0, float("nan"), float("inf"), "1", True):
+            with self.subTest(reserved_timeout_s=repr(bad)):
+                with self.assertRaises(ValueError):
+                    UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
+                                      priority=lambda request: True, reserved_timeout_s=bad)
+        UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
+                          priority=lambda request: True, reserved_timeout_s=0.2)
 
     def test_a_worker_frees_its_slot_before_it_closes_its_connection(self) -> None:
         """Witness W1, recorded, not timed: the order of the slot's release and the socket's close in the worker

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import io
+import itertools
 import os
 import threading
 import unittest
@@ -27,6 +28,10 @@ try:  # POSIX only
     import termios
 except ImportError:  # pragma: no cover - Windows
     pty = termios = None
+
+# select() on a pipe is POSIX only (Windows refuses it with WinError 10038): the tests that read a real
+# pipe through the terminal driver skip there. The mocked reads beside them run everywhere.
+posix_select = unittest.skipIf(os.name == "nt", "select() on a pipe is POSIX only")
 
 
 def fresh() -> tuple[TuiApp, RecordingAPI]:
@@ -229,6 +234,7 @@ class UnfinishedInputTest(unittest.TestCase):
         app.press(key, burst=tty.burst)
         self.assertEqual((key, tty.burst, api.calls), ("enter", True, []))
 
+    @posix_select
     def test_the_same_through_a_real_pipe(self) -> None:
         app, api = self.press_list()
         read_fd, write_fd = os.pipe()
@@ -712,11 +718,15 @@ class SharedInputThatEndsWithoutAKeyTest(unittest.TestCase):
             with self.subTest(reads=reads):
                 self.assertEqual(self.read_one(reads), (expected, False))
 
+    @posix_select
     def test_a_prepared_line_or_stop_is_not_sent_through_the_whole_client(self) -> None:
-        # Astra's interactive probes (a pipe, interactive() and its threads) and Sol's real-PTY hangup.
-        for keybytes, prefix, completion in ((b"\n", ":stop run-1", b""), (b"\n", ":stop run-1", b"z"),
-                                             (b"y", "s", b""), (b"y", "s", b"z")):
-            with self.subTest(keybytes=keybytes, completion=completion):
+        # Astra's interactive probes (a pipe, interactive() and its threads), rounds 3 and 4: the unfinished
+        # sequence ends at the end of input, as an unknown sequence, or (round 4) as a paste that begins.
+        cases = [(key, prefix, tail, completion) for key, prefix in ((b"\n", ":stop run-1"), (b"y", "s"))
+                 for tail, completion in ((b"\x1b[12", b""), (b"\x1b[12", b"z"), (b"\x1b[200", b"~"),
+                                          (b"\x1b[200", b"~ignored body\x1b[201~"), (b"\x1b[20", b"0~payload"))]
+        for keybytes, prefix, tail, completion in cases:
+            with self.subTest(keybytes=keybytes, tail=tail, completion=completion):
                 driver = FakeDriver()
                 driver.start_run()
                 api = RecordingAPI(driver.api)
@@ -769,7 +779,7 @@ class SharedInputThatEndsWithoutAKeyTest(unittest.TestCase):
                         handled.wait()
 
                 try:
-                    os.write(write_fd, keybytes + b"\x1b[12")
+                    os.write(write_fd, keybytes + tail)
                     with mock.patch.object(term, "Loop", WaitUntilHandled):
                         self.assertEqual(term.interactive(api, io.StringIO(), {"NO_COLOR": "1"}, tty,
                                                           on_app=prepare, stderr=io.StringIO()), 0)
@@ -826,6 +836,80 @@ class SharedInputThatEndsWithoutAKeyTest(unittest.TestCase):
         self.assertEqual((d.timeout(), d.discarded), (["esc"], 1), "a lone Esc is a key, not a dropped sequence")
         d.feed(b"\x1b[3")
         self.assertEqual((d.end(), d.discarded), ([], 2))
+
+
+class PasteBesideAKeyTest(unittest.TestCase):
+    """Round 4 (both reads of d69d18aa, C3): an Enter or y beside an unfinished sequence that turns into a
+    paste opener, or beside a paste begun in the same read, stays a burst. One paste, however it is split,
+    stays one event and not a burst."""
+
+    def read_one(self, reads: list) -> tuple:
+        tty = tty_for(-1)
+        with mock.patch.object(tty, "_read", side_effect=itertools.chain(reads, itertools.repeat(None))):
+            key = tty.read_key(0)
+        return key, tty.burst
+
+    def test_a_key_beside_a_paste_opener_or_a_paste_begun_is_a_burst(self) -> None:
+        for confirm in (b"\n", b"y"):
+            name = "enter" if confirm == b"\n" else "y"
+            for reads in ([confirm + b"\x1b[200", b"~"], [confirm + b"\x1b[200~body"],
+                          [confirm + b"\x1b[20", b"0", b"~body\x1b[20"], [confirm + b"\x1b[20", b"0~"],
+                          [confirm + b"\x1b[20", b"0~payload"]):
+                with self.subTest(reads=reads):
+                    self.assertEqual(self.read_one(reads), (name, True))
+
+    def test_one_paste_however_split_is_one_event(self) -> None:
+        for reads in ([b"\x1b[200~ab", b"c\x1b[201~"], [b"\x1b[200", b"~abc\x1b[201~"], [b"\x1b[20", b"0~abc\x1b[20", b"1~"]):
+            with self.subTest(reads=reads):
+                tty = tty_for(-1)
+                with mock.patch.object(tty, "_read", side_effect=itertools.chain(reads, itertools.repeat(None))):
+                    got = [k for k in (tty.read_key(0) for _ in range(len(reads) + 1)) if k is not None]
+                self.assertEqual((got, tty.burst), ([Paste("abc")], False))
+        tty = tty_for(-1)
+        with mock.patch.object(tty, "_read", side_effect=[b"\x1b[200~ab", b""]):
+            self.assertIsNone(tty.read_key(0))
+            self.assertEqual((tty.read_key(0), tty.burst), (Paste("ab"), False), "ended by the end of input")
+
+    def test_a_key_the_wait_gives_beside_half_a_character_is_a_burst(self) -> None:
+        self.assertEqual(self.read_one([b"\x1b\xc3", None]), ("esc", True))
+
+    def test_a_sequence_dropped_in_an_earlier_read_does_not_mark_a_later_key(self) -> None:
+        # The count is per read (both fourth reads' coverage note): an unknown sequence read alone, then
+        # an Enter read alone, is one key.
+        tty = tty_for(-1)
+        with mock.patch.object(tty, "_read", side_effect=itertools.chain([b"\x1b[999~", b"\n"], itertools.repeat(None))):
+            self.assertIsNone(tty.read_key(0))
+            self.assertEqual((tty.read_key(0), tty.burst), ("enter", False))
+
+    @unittest.skipIf(pty is None, "needs POSIX terminals")
+    def test_a_paste_opener_split_over_a_real_pty_read_sends_no_stop(self) -> None:  # both reads' PTY probes
+        for confirm, prefix in ((b"\n", ":stop run-1"), (b"y", "s")):
+            with self.subTest(confirm=confirm):
+                app, api = fresh()
+                for key in prefix:
+                    app.press(key)
+                master, slave = pty.openpty()
+                tty = tty_for(slave)
+                actual, first = tty._read, [True]
+
+                def read(timeout):  # the opener's last byte, and a paste left open, arrive in the wait
+                    data = actual(timeout)
+                    if first[0] and data:
+                        first[0] = False
+                        os.write(master, b"~body")
+                    return data
+
+                tty._read = read
+                try:
+                    with tty.cbreak():
+                        os.write(master, confirm + b"\x1b[200")
+                        key = tty.read_key(1)
+                        marked = tty.burst
+                    app.press(key, burst=marked)
+                    self.assertEqual((marked, [c for c in api.calls if c[0] == "run.stop"]), (True, []))
+                finally:
+                    os.close(master)
+                    os.close(slave)
 
 
 class Round3CoverageTest(unittest.TestCase):

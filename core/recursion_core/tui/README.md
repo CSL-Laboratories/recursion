@@ -67,9 +67,10 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   paste never sends the line. A paste on the run list or at a Stop confirmation is refused (the
   confirmation is cancelled). A paste keeps at most 65,536 characters and says how many it dropped.
 - Unbracketed paste (a heuristic, not a proof): a key is "burst" when it came in one read with other
-  input: another key, part of another key, or a sequence that ended without a key (dropped by the Esc
-  wait or the end of input, unknown, overlong, or broken off). A lone Esc, or one key whose bytes the
-  wait joins, is one key. A burst `y`, or any `y` after a burst `s`, cancels the Stop; a
+  input: another key, part of another key, a paste begun beside it (an unfinished sequence that turns
+  into a paste opener included), or a sequence that ended without a key (dropped by the Esc wait or the
+  end of input, unknown, overlong, or broken off). A lone Esc, one key whose bytes the wait joins, and one
+  paste however it is split, are each one event and not a burst. A burst `y`, or any `y` after a burst `s`, cancels the Stop; a
   burst Enter, or the first Enter on a line that took burst input, does not send it (the next Enter on
   its own does). The TUI says so each time. Input that arrives one key per read cannot be told from
   typing, so a slow unbracketed paste still acts as keys; bracketed paste is the protection.

@@ -209,12 +209,15 @@ class Tty:
             data = self._read(self.esc_wait_s)
             if data is None:
                 keys += decoder.timeout()  # a lone ESC becomes esc; a longer unfinished sequence is dropped
-        # Other input in the same read: another key, part of one held before or after it, or a sequence
-        # that ended without a key however it ended (dropped by the wait or the end of input, completed
-        # as an unknown sequence, broken by another character; reviews of a1f16a20 and 46b8d7d8, C3).
-        # A lone Esc, or one key split over the wait, is one key, not a burst.
+        # Other input in the same read: another key; part of one held before or after it; a sequence that
+        # ended without a key however it ended (dropped by the wait or the end of input, completed as an
+        # unknown sequence, broken by another character); or a paste begun beside it, an unfinished
+        # sequence that became a paste opener included (reviews of a1f16a20, 46b8d7d8 and d69d18aa, C3).
+        # Every sequence held beside a key ends as a key, as one of those sequences or as a paste, and the
+        # wait's loop stops at a paste opener, so a paste begun beside a key is still open here.
+        # A lone Esc, one key split over the wait, and one paste however split, are each one event.
         units = len(keys) + decoder.discarded - discarded_before
-        burst = units > 1 or bool(keys) and (held_before or decoder.holding)
+        burst = units > 1 or bool(keys) and (held_before or decoder.holding or decoder.in_paste)
         self._ready.extend((key, burst) for key in keys)
 
 

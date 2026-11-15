@@ -20,6 +20,10 @@ from recursion_core.tui.keys import KeyDecoder, Paste
 from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI, ScriptedAPI
 from recursion_core.tui.tests.test_inline import ALT_SCREEN, FakeTerminal, TtyOut
 
+# select() on a pipe is POSIX only (Windows refuses it with WinError 10038): the tests that read a real
+# pipe through the terminal driver skip there. The mocked reads beside them run everywhere.
+posix_select = unittest.skipIf(os.name == "nt", "select() on a pipe is POSIX only")
+
 # (bytes a terminal sends, the keys they decode to)
 TABLE = [
     (b"\x1b[C", ["right"]), (b"\x1b[D", ["left"]), (b"\x1b[A", ["up"]), (b"\x1b[B", ["down"]),
@@ -149,6 +153,7 @@ def pipe_keys(data: bytes, *, keep_open: bool = False) -> tuple[list, list[bool]
 
 
 class TtyPipeTest(unittest.TestCase):
+    @posix_select
     def test_piped_keys_decode(self) -> None:
         # The brief's "done when": a piped right arrow, Home, Shift+Tab and a bracketed paste of
         # "stop run-1" decode correctly. Before this lane each of them read as "esc".
@@ -160,10 +165,12 @@ class TtyPipeTest(unittest.TestCase):
                 self.assertEqual(got, want)
                 self.assertTrue(eof)
 
+    @posix_select
     def test_a_lone_esc_reads_as_esc_after_the_wait(self) -> None:
         got, _, eof = pipe_keys(b"\x1b", keep_open=True)
         self.assertEqual((got, eof), (["esc"], False))
 
+    @posix_select
     def test_keys_from_one_read_are_marked_burst(self) -> None:
         got, bursts, _ = pipe_keys(b"sy")
         self.assertEqual((got, bursts), (["s", "y"], [True, True]))
@@ -373,6 +380,8 @@ class BurstProvenanceTest(unittest.TestCase):
     def drive(self, chunks: list[bytes], read_bytes: int | None = None) -> None:
         """Each chunk is one OS write; every key read so far reaches the app before the next write."""
 
+        if os.name == "nt":
+            self.skipTest("select() on a pipe is POSIX only")
         r_fd, w_fd = os.pipe()
         tty = object.__new__(term.Tty)
         tty.fd = r_fd

@@ -172,6 +172,7 @@ class KeyDecoder:
         if self._state == _PASTE:
             self._take(self._paste_tail)
             out.append(self._finish_paste())
+            self._state = _GROUND  # the paste is delivered: nothing is open any more
         return out
 
     # -- the state machine ------------------------------------------------------------------------

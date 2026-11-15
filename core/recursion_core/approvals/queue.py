@@ -97,6 +97,7 @@ class ApprovalQueue:
         self._worker: threading.Thread | None = None
         self._generation = None        # the running worker's token; a worker whose token is gone returns
         self._running = False          # started and not stopped: a surface that subscribes now is offered
+        self._late = None              # while a start runs: (token, fn) of surfaces that subscribed during it
         self.ready = False
 
     # -- composition -------------------------------------------------------------------------------------
@@ -119,36 +120,46 @@ class ApprovalQueue:
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
         with self._lock:
-            self._running = True  # from here a surface that subscribes is offered what no surface took
+            self._late = []  # a surface that subscribes while this start runs is offered the backlog after it
         try:
             self.recover()
+            self._closing.clear()
+            generation = object()
+            worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines",
+                                      daemon=True)
+            self._generation = generation
+            self._worker = worker
+            # Ready before the worker runs: from here only the worker withdraws it (on a failure) and restores
+            # it (after a sweep), so start never overwrites a failure the worker has already reported.
+            self.ready = True
+            try:
+                worker.start()
+            except BaseException:
+                self.ready = False  # failed or interrupted: no worker is known to run; stop deals with this one
+                raise
         except BaseException:
             with self._lock:
-                self._running = False
+                self._late = None  # a failed start offers nothing to anybody
             raise
-        self._closing.clear()
-        generation = object()
-        worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines", daemon=True)
-        self._generation = generation
-        self._worker = worker
-        # Ready before the worker runs: from here only the worker withdraws it (on a failure) and restores it
-        # (after a sweep), so start never overwrites a failure the worker has already reported.
-        self.ready = True
-        try:
-            worker.start()
-        except Exception:
-            self.ready = False  # no worker runs; stop lets this one go (it never launched)
-            raise
+        # Recovery has retired what a dead driver left, and the worker runs: from here a surface that subscribes
+        # is offered what no surface took, and so is each one that subscribed during this start.
+        with self._lock:
+            late, self._late = self._late, None
+            self._running = True
+            subscribed = {token for token, _ in self._requested}
+        for token, fn in late:
+            if token in subscribed:
+                self._offer_late(fn)
 
     def stop(self, context=None) -> None:
         """Signal the worker and return only once it has joined. Interrupted, the worker is kept, and a
         second ``stop`` joins it again. A worker whose thread never launched (its start failed) has nothing
         to join and is let go; were it to launch late, its generation is gone and it returns at once."""
-        self.ready = False
         with self._lock:
+            self.ready = False
             self._running = False
+            self._closing.set()  # with ready, under the lock: a sweep that ends now cannot publish ready again
         self._generation = None
-        self._closing.set()
         self._wake.set()
         worker = self._worker
         if worker is not None:
@@ -164,12 +175,18 @@ class ApprovalQueue:
         with self._lock:
             self._requested.append((token, fn))
             running = self._running
+            if self._late is not None:
+                self._late.append((token, fn))
         if running:
-            try:
-                self._offer_unshown(only=fn)
-            except Exception as exc:  # noqa: BLE001 - the subscription stands; the next start offers them
-                log.error("pending approvals could not be offered to a new surface: %s", type(exc).__name__)
+            self._offer_late(fn)
         return self._unsubscriber(self._requested, token)
+
+    def _offer_late(self, fn) -> None:
+        """Offer one surface that subscribed late what no surface took; a failure keeps the subscription."""
+        try:
+            self._offer_unshown(only=fn)
+        except Exception as exc:  # noqa: BLE001 - the subscription stands; the next start offers them
+            log.error("pending approvals could not be offered to a new surface: %s", type(exc).__name__)
 
     def subscribe_answered(self, fn: Callable[[dict, object], None]) -> Callable[[], None]:
         """``fn(record, binding)`` after a request is resolved: a driver answers its engine from this."""
@@ -315,8 +332,12 @@ class ApprovalQueue:
                     binding = rows.binding_of(tx, approval_id)
             except ApprovalRefused as refused:
                 log.error("approval %s cannot be read (%s); set aside", approval_id, refused.code)
-                with self._store.transaction() as tx:
-                    rows.set_aside(tx, approval_id)
+                try:
+                    with self._store.transaction() as tx:
+                        rows.set_aside(tx, approval_id)
+                except Exception as exc:  # noqa: BLE001 - tried again at the next turn; the others go on
+                    log.error("approval %s could not be set aside (%s)", approval_id, type(exc).__name__)
+                    failure = failure or exc
                 continue
             except Exception as exc:  # noqa: BLE001 - one row's failure holds back no other deadline
                 log.error("approval %s could not be expired (%s)", approval_id, type(exc).__name__)
@@ -341,7 +362,9 @@ class ApprovalQueue:
                 if self._closing.is_set():
                     break
                 self.sweep()
-                self.ready = True
+                with self._lock:
+                    if not self._closing.is_set():
+                        self.ready = True
             except Exception as exc:  # noqa: BLE001 - the worker must outlive a failed transaction
                 self.ready = False
                 log.error("the approval deadline worker failed (%s); trying again", type(exc).__name__)

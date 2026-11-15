@@ -381,7 +381,8 @@ class Signal:
     Here ``set`` holds nothing. It stores the flag, then releases each waiter's own lock: single calls that
     happen or do not. Interrupted at any point it can be called again, any number of times, and finishes what
     it began: a waiter it had not reached is reached then. A waiter holds a lock of its own and nothing else,
-    so a waiter that is interrupted takes nothing from anybody."""
+    so a waiter that is interrupted takes nothing from anybody. A waiter that leaves, woken or not, takes its
+    lock off the list in one call."""
 
     __slots__ = ('_flag', '_waiters')
 
@@ -401,20 +402,26 @@ class Signal:
                 pass
 
     def wait(self, timeout: float | None = None) -> bool:
-        """True once the signal is set; False when ``timeout`` seconds passed first. With no timeout it waits."""
+        """True when the signal is set: at once if it is set already, otherwise when a ``set`` wakes this wait.
+        False when ``timeout`` seconds pass first, and that answer stands even if the signal is set a moment
+        later: it says whether the wait was woken, as ``threading.Event.wait`` does, and ``is_set()`` says what
+        the signal is now. With no timeout it waits."""
         mine = threading.Lock()
         mine.acquire()                  # nobody else has it yet: it is taken at once
         try:
             self._waiters.append(mine)
-            if not self._flag:          # looked at again, now that a set can find this lock
-                if timeout is None:
-                    mine.acquire()
-                elif timeout > 0:
-                    mine.acquire(True, timeout)
-            return self._flag
+            if self._flag:              # looked at again, now that a set can find this lock
+                return True
+            if timeout is None:
+                return mine.acquire()
+            if timeout > 0:
+                return mine.acquire(True, timeout)      # False: the time passed and no set had let this lock go
+            return False
         finally:
-            if mine in self._waiters:
-                self._waiters.remove(mine)
+            try:
+                self._waiters.remove(mine)      # ONE call finds it and takes it off. Looking first can miss it:
+            except ValueError:                  # a look walks the list while other waiters shorten it
+                pass                            # not there: this wait was interrupted before it was put on
 
 
 class MethodTable:

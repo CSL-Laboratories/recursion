@@ -1852,7 +1852,7 @@ class AdmissionTest(unittest.TestCase):
         time the gate does its work first (it is closed; the drain's one call has left), raises the interruption
         only then, and leaves the condition free: released where it was taken, and not released where it was
         not."""
-        for step, first_line in (('close', 'self._closed = True'), ('drain', 'while self._admitted > 0:')):
+        for step, first_line in (('close', 'self._closed = True'), ('drain', 'self._until_none_is_inside()')):
             method = getattr(H.Admission, step)
             lines, start = inspect.getsourcelines(method)
             target = start + next(index for index, line in enumerate(lines) if first_line in line)
@@ -3185,6 +3185,22 @@ class RegionWalk:
         self.assertEqual(unfinished, list(range(len(unfinished))), 'only the first points leave the work to be done again')
         self.assertLess(len(unfinished), total // 2, 'and they are few: once entered, the region always finishes')
 
+    def straight(self, module, owner, name) -> None:
+        """The region ``owner.name`` of ``module`` is written as OWNERSHIP says: one loop, the region's own, with
+        nothing in it but one try; and between that try and its one except no loop, no try and no with, because
+        the interpreter leaves the first instruction of a nested try and a nested loop's jump back outside the
+        handler."""
+        tree = ast.parse(pathlib.Path(module.__file__).read_text(encoding='utf-8'))
+        function, = [node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == owner
+                     for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        loop, = [node for node in function.body if isinstance(node, ast.While)]
+        self.assertEqual([type(node) for node in loop.body], [ast.Try], "the region's loop holds the try and nothing else")
+        region = loop.body[0]
+        nested = [type(node).__name__ for part in region.body for node in ast.walk(part)
+                  if isinstance(node, (ast.While, ast.For, ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith))]
+        self.assertEqual(nested, [], 'no loop, no try and no with is written between the try and its except')
+        self.assertEqual((len(region.handlers), region.orelse, region.finalbody), (1, [], []), 'one except; no else, no finally')
+
     def by_instruction(self, region) -> None:
         total, lost = self.lost_at_instructions()
         if lost:
@@ -3224,7 +3240,8 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     walked like every other point."""
 
     def lifecycle(self):
-        """Hooks with a store open and a service started, cheap enough to make a few hundred times."""
+        """Hooks with a store open and two services started (two, so that every loop of the teardown goes round
+        and its jump back is walked), cheap enough to make a few hundred times."""
         class Store:
             closed = False
 
@@ -3232,6 +3249,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
                 inner.closed = True
         made, store = H.Hooks(), Store()
         made.service(Service('events', []))
+        made.service(Service('sessions', []))
         made.set('event_store', lambda state_dir: store)
         made.freeze()
         made.open_store('/state')
@@ -3239,14 +3257,18 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         return made, store
 
     def draining(self):
-        """A gate that is closed with one call inside, which leaves as soon as the drain waits for it."""
+        """A gate that is closed with one call inside, which leaves the second time the drain waits for it: the
+        wait goes round once, so its jump back is walked."""
         gate = H.Admission()
         gate.enabled = True
         gate.enter()
         gate.close()
+        waits: list = []
 
         def waiting(timeout=None):      # the call leaves, as another thread's would: the test's own stand-in
-            gate._admitted = 0
+            waits.append(timeout)
+            if len(waits) > 1:
+                gate._admitted = 0
             return True
         gate._changed.wait = waiting
         return gate
@@ -3266,6 +3288,11 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         gate = H.Admission()
         gate.enabled = True
         return gate
+
+    def test_the_four_regions_have_no_loop_and_no_try_written_in_them(self) -> None:
+        for owner, name in (('Admission', 'close'), ('Admission', 'drain'), ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
+            with self.subTest(region=f'{owner}.{name}'):
+                self.straight(H, owner, name)
 
     @quiet
     def test_the_gates_close_at_every_event(self) -> None:

@@ -468,13 +468,22 @@ class ServiceContext:
 # again: it takes the lock where it does not have it, does what is not done, and releases what it holds. Each of the
 # four pieces of work can be gone into again (it asks what is left to do).
 #
+# THE WORK IS STRAIGHT-LINE: no loop and no try of its own is written between the try and its except, only calls and
+# plain statements. The interpreter leaves two kinds of instruction inside a try outside that try's handler: the first
+# instruction of a try nested in it, and the jump back of a loop nested in it (CPython 3.12 and 3.14, read from the
+# exception tables). A loop's jump back is also one of the few places where a real signal is delivered. So a piece of
+# work that loops or has a try of its own is a function, called from the region: the call is covered. A test holds
+# that the four regions are written so.
+#
 # What this form cannot cover, and does not claim:
 # (1) the instructions before the region is entered and after it is left. An interruption there is raised at once and
 #     is not kept. Nothing is owned either time. Before, nothing has been done and the call can be made again; after,
 #     everything has;
 # (2) a second interruption that lands while the first is being put away, inside the except clause. Pure Python has
 #     no way to make those instructions uninterruptible;
-# (3) what the lock's own acquire and release do inside themselves (with threading.RLock, single calls into C).
+# (3) what the lock's own acquire and release do inside themselves (with threading.RLock, single calls into C);
+# (4) on 3.14, the marker instruction the interpreter puts after a conditional jump that is not taken. It is outside
+#     every handler too; no signal is delivered at it.
 # A test walks every instruction of each region and interrupts it there (OwnershipRegionTest).
 def take_once(lock, errors: list) -> None:
     """Acquire ``lock`` and return holding it EXACTLY ONCE, however the acquiring is interrupted. ``lock`` is a
@@ -605,10 +614,7 @@ class Admission:
                 if not done:
                     if not self._lock._is_owned():
                         take_once(self._lock, kept)     # held once; the taking and its return are inside the region
-                    while self._admitted > 0:
-                        if not self._changed.wait(self.stall_log_s):
-                            log.warning('closing waits for %d admitted call(s); services and stores stay alive',
-                                        self._admitted)
+                    self._until_none_is_inside()
                     done = True
                 if self._lock._is_owned():
                     self._lock.release()
@@ -617,6 +623,14 @@ class Admission:
                 kept.append(exc)
                 log.warning('the wait for admitted calls was interrupted (%s); it goes on', type(exc).__name__)
         raise_kept(kept)
+
+    def _until_none_is_inside(self) -> None:
+        """The wait of ``drain``, whose caller holds the condition. It is a method of its own because a protected
+        region has no loop written in it (the comment OWNERSHIP says why): an interruption anywhere in here
+        reaches the region as one out of this call, which the region covers, and the wait is gone into again."""
+        while self._admitted > 0:
+            if not self._changed.wait(self.stall_log_s):
+                log.warning('closing waits for %d admitted call(s); services and stores stay alive', self._admitted)
 
 
 # ------------------------------------------------------------------------------------------ the hooks

@@ -33,10 +33,16 @@ stands on lane DRIVER-CC's handle service, lane STOP's Stop and lane ROUTING's c
     ``order.run_id``, incarnation ``order.worker_incarnation``, as a new turn or into the turn in progress
     (``order.how``). Same returns and raises as ``launch``.
 
+    ``interrupt(order: InterruptOrder)``: the driver's own cancel of the turn ``order.turn_id`` in the live worker of
+    ``order.run_id``, incarnation ``order.worker_incarnation`` (driver.v2: ``interrupt(turn_id)``, only where the
+    driver declares ``interrupt``). Returns when the cancel was handed to the engine; that the turn WAS interrupted
+    is reported back later (``Sessions.turn_interrupted``). Raises ``UnitRefused`` when the driver definitely did
+    not send it (the turn is not the one in progress, say); any other exception is an outcome nobody can vouch for.
+
     ``stop(run_id)``: today's Stop of one run; returns its stop.result.v1 answer, or None when no run of that id
     was ever registered. A Stop is safe to ask again (an emergency Stop never needs fresh state).
 
-The engine side reports back through the service (``Sessions.accepted``, ``turn_finished``,
+The engine side reports back through the service (``Sessions.accepted``, ``turn_finished``, ``turn_interrupted``,
 ``engine_session_reported``); in this slice the tests make those calls.
 """
 from __future__ import annotations
@@ -77,6 +83,14 @@ class SendOrder:
     how: str
 
 
+@dataclass(frozen=True)
+class InterruptOrder:
+    session_id: str
+    turn_id: str
+    run_id: str
+    worker_incarnation: str
+
+
 class Drivers(Protocol):
     def declaration(self, engine: str) -> dict | None: ...
 
@@ -89,6 +103,8 @@ class Units(Protocol):
     def launch(self, order: LaunchOrder) -> None: ...
 
     def send(self, order: SendOrder) -> None: ...
+
+    def interrupt(self, order: InterruptOrder) -> None: ...
 
     def stop(self, run_id: str) -> dict | None: ...
 

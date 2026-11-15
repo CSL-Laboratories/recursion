@@ -14,7 +14,7 @@ import unittest
 
 from recursion_core.control import hooks as H
 from recursion_core.sessions import store
-from recursion_core.sessions.tests.support import BOUND_S, SCHEMAS, Lane, wire_client
+from recursion_core.sessions.tests.support import BOUND_S, SCHEMAS, Lane, published_rules, wire_client
 
 
 class MethodsTest(unittest.TestCase):
@@ -23,18 +23,31 @@ class MethodsTest(unittest.TestCase):
     def setUpClass(cls):
         cls.client = wire_client()
         cls.schemas = None if cls.client is None else cls.client.SchemaSet(SCHEMAS)
+        cls.rules = published_rules()
 
     def setUp(self):
         self.lane = Lane()
 
     def call(self, method, params, principal=H.OWNER):
-        """Dispatch, and on an interpreter with jsonschema check the answer against the published answer schema."""
+        """Dispatch, and check the answer against the published answer schema: on every interpreter with SPINE's
+        standard-library reader (``conformance/rules.py``, ``fits``), and where jsonschema is installed also with
+        SPINE's conformance client."""
         answer = self.lane.call(method, params, principal)
+        self.assertTrue(self.rules.fits(f'methods.v1.json#/$defs/answer.{method}', answer),
+                        f'{method} answered {answer!r}')
         if self.client is not None:
             ref = f'methods.v1.json#/$defs/answer.{method}'
             problem = self.client.check_instance(self.schemas, {'file': f'good/{method}', 'schema': ref}, answer)
             self.assertIsNone(problem, f'{method} answered {answer!r}')
         return answer
+
+    def test_the_standard_library_reader_refuses_an_answer_the_table_does_not_give(self):
+        self.assertIsNotNone(self.rules, "SPINE's conformance/rules.py (#368) is not in the tree")
+        good = {'code': 'conflict', 'detail': 'stale_turn', 'session_id': 'ses-1'}
+        self.assertTrue(self.rules.fits('methods.v1.json#/$defs/answer.session.steer', good))
+        for bad in ({**good, 'detail': 'session_ended'}, {'code': 'busy', 'detail': 'live'}, {'code': 'ok'}):
+            with self.subTest(bad=bad):
+                self.assertFalse(self.rules.fits('methods.v1.json#/$defs/answer.session.steer', bad))
 
     def test_the_answers_are_checked_against_the_published_schema_on_this_interpreter(self):
         if self.client is None:

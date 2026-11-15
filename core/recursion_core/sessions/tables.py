@@ -68,7 +68,7 @@ CREATE INDEX sessions_delivery_open ON sessions_delivery (state, session_id);
 CREATE TABLE sessions_work (
     operation_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions_session (session_id),
-    kind TEXT NOT NULL CHECK (kind IN ('launch', 'send', 'stop')),
+    kind TEXT NOT NULL CHECK (kind IN ('launch', 'send', 'interrupt', 'stop')),
     state TEXT NOT NULL CHECK (state IN ('pending', 'attempting', 'done', 'failed', 'outcome_unknown')),
     payload TEXT NOT NULL,
     outcome TEXT

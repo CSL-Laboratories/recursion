@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from recursion_core.sessions.tests import make_fixtures
-from recursion_core.sessions.tests.support import FIXTURES, load_json, wire_client
+from recursion_core.sessions.tests.support import FIXTURES, load_json, published_rules, wire_client
 
 
 class FixturesTest(unittest.TestCase):
@@ -24,6 +24,13 @@ class FixturesTest(unittest.TestCase):
         named = {file for file, _, _, _ in self.found} | {'index.json', 'README.md'}
         present = {path.relative_to(FIXTURES).as_posix() for path in FIXTURES.rglob('*') if path.is_file()}
         self.assertEqual(present - named, set())
+
+    def test_every_fixture_fits_the_schema_its_index_names_on_every_interpreter(self):
+        rules = published_rules()
+        self.assertIsNotNone(rules, "SPINE's conformance/rules.py (#368) is not in the tree")
+        for file, schema, _, record in self.found:
+            with self.subTest(fixture=file):
+                self.assertTrue(rules.fits(schema, record))
 
     def test_every_fixture_validates_against_the_schema_its_index_names(self):
         client = wire_client()

@@ -45,7 +45,7 @@ def declaration(engine: str, *, input_ack: bool = False, **on) -> dict:
 # another message and input mid-turn; 'resumer' runs one turn per run and resumes the engine's session.
 DECLARATIONS = {
     'one_turn': declaration('claude_code'),
-    'worker': declaration('codex', input_ack=True, multi_turn=True, mid_turn_input=True, resume=True),
+    'worker': declaration('codex', input_ack=True, multi_turn=True, mid_turn_input=True, resume=True, interrupt=True),
     'resumer': declaration('opencode', resume=True),
 }
 ENGINE_OF = {'one_turn': 'claude_code', 'worker': 'codex', 'resumer': 'opencode'}
@@ -86,6 +86,7 @@ class FakeUnits:
     def __init__(self) -> None:
         self.launched: list = []
         self.sent: list = []
+        self.interrupts: list = []
         self.stops: list = []
         self.then: list = []
         self.stop_answers: list = []
@@ -114,6 +115,9 @@ class FakeUnits:
 
     def send(self, order) -> None:
         self._do(self.sent, order)
+
+    def interrupt(self, order) -> None:
+        self._do(self.interrupts, order)
 
     def stop(self, run_id):
         self.stops.append(run_id)
@@ -225,6 +229,24 @@ class Lane:
 
 def load_json(path) -> object:
     return json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
+
+
+_RULES = []
+
+
+def published_rules():
+    """SPINE's ``conformance/rules.py`` (#368, merged into this branch), loaded by its path: standard library only,
+    so its ``fits(ref, value)`` checks a value against the published schemas on EVERY interpreter, the
+    free-threaded one included. None when the file is absent (an installed core without the repository)."""
+    if not _RULES:
+        path = REPO / 'conformance' / 'rules.py'
+        module = None
+        if path.is_file():
+            spec = importlib.util.spec_from_file_location('sessions_published_rules', path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        _RULES.append(module)
+    return _RULES[0]
 
 
 def wire_client():

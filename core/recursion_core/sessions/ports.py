@@ -39,8 +39,9 @@ stands on lane DRIVER-CC's handle service, lane STOP's Stop and lane ROUTING's c
     ``stop(run_id)``: today's Stop of one run; returns its stop.result.v1 answer, or None when no run of that id
     is registered. A Stop is safe to ask again (an emergency Stop never needs fresh state). Only a well-formed
     answer that confirms the Stop settles a session (``records.stop_confirmed``). None is taken as "nothing of
-    that run runs" only when no launch of the run is still pending or in flight: a launch that is inside
-    ``launch`` may not have registered its run YET, so then the Stop is asked again (``service.py``).
+    that run runs" only when no launch of the run was pending or in flight when the Stop was claimed: a launch
+    that is inside ``launch`` may register its run after the Stop looked, so then the Stop is asked again
+    (``service.py``).
 
 The engine side reports back through the service (``Sessions.accepted``, ``turn_finished``,
 ``engine_session_reported``); in this slice the tests make those calls.

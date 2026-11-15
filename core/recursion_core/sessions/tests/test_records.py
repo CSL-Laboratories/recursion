@@ -167,6 +167,18 @@ class StopAnswerTest(unittest.TestCase):
             {**stopped, 'fence': {'state': 'open', 'incarnation': 1}}, {**stopped, 'fence': {'state': 'fenced'}},
             {**stopped, 'fence': {'state': 'fenced', 'incarnation': -1}},
             {**stopped, 'fence': {'state': 'fenced', 'incarnation': 1, 'more': 2}}, {**stopped, 'colour': 'red'},
+            # a JSON Schema integer may be written 1.0; a boolean, a fraction, a string or null is not one
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': 1.0}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': True}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': False}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': 1.5}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': '1'}},
+            {**stopped, 'fence': {'state': 'fenced', 'incarnation': None}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1.0, 'st_ino': 2}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1, 'st_ino': 2.0}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1.5, 'st_ino': 2}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': 1, 'st_ino': '2'}}},
+            {**stopped, 'attestation': {**seen, 'proof': 'removed', 'cgroup_identity': {'st_dev': -1.0, 'st_ino': 2}}},
             {'code': 'stopped', 'run_id': self.RUN}, 'stopped', [], 7,
         ]
 

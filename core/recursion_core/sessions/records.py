@@ -280,7 +280,8 @@ def _check_attestation(value) -> None:
     if identity is not None:
         _exact_keys(identity, ('st_dev', 'st_ino'), '/attestation/cgroup_identity')
         for key in ('st_dev', 'st_ino'):
-            _need(_is_int(identity[key]) and identity[key] >= 0, f'/attestation/cgroup_identity/{key}', 'minimum')
+            _need(integer(identity[key]) is not None and identity[key] >= 0, f'/attestation/cgroup_identity/{key}',
+                  'minimum')
     _need(value['proof'] != 'removed' or identity is not None, '/attestation/cgroup_identity', 'removed')
     _need(_instant(value['time']), '/attestation/time', 'timestamp')
 
@@ -303,7 +304,8 @@ def _check_stop(answer, run_id: str) -> None:
         fence = answer['fence']
         _exact_keys(fence, ('state', 'incarnation'), '/fence')
         _need(fence['state'] in ('fenced', 'dispatched'), '/fence/state', 'enum')
-        _need(_is_int(fence['incarnation']) and fence['incarnation'] >= 0, '/fence/incarnation', 'minimum')
+        _need(integer(fence['incarnation']) is not None and fence['incarnation'] >= 0, '/fence/incarnation',
+              'minimum')
     if code == 'stopped':
         _need(isinstance(answer.get('repeat'), bool), '/repeat', 'stopped')
         if 'attestation' in answer:

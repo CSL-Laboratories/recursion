@@ -23,9 +23,11 @@ THE FENCE BETWEEN A LAUNCH AND A STOP. Two passes may run at once (nothing here 
   ``failed`` (``stop_requested``) at its claim, and the Stop settles the turn as one that never started;
 - a Stop settles a session only on a well-formed answer that confirms it (``records.stop_confirmed``). An
   answer of None (no run of that id is registered) is taken as "nothing of that run runs" only when no launch
-  of that run is still pending or attempting: a launch inside the port may register its run after the Stop
-  looked. Until then the Stop is asked again and the session stays ``stop_pending``, so no replacement turn
-  can open beside a unit that may still appear.
+  of that run was pending or attempting when the Stop was CLAIMED, that is, before the Stop looked: such a
+  launch may register its run after the Stop looked, even if it ends before the Stop's answer is read. A launch
+  that had ended before the claim had registered its run, or not, before the Stop looked. Until then the Stop is
+  asked again and the session stays ``stop_pending``, so no replacement turn can open beside a unit that may
+  still appear.
 
 THE RESTART (``recover``), in one transaction:
 1. every delivery still ``delivering`` becomes ``outcome_unknown``, with its event (queue.item.v1);
@@ -263,6 +265,10 @@ class Sessions:
                     return 0
             if not store.move_work(tx, operation_id, 'pending', 'attempting'):
                 return 0
+            if operation['kind'] == 'stop':
+                # Read in the claim, before the Stop looks: a launch of the run still open now may register it
+                # after the Stop looked, whenever that launch ends.
+                operation['launch_open'] = self._launch_open(tx, operation['payload']['run_id'])
         if operation['kind'] == 'stop':
             self._stop(operation)
         else:
@@ -351,13 +357,14 @@ class Sessions:
         except Exception:  # noqa: BLE001 - a Stop is asked again; it is never taken as done
             log.exception('the Stop of %s failed; it will be asked again', run_id)
             answer = {'code': 'pending', 'run_id': run_id, 'state': 'pending', 'reason': 'confirm_unknown'}
-        # None: no run of that id is registered, so nothing of it runs, unless a launch of it may still register
-        # it (checked below, in the same transaction as the settling). Any answer but a well-formed confirmation
-        # of this run's Stop is NOT stopped.
-        code = 'ended' if answer is None else (records.stop_confirmed(answer, run_id) or 'pending')
+        # None: no run of that id is registered, so nothing of it runs, unless a launch of it was still open when
+        # this Stop was claimed (read in the claim, before the Stop looked). Any answer but a well-formed
+        # confirmation of this run's Stop is NOT stopped.
+        if answer is None:
+            code = 'pending' if operation['launch_open'] else 'ended'
+        else:
+            code = records.stop_confirmed(answer, run_id) or 'pending'
         with self.store.transaction() as tx:
-            if answer is None and self._launch_open(tx, run_id):
-                code = 'pending'
             if code == 'pending':
                 store.move_work(tx, operation['operation_id'], 'attempting', 'pending', {'answer': 'pending'})
                 return
@@ -376,7 +383,9 @@ class Sessions:
         self.wake.set()
 
     def _launch_open(self, tx, run_id: str) -> bool:
-        """Whether a launch of ``run_id`` is pending or attempting: it may still register that run."""
+        """Whether a launch of ``run_id`` is pending or attempting: it may still register that run. A launch of a
+        run is committed with the turn that binds the run, before any Stop of it can be asked, so a launch that is
+        not open when a Stop is claimed never opens again."""
         return any(operation['kind'] == 'launch' and operation['payload']['run_id'] == run_id
                    for state in ('pending', 'attempting') for operation in store.work(tx, state=state))
 

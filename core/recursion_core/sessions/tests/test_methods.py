@@ -397,7 +397,9 @@ class MethodsTest(unittest.TestCase):
                 ('session.queue', {'command_id': 'cmd-bad-00003', 'session_id': session['session_id'], 'text': 7},
                  'text'),
                 ('session.list', {'limit': 0}, 'limit'),
-                ('session.list', {'state': 'asleep'}, 'state')):
+                ('session.list', {'state': 'asleep'}, 'state'),
+                ('session.list', [], 'params'),
+                ('session.status', 'ses-x', 'params')):
             with self.subTest(method=method, field=field):
                 self.assertEqual(self.call(method, params), {'code': 'request_invalid', 'detail': field})
         self.assertEqual(list(self.receipts()), [('t1', 'session.start', 'cmd-start-0001')])

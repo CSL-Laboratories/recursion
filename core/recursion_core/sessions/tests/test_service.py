@@ -326,6 +326,59 @@ class FenceTest(unittest.TestCase):
         self.assertEqual([order.run_id for order in lane.units.launched], [first_run])
         self.assertEqual(lane.units.stops, [first_run, first_run])
 
+    def test_an_absence_seen_before_a_launch_ended_settles_nothing_even_when_read_after_it(self):
+        """The Stop looks while the launch is inside the port and sees no run; the launch then registers its run
+        and ends; only then is the Stop's answer read. That answer is stale: the session stays stop_pending, no
+        replacement opens, and the next Stop finds the run and stops it."""
+        lane = Lane()
+        session = lane.start(engine='opencode', prompt='first')['session']
+        sid, first_run = session['session_id'], session['worker']['run_id']
+        lane.sessions.engine_session_reported(sid, 'engine-conversation-1')
+        entered, release, errors = threading.Event(), threading.Event(), []
+        real_launch, real_stop = lane.units.launch, lane.units.stop
+
+        def launch(order):
+            entered.set()
+            if not release.wait(BOUND_S):
+                raise AssertionError('the launch was never released')
+            real_launch(order)
+
+        def carry():
+            try:
+                lane.sessions.run_pending()
+            except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+                errors.append(exc)
+
+        thread = threading.Thread(target=carry)
+
+        def stop(run_id):
+            seen = real_stop(run_id)                      # the launch has not registered its run yet
+            release.set()
+            thread.join(BOUND_S)                          # the launch registers its run and ends ...
+            self.assertIn(run_id, lane.units.registered)
+            return seen                                   # ... and only now is the absence read
+
+        lane.units.launch = launch
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(BOUND_S))
+            lane.units.stop = stop
+            lane.sessions.request_stop(sid)
+            self.assertEqual(lane.sessions.run_pending(), 1)
+        finally:
+            release.set()
+            thread.join(BOUND_S)
+        lane.units.stop = real_stop
+        self.assertEqual(errors, [])
+        held = session_of(lane, sid)
+        self.assertEqual(held['state'], 'stop_pending', 'an absence seen before the launch ended is stale')
+        replacement = turn_of(lane, held, text='replacement')
+        self.assertEqual((replacement['code'], replacement['detail']), ('busy', 'stop_pending'))
+        self.assertEqual(lane.sessions.run_pending(), 1)          # asked again: the run is there, and stopped
+        self.assertEqual(session_of(lane, sid)['state'], 'idle')
+        self.assertEqual([order.run_id for order in lane.units.launched], [first_run])
+        self.assertEqual(lane.units.stops, [first_run, first_run])
+
     def test_a_launch_not_yet_attempted_is_never_attempted_once_a_stop_is_asked(self):
         lane = Lane()
         session = lane.start(prompt='first')['session']
@@ -371,6 +424,20 @@ class FreshLaunchTest(unittest.TestCase):
         idle = session_of(lane, session['session_id'])
         self.assertEqual(idle['state'], 'idle')
         refused = turn_of(lane, idle)
+        self.assertEqual((refused['code'], refused['detail']), ('unsupported', 'not_implemented'))
+        self.assertEqual(lane.units.launched, [])
+
+    def test_a_refused_launch_then_one_whose_outcome_is_unknown_is_not_followed_by_a_fresh_launch(self):
+        lane = Lane()
+        lane.units.then = [UnitRefused('engine_missing'), RuntimeError('the pipe broke')]
+        session = lane.start(prompt='first')['session']
+        lane.settle()
+        self.assertEqual(turn_of(lane, session_of(lane, session['session_id']), text='again')['code'], 'ok')
+        with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
+            lane.settle()
+        idle = session_of(lane, session['session_id'])
+        self.assertEqual([turn['state'] for turn in idle['turns']], ['failed', 'failed'])
+        refused = turn_of(lane, idle, command_id='cmd-turn-0002')
         self.assertEqual((refused['code'], refused['detail']), ('unsupported', 'not_implemented'))
         self.assertEqual(lane.units.launched, [])
 
@@ -710,6 +777,66 @@ class ServiceLifecycleTest(unittest.TestCase):
             running = sum(thread.name == 'sessions-service' for thread in threading.enumerate())
             lane.service.stop(None)
             self.assertEqual(running - before, 1)
+
+    def test_a_start_during_a_stop_waits_until_the_old_loop_has_joined(self):
+        """Stop holds the service's lock until its loop has joined, so a start made meanwhile finds the lock held
+        and starts its loop only after the old one is gone: never two loops at once."""
+        lane = Lane()
+        in_recovery, release, joining, attempted = (threading.Event() for _ in range(4))
+        found_held = []
+        real_recover = lane.sessions.recover
+
+        def recover():
+            in_recovery.set()
+            if not release.wait(BOUND_S):
+                raise AssertionError('recovery was never released')
+            real_recover()
+
+        class WatchedLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+
+            def __enter__(self):
+                if threading.current_thread().name == 'sessions-test-starter':
+                    found_held.append(self.lock.locked())
+                    attempted.set()
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self.lock.release()
+
+        lane.sessions.recover = recover
+        lane.service.interval_s = BOUND_S
+        lane.service.start(None)
+        self.assertTrue(in_recovery.wait(BOUND_S))
+        old = lane.service._thread
+        real_join = old.join
+
+        def join(timeout=None):
+            joining.set()
+            real_join(timeout)
+
+        old.join = join
+        lane.service._lock = WatchedLock()
+        stopper = threading.Thread(target=lane.service.stop, args=(None,), daemon=True)
+        starter = threading.Thread(target=lane.service.start, args=(None,), name='sessions-test-starter', daemon=True)
+        stopper.start()
+        try:
+            self.assertTrue(joining.wait(BOUND_S))             # the stop is joining the old loop, still recovering
+            starter.start()
+            self.assertTrue(attempted.wait(BOUND_S))
+        finally:
+            release.set()
+            stopper.join(BOUND_S)
+            starter.join(BOUND_S)
+            if found_held != [True]:                           # whatever went wrong, leave no loop running
+                lane.service._stopping.set()
+                lane.sessions.wake.set()
+        self.assertEqual(found_held, [True], 'the start found the lifecycle held by the stop')
+        self.assertFalse(old.is_alive())
+        self.assertIsNot(lane.service._thread, old)
+        lane.service.stop(None)
 
     def test_a_crash_of_a_pass_leaves_the_service_not_ready_with_its_failure_kept(self):
         lane = Lane()

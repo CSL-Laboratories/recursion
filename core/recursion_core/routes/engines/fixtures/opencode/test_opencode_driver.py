@@ -7,6 +7,8 @@ A spy stands in for the launch path: it records every spawn and gives back a pla
 
 from __future__ import annotations
 
+import inspect
+import sys
 import unittest
 from pathlib import Path
 
@@ -144,6 +146,36 @@ class DriverTests(unittest.TestCase):
         driver = oc.OpenCodeDriver(self.spy, binary="/opt/oc/bin/opencode")
         driver.start(start_record(), ENV)
         self.assertEqual(self.spy.spawns[1][0][0], "/opt/oc/bin/opencode")
+
+
+class ParserStateTests(unittest.TestCase):
+    """The two fields this slice adds to ``Parser`` are put back with the rest when a line is interrupted."""
+
+    def test_an_interrupted_line_leaves_the_step_reason_and_the_last_type_as_they_were(self):
+        p = oc.Parser(connection_id="api_key:k1", model=None, wall=lambda: 1794614400.0, clock=lambda: 100.0)
+        p.feed(b'{"type":"step_start","sessionID":"ses_x","part":{"type":"step-start"}}\n')
+        finish = (b'{"type":"step_finish","sessionID":"ses_x","part":{"type":"step-finish","reason":"stop",'
+                  b'"tokens":{"input":1}}}\n')
+        lines, first = inspect.getsourcelines(oc.Parser.feed)
+        target = first + next(i for i, text in enumerate(lines) if text.strip() == "return drafts")
+
+        def tracer(frame, event, arg):
+            if frame.f_code is oc.Parser.feed.__code__:
+                if event == "line" and frame.f_lineno == target:
+                    raise KeyboardInterrupt
+                return tracer
+            return None
+
+        sys.settrace(tracer)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                p.feed(finish)                                   # interrupted on its return
+        finally:
+            sys.settrace(None)
+        self.assertEqual((p._finish, p.last_type), (None, "step_start"))
+        p.feed(finish)
+        self.assertEqual((p._finish, p.last_type), ("stop", "step_finish"))
+        self.assertEqual(p.end(None)[0]["payload"]["code"], None)  # the stream's own end of the turn
 
 
 if __name__ == "__main__":

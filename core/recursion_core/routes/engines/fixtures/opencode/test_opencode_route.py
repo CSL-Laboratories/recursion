@@ -104,12 +104,13 @@ class RouteTests(unittest.TestCase):
         self.assertEqual((res["status"], res["code"], res["text"]), ("ok", None, "The tests pass."))
         (call,) = self.launcher.calls
         self.assertEqual(call["argv"], ["opencode", "run", "--format", "json", "--model", MODEL])
-        self.assertEqual(call["env"], {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "OPENAI_API_KEY": "sk-made-up-k1"})
+        self.assertEqual(call["env"], {"PATH": "/usr/bin:/bin", "HOME": str(self.home),
+                                       "OPENAI_API_KEY": "sk-made-up-k1"})
         self.assertIs(call["shell"], False)
         process = self.launcher.processes[0]
         self.assertEqual((process.sent, process.stdin_closed), (["-v --model claude-agent/x"], True))
         (usage,) = [e for e in res["events"] if e["kind"] == "usage"]
-        self.assertEqual(usage["data"]["input_tokens"], 1200)
+        self.assertEqual(usage["data"]["input_tokens"], {"value": 1200, "quality": "known", "provenance": "observed"})
 
     def test_a_replayed_429_opens_the_breaker_for_that_connection_only(self):
         for name in ("synthetic-v1-limit-429.jsonl", "synthetic-v2-rate-limit.jsonl"):

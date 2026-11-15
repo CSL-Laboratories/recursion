@@ -9,8 +9,9 @@
 
 An error whose request id cannot be read carries ``id: null`` (JSON-RPC 2.0, section 5).
 
-Request ids are compared as JSON values, not as Python values: ``"1"`` and ``1`` are different requests,
-and ``true`` is never the request ``1`` (``id_key``).
+Request ids are compared as JSON values: ``"1"`` and ``1`` are different requests (a Python dict keeps
+them apart too), and ``true`` is never the request ``1`` because a boolean is not a valid id at all
+(Python alone would take ``True == 1``).
 """
 
 from __future__ import annotations
@@ -36,12 +37,6 @@ def valid_id(value: Any) -> bool:
     if isinstance(value, int):
         return True
     return isinstance(value, float) and math.isfinite(value)
-
-
-def id_key(value: Any) -> tuple[str, Any]:
-    """A key that keeps a string id apart from a numeric one of the same spelling. Call only on a valid id."""
-
-    return ("s", value) if isinstance(value, str) else ("n", value)
 
 
 def result(request_id: Any, value: dict) -> dict:

@@ -121,7 +121,7 @@ class LegacySession:
         self._descriptors = [t.descriptor for t in self._tools.values()]
         self._max_in_flight, self._reserved_stop = max_in_flight, reserved_stop
         self._cond = threading.Condition()
-        self._in_flight: dict[tuple[str, Any], _Call] = {}
+        self._in_flight: dict[Any, _Call] = {}  # by request id (str or number)
         self._general = 0
         self._reserved = 0
         self.initialized = False
@@ -158,7 +158,7 @@ class LegacySession:
             if not jsonrpc.valid_id(request_id):
                 return
             with self._cond:
-                call = self._in_flight.get(jsonrpc.id_key(request_id))
+                call = self._in_flight.get(request_id)
                 if call is not None:
                     call.cancelled = True
             self._log({"event": "cancelled", "in_flight": call is not None})
@@ -166,7 +166,7 @@ class LegacySession:
 
     def _request(self, req: jsonrpc.Request) -> None:
         with self._cond:
-            busy = jsonrpc.id_key(req.id) in self._in_flight
+            busy = req.id in self._in_flight
         if busy:
             self._write(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST,
                                       "Invalid Request: this id belongs to a request still in flight"))
@@ -262,7 +262,7 @@ class LegacySession:
                     break
                 self._cond.wait()
             call = _Call(request_id, tool, reserved)
-            self._in_flight[jsonrpc.id_key(request_id)] = call
+            self._in_flight[request_id] = call
             return call
 
     def _release(self, call: _Call) -> bool:
@@ -280,7 +280,7 @@ class LegacySession:
         """The call is over and its answer, if wanted, is written: its id may be used again."""
 
         with self._cond:
-            self._in_flight.pop(jsonrpc.id_key(call.request_id), None)
+            self._in_flight.pop(call.request_id, None)
             self._cond.notify_all()
 
     def _run(self, call: _Call, arguments: dict) -> None:

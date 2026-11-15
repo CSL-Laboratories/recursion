@@ -77,7 +77,7 @@ def check_path(path: str) -> None:
         raise SocketCheckFailed("socket_dir_missing", directory) from None
     except OSError as exc:
         raise SocketCheckFailed("socket_dir_missing", f"{directory}: {type(exc).__name__}") from None
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+    if not stat.S_ISDIR(st.st_mode):  # lstat: a symlink is not a directory
         raise SocketCheckFailed("socket_dir_not_a_directory", directory)
     _private(st, "socket_dir", directory)
     try:

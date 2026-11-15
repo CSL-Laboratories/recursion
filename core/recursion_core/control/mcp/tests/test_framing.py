@@ -9,6 +9,9 @@ import unittest
 
 from recursion_core.control.mcp import framing, jsonrpc
 from recursion_core.control.mcp.framing import NOT_JSON, NOT_UTF8, TOO_LARGE, Frame, FrameWriter, encode, read_frames
+from recursion_core.control.mcp.tests.support import HANG_GUARD_S
+
+SHORT = 0.2  # only ever used to show that something has not happened
 
 
 def frames(data: bytes, **kwargs) -> list[Frame]:
@@ -33,9 +36,9 @@ class ReadFramesTest(unittest.TestCase):
         data = b'{"n":1}\r\n\n  \r\n{"n":2}'
         self.assertEqual([Frame(message={"n": 1}), Frame(message={"n": 2})], frames(data))
 
-    def test_only_one_cr_before_the_newline_is_dropped(self) -> None:
-        # "\r" is JSON whitespace, so a second one is harmless; inside a string it would be refused by the parser.
+    def test_a_cr_is_json_whitespace_outside_a_string_and_refused_inside_one(self) -> None:
         self.assertEqual([Frame(message={"n": 1})], frames(b'{"n":1}\r\r\n'))
+        self.assertEqual([Frame(message={"n": 1})], frames(b'\r{"n":\r1}\r\n'))
         self.assertEqual([Frame(error=NOT_JSON)], frames(b'{"s":"a\rb"}\n'))
 
     def test_refusals(self) -> None:
@@ -74,14 +77,46 @@ class WriterTest(unittest.TestCase):
             with self.assertRaises((ValueError, TypeError)):
                 encode(bad)
 
-    def test_concurrent_writes_never_interleave(self) -> None:
-        class Slow(io.BytesIO):
-            def write(self, data):  # write byte by byte, so an unlocked writer would interleave
-                for i in range(len(data)):
-                    super().write(data[i:i + 1])
+    def test_a_second_write_does_not_start_until_the_first_is_whole(self) -> None:
+        first_inside, second_inside = threading.Event(), threading.Event()
+        overlapped = []
+
+        class Pausing:
+            """The first write stops halfway and gives a second writer every chance to come in."""
+
+            def __init__(self) -> None:
+                self.data = bytearray()
+                self.calls = 0
+
+            def write(self, data):
+                self.calls += 1
+                if self.calls > 1:
+                    second_inside.set()
+                    self.data += data
+                    return len(data)
+                self.data += data[:5]
+                first_inside.set()
+                overlapped.append(second_inside.wait(SHORT))  # time only shows that it has NOT happened
+                self.data += data[5:]
                 return len(data)
 
-        out = Slow()
+            def flush(self):
+                pass
+
+        out = Pausing()
+        writer = FrameWriter(out)
+        first = threading.Thread(target=writer.write, args=({"n": 1, "pad": "a" * 20},))
+        first.start()
+        self.assertTrue(first_inside.wait(HANG_GUARD_S))
+        second = threading.Thread(target=writer.write, args=({"n": 2, "pad": "b" * 20},))
+        second.start()
+        first.join()
+        second.join()
+        self.assertEqual([False], overlapped, "the second write entered the stream inside the first")
+        self.assertEqual([1, 2], [json.loads(line)["n"] for line in bytes(out.data).splitlines()])
+
+    def test_many_concurrent_writes_all_arrive_whole(self) -> None:
+        out = io.BytesIO()
         writer = FrameWriter(out)
         start = threading.Barrier(6)
 
@@ -97,7 +132,6 @@ class WriterTest(unittest.TestCase):
             t.join()
         lines = out.getvalue().split(b"\n")
         self.assertEqual(b"", lines.pop())
-        self.assertEqual(300, len(lines))
         seen = sorted((m["writer"], m["i"]) for m in map(json.loads, lines))
         self.assertEqual(sorted((n, i) for n in range(6) for i in range(50)), seen)
 
@@ -136,11 +170,6 @@ class JsonRpcTest(unittest.TestCase):
             self.assertTrue(jsonrpc.valid_id(value), value)
         for value in (None, True, False, float("nan"), float("inf"), [], {}, b"x"):
             self.assertFalse(jsonrpc.valid_id(value), value)
-
-    def test_id_keys_keep_strings_and_numbers_apart(self) -> None:
-        self.assertNotEqual(jsonrpc.id_key("1"), jsonrpc.id_key(1))
-        self.assertEqual(jsonrpc.id_key(1), jsonrpc.id_key(1))
-        self.assertEqual(jsonrpc.id_key("x"), jsonrpc.id_key("x"))
 
     def test_classify(self) -> None:
         self.assertEqual(jsonrpc.Request(1, "ping", {}), jsonrpc.classify({"jsonrpc": "2.0", "id": 1, "method": "ping"}))

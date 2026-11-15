@@ -7,7 +7,8 @@ stderr.
 
 Reading (``read_frames``):
 
-* a line is everything up to and including ``\\n``; one ``\\r`` before it is dropped (CRLF tolerated);
+* a line is everything up to and including ``\\n``; a ``\\r`` before it is JSON whitespace, so CRLF lines
+  are read as they are;
 * a line holding only whitespace is skipped;
 * a line longer than ``MAX_LINE_BYTES`` (terminator included) is drained to its newline without being
   kept in memory and yields ``Frame(error=TOO_LARGE)``; the next line is read normally;
@@ -56,8 +57,6 @@ def decode_line(line: bytes) -> Frame | None:
 
     if line.endswith(b"\n"):
         line = line[:-1]
-        if line.endswith(b"\r"):
-            line = line[:-1]
     try:
         text = line.decode("utf-8")
     except UnicodeDecodeError:

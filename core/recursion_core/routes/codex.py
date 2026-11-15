@@ -24,9 +24,11 @@ Typed limit signals:
 
 * ``account/rateLimits/read`` result and ``account/rateLimits/updated`` notifications: a window whose
   ``usedPercent`` is at least 100 is a limit, with its ``resetsAt`` (translated from Unix epoch onto
-  the breaker clock). Codex's default bucket (``limitId`` ``codex``) is credential-wide. Any other
-  ``limitId`` is the breaker model key itself: the requested route model is not used, so a notice for
-  one bucket does not fence a different model.
+  the breaker clock). Codex's default bucket (``limitId`` ``codex``) is credential-wide. R3 finding 10
+  (the brief's recommended option, under D0; Lucas's choice, lane questions Q2): any other ``limitId``
+  also fences the whole connection, until a bucket-to-model mapping is recorded in ``BUCKET_MODELS``
+  (none is: 0.160.0's ``limitId`` is free text and names no model); a recorded bucket fences its model
+  only. Before, an unknown bucket was taken as a model key, so the route model that hit it stayed open.
 * R3 finding 4 (Lucas, D0, Nov 12: "take the stricter, fail-closed option that the reviewer's test
   already encodes"): an ``api_key`` route ignores exactly one error of the rate-limit read, the one whose
   message is ``CHATGPT_AUTH_REQUIRED`` byte for byte and which carries no typed ``codexErrorInfo``;
@@ -60,16 +62,26 @@ from recursion_core.routes.launch import child_env
 
 # Never inherited by a Codex child (B1 note).
 CODEX_CREDENTIAL_ENV = ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY")
-# The only names an api_key route may select and custody may fill: the user's own API keys. CODEX_ACCESS_TOKEN
+# The only name an api_key route may select and custody may fill: CODEX_API_KEY, the one name the production
+# launcher's child-environment policy carries for Codex (child_env/policy.py). OPENAI_API_KEY was offered too,
+# and that launcher then refused every such route; it is now refused here, before custody is asked (R3
+# finding 8, the brief: "CODEX_HOME and OPENAI_API_KEY refuse early with an existing code"). CODEX_ACCESS_TOKEN
 # is a sign-in token, not an API key; Codex uses its own CLI login only and Recursion holds no ChatGPT token
 # (Lucas, Nov 8; PRODUCT.md 3.3, O61), so it is scrubbed and never selectable.
-CODEX_API_KEY_ENV = ("CODEX_API_KEY", "OPENAI_API_KEY")
+CODEX_API_KEY_ENV = ("CODEX_API_KEY",)
+# The operator's CODEX_HOME is not carried by the production launcher's policy (child_env/policy.py,
+# _CODEX_SCRUB), so a set one would be dropped and Codex would run on another home: refused (R3 finding 8;
+# lane questions Q3, reading (a)).
+CODEX_HOME_NOT_CARRIED = "codex_home_not_carried"
 # Top-level config key ``check_for_update_on_startup: Option<bool>`` (default true), read in openai/codex
 # 8703d32bd0ea5cf26768859a3dd476df906ba053 codex-rs/config/src/config_toml.rs:533 and only consulted by the
 # TUI's update check (codex-rs/tui/src/updates.rs:28, :153); no app-server source references the update
 # check. A process-tree check on a real binary has not been run (hard rule 8).
 NO_UPDATE_OVERRIDE = ("-c", "check_for_update_on_startup=false")
 DEFAULT_LIMIT_ID = "codex"  # name of the credential-wide bucket (unverified: limitId is free text in 0.160.0)
+# A vendor bucket -> the breaker model it limits, once such a mapping is recorded. None is yet, so every
+# exhausted bucket fences the connection (R3 finding 10).
+BUCKET_MODELS: dict[str, str] = {}
 _LIMIT_ERRORS = ("usageLimitExceeded",)  # CodexErrorInfo values (verified, 0.160.0)
 _AUTH_ERRORS = ("unauthorized",)  # CodexErrorInfo values (verified, 0.160.0)
 # Every CodexErrorInfo name 0.160.0 defines: its text values and the tags of its object variants (checked
@@ -115,8 +127,10 @@ class CodexAdapter(RouteAdapter):
         return [self._binary, *NO_UPDATE_OVERRIDE, "app-server"]
 
     def env(self, request: dict) -> dict[str, str]:
+        if "CODEX_HOME" in self._parent_env:  # before custody and the launcher are asked (R3 finding 8)
+            raise c.RouteError(c.LAUNCH_REFUSED, CODEX_HOME_NOT_CARRIED)
         cred = self.credential(request, CODEX_API_KEY_ENV)
-        return child_env(self._parent_env, extra_names=("CODEX_HOME",), never=CODEX_CREDENTIAL_ENV, credential=cred)
+        return child_env(self._parent_env, never=CODEX_CREDENTIAL_ENV, credential=cred)
 
     def drive(self, process, request, deadline_at, events):
         rid, model = request["request_id"], request["route"]["model"]
@@ -228,8 +242,8 @@ def _exhausted(snapshot: object, source: str, events: list, translate) -> dict |
         return None
     resets = [w["resetsAt"] for w in hit if isinstance(w.get("resetsAt"), (int, float))]
     reset_at = translate(max(resets)) if resets else None
-    if isinstance(limit_id, str) and limit_id and limit_id != DEFAULT_LIMIT_ID:
-        return c.limit_signal("model", source, model=limit_id, reset_at=reset_at)
+    if isinstance(limit_id, str) and limit_id in BUCKET_MODELS:
+        return c.limit_signal("model", source, model=BUCKET_MODELS[limit_id], reset_at=reset_at)
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 

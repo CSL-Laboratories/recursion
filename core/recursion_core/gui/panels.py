@@ -11,7 +11,7 @@ is an interface change for every importer, not an edit:
   ``withhold_venue_data`` (together ``PANEL_KEYS``);
 * the refusals: ``panel_registry`` raises ``ValueError`` whose text is one of ``REFUSALS``,
   checked in that order, so a declaration with several defects is refused with the first (a
-  ``panels`` that cannot be iterated at all gets the first);
+  ``panels`` that cannot be iterated, or that raises while it is iterated, gets the first);
 * the answer: a read-only mapping from panel id, in declaration order, to a read-only mapping of
   exactly ``title``, ``reads`` (a tuple, duplicates dropped, order kept), ``venue`` and
   ``venue_use``. ``withhold_venue_data`` is accepted and never kept: the page always filters.
@@ -51,9 +51,11 @@ REFUSALS = (
 def panel_registry(panels):
     registered = {}
     try:
-        declarations = iter(panels)
-    except TypeError:
-        raise ValueError(_NEEDS_KEYS) from None  # not a collection of declarations at all
+        # One copy of the collection: a value that cannot be iterated, or that raises while it is
+        # iterated, is not a collection of declarations.
+        declarations = tuple(panels)
+    except Exception:  # noqa: BLE001 - whatever the iteration raises, the refusal is the first text
+        raise ValueError(_NEEDS_KEYS) from None
     for panel in declarations:
         if not isinstance(panel, Mapping) or not REQUIRED_PANEL_KEYS <= panel.keys():
             raise ValueError(_NEEDS_KEYS)
@@ -154,7 +156,8 @@ def filter_venue_rows(value, venue):
         owned = _owned_labels(venue)
         for key in _RESPONSE_LEVEL:
             if key in value:
-                shown = _without_other_venues(value[key], owned, withheld)
+                # value[key] is one container below the response, as the rest of the answer counts.
+                shown = _without_other_venues(value[key], owned, withheld, 1)
                 if shown is not _DROP:
                     passed[key] = shown
         value = {key: item for key, item in value.items() if key not in _RESPONSE_LEVEL}

@@ -794,6 +794,39 @@ class BreakItPins(GuiHarness):
         self.assertEqual(self.api.calls, [])
         self.assertEqual(self.door.seen, 0)
 
+    def test_round4_f1_a_request_line_that_is_not_text_is_refused_with_the_page_headers(self) -> None:
+        ok_headers = self.headers_without_length(self.request("GET", "/")[1])
+        self.api.calls.clear()  # the home page above reads the routes; the refused requests below read nothing
+        for headers in ({"REQUEST_METHOD": ["GET"]}, {"PATH_INFO": ["/"]}, {"REQUEST_METHOD": ("GET",)},
+                        {"REQUEST_METHOD": 7}, {"PATH_INFO": b"/"}):
+            with self.subTest(headers=headers):
+                status, got, body = self.request("GET", "/", headers=headers)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertIn("Bad request: request line", body)
+                self.assertEqual(self.headers_without_length(got), ok_headers)
+        self.assertEqual(self.api.calls, [])
+
+    def test_round4_f4_a_host_or_origin_must_be_a_str_exactly(self) -> None:
+        class Lying(str):
+            def __eq__(self, other):
+                return True
+
+            def __hash__(self):
+                return hash(HOST) if self.startswith("evil") else str.__hash__(self)
+
+        class LyingOrigin(Lying):
+            def __hash__(self):
+                return hash(ORIGIN)
+
+        for headers, code in (({"HTTP_HOST": Lying("evil.example")}, "host_not_allowed"),
+                              ({"HTTP_HOST": Lying(HOST)}, "host_not_allowed"),
+                              ({"HTTP_ORIGIN": LyingOrigin("http://evil.example")}, "origin_not_allowed")):
+            with self.subTest(headers=headers):
+                status, _, body = self.request("GET", "/", headers=headers)
+                self.assertEqual(status, "403 Forbidden")
+                self.assertIn(code, body)
+        self.assertEqual(self.door.seen, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

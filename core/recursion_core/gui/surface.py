@@ -90,8 +90,8 @@ def _sign_in_cell(value: object) -> str:
 def withhold_venue_data(value: object) -> object:
     """Hide venue data unless the control API marks its switch exactly ``on``.
 
-    Any mapping is read as a dict and any list or tuple as a list, at every depth, and they
-    come back as a dict and a list (C7 finding 4: a tuple of rows or a mapping proxy used to
+    Any mapping is read as a dict and any list or tuple as a list, at every depth down to the
+    bound below, and they come back as a dict and a list (C7 finding 4: a tuple of rows or a mapping proxy used to
     pass through unredacted). Any other value that is not a str, an int (bool included), a
     float or None (a set, a deque, any other object) is replaced by a fixed marker, never shown.
     A float is kept whatever its value, NaN and the infinities included, as ``json.loads``
@@ -156,10 +156,11 @@ class Application:
     def _refusal(self, env: dict) -> str | None:
         method = env.get("REQUEST_METHOD")
         host = env.get("HTTP_HOST")
-        if not isinstance(host, str) or host not in self._hosts:
+        # A str exactly: a subclass could make its own equality and hash match a configured host.
+        if type(host) is not str or host not in self._hosts:
             return "host_not_allowed"
         origin = env.get("HTTP_ORIGIN")
-        if origin is not None and (not isinstance(origin, str) or "," in origin or origin not in self._origins):
+        if origin is not None and (type(origin) is not str or "," in origin or origin not in self._origins):
             return "origin_not_allowed"
         if method == "POST" and origin is None:
             return "origin_required"
@@ -180,6 +181,9 @@ class Application:
             status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
             return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))
         method, path = env.get("REQUEST_METHOD"), env.get("PATH_INFO", "")
+        if type(method) is not str or type(path) is not str:
+            return self._send(start_response, "400 Bad Request",
+                              self._page("Bad request", "<p>Bad request: request line</p>"))
         routes = {("GET", "/"): self._home, ("GET", "/read"): self._read, ("GET", "/panel"): self._panel,
                   ("POST", "/action"): self._action, ("POST", "/stop"): self._stop}
         handler = routes.get((method, path))

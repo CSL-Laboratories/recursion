@@ -216,6 +216,47 @@ class InterfaceTests(unittest.TestCase):
                 self.assertIs(type(caught.exception), ValueError)
                 self.assertEqual(caught.exception.args, (NEEDS_KEYS,))
 
+    def test_panels_that_raise_while_iterated_get_the_first_refusal(self):
+        # DeepSeek round 4, F2: the promise holds for a collection that raises while it is read.
+        class RaisingIter:
+            def __iter__(self):
+                raise RuntimeError("BOOM")
+
+        class RaisingNext:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise KeyError("BOOM")
+
+        def raising_generator():
+            yield dict(GOOD)
+            raise RuntimeError("BOOM-AFTER-ONE")
+
+        for panels_value in (RaisingIter(), RaisingNext(), raising_generator()):
+            with self.subTest(panels=type(panels_value).__name__):
+                with self.assertRaises(ValueError) as caught:
+                    panel_registry(panels_value)
+                self.assertIs(type(caught.exception), ValueError)
+                self.assertEqual(caught.exception.args, (NEEDS_KEYS,))
+
+    def test_the_depth_bound_is_sixty_four_containers_below_the_response_on_every_branch(self):
+        # DeepSeek round 4, F5: errors and provenance count from the response as the rest does.
+        def chain(levels, leaf):
+            value = leaf
+            for _ in range(levels):
+                value = {"next": value}
+            return value
+
+        for name, make in (("errors", lambda n: {"errors": chain(n, "LEAF")}),
+                           ("provenance", lambda n: {"provenance": chain(n, "LEAF")}),
+                           ("labelled", lambda n: {"venue": "paper", "next": chain(n, "LEAF")})):
+            with self.subTest(branch=name):
+                self.assertEqual(filter_venue_rows(make(64), "paper"), (make(64), False))
+                kept, withheld = filter_venue_rows(make(65), "paper")
+                self.assertTrue(withheld)
+                self.assertNotIn("LEAF", repr(kept))
+
     def test_deep_responses_and_keys_that_are_not_text_are_withheld_not_a_crash(self):
         # DeepSeek break-it read of #384, F1 and F7, at the filter itself.
         leaf = "DEEP-LEAF"

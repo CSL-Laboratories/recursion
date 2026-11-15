@@ -302,23 +302,23 @@ class TuiApp:
         except Exception:  # noqa: BLE001 - one that cannot be read is answered as call_api answers it (#405 r3, F2)
             answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
             code = answer["code"]
+        try:  # what every frame reads again: a plain copy, made before the lock is taken (#405 r3 F2, r4 R4)
+            kept = dict(answer)
+        except Exception:  # noqa: BLE001
+            kept = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
         with self._lock:
             if self.closed:  # the TUI ended while the answer was read: it changes nothing
                 return
             try:
-                self._apply_answer(method, params, answer, code)
+                self._apply_answer(method, params, answer, code, kept)
             except Exception as exc:  # noqa: BLE001 - one answer that cannot be read must not end the loop
                 # A Loop runs this on its only thread, and raw mode turns Ctrl-C into a key: a raise here would
                 # leave a terminal no key can reach (review 1 of #405, DeepSeek H1). Said, and not taken.
                 self._error(f"the answer to {method} could not be read ({type(exc).__name__}); it was not taken")
 
-    def _apply_answer(self, method: str, params: dict, answer: dict, code) -> None:
+    def _apply_answer(self, method: str, params: dict, answer: dict, code, kept: dict | None = None) -> None:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
-        try:  # what every frame reads again is a plain copy, never the caller's object (review 3 of #405, F2)
-            kept = dict(answer)
-        except Exception:  # noqa: BLE001
-            kept = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
-        self.last, self.last_method = kept, method
+        self.last, self.last_method = dict(answer) if kept is None else kept, method  # a plain copy (on_answer's)
         # A Stop answer confirms only the run it was sent for (ADV2-11): one that names another run,
         # or none, changes no run and is shown as a mismatch, never as this run's Stop.
         mismatch = (method == "run.stop" and code in ("stopped", "pending")
@@ -431,15 +431,20 @@ class TuiApp:
         if code == "request_invalid" and answer.get("detail") == "cursor_ahead":
             # The seq held is past the daemon's log: rule (7) does not bound the last position a gap line names,
             # and a daemon whose log did not persist has fewer positions than were shown. The next read goes on
-            # from the last line shown, or from the start of the log when that was the position refused, so one
-            # position is never refused twice in a row (review 2 of #405, DeepSeek M1; review 3, F1).
+            # from the last line shown, or from the start of the log when that was the position refused, so a
+            # position past the start is never refused twice in a row; what was shown is not shown again in the
+            # same epoch (review 2 of #405, DeepSeek M1; review 3, F1; review 4, R1, R3).
             refused = params["cursor"]["seq"]
             if transcript.printed < refused:
                 transcript.cursor = {**transcript.cursor, "seq": transcript.printed}
                 then = f"from seq {transcript.printed}, the last line shown"
-            else:
-                transcript.cursor, transcript.printed, transcript.gap_shown = s.first_cursor(sid), 0, 0
+            elif refused > 0:
+                transcript.cursor, transcript.printed = s.first_cursor(sid), 0
                 then = "from the start of its log"
+            else:  # the start itself is refused: no read can be served (review 4 of #405, DeepSeek R3)
+                self._error(f"transcript session={field(sid)}: the daemon refuses even the start of its log (seq 0); "
+                            f"nothing can be read from it until it serves that")
+                return
             self._notice(f"transcript session={field(sid)}: the daemon has no position seq {refused}; the next read "
                          f"goes on {then}")
             return

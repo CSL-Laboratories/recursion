@@ -115,9 +115,11 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   followed, up to the 50 reads). If the daemon then answers that the epoch held is ahead of its own, the next
   read goes on from epoch 1 by its seq; if it answers that the seq held is past its log (a gap line may name
   any later position), the next read goes on from the last line shown, and from the start of the log when
-  the daemon has not that either (a log that did not persist); a gap line already shown is not shown again.
-  An answer that cannot be read at all is said as an error; it never stops the TUI, nor does a control API
-  call that raises.
+  the daemon has not that either (a log that did not persist), and a daemon that refuses even the start is
+  said as an error. A line already shown, a gap line included, is not shown again in the same epoch, so a
+  log read again from its start does not fill the pane twice; a later epoch is a log of its own. An answer
+  that cannot be read at all is said as an error, and the copy every frame reads is made before the TUI's
+  lock is taken, so such an answer never holds it; a control API call that raises never stops the TUI.
 - The binding file: `$XDG_CONFIG_HOME/recursion/tui-keys.toml` (or `~/.config/...`), or `--keys FILE`;
   `--print-keys` prints the defaults to start from. `version = 1`, an optional `leader`, a table per
   context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action

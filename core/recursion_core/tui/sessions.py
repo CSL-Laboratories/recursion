@@ -2,7 +2,7 @@
 
 The TUI reads ``session.list``, and ``events.read`` with ``projection: "transcript"``, and prints the lines
 the daemon's projection gives, as given: it never projects or parses events itself. Each line is shown
-once, in ``seq`` order; a ``replay.gap`` line is a line like any other. Every line's text goes through the
+once in an epoch, in ``seq`` order; a ``replay.gap`` line is a line like any other. Every line's text goes through the
 same sanitizer as engine output (engine text is ``trust: untrusted``). Toolkit-neutral: answers in, rows
 out; nothing here sends a request.
 
@@ -16,7 +16,9 @@ An ``ok`` answer is checked before anything of it is taken (``page_problem``): a
 nothing (review 1 of #405, GPT-6.1 Sol R2 and DeepSeek H1, L1, L2). A refused answer is said and leaves the
 cursor as it is, but for two: ``cursor_epoch_ahead`` sets its epoch back to 1, and ``cursor_ahead`` its seq
 back to the last line shown, or to the start of the log when that line was the position refused (review 2
-of #405, DeepSeek M1, L4; review 3, F1). A replay.gap line already shown is not shown again (review 3, F3).
+of #405, DeepSeek M1, L4; review 3, F1). A line shown is not shown again in the same epoch, and a later epoch
+is a log of its own (review 4, R1, R2). A replay.gap line already shown is not shown again in that epoch
+either (review 3, F3). A refusal of the start itself is said as an error (review 4, R3).
 """
 
 from __future__ import annotations
@@ -120,14 +122,18 @@ def session_row(session: Mapping) -> str:
 
 
 class Transcript:
-    """One session's transcript as read so far, and the cursor to read on from."""
+    """One session's transcript as read so far, and the cursor to read on from. ``shown`` is the highest position
+    of a line, and ``gaps`` the positions of the replay.gap lines, shown in the epoch ``shown_epoch``: such a line
+    is not shown again, however the cursor was put back, until an answer names a later epoch, which is a log of
+    its own (review 4 of #405, DeepSeek R1, R2). Gap lines are kept by position, so a gap line that named a
+    position past the log hides no line after it. A consumer that puts ``cursor`` back itself keeps these."""
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self.cursor = first_cursor(session_id)
         self.pages = 0  # reads made in a row by the current open, the first included
-        self.printed = 0  # the last position whose line was shown (a gap line shows no content of the log)
-        self.gap_shown = 0  # the last position a shown replay.gap line stood for (review 3 of #405, DeepSeek F3)
+        self.printed = 0  # the last position, in the log the cursor reads, whose line was shown (not a gap line)
+        self.shown, self.gaps, self.shown_epoch = 0, set(), self.cursor["epoch"]
 
     def apply(self, answer: Mapping) -> list[dict]:
         """One ``ok`` answer that ``page_problem`` found right: the lines after the cursor, each once, in
@@ -135,18 +141,23 @@ class Transcript:
 
         last = self.cursor["seq"]
         new: list[dict] = []
+        cursor = answer.get("cursor")
+        if (isinstance(cursor, Mapping) and cursor.get("session_id") == self.session_id
+                and _is_int(cursor.get("epoch")) and cursor["epoch"] > self.shown_epoch):
+            self.shown, self.gaps, self.shown_epoch = 0, set(), cursor["epoch"]  # a later epoch: a log of its own
         lines = answer.get("lines")
         for line in lines if isinstance(lines, list) else []:
             if isinstance(line, Mapping) and _is_int(line.get("seq")) and line["seq"] > last:
                 last = line["seq"]
-                if line.get("event_type") != "replay.gap":
-                    self.printed = last
-                elif last <= self.gap_shown:
-                    continue  # a gap shown already, answered again after the cursor was put back: not twice
+                if line.get("event_type") == "replay.gap":
+                    if last in self.gaps:
+                        continue  # this gap was shown in this epoch, answered again after the cursor was put back
+                    self.gaps.add(last)
+                elif last <= self.shown:
+                    continue  # this line was shown in this epoch: the log is being read again from its start
                 else:
-                    self.gap_shown = last
+                    self.shown = self.printed = last
                 new.append(dict(line))
-        cursor = answer.get("cursor")
         epoch = self.cursor["epoch"]
         if (isinstance(cursor, Mapping) and cursor.get("session_id") == self.session_id
                 and _is_int(cursor.get("epoch")) and _is_int(cursor.get("seq"))):

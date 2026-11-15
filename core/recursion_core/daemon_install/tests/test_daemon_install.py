@@ -427,6 +427,35 @@ class InstallTests(unittest.TestCase):
             layout.replace_regular(self.unit, b"x", 0o644)
         self.assertEqual(caught.exception.kind, "not_regular")
 
+    def test_a_unit_gone_between_the_look_and_the_unlink_or_the_write(self) -> None:
+        # Review 7 of #382, DeepSeek L7-1 and I7-1: two uninstalls at once raised FileNotFoundError (printed as
+        # filesystem_error) or answered not_regular for a unit already gone; and the write looked twice, so a
+        # unit removed between the two looks was not_regular. Each now looks once.
+        real_unlink, real_lstat = os.unlink, os.lstat
+        install(self.roots, EXEC)
+
+        def the_other_caller_first(path, *args, **kwargs):
+            if os.fspath(path) == self.unit and os.path.lexists(self.unit):
+                real_unlink(path)  # the other uninstall, just before this one's unlink
+            return real_unlink(path, *args, **kwargs)
+        with mock.patch("os.unlink", side_effect=the_other_caller_first):
+            plan = uninstall(self.roots)
+        self.assertEqual((plan.action, plan.changed), ("uninstall", False))
+        self.assertFalse(os.path.lexists(self.unit))
+        install(self.roots, EXEC)
+        looked = []
+
+        def removed_after_the_look(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if os.fspath(path) == self.unit and not looked:
+                looked.append(path)
+                real_unlink(self.unit)  # the other caller, right after the one look
+            return info
+        with mock.patch("os.lstat", side_effect=removed_after_the_look):
+            layout.replace_regular(self.unit, render_unit(EXEC_NEXT).encode(), 0o644)
+        self.assertEqual(_read(self.unit), render_unit(EXEC_NEXT))  # written anew, not refused
+        self.assertEqual(len(looked), 1)
+
     def test_uninstall_removes_the_unit_and_nothing_else(self) -> None:
         before = _tree(self.home)
         install(self.roots, EXEC)

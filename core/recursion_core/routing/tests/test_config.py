@@ -103,6 +103,16 @@ SHAPE_DEFECTS = [
     ("a fallback profile that is not an object", "bad_limits", _with_fallback(_fallback("opencode", profile="anthropic"))),
     ("a custody key fallback with no credential_env", "bad_limits", _with_fallback(_fallback("opencode", conn_credential_env=None))),
     ("a custody key fallback with an empty credential_env", "bad_limits", _with_fallback(_fallback("opencode", conn_credential_env=""))),
+    ("a custody key fallback whose credential_env is not a string", "bad_limits", _with_fallback(_fallback(
+        "opencode", conn_credential_env=3))),
+    ("an explicit custody key fallback with no credential_env", "bad_limits", _with_fallback(_fallback(
+        "opencode", conn_key_source="custody", conn_credential_env=None))),
+    ("an api_key_helper on a subscription connection of claude_code", "bad_limits", _with_fallback(_fallback(
+        "claude_code", conn_key_source="api_key_helper"))),
+    ("a passthrough fallback whose method is not a string", "bad_limits", _with_fallback(_fallback(
+        "claude_code", connection={"kind": "passthrough", "id": "bedrock", "method": 3}))),
+    ("a passthrough fallback with an empty method", "bad_limits", _with_fallback(_fallback(
+        "claude_code", connection={"kind": "passthrough", "id": "bedrock", "method": ""}))),
     ("a fallback key_source that is not one", "bad_limits", _with_fallback(_fallback("opencode", conn_key_source="keychain"))),
     ("an api_key_helper fallback outside claude_code", "bad_limits", _with_fallback(_fallback(
         "codex", connection={"kind": "api_key", "id": "chatgpt-main", "key_source": "api_key_helper"}))),
@@ -136,6 +146,22 @@ class SchemaTests(unittest.TestCase):
         for name, code, mutate in SHAPE_DEFECTS:
             with self.subTest(name):
                 self.assertNotEqual(list(v.iter_errors(mutated(mutate))), [], name)
+
+    def test_a_helper_key_fallback_needs_no_credential_env(self) -> None:
+        # claude_code's api_key connection whose key comes from its own api_key_helper names no credential_env:
+        # the loader takes it on both interpreters, and the schema takes it where jsonschema is installed.
+        helper = {"engine": "claude_code", "model": "m", "connection": {
+            "kind": "api_key", "id": "anthropic-helper", "key_source": "api_key_helper"}}
+        raw = {"version": 1,
+               "logins": [{"id": "anthropic-helper", "vendor": "anthropic", "kind": "api_key",
+                           "connection_id": "anthropic-helper", "engines": ["claude_code"]}],
+               "default": {"engine": "claude_code", "limits": {"on_limit": "fallback", "fallback": [helper]}},
+               "rules": []}
+        routes = {"claude_code": {"route": helper, "deadline_s": 600, "binary": "claude"}}
+        loaded = rc.load_config(raw, routes, {"anthropic-helper": {"provider": "anthropic"}})
+        self.assertEqual(loaded.default.engine, "claude_code")
+        if jsonschema is not None:
+            self.assertEqual(list(jsonschema.Draft202012Validator(SCHEMA).iter_errors(raw)), [])
 
     def test_values_a_schema_cannot_tell_apart_are_refused_by_the_loader(self) -> None:
         # JSON Schema counts true and 1.0 equal to the const 1 in some readings and 1.0 always; the loader

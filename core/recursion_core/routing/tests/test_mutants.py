@@ -154,6 +154,28 @@ SCHEMA_MUTANTS = {
     "S9 a custody key fallback with no credential_env allowed": (
         SCHEMA, '"required": ["credential_env"], ', "",
         {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    # S10 to S15 answer the second reads of #371 (b3bdb121): each removal had left every lane test green.
+    "S10 an api_key_helper allowed on a subscription connection": (
+        SCHEMA, '"connection": {"properties": {"kind": {"const": "api_key"}}}', '"connection": {"properties": {}}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S11 a credential_env that is not a string allowed": (
+        SCHEMA, '"credential_env": {"type": "string", "minLength": 1}', '"credential_env": {"minLength": 1}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S12 an explicit custody key source exempt from credential_env": (
+        SCHEMA, '"not": {"required": ["key_source"], "properties": {"key_source": {"const": "api_key_helper"}}}',
+        '"not": {"required": ["key_source"]}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S13 a passthrough method that is not a string allowed": (
+        SCHEMA, '"method": {"type": "string", "minLength": 1}', '"method": {"minLength": 1}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S14 an empty passthrough method allowed": (
+        SCHEMA, '"method": {"type": "string", "minLength": 1}', '"method": {"type": "string"}',
+        {"test_json_schema_accepts_example_and_rejects_bad_shapes"}),
+    "S15 a helper key fallback made to name a credential_env": (
+        SCHEMA,
+        ',\n            "not": {"required": ["key_source"], "properties": {"key_source": {"const": "api_key_helper"}}}',
+        "",
+        {"test_a_helper_key_fallback_needs_no_credential_env"}),
 }
 
 try:

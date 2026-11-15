@@ -79,8 +79,8 @@ MUTANTS = {
         {"test_a_hand_pick_is_never_switched_away_from"}),
     "M11 any failure treated as a limit (a blind retry)": (
         ROUTER,
-        "    if code not in route_limits.LIMIT_CODES:\n",
-        "    if code is None:\n",
+        "    if type(code) is not str or code not in route_limits.LIMIT_CODES:",
+        "    if code is None:",
         {"test_only_a_limit_leads_anywhere"}),
     "M12 a route already tried offered again": (
         ROUTER,
@@ -393,7 +393,7 @@ MUTANTS = {
         {"test_a_missing_snapshot_is_detection_unavailable"}),
     "M68 an attempt's structured connection not read as its word": (
         ROUTER,
-        "    if isinstance(value, Mapping):\n        return f\"{value.get('kind')}:{value.get('id')}\"\n",
+        "    if isinstance(value, Mapping):\n        return f\"{_plain(value.get('kind'))}:{_plain(value.get('id'))}\"\n",
         "",
         {"test_an_attempt_with_a_structured_connection_counts_as_tried"}),
     # The fifth read of #399 (30073846): DeepSeek A-G (A and B are pinned by M66's wider killers).
@@ -419,7 +419,7 @@ MUTANTS = {
         {"test_route_decision_refuses_members_dict_would_accept"}),
     "M73 a bare connection word in attempts not counted as tried": (
         ROUTER,
-        "    if isinstance(entry, str):\n        return (_ANY, _ANY, entry)\n",
+        "    if isinstance(entry, str):\n        return (_ANY, _ANY, _plain(entry))\n",
         "",
         {"test_a_bare_connection_word_in_attempts_counts_as_tried"}),
     "M74 a wait until that is not a time passed through": (
@@ -442,6 +442,90 @@ MUTANTS = {
         "        if isinstance(tried, str):\n            tried = [tried]  # one bare kind:id word, never its characters\n",
         "",
         {"test_a_bare_connection_word_in_attempts_counts_as_tried"}),
+    # The sixth read of #399 (7bbd59be): DeepSeek F1-F6 (F4 is a sentence).
+    "M78 a reason, rule or connection decide never gives used": (
+        ROUTER,
+        '        return {"action": "none", "reason": "no_decision"}  # a reason, rule or connection decide never gives\n',
+        "        pass\n",
+        {"test_values_that_cannot_be_compared_or_formatted_are_no_decision"}),
+    "M79 an unreadable attempts entry discarding the limit": (
+        ROUTER,
+        "            except Exception:  # noqa: BLE001 - an entry that cannot be read is not an attempt, as other non-attempts\n",
+        "            except ZeroDivisionError:\n",
+        {"test_an_unreadable_attempts_entry_is_dropped_not_the_limit"}),
+    "M80 a wait until of NaN or an infinity": (
+        ROUTER,
+        "        return math.isfinite(value)\n",
+        "        return True\n",
+        {"test_a_wait_until_is_finite"}),
+    "M81 route_decision publishing a connection without kind and id": (
+        ROUTER,
+        '        if (not isinstance(connection, Mapping) or type(connection.get("kind")) is not str\n'
+        '                or type(connection.get("id")) is not str):\n',
+        "        if not isinstance(connection, Mapping):\n",
+        {"test_route_decision_needs_the_connections_kind_and_id", "test_route_decision_needs_plain_words"}),
+    "M82 an attempt naming only its connection not counted as tried": (
+        ROUTER,
+        "        if engine is None and model is None:\n            return (_ANY, _ANY, word)  # names only its connection, as a bare word does\n",
+        "",
+        {"test_an_attempt_naming_only_its_connection_counts_as_tried"}),
+    "M83 an attempt whose parts are not words compared": (
+        ROUTER,
+        "            return None  # parts that are not words: compared later, they could name nothing (or raise)\n",
+        "            pass\n",
+        {"test_an_attempt_whose_parts_are_not_words_is_not_an_attempt"}),
+    # The sixth read's F1 and F5 one step further (a str subclass passes isinstance), and F3's own check, which
+    # raised on an int too large for a float or one whose conversion raises.
+    "M84 a time of a number subclass converted": (
+        ROUTER,
+        "    if type(value) is not int and type(value) is not float:\n",
+        "    if isinstance(value, bool) or not isinstance(value, (int, float)):\n",
+        {"test_a_wait_until_is_finite"}),
+    "M85 an int too large for a float raising": (
+        ROUTER,
+        "    except OverflowError:  # an int too large for a float: no finite time\n",
+        "    except ZeroDivisionError:\n",
+        {"test_a_wait_until_is_finite"}),
+    "M86 a reason that is a str subclass used": (
+        ROUTER,
+        '(type(read["reason"]) is not str or read["reason"] not in REASONS)',
+        '(read["reason"] not in REASONS)',
+        {"test_a_decision_word_that_is_a_str_subclass_is_no_decision"}),
+    "M87 a rule that is a str subclass compared": (
+        ROUTER,
+        'read["rule"] is not None and type(read["rule"]) is not str)',
+        'read["rule"] is not None and not isinstance(read["rule"], str))',
+        {"test_a_decision_word_that_is_a_str_subclass_is_no_decision"}),
+    "M88 a connection kind or id that is a str subclass formatted": (
+        ROUTER,
+        'and type(conn[key]) is not str for key in ("kind", "id")',
+        'and not isinstance(conn[key], str) for key in ("kind", "id")',
+        {"test_a_decision_word_that_is_a_str_subclass_is_no_decision"}),
+    "M89 an engine that is a str subclass compared": (
+        ROUTER,
+        '(read["engine"] is not _MISSING and type(read["engine"]) is not str)',
+        '(read["engine"] is not _MISSING and not isinstance(read["engine"], str))',
+        {"test_a_decision_word_that_is_a_str_subclass_is_no_decision"}),
+    "M90 a model that is a str subclass compared": (
+        ROUTER,
+        'read["model"] is not None and type(read["model"]) is not str)',
+        'read["model"] is not None and not isinstance(read["model"], str))',
+        {"test_a_decision_word_that_is_a_str_subclass_is_no_decision"}),
+    "M91 an attempt's str subclass compared as it is": (
+        ROUTER,
+        "    return str.__str__(value) if issubclass(type(value), str) else value\n",
+        "    return value\n",
+        {"test_an_attempt_word_that_is_a_str_subclass_is_read_as_its_text"}),
+    "M92 a limit code that is a str subclass compared": (
+        ROUTER,
+        "    if type(code) is not str or code not in route_limits.LIMIT_CODES:",
+        "    if code not in route_limits.LIMIT_CODES:",
+        {"test_a_limit_code_that_is_a_str_subclass_is_not_a_limit"}),
+    "M93 route_decision publishing words that are str subclasses": (
+        ROUTER,
+        "        if type(reason) is not str or reason not in REASONS or type(engine) is not str or type(model) is not str:\n",
+        "        if reason not in REASONS or not isinstance(engine, str) or not isinstance(model, str):\n",
+        {"test_route_decision_needs_plain_words"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

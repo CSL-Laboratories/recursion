@@ -9,8 +9,9 @@ Only these four are served: every one is implemented by the control API over the
 ``check_arguments`` checks a call's arguments against the tool's own ``inputSchema`` before anything
 is sent to the daemon: 2025-06-18 answers invalid arguments as a protocol error (``-32602``), and a call
 that does not match what the server advertised must have no side effect. It knows only the schema
-keywords the descriptors use; a descriptor with any other keyword is refused when the table is built
-(``SchemaUnsupported``), so a schema is never half checked.
+keywords the descriptors use; a descriptor with any other keyword, or with a known keyword whose value
+is not of the form it reads (``minLength: "x"``, ``properties`` as a list), is refused when the table is
+built (``SchemaUnsupported``), so a schema is never half checked.
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ class Tool:
 
 
 def _require_supported(schema: Any, where: str) -> None:
+    """Refuse a schema ``check_arguments`` would not check completely: an unknown keyword, or a known one
+    whose value is not of the form it reads."""
+
     if not isinstance(schema, Mapping):
         raise SchemaUnsupported(f"{where}: a schema must be an object")
     unknown = set(schema) - _SUPPORTED
@@ -58,6 +62,17 @@ def _require_supported(schema: Any, where: str) -> None:
         raise SchemaUnsupported(f"{where}: type must be one of {sorted(_TYPES)}")
     if "additionalProperties" in schema and schema["additionalProperties"] is not False:
         raise SchemaUnsupported(f"{where}: additionalProperties may only be false")
+    for key in ("minLength", "maxLength"):
+        if key in schema and (type(schema[key]) is not int or schema[key] < 0):
+            raise SchemaUnsupported(f"{where}: {key} must be a whole number of at least 0")
+    for key in ("minimum", "maximum"):
+        if key in schema and (isinstance(schema[key], bool) or not isinstance(schema[key], (int, float))):
+            raise SchemaUnsupported(f"{where}: {key} must be a number")
+    if "required" in schema and (not isinstance(schema["required"], list)
+                                 or any(not isinstance(n, str) for n in schema["required"])):
+        raise SchemaUnsupported(f"{where}: required must be a list of names")
+    if not isinstance(schema.get("properties", {}), Mapping):
+        raise SchemaUnsupported(f"{where}: properties must be an object")
     for name, sub in schema.get("properties", {}).items():
         _require_supported(sub, f"{where}.{name}")
 

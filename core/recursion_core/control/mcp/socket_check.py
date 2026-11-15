@@ -13,12 +13,14 @@ of these hold, checked in this order, each with its own refusal reason:
 4. the socket exists (``socket_missing``), is a socket and not a symlink (``socket_not_a_socket``),
    belongs to this user (``socket_foreign_owner``) and grants no group or other bit (``socket_mode``);
    the daemon's server makes it 0600;
-5. one read through the socket gets the control API's answer (``daemon_unreachable``, with the client's
-   detail): ``run.list`` with ``limit: 1``. The connection itself checks that the listening process runs
-   as this user (``UnixControlClient``, SO_PEERCRED), and the daemon refuses a peer inside a run unit
-   (``daemon:scope_refused``), so a server started by an engine inside a run does not start. An answer
-   from the control API that is not a success (``registry_unavailable``) still passes: the socket is
-   sound and the daemon answered.
+5. one read through the socket gets an answer in the control API's shape, an object with a string
+   ``code`` (``daemon_unreachable``, with the client's detail): ``run.list`` with ``limit: 1``. The
+   connection itself checks that the listening process runs as this user (``UnixControlClient``,
+   SO_PEERCRED), and the daemon refuses a peer inside a run unit (``daemon:scope_refused``), so a server
+   started by an engine inside a run does not start. An answer that is not a success
+   (``registry_unavailable``) still passes. This proves the socket is sound and that a process of this
+   user answers on it in that shape; it does not prove which program that is (only this user can put a
+   listener inside the 0700 folder).
 
 Steps 3 and 4 are repeated before every call the server forwards (``CheckedSocketAPI``): a directory or
 socket that stops passing answers ``control_api_unavailable`` with ``delivered: false`` and nothing is

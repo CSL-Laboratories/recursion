@@ -20,24 +20,41 @@ This is the lane's first slice. What it covers and what it does not:
 The process takes no arguments. Before it reads anything from stdin it runs the socket check
 (`socket_check.py`): the platform has the Unix transport; the socket path is absolute; its folder
 exists, is a real folder of this user with mode 0700 or narrower; the socket exists, is a socket of
-this user with mode 0600 or narrower; and one read (`run.list`, `limit: 1`) gets the control API's
-answer, which also proves the listener runs as this user and admits this process (a process inside a
-run unit is not admitted). If any step fails it writes one JSON line to stderr,
-`{"code": "socket_check_failed", "reason": ..., "detail": ...}`, nothing to stdout, and exits 1. The
-folder and socket steps are repeated before every forwarded call.
+this user with mode 0600 or narrower; and one read (`run.list`, `limit: 1`) gets an answer in the control
+API's shape, which also proves the listener runs as this user and admits this process (a process inside a
+run unit is not admitted). It proves the socket is sound and answered, not which program answered. If any
+step fails it writes one JSON line to stderr, `{"code": "socket_check_failed", "reason": ..., "detail": ...}`,
+nothing to stdout, and exits 1. The folder and socket steps are repeated before every forwarded call.
 
-Exit statuses: 0 when the client closes stdin; 1 when the socket check fails; 2 for an argument; 130
-when interrupted. Closing stdin never stops a run: calls in flight finish and are answered, and the
-runs go on.
+Exit statuses: 0 when the client ends stdin or stdout fails; 1 when the socket check fails; 2 for an
+argument; 3 for an unexpected error while serving (one JSON line, `internal_error`); 130 when interrupted.
+Ending stdin never stops a run: admitted calls finish and are answered, and the runs go on. The process
+reads fd 0 and writes fd 1 directly (`stdio.py`): nothing is buffered in `sys.stdout`, so a client that
+stops reading ends the process with status 0, not with a failed final flush.
 
 ## The wire
 
-`server.py` says what each method answers. In short: `initialize` always answers `2025-06-18`;
-`server/discover` (a dual-era client's probe) and every other unknown method answer `-32601` and the
-process keeps serving, so such a client falls back to `initialize`; `tools/list` and `tools/call` are
-refused until `initialize`; invalid arguments are `-32602` and reach nothing; `notifications/cancelled`
-drops that request's answer and sends nothing to the daemon. Diagnostics go to stderr as JSON lines;
-stdout carries only protocol messages, one ASCII line each.
+`server.py` says what each method answers. In short:
+
+- `initialize` always answers `2025-06-18`; `protocolVersion`, `capabilities` and `clientInfo` (with a
+  string `name` and `version`) are required, as the 2025-06-18 schema says.
+- `server/discover` (a dual-era client's probe) and every other unknown method answer `-32601` and the
+  process keeps serving, so such a client falls back to `initialize`.
+- `tools/list` and `tools/call` are refused until `initialize`. Invalid arguments are `-32602` and reach
+  nothing; `arguments` may be left out (`{}`), and when present must be an object (`null` is refused).
+- Request ids are strings or integers. A fraction or a boolean is not an id, so it can never name another
+  request.
+- Admission never makes the reader wait: a call takes one of 8 ordinary slots (the stop tool also one of
+  2 reserved slots), or waits in a queue (16 places for ordinary calls, 8 for stop calls, served first),
+  or is refused at once with `-32000` "Server busy" and `data.delivered: false` (nothing was sent). A slot
+  is held until the call's answer is written, so slow stdout cannot pile up workers.
+- `notifications/cancelled`: a waiting call is dropped unsent; a running call's answer is dropped; an
+  answer already being written goes out (the cancellation came too late). Nothing is ever sent to the
+  daemon for a cancellation.
+- When stdout fails, nothing more is sent: waiting calls are dropped, and the session ends without
+  waiting for more input.
+
+Diagnostics go to stderr as JSON lines; stdout carries only protocol messages, one ASCII line each.
 
 ## Fixtures
 

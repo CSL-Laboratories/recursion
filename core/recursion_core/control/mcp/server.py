@@ -6,10 +6,10 @@ One ``LegacySession`` serves one client over one stdio pair (``serve``). What it
     Answers ``protocolVersion: "2025-06-18"`` whatever the client asked for: 2025-06-18 lifecycle,
     "Version Negotiation": a server that supports the requested version answers it, otherwise it answers
     another version it supports, and this server supports exactly one. The client decides whether to go
-    on. ``protocolVersion`` must be a non-empty string; ``capabilities`` and ``clientInfo``, when present,
-    must be objects. A refused ``initialize`` leaves the session uninitialized; a second ``initialize``
-    is refused. Capabilities: ``tools`` only, ``listChanged: false`` (the list never changes while the
-    process lives).
+    on. As the 2025-06-18 schema requires, ``protocolVersion`` is a non-empty string, ``capabilities`` an
+    object and ``clientInfo`` an object with a string ``name`` and ``version``; anything else is
+    ``-32602``. A refused ``initialize`` leaves the session uninitialized; a second one is refused.
+    Capabilities: ``tools`` only, ``listChanged: false`` (the list never changes while the process lives).
 ``server/discover`` and every other unknown method
     ``-32601`` Method not found, before and after ``initialize``, and the process keeps serving. A
     dual-era client probes a stdio server with ``server/discover`` and falls back to ``initialize`` on
@@ -20,34 +20,53 @@ One ``LegacySession`` serves one client over one stdio pair (``serve``). What it
     ``{}``, in any state.
 ``tools/list``, ``tools/call``
     ``-32600`` until ``initialize`` has been answered. ``tools/list`` has one page; a ``cursor`` (this
-    server never issues one) is ``-32602``. ``tools/call``: an unknown tool or arguments that break the
-    tool's ``inputSchema`` are ``-32602`` and nothing reaches the daemon; otherwise the call runs on a
-    worker thread and its answer is ``control.mcp_tools.call_tool``'s, unchanged: the control API's answer
-    as ``structuredContent``, the same JSON as text, ``isError`` true unless the code is a success code.
+    server never issues one) is ``-32602``. ``tools/call``: an unknown tool, or ``arguments`` that break
+    the tool's ``inputSchema`` (``arguments`` may be left out, which is ``{}``; when present it is checked
+    as it is, so ``null`` is refused), are ``-32602`` and nothing reaches the daemon. Otherwise the call is
+    admitted (below) and its answer is ``control.mcp_tools.call_tool``'s, unchanged: the control API's
+    answer as ``structuredContent``, the same JSON as text, ``isError`` true unless the code is a success
+    code.
 ``notifications/initialized``
-    Recorded; requests after the ``initialize`` answer are served whether or not it has arrived.
+    Accepted; requests after the ``initialize`` answer are served whether or not it has arrived.
 ``notifications/cancelled``
-    Names one in-flight request by its id (compared as a JSON value). That request's answer is not
-    written. Nothing else happens: the call already sent to the daemon is not withdrawn, and no Stop is
-    ever sent for a cancellation. A cancellation for an id that is not in flight is ignored.
+    Names one request by its id (a string or an integer; ``"1"`` and ``1`` are different requests).
+    A call still WAITING for a slot is dropped and never sent. A call RUNNING has its answer dropped; the
+    call already sent to the daemon is not withdrawn. A call whose answer is already being written is not
+    affected: the answer was committed before the cancellation arrived, as for a call that has finished
+    (the specification lets a receiver ignore a cancellation that comes too late). Which of these happened
+    is decided under the session's lock, so a cancellation and an answer never both win. No Stop is ever
+    sent for a cancellation, and a cancellation for an id that is not in flight is ignored.
 
 The MCP face has no Stop path of its own: ``recursion_run_stop`` forwards to ``run.stop`` and answers
-what it answered (``stopped`` only when cleanup is confirmed, otherwise ``pending``). A call that raises
-answers ``control_api_unavailable`` with ``delivered: "unknown"``, never a stop.
+what it answered (``stopped`` only when cleanup is confirmed, otherwise ``pending``). A call that raises,
+or whose answer is not an object, answers ``control_api_unavailable`` with ``delivered: "unknown"``.
 
-Concurrency. At most ``max_in_flight`` calls run at once; when all are busy the reader waits for one to
-finish before it reads on (back-pressure, not refusal). ``recursion_run_stop`` may also use one of
-``reserved_stop`` extra slots, so a Stop is not kept waiting behind slow starts (the daemon keeps
-reserved connections for Stop in the same way). A request whose id is still in flight is refused.
+ADMISSION AND OVERLOAD. The reader never waits for capacity, so a Stop or a cancellation behind a busy
+moment is still read. A call takes one of ``max_in_flight`` ordinary slots; the stop tool may also take
+one of ``reserved_stop`` extra slots (the daemon keeps reserved connections for Stop in the same way). A
+slot is held until the call's answer has been written (or dropped), so the number of worker threads and
+of answers waiting for stdout is bounded by the slots. A call that finds no slot waits in a queue:
+ordinary calls in one of ``max_waiting`` places, stop calls in one of ``max_waiting_stops`` places of their
+own, which are served first. A call that finds its queue full is refused at once with ``-32000`` "Server
+busy" and ``data.delivered: false``: nothing was sent, so it is safe to send again. A request whose id is
+still in flight (waiting, running or being answered) is refused.
 
-End of input. The client closing stdin ends the session: the reader stops, calls still in flight finish
-and their answers are written while stdout stays open, and the process exits 0. It never stops a run:
-the runs it started go on (detach, not stop). A write to stdout that fails ends reading in the same way:
-nothing more is forwarded whose answer the client could not see.
+END OF INPUT. The client ending stdin ends reading: calls already admitted are run (waiting ones as slots
+free) and answered while stdout stays open, then ``serve`` returns 0. It never stops a run: the runs it
+started go on (detach, not stop).
+
+OUTPUT FAILURE. When a write to stdout fails, the session stops forwarding: no frame read afterwards and no
+waiting call is sent, a call that has been admitted but not yet sent is not sent, calls already sent are
+left to finish at the daemon (no Stop is sent in their place), and ``serve`` returns without waiting for
+more input. Reading runs on its own thread for that reason.
+
+Synchronous answers (pings, refusals, ``initialize``, ``tools/list``) are written by the reader itself; a
+client that stops reading stdout altogether therefore stops the reader once the pipe is full.
 """
 
 from __future__ import annotations
 
+import collections
 import json
 import threading
 from collections.abc import Callable, Iterable
@@ -57,7 +76,7 @@ from typing import Any, BinaryIO
 from recursion_core.control import mcp_tools
 
 from . import jsonrpc
-from .framing import NOT_JSON, NOT_UTF8, TOO_LARGE, Frame, FrameWriter, read_frames
+from .framing import MAX_INT_DIGITS, NOT_JSON, NOT_UTF8, NUMBER_TOO_LONG, TOO_LARGE, Frame, FrameWriter, read_frames
 from .tools import Tool, check_arguments, tool_table
 
 LEGACY_PROTOCOL = "2025-06-18"
@@ -72,15 +91,23 @@ INSTRUCTIONS = (
 
 MAX_IN_FLIGHT = 8
 RESERVED_STOP = 2
+MAX_WAITING = 16
+MAX_WAITING_STOPS = 8
+SERVER_BUSY = -32000
 
 UNAVAILABLE = "control_api_unavailable"
 _KNOWN_AFTER_INIT = frozenset({"tools/list", "tools/call"})
+WAITING, RUNNING, ANSWERING = "waiting", "running", "answering"
 
 Log = Callable[[dict], None]
 
 
 def _quiet(_event: dict) -> None:
     pass
+
+
+def _always_open() -> bool:
+    return True
 
 
 def negotiate(requested: str) -> str:
@@ -97,42 +124,61 @@ def _unknown_outcome(exc: BaseException) -> dict:
             "structuredContent": answer, "isError": True}
 
 
+class _Busy(Exception):
+    pass
+
+
+class _OutputLost(Exception):
+    pass
+
+
 @dataclass(slots=True, eq=False)
 class _Call:
     request_id: Any
     tool: Tool
-    reserved: bool
+    state: str = WAITING
+    holds_slot: bool = False
+    reserved: bool = False
     cancelled: bool = False
+    ready: bool = False  # its arguments are attached: it may be started
+    arguments: Any = None
 
 
 class LegacySession:
     """One client's session. ``api`` is anything with ``call(method, params) -> dict``; ``write`` puts one
-    message on the wire."""
+    message on the wire; ``output_open()`` says whether stdout still takes answers."""
 
     def __init__(self, api: Any, write: Callable[[dict], Any], *, tools: Iterable[Tool] | None = None,
                  max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP,
-                 log: Log | None = None) -> None:
-        if max_in_flight < 1 or reserved_stop < 0:
-            raise ValueError("max_in_flight must be positive and reserved_stop not negative")
+                 max_waiting: int = MAX_WAITING, max_waiting_stops: int = MAX_WAITING_STOPS,
+                 log: Log | None = None, output_open: Callable[[], bool] = _always_open) -> None:
+        if max_in_flight < 1 or min(reserved_stop, max_waiting, max_waiting_stops) < 0:
+            raise ValueError("max_in_flight must be positive and the other limits not negative")
         self._api = api
         self._write = write
         self._log = log or _quiet
+        self._output_open = output_open
         self._tools = {t.name: t for t in (tool_table() if tools is None else tools)}
         self._descriptors = [t.descriptor for t in self._tools.values()]
         self._max_in_flight, self._reserved_stop = max_in_flight, reserved_stop
+        self._max_waiting, self._max_waiting_stops = max_waiting, max_waiting_stops
         self._cond = threading.Condition()
-        self._in_flight: dict[Any, _Call] = {}  # by request id (str or number)
+        self._in_flight: dict[Any, _Call] = {}
+        self._waiting: collections.deque[_Call] = collections.deque()
+        self._waiting_stops: collections.deque[_Call] = collections.deque()
         self._general = 0
         self._reserved = 0
+        self._output_lost = False
         self.initialized = False
-        self.initialized_notified = False
-        self.client_info: dict | None = None
-        self.requested_version: str | None = None
 
     # -- input --------------------------------------------------------------------------------------
     def receive(self, frame: Frame) -> None:
         if frame.error == TOO_LARGE:
             self._write(jsonrpc.error(None, jsonrpc.INVALID_REQUEST, "Invalid Request: message too large"))
+            return
+        if frame.error == NUMBER_TOO_LONG:
+            self._write(jsonrpc.error(None, jsonrpc.INVALID_REQUEST,
+                                      f"Invalid Request: an integer longer than {MAX_INT_DIGITS} digits"))
             return
         if frame.error in (NOT_UTF8, NOT_JSON):
             detail = "not UTF-8" if frame.error == NOT_UTF8 else "not JSON"
@@ -149,20 +195,28 @@ class LegacySession:
             self._request(message)
 
     def _notification(self, note: jsonrpc.Notification) -> None:
-        if note.method == "notifications/initialized":
-            if self.initialized:
-                self.initialized_notified = True
-            return
         if note.method == "notifications/cancelled":
             request_id = note.params.get("requestId")
-            if not jsonrpc.valid_id(request_id):
-                return
-            with self._cond:
-                call = self._in_flight.get(request_id)
-                if call is not None:
-                    call.cancelled = True
-            self._log({"event": "cancelled", "in_flight": call is not None})
-        # Any other notification is ignored.
+            if jsonrpc.valid_id(request_id):
+                self._cancel(request_id)
+        # notifications/initialized and every other notification need nothing.
+
+    def _cancel(self, request_id: Any) -> None:
+        with self._cond:
+            call = self._in_flight.get(request_id)
+            if call is None:
+                outcome = "not_in_flight"
+            elif call.state == WAITING:
+                (self._waiting_stops if call.tool.is_stop else self._waiting).remove(call)
+                del self._in_flight[request_id]
+                self._cond.notify_all()
+                outcome = "never_sent"
+            elif call.state == RUNNING:
+                call.cancelled = True
+                outcome = "answer_dropped"
+            else:
+                outcome = "answer_already_written"
+        self._log({"event": "cancelled", "outcome": outcome})
 
     def _request(self, req: jsonrpc.Request) -> None:
         with self._cond:
@@ -191,22 +245,21 @@ class LegacySession:
         if self.initialized:
             self._write(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST, "Invalid Request: already initialized"))
             return
-        requested = req.params.get("protocolVersion")
+        params = req.params
+        requested, info = params.get("protocolVersion"), params.get("clientInfo")
+        problem = None
         if not isinstance(requested, str) or not requested:
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS,
-                                      "Invalid params: protocolVersion must be a non-empty string"))
+            problem = "protocolVersion must be a non-empty string"
+        elif not isinstance(params.get("capabilities"), dict):
+            problem = "capabilities must be an object"
+        elif not (isinstance(info, dict) and isinstance(info.get("name"), str) and isinstance(info.get("version"), str)):
+            problem = "clientInfo must be an object with a string name and version"
+        if problem is not None:
+            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Invalid params: {problem}"))
             return
-        for name in ("capabilities", "clientInfo"):
-            if name in req.params and not isinstance(req.params[name], dict):
-                self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS,
-                                          f"Invalid params: {name} must be an object"))
-                return
         answered = negotiate(requested)
         self.initialized = True
-        self.requested_version = requested
-        self.client_info = req.params.get("clientInfo")
-        self._log({"event": "initialize", "requested": requested, "answered": answered,
-                   "client": (self.client_info or {}).get("name")})
+        self._log({"event": "initialize", "requested": requested, "answered": answered, "client": info["name"]})
         self._write(jsonrpc.result(req.id, {
             "protocolVersion": answered,
             "capabilities": {"tools": {"listChanged": False}},
@@ -230,81 +283,145 @@ class LegacySession:
         if tool is None:
             self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Unknown tool: {name}"))
             return
-        arguments = req.params.get("arguments", {})
-        if arguments is None:
-            arguments = {}
-        problem = check_arguments(tool.input_schema, arguments)
+        arguments = req.params["arguments"] if "arguments" in req.params else {}
+        try:
+            problem = check_arguments(tool.input_schema, arguments)
+        except Exception:  # noqa: BLE001 - a schema the checker cannot apply: refuse, send nothing, keep reading
+            self._write(jsonrpc.error(req.id, jsonrpc.INTERNAL_ERROR,
+                                      "Internal error: the tool's input schema could not be applied", {"tool": name}))
+            return
         if problem is not None:
             self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Invalid params: {problem}",
                                       {"tool": name}))
             return
-        call = self._admit(req.id, tool)
-        worker = threading.Thread(target=self._run, args=(call, arguments), name="mcp-tools-call", daemon=True)
         try:
-            worker.start()
-        except RuntimeError:  # no thread could be started: nothing was sent to the daemon
-            self._release(call)
-            self._forget(call)
-            self._write(jsonrpc.error(req.id, jsonrpc.INTERNAL_ERROR, "Internal error: no worker for this call"))
+            call = self._admit(req.id, tool)
+        except _OutputLost:  # no answer could be seen: nothing is sent and nothing is written
+            return
+        except _Busy:
+            self._write(jsonrpc.error(req.id, SERVER_BUSY, "Server busy: this call was not sent; it may be sent again",
+                                      {"delivered": False}))
+            return
+        with self._cond:
+            call.arguments, call.ready = arguments, True
+            start = [call] if call.state == RUNNING else self._startable()
+        for each in start:
+            self._start(each)
 
     def _admit(self, request_id: Any, tool: Tool) -> _Call:
-        """Take a slot (waiting for one if every slot is busy) and record the call as in flight."""
+        """Record the call as in flight, holding a slot (``running``) or a place in its queue (``waiting``);
+        never waits. ``_Busy`` when its queue is full, ``_OutputLost`` once stdout has failed."""
 
         with self._cond:
-            while True:
-                if self._general < self._max_in_flight:
-                    self._general += 1
-                    reserved = False
-                    break
-                if tool.is_stop and self._reserved < self._reserved_stop:
-                    self._reserved += 1
-                    reserved = True
-                    break
-                self._cond.wait()
-            call = _Call(request_id, tool, reserved)
+            if self._output_lost or not self._output_open():
+                raise _OutputLost()
+            call = _Call(request_id, tool)
+            if self._take_slot(call):
+                call.state = RUNNING
+            elif tool.is_stop and len(self._waiting_stops) < self._max_waiting_stops:
+                self._waiting_stops.append(call)
+            elif not tool.is_stop and len(self._waiting) < self._max_waiting:
+                self._waiting.append(call)
+            else:
+                raise _Busy()
             self._in_flight[request_id] = call
             return call
 
-    def _release(self, call: _Call) -> bool:
-        """Give the call's slot back; ``True`` when its answer is still wanted (it was not cancelled)."""
+    def _take_slot(self, call: _Call) -> bool:
+        """Under the lock: an ordinary slot, else (for the stop tool) a reserved one."""
 
-        with self._cond:
-            if call.reserved:
-                self._reserved -= 1
-            else:
-                self._general -= 1
-            self._cond.notify_all()
-            return not call.cancelled
+        if self._general < self._max_in_flight:
+            self._general += 1
+        elif call.tool.is_stop and self._reserved < self._reserved_stop:
+            self._reserved += 1
+            call.reserved = True
+        else:
+            return False
+        call.holds_slot = True
+        return True
 
-    def _forget(self, call: _Call) -> None:
-        """The call is over and its answer, if wanted, is written: its id may be used again."""
+    def _startable(self) -> list[_Call]:
+        """Under the lock: waiting calls that can now take a slot, stop calls first; each is moved to running."""
 
-        with self._cond:
-            self._in_flight.pop(call.request_id, None)
-            self._cond.notify_all()
+        started: list[_Call] = []
+        if self._output_lost:
+            return started
+        for queue in (self._waiting_stops, self._waiting):
+            for call in list(queue):
+                if not call.ready or not self._take_slot(call):
+                    continue
+                queue.remove(call)
+                call.state = RUNNING
+                started.append(call)
+        return started
 
-    def _run(self, call: _Call, arguments: dict) -> None:
+    def _start(self, call: _Call) -> None:
+        worker = threading.Thread(target=self._run, args=(call,), name="mcp-tools-call", daemon=True)
         try:
-            try:
-                outcome = mcp_tools.call_tool(self._api, call.tool.name, arguments)
-            except Exception as exc:  # noqa: BLE001 - an answer is owed; the call's effect is unknown
-                outcome = _unknown_outcome(exc)
-            if self._release(call):
-                try:
-                    self._write(jsonrpc.result(call.request_id, outcome))
-                except (TypeError, ValueError):  # an answer JSON cannot hold; it claims nothing either way
-                    self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR,
-                                              "Internal error: the answer is not JSON"))
-        finally:
-            self._forget(call)
+            worker.start()
+        except RuntimeError:  # no thread could be started: nothing was sent to the daemon
+            self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR, "Internal error: no worker for this call"))
+            self._finish(call)
 
-    # -- end of input -----------------------------------------------------------------------------------
+    def _run(self, call: _Call) -> None:
+        try:
+            if self._output_open() and not self._output_lost:
+                try:
+                    outcome = mcp_tools.call_tool(self._api, call.tool.name, call.arguments)
+                except Exception as exc:  # noqa: BLE001 - an answer is owed; the call's effect is unknown
+                    outcome = _unknown_outcome(exc)
+                with self._cond:
+                    send = not call.cancelled
+                    if send:
+                        call.state = ANSWERING
+                if send:
+                    try:
+                        self._write(jsonrpc.result(call.request_id, outcome))
+                    except (TypeError, ValueError):  # an answer JSON cannot hold; it claims nothing either way
+                        self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR,
+                                                  "Internal error: the answer is not JSON"))
+            # Output already lost: the call is not sent at all.
+        finally:
+            self._finish(call)
+
+    def _finish(self, call: _Call) -> None:
+        """The call is over and its answer, if wanted, written: give its slot and id back, start what waits."""
+
+        with self._cond:
+            if call.holds_slot:
+                if call.reserved:
+                    self._reserved -= 1
+                else:
+                    self._general -= 1
+                call.holds_slot = False
+            self._in_flight.pop(call.request_id, None)
+            start = self._startable()
+            self._cond.notify_all()
+        for each in start:
+            self._start(each)
+
+    # -- output failure and end of input ------------------------------------------------------------------
+    def output_lost(self) -> None:
+        """Stdout failed: send nothing more. Waiting calls are dropped unsent; running ones finish."""
+
+        with self._cond:
+            if self._output_lost:
+                return
+            self._output_lost = True
+            dropped = list(self._waiting_stops) + list(self._waiting)
+            self._waiting_stops.clear()
+            self._waiting.clear()
+            for call in dropped:
+                self._in_flight.pop(call.request_id, None)
+            self._cond.notify_all()
+        self._log({"event": "output_lost", "dropped_unsent": len(dropped)})
+
     def in_flight(self) -> int:
         with self._cond:
             return len(self._in_flight)
 
     def close(self) -> None:
-        """Wait until every call in flight has finished and written its answer (if wanted)."""
+        """Wait until every admitted call has been run (or dropped) and its answer written (if wanted)."""
 
         with self._cond:
             while self._in_flight:
@@ -312,16 +429,41 @@ class LegacySession:
 
 
 def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None = None,
-          max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP) -> int:
-    """Serve one client until end of input; returns the process exit status (0)."""
+          max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP,
+          max_waiting: int = MAX_WAITING, max_waiting_stops: int = MAX_WAITING_STOPS) -> int:
+    """Serve one client until end of input or until stdout fails; returns the process exit status (0).
 
-    writer = FrameWriter(outstream)
+    Reading runs on a thread of its own, so that a failure of stdout ends the session even while the
+    reader waits for input. An exception raised while reading (an interrupt included) is raised here.
+    """
+
     log = log or _quiet
-    session = LegacySession(api, writer.write, log=log, max_in_flight=max_in_flight, reserved_stop=reserved_stop)
-    for frame in read_frames(instream):
-        session.receive(frame)
-        if writer.broken:  # the client stopped reading: forward nothing more whose answer it cannot see
-            break
+    done = threading.Event()
+    failure: list[BaseException] = []
+    writer = FrameWriter(outstream)
+    session = LegacySession(api, writer.write, log=log, max_in_flight=max_in_flight, reserved_stop=reserved_stop,
+                            max_waiting=max_waiting, max_waiting_stops=max_waiting_stops,
+                            output_open=lambda: not writer.broken)
+
+    def output_failed() -> None:
+        session.output_lost()
+        done.set()
+
+    writer.on_broken = output_failed
+
+    def read() -> None:
+        try:
+            for frame in read_frames(instream):  # after an output failure a frame is still read, and refused
+                session.receive(frame)           # at admission: nothing is sent (LegacySession._admit)
+        except BaseException as exc:  # noqa: BLE001 - carried to the serving thread and raised there
+            failure.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=read, name="mcp-stdin", daemon=True).start()
+    done.wait()
+    if failure:
+        raise failure[0]
     session.close()
-    log({"event": "end_of_input", "stdout_broken": writer.broken})
+    log({"event": "end_of_input" if not writer.broken else "output_failed", "stdout_broken": writer.broken})
     return 0

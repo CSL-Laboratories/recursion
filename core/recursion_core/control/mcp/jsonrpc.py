@@ -1,7 +1,8 @@
 """JSON-RPC 2.0 message shapes as MCP 2025-06-18 uses them (basic/index, "Messages").
 
-* A request has ``jsonrpc: "2.0"``, a string ``method``, an ``id`` that is a string or a number (MCP: never
-  null; a JSON boolean is not a number), and ``params`` that, when present, is an object.
+* A request has ``jsonrpc: "2.0"``, a string ``method``, an ``id`` that is a string or an integer (MCP
+  2025-06-18: never null; a fraction is not taken, and a JSON boolean is not an integer), and ``params``
+  that, when present, is an object.
 * A notification is a request without an ``id``; it is never answered.
 * A response (``result`` or ``error``, no ``method``) is something this server never asked for: it sends
   no requests, so a response from the client is ignored.
@@ -9,14 +10,14 @@
 
 An error whose request id cannot be read carries ``id: null`` (JSON-RPC 2.0, section 5).
 
-Request ids are compared as JSON values: ``"1"`` and ``1`` are different requests (a Python dict keeps
-them apart too), and ``true`` is never the request ``1`` because a boolean is not a valid id at all
-(Python alone would take ``True == 1``).
+Request ids are compared as JSON values. ``"1"`` and ``1`` are different requests (a Python dict keeps
+them apart too). ``1.0`` and ``true`` are not ids at all, so neither can name the request ``1`` (Python
+alone would take ``1.0 == 1`` and ``True == 1``): a request carrying one is refused with ``id: null``,
+and a cancellation naming one is ignored.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,15 +29,9 @@ INTERNAL_ERROR = -32603
 
 
 def valid_id(value: Any) -> bool:
-    """A string, or a finite number that is not a boolean."""
+    """A string, or an integer that is not a boolean."""
 
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, str):
-        return True
-    if isinstance(value, int):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
+    return isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
 
 
 def result(request_id: Any, value: dict) -> dict:
@@ -97,7 +92,7 @@ def classify(message: Any) -> Request | Notification | Response | Invalid:
     if "id" not in message:
         return Notification(method, params if isinstance(params, dict) else {})
     if readable_id is None:
-        return Invalid(None, INVALID_REQUEST, "Invalid Request: id must be a string or a number, never null")
+        return Invalid(None, INVALID_REQUEST, "Invalid Request: id must be a string or an integer, never null")
     if not isinstance(params, dict):
         return Invalid(readable_id, INVALID_PARAMS, "Invalid params: params must be an object")
     return Request(readable_id, method, params)

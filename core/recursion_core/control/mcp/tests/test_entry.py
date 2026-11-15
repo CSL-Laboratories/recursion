@@ -98,6 +98,19 @@ class EntryTest(unittest.TestCase):
         self.assertEqual(130, entry.main([], stdin=Interrupting(), stdout=io.BytesIO(), stderr=io.StringIO(),
                                          check=lambda environ: ScriptedAPI()))
 
+    def test_an_unexpected_error_while_serving_exits_3_with_one_json_line(self) -> None:
+        class Failing(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readline(self, size=-1):
+                raise RuntimeError("the input broke")
+
+        err = io.StringIO()
+        self.assertEqual(3, entry.main([], stdin=Failing(), stdout=io.BytesIO(), stderr=err,
+                                       check=lambda environ: ScriptedAPI()))
+        self.assertEqual({"code": "internal_error", "detail": "RuntimeError: the input broke"}, stderr_lines(err)[-1])
+
     @unittest.skipUnless(os.name == "nt", "Windows-only: the real socket check refuses the platform")
     def test_windows_refuses_with_the_real_check(self) -> None:
         err = io.StringIO()

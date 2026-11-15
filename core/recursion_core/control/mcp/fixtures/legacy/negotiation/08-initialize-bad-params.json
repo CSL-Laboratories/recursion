@@ -2,8 +2,8 @@
   "format": "mcp-stdio-fixture/1",
   "name": "negotiation/08-initialize-bad-params",
   "protocol": "2025-06-18",
-  "summary": "initialize without a usable protocolVersion, or with capabilities or clientInfo that are not objects, is refused and leaves the session uninitialized; a correct initialize then succeeds.",
-  "source": "MCP 2025-06-18 basic/lifecycle (Initialization, Version Negotiation)",
+  "summary": "initialize without a usable protocolVersion, without capabilities as an object, or without clientInfo as an object with a string name and version (all three are required by the 2025-06-18 schema) is refused and leaves the session uninitialized; a correct initialize then succeeds.",
+  "source": "MCP 2025-06-18 basic/lifecycle (Initialization, Version Negotiation); MCP 2025-06-18 schema, InitializeRequest",
   "api": [],
   "steps": [
     {
@@ -115,7 +115,7 @@
           "id": 5,
           "error": {
             "code": -32602,
-            "message": "Invalid params: clientInfo must be an object"
+            "message": "Invalid params: clientInfo must be an object with a string name and version"
           }
         }
       ]
@@ -144,7 +144,6 @@
         "method": "initialize",
         "params": {
           "protocolVersion": "2025-06-18",
-          "capabilities": {},
           "clientInfo": {
             "name": "fixture-client",
             "version": "1.0.0"
@@ -155,6 +154,101 @@
         {
           "jsonrpc": "2.0",
           "id": 7,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: capabilities must be an object"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {}
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 8,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: clientInfo must be an object with a string name and version"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "x"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 9,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: clientInfo must be an object with a string name and version"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": 1,
+            "version": "1"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 10,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: clientInfo must be an object with a string name and version"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "fixture-client",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 11,
           "result": {
             "protocolVersion": "2025-06-18",
             "capabilities": {

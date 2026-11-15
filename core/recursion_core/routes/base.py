@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
+from recursion_core.routes.host import PLATFORM_UNSUPPORTED, platform_supported
 from recursion_core.routes.launch import EngineProcess, Launcher, ReadTimeout
 
 # credentials(connection_id, env_name) -> secret value. Owned by the core's custody layer (A3), injected.
@@ -36,6 +37,11 @@ class RouteAdapter:
 
     def run(self, request: dict, deadline_at: float) -> dict:
         rid = request["request_id"]
+        if not platform_supported():
+            # Lucas, Nov 12 ("Yes, as recommended", decision sheet D9): "Windows refuses uniformly at the
+            # shared adapter boundary, before any path or connector is looked at" (R3-7). Nothing is built:
+            # no argv, no environment, no credential lookup, and the launcher is never called.
+            return c.result(rid, c.LAUNCH_REFUSED, detail=PLATFORM_UNSUPPORTED)
         try:
             argv, env = self.argv(request), self.env(request)
         except c.RouteError as err:

@@ -75,7 +75,8 @@ DEFAULT_EXECUTABLE = "agent"
 # included. Whether ``agent acp`` honours it is not known (V38, the record's question 7).
 NO_UPDATE = "--disable-auto-update"
 # Options that carry a credential in argv (``--api-key``, ``--auth-token``) or can (a custom request
-# header). A key reaches Cursor only as CURSOR_API_KEY in the child environment, never in argv.
+# header). A key never goes in argv. Passing it as CURSOR_API_KEY in the child environment is a later slice's:
+# child_env has no Cursor profile yet (the eighth break-it read of #388, F8-4).
 CREDENTIAL_OPTIONS = ("--api-key", "--auth-token", "--header")
 CREDENTIAL_SHORT_OPTIONS = ("-H",)
 # Options that widen what a run may do without asking (https://cursor.com/docs/cli/reference/parameters:
@@ -115,7 +116,7 @@ _TYPES = ("system", "user", "assistant", "tool_call", "result")   # the document
 COUNTS = (
     "not_json",            # not one strict JSON object (also: duplicate keys, NaN, too deep)
     "unknown_type",        # a type this parser does not read; it never sets the conversation's id
-    "no_session",          # no session_id, or one that is not a string of 1 to 256 characters
+    "no_session",          # no session_id, or not a string of 1 to 256 characters with no lone surrogate
     "other_session",       # a session_id other than the first a known line reported
     "after_result",        # any other line of this conversation after the terminal result
     "result_repeated",     # a second terminal result line
@@ -162,13 +163,14 @@ def oneshot_declaration() -> dict:
 def _executable(binary: object) -> str:
     """argv[0]: the ``binary`` option composition gave, else DEFAULT_EXECUTABLE.
 
-    The option must be a plain absolute path: it starts with ``/``, and no part of it is empty, ``.`` or
-    ``..`` (so ``/``, ``/..``, ``//x`` and ``/opt/agent/`` are refused); no NUL, CR, LF or lone surrogate.
+    The option must be exactly a ``str`` (a subclass could show the rules one text and execve another) and a
+    plain absolute path: it starts with ``/``, and no part of it is empty, ``.`` or ``..`` (so ``/``, ``/..``,
+    ``//x`` and ``/opt/agent/`` are refused); no NUL, CR, LF or lone surrogate.
     Nothing here looks at the file system, so whether a file is there shows only at launch.
     """
     if binary is None:
         return DEFAULT_EXECUTABLE
-    if (not isinstance(binary, str) or not binary.startswith("/") or any(ch in binary for ch in "\x00\r\n")
+    if (type(binary) is not str or not binary.startswith("/") or any(ch in binary for ch in "\x00\r\n")
             or _has_surrogate(binary) or any(part in ("", ".", "..") for part in binary.split("/")[1:])):
         raise ArgvRefused("binary_not_absolute")
     return binary
@@ -179,10 +181,10 @@ def oneshot_argv(model: object, *, binary: object = None) -> list[str]:
     complete argv with ``check_argv``).
 
     The updater flag stands first, right after argv[0], on both drives, and the drive (``-p``) right after
-    it. No ``--force``, ``--api-key`` or header is added. A model that is empty, starts with a dash, or holds
-    a NUL, CR, LF or lone surrogate is ``model_invalid``.
+    it. No ``--force``, ``--api-key`` or header is added. A model that is not exactly a ``str``, is empty,
+    starts with a dash, or holds a NUL, CR, LF or lone surrogate is ``model_invalid``.
     """
-    if (not isinstance(model, str) or not model or model.startswith("-") or any(ch in model for ch in "\x00\r\n")
+    if (type(model) is not str or not model or model.startswith("-") or any(ch in model for ch in "\x00\r\n")
             or _has_surrogate(model)):
         raise ArgvRefused("model_invalid")
     return [_executable(binary), NO_UPDATE, "-p", "--output-format", "stream-json", "--model", model]
@@ -205,10 +207,16 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
 
     * ``full_access_malformed``: ``full_access_acknowledged`` is not a bool; only ``True`` acknowledges, as
       in the existing launch guards (``"true"``, ``1`` and the like are not an acknowledgement).
-    * ``argv_invalid``: not a non-empty list of text; an empty argument; an argument holding a NUL or a lone
+    * ``argv_invalid``: not a non-empty list or tuple of text, the container exactly a ``list`` or ``tuple``
+      and each argument exactly a ``str`` (a subclass could show these rules one argv and execve another:
+      the eighth break-it read of #388, F8-1); an empty argument; an argument holding a NUL or a lone
       surrogate, or longer than MAX_ARG_BYTES UTF-8 bytes; an argv longer than MAX_ARGV_BYTES in all, each
-      argument counted with its NUL and its pointer, ARG_POINTER_BYTES (none of these can be passed to
-      execve); an option holding a CR or LF.
+      argument counted with its NUL and its pointer, ARG_POINTER_BYTES; an option holding a CR or LF. The
+      NUL, the lone surrogate and the over-long argument cannot be passed to execve; the empty argument, the
+      whole-argv bound (half of the usual ARG_MAX) and the line break among the options are this lane's own
+      limits.
+    * ``binary_not_absolute``: the ``binary`` option is not exactly a ``str`` holding a plain absolute path
+      (``_executable``). It is checked as argv[0] is compared, so after every case above.
     * ``executable_mismatch``: argv[0] is not the vouched executable.
     * ``credential_in_argv:<option>``: an option carries a credential, in any spelling: ``--api-key K``,
       ``--api-key=K``, ``-H V``, ``-HV``, or ``H`` among bundled short options (``-vH V``).
@@ -222,8 +230,8 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
     """
     if not isinstance(full_access_acknowledged, bool):
         raise ArgvRefused("full_access_malformed")
-    if (not isinstance(argv, (list, tuple)) or not argv
-            or not all(isinstance(a, str) and a and "\x00" not in a and not _has_surrogate(a)
+    if (type(argv) not in (list, tuple) or not argv
+            or not all(type(a) is str and a and "\x00" not in a and not _has_surrogate(a)
                        and len(a.encode("utf-8")) <= MAX_ARG_BYTES for a in argv)
             or sum(len(a.encode("utf-8")) + 1 + ARG_POINTER_BYTES for a in argv) > MAX_ARGV_BYTES):
         raise ArgvRefused("argv_invalid")

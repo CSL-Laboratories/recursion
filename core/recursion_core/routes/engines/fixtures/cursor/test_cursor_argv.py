@@ -307,6 +307,65 @@ class CheckTest(unittest.TestCase):
         cursor.check_argv(["agent", "--disable-auto-update", "acp"])
         cursor.check_argv(("agent", "--disable-auto-update", "acp"))
 
+    def test_a_subclass_of_list_or_str_is_refused_not_trusted(self):
+        """Break-it read 8 of #388, F8-1: every rule reads the argv through the container's and the arguments'
+        own methods, so a subclass could show the rules one argv and execve another. The argv must be exactly
+        a list or a tuple, and each argument, the model and the binary exactly a str. A subclass is refused
+        with the rule's own code, never with anything but ArgvRefused."""
+
+        class BenignView(list):   # all() and sum() see a short argv; slicing and indexing see the real one
+            def __iter__(self):
+                return iter(["agent", "--disable-auto-update", "-p"])
+
+        class LyingLength(str):   # encode() reports one byte, whatever the text
+            def encode(self, *args, **kwargs):
+                return b"x"
+
+        class HiddenSurrogate(str):   # iterating it hides the lone surrogate from the surrogate rule
+            def __iter__(self):
+                return iter("ok")
+
+        head = ["agent", "--disable-auto-update", "-p", "--"]
+        big = BenignView(head + ["x" * cursor.MAX_ARG_BYTES] * 60)
+        self.assertGreater(argv_cost(list.__iter__(big)), cursor.MAX_ARGV_BYTES)
+        self.assertLessEqual(argv_cost(big), cursor.MAX_ARGV_BYTES)
+        for argv in (big, head + [LyingLength("x" * 200000)], head + [HiddenSurrogate("say " + chr(0xD800))],
+                     [LyingLength("agent"), "--disable-auto-update", "acp"],
+                     type("Row", (tuple,), {})(("agent", "--disable-auto-update", "acp"))):
+            with self.subTest(argv=type(argv).__name__):
+                with self.assertRaises(cursor.ArgvRefused) as caught:
+                    cursor.check_argv(argv)
+                self.assertEqual(caught.exception.detail, "argv_invalid")
+        for model in (HiddenSurrogate("m" + chr(0xD800)), LyingLength("m")):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.oneshot_argv(model)
+            self.assertEqual(caught.exception.detail, "model_invalid")
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.acp_argv(binary=HiddenSurrogate("/opt/" + chr(0xD800) + "/agent"))
+        self.assertEqual(caught.exception.detail, "binary_not_absolute")
+        with self.assertRaises(cursor.ArgvRefused) as caught:
+            cursor.check_argv(["/opt/c/agent", "--disable-auto-update", "acp"], binary=LyingLength("/opt/c/agent"))
+        self.assertEqual(caught.exception.detail, "binary_not_absolute")
+        cursor.check_argv(["agent", "--disable-auto-update", "acp"])   # the same text, plain, is taken
+        cursor.check_argv(("agent", "--disable-auto-update", "acp"))
+        cursor.check_argv(["/opt/c/agent", "--disable-auto-update", "acp"], binary="/opt/c/agent")
+
+    def test_a_bad_binary_is_refused_after_argv_invalid_and_before_executable_mismatch(self):
+        """Break-it read 8 of #388, F8-3: ``binary_not_absolute`` is raised as argv[0] is compared, so after
+        every ``argv_invalid`` case (a line break among the options included, since round 7) and before
+        ``executable_mismatch``, and the docstring lists it there."""
+        for argv, detail in ((["agent", "--disable-auto-update", "-p", "--model", "a\nb"], "argv_invalid"),
+                             (["agent", "--disable-auto-update", "acp"], "binary_not_absolute"),
+                             (["wrong", "--disable-auto-update", "acp"], "binary_not_absolute"),
+                             (["agent", "--disable-auto-update", "--api-key", "k", "acp"], "binary_not_absolute")):
+            with self.subTest(argv=argv):
+                with self.assertRaises(cursor.ArgvRefused) as caught:
+                    cursor.check_argv(argv, binary="relative/agent")
+                self.assertEqual(caught.exception.detail, detail)
+        doc = cursor.check_argv.__doc__
+        self.assertLess(doc.index("* ``argv_invalid``"), doc.index("* ``binary_not_absolute``"))
+        self.assertLess(doc.index("* ``binary_not_absolute``"), doc.index("* ``executable_mismatch``"))
+
     def test_every_refused_argv_of_the_fixture(self):
         self.assertEqual(len(ARGV["refused"]), 24)
         for case in ARGV["refused"]:

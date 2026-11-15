@@ -36,19 +36,37 @@ SCOPE_COLUMN = {
 
 @dataclass(frozen=True)
 class Principal:
-    """Mirror of control/hooks.py Principal (SPINE #369): made by the server, never read from params."""
+    """Mirror of control/hooks.py Principal (SPINE #369): made by the server, never read from params. ``grant``
+    is the field this lane asks SPINE for: the verified token's grant id, for a principal made from a token."""
     kind: str
     id: str | None = None
     in_run_unit: bool = False
+    grant: str | None = None
+
+
+def g(kind: str, principal_id: str) -> str:
+    """The stand-in grant id of the one grant ``Grants`` keeps for ``(kind, principal_id)``."""
+    return f"g-{kind}-{principal_id}"
+
+
+def bearer(kind: str, principal_id: str, in_run_unit: bool = False) -> Principal:
+    """A principal as the server would make it from a verified token: it names its grant."""
+    return Principal(kind, principal_id, in_run_unit, g(kind, principal_id))
 
 
 class Grants:
-    """Stands in for CredentialStore.held: what each (kind, id) holds right now."""
+    """Stands in for CredentialStore: ``held`` (an identity's live grants, for host-attributed plugins) and
+    ``grant_scopes`` (the one grant a token principal names), one grant per ``(kind, id)``, id ``g(kind, id)``."""
 
     def __init__(self, table: dict) -> None:
         self.table = dict(table)
 
     def held(self, kind, principal_id) -> frozenset:
+        return frozenset(self.table.get((kind, principal_id), ()))
+
+    def grant_scopes(self, grant, kind, principal_id) -> frozenset:
+        if grant != g(kind, principal_id):
+            return frozenset()
         return frozenset(self.table.get((kind, principal_id), ()))
 
 
@@ -68,11 +86,11 @@ PRINCIPALS = {
     "owner": Principal("owner", "local"),
     "internal": Principal("internal", "quota"),
     "page": Principal("device", "page"),
-    "device-run": Principal("device", "phone-1"),
-    "device-read": Principal("device", "phone-2"),
+    "device-run": bearer("device", "phone-1"),
+    "device-read": bearer("device", "phone-2"),
     "plugin": Principal("plugin", "plugin.alpha"),
-    "session": Principal("session", "s1"),
-    "agent": Principal("agent", "mcp"),
+    "session": bearer("session", "s1"),
+    "agent": bearer("agent", "mcp"),
     "nobody": Principal("plugin", "plugin.unknown"),
 }
 GRANTS = Grants({
@@ -175,11 +193,12 @@ class CeilingAtCallTest(unittest.TestCase):
         auth = authorizer(credentials=loose)
         for kind in ("plugin", "session", "agent"):
             with self.subTest(kind=kind):
-                self.assertEqual(auth(Principal(kind, "x"), "approval.answer", {}), ("scope_refused", "needs_approve"))
-                self.assertEqual(auth(Principal(kind, "x"), "workspace.publish", {}), ("scope_refused", "needs_manage"))
-                self.assertIsNone(auth(Principal(kind, "x"), "run.start", {}))
-        self.assertIsNone(auth(Principal("device", "x"), "approval.answer", {}))
-        self.assertEqual(auth(Principal("device", "x"), "workspace.publish", {}), ("scope_refused", "needs_manage"))
+                principal = Principal(kind, "x") if kind == "plugin" else bearer(kind, "x")
+                self.assertEqual(auth(principal, "approval.answer", {}), ("scope_refused", "needs_approve"))
+                self.assertEqual(auth(principal, "workspace.publish", {}), ("scope_refused", "needs_manage"))
+                self.assertIsNone(auth(principal, "run.start", {}))
+        self.assertIsNone(auth(bearer("device", "x"), "approval.answer", {}))
+        self.assertEqual(auth(bearer("device", "x"), "workspace.publish", {}), ("scope_refused", "needs_manage"))
 
     def test_the_page_holds_read_run_approve_and_never_manage(self) -> None:
         auth = authorizer(page_scopes=frozenset({"read", "run", "approve", "manage"}))
@@ -217,7 +236,10 @@ class RunUnitTest(unittest.TestCase):
         class Truthy:
             kind, id, in_run_unit = "owner", "local", 1
 
-        for principal in (NoFlag(), Truthy()):
+        class Zero:
+            kind, id, in_run_unit = "owner", "local", 0   # falsy, and still not exactly False
+
+        for principal in (NoFlag(), Truthy(), Zero()):
             self.assertEqual(auth(principal, "run.list", {}), ("scope_refused", "peer is inside a run unit"))
 
 
@@ -277,7 +299,7 @@ class StopTest(unittest.TestCase):
                                                                               ("session", "s1.child"): {"run"}}))
         self.assertIsNone(with_lineage(session, "run.stop", {"run_id": "run-s1-child"}))
         self.assertEqual(with_lineage(session, "run.stop", {"run_id": "run-s2"}), ("scope_refused", "run_outside_session"))
-        self.assertEqual(with_lineage(Principal("session", "s1.child"), "run.stop", {"run_id": "run-s1"}),
+        self.assertEqual(with_lineage(bearer("session", "s1.child"), "run.stop", {"run_id": "run-s1"}),
                          ("scope_refused", "run_outside_session"))   # a child cannot stop its parent
 
         def broken(run_session, ancestor):
@@ -291,7 +313,7 @@ class StopTest(unittest.TestCase):
         # subtree, whatever a lineage function would say.
         permissive = authorizer(credentials=Grants({("session", ""): {"run"}, ("session", "s1"): {"run"}}),
                                 in_subtree=lambda a, b: True)
-        self.assertEqual(permissive(Principal("session", ""), "run.stop", {"run_id": "run-s1"}),
+        self.assertEqual(permissive(bearer("session", ""), "run.stop", {"run_id": "run-s1"}),
                          ("scope_refused", "run_not_owned"))
         for run_id in ("run-host", "run-alpha", "run-noowner"):
             self.assertEqual(permissive(session, "run.stop", {"run_id": run_id}), ("scope_refused", "run_outside_session"))
@@ -345,6 +367,122 @@ class WithTheRealStoreTest(unittest.TestCase):
         store.revoke(cred.token_id)
         self.assertEqual(auth(plugin, "run.stop", {"run_id": "run-alpha"}), ("scope_refused", "needs_run"))
         self.assertEqual(auth(plugin, "plugin.list", {}), ("scope_refused", "needs_read"))
+
+
+@unittest.skipUnless(POSIX, "the credential store needs uids and O_NOFOLLOW (POSIX)")
+class GrantBoundTest(unittest.TestCase):
+    """A token principal holds its own grant only (both reads of #377 and #385): never another grant of the
+    same identity, never the page's scopes, nothing when it names no grant."""
+
+    def setUp(self) -> None:
+        base = tempfile.mkdtemp(prefix="scopes-grant-")
+        self.addCleanup(shutil.rmtree, base, True)
+        self.store = CredentialStore(os.path.join(base, "state", "credentials.json"))
+        self.auth = authorizer(credentials=self.store)
+
+    def test_a_read_token_is_not_widened_by_another_grant_of_its_identity(self) -> None:
+        _, read = self.store.mint("device", "phone-1", ["read"])
+        _, run = self.store.mint("device", "phone-1", ["read", "run"])
+        reader = Principal("device", "phone-1", grant=read.token_id)
+        runner = Principal("device", "phone-1", grant=run.token_id)
+        self.assertEqual(self.auth(reader, "run.start", {}), ("scope_refused", "needs_run"))
+        self.assertIsNone(self.auth(reader, "run.list", {}))
+        self.assertIsNone(self.auth(runner, "run.start", {}))
+        self.store.revoke(read.token_id)
+        self.assertEqual(self.auth(reader, "run.list", {}), ("scope_refused", "needs_read"))
+        self.assertIsNone(self.auth(runner, "run.list", {}))
+
+    def test_a_grant_counts_only_for_the_identity_it_was_minted_for(self) -> None:
+        _, cred = self.store.mint("device", "phone-1", ["read", "run"])
+        for principal in (Principal("device", "phone-2", grant=cred.token_id),
+                          Principal("session", "phone-1", grant=cred.token_id),
+                          Principal("device", "phone-1", grant="ctk-not-a-grant"),
+                          Principal("device", "phone-1", grant=5)):
+            self.assertEqual(self.auth(principal, "run.list", {}), ("scope_refused", "needs_read"), principal)
+
+    def test_a_bearer_kind_without_a_grant_holds_nothing_and_a_host_attributed_plugin_holds_its_identity(self) -> None:
+        self.store.mint("device", "phone-1", ["read", "run"])
+        self.store.mint("session", "s1", ["read", "run"])
+        self.store.mint("agent", "mcp", ["read"])
+        self.store.mint("plugin", "plugin.alpha", ["read"])
+        self.store.mint("plugin", "plugin.alpha", ["run"])
+        for principal in (Principal("device", "phone-1"), Principal("session", "s1"), Principal("agent", "mcp")):
+            self.assertEqual(self.auth.held(principal), frozenset(), principal)
+        self.assertEqual(self.auth.held(Principal("plugin", "plugin.alpha")), frozenset({"read", "run"}))
+
+    def test_a_token_principal_named_page_never_holds_the_page_scopes(self) -> None:
+        self.assertEqual(self.auth.held(Principal("device", "page", grant="ctk-anything")), frozenset())
+        self.assertEqual(self.auth.held(Principal("device", "page")), frozenset({"read", "run", "approve"}))
+
+
+class BreakItAnswersTest(unittest.TestCase):
+    """The DeepSeek read of #377: Stop's own rule, a store that raises, principals and rows that are not what
+    they should be."""
+
+    def test_run_stop_needs_a_held_run_scope_whatever_the_table_row_says(self) -> None:
+        def scope_of(method):
+            return "read" if method == "run.stop" else SCOPE_COLUMN.get(method)
+
+        auth = authorizer(scope_of=scope_of)
+        self.assertEqual(auth(PRINCIPALS["device-read"], "run.stop", {"run_id": "run-legacy"}), ("scope_refused", "needs_run"))
+        self.assertEqual(auth(PRINCIPALS["nobody"], "run.stop", {"run_id": "run-alpha"}), ("scope_refused", "needs_read"))
+        for name in ("owner", "page", "device-run"):
+            self.assertIsNone(auth(PRINCIPALS[name], "run.stop", {"run_id": "run-legacy"}), name)
+        self.assertIsNone(auth(PRINCIPALS["plugin"], "run.stop", {"run_id": "run-alpha"}))
+
+    def test_a_credential_store_that_raises_refuses_and_is_logged(self) -> None:
+        class Broken:
+            def held(self, kind, principal_id):
+                raise RuntimeError("credential store unavailable")
+
+            grant_scopes = held
+
+        auth = authorizer(credentials=Broken())
+        for name in ("plugin", "device-run", "session"):
+            for method in ("run.list", "run.start", "run.stop"):
+                with self.assertLogs("recursion_core.control.scopes", "ERROR"):
+                    self.assertEqual(auth(PRINCIPALS[name], method, {"run_id": "run-alpha"}),
+                                     ("scope_refused", "credentials_unavailable"), (name, method))
+        self.assertIsNone(auth(PRINCIPALS["owner"], "run.stop", {"run_id": "run-alpha"}))   # no store needed
+
+    def test_a_principal_whose_attributes_raise_holds_nothing(self) -> None:
+        class NoKind:
+            in_run_unit, id = False, "local"
+
+            @property
+            def kind(self):
+                raise RuntimeError("no kind")
+
+        class NoFlag:
+            kind, id = "owner", "local"
+
+            @property
+            def in_run_unit(self):
+                raise RuntimeError("no flag")
+
+        auth = authorizer()
+        self.assertEqual(auth(NoKind(), "run.list", {}), ("scope_refused", "needs_read"))
+        self.assertEqual(auth.held(NoKind()), frozenset())
+        self.assertEqual(auth(NoFlag(), "run.list", {}), ("scope_refused", "peer is inside a run unit"))
+
+    def test_a_row_that_is_not_a_scope_word_opens_nothing_and_a_table_that_raises_is_left_to_s5(self) -> None:
+        for bad in (["run"], 5, {"scope": "run"}, ""):
+            auth = authorizer(scope_of=lambda method, bad=bad: bad)
+            self.assertEqual(auth(PRINCIPALS["owner"], "run.list", {}), ("scope_refused", "scope_unknown"), repr(bad))
+
+        def broken(method):
+            raise RuntimeError("table unavailable")
+
+        with self.assertRaises(RuntimeError):   # S5 (control/hooks.py) refuses it as authorizer_failed and logs it
+            authorizer(scope_of=broken)(PRINCIPALS["owner"], "run.list", {})
+
+
+class ConstructionTest(unittest.TestCase):
+    def test_the_providers_must_be_callable(self) -> None:
+        for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},
+                       {"scope_of": SCOPE_COLUMN.get, "in_subtree": True}):
+            with self.assertRaises(TypeError):
+                Authorizer(**kwargs)
 
 
 class RegistrantTest(unittest.TestCase):

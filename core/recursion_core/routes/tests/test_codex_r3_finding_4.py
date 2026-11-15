@@ -10,22 +10,24 @@ error text never reaches an event. Fakes only: no real ``codex``, no credential,
 
 import json
 import unittest
+from unittest.mock import patch
 
 from recursion_core.routes import CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import codex as codex_module
 from recursion_core.routes import contract as c
-from recursion_core.routes.tests import fakes
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, request
 
-# DRIVER-CC's split (#376) adds fakes.runs_adapter, which skips a test that drives an adapter where the
-# platform is refused at the shared boundary (native Windows, R3-7). Until it merges this is a no-op.
-runs_adapter = getattr(fakes, "runs_adapter", lambda test: test)
+# These tests drive the adapter through a fake launcher only. DRIVER-CC's R3-7 (#376) refuses native Windows
+# at the shared adapter boundary before the launcher; pinning the host test keeps them running there (the
+# form the two reviews of #376 proposed for test_r3_finding_9, R4). create=True: the name exists only once
+# #376 has merged.
+on_any_host = patch("recursion_core.routes.base.platform_supported", lambda: True, create=True)
 
 EXACT = "chatgpt authentication required to read rate limits"
 READ_ONLY = ["initialize", "initialized", "account/rateLimits/read"]
 
 
-@runs_adapter
+@on_any_host
 class AstraCodexReadFailureTest(unittest.TestCase):
     def run_response(self, error):
         clock = FakeClock()
@@ -67,7 +69,7 @@ def _turn(text="keyed"):
                                                                               "status": "completed"}}}]
 
 
-@runs_adapter
+@on_any_host
 class ExactErrorOnlyTest(unittest.TestCase):
     """This lane's tests: which read errors are ignored, which are classified, and what is recorded."""
 

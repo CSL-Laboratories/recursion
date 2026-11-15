@@ -15,13 +15,13 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from recursion_core.routes import CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import codex as codex_module
-from recursion_core.routes.tests import fakes
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request
 
-runs_adapter = getattr(fakes, "runs_adapter", lambda test: test)  # see test_codex_r3_finding_4
+on_any_host = patch("recursion_core.routes.base.platform_supported", lambda: True, create=True)  # see finding_4
 
 ROUTES = Path(__file__).resolve().parents[1]
 FIXTURE = ROUTES / "engines" / "fixtures" / "codex" / "app-server-0.160.0.json"
@@ -106,7 +106,7 @@ class MethodNameTest(unittest.TestCase):
         self.assertFalse(METHOD_LIKE.match("codex.account/rateLimits/read"))  # an event source label
 
 
-@runs_adapter
+@on_any_host
 class SentMessageTest(unittest.TestCase):
     def check_message(self, doc: dict, msg: dict) -> None:
         self.assertLessEqual(set(msg), ENVELOPE, msg)

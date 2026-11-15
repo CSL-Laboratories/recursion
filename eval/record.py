@@ -15,7 +15,7 @@ Rules (PROTOCOL.md, "The record"):
   plan's per-task budget, at the next index after the planned attempts (so no two trials of a task
   share an index, and no trial replaces itself);
 * a label claims only what the run is: ``dev`` is the dev set and only it; ``screen``, ``pilot`` and
-  ``full`` need k of at least 5 and a real engine, and ``pilot`` and ``full`` a frozen suite;
+  ``full`` need k of at least 5, a real engine and a frozen suite;
 * every number is finite: NaN and infinity are refused, in the checks and in the JSON read and written.
 
 ``arm.settings_sha256`` is the hash of the settings BOTH arms must share (engine, model, route, effort,
@@ -35,7 +35,7 @@ SCHEMA_ID = "recursion-eval-run/1"
 # held-out suite, a harvest check). screen, pilot, full: measurements (PROTOCOL.md section 7).
 LABELS = ("dev", "shakedown", "screen", "pilot", "full")
 MEASURED_LABELS = ("screen", "pilot", "full")
-FROZEN_LABELS = ("pilot", "full")
+FROZEN_LABELS = ("screen", "pilot", "full")     # every measurement runs a frozen suite
 MIN_MEASURED_K = 5
 ORACLE_ENGINES = ("standin",)
 REPLACEABLE_TIERS = ("infra", "grader")

@@ -13,8 +13,9 @@ One record per suite run of one arm (eval/record.py), every planned trial in it.
 record by eval/analyze.py; the runner stores none.
 
 Before any attempt: the plan and the label are checked (a measurement needs k of at least 5, a held-out
-suite, a real engine and kept artifacts; a pilot or full comparison a frozen suite), and a frozen suite
-must pin the selected engine's version and settings and name the commit actually checked out.
+frozen suite, a real engine and kept artifacts), and a frozen suite must pin the selected engine's
+version and settings (for a real engine all of model, route, effort and permission mode) and name the
+commit actually checked out.
 
 Exit codes of eval/run: 0 every arm ran; 2 refused before any attempt (the message says why);
 3 an arm refused and the others ran; 130 interrupted (the record keeps every trial that ran).
@@ -270,8 +271,10 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def check_plan(suite, arms: list, *, k, attempts, replacements, label: str, artifacts) -> None:
+def check_plan(suite, arms: list, *, k, attempts, replacements, label: str, artifacts, seed=0) -> None:
     """Every plan and label rule, before any arm is asked to do anything (PROTOCOL.md sections 3 and 7)."""
+    if not _is_int(seed):
+        raise RunRefused(f"seed must be an integer, got {seed!r}")
     if not (_is_int(k) and k >= 1):
         raise RunRefused(f"k must be a positive integer, got {k!r}")
     if not (_is_int(attempts) and attempts >= 1):
@@ -312,10 +315,18 @@ def evaluated_commit_matches(commit: str, root: Path = REPO_ROOT) -> str | None:
     return None
 
 
+REAL_ENGINE_PINS = ("model", "route", "effort", "permission_mode")
+
+
 def _pinned_settings_problem(suite, arm) -> str | None:
     pinned = suite.arms.get(arm.engine)
     if not isinstance(pinned, dict):
         return f"the frozen suite pins no settings for engine {arm.engine!r} (arms.{arm.engine})"
+    if arm.engine not in record_mod.ORACLE_ENGINES:
+        absent = [key for key in REAL_ENGINE_PINS if pinned.get(key) in (None, "")]
+        if absent:
+            return (f"the frozen suite must pin the complete settings of a real engine: arms.{arm.engine} "
+                    f"has no {', '.join(absent)}")
     settings = arm.settings()
     expected = {key: pinned.get(key, [] if key == "extra_args" else None) for key in settings if key != "engine"}
     actual = {key: value for key, value in settings.items() if key != "engine"}
@@ -349,7 +360,8 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
         tmp_base: Path = scratch_mod.DEFAULT_TMP_BASE, xdg_base: Path = scratch_mod.DEFAULT_XDG_BASE,
         log=print) -> Outcome:
     attempts = attempts if attempts is not None else k
-    check_plan(suite, arms, k=k, attempts=attempts, replacements=replacements, label=label, artifacts=artifacts)
+    check_plan(suite, arms, k=k, attempts=attempts, replacements=replacements, label=label, artifacts=artifacts,
+               seed=seed)
     if suite.split == "held_out" and artifacts is not None:
         heldout.check_path(artifacts, must_exist=False)  # held-out diffs and logs stay out of the repository too
     runner = {"version": __version__, "sha256": runner_sha256()}

@@ -67,8 +67,10 @@ def trial(task_id, index, outcome, *, planned=True, replacement_for=None, claime
 
 def build_record(rows, *, tasks=None, k=2, attempts=3, replacements=2, label="dev", record_id="r",
                  manifest_sha=SHA, clusters=None, arm="direct"):
-    """A valid recursion-eval-run/1 record around the given trial rows."""
+    """A valid recursion-eval-run/1 record around the given trial rows, naming the protocol and analysis
+    this code implements (eval/analyze.py scores no other version)."""
     from eval import record as record_mod
+    from eval.analyze import implemented_protocol
 
     task_ids = tasks or sorted({r["task_id"] for r in rows})
     plan = {"k": k, "attempts_per_task": attempts, "replacements_per_task": replacements, "seed": 1,
@@ -85,7 +87,7 @@ def build_record(rows, *, tasks=None, k=2, attempts=3, replacements=2, label="de
         "arm": {"name": arm, "engine": "standin", "engine_version": "eval-standin/1", "model": None, "route": None,
                 "effort": None, "settings_sha256": settings},
         "runner": {"version": "0.1.0", "sha256": SHA, "pinned": False, "evaluated_commit": None},
-        "protocol": {"protocol_sha256": SHA, "analysis_sha256": SHA},
+        "protocol": implemented_protocol(),
         "plan": plan, "environment": {"python": "3", "platform": "test"},
         "started_at": "2026-11-14T00:00:00+00:00", "finished_at": "2026-11-14T00:01:00+00:00",
         "trials": rows,

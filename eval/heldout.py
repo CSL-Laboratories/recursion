@@ -7,8 +7,9 @@ Rules (PROTOCOL.md, "Held-out tasks"):
    ``declare("optimize")``) can never open one afterwards, whatever purpose it then claims.
 3. The path is given at run time and is absolute. It may not lie inside the repository, through a
    symlink or otherwise: there is no default and nothing in the repository points at it. The same
-   holds for every input the loader reads (the manifest, each task file or folder, every link inside a
-   task folder): each must resolve inside the held-out folder and outside the repository.
+   holds for every input the loader reads (the manifest, each task file or folder): each must resolve
+   inside the held-out folder and outside the repository and be reached through no link, and a task
+   folder holds no link at any depth (the loader refuses links too).
 4. Only eval/runner.py calls this module, and only eval/heldout.py calls the suite module's held-out
    loader (eval/tests/tests_heldout.py checks both across every Python file in the repository).
 
@@ -69,22 +70,30 @@ def check_path(path, *, must_exist: bool = True) -> Path:
     return resolved
 
 
-def _check_source(path: Path, folder: Path, what: str) -> None:
-    """``path``, resolved through every link, lies inside the held-out folder and outside the repository."""
+def _plain_input(path: Path, folder: Path, what: str) -> None:
+    """``path`` exists and is reached from the held-out folder through no link at all. The folder itself is
+    outside the repository (check_path) and task paths hold no '..', so such a path lies inside the
+    held-out folder and outside the repository."""
     try:
         resolved = path.resolve(strict=True)
     except OSError as exc:
         raise HeldOutDenied(f"{what} cannot be opened: {exc}") from None
-    if _inside(resolved, REPO_ROOT.resolve()):
-        raise HeldOutDenied(f"{what} resolves into the repository ({resolved}): held-out tasks never load from it")
-    if not _inside(resolved, folder):
-        raise HeldOutDenied(f"{what} resolves outside the held-out folder ({resolved})")
+    if resolved != Path(os.path.normpath(path)):
+        if _inside(resolved, REPO_ROOT.resolve()):
+            where = ", inside the repository"
+        elif not _inside(resolved, folder):
+            where = ", outside the held-out folder"
+        else:
+            where = ""
+        raise HeldOutDenied(f"{what} is reached through a link: it leads to {resolved}{where}; held-out inputs "
+                            "are plain files and folders inside the held-out folder")
 
 
 def check_sources(folder: Path, manifest: Path) -> None:
-    """Every input the held-out loader will read: the manifest, each task file or folder, and every link
-    inside a task folder."""
-    _check_source(manifest, folder, "suite.json")
+    """Every input the held-out loader will read: the manifest and each task file or folder are reached
+    through no link, and a task folder holds no link at any depth (the loader refuses one too, so what is
+    checked is exactly what is read)."""
+    _plain_input(manifest, folder, "suite.json")
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -98,13 +107,14 @@ def check_sources(folder: Path, manifest: Path) -> None:
             continue
         what = f"task {entry.get('id')!r} ({rel})"
         source = folder / rel
-        _check_source(source, folder, what)
+        _plain_input(source, folder, what)
         if source.is_dir():
             for dirpath, dirs, files in os.walk(source):
                 for name in dirs + files:
                     item = Path(dirpath) / name
                     if item.is_symlink():
-                        _check_source(item, folder, f"{what}: {item.relative_to(source)}")
+                        raise HeldOutDenied(f"{what}: {item.relative_to(source)} is a link; a held-out task folder "
+                                            "holds plain files and folders only")
 
 
 def open_suite(path, *, purpose: str):

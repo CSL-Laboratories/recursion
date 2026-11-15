@@ -29,9 +29,19 @@ ENGINES = ("standin", "claude_code")
 # Claude Code's own flags, as `claude --help` (2.1.318) lists them: --effort and --permission-mode.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
-# Variables an attempt owns; passing them from the runner's environment is refused.
-RESERVED_ENV = ("TMPDIR", "XDG_RUNTIME_DIR", "HOME", "DBUS_SESSION_BUS_ADDRESS", "PATH",
-                "EVAL_STANDIN_PLAN", "EVAL_STANDIN_TRIAL", "EVAL_STANDIN_EFFORT")
+# The only variables that may be passed from the runner's environment to an engine: where its sign-in
+# lives and how it reaches the network. Anything else could change what the engine is asked to do (an
+# effort, model or permission variable overrides the recorded flags) or the attempt's own runtime, so it
+# is refused (PROTOCOL.md, section 1).
+ALLOWED_PASS_ENV = ("CLAUDE_CONFIG_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "SSL_CERT_FILE",
+                    "NODE_EXTRA_CA_CERTS")
+# Engine arguments that would set what a named setting sets; the named setting is the only way.
+OVERRIDING_ARGS = ("--effort", "--model", "--permission-mode", "--settings", "--dangerously-skip-permissions",
+                   "--allow-dangerously-skip-permissions")
+
+
+class SessionCleanupError(RuntimeError):
+    """Processes of an engine's session were still alive when cleanup gave up."""
 INFRA_RESULT_ERRORS = {
     "rate_limit": "vendor_limit",
     "authentication_failed": "auth_failed",
@@ -114,12 +124,16 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     for thread in threads:
         thread.start()
     timed_out = False
+    cleanup_error = None
     try:
         process.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
     finally:
-        _kill_session(process.pid)
+        try:
+            _kill_session(process.pid)
+        except SessionCleanupError as exc:
+            cleanup_error = exc
         process.wait()
     for thread in threads:
         thread.join(timeout=30)
@@ -128,6 +142,8 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
             pipe.close()
         except OSError:
             pass
+    if cleanup_error is not None:
+        raise cleanup_error
     code = process.returncode
     return {
         "exit": code if code is not None and code >= 0 else None,
@@ -163,8 +179,9 @@ def _session_members(sid: int) -> list:
 
 
 def _kill_session(sid: int) -> None:
-    """Kill every live process of session ``sid``, in any process group, then wait (bounded) until each
-    is gone or a zombie. The session is the engine's own (start_new_session), never the runner's."""
+    """Kill every live process of session ``sid``, in any process group, rescanning until none is left
+    (a process forked between a scan and a kill is found by the next scan). The session is the engine's
+    own (start_new_session), never the runner's. SessionCleanupError if any is still alive after 10 s."""
     if sid == os.getsid(0):
         raise RuntimeError("refusing to kill the runner's own session")
     try:
@@ -173,13 +190,18 @@ def _kill_session(sid: int) -> None:
         pass
     if not os.path.isdir("/proc"):
         return
-    for pid in _session_members(sid):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
     deadline = time.monotonic() + 10
-    while _session_members(sid) and time.monotonic() < deadline:
+    while True:
+        members = _session_members(sid)
+        if not members:
+            return
+        if time.monotonic() >= deadline:
+            raise SessionCleanupError(f"processes {members} of the engine's session {sid} survived cleanup")
+        for pid in members:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
         time.sleep(0.01)
 
 
@@ -241,6 +263,10 @@ class Arm:
         if permission_mode is not None and permission_mode not in PERMISSION_MODES:
             raise ArmRefused(f"{self.name} arm: permission mode {permission_mode!r} is not one of "
                              f"{', '.join(PERMISSION_MODES)}")
+        overriding = [a for a in extra_args if isinstance(a, str) and a.split("=", 1)[0] in OVERRIDING_ARGS]
+        if overriding:
+            raise ArmRefused(f"{self.name} arm: extra engine arguments {overriding} would set what a named setting "
+                             "sets (effort, model, permission mode, settings); use the named setting")
         self.engine = engine
         self.model = model
         self.route = route
@@ -304,9 +330,11 @@ class DirectArm(Arm):
         return argv + list(self.extra_args)
 
     def preflight(self) -> None:
-        reserved = sorted(set(self.claude.pass_env) & set(RESERVED_ENV))
-        if reserved:
-            raise ArmRefused(f"direct arm: {', '.join(reserved)} belong to the attempt and cannot be passed in")
+        refused = sorted(set(self.claude.pass_env) - set(ALLOWED_PASS_ENV))
+        if refused:
+            raise ArmRefused(f"direct arm: {', '.join(refused)} may not be passed to the engine (only "
+                             f"{', '.join(ALLOWED_PASS_ENV)}): they could override the recorded settings or the "
+                             "attempt's own runtime")
         if self.engine == "claude_code":
             if not self.model:
                 raise ArmRefused("direct arm (claude_code): a model is required, the same one the Recursion arm uses")

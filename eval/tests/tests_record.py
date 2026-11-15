@@ -104,6 +104,31 @@ class SchemaAgreementTests(unittest.TestCase):
     def test_good_record_passes_the_schema(self):
         self.assertEqual(self.schema_errors(good()), [])
 
+    def measured(self):
+        record = build_record([trial("a", i, "pass") for i in range(1, 6)], k=5, attempts=5, label="pilot")
+        record["suite"].update(split="held_out", frozen=True)
+        record["arm"]["engine"] = "claude_code"
+        self.assertEqual(self.schema_errors(record), [])
+        return record
+
+    def test_schema_states_the_label_rules(self):
+        cases = {
+            "pilot on the dev split": lambda r: r["suite"].update(split="dev"),
+            "dev label on a held-out split": lambda r: r.update(label="dev"),
+            "pilot with k 4": lambda r: r["plan"].update(k=4),
+            "pilot on the stand-in": lambda r: r["arm"].update(engine="standin"),
+            "pilot unfrozen": lambda r: r["suite"].update(frozen=False),
+            "screen unfrozen": lambda r: (r.update(label="screen"), r["suite"].update(frozen=False)),
+            "retained artifacts with a storage error": lambda r: r["trials"][0]["artifacts"].update(
+                retained=True, artifact_error="disk full"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                record = self.measured()
+                mutate(record)
+                self.assertNotEqual(self.schema_errors(record), [], name)
+                self.assertNotEqual(record_mod.validate(record), [], name)
+
     def test_schema_refuses_what_the_checks_refuse(self):
         # Rules a schema can state; the cross-trial ones (plan hash, rows per plan) are record.py's alone.
         for name, mutate in broken():

@@ -212,11 +212,12 @@ class PlanAndLabelTests(unittest.TestCase):
         art = Path("/var/tmp/x")
         refused = [
             ("pilot with k 4", dict(suite=self.suite(frozen=True), arms=real, k=4, label="pilot", artifacts=art)),
-            ("screen with the stand-in", dict(suite=self.suite(), arms=[arms.DirectArm("standin")], k=5,
+            ("screen with the stand-in", dict(suite=self.suite(frozen=True), arms=[arms.DirectArm("standin")], k=5,
                                               label="screen", artifacts=art)),
             ("full without artifacts", dict(suite=self.suite(frozen=True), arms=real, k=5, label="full",
                                             artifacts=None)),
             ("pilot on an unfrozen suite", dict(suite=self.suite(), arms=real, k=5, label="pilot", artifacts=art)),
+            ("screen on an unfrozen suite", dict(suite=self.suite(), arms=real, k=5, label="screen", artifacts=art)),
             ("dev label on a held-out suite", dict(suite=self.suite(), arms=real, k=5, label="dev", artifacts=art)),
             ("shakedown on the dev set", dict(suite=self.suite("dev"), arms=real, k=5, label="shakedown",
                                               artifacts=art)),
@@ -226,7 +227,7 @@ class PlanAndLabelTests(unittest.TestCase):
                 with self.assertRaises(runner.RunRefused):
                     runner.check_plan(kw["suite"], kw["arms"], k=kw["k"], attempts=kw["k"], replacements=2,
                                       label=kw["label"], artifacts=kw["artifacts"])
-        runner.check_plan(self.suite(), real, k=5, attempts=5, replacements=2, label="screen", artifacts=art)
+        runner.check_plan(self.suite(frozen=True), real, k=5, attempts=5, replacements=2, label="screen", artifacts=art)
         runner.check_plan(self.suite(), [arms.DirectArm("standin")], k=1, attempts=1, replacements=0,
                           label="shakedown", artifacts=None)
 
@@ -468,7 +469,7 @@ class HeldOutSourceTests(unittest.TestCase):
                         "tasks": [{"id": "h-1", "dir": "h-1", "sha256": "0" * 64, "parent_tree": "0" * 40,
                                    "parent_commit": "0" * 40, "commit": "0" * 40}]}
             (folder / "suite.json").write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(heldout.HeldOutDenied, "outside the held-out folder"):
+            with self.assertRaisesRegex(heldout.HeldOutDenied, "is a link"):
                 heldout.open_suite(folder, purpose="score")
 
 

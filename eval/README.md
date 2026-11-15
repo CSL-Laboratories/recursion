@@ -27,4 +27,5 @@ Run, from the repository root, with the scratch folders the lane preamble names:
     python -m eval.analyze eval/results/dev/<record>.json
     python -m eval.dev check
 
-Standard library only. Records go to `eval/results/<suite>/`; trial artifacts only where `--artifacts` says.
+Standard library only. Records go to `eval/results/<suite>/` and trial artifacts only where `--artifacts` says;
+neither is committed (`eval/.gitignore`): publishing any record is the owner's decision.

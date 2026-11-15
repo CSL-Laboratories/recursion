@@ -18,6 +18,8 @@ Scoring.
   out, failed replacements included; the planned-only count is printed beside them.
 * A paired comparison refuses two records that differ in suite, k, planned attempts, shared arm
   settings, engine version, runner, evaluated commit, protocol or analysis (COMPARABLE).
+* A record is scored, alone or paired, only if it names the protocol and analysis this code implements
+  (implemented_protocol); a record of another version is refused, never scored by this one.
 * pass@1 is c / n per task averaged over tasks; the first-attempt rate is trial 1 alone.
 * Intervals resample tasks (eval/passk.py). A clustered interval and leave-one-cluster-out appear
   when the tasks come from two or more clusters.
@@ -27,12 +29,36 @@ Scoring.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
+from pathlib import Path
 
 from eval import passk
 from eval import record as record_mod
+
+HERE = Path(__file__).resolve().parent
+
+
+def implemented_protocol() -> dict:
+    """The protocol and analysis THIS code implements, from the bytes of PROTOCOL.md, this file and the
+    calculator (the same values the runner writes into a record from FROZEN.sha256)."""
+    def digest(name):
+        return hashlib.sha256((HERE / name).read_bytes()).hexdigest()
+    return {"protocol_sha256": digest("PROTOCOL.md"),
+            "analysis_sha256": record_mod.sha256_json({"analyze.py": digest("analyze.py"), "passk.py": digest("passk.py")})}
+
+
+def require_supported(record: dict) -> None:
+    """A record is scored only by the analysis it names; one made under another protocol or analysis
+    version is refused, never scored by this one."""
+    implemented = implemented_protocol()
+    if record["protocol"] != implemented:
+        raise ValueError(f"record {record['record_id']} names protocol {record['protocol']['protocol_sha256'][:12]} "
+                         f"and analysis {record['protocol']['analysis_sha256'][:12]}; this code implements protocol "
+                         f"{implemented['protocol_sha256'][:12]} and analysis {implemented['analysis_sha256'][:12]}: "
+                         "unsupported version, not scored")
 
 VALID_TIERS = ("none", "agent")
 EXCLUDED_TIERS = ("infra", "grader", "unknown")
@@ -183,6 +209,7 @@ def first_attempt(record: dict) -> float | None:
 
 def summarize(record: dict, *, resamples: int = passk.DEFAULT_RESAMPLES, seed: int = passk.DEFAULT_SEED) -> dict:
     record_mod.require_valid(record)
+    require_supported(record)
     k = record["plan"]["k"]
     cluster_of = {t["id"]: t["cluster"] for t in record["plan"]["tasks"]}
     head = headline_counts(record)
@@ -266,6 +293,8 @@ def compare(a: dict, b: dict, *, resamples: int = passk.DEFAULT_RESAMPLES, seed:
     if differ:
         raise ValueError("the two records are not comparable: they differ in " + ", ".join(differ)
                          + " (settings, engine version, runner, evaluated commit, protocol and analysis must match)")
+    require_supported(a)
+    require_supported(b)
     k = a["plan"]["k"]
     label = a["label"] if a["label"] == b["label"] else min((a["label"], b["label"]), key=record_mod.LABELS.index)
     out = {"a": a["record_id"], "b": b["record_id"], "arm_a": a["arm"], "arm_b": b["arm"], "k": k, "label": label}

@@ -12,7 +12,7 @@
     {"if": {"properties": {"label": {"enum": ["screen", "pilot", "full"]}}, "required": ["label"]},
      "then": {"properties": {"plan": {"properties": {"k": {"minimum": 5}}},
                              "arm": {"properties": {"engine": {"not": {"const": "standin"}}}}}}},
-    {"if": {"properties": {"label": {"enum": ["pilot", "full"]}}, "required": ["label"]},
+    {"if": {"properties": {"label": {"enum": ["screen", "pilot", "full"]}}, "required": ["label"]},
      "then": {"properties": {"suite": {"properties": {"frozen": {"const": true}}}}}}
   ],
   "required": ["schema", "record_id", "label", "suite", "arm", "runner", "protocol", "plan", "environment",

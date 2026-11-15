@@ -202,6 +202,17 @@ def load_txtar(path: Path) -> Task:
     )
 
 
+def _refuse_links(root: Path) -> None:
+    """A task folder holds plain files and folders only: a link could make the loader read something the
+    folder does not hold (eval/heldout.py refuses the same)."""
+    if root.is_symlink():
+        raise TaskError(f"{root} is a link; a task folder holds plain files and folders only")
+    for dirpath, dirs, names in os.walk(root):
+        for name in dirs + names:
+            if (Path(dirpath) / name).is_symlink():
+                raise TaskError(f"{Path(dirpath) / name} is a link; a task folder holds plain files and folders only")
+
+
 def _read_tree(root: Path) -> dict:
     out = {}
     if not root.is_dir():
@@ -225,6 +236,7 @@ def dir_digest(root: Path) -> str:
 
 
 def load_dir(path: Path) -> Task:
+    _refuse_links(path)
     meta = _meta(path.name, json.loads((path / "task.json").read_text(encoding="utf-8")))
     hidden = _read_tree(path / "hidden")
     if not hidden:

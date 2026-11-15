@@ -1,4 +1,4 @@
-# Evaluation protocol (lane EVAL), version 2
+# Evaluation protocol (lane EVAL), version 3
 
 Written before any measured run. This file, the analysis script `eval/analyze.py` and the calculator
 `eval/passk.py` are hashed in `eval/FROZEN.sha256`; every record carries those hashes, and a test fails
@@ -24,9 +24,14 @@ the same permission mode and extra engine arguments. These shared settings are f
 manifest (`arms`), hashed into the record (`arm.settings_sha256`, the same value for both arms: the arm's
 name and how it reaches the engine, such as the binary path, passed variable names or route home, are
 not part of it) and into the plan (`plan.plan_sha256`). The direct arm passes effort and permission mode
-to Claude Code with Claude Code's own `--effort` and `--permission-mode` flags. A paired comparison
-refuses two records that differ in these settings, the engine version, the runner, the evaluated
-commit, the protocol or the analysis.
+to Claude Code with Claude Code's own `--effort` and `--permission-mode` flags, and nothing else may set
+them: extra engine arguments that would set effort, model, permission mode or settings are refused, and
+only the variables that say where the sign-in lives and how the network is reached (`CLAUDE_CONFIG_DIR`,
+proxy and certificate variables) may be passed to an engine, because an environment variable can
+override a flag. A paired comparison refuses two records that differ in these settings, the engine
+version, the runner, the evaluated commit, the protocol or the analysis; and a record is scored only by
+the protocol and analysis version it names: a record of any other version is refused, never scored by
+this one.
 
 The recursion arm refuses, with a message naming what is missing, until WORKSPACE's `workspace` and
 EVENTS' usage events are both on the evaluated base. A refused arm writes no record; the other arms run.
@@ -50,7 +55,8 @@ is pinned and checked again at every attempt.
   list is never widened after it.
 - Held-out tasks load only from a folder given at run time (`--tasks`), never from the repository, and
   only for scoring (`eval/heldout.py`); every input the loader reads (the manifest, each task file or
-  folder, every link inside a task folder) must resolve inside that folder and outside the repository. No dev-mode or optimizer-side code path can open them; a test
+  folder) must lie inside that folder and outside the repository and be reached through no link, and a
+  task folder holds no link at any depth. No dev-mode or optimizer-side code path can open them; a test
   shows it. Every engine runs as the same operator, so the operator keeps the held-out folder out of an
   engine's reach during a run (on a path no prompt, setting or work tree names); the guard covers the
   repository's code paths, not a curious engine.
@@ -68,8 +74,9 @@ One command runs a pinned suite through each arm (`eval/run`). For every attempt
    (otherwise the attempt is an infra failure, `start_tree_mismatch`);
 3. the engine run in it with the prompt, at most the task's time limit, in its own process session; every
    process left in that session, whatever process group it moved to, is killed when the engine exits or
-   runs out of time; variables passed to the engine can never replace the attempt's TMPDIR,
-   XDG_RUNTIME_DIR, HOME or PATH;
+   runs out of time, rescanning until none is left (a cleanup that cannot empty the session is
+   reported, and the attempt is not graded); variables passed to the engine can never replace the
+   attempt's TMPDIR, XDG_RUNTIME_DIR, HOME or PATH;
 4. the final diff taken against the start commit (new files included);
 5. the hidden tests written over the work tree (over whatever the engine left at those paths) and run;
    pass means exit 0.
@@ -80,9 +87,10 @@ held-out suite it may not be inside the repository. A failure to store them neve
 row: the record says `retained: false` with the reason.
 
 **Before any attempt.** The plan is checked (k and attempts positive integers, attempts at least k,
-replacements a non-negative integer), and so is the label (section 7). A frozen suite must pin the
-version and the settings of every selected engine, and name as its evaluated commit the commit actually
-checked out, with nothing changed under `core/`.
+replacements a non-negative integer, the seed an integer), and so is the label (section 7). A frozen
+suite must pin the version and the settings of every selected engine (for a real engine all of model,
+route, effort and permission mode, none of them empty), and name as its evaluated commit the commit
+actually checked out, with nothing changed under `core/`.
 
 **Interrupted runs.** A run that is interrupted keeps every trial that ran; only trials that never ran
 are written as `not_run`.
@@ -162,8 +170,10 @@ be done and whose hidden tests did not pass.
 - Every number is printed with its label: **dev**, **shakedown**, **screen**, **pilot** or **full**. The
   dev set is labelled dev, and only it; a shakedown (for example the stand-in engine on a held-out
   suite) checks the harness. Neither is ever a measurement. A screen, a pilot and a full comparison need
-  k of at least 5, a held-out suite and a real engine (never the stand-in, which is an oracle); a pilot
-  and a full comparison also a frozen suite. The runner refuses, and the record checks, all of these.
+  k of at least 5, a held-out frozen suite and a real engine (never the stand-in, which is an oracle).
+  The runner refuses, and the record checks, all of these.
+- Nothing a run writes is published by default: no record, write-up or artifact is committed, pushed
+  or posted unless the owner decides so (`eval/.gitignore` keeps `results/` and `artifacts/` out of git).
   Pilots stay labelled pilots until the full comparison meets O55, and no per-competitor score is
   published before it.
 - If the paired interval contains 0: "no detectable difference", with the interval, and never
@@ -193,3 +203,10 @@ be done and whose hidden tests did not pass.
   tasks are checked against the commit's own tree; interrupted runs keep every trial that ran; storage
   failures keep the trial; numbers must be finite. The analysis changed (`analyze.py`); the calculator
   (`passk.py`) did not.
+- 3 (Nov 14, 2026, answering the two confirming reads of #381; still before any measured run): a record
+  of another protocol or analysis version is refused, not scored; effort, model and permission mode can
+  be set only by the named settings (overriding engine arguments and passed variables are refused); the
+  seed must be an integer; a frozen real-engine suite pins model, route, effort and permission mode; a
+  screen needs a frozen suite too; held-out inputs are reached through no link and task folders hold
+  none; session cleanup rescans and reports a failure; nothing is published by default. The analysis
+  changed (`analyze.py`); the calculator did not.

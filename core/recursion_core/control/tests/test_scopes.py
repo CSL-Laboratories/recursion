@@ -699,6 +699,117 @@ class RoundFiveScopesTest(unittest.TestCase):
                 self.assertIsNone(auth(PRINCIPALS["owner"], "run.stop", params))
 
 
+class RoundSixScopesTest(unittest.TestCase):
+    """The round-6 reads of #377: Codex GPT-6.1 Sol 1 and GPT-6 Astra 1 (STRICT: a metaclass answered for the
+    type's reader, so a declared default stood in for the real read), DeepSeek V4.1 Flash 3 and 5."""
+
+    class SwapsReader(type):
+        """Hands back object's own reader when asked for the class's, hiding a custom __getattribute__."""
+
+        def __getattribute__(cls, name):
+            if name == "__getattribute__":
+                return object.__getattribute__
+            return type.__getattribute__(cls, name)
+
+    def principal(self, kind, principal_id, answer):
+        class Swapped(metaclass=self.SwapsReader):
+            grant = None                       # the declared default the metaclass's reader would read
+            in_run_unit = False
+
+            def __init__(self):
+                self.kind, self.id = kind, principal_id
+
+            def __getattribute__(self, name):
+                if name == "grant":
+                    if isinstance(answer, BaseException):
+                        raise answer
+                    return answer
+                return object.__getattribute__(self, name)
+
+        return Swapped()
+
+    def test_declared_reader_is_not_replaced_by_metaclass_attribute_lookup(self) -> None:
+        # Sol 1's test; Astra 1's ReaderSelection test is the same case. Here for every kind that holds scopes
+        # without a grant, so an owner, internal or the page cannot keep theirs through the swapped reader either.
+        refusing = authorizer(credentials=_NoStore())
+        for failure in (AttributeError("context unavailable"), RuntimeError("context unavailable")):
+            for kind, principal_id in (("plugin", "plugin.alpha"), ("owner", "local"), ("internal", "daemon"),
+                                       ("device", "page")):
+                with self.subTest(failure=type(failure).__name__, kind=kind):
+                    who = self.principal(kind, principal_id, failure)
+                    self.assertEqual(refusing.held(who), frozenset())
+                    self.assertEqual(refusing(who, "run.start", {}), ("scope_refused", "needs_run"))
+
+    def test_metaclass_lookup_cannot_discard_a_readable_named_context(self) -> None:
+        # Sol 1's companion (Astra 1's supplied-value case): the value the type's reader supplies is the grant used.
+        seen = []
+
+        class RejectingStore:
+            def held(self, *args):
+                raise AssertionError("a supplied grant must be the only one read")
+
+            def grant_scopes(self, *args):
+                seen.append(args)
+                return frozenset()
+
+        auth = authorizer(credentials=RejectingStore())
+        self.assertEqual(auth.held(self.principal("plugin", "synthetic", "synthetic-grant-id")), frozenset())
+        self.assertEqual(seen, [("synthetic-grant-id", "plugin", "synthetic")])
+        live = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        self.assertEqual(live.held(self.principal("plugin", "plugin.alpha", g("plugin", "plugin.alpha"))),
+                         frozenset({"read", "run"}))
+        self.assertEqual(live.held(self.principal("owner", "local", g("plugin", "plugin.alpha"))), frozenset())
+
+    def test_a_grant_a_getattr_supplies_holds_only_that_grant(self) -> None:
+        # DeepSeek 3: the module text said no __getattr__ is ever read. Nothing is declared here, so the ordinary
+        # read is used; the grant it supplies counts as named, and never widens the principal.
+        def dynamic(kind, principal_id):
+            class Dynamic:
+                in_run_unit = False
+
+                def __init__(self):
+                    self.kind, self.id = kind, principal_id
+
+                def __getattr__(self, name):
+                    if name == "grant":
+                        return g("plugin", "plugin.alpha")
+                    raise AttributeError(name)
+
+            return Dynamic()
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read"}}))
+        self.assertEqual(auth.held(dynamic("plugin", "plugin.alpha")), frozenset({"read"}))
+        for kind, principal_id in (("owner", "local"), ("internal", "daemon"), ("device", "page")):
+            with self.subTest(kind=kind):
+                self.assertEqual(auth.held(dynamic(kind, principal_id)), frozenset())
+
+    def test_a_method_name_that_compares_unequal_cannot_step_past_the_stop_row(self) -> None:
+        # DeepSeek 5: method == STOP_METHOD was the caller's own comparison, so a str subclass answering False
+        # skipped the Stop row and a plugin stopped a host-owned run on its scope column alone.
+        class Liar(str):
+            def __eq__(self, other):
+                return False
+
+            def __ne__(self, other):
+                return True
+
+            __hash__ = str.__hash__
+
+        asked = []
+
+        def scope_of(method):
+            asked.append(type(method))
+            return "run"
+
+        auth = Authorizer(scope_of=scope_of, credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}),
+                          run_record={"run-host": {"launch": {"owner": "host", "session_id": "s1"}}}.get)
+        plugin = Principal("plugin", "plugin.alpha")
+        for method in ("run.stop", Liar("run.stop")):
+            with self.subTest(method=type(method).__name__):
+                self.assertEqual(auth(plugin, method, {"run_id": "run-host"}), ("scope_refused", "run_not_owned"))
+        self.assertEqual(asked, [str, str])
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

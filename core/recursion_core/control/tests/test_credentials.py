@@ -1186,6 +1186,94 @@ class TwoStoresTest(unittest.TestCase):
         self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
 
+class RoundSixCredentialsTest(unittest.TestCase):
+    """The round-6 read of #377 by DeepSeek V4.1 Flash, 1 and 2: a peer, a token or a token id whose own comparison,
+    hash or encode raised escaped with that error. And the round-4 reads of #385 (Codex GPT-6 Astra 2, GPT-6.1
+    Sol 2): no test linked the writers' lock to an existing valid file."""
+
+    class EqRaises(str):
+        def __eq__(self, other):
+            raise RuntimeError("the connection is gone")
+
+        def __ne__(self, other):
+            raise RuntimeError("the connection is gone")
+
+        __hash__ = str.__hash__
+
+    class HashRaises(str):
+        def __hash__(self):
+            raise RuntimeError("the id cannot be hashed")
+
+    class EncodeRaises(str):
+        def encode(self, *args, **kwargs):
+            raise RuntimeError("the text cannot be encoded")
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-r6-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.path = os.path.join(self.base, "state", "credentials.json")
+
+    def test_a_peer_that_is_a_str_subclass_is_counted_as_its_text(self) -> None:
+        limit = creds.FailedAuthLimit(max_failures=2)
+        self.assertEqual([limit.failed(self.EqRaises("peer-a")) for _ in range(2)], [False, True])
+        self.assertTrue(limit.blocked(self.EqRaises("peer-a")))
+        self.assertTrue(limit.blocked("peer-a"))                # the same peer, as plain text
+        self.assertFalse(limit.blocked("peer-b"))
+
+    def test_a_peer_whose_comparison_raises_in_the_count_is_refused_peer_invalid(self) -> None:
+        class Peer:                                             # not text: it hashes, but comparing it raises
+            def __hash__(self):
+                return 7
+
+            def __eq__(self, other):
+                raise RuntimeError("the connection is gone")
+
+        limit = creds.FailedAuthLimit()
+        self.assertFalse(limit.failed(Peer()))                  # nothing to compare it with yet
+        for method in (limit.blocked, limit.failed):
+            with self.subTest(method=method.__name__):
+                with self.assertRaises(CredentialRefused) as caught:
+                    method(Peer())
+                self.assertEqual(caught.exception.detail, "peer_invalid")
+
+    @NEEDS_POSIX
+    def test_verify_counts_a_peer_whose_comparison_raises(self) -> None:
+        store = CredentialStore(self.path, limit=creds.FailedAuthLimit(max_failures=1))
+        token, cred = store.mint("device", "d1", ["read"])
+        self.assertEqual(store.verify(token, peer=self.EqRaises("p")).token_id, cred.token_id)
+        with self.assertRaises(CredentialRefused) as caught:
+            store.verify("rct1_" + "B" * 43, peer=self.EqRaises("p"))
+        self.assertEqual(caught.exception.detail, "token_unknown")
+        with self.assertRaises(CredentialRefused) as caught:
+            store.verify(token, peer=self.EqRaises("p"))
+        self.assertEqual(caught.exception.detail, "auth_rate_limited")
+
+    @NEEDS_POSIX
+    def test_a_token_or_an_id_that_is_a_str_subclass_is_read_as_its_text(self) -> None:
+        store = CredentialStore(self.path)
+        token, cred = store.mint("plugin", "p1", ["read"])
+        self.assertEqual(store.verify(self.EncodeRaises(token), peer="p").token_id, cred.token_id)
+        self.assertEqual(store.grant_scopes(self.HashRaises(cred.token_id), self.EqRaises("plugin"),
+                                            self.EqRaises("p1")), frozenset({"read"}))
+        self.assertEqual(store.held(self.EqRaises("plugin"), self.EqRaises("p1")), frozenset({"read"}))
+        self.assertIsNotNone(store.revoke(self.HashRaises(cred.token_id)).revoked_at)
+        with self.assertRaises(CredentialRefused) as caught:
+            store.verify(token, peer="p")
+        self.assertEqual(caught.exception.detail, "token_revoked")
+
+    @NEEDS_POSIX
+    def test_a_lock_symlink_to_an_existing_valid_target_is_refused(self) -> None:
+        # Sol 2 and Astra 2 on #385 (round 4): the older fixture linked the lock to a missing file, so taking
+        # O_NOFOLLOW off the writers' lock left every test green.
+        store = CredentialStore(self.path)
+        target = os.path.join(self.base, "state", "valid-lock-target")
+        os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        os.unlink(store._lock_path)
+        os.symlink(target, store._lock_path)
+        with self.assertRaises(CredentialStoreError):
+            CredentialStore(self.path)
+
+
 class PlatformTest(unittest.TestCase):
     def test_without_uids_the_store_refuses_to_open(self) -> None:
         with mock.patch.object(creds.os, "name", "nt"):

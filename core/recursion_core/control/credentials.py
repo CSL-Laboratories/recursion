@@ -61,7 +61,11 @@ grants) is for principals the host attributes by identity, plugins.
 EVENTS. ``emit(event_type, payload)`` is called after a mint or a revoke has been written, outside the
 store's lock: ``credential.issued`` with ``token_id``, ``kind``, ``id``, ``scopes``, ``issued_at`` and
 ``expires_at``; ``credential.revoked`` with ``token_id``, ``kind``, ``id`` and ``revoked_at``. Neither
-carries the token or its digest. The event names wait on lane SPINE's event schema.
+carries the token or its digest. The event names wait on lane SPINE's event schema. An ``emit`` that
+raises an ``Exception`` is logged and the change stands. One that raises a ``BaseException`` (a
+``KeyboardInterrupt``) propagates after the change is written, so a mint interrupted there leaves a written,
+live grant whose token was never returned; it counts toward its plugin's identity grants until it is
+revoked (round 6, DeepSeek 7).
 
 FAILED CHECKS are counted per peer (``FailedAuthLimit``): after ``max_failures`` failed checks within
 ``window_s`` seconds the peer is refused, valid token or not, until the window has passed. Every failed
@@ -172,7 +176,15 @@ def check_grant(kind: object, scopes: object) -> frozenset[str]:
 
 
 def _digest(token: str) -> str:
-    return hashlib.sha256(token.encode("ascii")).hexdigest()
+    return hashlib.sha256(str.encode(token, "ascii")).hexdigest()   # str's own encode, never a subclass's
+
+
+def _text(value: object) -> str | None:
+    """``value`` as a plain ``str``, so no method of a ``str`` subclass runs on it; None for anything else. The
+    round-6 read of #377 by DeepSeek, 2: a token id whose own hash raised left ``revoke`` and ``grant_scopes``
+    with that error, and an ``encode`` that raised left ``verify``."""
+
+    return str.__str__(value) if issubclass(type(value), str) else None
 
 
 def _identity_of(st: os.stat_result) -> tuple:
@@ -196,13 +208,19 @@ class Credential:
                 "issued_at": self.issued_at, "expires_at": self.expires_at, "revoked_at": self.revoked_at}
 
 
-def _peer_key(peer: object) -> None:
-    """A peer that cannot key the failure count (unhashable, or whose hash raises) is refused ``peer_invalid``."""
+def _peer_key(peer: object) -> Hashable:
+    """The key a peer's failed checks are counted under. A ``str`` subclass counts as its text, so its own
+    comparison never runs. A peer that cannot key the count (unhashable, or whose hash raises, or whose
+    comparison raises in the count's lookups) is refused ``peer_invalid`` (round 6, DeepSeek 1)."""
 
+    text = _text(peer)
+    if text is not None:
+        return text
     try:
         hash(peer)
     except Exception:  # noqa: BLE001 - any failure to hash is a peer that cannot be counted
         raise CredentialRefused("peer_invalid") from None
+    return peer
 
 
 class FailedAuthLimit:
@@ -232,21 +250,28 @@ class FailedAuthLimit:
         return times
 
     def blocked(self, peer: Hashable) -> bool:
-        _peer_key(peer)
+        key = _peer_key(peer)
         with self._lock:
-            times = self._recent(peer, self._clock())
+            now = self._clock()
+            try:
+                times = self._recent(key, now)
+            except Exception:  # noqa: BLE001 - a peer whose comparison raises cannot be counted
+                raise CredentialRefused("peer_invalid") from None
             return times is not None and len(times) >= self._max
 
     def failed(self, peer: Hashable) -> bool:
         """Count one failed check; True when the peer is now refused."""
-        _peer_key(peer)
+        key = _peer_key(peer)
         with self._lock:
             now = self._clock()
-            times = self._recent(peer, now)
-            if times is None:
-                times = self._failures[peer] = collections.deque()
+            try:
+                times = self._recent(key, now)
+                if times is None:
+                    times = self._failures[key] = collections.deque()
+                self._failures.move_to_end(key)
+            except Exception:  # noqa: BLE001 - a peer whose comparison raises cannot be counted
+                raise CredentialRefused("peer_invalid") from None
             times.append(now)
-            self._failures.move_to_end(peer)
             while len(self._failures) > self._max_peers:
                 self._failures.popitem(last=False)
             return len(times) >= self._max
@@ -578,6 +603,7 @@ class CredentialStore:
         write. The ``credential.revoked`` notice goes out once, after the write that made it durable.
         """
 
+        token_id = _text(token_id)   # its text; anything else is unknown (round 6, DeepSeek 2)
         with self._lock:
             pending_before = isinstance(token_id, str) and token_id in self._unpersisted
             known = self._grants.get(token_id) if isinstance(token_id, str) else None
@@ -669,6 +695,7 @@ class CredentialStore:
         expired) and was minted for exactly ``(kind, principal_id)``. What a principal made from a verified
         token holds: another grant of the same identity never widens it."""
 
+        token_id, kind, principal_id = _text(token_id), _text(kind), _text(principal_id)   # round 6, DeepSeek 2
         now = self._now()
         with self._lock:
             self._refresh()
@@ -685,6 +712,7 @@ class CredentialStore:
         own grant instead. Every grant is within its kind's ceiling (checked at mint and when the file is
         read); the authorizer cuts to it again."""
 
+        kind, principal_id = _text(kind), _text(principal_id)   # compared as their text (round 6, DeepSeek 2)
         now = self._now()
         out: set[str] = set()
         with self._lock:

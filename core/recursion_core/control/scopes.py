@@ -27,9 +27,12 @@ recovery Stop never passes here.
    - any other device, session or agent principal with no ``grant`` holds nothing;
    - a principal whose ``grant`` cannot be read holds nothing, whatever its kind: an unreadable grant is
      not an absent one, so it never falls through to a plugin's identity grants. A grant is absent only
-     when nothing named ``grant`` is declared on the principal, its class or its metaclass; a declared one
-     is read with the type's own ``__getattribute__``, never a ``__getattr__`` fallback, and if that read
-     raises, even ``AttributeError``, it is unreadable. An unset ``__slots__`` grant is unreadable too;
+     when nothing named ``grant`` is declared on the principal, its class or its metaclass. A declared one
+     is read by the reader Python itself selects, the ``__getattribute__`` found in the dictionaries of the
+     principal's class and its bases (no metaclass can answer in its place), never a ``__getattr__``
+     fallback; if that read raises, even ``AttributeError``, it is unreadable. An unset ``__slots__`` grant
+     is unreadable too. A grant nothing declares is read the ordinary way, so a ``__getattr__`` may supply
+     one: it then counts as a named grant and holds only that grant's scopes;
    - a principal that names a grant and claims ``owner`` or ``internal`` holds nothing: those kinds come
      from how a request arrives, never from a token.
    Every set is cut to the kind's ceiling (``credentials.CEILING``), so a plugin, session or agent never
@@ -117,6 +120,36 @@ def _attr(principal, name: str, default):
         return default
 
 
+# A class's own MRO and dictionary, read through type's descriptors: no metaclass is asked for either.
+_TYPE_MRO = type.__dict__["__mro__"].__get__
+_TYPE_DICT = type.__dict__["__dict__"].__get__
+
+
+def _special(cls: type, name: str):
+    """``name`` as Python finds a special method for an instance of ``cls``: in the dictionaries of ``cls`` and
+    its bases, in MRO order, asking no metaclass. ``_ABSENT`` when none has it."""
+
+    for base in _TYPE_MRO(cls):
+        found = _TYPE_DICT(base).get(name, _ABSENT)
+        if found is not _ABSENT:
+            return found
+    return _ABSENT
+
+
+def _read_declared_grant(principal):
+    """``principal.grant`` as Python reads it with no ``__getattr__`` fallback: the ``__getattribute__`` Python
+    selects for the type, bound as Python binds it. A metaclass cannot put another reader in its place (the
+    round-6 reads of #377, Astra 1 and Sol 1: ``type(principal).__getattribute__`` asked the metaclass, which
+    could hand back ``object.__getattribute__`` and so read a declared default instead). A failed read raises."""
+
+    cls = type(principal)
+    reader = _special(cls, "__getattribute__")
+    bind = _special(type(reader), "__get__")
+    if bind is not _ABSENT:
+        reader = bind(reader, principal, cls)
+    return reader("grant")
+
+
 class Authorizer:
     """``authorizer(principal, method, params) -> None | ("scope_refused", detail)``. See the module text."""
 
@@ -131,7 +164,10 @@ class Authorizer:
         self._page_scopes = frozenset(page_scopes)   # cut to the device ceiling by held(), like every set
 
     def held(self, principal) -> frozenset[str]:
-        """The scopes ``principal`` holds now, within its kind's ceiling."""
+        """The scopes ``principal`` holds now, within its kind's ceiling.
+
+        A credential store that cannot be read raises here (``CredentialStoreError``, or whatever the store
+        raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``."""
 
         kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
         try:
@@ -142,8 +178,9 @@ class Authorizer:
                 # custom __getattribute__ included, but never a __getattr__ fallback, so no default stands in
                 # for a read that failed; such a failure, AttributeError included, is unreadable (the round-3
                 # reads of #377, Astra 1 and Sol 1; round 4, Astra 1; round 5, Astra 1, Sol 1 and DeepSeek F6:
-                # a metaclass declaration no instance read reaches is unreadable too).
-                grant = type(principal).__getattribute__(principal, "grant")
+                # a metaclass declaration no instance read reaches is unreadable too). The reader is the one
+                # Python selects, so a metaclass cannot answer for it (round 6, Astra 1 and Sol 1).
+                grant = _read_declared_grant(principal)
             else:
                 grant = getattr(principal, "grant", None)   # not declared: absent (SPINE's Principal today)
         except Exception:  # noqa: BLE001 - unreadable is not absent: such a principal holds nothing at all
@@ -176,7 +213,11 @@ class Authorizer:
             return (SCOPE_REFUSED, "credentials_unavailable")
         # The method table is the composition's own; if reading it raises, S5 refuses the call (authorizer_failed)
         # and logs it, so the failure is left to S5.
-        scope = self._scope_of(method) if isinstance(method, str) else None
+        if issubclass(type(method), str):
+            # Its text, as a plain str: no __eq__ or __hash__ of a subclass decides which row applies, so a method
+            # name that compares unequal cannot step past the Stop row below (round 6, DeepSeek 5).
+            method = str.__str__(method)
+        scope = self._scope_of(method) if type(method) is str else None
         if scope is None:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")
         if not isinstance(scope, str) or scope not in ALL_SCOPES:

@@ -915,10 +915,15 @@ class AcpSession:
     from it). ``on_update(params)`` gets each session/update of the turn; ``on_ask(ask)`` each new permission
     ask (it must not block: the answer comes back through ``answer_permission``, from any thread). When one
     of them raises, the error reaches the caller of ``prompt`` and the turn is abandoned (item 12).
-    ``on_abandoned(code, detail)`` is called when ``prompt`` abandons its turn because handling it raised,
-    after the agent was asked to stop it and before the error is raised: a driver closes the turn's drafts
-    there. An ``Exception`` out of it is dropped (the turn's own error is the one raised); an interruption
-    is raised.
+    ``on_turn_end(number, outcome, code, detail)`` is told EVERY end of a turn ``prompt`` began, once: the
+    answer, the deadline, the agent going away (``outcome`` is the ``TurnOutcome``), and every raise while the
+    turn was handled (a protocol error, a line it cannot parse, any callback raising; ``outcome`` is None,
+    ``code`` and ``detail`` are the abandoned turn's, after the agent was asked to stop it). ``number`` is the
+    turn's number, or None when no turn began (a prompt refused before it was written). An ``Exception`` out
+    of it is dropped and counted (``turn_end_failures``), so it never replaces the turn's own error or
+    outcome; an interruption is raised. A callback bound to an object that has a ``turn_end`` method (the
+    engine's draft maker) brings that method along as ``on_turn_end`` when none is given, so wiring that
+    object's callbacks wires its turn end too.
 
     The session reads the clock with its ordering lock held, at the moment a step that starts work is
     serialized (item 11); the connection's own lock is never held while calling out.
@@ -929,7 +934,7 @@ class AcpSession:
                  on_line: Callable[[str], object] | None = None,
                  on_update: Callable[[dict], object] | None = None,
                  on_ask: Callable[[PermissionAsk], object] | None = None,
-                 on_abandoned: Callable[[str, str], object] | None = None) -> None:
+                 on_turn_end: Callable[[int | None, object, str, str], object] | None = None) -> None:
         self.process = process
         self._clock = clock
         self.connection = AcpConnection(hooks=hooks, clock=clock, permission_timeout_s=permission_timeout_s)
@@ -941,7 +946,15 @@ class AcpSession:
         self._reading = threading.Lock()
         self.input_lost = False
         self._on_line, self._on_update, self._on_ask = on_line, on_update, on_ask
-        self._on_abandoned = on_abandoned
+        if on_turn_end is None:
+            owners: list = []   # by identity: a bound method's owner may be unhashable (a list's append)
+            for cb in (on_line, on_update, on_ask):
+                owner = getattr(cb, "__self__", None)
+                if callable(getattr(owner, "turn_end", None)) and not any(owner is o for o in owners):
+                    owners.append(owner)
+            on_turn_end = owners[0].turn_end if len(owners) == 1 else None
+        self._on_turn_end = on_turn_end
+        self.turn_end_failures = 0
 
     # -- writing ------------------------------------------------------------------------------------------
     def _write(self, lines) -> bool:
@@ -1070,6 +1083,30 @@ class AcpSession:
 
     def _prompt(self, text: str, deadline_at: float) -> TurnOutcome:
         self._drain(deadline_at)
+        try:
+            outcome = self._turn(text, deadline_at)
+        except BaseException as error:
+            self._turn_ended(None, error)
+            raise
+        self._turn_ended(outcome, None)
+        return outcome
+
+    def _turn_ended(self, outcome: TurnOutcome | None, error: BaseException | None) -> None:
+        """THE one place the session tells a turn's end (``on_turn_end``): every exit of ``_turn`` passes here."""
+        if self._on_turn_end is None:
+            return
+        if outcome is not None:
+            number, code, detail = outcome.turn, outcome.code, outcome.detail
+        else:
+            number = self.connection.abandoned_turn
+            code = error.code if isinstance(error, AcpError) else c.ENGINE_ERROR
+            detail = f"handling the turn raised {type(error).__name__}"
+        try:
+            self._on_turn_end(number, outcome, code, detail)
+        except Exception:   # never replaces the turn's own error or outcome; an interruption still goes up
+            self.turn_end_failures += 1
+
+    def _turn(self, text: str, deadline_at: float) -> TurnOutcome:
         # A prompt that could not be written is seen by the pump's first round (the input is lost): the turn
         # ends engine_exited there, as for any failed write. When the write was interrupted instead, the turn
         # it began ends here with the agent's input, before the interruption is raised: no turn is left in
@@ -1095,11 +1132,6 @@ class AcpSession:
             detail = f"handling the turn raised {type(error).__name__}"
             self.connection.abandon(code, detail, rpc_id=rpc_id)
             self.cancel()
-            if self._on_abandoned is not None:
-                try:
-                    self._on_abandoned(code, detail)
-                except Exception:   # the turn's own error is the one raised; an interruption still goes up
-                    pass
             raise
 
     def _drain(self, deadline_at: float) -> None:
@@ -1264,6 +1296,8 @@ class ToolCalls:
     """
 
     def __init__(self, digest: Callable[[object], str], mask: Callable[[str], str] | None = None) -> None:
+        if not callable(digest) or (mask is not None and not callable(mask)):
+            raise AcpInvalid("digest (and mask, when given) must be callable")
         self._digest = digest
         self._mask = mask
         self._calls: dict[str, _ToolCall] = {}
@@ -1304,6 +1338,11 @@ class ToolCalls:
             drafts.append(self._result(call, "ok" if call.status == "completed" else self._failed(call)))
         return drafts
 
+    @property
+    def has_open(self) -> bool:
+        """Whether a call is drafted without its result."""
+        return any(call.called and not call.resulted for call in self._calls.values())
+
     def turn_ended(self, stopped: bool) -> list[dict]:
         status = "cancelled" if stopped else "error"
         return [self._result(call, status) for call in self._calls.values() if call.called and not call.resulted]
@@ -1321,6 +1360,8 @@ class ToolCalls:
             digest = self._digest(value)
         except ValueError:          # no canonical text: the agent's protocol error, never an input dropped
             raise AcpProtocolError("tool input has no RFC 8785 text") from None
+        except Exception as err:    # the caller's digest failed in another way: the caller's error, typed
+            raise AcpInvalid(f"the digest function failed: {type(err).__name__}") from None
         if not (isinstance(digest, str) and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)):
             raise AcpInvalid("the digest function must give a SHA-256 as 64 lowercase hex characters")
         call.called = True          # only once its draft exists: a refused call is never "drafted"

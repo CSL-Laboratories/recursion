@@ -104,6 +104,10 @@ def detect(config: Config, *, route_refusal: Callable | None = None, breaker_sta
 
     A source left out (None) is not consulted, except the key state: a key route with no key source is
     ``key_state_unknown``, never routable, because spending needs a positive opt-in.
+
+    ``active`` is not a source: it is the caller's own iterable of engine ids (the composition's engine
+    table), read once. A single string is refused (TypeError); an iterable that raises, or a value that is
+    not iterable, raises as any wrong argument does.
     """
     if isinstance(active, (str, bytes)):
         raise TypeError("active is an iterable of engine ids, not one string")

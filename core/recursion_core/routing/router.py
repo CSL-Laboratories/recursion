@@ -76,7 +76,7 @@ def snapshot(detection: object) -> tuple[dict | None, str | None]:
         if "engines" not in detection:
             return None, "detection_unavailable"
         engines = detection["engines"]
-        if not isinstance(engines, Mapping):
+        if not isinstance(engines, Mapping):  # the except below gives the same answer; this says it in words
             return None, "detection_malformed"
         for eng, entry in engines.items():
             if not _entry_ok(eng, entry):
@@ -236,19 +236,28 @@ def _decide(config: Config, detection: object, kind: str | None, tags: frozenset
 def route_decision(decision: Mapping) -> dict | None:
     """The control schema's ``route_decision`` (common.v1: chosen, reason, candidates, hand_pick) for a routed
     decision, or None for a refusal. This is what the run record keeps and the ``route.decision`` event
-    carries; the start path that stores it is a later slice."""
-    if not isinstance(decision, Mapping) or not decision.get("ok"):
+    carries; the start path that stores it is a later slice. Anything else (an object that is not a routed
+    decision, one whose members are missing or of a type ``decide`` never gives, or one that cannot be read)
+    answers None, never an error."""
+    try:
+        if not isinstance(decision, Mapping) or not decision.get("ok"):
+            return None
+        if any(key not in decision for key in ("reason", "engine", "model", "connection", "candidates", "hand_pick")):
+            return None  # carries ok without decide's members: not a routed decision
+        reason, engine, model = decision["reason"], decision["engine"], decision["model"]
+        connection, candidates, hand = decision["connection"], decision["candidates"], decision["hand_pick"]
+        if (reason not in REASONS or not isinstance(engine, str) or not isinstance(model, str)
+                or not isinstance(connection, Mapping) or not isinstance(candidates, (list, tuple))
+                or not all(isinstance(c, Mapping) for c in candidates) or not (hand is None or isinstance(hand, Mapping))):
+            return None  # members of a type decide never gives: not a routed decision
+        return {
+            "chosen": {"engine": engine, "model": model, "connection": dict(connection)},
+            "reason": reason,
+            "candidates": [{"engine": c["engine"], "model": c["model"], "skipped": c["skipped"]} for c in candidates],
+            "hand_pick": None if hand is None else dict(hand),
+        }
+    except Exception:  # noqa: BLE001 - a decision that cannot be read is not a routed decision
         return None
-    if any(key not in decision for key in ("reason", "engine", "model", "connection", "candidates", "hand_pick")):
-        return None  # carries ok without decide's members: not a routed decision
-    return {
-        "chosen": {"engine": decision["engine"], "model": decision["model"],
-                   "connection": dict(decision["connection"])},
-        "reason": decision["reason"],
-        "candidates": [{"engine": c["engine"], "model": c["model"], "skipped": c["skipped"]}
-                       for c in decision["candidates"]],
-        "hand_pick": None if decision["hand_pick"] is None else dict(decision["hand_pick"]),
-    }
 
 
 # -- explain: the decision and every rule's part in it ------------------------------------------------------
@@ -388,9 +397,18 @@ def _route_limits(config: Config, decision: Mapping) -> tuple[dict, str]:
     return route_limits.validate_limits(route_limits.DEFAULT_LIMITS), "default"
 
 
-def _same_route(route: Mapping, seen: Mapping) -> bool:
+def _connection_word(value: object) -> object:
+    """An attempt's connection as ``routes.limits.describe`` writes it, ``kind:id``. A ``{kind, id}`` mapping is
+    read as the same word, so a notice built by hand cannot hide a route already tried."""
+    if isinstance(value, Mapping):
+        return f"{value.get('kind')}:{value.get('id')}"
+    return value
+
+
+def _same_route(route: Mapping, seen: tuple) -> bool:
+    """``seen`` is an attempt read once: ``(engine, model, connection word)``."""
     mine = (route["engine"], route["model"], contract.connection_key(route))
-    return mine == (seen.get("engine"), seen.get("model"), seen.get("connection"))
+    return mine == seen
 
 
 def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detection: object = None) -> dict:
@@ -416,18 +434,30 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     switch is a new run that the caller (SESSIONS) starts; this function starts nothing. A hand pick is
     never switched away from on its own: the user chose that route for this task, so the answer is ask.
     """
-    if not isinstance(decision, Mapping) or "ok" not in decision:
+    try:
+        if not isinstance(decision, Mapping) or "ok" not in decision:
+            return {"action": "none", "reason": "no_decision"}
+        if not decision["ok"]:
+            return {"action": "none", "reason": "no_route"}
+        connection = decision.get("connection")
+        if (any(key not in decision for key in ("reason", "rule", "engine", "model"))
+                or not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)):
+            return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
+    except Exception:  # noqa: BLE001 - a decision that cannot be read is not decide's answer
         return {"action": "none", "reason": "no_decision"}
-    if not decision["ok"]:
-        return {"action": "none", "reason": "no_route"}
-    connection = decision.get("connection")
-    if (any(key not in decision for key in ("reason", "rule", "engine", "model"))
-            or not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)):
-        return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
     if not isinstance(decision["engine"], str) or not isinstance(decision["model"], (str, type(None))):
         return {"action": "none", "reason": "no_decision"}  # an engine or model decide never gives
+    # The limit result, read once: its code, the vendor's signal, the route service's notice and retry time.
     try:
-        code = limit.get("code") if isinstance(limit, Mapping) else None
+        if isinstance(limit, Mapping):
+            code, signal, notice, retry_at = (limit.get("code"), limit.get("limit"), limit.get("limit_notice"),
+                                              limit.get("retry_at"))
+        else:
+            code = signal = notice = retry_at = None
+        reset_at = signal.get("reset_at") if isinstance(signal, Mapping) else None
+        tried = notice.get("attempts") if isinstance(notice, Mapping) else None
+        attempts = [(a.get("engine"), a.get("model"), _connection_word(a.get("connection")))
+                    for a in (tried or ()) if isinstance(a, Mapping)]
     except Exception:  # noqa: BLE001 - a limit result that cannot be read is not a limit: no blind retry
         return {"action": "none", "reason": "not_a_limit"}
     if code not in route_limits.LIMIT_CODES:
@@ -439,15 +469,12 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     if limits["on_limit"] == "ask":
         return {"action": "ask", "reason": "on_limit_ask", "choices": choices}
     if limits["on_limit"] == "wait":
-        signal = limit.get("limit") if isinstance(limit.get("limit"), Mapping) else {}
-        until = signal.get("reset_at")
+        until = reset_at
         if until is None:
-            until = limit.get("retry_at")
+            until = retry_at
         return {"action": "wait", "until": until, "choices": choices}
-    notice = limit.get("limit_notice") if isinstance(limit.get("limit_notice"), Mapping) else {}
-    attempts = [a for a in (notice.get("attempts") or ()) if isinstance(a, Mapping)]
-    attempts.append({"engine": decision["engine"], "model": decision["model"],
-                     "connection": f"{decision['connection']['kind']}:{decision['connection']['id']}"})
+    attempts.append((decision["engine"], decision["model"],
+                     f"{decision['connection']['kind']}:{decision['connection']['id']}"))
     entries, err = snapshot(detection) if detection is not None else (None, None)
     skipped = []
     for place, route in enumerate(limits["fallback"], 1):

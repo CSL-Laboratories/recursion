@@ -514,10 +514,86 @@ class ReviewThreeRegressionTests(unittest.TestCase):
             self.assertEqual(router.next_after_limit(cfg, odd, LIMIT), {"action": "none", "reason": "no_decision"}, odd)
         self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "ask")
 
-    def test_a_limit_result_that_cannot_be_read_is_not_a_limit(self) -> None:  # ds N5
+    def test_a_limit_result_that_cannot_be_read_is_not_a_limit(self) -> None:  # ds N5; fourth reads E, sol's later N5
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         self.assertEqual(router.next_after_limit(cfg, d, _Unreadable("all")), {"action": "none", "reason": "not_a_limit"})
+
+        class FailsOn(dict):
+            """A limit result whose get answers ``code`` and fails on one other member."""
+
+            def __init__(self, member: str, **values) -> None:
+                super().__init__(code=c.PLAN_LIMIT, **values)
+                self.member = member
+
+            def get(self, key, default=None):
+                if key == self.member:
+                    raise RuntimeError(key)
+                return super().get(key, default)
+
+        class Broken(dict):
+            def get(self, key, default=None):
+                raise RuntimeError(key)
+        wait = with_limits({"on_limit": "wait"})
+        dw = router.decide(wait, SENTRY, {})
+        not_a_limit = {"action": "none", "reason": "not_a_limit"}
+        for member in ("limit", "retry_at"):  # the wait path's reads
+            self.assertEqual(router.next_after_limit(wait, dw, FailsOn(member)), not_a_limit, member)
+        self.assertEqual(router.next_after_limit(cfg, d, FailsOn("limit_notice")), not_a_limit)  # the switch path's
+        # The nested reads too: the vendor's signal, the notice, and an attempt in it.
+        self.assertEqual(router.next_after_limit(wait, dw, {"code": c.PLAN_LIMIT, "limit": Broken()}), not_a_limit)
+        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": Broken()}), not_a_limit)
+        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": {"attempts": [Broken()]}}),
+                         not_a_limit)
+
+
+class ReviewFourRegressionTests(unittest.TestCase):
+    """The fourth reads of #399 (477fa308): DeepSeek V4.1 Flash A-F and I (E is beside N5's test)."""
+
+    def test_route_decision_of_an_unreadable_or_wrong_typed_decision_is_none(self) -> None:  # ds A, B
+        class UnreadableDecision(dict):
+            def __getitem__(self, key):
+                raise RuntimeError("getitem")
+        d = router.decide(config(), SENTRY, {})
+        for broken in ("contains", "getitem", "all"):
+            self.assertIsNone(router.route_decision(_Unreadable(broken)), broken)
+        self.assertIsNone(router.route_decision(UnreadableDecision(d)))
+        for member, value in (("connection", ["a", "b"]), ("connection", None), ("connection", "x:y"),
+                              ("candidates", [None]), ("candidates", 5), ("hand_pick", "codex"), ("hand_pick", 5),
+                              ("reason", ["config"]), ("reason", "learned"), ("engine", ["codex"]), ("model", ["m"]),
+                              ("model", None)):
+            self.assertIsNone(router.route_decision({**d, member: value}), (member, value))
+        self.assertEqual(router.route_decision(d)["chosen"]["model"], "claude-model-a")
+
+    def test_next_after_limit_answers_no_decision_for_a_decision_it_cannot_read(self) -> None:  # ds C, D
+        class UnreadableDecision(dict):
+            def __getitem__(self, key):
+                raise RuntimeError("getitem")
+
+        class UnwalkableConnection(dict):
+            def __iter__(self):
+                raise RuntimeError("connection iter")
+        cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        d = router.decide(cfg, SENTRY, {})
+        no_decision = {"action": "none", "reason": "no_decision"}
+        self.assertEqual(router.next_after_limit(cfg, _Unreadable("contains"), LIMIT), no_decision)
+        self.assertEqual(router.next_after_limit(cfg, UnreadableDecision(d), LIMIT), no_decision)
+        connection = UnwalkableConnection(kind="subscription", id="claude-main")
+        self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT), no_decision)
+
+    def test_a_missing_snapshot_is_detection_unavailable(self) -> None:  # ds F
+        for missing in (None, 5, "engines", ["engines"]):
+            self.assertEqual(router.snapshot(missing), (None, "detection_unavailable"), missing)
+        d = router.decide(config(), None, {})
+        self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "default_engine_unavailable", "detection_unavailable"))
+        self.assertEqual(router.snapshot({"engines": []}), (None, "detection_malformed"))
+
+    def test_an_attempt_with_a_structured_connection_counts_as_tried(self) -> None:  # ds I
+        cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        d = router.decide(cfg, SENTRY, {})
+        structured = {"engine": "codex", "model": CODEX["model"], "connection": dict(CODEX["connection"])}
+        out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": {"attempts": [structured]}})
+        self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]), ("ask", "fallback_exhausted", "already_tried"))
 
 
 if __name__ == "__main__":

@@ -51,8 +51,11 @@ class HandPickThroughTheDaemonTest(Composed):
         path.write_text(json.dumps(data), encoding="utf-8")
         os.chmod(path, 0o600)
 
-    def test_a_start_naming_no_engine_gets_the_default_as_the_daemon_composes_it(self) -> None:
-        _, composed = self.boot()  # control/hooks.py's own compose(): routing's registrant from REGISTRANTS
+    def test_a_start_naming_no_engine_gets_the_default(self) -> None:
+        # SPINE's harness (#370 at a3cb385c) gives every installed registrant a stand-in that registers nothing, and
+        # each lane tests its own registration: routing's is passed in here, and test_hooks checks that
+        # control/hooks.py's own compose() finds it.
+        _, composed = self.boot(hooks_of(rh.register))
         answer = composed.control.call("run.start", {"tenant": "t1", "prompt": LIVE})
         self.assertEqual(answer["code"], "started", answer)
         launch = composed.control.registry.get(answer["run"]["run_id"])["launch"]

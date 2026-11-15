@@ -73,6 +73,18 @@ class RegistrantTests(unittest.TestCase):
         self.assertTrue(self.hooks.engine_may_be_chosen)
         self.assertEqual(self.hooks.declared_fields(), frozenset({"hand_pick"}))
 
+    def test_control_hooks_own_compose_finds_routings_registrant(self) -> None:
+        # The daemon's composition: control/hooks.py's REGISTRANTS names recursion_core.routing.hooks, and compose()
+        # imports it and calls register(). (SPINE's daemon harness gives installed registrants stand-ins, so this
+        # is where routing's real registration is shown.)
+        self.assertIn("recursion_core.routing.hooks", H.REGISTRANTS)
+        made = H.compose()
+        self.assertIn("routing", made.start_order())
+        self.assertTrue(made.engine_may_be_chosen)
+        launch, refusal = made.launch_snapshot(H.OWNER, dict(START))
+        self.assertIsNone(refusal)
+        self.assertEqual(launch["route_decision"]["reason"], "default")
+
     def test_no_engine_named_runs_the_default(self) -> None:
         launch, refusal = self.start()
         self.assertIsNone(refusal)

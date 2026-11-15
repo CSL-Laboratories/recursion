@@ -71,12 +71,18 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   - leader `Ctrl+X`, then: `k` stop (asks `y`), `r` refresh, `n` the command line with `start `, `c` the
     conditions again, `q` close. While a sequence waits, the prompt row lists what can follow; Esc
     cancels it, and an unbound key after `Ctrl+X` is said and does nothing;
-  - output pager: `j`/`k` a line, `Ctrl+D`/`Ctrl+U` or Page Down/Up half a page, `g g`/Home the oldest
-    line kept, `G`/End the newest (and follow), `/` search older lines (case-insensitive unless the
+  - output pager (it counts display rows, so every row of a long wrapped line can be reached, and a
+    scrolled view stays on its rows while output arrives, a partial line begun or finished included): `j`/`k`
+    a row, `Ctrl+D`/`Ctrl+U` or Page Down/Up half a page, `g g`/Home the oldest row kept, `G`/End the
+    newest (and follow); another run (attached, or by `status RUN`) starts at its newest rows; `/` search older lines (case-insensitive unless the
     pattern has a capital), `n`/`N` the next older or newer match, `Tab`, Esc or `q` back to the run list;
   - Esc only cancels local UI (a line, the help, a pending sequence, the pager focus, a Stop
     confirmation); it never sends anything. No key approves anything, there is no `Ctrl+Y`, and no global
-    `Ctrl+P`. Ctrl-C is not the keymap's: it ends the TUI from any mode, and no binding can take it.
+    `Ctrl+P`. Ctrl-C is not the keymap's: it ends the TUI from any mode, and no binding can take it. A
+    binding file can bind Esc only alone and only to the cancel of its context (`line.cancel`, `help.close`,
+    `focus.runs`), and cannot remove it there; with a sequence pending, Esc cancels it and then does that;
+  - the keys (`?`): `j`/`k` a row, Page Down/Up or `Ctrl+D`/`Ctrl+U` a page, `g g`/Home the first, `G`/End
+    the last, so every entry can be read in full screen; Esc, `q` or `?` closes them.
 - Commands (`:` or `/`, and `--plain`): the CLI's `list` (also `runs`), `status RUN`, `stop RUN`,
   `start ...`, `conditions`, and the TUI's own `help` (also `keys`) and `quit`, which send nothing. A
   leading `/` is accepted.
@@ -85,9 +91,12 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action
   id as the value, `"none"` to remove a default), and `[safety]`, which can only make the fixed rules
   stricter: it may add keys to `never_bind` and restate `confirm_stop`, `esc_never_sends`,
-  `plugins_under_leader_p` and `no_key_approves` as `true`. Plugin actions (`plugin.<plugin>.<command>`)
-  are bound only under `<leader> p`; until a plugin host exists, pressing one says so and sends nothing.
-  Neither a binding nor the leader can be `ctrl+c`. A
+  `plugins_under_leader_p` and `no_key_approves` as `true`. Plugin actions (`plugin.<plugin_id>.<command>`,
+  in SPINE's names: api.v1's `plugin_id`, which may hold dots, and `name`, which holds none) are bound only
+  under `<leader> p`; until a plugin host exists, pressing one says so and sends nothing.
+  Neither a binding nor the leader can be `ctrl+c`. The leader cannot be a key the default bindings of the
+  run list, the pager or `global` use (`tab`, the arrows, Home, End, Page Up/Down, `ctrl+d`, `ctrl+u`, ...),
+  and no binding there takes the leader alone, since either would shadow the leader's sequences. A
   file that cannot be read, or that loosens `[safety]`, is not used at all; a refused binding is skipped.
   Either way the reason is shown as an error when the TUI opens.
 - The command line (`:` or `/`, `Ctrl+X n`, and the pager's `/` search) has a cursor: left, right, Home and End move it (it is drawn as `▏` when it is

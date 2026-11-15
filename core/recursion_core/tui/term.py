@@ -83,7 +83,7 @@ def load_keymap(path: str | None, *, explicit: bool) -> Keymap:
         km = Keymap.default()
         km.notes.append(f"binding file not used: {path} does not exist")
         return km
-    except (OSError, UnicodeDecodeError) as err:
+    except (OSError, UnicodeDecodeError, ValueError) as err:  # ValueError: a NUL in the path
         km = Keymap.default()
         km.notes.append(f"binding file not used: {path} could not be read ({type(err).__name__})")
         return km
@@ -334,19 +334,24 @@ def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: Te
          clock: Callable[[], float] = time.monotonic, terminal=None, stderr: TextIO | None = None) -> int:
     stdin, stdout, stderr = stdin or sys.stdin, stdout or sys.stdout, stderr or sys.stderr
     environ = os.environ if environ is None else environ
-    args, keys_file, unknown = list(argv), None, []
+    args, keys_file, unknown, modes = list(argv), None, [], set()
     while args:
         arg = args.pop(0)
         if arg == "--keys" and args:
             keys_file = args.pop(0)
+            if not keys_file:  # an empty path names no file
+                unknown.append("--keys ''")
         elif arg.startswith("--keys="):
             keys_file = arg[len("--keys="):]
-        elif arg not in FLAGS:
+            if not keys_file:
+                unknown.append(arg)
+        elif arg in FLAGS:  # a flag only where a flag stands: a --keys value is a path (review 1 of #404)
+            modes.add(FLAGS[arg])
+        else:
             unknown.append(arg)
     if unknown:  # diagnostics go to stderr, never into the transcript stream
         print(f"usage error: unrecognized arguments: {' '.join(unknown)}; {USAGE}", file=stderr)
         return 2
-    modes = {FLAGS[a] for a in argv if a in FLAGS}
     if "print_keys" in modes:  # the default binding file, to copy and edit; reads nothing, sends nothing
         stdout.write(default_toml())
         return 0

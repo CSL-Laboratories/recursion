@@ -84,17 +84,21 @@ class _Output:
         return [*self.lines, self.partial] if self.partial else list(self.lines)
 
     def tail(self, rows: int, width: int, offset: int = 0) -> list[str]:
-        """The last ``rows`` display rows, ending ``offset`` lines above the newest (the pager's view)."""
+        """``rows`` display rows ending ``offset`` display rows above the newest (the pager's view). The pager
+        counts wrapped rows, not lines, so every row of a long line can be reached (review 1 of #404, R2)."""
 
-        src = self.source()
-        if offset:
-            src = src[:max(0, len(src) - offset)]
+        if not rows:
+            return []
         out: list[str] = []
-        for line in reversed(src):
+        for line in reversed(self.source()):
             out[:0] = wrap(line, width)
-            if len(out) >= rows:
+            if len(out) >= rows + offset:
                 break
-        return out[-rows:] if rows else []
+        end = max(0, len(out) - offset)
+        return out[max(0, end - rows):end]
+
+    def total_rows(self, width: int) -> int:
+        return sum(len(wrap(line, width)) for line in self.source())
 
 
 
@@ -105,7 +109,7 @@ class TuiApp:
                  dispatch: Dispatch | None = None, output_lines: int = OUTPUT_LINES,
                  log_cap: int = LOG_CAP, keymap: Keymap | None = None) -> None:
         self._api, self._clock = api, clock
-        self.keymap = keymap or Keymap.default()
+        self.keymap = (keymap or Keymap.default()).for_client()  # its own pending sequence (review 1 of #404)
         self.dispatch: Dispatch = dispatch or self._inline
         self.color = color_enabled(environ or {})
         self.width = self.height = 0
@@ -136,6 +140,7 @@ class TuiApp:
         self.scroll = 0  # the pager's view, in lines above the newest; 0 follows new output
         self.search = ""  # the pager's last search
         self.help_lines: list[str] = []
+        self.help_scroll = 0  # the first help row shown in full screen
         self._out_rows = 10  # rows the output pane had in the last frame (a half page is half of it)
         # Burst input seen since the line was opened, or on any key of the sequence that armed a Stop
         # (review of #372, R1): the next Enter or y does not act on it, however it arrives itself.
@@ -191,9 +196,17 @@ class TuiApp:
         self.request("run.list", {})
 
     def attach(self, run_id: str) -> None:
-        self.attached = self.selected = run_id
+        self._attach_view(run_id)
         self._emit("attach", "operator", f"attach run={field(run_id)}: reads run.status; starts nothing")
         self.request("run.status", {"run_id": run_id})
+
+    def _attach_view(self, run_id: str) -> None:
+        """The run the output pane shows. Another run starts at its newest rows with no search: an offset or
+        a search kept from the last run would show rows that are not there (reviews 1 of #404, M2 and R4)."""
+
+        if run_id != self.attached:
+            self.scroll, self.search = 0, ""
+        self.attached = self.selected = run_id
 
     def refresh(self) -> None:
         self.request("run.list", {})
@@ -322,9 +335,16 @@ class TuiApp:
             out = self.outputs.get(run_id)
             if out is None:
                 out = self.outputs[run_id] = _Output(self._output_lines, run_id)
+            before = out.partial
             chunk, done = out.feed(text)
-            if self.scroll and run_id == self.attached:  # a scrolled pager stays on the lines it shows
-                self.scroll = min(self.scroll + len(done), max(0, len(out.lines) - 1))
+            if self.scroll and run_id == self.attached:
+                # A scrolled pager stays on the rows it shows: it moves up by the display rows this chunk
+                # added at the end, a partial line begun, grown or finished included (review 1 of #404, R3).
+                # The frame and the pager keep it within the rows retained.
+                w = self._pane_width()
+                rows = lambda text: len(wrap(text, w)) if text else 0  # noqa: E731
+                added = sum(len(wrap(line, w)) for line in done) + rows(out.partial) - rows(before)
+                self.scroll = max(0, self.scroll + added)
             speech, state = "\n".join(out.label + line for line in done), self._state
         # Logged already sanitized, outside the lock; the linear renderer says each finished line once,
         # marked as output. If the TUI ended meanwhile, the sealed log refuses it.
@@ -364,12 +384,26 @@ class TuiApp:
             return
         if isinstance(key, Paste):
             self.keymap.pending = ()
-            self._notice("paste ignored: the run list takes keys, not text; press : to paste a command; "
-                         "nothing sent")
+            if self.mode == "help":
+                self._notice("paste ignored: the keys view takes keys, not text; Esc leaves it; nothing sent")
+            else:
+                place = "the output pager" if self.focus == "output" else "the run list"
+                self._notice(f"paste ignored: {place} takes keys, not text; press : to paste a command; nothing sent")
             return
         if self.mode == "help":
-            if self.keymap.feed(key, "help") == "help.close":
+            result = self.keymap.feed(key, "help")
+            if isinstance(result, Unbound) and result.keys[-1] == "esc":
+                result = self._cancelled(result.keys, "help")
+            page = max(1, self._out_rows)
+            step = {"help.down": 1, "help.up": -1, "help.page_down": page, "help.page_up": -page}.get(result)
+            if result == "help.close":
                 self.mode = "keys"
+            elif step is not None:  # the frame keeps it within the rows (review 1 of #404, R5)
+                self.help_scroll = max(0, self.help_scroll + step)
+            elif result == "help.top":
+                self.help_scroll = 0
+            elif result == "help.bottom":
+                self.help_scroll = max(0, len(self._help_rows()) - self._out_rows)
             return
         # A sequence is burst when any of its keys was: Ctrl+X read with other input arms a Stop that the
         # next y does not confirm, however the k arrives. A key read again on its own, after it broke a
@@ -385,14 +419,26 @@ class TuiApp:
         self._seq_burst = burst and isinstance(result, Pending)
         if isinstance(result, Pending):
             return  # the prompt row shows what can follow
+        if isinstance(result, Unbound) and result.keys[-1] == "esc":
+            then = self._cancelled(result.keys, self.focus)
+            if then is not None:
+                self._act(then, "esc", False)
+            return
         if isinstance(result, Unbound):
-            if result.keys[-1] == "esc":
-                self._notice(f"{show_sequence(result.keys[:-1], self.keymap.leader)} cancelled; nothing done")
-            else:
-                self._notice(f"{show_sequence(result.keys, self.keymap.leader)} is not bound; nothing done")
+            self._notice(f"{show_sequence(result.keys, self.keymap.leader)} is not bound; nothing done")
             return
         if result is not None:
             self._act(result, key, burst)
+
+    def _cancelled(self, keys: tuple[str, ...], context: str) -> str | None:
+        """Esc ended a pending sequence: say so, and give back what Esc alone does in ``context``, so Esc
+        still leaves the line, the help or the pager (review 1 of #404, M4). Esc is bound to nothing that
+        sends a request (the keymap refuses it)."""
+
+        then = self.keymap.view(context).get(("esc",))
+        self._notice(f"{show_sequence(keys[:-1], self.keymap.leader)} cancelled; "
+                     f"{'nothing done' if then is None else 'nothing sent'}")
+        return then
 
     def _act(self, action: str, key: str, burst: bool) -> None:
         """One action from the keymap. Every action that sends goes through the same path as the CLI's
@@ -451,6 +497,8 @@ class TuiApp:
         action = self.keymap.feed(key, "command")
         if burst and action != "line.submit":
             self._line_burst = True
+        if isinstance(action, Unbound) and action.keys[-1] == "esc":
+            action = self._cancelled(action.keys, "command")  # and then Esc leaves the line
         if isinstance(action, (Pending, Unbound)):
             return
         if action == "line.submit" and (burst or self._line_burst):
@@ -483,15 +531,28 @@ class TuiApp:
             self.line, self.cursor = line[:at] + key + line[at:], at + 1
 
     # -- the output pager -------------------------------------------------------------------------
-    def _page(self, action: str, burst: bool = False) -> None:
+    def _pane_width(self) -> int:
+        return max(1, self.width - 2)  # the output pane's rows start with "│ "
+
+    def _help_rows(self) -> list[str]:
+        return [row for text in self.help_lines for row in wrap(text, self._pane_width())]
+
+    def _top_scroll(self) -> int:
+        """The pager's largest offset: the oldest retained display row is the pane's newest (as before, in
+        rows instead of lines, so a long line's first row is reachable too)."""
+
         out = self.outputs.get(self.attached or "")
-        newest = len(out.source()) - 1 if out else 0
+        return max(0, out.total_rows(self._pane_width()) - 1) if out else 0
+
+    def _page(self, action: str, burst: bool = False) -> None:
+        """Pager steps in display rows (a long line's rows are each reachable; review 1 of #404, R2)."""
+
         half = max(1, self._out_rows // 2)
         step = {"pager.down": -1, "pager.up": 1, "pager.half_down": -half, "pager.half_up": half}.get(action)
         if step is not None:
-            self.scroll = min(max(0, self.scroll + step), max(0, newest))
+            self.scroll = min(max(0, self.scroll + step), self._top_scroll())
         elif action == "pager.top":
-            self.scroll = max(0, newest)
+            self.scroll = self._top_scroll()
         elif action == "pager.bottom":
             self.scroll = 0
         elif action == "pager.search":
@@ -515,8 +576,13 @@ class TuiApp:
             return
         fold = pattern == pattern.lower()
         needle = pattern.lower() if fold else pattern
-        n = len(src)
-        shown = n - 1 - min(self.scroll, n - 1)
+        n, w = len(src), self._pane_width()
+        counts = [len(wrap(line, w)) for line in src]
+        below = 0  # display rows under the pane's newest row
+        shown = n - 1
+        while shown > 0 and below + counts[shown] <= self.scroll:  # the line holding the pane's newest row
+            below += counts[shown]
+            shown -= 1
         if step == 0:  # a new search: the newest line shown first, then older ones
             visit = [(shown - i) % n for i in range(n)]
         elif step == 1:  # n: on to older lines
@@ -525,7 +591,7 @@ class TuiApp:
             visit = [(shown + i) % n for i in range(1, n + 1)]
         for idx in visit:
             if needle in (src[idx].lower() if fold else src[idx]):
-                self.scroll = n - 1 - idx
+                self.scroll = sum(counts[idx + 1:])  # the match's last row is the pane's newest
                 self._notice(f"search {field(pattern)}: line {idx + 1} of {n}")
                 return
         self._notice(f"search {field(pattern)}: not found in the {n} lines kept")
@@ -549,7 +615,7 @@ class TuiApp:
                   "commands (: or /, and --plain): list (or runs), status RUN, stop RUN, "
                   "start --tenant T --engine E --prompt P [--client-key K], conditions, help (or keys), quit",
                   "Ctrl+C closes the TUI from any mode; closing the TUI never stops a run; Esc never sends anything"]
-        self.help_lines = lines
+        self.help_lines, self.help_scroll = lines, 0
         self.mode = "help"
         self._emit("help", "recursion", "\n".join(lines))
 
@@ -579,7 +645,7 @@ class TuiApp:
             self.show_conditions()
             return
         if method == "run.status":
-            self.attached = self.selected = params["run_id"]
+            self._attach_view(params["run_id"])
         self.request(method, params)
 
     def stop(self, run_id: str) -> None:
@@ -777,16 +843,21 @@ class TuiApp:
             rows.extend((5, "", None) for _ in range(run_rows - len(self.runs[start:start + run_rows])))
         if rem and self.mode == "help":  # the keys, in the output pane's place, until Esc, q or ?
             self._out_rows = rem - 1
-            rows.append((6, "-- keys (Esc, q or ? closes; the transcript has them too) --", None))
-            lines = [r for text in self.help_lines for r in wrap(text, max(1, w - 2))][:rem - 1]
+            every = self._help_rows()
+            self.help_scroll = min(self.help_scroll, max(0, len(every) - (rem - 1)))  # every row can be reached
+            lines = every[self.help_scroll:self.help_scroll + rem - 1]
+            more = (f"; rows {self.help_scroll + 1}-{self.help_scroll + len(lines)} of {len(every)}, j/k and "
+                    f"Page Up/Down scroll" if len(every) > rem - 1 else "")
+            rows.append((6, f"-- keys (Esc, q or ? closes{more}; the transcript has them too) --", None))
             rows.extend((6, "│ " + line, None) for line in lines)
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
         elif rem:
             self._out_rows = rem - 1
             out = self.outputs.get(self.attached or "")
+            self.scroll = min(self.scroll, self._top_scroll())  # retention may have dropped the rows it was on
             pager = ""
             if self.focus == "output" or self.scroll:
-                pager = (f" [pager: {self.scroll} lines up, G follows]" if self.scroll else " [pager: following]")
+                pager = (f" [pager: {self.scroll} rows up, G follows]" if self.scroll else " [pager: following]")
             rows.append((6, f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
                             f"text, display only)" + (f" skipped_events={self.skipped_events}"
                                                       if self.skipped_events else "") + pager + " --", None))
@@ -913,7 +984,7 @@ class TuiApp:
                 return f"search older lines: {shown}"
             return f"recursion: {'/' if self.line_kind == '/' else ''}{shown}"
         if self.mode == "help":
-            return "recursion: keys shown; Esc, q or ? closes"
+            return "recursion: keys shown; j/k and Page Up/Down scroll; Esc, q or ? closes"
         if self.focus == "output":
             return self._hints("output pager", (("pager.down", "pager.up", "line"), ("pager.half_down", "pager.half_up",
                                "half page"), ("pager.top", "pager.bottom", "top/newest"), ("pager.search", None, "search"),

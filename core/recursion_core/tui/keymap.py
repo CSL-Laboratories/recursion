@@ -5,13 +5,16 @@ Key names are ``keys.KeyDecoder``'s (``j``, ``enter``, ``ctrl+x``, ``alt+x``, ``
 is a sequence of them, written with spaces (``"ctrl+d ctrl+d"``, ``"g g"``, ``"<leader> k"``); ``<leader>``
 stands for the leader key, ``ctrl+x`` unless the binding file says otherwise.
 
-Contexts. ``global`` applies wherever the focused context does not bind the same keys; ``runs`` is the run
-list, ``output`` the output pager, ``command`` the ":" and "/" line, ``help`` the help view. A context's own
-binding shadows every global binding it overlaps (``output``'s ``ctrl+d`` shadows the global ``ctrl+d ctrl+d``).
-The Stop confirmation is not a context of the keymap: ``y`` alone confirms and any other key cancels.
+Contexts. ``runs`` is the run list, ``output`` the output pager, ``command`` the ":" and "/" line, ``help``
+the help view. ``global`` applies in ``runs`` and ``output`` wherever they do not bind the same keys: a
+context's own binding shadows every global binding it overlaps (``output``'s ``ctrl+d`` shadows the global
+``ctrl+d ctrl+d``). ``command`` and ``help`` use their own bindings only, so a typed ``q`` stays text and a
+global ``<leader> p`` plugin binding does not reach the command line. The Stop confirmation is not a context
+of the keymap: ``y`` alone confirms and any other key cancels.
 
 No timers. Within one context no binding may be a prefix of another, so a sequence is complete, still
-pending, or not bound, decided by the keys alone. A pending sequence waits for the next key; Esc cancels it.
+pending, or not bound, decided by the keys alone. A pending sequence waits for the next key; Esc cancels it,
+and then does what Esc does where it was pressed (leaves the line, the help or the pager).
 A key that breaks a leader sequence is consumed (the user meant a leader command); a key that breaks any
 other prefix (``ctrl+d`` then ``j``) is read again on its own.
 
@@ -34,9 +37,11 @@ in an otherwise good file is skipped. Either way the reason is returned for the 
 
 from __future__ import annotations
 
+import copy
+import re
 import tomllib
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 LEADER = "ctrl+x"
 CONTEXTS = ("global", "runs", "output", "command", "help")
@@ -44,6 +49,13 @@ VIEWS = {"runs": ("runs", "global"), "output": ("output", "global"), "command": 
 FILE_VERSION = 1
 NONE = "none"
 PLUGIN_PREFIX = "plugin."
+# A plugin action is plugin.<plugin_id>.<command> in SPINE's names (schemas/control/v1/api.v1.json at #368's
+# pin 16dea486: $defs plugin_id and name). A plugin_id may hold dots; a command name holds none, so the last
+# dot separates them (review 1 of #404, R8).
+PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
+PLUGIN_COMMAND = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+# Esc only cancels local UI: alone, and only to the cancel of its context (review 1 of #404, R1).
+ESC_CANCELS = {"command": "line.cancel", "help": "help.close", "output": "focus.runs"}
 SAFETY_RULES = ("confirm_stop", "esc_never_sends", "plugins_under_leader_p", "no_key_approves")
 NEVER_BIND = frozenset({"ctrl+y"})
 NEVER_BIND_GLOBAL = frozenset({"ctrl+p"})
@@ -101,6 +113,12 @@ ACTIONS: tuple[Action, ...] = (
     Action("line.backspace", ("command",), "delete back", "delete before the cursor", "(--plain: the terminal edits the line)"),
     Action("line.delete", ("command",), "delete", "delete at the cursor", "(--plain: the terminal edits the line)"),
     Action("help.close", ("help",), "close", "close the keys", "(--plain: help prints once)"),
+    Action("help.down", ("help",), "down", "scroll the keys down a line", "(--plain: help prints once)"),
+    Action("help.up", ("help",), "up", "scroll the keys up a line", "(--plain: help prints once)"),
+    Action("help.page_down", ("help",), "page down", "scroll the keys down a page", "(--plain: help prints once)"),
+    Action("help.page_up", ("help",), "page up", "scroll the keys up a page", "(--plain: help prints once)"),
+    Action("help.top", ("help",), "top", "the first of the keys", "(--plain: help prints once)"),
+    Action("help.bottom", ("help",), "bottom", "the last of the keys", "(--plain: help prints once)"),
 )
 BY_ID: dict[str, Action] = {a.id: a for a in ACTIONS}
 
@@ -118,8 +136,17 @@ DEFAULTS: dict[str, dict[str, str]] = {
     "command": {"enter": "line.submit", "esc": "line.cancel", "left": "line.left", "right": "line.right",
                 "home": "line.home", "ctrl+a": "line.home", "end": "line.end", "ctrl+e": "line.end",
                 "backspace": "line.backspace", "delete": "line.delete"},
-    "help": {"esc": "help.close", "q": "help.close", "?": "help.close"},
+    "help": {"esc": "help.close", "q": "help.close", "?": "help.close", "j": "help.down", "down": "help.down",
+             "k": "help.up", "up": "help.up", "pagedown": "help.page_down", "ctrl+d": "help.page_down",
+             "pageup": "help.page_up", "ctrl+u": "help.page_up", "g g": "help.top", "home": "help.top",
+             "G": "help.bottom", "end": "help.bottom"},
 }
+# Every key a default binding uses where the global bindings apply; none may be the leader, or that binding
+# would shadow the leader's sequences there (review 1 of #404, M3). The command line and the help never see
+# a leader sequence, so their keys (Ctrl+A on the line) may be the leader.
+LEADER_CONTEXTS = ("global", "runs", "output")  # where a leader sequence can be typed
+DEFAULT_KEYS = frozenset(key for context in LEADER_CONTEXTS for seq in DEFAULTS[context]
+                         for key in seq.split() if key != "<leader>")
 
 
 def is_key_name(token: str) -> bool:
@@ -188,7 +215,9 @@ class Unbound:
 
 @dataclass
 class Keymap:
-    """Bindings by context, after the defaults, the binding file and the safety rules."""
+    """Bindings by context, after the defaults, the binding file and the safety rules, and one client's
+    matching state (``pending``, ``last``). That state belongs to one client's keys: a client takes its own
+    with ``for_client()``, so several clients can share one set of bindings."""
 
     leader: str = LEADER
     bindings: dict[str, dict[tuple[str, ...], str]] = field(default_factory=dict)
@@ -207,6 +236,11 @@ class Keymap:
                     raise ValueError(f"default binding {context} {seq_text!r}: {problem}")
         return km
 
+    def for_client(self) -> Keymap:
+        """The same bindings (shared, not copied) with matching state of their own (review 1 of #404, M1)."""
+
+        return replace(self, pending=(), last=())
+
     # -- building --------------------------------------------------------------------------------
     def bind(self, context: str, seq_text: str, action: str) -> str | None:
         """Add one binding; return why it was refused, or None. ``action == "none"`` removes one."""
@@ -219,6 +253,8 @@ class Keymap:
             return str(exc)
         table = self.bindings.setdefault(context, {})
         if action == NONE:
+            if seq == ("esc",) and context in ESC_CANCELS:
+                return "Esc always cancels here; it cannot be removed"
             table.pop(seq, None)
             return None
         problem = self._refusal(context, seq, action)
@@ -231,12 +267,19 @@ class Keymap:
         return None
 
     def _refusal(self, context: str, seq: tuple[str, ...], action: str) -> str | None:
+        if seq == (self.leader,) and context in LEADER_CONTEXTS:  # alone it would shadow the leader (#404, M3)
+            return "the leader is not bound alone; it starts the leader's sequences"
+        if "esc" in seq and (seq != ("esc",) or ESC_CANCELS.get(context) != action):  # review 1 of #404, R1
+            return ("Esc never sends a request or arms anything: it is bound only alone, to the cancel of its "
+                    "context (line.cancel, help.close, focus.runs)")
         under_p = len(seq) >= 2 and seq[:2] == (self.leader, "p")
         if action.startswith(PLUGIN_PREFIX):
             if not under_p:
                 return "plugin actions are bound only under <leader> p"
-            if action.count(".") < 2 or not all(action.split(".")[1:]):
-                return f"plugin action {action!r} must be plugin.<plugin>.<command>"
+            plugin_id, _, command = action[len(PLUGIN_PREFIX):].rpartition(".")
+            if not (PLUGIN_ID.fullmatch(plugin_id) and plugin_id != "host" and PLUGIN_COMMAND.fullmatch(command)):
+                return (f"plugin action {action!r} must be plugin.<plugin>.<command> in SPINE's names "
+                        f"(api.v1 plugin_id and name)")
             return self._key_refusal(context, seq)
         if under_p:
             return "<leader> p is kept for plugin actions"
@@ -247,8 +290,6 @@ class Keymap:
             return f"unknown action {action!r}"
         if context not in known.contexts:
             return f"{action} is not available in {context}"
-        if seq == ("esc",) and known.sends:
-            return "Esc never sends a request"
         return self._key_refusal(context, seq)
 
     def _key_refusal(self, context: str, seq: tuple[str, ...]) -> str | None:
@@ -263,7 +304,8 @@ class Keymap:
 
     # -- matching --------------------------------------------------------------------------------
     def view(self, focus: str) -> dict[tuple[str, ...], str]:
-        """The bindings that apply with ``focus``: its own, then every global one it does not overlap."""
+        """The bindings that apply with ``focus``: its own, then, in ``runs`` and ``output``, every global one
+        it does not overlap (``command`` and ``help`` have their own only)."""
 
         merged: dict[tuple[str, ...], str] = {}
         for context in VIEWS.get(focus, (focus,)):
@@ -310,10 +352,11 @@ class Keymap:
 
 
 def load(text: str, base: Keymap | None = None) -> Keymap:
-    """The defaults with a binding file applied. A file that cannot be used leaves the defaults, with the
-    reason in ``notes``; a binding that is refused is skipped, with the reason in ``notes``."""
+    """The defaults (or a copy of ``base``, which is left unchanged) with a binding file applied. A file that
+    cannot be used leaves the defaults, with the reason in ``notes``; a binding that is refused is skipped,
+    with the reason in ``notes``."""
 
-    km = base or Keymap.default()
+    km = copy.deepcopy(base) if base is not None else Keymap.default()
     try:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
@@ -352,7 +395,7 @@ def load(text: str, base: Keymap | None = None) -> Keymap:
 
 
 def _file_refusal(doc: Mapping) -> str | None:
-    if doc.get("version") != FILE_VERSION:
+    if type(doc.get("version")) is not int or doc["version"] != FILE_VERSION:  # true and 1.0 are not 1
         return f"version must be {FILE_VERSION}"
     unknown = sorted(set(doc) - {"version", "leader", "bindings", "safety"})
     if unknown:
@@ -364,6 +407,8 @@ def _file_refusal(doc: Mapping) -> str | None:
         return f"leader {leader!r} is a key bound nowhere"
     if leader in RESERVED:
         return f"leader {leader!r} is kept: it ends the TUI from any mode"
+    if leader in DEFAULT_KEYS:  # a context's own binding of it would shadow the leader's sequences there
+        return f"leader {leader!r} is a key the default bindings use; choose one they do not"
     if not isinstance(doc.get("bindings", {}), Mapping):
         return "bindings must be a table of contexts"
     safety = doc.get("safety", {})

@@ -370,24 +370,48 @@ class FakeLanes:
     """Registrant modules under their REAL names, for one test. The composition imports its registrants with
     literal statements, so a test cannot hand it a name: it writes the lane's package into a temporary folder
     and puts that folder on the path of the package the lane sits in (``recursion_core`` for a lane's own
-    package), for as long as the test runs."""
+    package), for as long as the test runs.
+
+    A fake STANDS IN for a real module of its name, when a lane's real one is in the tree: its folder is
+    searched first, and a real module that is already imported is set aside for the test and put back after
+    it, the same object. So these tests are about the fakes they install, whatever lanes have landed; each lane
+    tests its own registration."""
 
     def __init__(self, case: unittest.TestCase) -> None:
         self._dir = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._dir.name)
         self._mounted: list = []
         self._names: list = []
+        self._real: dict = {}       # name -> a real module set aside for this test; put back by _clean
         case.addCleanup(self._clean)
 
     def _folder(self, package: str) -> pathlib.Path:
-        """A folder that is searched for the submodules of ``package``, a package of the core that exists."""
+        """A folder that is searched FIRST for the submodules of ``package``, a package of the core that exists."""
         folder = self.root / package
         if not folder.exists():
             module = importlib.import_module(package)
             folder.mkdir()
-            module.__path__.append(str(folder))
+            module.__path__.insert(0, str(folder))      # before the package's own folder: the fake is the one found
             self._mounted.append((module, str(folder)))
         return folder
+
+    def _is_fake(self, module) -> bool:
+        file = getattr(module, '__file__', None)
+        try:
+            return file is not None and pathlib.Path(file).resolve().is_relative_to(self.root.resolve())
+        except (OSError, ValueError):
+            return False
+
+    def _set_aside(self, name: str) -> None:
+        """Forget what is imported under this name and below it, so that the fake is imported in its place. A
+        real module among it is kept, to be put back; an earlier fake of this fixture is simply dropped."""
+        for loaded in [key for key in sys.modules if key == name or key.startswith(name + '.')]:
+            module = sys.modules.pop(loaded)
+            if not self._is_fake(module):
+                self._real.setdefault(loaded, module)
+        parent, _, leaf = name.rpartition('.')
+        if hasattr(sys.modules.get(parent), leaf):
+            delattr(sys.modules[parent], leaf)
 
     def lane(self, name: str, init: str = '', **modules: str) -> str:
         """The package ``recursion_core.<name>`` with this ``__init__`` and these modules; its full name."""
@@ -397,17 +421,32 @@ class FakeLanes:
         (folder / '__init__.py').write_text(init, encoding='utf-8')
         for module, text in modules.items():
             (folder / f'{module}.py').write_text(text, encoding='utf-8')
-        self._names.append(f'{parent}.{leaf}')
-        importlib.invalidate_caches()
-        return f'{parent}.{leaf}'
+        return self._installed(f'{parent}.{leaf}')
 
     def module(self, name: str, text: str) -> str:
         """The module ``recursion_core.<name>`` inside a package of the core that exists; its full name."""
         parent, _, leaf = f'recursion_core.{name}'.rpartition('.')
         (self._folder(parent) / f'{leaf}.py').write_text(text, encoding='utf-8')
-        self._names.append(f'{parent}.{leaf}')
+        return self._installed(f'{parent}.{leaf}')
+
+    def _installed(self, name: str) -> str:
+        """A fake's files are written: from here on it is the one found under ``name``, for a package and for a
+        module alike."""
+        self._set_aside(name)
+        self._names.append(name)
         importlib.invalidate_caches()
-        return f'{parent}.{leaf}'
+        return name
+
+    def stand_in_for_the_installed(self) -> None:
+        """Every registrant that is REALLY in this tree gets a stand-in that registers nothing, for this test.
+        With no lane landed this does nothing."""
+        for name in H.REGISTRANTS:
+            try:
+                there = importlib.util.find_spec(name) is not None
+            except ModuleNotFoundError:     # a package above it is not there
+                there = False
+            if there:
+                self.module(name.removeprefix('recursion_core.'), REGISTERS_NOTHING)
 
     def _clean(self) -> None:
         for module, folder in self._mounted:
@@ -418,6 +457,12 @@ class FakeLanes:
             parent, _, leaf = name.rpartition('.')
             if hasattr(sys.modules.get(parent), leaf):
                 delattr(sys.modules[parent], leaf)
+        for name, module in self._real.items():     # the real ones: the same objects, where they were
+            sys.modules[name] = module
+            parent, _, leaf = name.rpartition('.')
+            if parent in sys.modules:
+                setattr(sys.modules[parent], leaf, module)
+        self._mounted, self._names, self._real = [], [], {}
         self._dir.cleanup()
         importlib.invalidate_caches()
 
@@ -431,6 +476,73 @@ class RegistrationTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.fake = FakeLanes(self)
+        self.fake.stand_in_for_the_installed()      # a registrant that has landed registers nothing in these tests
+
+    def landed(self, text: str):
+        """A module that plays a lane's REAL ``control.scopes``, for one test, already imported. It is put before
+        whatever this tree has under that name (and before the stand-in the fixture gave that), so the test is the
+        same whether or not a lane's real module has landed; a fixture made afterwards mounts its fakes before it
+        in turn. ``(the module, a fixture of its own, the call that cleans that fixture)``."""
+        folder = tempfile.mkdtemp(prefix='seam-real-registrant-')
+        control = importlib.import_module('recursion_core.control')
+        pathlib.Path(folder, 'scopes.py').write_text(text, encoding='utf-8')
+
+        def unmount() -> None:
+            control.__path__.remove(folder)
+            sys.modules.pop('recursion_core.control.scopes', None)
+            if hasattr(control, 'scopes'):
+                del control.scopes
+            shutil.rmtree(folder, True)
+            importlib.invalidate_caches()
+        sys.modules.pop('recursion_core.control.scopes', None)
+        control.__path__.insert(0, folder)
+        self.addCleanup(unmount)
+        importlib.invalidate_caches()
+        real = importlib.import_module('recursion_core.control.scopes')
+        self.assertTrue(real.REAL, 'the module that plays the real one is the one imported before any fake')
+        calls: list = []
+        fake = FakeLanes(mock.Mock(addCleanup=calls.append))    # cleaned by the test itself, not at its end
+
+        def clean() -> None:
+            while calls:
+                calls.pop()()
+        self.addCleanup(clean)
+        return real, fake, clean
+
+    def test_a_fake_registrant_stands_in_for_a_real_module_of_its_name_and_the_real_one_is_put_back(self) -> None:
+        """A registrant can be a module of the core itself (``control.scopes``), and one day a lane's real one is
+        there. A test's fake of that name is still the one composed: it is searched for first, and the real
+        module, already imported, is set aside for the test. Afterwards the real one is back, the same object.
+        A fake that a second fake of its name replaces is dropped: it is not put back as if it had been real."""
+        engine = 'def register(hooks):\n    hooks.engines.register(%r, lambda *a, **k: None)\n'
+        real, fake, clean = self.landed('REAL = True\n\n\ndef register(hooks):\n    pass\n')
+        control = sys.modules['recursion_core.control']
+        fake.module('control.scopes', engine % 'grok')
+        self.assertIn('grok', H.compose().engines.names(), 'the fake was composed, not the real module of its name')
+        other = 'recursion_core.routes.driver_hooks'
+        before = sys.modules.get(other)             # whatever is there under another registrant's name: none today
+        fake.module('routes.driver_hooks', engine % 'opencode')
+        self.assertIn('opencode', H.compose().engines.names())
+        fake.module('routes.driver_hooks', engine % 'pi')
+        names = H.compose().engines.names()
+        self.assertEqual(('pi' in names, 'opencode' in names), (True, False), 'the second fake of a name replaces the first')
+        clean()
+        self.assertIs(sys.modules.get('recursion_core.control.scopes'), real, 'the real module is back, the same object')
+        self.assertIs(control.scopes, real)
+        self.assertIs(sys.modules.get(other), before, 'and no fake is left behind where a fake replaced a fake')
+        self.assertNotIn('grok', H.compose().engines.names())
+
+    def test_a_registrant_that_has_landed_registers_nothing_once_the_fixture_stands_in_for_it(self) -> None:
+        """These tests are about the fakes they install. A lane's real registrant, once it is in the tree, would
+        register into every composition here; the fixture gives each one that is installed a stand-in that
+        registers nothing, and puts the real one back afterwards."""
+        real, fake, clean = self.landed("REAL = True\n\n\ndef register(hooks):\n    hooks.engines.register('grok', lambda *a, **k: None)\n")
+        self.assertIn('grok', H.compose().engines.names(), 'it is installed: a composition finds it')
+        fake.stand_in_for_the_installed()
+        self.assertEqual(H.compose().engines.names(), ('claude_code', 'codex'))
+        clean()
+        self.assertIs(sys.modules.get('recursion_core.control.scopes'), real)
+        self.assertIn('grok', H.compose().engines.names())
 
     def test_nothing_is_installed_today_and_the_hooks_compose_with_their_defaults(self) -> None:
         composed = H.compose()
@@ -3207,6 +3319,79 @@ class LifecycleTest(unittest.TestCase):
         again.start()
         again.join(BOUND_S)
         self.assertFalse(again.is_alive(), 'another caller is not left waiting for a lifecycle nobody holds')
+
+    def test_the_two_helpers_that_take_an_ownership_keep_their_own_word(self) -> None:
+        """``take_once`` and ``own_teardown`` are called inside their callers' protected regions, which would by
+        themselves make up for a helper that let an interruption through or forgot to refuse. Their own word is
+        held here, directly: the lock comes back held exactly once however the taking is interrupted, with the
+        interruption kept; and the thread that already owns a teardown is refused, with nothing taken."""
+        for helper in (H.take_once, H.own_teardown):
+            for when in ('before', 'after'):
+                lock, kept = WatchedLock(), []
+                lock.interrupt_next = when
+                with self.subTest(helper=helper.__name__, interrupted=when):
+                    helper(lock, kept)
+                    self.assertEqual(([type(exc) for exc in kept], lock._is_owned()), ([KeyboardInterrupt], True))
+                    lock.release()
+                    self.assertFalse(lock._is_owned(), 'held once: one release frees it')
+        lock = WatchedLock()
+        lock.acquire()
+        with self.assertRaises(H.HookError):
+            H.own_teardown(lock, [])
+        lock.release()
+        self.assertFalse(lock._is_owned(), 'the refusal took nothing')
+
+    @quiet
+    def test_an_interruption_on_the_way_back_from_taking_the_lifecycle_is_inside_the_protected_region(self) -> None:
+        """The third reads of the calls. ``finish_close`` and ``stop_services`` are interrupted as the helper that
+        takes the lifecycle is entered (nothing is taken yet), at its return (the lifecycle is taken), and at the
+        first line after it. Each time the teardown is complete before the interruption is raised (the service has
+        stopped; for the close, the store is closed too), and the lifecycle is free: a later call from another
+        thread returns. Before, the interruption escaped with the lifecycle owned, and every later close was
+        refused on this thread and waited for ever on any other."""
+        for step, first_line in (('finish_close', 'self._teardown(context, errors)'),
+                                 ('stop_services', 'self._stop_all(context, errors)')):
+            method = getattr(H.Hooks, step)
+            lines, start = inspect.getsourcelines(method)
+            target = start + next(index for index, line in enumerate(lines) if first_line in line)
+            for where in ('the call of the taking', 'the return of the taking', 'the first line after it'):
+                log: list = []
+                store = FakeStore(log)
+                made = H.Hooks()
+                made.service(Service('events', log))
+                made.set('event_store', lambda state_dir, store=store: store)
+                made.freeze()
+                context = H.ServiceContext()
+                made.open_store('/state')
+                made.start_services(context)
+                fired: list = []
+
+                def trace(frame, event, arg, code=method.__code__, target=target, where=where, fired=fired):
+                    taking = frame.f_code is H.own_teardown.__code__ and frame.f_back.f_code is code
+                    if not fired and ((where == 'the call of the taking' and event == 'call' and taking)
+                                      or (where == 'the return of the taking' and event == 'return' and taking)
+                                      or (where == 'the first line after it' and event == 'line'
+                                          and frame.f_code is code and frame.f_lineno == target)):
+                        fired.append(where)
+                        raise KeyboardInterrupt(where)
+                    return trace
+                with self.subTest(step=step, interrupted_at=where):
+                    before = sys.gettrace()
+                    sys.settrace(trace)
+                    try:
+                        with self.assertRaises(KeyboardInterrupt):
+                            getattr(made, step)(context)
+                    finally:
+                        sys.settrace(before)
+                    done = [(what, name) for what, name, _ in log if what in ('stop', 'close')]
+                    self.assertEqual((fired, made._lifecycle._is_owned()), ([where], False))
+                    self.assertEqual(done, [('stop', 'events'), ('close', 'store')] if step == 'finish_close' else [('stop', 'events')],
+                                     'the teardown was complete when the interruption was raised')
+                    later: list = []
+                    other = threading.Thread(target=lambda: later.append(made.finish_close(context)), daemon=True)
+                    other.start()
+                    other.join(BOUND_S)
+                    self.assertEqual((later, store.closed), ([None], True), 'a later close from another thread returns')
 
     @unittest.skipUnless(hasattr(signal, 'pthread_kill'), 'needs a signal that can be aimed at one thread')
     def test_a_real_interrupt_while_a_close_waits_for_the_lifecycle_is_kept_until_the_owner_has_finished(self) -> None:

@@ -13,7 +13,15 @@ import secrets
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .unit import UNIT_NAME
+from .unit import STATE_HOME, UNIT_NAME
+
+# Where the daemon opens its stores, under its state folder (tests/test_daemon_install.py holds these
+# to the daemon's own names): daemon/__main__.py's "recursion", daemon/breaker.py's STORE_DIR and
+# STORE_FILE, daemon/plugins.py's REVOCATION_FILE.
+STATE_FOLDER = "recursion"
+STORE_FOLDER = "plugin-security"
+BREAKER_FILE = "breaker.sqlite3"
+REVOCATION_FILE = "revoked.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -25,10 +33,14 @@ class Roots:
 
 @dataclass(frozen=True)
 class Owned:
-    home: str        # the resolved root
-    unit_dir: str    # <home>/.config/systemd/user
-    unit: str        # <unit_dir>/recursion-daemon.service
-    enabled: str     # <unit_dir>/default.target.wants/recursion-daemon.service, made by `enable`
+    home: str              # the resolved root
+    unit_dir: str          # <home>/.config/systemd/user
+    unit: str              # <unit_dir>/recursion-daemon.service
+    enabled: str           # <unit_dir>/default.target.wants/recursion-daemon.service, made by `enable`
+    state: str             # <home>/.local/state/recursion, the daemon's state folder under the unit
+    store_dir: str         # <state>/plugin-security
+    breaker_store: str     # <store_dir>/breaker.sqlite3
+    revocation_store: str  # <store_dir>/revoked.sqlite3
 
 
 def owned_paths(roots: Roots) -> Owned:
@@ -36,11 +48,17 @@ def owned_paths(roots: Roots) -> Owned:
         raise InstallRefused("roots")
     home = _directory_root(roots.home)
     unit_dir = os.path.join(home, ".config", "systemd", "user")
+    state = os.path.join(home, *STATE_HOME.split("/"), STATE_FOLDER)
+    store_dir = os.path.join(state, STORE_FOLDER)
     return Owned(
         home=home,
         unit_dir=unit_dir,
         unit=os.path.join(unit_dir, UNIT_NAME),
         enabled=os.path.join(unit_dir, "default.target.wants", UNIT_NAME),
+        state=state,
+        store_dir=store_dir,
+        breaker_store=os.path.join(store_dir, BREAKER_FILE),
+        revocation_store=os.path.join(store_dir, REVOCATION_FILE),
     )
 
 

@@ -1,8 +1,8 @@
 # core/recursion_core/daemon_install (lane INSTALL)
 
-The per-user daemon's systemd user unit: `recursiond install`, `upgrade` and `uninstall`
-(`control/commands/setup.py` is the command family; `recursion_core._entrypoints` is the
-`recursiond` command). Linux only; `recursiond` refuses every command elsewhere with
+The per-user daemon's systemd user unit and its stores: `recursiond install`, `upgrade` and
+`uninstall` (`control/commands/setup.py` is the command family; `recursion_core._entrypoints` is
+the `recursiond` command). Linux only; `recursiond` refuses every command elsewhere with
 `platform_unsupported`.
 
 ## What it writes
@@ -12,9 +12,15 @@ calls `%h`; never `$HOME`, never `os.environ`):
 
 | path | install | upgrade | uninstall |
 | --- | --- | --- | --- |
-| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs` | rewrites it; missing refuses `unit_missing` | removes it if its first line is this installer's marker (`unit_not_ours` otherwise); refuses `unit_enabled` while `default.target.wants/` links it |
-| `~/.config`, `~/.config/systemd`, `~/.config/systemd/user` | creates the missing ones (0700); existing ones stay as they are | - | stay: other units share them |
-| the daemon's state folder (`$XDG_STATE_HOME/recursion`: the run registry, and from slice 2 the stores) | - | - | stays |
+| `~/.local/state/recursion/plugin-security/breaker.sqlite3` and `revoked.sqlite3` (the breaker store and the revocation store, where the daemon opens them) | creates each missing one through `plugin_security.stores` (0600), before the unit; one already there must pass `stores.open_store` and is left as it is; a refusal keeps the store's code (`breaker_store_untrusted`, `revocation_store_invalid`, ...), and a store that cannot be made at all is `store_not_created` | the same | stay (question 3: deleting them would reset every runtime revocation) |
+| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`, before any store is made | rewrites it; missing refuses `unit_missing`, before any store is made | removes it if its first line is this installer's marker (`unit_not_ours` otherwise); refuses `unit_enabled` while `default.target.wants/` links it |
+| `~/.config`, `~/.config/systemd`, `~/.config/systemd/user`, and `~/.local`, `~/.local/state`, `~/.local/state/recursion`, `.../plugin-security` | creates the missing ones (0700); existing ones stay as they are | the same | stay: other units share them, and the state folder holds the run registry |
+| anything else in the daemon's state folder (the run registry) | - | - | stays |
+
+The unit sets `XDG_STATE_HOME=%h/.local/state`, so the daemon's state folder
+(`$XDG_STATE_HOME/recursion`, `daemon/__main__.py`) is the one install made the stores in, whatever
+the user manager's own environment says. The ledger is not made yet: it is bound to the installer's
+anchor key, which is the open question for Lucas in the lane brief.
 
 A link at any folder or file under the home is refused (`symlink_refused`, `not_regular`), never
 followed. A link above the home (`/home` -> `/var/home`) is resolved. Every write goes to a fresh
@@ -27,7 +33,8 @@ resolved to its target). Before writing, the command layer starts that interpret
 will (`-I`, from `/`) and refuses unless it is free-threaded CPython 3.14
 (`interpreter_not_free_threaded`) and imports this same `recursion_core` without `PYTHONPATH`
 (`not_installed`). The unit has `Restart=on-failure`, `WantedBy=default.target`, `UMask=0077`,
-`KillMode=control-group`, `UnsetEnvironment=PYTHONPATH PYTHONHOME`, and a finite stop:
+`KillMode=control-group`, `UnsetEnvironment=PYTHONPATH PYTHONHOME`,
+`Environment=XDG_STATE_HOME=%h/.local/state`, and a finite stop:
 `TimeoutStopSec=90` with `SendSIGKILL=yes`. A stop that runs past it is a daemon crash: the run
 units (their own transient `recursion-run-*.service` units) stay alive, and the daemon recovers at
 its next start (seams S1 and S13 in SPINE's brief).

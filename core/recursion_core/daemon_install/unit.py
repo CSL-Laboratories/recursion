@@ -25,6 +25,11 @@ DAEMON_MODULE = "recursion_core.daemon"
 # The unit's first line. ``uninstall`` removes only a unit that starts with it.
 MARKER = "# Recursion per-user daemon, written by `recursiond install` (csl-recursion)."
 STOP_TIMEOUT_S = 90  # systemd's own default, stated: finite, and long enough for a normal drain
+# The daemon keeps its state in $XDG_STATE_HOME/recursion, or <home>/.local/state/recursion when the
+# variable is unset (daemon/__main__.py). The unit sets the variable to that default under the user
+# manager's %h, the folder `install` creates the stores in, so a value in the user manager's own
+# environment cannot point the daemon at another state folder than the one install prepared.
+STATE_HOME = ".local/state"  # relative to the home
 MAX_ARGS = 16
 MAX_ARG_LEN = 256
 _ARG = re.compile(r"[A-Za-z0-9_./:%@=+-]+")
@@ -68,12 +73,14 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
         "# unit's cgroup, so stopping or killing this unit never stops a run.\n"
         f"# A stop still running after {STOP_TIMEOUT_S} s is ended with SIGKILL: a daemon crash,\n"
         "# with the run units left alive and their state recovered at the next start.\n"
+        f"# The daemon's state, with the stores `recursiond install` creates, is in %h/{STATE_HOME}/recursion.\n"
         "[Unit]\n"
         "Description=Recursion per-user daemon\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
         "UnsetEnvironment=PYTHONPATH PYTHONHOME\n"
+        f"Environment=XDG_STATE_HOME=%h/{STATE_HOME}\n"
         f"ExecStart={' '.join(exec_args)}\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"

@@ -1,15 +1,20 @@
-"""The per-user unit: install, upgrade, uninstall. No systemctl, no network; files under a temporary home."""
+"""The per-user unit and the stores: install, upgrade, uninstall. No systemctl, no network; files under a temporary home."""
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import shutil
+import sqlite3
 import stat
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from recursion_core.daemon_install import (
     MARKER,
+    STATE_HOME,
     STOP_TIMEOUT_S,
     UNIT_NAME,
     InstallRefused,
@@ -17,12 +22,14 @@ from recursion_core.daemon_install import (
     daemon_exec_args,
     install,
     leftovers,
+    owned_paths,
     plan_commands,
     render_unit,
     service_fields,
     uninstall,
     upgrade,
 )
+from recursion_core.plugin_security import stores
 
 PY = "/opt/recursion/venv/bin/python3.14t"
 PY_NEXT = "/opt/recursion/venv-2/bin/python3.14t"
@@ -68,7 +75,10 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(fields["Service.SendSIGKILL"], "yes")
         self.assertEqual(fields["Service.UnsetEnvironment"].split(), ["PYTHONPATH", "PYTHONHOME"])
         self.assertEqual(fields["Install.WantedBy"], "default.target")
-        self.assertNotIn("Service.Environment", fields)
+        # The one variable the unit sets: the daemon's state folder is the one install made the stores in.
+        self.assertEqual(fields["Service.Environment"], "XDG_STATE_HOME=%h/.local/state")
+        self.assertEqual(STATE_HOME, ".local/state")
+        self.assertEqual(text.count("Environment="), 2)  # this line and UnsetEnvironment's
         self.assertNotIn("Service.ExecStartPre", fields)
         self.assertTrue(0 < STOP_TIMEOUT_S < 3600)
 
@@ -143,25 +153,34 @@ class InstallTests(unittest.TestCase):
         self.roots = Roots(home=self.home)
         self.unit_dir = os.path.join(self.home, ".config", "systemd", "user")
         self.unit = os.path.join(self.unit_dir, UNIT_NAME)
-        # The daemon's state folder: the installer never writes, reads or removes anything in it.
+        # The daemon's state folder: the installer adds plugin-security/ with the two stores in it, and
+        # never writes, reads or removes anything else there.
         self.state = os.path.join(self.home, ".local", "state", "recursion")
         os.makedirs(self.state, 0o700)
         with open(os.path.join(self.state, "runs.sqlite3"), "wb") as handle:
             handle.write(b"rows-v1")
+        self.store_dir = os.path.join(self.state, "plugin-security")
+        self.breaker = os.path.join(self.store_dir, "breaker.sqlite3")
+        self.revoked = os.path.join(self.store_dir, "revoked.sqlite3")
 
     def test_install_writes_the_unit_and_install_twice_equals_install_once(self) -> None:
         state_before = _tree(self.state)
         plan = install(self.roots, EXEC)
         self.assertEqual((plan.action, plan.changed, plan.unit), ("install", True, self.unit))
         self.assertEqual(plan.commands, plan_commands("install"))
+        self.assertEqual(plan.stores, (("breaker_store", self.breaker, True), ("revocation_store", self.revoked, True)))
         self.assertEqual(_read(self.unit), render_unit(EXEC))
         self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), 0o644)
+        state_after = _tree(self.state)
+        self.assertEqual(set(state_after) - set(state_before), {self.store_dir, self.breaker, self.revoked})
+        self.assertEqual({path: state_after[path] for path in state_before}, state_before)
         once = _tree(self.home)
         again = install(self.roots, EXEC)
         self.assertEqual((again.action, again.changed, again.unit), ("install", False, self.unit))
+        self.assertEqual(again.stores, (("breaker_store", self.breaker, False), ("revocation_store", self.revoked, False)))
         self.assertEqual(_tree(self.home), once)
-        self.assertEqual(_tree(self.state), state_before)
         self.assertEqual(sorted(os.listdir(self.unit_dir)), [UNIT_NAME])  # no temporary file left
+        self.assertEqual(sorted(os.listdir(self.store_dir)), ["breaker.sqlite3", "revoked.sqlite3"])
 
     def test_a_new_unit_folder_is_owner_only_and_an_existing_one_is_left_as_it_is(self) -> None:
         install(self.roots, EXEC)
@@ -208,6 +227,7 @@ class InstallTests(unittest.TestCase):
             upgrade(self.roots, EXEC)
         self.assertEqual(caught.exception.kind, "unit_missing")
         self.assertFalse(os.path.lexists(self.unit_dir))
+        self.assertFalse(os.path.lexists(self.store_dir))  # refused before any store is made
 
     def test_uninstall_removes_the_unit_and_nothing_else(self) -> None:
         before = _tree(self.home)
@@ -221,8 +241,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(plan.commands, plan_commands("uninstall"))
         self.assertEqual(leftovers(self.roots), ())
         after = _tree(self.home)
+        # Left: the unit folders (other units share them), the neighbour, and the stores (question 3).
         self.assertEqual(set(after) - set(before),
-                         {os.path.join(self.home, ".config"), os.path.dirname(self.unit_dir), self.unit_dir, neighbour})
+                         {os.path.join(self.home, ".config"), os.path.dirname(self.unit_dir), self.unit_dir, neighbour,
+                          self.store_dir, self.breaker, self.revoked})
         self.assertEqual({path: after[path] for path in before}, before)  # the state folder too
         again = uninstall(self.roots)
         self.assertEqual((again.action, again.changed), ("uninstall", False))
@@ -301,6 +323,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(plan.unit, self.unit)
 
     def test_losing_the_race_for_the_unit_is_refused_and_leaves_no_temporary_file(self) -> None:
+        install(self.roots, EXEC)
+        uninstall(self.roots)  # the stores stay, so the link below is the unit's alone
         with mock.patch("os.link", side_effect=FileExistsError):
             with self.assertRaises(InstallRefused) as caught:
                 install(self.roots, EXEC)
@@ -324,11 +348,154 @@ class InstallTests(unittest.TestCase):
             return real_fsync(fd)
         with mock.patch("os.fsync", side_effect=fsync):
             install(self.roots, EXEC)
-            self.assertEqual(synced, ["file", "dir"])
+            # Each new store's folder (``stores._create``; SQLite syncs the store's own file), then the unit.
+            self.assertEqual(synced, ["dir", "dir", "file", "dir"])
             upgrade(self.roots, EXEC_NEXT)
-            self.assertEqual(synced, ["file", "dir", "file", "dir"])
+            self.assertEqual(synced, ["dir", "dir", "file", "dir", "file", "dir"])
             uninstall(self.roots)
-            self.assertEqual(synced, ["file", "dir", "file", "dir", "dir"])
+            self.assertEqual(synced, ["dir", "dir", "file", "dir", "file", "dir", "dir"])
+
+
+@unittest.skipUnless(os.name == "posix", "the installer is Linux-only")
+class StoreTests(unittest.TestCase):
+    """``install`` and ``upgrade`` make the breaker store and the revocation store before the unit."""
+
+    setUp = InstallTests.setUp
+
+    def refused(self, kind: str, call, *args) -> InstallRefused:
+        with self.assertRaises(InstallRefused) as caught:
+            call(*args)
+        self.assertEqual(caught.exception.kind, kind)
+        return caught.exception
+
+    def test_both_stores_are_owner_only_and_open_as_the_daemon_opens_them(self) -> None:
+        install(self.roots, EXEC)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.store_dir).st_mode), 0o700)
+        for path, magic in ((self.breaker, stores.BREAKER_MAGIC), (self.revoked, stores.REVOCATION_MAGIC)):
+            with self.subTest(store=os.path.basename(path)):
+                self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o600)
+                stores.open_store(path, magic).close()
+        from recursion_core.plugin_security import ConnectionBreaker, TrustStore
+        ConnectionBreaker(self.breaker).close()
+        TrustStore({}, revocation_store=self.revoked).close()
+
+    def test_the_paths_are_the_daemons_own(self) -> None:
+        from recursion_core.daemon import breaker as daemon_breaker
+        from recursion_core.daemon import plugins as daemon_plugins
+        paths = owned_paths(self.roots)
+        self.assertEqual(paths.state, self.state)
+        self.assertEqual(str(daemon_breaker.store_path(paths.state)), paths.breaker_store)
+        self.assertEqual(str(Path(paths.state) / daemon_plugins.STORE_DIR / daemon_plugins.REVOCATION_FILE),
+                         paths.revocation_store)
+        # The daemon's state folder is $XDG_STATE_HOME/recursion (daemon/__main__.py), and the unit sets
+        # XDG_STATE_HOME to %h/.local/state: together, paths.state.
+        main = Path(importlib.util.find_spec("recursion_core.daemon.__main__").origin).read_text(encoding="utf-8")
+        self.assertIn("state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'",
+                      main)
+        self.assertEqual(service_fields(render_unit(EXEC))["Service.Environment"], f"XDG_STATE_HOME=%h/{STATE_HOME}")
+        self.assertEqual(os.path.join(self.home, *STATE_HOME.split("/"), "recursion"), paths.state)
+
+    def test_stores_already_there_are_checked_and_left_as_they_are(self) -> None:
+        install(self.roots, EXEC)
+        uninstall(self.roots)
+        before = _tree(self.store_dir)
+        plan = install(self.roots, EXEC)
+        self.assertTrue(plan.changed)  # the unit was written again
+        self.assertEqual(plan.stores, (("breaker_store", self.breaker, False), ("revocation_store", self.revoked, False)))
+        self.assertEqual(_tree(self.store_dir), before)
+
+    def test_a_missing_store_alone_is_made_and_counts_as_a_change(self) -> None:
+        install(self.roots, EXEC)
+        unit = _read(self.unit)
+        os.unlink(self.revoked)
+        plan = install(self.roots, EXEC)
+        self.assertEqual((plan.changed, plan.stores),
+                         (True, (("breaker_store", self.breaker, False), ("revocation_store", self.revoked, True))))
+        os.unlink(self.breaker)
+        plan = upgrade(self.roots, EXEC)
+        self.assertEqual((plan.changed, plan.stores),
+                         (True, (("breaker_store", self.breaker, True), ("revocation_store", self.revoked, False))))
+        self.assertEqual(_read(self.unit), unit)
+        self.assertFalse(upgrade(self.roots, EXEC).changed)
+
+    def test_a_store_open_store_refuses_is_refused_with_its_code_and_no_unit_is_written(self) -> None:
+        elsewhere = os.path.join(self.case, "elsewhere.sqlite3")
+        stores.create_breaker_store(elsewhere)
+
+        def link(path):
+            os.symlink(elsewhere, path)
+
+        def group_writable(path):
+            stores.create_revocation_store(path)
+            os.chmod(path, 0o660)
+
+        def junk(path):
+            with open(path, "wb") as handle:
+                handle.write(b"not a store" * 16)
+
+        def another_store(path):
+            stores.create_breaker_store(path)  # a breaker store where the revocation store belongs
+
+        cases = ((self.breaker, link, "breaker_store_untrusted"), (self.revoked, group_writable, "revocation_store_untrusted"),
+                 (self.breaker, junk, "breaker_store_invalid"), (self.revoked, another_store, "revocation_store_invalid"))
+        for path, make, kind in cases:
+            with self.subTest(case=make.__name__):
+                os.makedirs(self.store_dir, 0o700, exist_ok=True)
+                make(path)
+                self.assertIn(path, self.refused(kind, install, self.roots, EXEC).detail)
+                self.assertFalse(os.path.lexists(self.unit))
+                for name in os.listdir(self.store_dir):
+                    os.unlink(os.path.join(self.store_dir, name))
+        install(self.roots, EXEC)
+        os.unlink(self.breaker)
+        link(self.breaker)
+        self.refused("breaker_store_untrusted", upgrade, self.roots, EXEC_NEXT)
+        self.assertEqual(_read(self.unit), render_unit(EXEC))  # not rewritten
+
+    def test_a_leftover_wal_beside_a_missing_store_is_refused_and_left(self) -> None:
+        os.makedirs(self.store_dir, 0o700)
+        with open(self.breaker + "-wal", "wb") as handle:
+            handle.write(b"stale")
+        self.assertIn("breaker.sqlite3-wal", self.refused("breaker_store_exists", install, self.roots, EXEC).detail)
+        with open(self.breaker + "-wal", "rb") as handle:
+            self.assertEqual(handle.read(), b"stale")
+        self.assertEqual(os.listdir(self.store_dir), ["breaker.sqlite3-wal"])
+        self.assertFalse(os.path.lexists(self.unit))
+
+    def test_a_different_unit_is_refused_before_any_store_is_made(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        with open(self.unit, "w", encoding="utf-8") as handle:
+            handle.write("# hand placed\n[Service]\nExecStart=/old\n")
+        self.refused("unit_differs", install, self.roots, EXEC)
+        self.assertFalse(os.path.lexists(self.store_dir))
+
+    def test_a_link_in_the_state_path_is_refused_not_followed(self) -> None:
+        outside = os.path.join(self.case, "outside")
+        os.mkdir(outside, 0o700)
+        os.symlink(outside, self.store_dir)
+        self.refused("symlink_refused", install, self.roots, EXEC)
+        self.assertEqual(os.listdir(outside), [])
+        self.assertFalse(os.path.lexists(self.unit))
+
+    def test_a_store_that_cannot_be_made_is_refused_and_no_unit_is_written(self) -> None:
+        for exc in (OSError(28, "No space left on device"), sqlite3.OperationalError("disk I/O error")):
+            with self.subTest(error=type(exc).__name__):
+                with mock.patch.object(stores, "create_revocation_store", side_effect=exc):
+                    error = self.refused("store_not_created", install, self.roots, EXEC)
+                self.assertIn(self.revoked, error.detail)
+                self.assertIn(type(exc).__name__, error.detail)
+                self.assertFalse(os.path.lexists(self.unit))
+        # For real: a umask that takes the owner's own write bit leaves a folder no store can be made in.
+        shutil.rmtree(self.store_dir)
+        old = os.umask(0o277)
+        try:
+            error = self.refused("store_not_created", install, self.roots, EXEC)
+        finally:
+            os.umask(old)
+            os.chmod(self.store_dir, 0o700)
+        self.assertIn("PermissionError", error.detail)
+        self.assertEqual(os.listdir(self.store_dir), [])
+        self.assertFalse(os.path.lexists(self.unit))
 
 
 if __name__ == "__main__":

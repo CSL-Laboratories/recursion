@@ -55,14 +55,19 @@ class CommandTests(unittest.TestCase):
     def test_install_prints_ok_and_install_twice_changes_nothing(self):
         code, answer = self.run_action("install")
         self.assertEqual(code, 0)
+        store_dir = os.path.join(self.home, ".local", "state", "recursion", "plugin-security")
+        stores = [{"kind": "breaker_store", "path": os.path.join(store_dir, "breaker.sqlite3"), "created": True},
+                  {"kind": "revocation_store", "path": os.path.join(store_dir, "revoked.sqlite3"), "created": True}]
         self.assertEqual(answer, {
             "code": "ok", "action": "install", "changed": True, "unit": self.unit, "interpreter": PY,
+            "stores": stores,
             "next": [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", UNIT_NAME]]})
         with open(self.unit, encoding="utf-8") as handle:
             first = handle.read()
         self.assertEqual(service_fields(first)["Service.ExecStart"], f"{PY} -I -X gil=0 -m recursion_core.daemon")
         code, answer = self.run_action("install")
         self.assertEqual((code, answer["changed"]), (0, False))
+        self.assertEqual(answer["stores"], [dict(store, created=False) for store in stores])
         with open(self.unit, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), first)
 

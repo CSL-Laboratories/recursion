@@ -198,7 +198,11 @@ class FakeStore:
         A declaration can only declare: ``CREATE TABLE`` and ``CREATE INDEX`` on its own tables. Anything else
         in it (a write to the helper's own tables, a view, a trigger, a change to an existing table) is refused,
         and a declaration that fails leaves NOTHING behind: every statement of it is undone and the lane can
-        declare again. It is made under the same guard as closing, so none is made on a closed store."""
+        declare again. It is made under the same guard as closing, so none is made on a closed store.
+
+        "Its own tables" are the ones this declaration makes. A table that existed before it (the helper's, or
+        another lane's) cannot be declared again, in any spelling of its name and not with IF NOT EXISTS either:
+        declaring it again would make it count as this declaration's own, and an index could then be put on it."""
         with self._guard:
             if self.closed:
                 raise RuntimeError('store_closed')
@@ -206,15 +210,16 @@ class FakeStore:
                 raise RuntimeError('a lane declares its tables once')
             created: set = set()
             indexes: set = set()
+            existing: set = set()   # every table there before this declaration, lower case: names are not case-sensitive
 
             def declaration_only(action, first, second, database, source) -> int:
                 if action == sqlite3.SQLITE_CREATE_TABLE:
-                    if first in ('receipts', 'events'):
-                        return sqlite3.SQLITE_DENY
-                    created.add(first)
+                    if first.lower() in existing:
+                        return sqlite3.SQLITE_DENY      # the fourth reads: not its own, however it is declared
+                    created.add(first.lower())
                     return sqlite3.SQLITE_OK
                 if action == sqlite3.SQLITE_CREATE_INDEX:
-                    if second not in created:
+                    if second.lower() not in created:
                         return sqlite3.SQLITE_DENY      # an index on a table this declaration did not make. An index
                     indexes.add(first)                  # on a constant reads no column, so no later check sees it.
                     return sqlite3.SQLITE_OK
@@ -222,7 +227,7 @@ class FakeStore:
                     return sqlite3.SQLITE_OK if first in indexes else sqlite3.SQLITE_DENY
                 if first in ('sqlite_master', 'sqlite_schema'):
                     return sqlite3.SQLITE_OK        # what creating a table writes, and nothing a statement can name
-                if action == sqlite3.SQLITE_READ and first in created:
+                if action == sqlite3.SQLITE_READ and first.lower() in created:
                     return sqlite3.SQLITE_OK
                 if action == sqlite3.SQLITE_FUNCTION:
                     return sqlite3.SQLITE_OK        # in a default or a check; a declaration SELECTs nothing
@@ -230,6 +235,7 @@ class FakeStore:
 
             with contextlib.closing(self._connect()) as db:
                 before = self._names(db)
+                existing.update(name.lower() for name in before)
                 db.execute('BEGIN IMMEDIATE')
                 try:
                     db.set_authorizer(declaration_only)
@@ -454,10 +460,23 @@ class RegistrationTest(unittest.TestCase):
         # The whole module, not only its sixteen loaders (the third read): nothing is imported FROM importlib under
         # another name, no builtin that imports or evaluates is named at all, and the one thing importlib is used
         # for anywhere is importlib.util.find_spec with literal text.
+        # The fourth reads: the same under an ordinary alias. importlib comes in as ``import importlib.util`` and in
+        # no other way; ``builtins`` does not come in at all; an importer or an evaluator is not reached as an
+        # attribute of anything; and every ``find_spec`` call is spelled ``importlib.util.find_spec``.
         parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotEqual(alias.name.split('.')[0], 'builtins', 'the builtins module is not imported')
+                    if alias.name.split('.')[0] == 'importlib':
+                        self.assertEqual((alias.name, alias.asname), ('importlib.util', None), 'importlib under its own name only')
             if isinstance(node, ast.ImportFrom):
-                self.assertNotEqual((node.module or '').split('.')[0], 'importlib', 'no importer is brought in under another name')
+                self.assertNotIn((node.module or '').split('.')[0], ('importlib', 'builtins'),
+                                 'no importer is brought in under another name')
+            if isinstance(node, ast.Attribute):
+                self.assertNotIn(node.attr, {'import_module', '__import__', 'exec', 'eval', 'reload', '__builtins__'})
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'find_spec':
+                self.assertEqual(ast.unparse(node.func), 'importlib.util.find_spec', 'find_spec is called under its own name')
             if isinstance(node, ast.Name):
                 self.assertNotIn(node.id, {'__import__', 'exec', 'eval', 'reload', '__builtins__'})
                 if node.id == 'importlib':
@@ -489,6 +508,49 @@ class RegistrationTest(unittest.TestCase):
                            for alias in statement.names]
                 self.assertEqual(imports, [name], 'one literal import statement, of exactly this module')
                 self.assertEqual([s for s in ast.walk(node) if isinstance(s, ast.ImportFrom)], [])
+
+    def test_the_guard_on_computed_imports_refuses_each_form_under_an_alias_too(self) -> None:
+        """The fourth reads' finding E: the guard above is itself held. With nothing added to the module's text it
+        passes; with any of these forms added it fails. A module, an importer or a builtin that comes in under
+        another name is as refused as under its own."""
+        source = pathlib.Path(H.__file__).read_text(encoding='utf-8')
+        forms = {
+            'importlib under another name': 'import importlib as _lib\n_load = _lib.import_module\n',
+            'importlib.util under another name': 'import importlib.util as _specs\n\n\ndef _find(name):\n    return _specs.find_spec(name)\n',
+            'an importer from builtins under another name': 'from builtins import __import__ as _load\n',
+            'builtins under another name': 'import builtins as _b\n_load = _b.__import__\n',
+            'builtins under its own name': 'import builtins\n_load = builtins.__import__\n',
+            'find_spec through another object': '_specs = importlib.util\n\n\ndef _find(name):\n    return _specs.find_spec(name)\n',
+            # One form for each rule of the guard that no other rule also refuses.
+            'another part of importlib': 'import importlib.machinery\n',
+            'builtins asked for a name it is given as text': "import builtins\n_load = getattr(builtins, '__imp' + 'ort__')\n",
+            'an importer reached through the table of modules': "import sys\n_load = sys.modules['builtins'].__import__\n",
+            'find_spec on a module taken from the table of modules':
+                "import sys\n_specs = sys.modules['importlib.util']\n\n\ndef _find(name):\n    return _specs.find_spec(name)\n",
+            # The third read's three spellings stay refused.
+            'an importer imported from importlib': 'from importlib import import_module as _load\n',
+            'a find_spec that is not literal': 'def _find(name):\n    return importlib.util.find_spec(name)\n',
+            'a builtin importer under another name': '_load = __import__\n',
+        }
+        guard = 'test_the_registrants_are_guarded_static_imports_and_nothing_is_imported_by_a_computed_name'
+
+        def passes(text) -> bool:
+            result = unittest.TestResult()
+            with mock.patch.object(pathlib.Path, 'read_text', lambda path, *args, **kwargs: text):
+                type(self)(guard).run(result)
+            return result.wasSuccessful()
+        self.assertTrue(passes(source), 'the module as it is passes its guard')
+        for what, added in forms.items():
+            with self.subTest(form=what):
+                self.assertFalse(passes(source + '\n\n' + added))
+
+    def test_the_drive_owners_contract_says_a_hand_over_is_all_or_nothing_and_names_the_drivers_service(self) -> None:
+        """Text that other lanes build against, so that it cannot go missing unseen (the fourth reads)."""
+        text = ' '.join(H.__doc__.split())
+        for sentence in ('A hand-over is all or nothing.',
+                         'a hand-over that raises leaves no worker behind that still owns the run',
+                         'registers that service under the name ``routes.driver_cc``'):
+            self.assertIn(sentence, text)
 
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
         self.assertIsNone(importlib.util.find_spec('recursion_core.keys'), 'no keys lane is installed in this tree')
@@ -1625,6 +1687,49 @@ class AdmissionTest(unittest.TestCase):
                     self.assertEqual(answered_from_another_thread(self, gate), [False])
 
     @quiet
+    def test_an_interruption_on_the_way_back_from_taking_the_condition_is_inside_the_protected_region(self) -> None:
+        """The fourth reads' finding C. The taking of the condition, the return from it and what follows are one
+        protected region. A close and a drain are interrupted as the helper that takes the condition is entered
+        (nothing is taken yet), at its return (the condition is taken), and at the first line after it. Each
+        time the gate does its work first (it is closed; the drain's one call has left), raises the interruption
+        only then, and leaves the condition free: released where it was taken, and not released where it was
+        not."""
+        for step, first_line in (('close', 'self._closed = True'), ('drain', 'while self._admitted > 0:')):
+            method = getattr(H.Admission, step)
+            lines, start = inspect.getsourcelines(method)
+            target = start + next(index for index, line in enumerate(lines) if first_line in line)
+            for where in ('the call of the taking', 'the return of the taking', 'the first line after it'):
+                gate = H.Admission()
+                gate.enabled = True
+                if step == 'drain':
+                    gate.enter()
+                    gate.close()
+                    gate._changed.wait = lambda timeout=None, gate=gate: (gate.leave(), True)[1]   # the call leaves meanwhile
+                fired = []
+
+                def trace(frame, event, arg, code=method.__code__, target=target, where=where, fired=fired):
+                    if not fired and (
+                            (where == 'the call of the taking' and event == 'call'
+                             and frame.f_code is H.take_once.__code__ and frame.f_back.f_code is code)
+                            or (where == 'the return of the taking' and event == 'return'
+                                and frame.f_code is H.take_once.__code__ and frame.f_back.f_code is code)
+                            or (where == 'the first line after it' and event == 'line'
+                                and frame.f_code is code and frame.f_lineno == target)):
+                        fired.append(where)
+                        raise KeyboardInterrupt(where)
+                    return trace
+                with self.subTest(step=step, interrupted_at=where):
+                    before = sys.gettrace()
+                    sys.settrace(trace)
+                    try:
+                        with self.assertRaises(KeyboardInterrupt):
+                            getattr(gate, step)()
+                    finally:
+                        sys.settrace(before)
+                    self.assertEqual((fired, gate.closed, gate.admitted, gate._lock._is_owned()), ([where], True, 0, False))
+                    self.assertEqual(answered_from_another_thread(self, gate), [False])
+
+    @quiet
     def test_a_teardown_error_is_raised_only_after_everything_was_stopped_and_closed(self) -> None:
         log = []
         store = FakeStore(log)
@@ -2093,6 +2198,16 @@ class FakeStoreBoundaryTest(unittest.TestCase):
             "the same over another lane's table": 'CREATE TABLE mine (id TEXT); CREATE UNIQUE INDEX sabotage ON work ((1 + 1))',
             'a table made with rows in it': 'CREATE TABLE mine AS SELECT 1 AS id',
             'no table at all': 'SELECT 1',
+            # The fourth reads' witnesses. A table that was there before is not the declaration's own, however
+            # it is declared again: the index after it would otherwise count as an index on its own table.
+            "another lane's table declared again, quietly, and given a unique index on a column":
+                'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS work (id TEXT); CREATE UNIQUE INDEX sabotage ON work (state)',
+            'the same with a unique index on a constant':
+                'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS work (id TEXT); CREATE UNIQUE INDEX sabotage ON work (1)',
+            'the same under another spelling of its name':
+                'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS WORK (id TEXT); CREATE UNIQUE INDEX sabotage ON WORK (1)',
+            "another lane's table declared again and nothing else": 'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS work (id TEXT)',
+            "the helper's events declared again under another spelling": 'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS Events (id TEXT)',
         }
         made = {'own', 'leaked', 'seen', 'peek', 't1', 'sneak', 'mine', 'on_work', 'on_receipts', 'sabotage'}
         for what, ddl in refused.items():
@@ -2111,6 +2226,9 @@ class FakeStoreBoundaryTest(unittest.TestCase):
             # And two unrelated receipts are both kept: no declaration left a constraint on the helper's table.
             tx.receipt_put('t1', 'session.turn', 'c2', 'digest-2', {'code': 'ok'})
             tx.receipt_put('t2', 'session.start', 'c3', 'digest-3', {'code': 'ok'})
+            # Nor on the other lane's: two more of its rows in the state its first row is in are both kept.
+            tx.execute('INSERT INTO work VALUES (?, ?, ?)', ('c2', 'op-2', 'pending'))
+            tx.execute('INSERT INTO work VALUES (?, ?, ?)', ('c3', 'op-3', 'pending'))
 
     def test_a_foreign_key_a_declaration_states_is_enforced(self) -> None:
         store = FakeStore()

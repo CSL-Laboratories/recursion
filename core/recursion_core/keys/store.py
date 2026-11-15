@@ -162,7 +162,7 @@ class KeyStore:
                                 f'the {STORE_TEXT[name]} backend is not built yet; no key is written to a file on a host '
                                 'that has a keychain')
         backend = BACKENDS[name]
-        return backend(self.system) if name == 'secret_service' else backend()
+        return backend() if name == 'owner_file' else backend(self.system)
 
     # -- commands ----------------------------------------------------------------------------------
     def add(self, key_id: str, provider: str, env_name: str, value: str, *, metered_spend_allowed: bool = False,

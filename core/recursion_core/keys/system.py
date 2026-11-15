@@ -13,8 +13,9 @@ only on its standard input, never in its arguments or its environment.
 
 WHICH BACKEND ANSWERS (``detect``):
 
-- macOS and Windows always have a keychain: ``macos_keychain`` and ``windows_credential``. Their backends
-  are not built in this slice, so the store refuses there (``backend_not_built``) instead of writing a file.
+- macOS and Windows always have a keychain: ``macos_keychain`` and ``windows_credential``. macOS needs the
+  ``security`` tool (refused ``keychain_tool_missing`` without it). The Windows backend is not built yet, so the
+  store refuses there (``backend_not_built``) instead of writing a file.
 - Elsewhere the keychain is the Secret Service, reached over the user's session bus. No session bus (no
   address in the environment and no ``$XDG_RUNTIME_DIR/bus`` socket): there is no keychain, ``owner_file``.
 - With a bus, the bus itself is asked whether ``org.freedesktop.secrets`` has an owner or can be started
@@ -152,6 +153,9 @@ def _absolute_path(value: str) -> list:
 def detect(system: System) -> str:
     """The backend this host offers now: a name from ``store.STORES``. Raises ``KeyStoreError``."""
     if system.platform == 'darwin':
+        if system.which('security') is None:
+            raise KeyStoreError('keychain_tool_missing', 'the macOS security tool was not found; no key is written to '
+                                'a file on a host that has a keychain')
         return 'macos_keychain'
     if system.platform == 'win32':
         return 'windows_credential'

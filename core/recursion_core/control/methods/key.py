@@ -21,7 +21,7 @@ def key_list(ctx, params) -> dict:
     if not isinstance(params, dict):
         return {'code': 'request_invalid', 'detail': 'params'}
     if params:
-        return {'code': 'request_invalid', 'detail': sorted(params)[0]}
+        return {'code': 'request_invalid', 'detail': min(params)}
     try:
         index = default_store().list()
     except KeyStoreError as exc:

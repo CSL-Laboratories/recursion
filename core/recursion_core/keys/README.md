@@ -21,7 +21,8 @@ The index, `$XDG_CONFIG_HOME/recursion/keys/index.json` (default `~/.config/recu
 
 - **Linux with a Secret Service on the session bus:** the Secret Service, through `secret-tool`. The key goes in on its standard input and comes back on its standard output, never in its arguments or environment. Without `secret-tool` (package `libsecret-tools`), the store refuses rather than write a file.
 - **No session bus, or a bus with no Secret Service:** the owner-only file `secrets.json` beside the index.
-- **macOS and Windows:** their keychain backends are not built yet, so the store refuses there instead of writing a file.
+- **macOS:** the login keychain, through `/usr/bin/security`. The key is written with `security -i` from standard input, as hexadecimal, never in the arguments, and read back to check it was kept exactly. This backend follows Apple's documented interface and is tested against a stand-in program; it has not yet run on a Mac.
+- **Windows:** the Credential Manager backend is not built yet, so the store refuses there instead of writing a file.
 
 The folder is 0700 and every file in it is 0600, owned by the user. All of this is checked on every open, through the descriptor that was opened. Symlinks are refused and not followed, a FIFO cannot block a read, and writes go through a temp file, fsync and rename under a lock (see `files.py`).
 
@@ -31,7 +32,13 @@ The folder is 0700 and every file in it is 0600, owned by the user. All of this 
 
 `credentials(connection_id, env_name)` is the `Credentials` type of `routes/base.py`. It returns the value only when the id is saved under exactly that variable name and the key has a spend opt-in with a cap above 0. An unknown id, or a known one asked for under another name, raises `KeyError(connection_id)`, as the daemon's default does. A refused known id raises `KeyRefused`, a `KeyError` with a typed code. Either way the route refuses before launch: `launch_refused`, "no credential for ID".
 
-`hooks.py` registers it into seam S7, and the `key` command family into S2, once SPINE's seams pull request lands. Until then the daemon still passes `no_custody` and every API-key route refuses, as before.
+`hooks.py` registers it into seam S7, `key.list` into the method table (S1) and the `key` command family into S2, once SPINE's seams pull request lands. Until then the daemon still passes `no_custody` and every API-key route refuses, as before.
+
+## For other lanes
+
+- **`key.list`** (S1, a read) answers `{"code": "ok", "keys": [...]}`, each key with exactly `key_id`, `provider`, `env_name`, `created_at` and `store`, as published in `schemas/control/v1/methods.v1.json`. It reads the index only, so no keychain is asked. `tests/fixtures/key.list.ok.json` is an example answer.
+- **`spend_policy(connection_id)`** returns `{"metered_spend_allowed": bool, "cap_usd": number}`, read from the index. This is what lane QUOTA reserves against.
+- **`describe()`** returns the folder, the pinned store, the backend the host offers now (or why it cannot say), the owner-only file's path when it is in use, and the key count. This is what lane INSTALL's `doctor` reports. It never raises for a store it cannot use, and it never returns a value.
 
 ## Spend
 
@@ -39,4 +46,4 @@ Each key records `metered_spend_allowed` and `cap_usd`, entered at `add`. With n
 
 ## Not in this package yet
 
-The macOS Keychain backend, `key.list` (S1), `describe()` and `spend_policy()` (pull request 2); the Windows Credential Manager backend, replace and rotate (pull request 3). Import from other tools is lane IMPORT's.
+The Windows Credential Manager backend, replace and rotate (pull request 3). Import from other tools is lane IMPORT's.

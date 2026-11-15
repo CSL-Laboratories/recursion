@@ -109,7 +109,7 @@ class PinTest(TempStoreCase):
     def test_a_host_that_cannot_say_refuses_rather_than_writes_a_file(self) -> None:
         for system, code in ((FakeSystem(tools={'busctl': busctl(owner=True)}, bus='unix:path=/b'), 'keychain_tool_missing'),
                              (FakeSystem(bus='unix:path=/b'), 'keychain_undetermined'),
-                             (FakeSystem(platform='darwin'), 'backend_not_built'),
+                             (FakeSystem(platform='darwin'), 'keychain_tool_missing'),
                              (FakeSystem(platform='win32'), 'backend_not_built')):
             with self.subTest(code=code, platform=system.platform):
                 with self.assertRaises(KeyStoreError) as caught:

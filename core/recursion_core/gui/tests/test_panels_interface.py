@@ -183,6 +183,30 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(reads, ["operator.orders.submit"])  # the declaration did change after the check
         self.assertEqual(registry["p"]["reads"], (READS[0],))
 
+    def test_reads_snapshot_is_taken_before_validation(self):
+        # Second review of #384 (GPT-6 Astra, R1; its suggested test, made stricter): the copy comes
+        # before the check, not only before the next read of the declaration. The check itself changes
+        # the source list, once by adding a read and once by replacing the read it has just checked;
+        # what is kept is what was checked.
+        from unittest.mock import patch
+
+        for change in ("append", "replace"):
+            source = [READS[0]]
+
+            class Membership(tuple):
+                def __contains__(self, item):
+                    if source == [READS[0]]:
+                        if change == "append":
+                            source.append(READS[1])
+                        else:
+                            source[0] = READS[1]
+                    return super().__contains__(item)
+
+            with self.subTest(change=change), patch.object(panels, "READS", Membership(READS)):
+                answer = panel_registry([{"id": "p", "title": "Panel", "reads": source}])
+                self.assertNotEqual(source, [READS[0]])  # the check did change the declaration
+                self.assertEqual(answer["p"]["reads"], (READS[0],))
+
     def test_a_tuple_subclass_of_reads_is_refused(self):
         class Reads(tuple):
             pass

@@ -122,6 +122,11 @@ class ApprovalQueue:
     def now(self) -> str:
         return timestamp_of(self._clock())
 
+    @property
+    def store(self):
+        """The event store this queue writes to, or ``None`` before one is attached."""
+        return self._store
+
     # -- requests ----------------------------------------------------------------------------------------
 
     def request(self, source: str, effect: dict, *, session_id=None, run_id=None, turn_id=None,

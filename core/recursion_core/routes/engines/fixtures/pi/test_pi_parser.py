@@ -61,11 +61,18 @@ class FramingTest(unittest.TestCase):
             '{"type":"x","a":1,"a":2}': "duplicate_key", '{"type":"x","o":{"k":1,"k":1}}': "duplicate_key",
             '{"type":"x","n":NaN}': "not_a_number", '{"type":"x","n":Infinity}': "not_a_number",
             '{"type":"x","n":-Infinity}': "not_a_number", '{"type":"x"}\n{"type":"y"}': "lf_inside_record",
+            # valid JSON numbers no binary64 holds: Python would read each as an infinity
+            '{"type":"x","n":1e400}': "number_out_of_range", '{"type":"x","n":-1e400}': "number_out_of_range",
+            '{"type":"x","o":{"a":[1E309]}}': "number_out_of_range",
         }
         for text, code in cases.items():
             with self.subTest(text=text), self.assertRaises(pi.PiProtocolError) as caught:
                 pi.read_record(text)
             self.assertEqual(caught.exception.code, code)
+
+    def test_finite_numbers_at_the_edges_are_read_as_given(self):
+        record = pi.read_record('{"type":"x","big":1.7976931348623157e308,"tiny":1e-400,"s":"1e400","i":10}')
+        self.assertEqual(record, {"type": "x", "big": 1.7976931348623157e308, "tiny": 0.0, "s": "1e400", "i": 10})
 
     def test_read_record_takes_bytes_and_text_with_or_without_the_line_end(self):
         for line in ('{"type":"x"}', '{"type":"x"}\n', '{"type":"x"}\r\n', b'{"type":"x"}\n'):
@@ -115,6 +122,16 @@ class DigestTest(unittest.TestCase):
                 pi.input_digest(value)
             self.assertEqual(caught.exception.code, code)
         pi.input_digest({"n": 2**53 - 1, "m": -(2**53 - 1), "f": 0.5})   # the edges themselves are taken
+
+    def test_the_depth_limit_is_64_levels_below_the_input(self):
+        # Pinned by its number, not by the constant: changing the limit must change this test.
+        nested = {}
+        for _ in range(64):
+            nested = {"d": nested}
+        pi.input_digest(nested)
+        with self.assertRaises(pi.PiProtocolError) as caught:
+            pi.input_digest({"d": nested})
+        self.assertEqual(caught.exception.code, "tool_input_too_deep")
 
     def test_a_tool_call_with_an_input_outside_the_profile_is_a_protocol_error(self):
         stream = json_stream()
@@ -167,6 +184,27 @@ class UsageTest(unittest.TestCase):
         used["cost"] = {"total": -0.5}
         self.assertEqual(self.usage_of(used)["cost_usd"]["quality"], "unknown")
 
+    def test_a_cost_pi_could_not_have_written_is_unknown(self):
+        known = {"value": None, "quality": "known", "provenance": "modelled"}
+        for cost, want in ((True, None), (False, None), (10**400, None), (2**53, None), (-1, None), ("0.1", None),
+                           (None, None), (2**53 - 1, 2**53 - 1), (0, 0), (0.5, 0.5)):
+            with self.subTest(cost=str(cost)[:20]):
+                used = f.usage(10, 5)
+                used["cost"]["total"] = cost
+                got = self.usage_of(used)["cost_usd"]
+                if want is None:
+                    self.assertEqual(got, {"value": None, "quality": "unknown", "provenance": "unavailable"})
+                else:
+                    self.assertEqual(got, dict(known, value=want))
+
+    def test_a_cost_too_large_for_binary64_is_a_protocol_error(self):
+        # Where one read asked for "unknown" and the other for a refusal at read, the stricter is taken.
+        line = assistant_end(used=f.usage(10, 5, cost=0.25)).replace('"total":0.25', '"total":1e309')
+        self.assertIn("1e309", line)
+        with self.assertRaises(pi.PiProtocolError) as caught:
+            json_stream().feed(line)
+        self.assertEqual(caught.exception.code, "number_out_of_range")
+
     def test_no_usage_object_is_unknown_and_a_model_without_provider_stays_bare(self):
         message = f.assistant("ok", f.T0)
         del message["usage"], message["provider"]
@@ -174,6 +212,76 @@ class UsageTest(unittest.TestCase):
         p = stream.feed(rec({"type": "message_end", "message": message}))[0]["payload"]
         self.assertEqual(p["input_tokens"]["quality"], "unknown")
         self.assertEqual(p["model"], "model-synthetic")
+
+
+class HeldUsageTest(unittest.TestCase):
+    """Usage that is not one model call: measured, kept once as a signal, never drafted (questions.md Q10)."""
+
+    def tool_result(self, used, call_id="c1"):
+        message = {"role": "toolResult", "toolCallId": call_id, "toolName": "delegate",
+                   "content": [{"type": "text", "text": "done"}], "isError": False, "timestamp": f.T0}
+        if used is not None:
+            message["usage"] = used
+        return message
+
+    def held(self, stream):
+        return [s for s in stream.signals if s["signal"] == "usage_held"]
+
+    def test_a_tool_results_usage_is_held_once_with_its_measurements_and_no_model(self):
+        stream = json_stream()
+        result = self.tool_result(f.usage(700, 60, cost=0.07))
+        drafts = drafts_of(stream, {"type": "message_start", "message": result},
+                           {"type": "message_end", "message": result},
+                           {"type": "message_end", "message": result},     # the same result again
+                           {"type": "tool_execution_end", "toolCallId": "c1", "toolName": "delegate",
+                            "result": {"content": result["content"], "usage": result["usage"]}, "isError": False},
+                           {"type": "turn_end", "message": f.assistant("", f.T0), "toolResults": [result]},
+                           {"type": "agent_end", "messages": [result], "willRetry": False})
+        self.assertEqual([d["type"] for d in drafts], ["tool.result"])      # no usage draft
+        held = self.held(stream)
+        self.assertEqual(len(held), 1)
+        self.assertEqual((held[0]["source"], held[0]["call_id"]), ("tool_result", "c1"))
+        usage = held[0]["usage"]
+        self.assertEqual((usage["connection_id"], usage["model"], usage["bucket"]), (CONN, None, None))
+        self.assertEqual(usage["input_tokens"], {"value": 700, "quality": "known", "provenance": "observed"})
+        self.assertEqual(usage["cost_usd"], {"value": 0.07, "quality": "known", "provenance": "modelled"})
+        self.assertNotIn("span", usage)
+
+    def test_a_compactions_usage_is_held_and_a_compaction_without_one_holds_nothing(self):
+        stream = json_stream()
+        done = {"type": "compaction_end", "reason": "threshold", "aborted": False, "willRetry": False,
+                "result": {"summary": "s", "firstKeptEntryId": "e1", "tokensBefore": 10000,
+                           "estimatedTokensAfter": 1000, "usage": f.usage(900, 90, cost=0.09), "details": {}}}
+        self.assertEqual(stream.feed(rec(done)), [])
+        held = self.held(stream)
+        self.assertEqual([(h["source"], h["usage"]["input_tokens"]["value"]) for h in held], [("compaction", 900)])
+        self.assertNotIn("call_id", held[0])
+        for empty in ({"type": "compaction_end", "reason": "threshold", "aborted": True, "willRetry": False},
+                      {"type": "compaction_end", "reason": "overflow", "aborted": False, "willRetry": False,
+                       "errorMessage": "summary failed"},
+                      dict(done, result=dict(done["result"], usage=f.usage(0, 0)))):
+            with self.subTest(empty=str(empty)[:50]):
+                quiet = json_stream()
+                self.assertEqual(quiet.feed(rec(empty)), [])
+                self.assertEqual(self.held(quiet), [])
+
+    def test_a_tool_result_without_reported_usage_holds_nothing(self):
+        for used in (None, f.usage(0, 0), "x"):
+            with self.subTest(used=used):
+                stream = json_stream()
+                stream.feed(rec({"type": "message_end", "message": self.tool_result(used)}))
+                self.assertEqual(self.held(stream), [])
+
+    def test_held_usage_would_fit_event_v1_once_it_has_a_span(self):
+        from recursion_core.routes.engines.fixtures.pi.test_pi_fixtures import NO_RULES, RULES
+        if RULES is None:
+            self.skipTest(NO_RULES)
+        stream = json_stream()
+        stream.feed(rec({"type": "message_end", "message": self.tool_result(f.usage(700, 60, cost=0.07))}))
+        payload = self.held(stream)[0]["usage"]
+        self.assertTrue(RULES.fits("driver.v2.json#/$defs/event_draft",
+                                   {"type": "usage", "payload": dict(payload, span="call")}))
+        self.assertFalse(RULES.fits("driver.v2.json#/$defs/event_draft", {"type": "usage", "payload": payload}))
 
 
 class ToolTest(unittest.TestCase):
@@ -216,6 +324,33 @@ class ToolTest(unittest.TestCase):
         stream = json_stream()
         drafts = drafts_of(stream, assistant_end(text="", stop="toolUse", calls=[("c2", "write", small)]))
         self.assertEqual(drafts[1]["payload"]["input"], small)   # exactly at the cap it is carried
+
+    def test_the_carry_cap_is_262144_utf8_bytes(self):
+        # Pinned by its number. '{"content":""}' is 14 bytes; an e-acute is 2 bytes in UTF-8, 1 character.
+        def carried(arguments):
+            stream = json_stream()
+            return stream.feed(rec({"type": "tool_execution_start", "toolCallId": "c1", "toolName": "write",
+                                    "args": arguments}))[0]["payload"]["input"]
+        self.assertIsNotNone(carried({"content": "x" * (262144 - 14)}))
+        self.assertIsNone(carried({"content": "x" * (262144 - 13)}))
+        self.assertIsNone(carried({"content": "\u00e9" * 131072}))         # 131072 characters, 262158 bytes
+
+    def test_the_result_text_cap_is_65536_characters(self):
+        for size, truncated in ((65536, False), (65537, True)):
+            with self.subTest(size=size):
+                payload = json_stream().feed(rec(self.end(result={"content": [{"type": "text", "text": "y" * size}]})))
+                self.assertEqual((len(payload[0]["payload"]["text"]), payload[0]["payload"]["truncated"]),
+                                 (65536, truncated))
+
+    def test_a_carriage_return_in_an_id_or_a_name_is_a_protocol_error(self):
+        for call_id, name, code in (("call\rname", "bash", "tool_call_id"), ("\r", "bash", "tool_call_id"),
+                                    ("c1", "x\ry", "tool_name")):
+            with self.subTest(call_id=call_id, name=name), self.assertRaises(pi.PiProtocolError) as caught:
+                json_stream().feed(rec({"type": "tool_execution_start", "toolCallId": call_id, "toolName": name,
+                                        "args": {}}))
+            self.assertEqual(caught.exception.code, code)
+        with self.assertRaises(pi.PiProtocolError):
+            json_stream().feed(rec(self.end(toolCallId="c\r1")))
 
     def test_bad_call_ids_names_and_inputs_are_protocol_errors(self):
         for call_id, name, arguments, code in [
@@ -326,6 +461,8 @@ class JsonModeTest(unittest.TestCase):
             stream.prompt("x", delivery_id="dlv-3", turn_id="turn-3", how="new_turn")   # an RPC line
         with self.assertRaises(ValueError):
             stream.command("abort")
+        with self.assertRaises(ValueError):
+            stream.cancel_dialog("ui-1")                                                # an RPC record too
 
     def test_rpc_records_are_protocol_errors_in_a_one_shot_run(self):
         for record in ({"type": "response", "command": "prompt", "success": True},
@@ -388,6 +525,26 @@ class JsonModeTest(unittest.TestCase):
         _stream, result = self.settle()
         self.assertEqual(result["payload"], {"code": "engine_error", "detail": "no assistant message"})
 
+    def test_the_detail_carries_500_characters_of_error_text(self):
+        # Pinned by its number, not by the constant.
+        _stream, result = self.settle(assistant_end(stop="error", error="x" * 499 + "yz" + "w" * 300))
+        self.assertEqual(result["payload"]["detail"], "error: " + "x" * 499 + "y")
+        self.assertEqual(len(result["payload"]["detail"]), len("error: ") + 500)
+
+    def test_a_retry_hint_is_seen_until_the_next_run_starts(self):
+        stream = json_stream()
+        drafts_of(stream, {"type": "agent_start"}, assistant_end(stop="error", error="overloaded"))
+        self.assertIsNone(stream.will_retry)                 # no run has ended yet
+        stream.feed(rec({"type": "agent_end", "messages": [], "willRetry": True}))
+        self.assertIs(stream.will_retry, True)
+        stream.feed(rec({"type": "agent_start"}))
+        self.assertIsNone(stream.will_retry)
+        for hint in (False, "yes", None):
+            with self.subTest(hint=hint):
+                other = json_stream()
+                other.feed(rec({"type": "agent_end", "messages": [], "willRetry": hint}))
+                self.assertIs(other.will_retry, False)
+
     def test_a_retry_starts_over_and_the_last_attempt_decides(self):
         stream = json_stream()
         drafts = drafts_of(stream, {"type": "agent_start"}, assistant_end(stop="error", error="overloaded"),
@@ -418,18 +575,42 @@ class RpcModeTest(unittest.TestCase):
         record.update(fields)
         return rec(record)
 
-    def test_the_lines_this_stream_writes(self):
+    def test_the_records_this_stream_writes_carry_no_line_end(self):
         token, line = self.stream.prompt("Hi", delivery_id="dlv-1", turn_id="turn-1", how="new_turn")
-        self.assertEqual((token, line), ("e8-1", '{"id":"e8-1","type":"prompt","message":"Hi"}\n'))
+        self.assertEqual((token, line), ("e8-1", '{"id":"e8-1","type":"prompt","message":"Hi"}'))
         token, line = self.stream.prompt("More " + chr(0x2028), delivery_id="dlv-2", turn_id="turn-1", how="mid_turn")
         self.assertEqual(json.loads(line), {"id": "e8-2", "type": "prompt", "message": "More " + chr(0x2028),
                                             "streamingBehavior": "steer"})
-        self.assertTrue(line.isascii() and line.count("\n") == 1)   # one record; U+2028 written as an escape
-        self.assertEqual(self.stream.command("abort"), ("e8-3", '{"id":"e8-3","type":"abort"}\n'))
-        self.assertEqual(self.stream.command("get_state"), ("e8-4", '{"id":"e8-4","type":"get_state"}\n'))
+        self.assertTrue(line.isascii() and "\n" not in line and "\r" not in line)   # U+2028 written as an escape
+        self.assertEqual(self.stream.command("abort"), ("e8-3", '{"id":"e8-3","type":"abort"}'))
+        self.assertEqual(self.stream.command("get_state"), ("e8-4", '{"id":"e8-4","type":"get_state"}'))
         self.assertEqual(self.stream.cancel_dialog("ui-1"),
-                         '{"type":"extension_ui_response","id":"ui-1","cancelled":true}\n')
+                         '{"type":"extension_ui_response","id":"ui-1","cancelled":true}')
         self.assertEqual(self.stream.pending_deliveries(), ["dlv-1", "dlv-2"])
+
+    def test_each_record_is_one_line_through_the_launchers_own_send(self):
+        # The production EngineProcess.send (daemon/launcher.py) writes the text and one LF. Its send is run
+        # here on an anonymous pipe, its constructor bypassed: no daemon, unit or process is started.
+        import os
+        import threading
+
+        from recursion_core.daemon.launcher import UnitEngineProcess
+        records = [self.stream.prompt("Hi " + chr(0x2028), delivery_id="dlv-1", turn_id="turn-1", how="new_turn")[1],
+                   self.stream.command("abort")[1], self.stream.command("get_state")[1],
+                   self.stream.cancel_dialog("ui-1")]
+        for record in records:
+            with self.subTest(record=record[:40]):
+                read_fd, write_fd = os.pipe()
+                try:
+                    process = UnitEngineProcess.__new__(UnitEngineProcess)
+                    process._stdin, process._lock = write_fd, threading.Lock()
+                    process.send(record)
+                    wire = os.read(read_fd, 65536)
+                finally:
+                    os.close(read_fd)
+                    os.close(write_fd)
+                self.assertEqual(wire, record.encode("utf-8") + b"\n")
+                self.assertEqual(pi.records_of(wire), [record])          # one record, not an empty second
 
     def test_the_writers_refuse_malformed_arguments(self):
         for kwargs in ({"delivery_id": "x", "turn_id": "turn-1", "how": "new_turn"},
@@ -472,12 +653,26 @@ class RpcModeTest(unittest.TestCase):
         t3, _ = self.stream.prompt("c", delivery_id="dlv-3", turn_id="turn-3", how="new_turn")
         self.assertEqual(self.stream.feed(self.response(t1, success=False, error="Agent is already processing")), [])
         self.assertEqual(self.stream.feed(self.response(t2, data={"disposition": "handled"})), [])
-        self.assertEqual(self.stream.feed(self.response(t3)), [])   # no disposition at all
+        self.assertEqual(self.stream.feed(self.response(t3, data={"disposition": "deferred"})), [])   # a later word
         self.assertEqual(self.stream.signals, [
             {"signal": "refused", "delivery_id": "dlv-1", "error": "Agent is already processing"},
             {"signal": "not_started", "delivery_id": "dlv-2", "disposition": "handled"},
-            {"signal": "not_started", "delivery_id": "dlv-3", "disposition": "None"}])
+            {"signal": "not_started", "delivery_id": "dlv-3", "disposition": "deferred"}])
         self.assertEqual(self.stream.pending_deliveries(), [])
+
+    def test_a_successful_prompt_answer_without_a_word_for_its_disposition_is_a_protocol_error(self):
+        # Pi always answers a prompt's success with data {disposition} (rpc-mode.ts). Anything else is
+        # refused before the delivery is taken off the pending list, so its outcome stays unknown.
+        for fields in ({"data": {"disposition": []}}, {"data": {"disposition": {}}}, {"data": {"disposition": 7}},
+                       {"data": {}}, {"data": "started"}, {}):
+            with self.subTest(fields=fields):
+                stream = pi.PiStream("rpc", connection_id="api_key:openai-key-1")
+                token, _ = stream.prompt("a", delivery_id="dlv-1", turn_id="turn-1", how="new_turn")
+                with self.assertRaises(pi.PiProtocolError) as caught:
+                    stream.feed(self.response(token, **fields))
+                self.assertEqual(caught.exception.code, "response")
+                self.assertEqual(stream.pending_deliveries(), ["dlv-1"])
+                self.assertEqual(stream.signals, [])
 
     def test_only_a_response_to_a_token_this_stream_minted_counts_and_only_once(self):
         other = pi.PiStream("rpc", connection_id="api_key:openai-key-1")
@@ -504,6 +699,18 @@ class RpcModeTest(unittest.TestCase):
         with self.assertRaises(pi.PiProtocolError) as caught:
             self.stream.feed(self.response(token, command="get_state", data={"sessionId": "another"}))
         self.assertEqual(caught.exception.code, "session_changed")
+        self.assertEqual(self.stream.engine_session_id, f.SESSION_ID)
+
+    def test_an_empty_or_absent_session_file_keeps_the_last_good_path(self):
+        token, _ = self.stream.command("get_state")
+        self.stream.feed(self.response(token, command="get_state",
+                                       data={"sessionId": f.SESSION_ID, "sessionFile": f.SESSION_FILE}))
+        for data in ({"sessionId": f.SESSION_ID, "sessionFile": ""}, {"sessionId": f.SESSION_ID, "sessionFile": 7},
+                     {"sessionId": f.SESSION_ID}):
+            with self.subTest(data=data):
+                token, _ = self.stream.command("get_state")
+                self.stream.feed(self.response(token, command="get_state", data=data))
+                self.assertEqual(self.stream.session_file, f.SESSION_FILE)
 
     def test_a_failed_get_state_reads_nothing(self):
         token, _ = self.stream.command("get_state")
@@ -549,9 +756,17 @@ class RpcModeTest(unittest.TestCase):
 class ConstructionTest(unittest.TestCase):
     def test_a_stream_needs_a_mode_and_a_connection_id(self):
         for mode, conn in (("text", CONN), ("json", "pi-chatgpt"), ("json", "subscription:"), ("json", "oauth:x"),
-                           ("json", "subscription:a\nb"), ("rpc", None)):
+                           ("json", "subscription:a\nb"), ("rpc", "api_key:synthetic\rreview"), ("rpc", None)):
             with self.subTest(mode=mode, conn=conn), self.assertRaises(ValueError):
                 pi.PiStream(mode, connection_id=conn)
+
+    def test_the_list_of_protocol_error_codes_is_the_list_raised(self):
+        import re
+        from pathlib import Path
+        source = Path(pi.__file__).read_text(encoding="utf-8")
+        raised = set(re.findall(r'PiProtocolError\("([a-z_0-9]+)"', source))
+        self.assertEqual(raised, set(pi.PROTOCOL_ERRORS))
+        self.assertEqual(len(pi.PROTOCOL_ERRORS), len(set(pi.PROTOCOL_ERRORS)))
 
     def test_the_names_a_registration_will_state(self):
         self.assertEqual((pi.ENGINE, pi.DEFAULT_EXECUTABLE), ("pi", "pi"))

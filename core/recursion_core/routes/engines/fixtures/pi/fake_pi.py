@@ -8,16 +8,26 @@ docs/rpc.md, docs/rpc-commands.md, docs/message-types.md). No Pi binary was run 
 ``read_line(timeout_s)`` (a line, ``None`` at EOF, ``ReadTimeout`` when nothing more will come until
 something is sent) and ``fence(reason)``. It keeps no thread and no clock.
 
+* ``send(text)`` does what the production ``UnitEngineProcess.send`` does: it writes ``text`` and one
+  LF. The fake then reads its stdin as Pi's ``attachJsonlLineReader`` does (rpc/jsonl.ts): records on
+  LF, a CR before it stripped, an EMPTY record passed on, so a text that already ended with an LF
+  reaches the fake as two records and the second gets Pi's parse error.
 * ``FakePi("json", lines=[...])`` replays a one-shot run's stdout and then ends. It reads no stdin, as
   ``pi -p`` given its prompt in argv does not: a send raises ``BrokenPipeError``.
 * ``FakePi("rpc")`` answers commands the way Pi's RPC mode does: ``prompt`` (``started`` when idle;
-  ``queued`` with ``streamingBehavior: "steer"`` while a run is going, which delivers the message
-  before the run's next model call; refused without it), ``abort`` (the run ends ``aborted``, and the
-  response comes after ``agent_settled``, as Pi's abort waits for idle), ``get_state``, an
-  ``extension_ui_response`` (no response), a line that is not JSON (``command: "parse"``, no id), and
-  anything else (``Unknown command``). Each reply is the next of ``replies``. ``session_id`` is what a
-  worker started with ``--session <id>`` reports, so a second fake given the first one's id stands for
-  a resumed session.
+  ``queued`` with ``streamingBehavior: "steer"`` while a run is going; refused without it), ``abort``
+  (the run ends ``aborted``, and the response comes after ``agent_settled``, as Pi's abort waits for
+  idle), ``get_state``, an ``extension_ui_response`` (no response), a record that is not JSON
+  (``command: "parse"``, no id), and anything else (``Unknown command``). Each reply is the next of
+  ``replies``. ``session_id`` is what a worker started with ``--session <id>`` reports, so a second
+  fake given the first one's id stands for a resumed session.
+* A queued steer is held apart from the output the fake has scheduled, as Pi holds it
+  (agent-session.ts ``_queueSteer``, ``pendingMessageCount``; agent.ts ``steer``, ``abort``;
+  agent-loop.ts). It is taken one at a time where Pi polls its steering queue: when a turn ends and the
+  run would end (a turn of its own before ``agent_end``), and when a new run starts (its user message
+  right after the prompt's, in the same turn). An abort does not empty the queue: the aborted run ends
+  without polling it, and the next prompt's run delivers it. ``pendingMessageCount`` counts the steers
+  whose user message has not started.
 """
 
 from __future__ import annotations
@@ -102,6 +112,8 @@ class FakePi:
         self._out: deque[str] = deque(lines)    # what is written to stdout next
         self._run: deque[str] = deque()         # the rest of the run in progress, after _out
         self._running = False
+        self._aborted = False                   # the run in progress was aborted: it polls no steer
+        self._steers: deque[str] = deque()      # steers Pi took whose user message has not started
         self._replies = iter(replies) if replies is not None else (f"reply {n}" for n in range(1, 10**6))
         self._at = T0
         self.messages = 0
@@ -113,9 +125,8 @@ class FakePi:
         if self.stdin_closed or self.fenced is not None:
             raise BrokenPipeError("stdin is closed")
         self.sent.append(text)
-        for raw in text.split("\n"):
-            if raw:
-                self._command(raw)
+        for raw in (text + "\n").split("\n")[:-1]:     # the LF the production send adds
+            self._command(raw[:-1] if raw.endswith("\r") else raw)
 
     def close_stdin(self) -> None:
         # Pi shuts down at the end of its stdin; the run in progress is not finished.
@@ -128,8 +139,14 @@ class FakePi:
         if self._out:
             return self._out.popleft()
         if self._run:
+            if self._steers and not self._aborted and json.loads(self._run[0])["type"] == "agent_end":
+                self._deliver_steer()                 # the turn ended and the run would end: Pi polls
             out = self._run.popleft()
-            if json.loads(out)["type"] == "agent_settled":
+            record = json.loads(out)
+            message = record.get("message") if record["type"] == "message_start" else None
+            if message and message.get("role") == "user" and message.get("content") in self._steers:
+                self._steers.remove(message["content"])   # Pi drops it from the queue as it starts
+            if record["type"] == "agent_settled":
                 self._running = False
             return out
         if self.mode == "json" or self.stdin_closed:
@@ -156,8 +173,9 @@ class FakePi:
         try:
             command = json.loads(raw)
         except ValueError:
+            reason = "Unexpected end of JSON input" if not raw.strip() else "not valid JSON"
             self._out.append(line({"type": "response", "command": "parse", "success": False,
-                                   "error": "Failed to parse command"}))
+                                   "error": f"Failed to parse command: {reason}"}))
             return
         self.commands.append(command)
         kind = command.get("type")
@@ -172,7 +190,8 @@ class FakePi:
                 "thinkingLevel": "medium", "isStreaming": self._running, "isCompacting": False,
                 "steeringMode": "one-at-a-time", "followUpMode": "one-at-a-time",
                 "sessionFile": self.session_file, "sessionId": self.session_id,
-                "autoCompactionEnabled": True, "messageCount": self.messages, "pendingMessageCount": 0})
+                "autoCompactionEnabled": True, "messageCount": self.messages,
+                "pendingMessageCount": len(self._steers)})
         elif kind == "extension_ui_response":
             pass
         else:
@@ -186,25 +205,32 @@ class FakePi:
                                                     "('steer' or 'followUp') to queue the message.")
                 return
             self._respond(command, True, data={"disposition": "queued"})
-            self._steer(text)
+            self._steers.append(text)          # held until Pi's loop polls its steering queue
             return
         self._respond(command, True, data={"disposition": "started"})
-        self._running = True
+        self._running, self._aborted = True, False
         self._at += 10_000
         self.messages += 2
-        self._run.extend(line(e) for e in run_events(text, next(self._replies), self._at))
+        events = run_events(text, next(self._replies), self._at)
+        if self._steers:
+            # A new run polls the steering queue first (agent-loop.ts runLoop): one queued steer's user
+            # message follows the prompt's in the run's first turn, and the reply answers both.
+            steer = user(self._steers[0], self._at + 1)
+            events[4:4] = [{"type": "message_start", "message": steer}, {"type": "message_end", "message": steer}]
+            self.messages += 1
+        self._run.extend(line(e) for e in events)
 
-    def _steer(self, text: str) -> None:
-        """Deliver ``text`` before the run's next model call: a turn of its own before the run ends."""
-        records = [json.loads(r) for r in self._run]
-        end = next(i for i, r in enumerate(records) if r["type"] in ("agent_end", "agent_settled"))
+    def _deliver_steer(self) -> None:
+        """The run's turn ended and a steer is queued: Pi takes it into a turn of its own before the run ends."""
         self._at += 1_000
         self.messages += 2
-        turn = reply_events(text, next(self._replies), self._at)
-        self._run = deque(line(r) for r in records[:end] + turn + records[end:])
+        turn = reply_events(self._steers[0], next(self._replies), self._at)
+        self._run.extendleft(line(r) for r in reversed(turn))
 
     def _abort(self) -> None:
-        """End the run now: the reply being streamed stops ``aborted``, then the run settles aborted."""
+        """End the run now: the reply being streamed stops ``aborted``, then the run settles aborted. The
+        queued steers stay queued (Pi's abort does not clear them)."""
+        self._aborted = True
         records = [json.loads(r) for r in self._run]
         streaming = next((r["message"] for r in records
                           if r["type"] == "message_end" and r["message"].get("role") == "assistant"), None)

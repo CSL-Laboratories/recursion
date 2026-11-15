@@ -28,6 +28,7 @@ FIXTURES = {
     "synthetic-json-error-quota": ("json", "api_key:openai-key-1", "Summarise the repository."),
     "synthetic-rpc-two-turns": ("rpc", "api_key:openai-key-1", None),
     "synthetic-rpc-steer-abort": ("rpc", "subscription:pi-chatgpt", None),
+    "synthetic-rpc-abort-before-steer": ("rpc", "api_key:openai-key-1", None),
 }
 
 # event.v1's payload keys for each type a driver may draft (every key required, no other allowed).
@@ -120,6 +121,23 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(results["synthetic-json-error-quota"][0]["payload"]["code"], "short_fault")
         self.assertEqual(results["synthetic-rpc-two-turns"], [])
         self.assertEqual(results["synthetic-rpc-steer-abort"], [])
+        self.assertEqual(results["synthetic-rpc-abort-before-steer"], [])
+
+    def test_a_steer_queued_before_an_abort_is_delivered_by_the_next_run(self):
+        # Pi's abort keeps its steering queue (agent.ts abort; agent-loop.ts returns on an aborted reply
+        # before it polls); the next prompt's run polls it first. The fixture shows the steer accepted,
+        # counted while it waits, kept through the abort, and replayed after the next prompt's message.
+        name = "synthetic-rpc-abort-before-steer"
+        steps = [json.loads(line) for line in pi.records_of(data_file(name).read_bytes())]
+        counts = [s["record"]["data"]["pendingMessageCount"] for s in steps
+                  if s.get("from") == "pi" and s["record"].get("command") == "get_state"]
+        self.assertEqual(counts, [1, 1, 0])
+        users = [s["record"]["message"]["content"] for s in steps if s.get("from") == "pi"
+                 and s["record"]["type"] == "message_start" and s["record"]["message"].get("role") == "user"]
+        self.assertEqual(users, ["Refactor the parser.", "Go on.", "Keep the old names."])
+        _stream, drafts = replay(name)
+        accepted = [(d["payload"]["delivery_id"], d["payload"]["how"]) for d in drafts if d["type"] == "input.accepted"]
+        self.assertEqual(accepted, [("dlv-c1", "new_turn"), ("dlv-c2", "mid_turn"), ("dlv-c3", "new_turn")])
 
 
 class SchemaTest(unittest.TestCase):

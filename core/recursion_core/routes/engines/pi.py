@@ -22,8 +22,12 @@ WHAT PI WRITES
 * ``pi --mode rpc`` (long-lived): commands on stdin, each with an optional ``id``; on stdout a
   ``{"type":"response","id","command","success","data"|"error"}`` for each command and the same session
   events as JSON mode. No header: the session id is read with ``get_state``.
-* Framing (json.md, rpc.md): one JSON object per LF; an optional CR before the LF is stripped; U+2028
-  and U+2029 are characters inside strings, never record boundaries (so never ``str.splitlines``).
+* Framing (json.md, rpc.md, rpc/jsonl.ts): one JSON object per LF; an optional CR before the LF is
+  stripped; U+2028 and U+2029 are characters inside strings, never record boundaries (so never
+  ``str.splitlines``). Pi's reader passes an EMPTY record on too, and answers it with a parse error.
+  So the writers below return one record WITHOUT its LF: ``EngineProcess.send`` adds the LF
+  (``daemon/launcher.py`` ``UnitEngineProcess.send``), and a record that ended with its own LF would
+  reach Pi as two records, the second empty.
 
 WHAT THE PARSER DRAFTS (driver.v2 ``$defs/event_draft``; every payload has exactly event.v1's keys)
 
@@ -31,6 +35,12 @@ WHAT THE PARSER DRAFTS (driver.v2 ``$defs/event_draft``; every payload has exact
   assistant message a usage object; when every count in it is 0 the provider reported nothing, and
   every measurement is ``unknown`` (never 0). ``cost_usd`` is Pi's own figure from its price table, so
   its provenance is ``modelled``. ``reasoning`` is optional in Pi and is already inside ``output``.
+  Usage that is NOT one model call is measured and held, not drafted: a tool result's ``usage`` (the
+  nested model work the tool did, message-types.md "ToolResultMessage") and a compaction's
+  ``result.usage`` (the summary's model work, which compaction.ts adds up over one or two calls) are
+  each kept once as a ``usage_held`` signal with event.v1's measurements, because event.v1's spans
+  (``call``, ``turn``, ``session_total``) have no name for a sum of some calls inside a turn. The
+  driver can draft them unchanged once SPINE names that span (questions.md Q10).
 * ``tool.call``: one per ``toolCall`` block of a completed assistant message (the engine asking), and
   one for a ``tool_execution_start`` whose id no block named. ``input_digest`` is SHA-256 over the
   input as RFC 8785 writes it (``rfc8785/v1``); an input outside that form's strict profile is a
@@ -50,7 +60,24 @@ parser is not given; lane EVENTS' tailer writes each line the parser drafts noth
 no typed limit signal is known for Pi (no oracle). Free
 error text that sounds like a quota makes the one-shot ``result`` a ``short_fault`` (grill Q23), never
 a ``plan_limit``. Facts that are not events (the session id, a refused prompt, a dialog Pi waits on, a
-settled run) are kept as ``signals`` for the driver.
+settled run, usage that is not one call) are kept as ``signals`` for the driver.
+
+INTERFACE (what the one-shot driver and the RPC worker call; no other lane imports this module yet)
+
+* ``records_of(data: bytes) -> list[str]`` and ``read_record(line: str | bytes) -> dict``: framing and
+  the strict reader. ``PiProtocolError(code, detail)`` is a ``ValueError``; ``code`` is one of
+  ``PROTOCOL_ERRORS``. It is a parser error, not a control-method refusal: the driver that catches it
+  fences the run and turns it into its typed outcome. A malformed argument from the caller is a plain
+  ``ValueError``.
+* ``PiStream(mode: "json" | "rpc", *, connection_id: str)``, one per worker incarnation:
+  ``feed(line) -> list[dict]`` (the drafts of one record); RPC writers ``prompt(text, *, delivery_id,
+  turn_id, how) -> (token, record)``, ``command("abort" | "get_state") -> (token, record)`` and
+  ``cancel_dialog(request_id) -> record``, each record one JSON object with no LF; JSON mode
+  ``argv_prompt(text, *, delivery_id, turn_id) -> text`` (once); ``pending_deliveries() -> list[str]``;
+  ``result_code() -> (code | None, detail)``. State it keeps: ``engine_session_id``, ``session_file``,
+  ``settled``, ``aborted``, ``will_retry`` (``None`` until a run ends, then whether Pi said it retries;
+  ``None`` again at the next ``agent_start``), ``final``, ``signals``, ``ignored``, ``other_types``.
+* ``normalised``, ``number_text``, ``canonical_text`` and ``input_digest``: ``rfc8785/v1``.
 """
 
 from __future__ import annotations
@@ -75,6 +102,13 @@ INPUT_CARRY_MAX = 262144     # UTF-8 bytes of a tool input's text carried in a t
 TOOL_TEXT_MAX = 65536        # characters of a tool result's text carried in a tool.result; more is cut
 DETAIL_MAX = 500             # characters of engine error text carried in a result's detail
 DIALOGS = ("select", "confirm", "input", "editor")   # extension UI requests Pi waits on (rpc-types.ts)
+PROTOCOL_ERRORS = (   # every PiProtocolError code this module raises
+    "assistant_content", "content_block", "duplicate_key", "extension_ui_request", "integer_out_of_range",
+    "lf_inside_record", "lone_surrogate", "message", "no_type", "not_a_json_value", "not_a_number",
+    "not_an_object", "not_json", "not_utf8", "number_out_of_range", "response", "rpc_record_in_json_mode",
+    "session_changed", "session_header", "session_id", "text_block", "tool_call_id", "tool_input_not_an_object",
+    "tool_input_too_deep", "tool_name",
+)
 
 _CONNECTION = re.compile(r"(subscription|api_key|passthrough):[^\r\n]{1,240}")
 _TURN = re.compile(r"turn-[A-Za-z0-9_-]{1,59}")
@@ -123,12 +157,22 @@ def _no_constant(token):
     raise PiProtocolError("not_a_number", token)
 
 
+def _finite(text):
+    # A number with a fraction or an exponent. ``1e400`` is valid JSON that no binary64 holds: Python
+    # would read it as an infinity, which no record may carry.
+    value = float(text)
+    if not math.isfinite(value):
+        raise PiProtocolError("number_out_of_range", text[:64])
+    return value
+
+
 def read_record(line) -> dict:
     """One record: a JSON object with a string ``type``, read strictly, or ``PiProtocolError``.
 
     ``line`` is text or bytes, with or without its LF. Refused: invalid UTF-8, an LF inside, text that
-    is not JSON, ``NaN`` or an infinity, a key named twice at any depth, anything but an object, and an
-    object without a non-empty string ``type``. Pi's JSON.stringify writes none of these.
+    is not JSON, ``NaN`` or an infinity (named, or a number too large for binary64), a key named twice
+    at any depth, anything but an object, and an object without a non-empty string ``type``. Pi's
+    JSON.stringify writes none of these. So every float in a record that was read is finite.
     """
     if isinstance(line, bytes):
         try:
@@ -142,7 +186,8 @@ def read_record(line) -> dict:
     if "\n" in line:
         raise PiProtocolError("lf_inside_record")
     try:
-        record = json.loads(line, object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+        record = json.loads(line, object_pairs_hook=_no_duplicates, parse_constant=_no_constant,
+                            parse_float=_finite)
     except PiProtocolError:
         raise
     except (ValueError, RecursionError):
@@ -281,6 +326,14 @@ def _count(value) -> bool:
     return type(value) is int and value >= 0
 
 
+def _dollars(value) -> bool:
+    # A cost Pi could have written: a JSON number, not a boolean, not negative, held exactly by binary64
+    # when whole. Every float a read record holds is finite (read_record), so no infinity reaches here.
+    if type(value) is int:
+        return 0 <= value <= MAX_INT
+    return type(value) is float and value >= 0
+
+
 def _text_of_user(content) -> str | None:
     if isinstance(content, str):
         return content
@@ -294,8 +347,9 @@ def _text_of_user(content) -> str | None:
 class PiStream:
     """The reader of one Pi worker's stdout, and the writer of the lines this stream correlates.
 
-    One stream per worker incarnation: the tokens it mints (``e8-1``, ``e8-2``, ...) are known only to it,
-    so a response that names a token of an earlier worker matches nothing here.
+    One stream per worker incarnation. The tokens it mints (``e8-1``, ``e8-2``, ...) are unique only
+    within it: every stream starts at ``e8-1``. So the caller must feed a stream only the stdout of the
+    worker it wrote to; a response read from an earlier worker's output would match the same token.
 
     ``feed(line)`` reads one record and returns its drafts. ``signals`` collects the facts that are not
     events. Nothing here holds a lock or writes to a process; the driver writes the lines it is given.
@@ -322,6 +376,7 @@ class PiStream:
         self._argv_registered = False
         self._calls: set[str] = set()
         self._results: set[str] = set()
+        self._held: set[str] = set()      # tool results whose usage was held already
         self._result_drafted = False
 
     # -- the lines the driver writes, and what is correlated with them --------------------------------
@@ -330,10 +385,12 @@ class PiStream:
         return f"e8-{self._minted}"
 
     def _line(self, record: dict) -> str:
-        return json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+        # One record, no LF: EngineProcess.send adds it. ASCII, so U+2028 and U+2029 travel as escapes.
+        return json.dumps(record, ensure_ascii=True, separators=(",", ":"))
 
     def prompt(self, text: str, *, delivery_id: str, turn_id: str, how: str) -> tuple[str, str]:
-        """RPC: the ``prompt`` line for one user message, and its token. ``mid_turn`` steers the run.
+        """RPC: ``(token, record)``, the token and the ``prompt`` record for one user message. ``mid_turn``
+        steers the run.
 
         The delivery is pending from here: a write that then fails leaves it pending, its outcome
         unknown, and a later typed acceptance of it still counts.
@@ -355,7 +412,7 @@ class PiStream:
         return token, self._line(record)
 
     def command(self, kind: str) -> tuple[str, str]:
-        """RPC: an ``abort`` or ``get_state`` line and its token."""
+        """RPC: ``(token, record)`` for an ``abort`` or a ``get_state``."""
         self._need("rpc")
         if kind not in ("abort", "get_state"):
             raise ValueError(kind)
@@ -364,7 +421,7 @@ class PiStream:
         return token, self._line({"id": token, "type": kind})
 
     def cancel_dialog(self, request_id: str) -> str:
-        """RPC: the answer that cancels an extension dialog Pi waits on. It gets no response."""
+        """RPC: the record that cancels an extension dialog Pi waits on. It gets no response."""
         self._need("rpc")
         if not _bounded_id(request_id, 256):
             raise ValueError("request_id")
@@ -416,11 +473,14 @@ class PiStream:
         self.ignored[reason] = self.ignored.get(reason, 0) + 1
         self.signals.append({"signal": "ignored", "reason": reason, **fields})
 
-    def _set_session(self, value) -> None:
+    def _check_session(self, value) -> None:
         if not _bounded_id(value, 256):
             raise PiProtocolError("session_id")
         if self.engine_session_id not in (None, value):
             raise PiProtocolError("session_changed")
+
+    def _set_session(self, value) -> None:
+        self._check_session(value)
         if self.engine_session_id is None:
             self.engine_session_id = value
             self.signals.append({"signal": "session", "engine_session_id": value})
@@ -435,7 +495,38 @@ class PiStream:
             return self._assistant(message)
         if role == "user":
             return self._user(message)
-        return []   # tool results come from tool_execution_end; the other roles carry no event
+        if role == "toolResult":
+            self._tool_usage(message)
+        return []   # a tool's result is drafted from tool_execution_end; the other roles carry no event
+
+    def _tool_usage(self, message: dict) -> None:
+        # Only here: tool_execution_end, turn_end's toolResults and agent_end's messages repeat the result,
+        # and a usage taken from more than one of them would be counted twice.
+        call_id = message.get("toolCallId")
+        if not _bounded_id(call_id, 128) or call_id in self._held:
+            return
+        held = self._held_usage(message.get("usage"))
+        if held is not None:
+            self._held.add(call_id)
+            self.signals.append({"signal": "usage_held", "source": "tool_result", "call_id": call_id,
+                                 "usage": held})
+
+    def _compaction(self, record: dict) -> list[dict]:
+        result = record.get("result")
+        held = self._held_usage(result.get("usage")) if isinstance(result, dict) else None
+        if held is not None:
+            self.signals.append({"signal": "usage_held", "source": "compaction", "usage": held})
+        return []
+
+    def _held_usage(self, usage) -> dict | None:
+        """event.v1's usage payload but its ``span``, for usage that is not one model call; ``None`` when
+        nothing was reported. Pi names no model for it, so the model is unknown."""
+        if not isinstance(usage, dict):
+            return None
+        measured = self._measurements(usage)
+        if measured is None:
+            return None
+        return {"connection_id": self.connection_id, "model": None, "bucket": None, **measured}
 
     def _assistant(self, message: dict) -> list[dict]:
         content = message.get("content")
@@ -460,21 +551,37 @@ class PiStream:
         }
         return [self._usage(message)] + calls
 
-    def _usage(self, message: dict) -> dict:
-        usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+    @staticmethod
+    def _measurements(usage: dict) -> dict | None:
+        """event.v1's six measurements of a Pi usage object, or ``None`` when every count is 0 or absent:
+        the provider reported nothing (compaction.ts skips such usage too)."""
         counts = [usage.get(name) for name in ("input", "output", "cacheRead", "cacheWrite", "totalTokens")]
-        reported = any(_count(v) and v > 0 for v in counts)
+        if not any(_count(v) and v > 0 for v in counts):
+            return None
 
         def measured(value):
-            if reported and _count(value):
+            if _count(value):
                 return {"value": value, "quality": "known", "provenance": "observed"}
             return dict(_UNKNOWN_COUNT)
 
         cost = usage.get("cost").get("total") if isinstance(usage.get("cost"), dict) else None
-        if reported and type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
-            cost_usd = {"value": cost, "quality": "known", "provenance": "modelled"}
-        else:
-            cost_usd = dict(_UNKNOWN_COUNT)
+        return {
+            "input_tokens": measured(usage.get("input")),
+            "output_tokens": measured(usage.get("output")),
+            "reasoning_tokens": measured(usage.get("reasoning")),
+            "cache_read_tokens": measured(usage.get("cacheRead")),
+            "cache_write_tokens": measured(usage.get("cacheWrite")),
+            "cost_usd": ({"value": cost, "quality": "known", "provenance": "modelled"} if _dollars(cost)
+                         else dict(_UNKNOWN_COUNT)),
+        }
+
+    def _usage(self, message: dict) -> dict:
+        usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+        measured = self._measurements(usage)
+        if measured is None:
+            names = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
+                     "cache_write_tokens", "cost_usd")
+            measured = {name: dict(_UNKNOWN_COUNT) for name in names}
         provider, model = message.get("provider"), message.get("model")
         if isinstance(model, str) and model and isinstance(provider, str) and provider:
             model = f"{provider}/{model}"
@@ -485,12 +592,7 @@ class PiStream:
             "model": model,
             "bucket": None,
             "span": "call",
-            "input_tokens": measured(usage.get("input")),
-            "output_tokens": measured(usage.get("output")),
-            "reasoning_tokens": measured(usage.get("reasoning")),
-            "cache_read_tokens": measured(usage.get("cacheRead")),
-            "cache_write_tokens": measured(usage.get("cacheWrite")),
-            "cost_usd": cost_usd,
+            **measured,
         }}
 
     def _tool_call(self, call_id, name, arguments) -> list[dict]:
@@ -614,14 +716,20 @@ class PiStream:
                 return []
             self._ignore("response_unmatched", command=command[:64])
             return []
-        del self._pending[token]
+        # Everything that can refuse the record is checked before the pending entry is taken, so that a
+        # malformed answer leaves the delivery pending (its outcome unknown) rather than lost.
         data = record.get("data") if isinstance(record.get("data"), dict) else {}
+        if success and command == "prompt" and not isinstance(data.get("disposition"), str):
+            raise PiProtocolError("response", "a prompt's success names no disposition")
+        if success and command == "get_state":
+            self._check_session(data.get("sessionId"))
+        del self._pending[token]
         if command == "prompt":
             return self._prompt_answer(pending, success, data, record.get("error"))
         if command == "get_state" and success:
             self._set_session(data.get("sessionId"))
             if isinstance(data.get("sessionFile"), str) and data["sessionFile"]:
-                self.session_file = data["sessionFile"]
+                self.session_file = data["sessionFile"]   # an empty or absent one keeps the last good path
         self.signals.append({"signal": "response", "command": command, "token": token, "success": success})
         return []
 
@@ -630,11 +738,11 @@ class PiStream:
             self.signals.append({"signal": "refused", "delivery_id": pending.delivery_id,
                                  "error": str(error)[:DETAIL_MAX]})
             return []
-        how = {"started": "new_turn", "queued": "mid_turn"}.get(data.get("disposition"))
+        how = {"started": "new_turn", "queued": "mid_turn"}.get(data["disposition"])
         if how is None:
             # "handled": an extension took the text and no run started. Not an acceptance into a turn.
             self.signals.append({"signal": "not_started", "delivery_id": pending.delivery_id,
-                                 "disposition": str(data.get("disposition"))[:64]})
+                                 "disposition": data["disposition"][:64]})
             return []
         return [{"type": "input.accepted", "payload": {
             "delivery_id": pending.delivery_id, "turn_id": pending.turn_id, "how": how}}]
@@ -654,6 +762,7 @@ class PiStream:
         "agent_start": _agent_start,
         "agent_end": _agent_end,
         "agent_settled": _agent_settled,
+        "compaction_end": _compaction,
         "response": _response,
         "extension_ui_request": _dialog,
     }

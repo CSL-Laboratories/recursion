@@ -50,7 +50,7 @@ class FakeJsonTest(unittest.TestCase):
         stream = pi.PiStream("json", connection_id="subscription:pi-chatgpt")
         stream.argv_prompt("Say hello in one word.", delivery_id="dlv-1", turn_id="turn-1")
         with self.assertRaises(BrokenPipeError):
-            process.send('{"type":"prompt","message":"x"}\n')
+            process.send('{"type":"prompt","message":"x"}')
         self.assertEqual(drain(process, stream), expected("synthetic-json-basic")["drafts"])
         self.assertIsNone(process.read_line(1.0))
 
@@ -142,12 +142,82 @@ class FakeRpcTest(unittest.TestCase):
         drain(resumed, stream)
         self.assertEqual(stream.engine_session_id, "019a5b2e-2222-7000-8000-00000000e802")
 
-    def test_lines_that_are_not_commands_get_pis_answers(self):
-        self.send("not json\n")
-        self.send('{"id":"x1","type":"bash","command":"ls"}\n')
+    def test_records_that_are_not_commands_get_pis_answers(self):
+        self.send("not json")
+        self.send('{"id":"x1","type":"bash","command":"ls"}')
         drain(self.process, self.stream)
-        self.assertEqual(self.stream.signals[0], {"signal": "parse_error", "error": "Failed to parse command"})
+        self.assertEqual(self.stream.signals[0], {"signal": "parse_error",
+                                                  "error": "Failed to parse command: not valid JSON"})
         self.assertEqual(self.stream.ignored, {"response_unmatched": 1})
+
+    def test_send_adds_the_line_end_so_a_record_that_has_one_reaches_pi_as_two(self):
+        # As the production send and Pi's reader do: the second, empty record gets a parse error.
+        _token, record = self.stream.command("get_state")
+        self.send(record + "\n")
+        drain(self.process, self.stream)
+        self.assertEqual([s["signal"] for s in self.stream.signals], ["session", "response", "parse_error"])
+        self.assertEqual(self.stream.signals[2]["error"], "Failed to parse command: Unexpected end of JSON input")
+        self.send("")
+        self.send('{"id":"x2","type":"get_state"}\r')            # Pi strips a CR before the LF
+        records = []
+        while True:
+            try:
+                records.append(json.loads(self.process.read_line(1.0)))
+            except ReadTimeout:
+                break
+        self.assertEqual([(r["command"], r["success"]) for r in records], [("parse", False), ("get_state", True)])
+
+    def test_a_queued_steer_is_counted_until_its_message_starts(self):
+        self.prompt("Long task.", "dlv-1", "turn-1")
+        read(self.process, self.stream, 7)            # the response, the run's start, the reply streaming
+        self.prompt("Also this.", "dlv-2", "turn-1", how="mid_turn")
+        self.assertEqual(self.pending_count(), 1)
+        records = self.read_all()
+        steer_at = next(i for i, r in enumerate(records) if r["type"] == "message_start"
+                        and r["message"].get("content") == "Also this.")
+        self.assertLess(steer_at, [r["type"] for r in records].index("agent_end"))
+        self.assertEqual(self.pending_count(), 0)
+
+    def test_an_abort_keeps_a_queued_steer_and_the_next_run_delivers_it(self):
+        self.prompt("Long task.", "dlv-1", "turn-1")
+        read(self.process, self.stream, 7)
+        self.prompt("Also this.", "dlv-2", "turn-1", how="mid_turn")
+        _token, record = self.stream.command("abort")
+        self.send(record)
+        aborted = self.read_all()
+        self.assertNotIn("Also this.", [r["message"].get("content") for r in aborted if "message" in r])
+        self.assertEqual(settles(self.stream)[-1]["aborted"], True)
+        self.assertEqual(self.pending_count(), 1)                     # not dropped by the abort
+        self.prompt("Next.", "dlv-3", "turn-2")
+        records = self.read_all()
+        users = [r["message"]["content"] for r in records
+                 if r["type"] == "message_start" and r["message"].get("role") == "user"]
+        self.assertEqual(users, ["Next.", "Also this."])               # after the prompt, in its first turn
+        self.assertEqual([r["type"] for r in records].count("turn_start"), 1)
+        self.assertEqual(settles(self.stream)[-1], {"signal": "settled", "aborted": False, "stop_reason": "stop",
+                                                     "text": "two"})
+        self.assertEqual(self.pending_count(), 0)
+
+    def pending_count(self):
+        """Pi's ``pendingMessageCount``, read with a ``get_state`` (what comes before its answer is fed too)."""
+        _token, record = self.stream.command("get_state")
+        self.send(record)
+        while True:
+            line = self.process.read_line(1.0)
+            self.stream.feed(line)
+            got = json.loads(line)
+            if got["type"] == "response" and got["command"] == "get_state":
+                return got["data"]["pendingMessageCount"]
+
+    def read_all(self):
+        records = []
+        while True:
+            try:
+                line = self.process.read_line(1.0)
+            except ReadTimeout:
+                return records
+            records.append(json.loads(line))
+            self.stream.feed(line)
 
     def test_a_dialog_answer_gets_no_response(self):
         self.send(self.stream.cancel_dialog("u1"))
@@ -162,13 +232,13 @@ class FakeRpcTest(unittest.TestCase):
         self.assertEqual(settles(self.stream), [])                   # the run was not finished
         self.assertEqual(self.stream.pending_deliveries(), [])        # its prompt had been accepted
         with self.assertRaises(BrokenPipeError):
-            self.process.send("{}\n")
+            self.process.send("{}")
         fenced = f.FakePi("rpc")
         fenced.send(pi.PiStream("rpc", connection_id=CONN).command("get_state")[1])
         fenced.fence("deadline")
         self.assertIsNone(fenced.read_line(1.0))
         with self.assertRaises(BrokenPipeError):
-            fenced.send("{}\n")
+            fenced.send("{}")
 
 
 if __name__ == "__main__":

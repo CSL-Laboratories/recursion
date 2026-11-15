@@ -1297,7 +1297,7 @@ class DeclarationTests(unittest.TestCase):
             with self.subTest(model):
                 with self.assertRaises(ValueError):
                     oc.build_argv(model)
-        for binary in ("", "a\x00b", 5):
+        for binary in ("", "a\x00b", 5, " ", "  ", "-x", "--model"):
             with self.subTest(binary):
                 with self.assertRaises(ValueError):
                     oc.build_argv(MODEL, binary=binary)

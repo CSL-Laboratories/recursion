@@ -18,6 +18,7 @@ from recursion_core.routes import contract as c
 from recursion_core.routes.driver import Declaration, DriverInputError, DriverRefused, DriverStateError
 from recursion_core.routes.engines import opencode as oc
 from recursion_core.routes.launch import ReadTimeout
+from recursion_core.subscription_routes import SubscriptionRouteRefused
 
 HERE = Path(__file__).resolve().parent
 ENV = {"PATH": "/usr/bin:/bin", "HOME": "/var/lib/recursion/homes/opencode", "OPENAI_API_KEY": "sk-made-up"}
@@ -150,7 +151,7 @@ class PartsTests(unittest.TestCase):
                     oc.serve_argv(port)
                 with self.assertRaises(ValueError):
                     oc.server_url(port)
-        for binary in ("", "a\nb", 5):
+        for binary in ("", "a\nb", 5, " ", "-x"):
             with self.subTest(binary=binary):
                 with self.assertRaises(ValueError):
                     oc.serve_argv(PORT, binary=binary)
@@ -236,8 +237,17 @@ class StartTests(Base):
         bad["route"]["connection"]["id"] = "a\nb"
         with self.assertRaises((ValueError, DriverInputError)):
             driver.start(bad, None, ENV)
-        with self.assertRaises((ValueError, DriverInputError)):
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
             driver.start(session(model="-x/y"), None, ENV)
+        self.assertEqual(caught.exception.cause, "model_malformed")
+        self.assertEqual(self.spy.spawns, [])
+
+    def test_a_connection_the_gate_takes_and_the_parser_refuses_starts_nothing(self):
+        driver = self.make()
+        bad = session()
+        bad["route"]["connection"]["id"] = "k" + chr(0xD800)   # one line, so the gate takes it
+        with self.assertRaises(ValueError):
+            driver.start(bad, None, ENV)
         self.assertEqual(self.spy.spawns, [])
 
     def test_the_constructor_refuses_what_it_cannot_use(self):
@@ -286,6 +296,27 @@ class TurnTests(Base):
         handle = driver.start(session(), None, ENV)
         driver.send(handle, message())
         self.assertEqual([argv[0] for argv, _ in self.spy.spawns], ["/opt/oc/bin/opencode"] * 2)
+
+    def test_only_a_step_start_accepts_the_message(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        for line in ("not json\n", '{"type":"text","timestamp":1,"sessionID":"ses_x","part":{"text":"hi"}}\n'):
+            self.assertNotIn("input.accepted", [d["type"] for d in driver.parse(handle, line)])
+        start = '{"type":"step_start","timestamp":1,"sessionID":"ses_x","part":{"type":"step-start"}}\n'
+        self.assertIn("input.accepted", [d["type"] for d in driver.parse(handle, start)])
+
+    def test_the_launched_model_is_held_to_the_guard_before_anything_starts(self):
+        for model, cause in (("Claude-Agent/sonnet", "claude_subscription_provider"),
+                             ("claude_max/x", "claude_subscription_provider"), ("gpt", "model_malformed")):
+            with self.subTest(model):
+                driver = self.make()
+                with self.assertRaises(SubscriptionRouteRefused) as caught:
+                    driver.start(session(model=model), None, ENV)
+                self.assertEqual(caught.exception.cause, cause)
+                with self.assertRaises(SubscriptionRouteRefused):
+                    driver.resume("ses_abc", session(model=model), None, ENV)
+                self.assertEqual(self.spy.spawns, [])
 
     def test_a_turn_accepts_its_message_once(self):
         driver = self.make()
@@ -396,9 +427,11 @@ class TurnTests(Base):
         driver = self.make()
         handle = driver.start(session(), None, ENV)
         driver.send(handle, message())
-        with self.assertRaises(ValueError):
-            driver.finish_turn(handle, "0")
-        self.assertEqual(handle.live_turn, "turn-1")
+        for bad in ("0", True, 1.0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(DriverInputError):
+                    driver.finish_turn(handle, bad)
+                self.assertEqual(handle.live_turn, "turn-1")
         driver.finish_turn(handle, 0)
         self.assertIsNone(handle.live_turn)
 

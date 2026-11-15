@@ -540,11 +540,12 @@ class ReviewThreeRegressionTests(unittest.TestCase):
         for member in ("limit", "retry_at"):  # the wait path's reads
             self.assertEqual(router.next_after_limit(wait, dw, FailsOn(member)), not_a_limit, member)
         self.assertEqual(router.next_after_limit(cfg, d, FailsOn("limit_notice")), not_a_limit)  # the switch path's
-        # The nested reads too: the vendor's signal, the notice, and an attempt in it.
+        # The nested reads too: the vendor's signal and the notice. An attempt in it that cannot be read is dropped
+        # like any other non-attempt (sixth read, F2), so the limit itself still leads where the user listed.
         self.assertEqual(router.next_after_limit(wait, dw, {"code": c.PLAN_LIMIT, "limit": Broken()}), not_a_limit)
         self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": Broken()}), not_a_limit)
-        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": {"attempts": [Broken()]}}),
-                         not_a_limit)
+        self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": {"attempts": [Broken()]}})["action"],
+                         "switch")
 
 
 class ReviewFourRegressionTests(unittest.TestCase):
@@ -673,6 +674,151 @@ class ReviewFiveRegressionTests(unittest.TestCase):
         for notice in ({"attempts": 5}, {"attempts": {"a": 1}}, {"attempts": [5, None]}, ["x"]):
             out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": notice})
             self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), notice)
+
+
+class _EvilEq:
+    """A value that raises when compared."""
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        raise RuntimeError("eq")
+
+
+class _EvilFormat:
+    """A value that raises when formatted."""
+
+    def __format__(self, spec):
+        raise RuntimeError("format")
+
+
+class _EvilEqStr(str):
+    """A str whose comparing raises (its hash is str's)."""
+    __hash__ = str.__hash__
+
+    def __eq__(self, other):
+        raise RuntimeError("eq")
+
+    def __ne__(self, other):
+        raise RuntimeError("ne")
+
+
+class _EvilFormatStr(str):
+    """A str whose formatting raises."""
+
+    def __format__(self, spec):
+        raise RuntimeError("format")
+
+
+class _AlwaysEqStr(str):
+    """A str equal to anything."""
+    __hash__ = str.__hash__
+
+    def __eq__(self, other):
+        return True
+
+
+class _EvilFloatInt(int):
+    """An int whose conversion to a float raises."""
+
+    def __float__(self):
+        raise RuntimeError("float")
+
+
+class ReviewSixRegressionTests(unittest.TestCase):
+    """The sixth read of #399 (7bbd59be): DeepSeek V4.1 Flash F1-F6."""
+
+    def setUp(self) -> None:
+        self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        self.d = router.decide(self.cfg, SENTRY, {})
+        self.word = route_limits.describe(CODEX)["connection"]
+
+    def test_values_that_cannot_be_compared_or_formatted_are_no_decision(self) -> None:  # ds F1
+        rule = router.decide(self.cfg, SENTRY, {"task_kind": "review"})
+        no_decision = {"action": "none", "reason": "no_decision"}
+        for decision in ({**self.d, "reason": _EvilEq()}, {**rule, "rule": _EvilEq()}, {**self.d, "reason": ["config"]},
+                         {**self.d, "rule": ["review-to-codex"]},
+                         {**self.d, "connection": {"kind": _EvilFormat(), "id": "claude-main"}},
+                         {**self.d, "connection": {"kind": "subscription", "id": _EvilFormat()}}):
+            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), no_decision, decision)
+        self.assertIsNone(router.route_decision({**self.d, "reason": _EvilEq()}))
+
+    def test_an_attempt_whose_parts_are_not_words_is_not_an_attempt(self) -> None:  # ds F1
+        for entry in ({"engine": _EvilEq(), "model": "y", "connection": "z"},
+                      {"engine": _EvilEq(), "model": CODEX["model"], "connection": self.word},
+                      {"engine": "codex", "model": CODEX["model"], "connection": 5}):
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [entry]}})
+            self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), entry)
+
+    def test_an_unreadable_attempts_entry_is_dropped_not_the_limit(self) -> None:  # ds F2
+        class GetRaises(dict):
+            def get(self, key, default=None):
+                raise RuntimeError("get")
+        unreadable = GetRaises(engine="codex", model=CODEX["model"], connection=self.word)
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable]}})
+        self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable, self.word]}})
+        self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
+
+    def test_a_wait_until_is_finite(self) -> None:  # ds F3
+        cfg = with_limits({"on_limit": "wait"})
+        d = router.decide(cfg, SENTRY, {})
+
+        def until(reset_at, retry_at):
+            signal = {"scope": "connection", "model": None, "reset_at": reset_at, "source": "test.typed"}
+            return router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit": signal, "retry_at": retry_at})["until"]
+        # NaN and the infinities; an int too large for a float (valid JSON) and an int whose conversion raises,
+        # which a finiteness check alone would raise on.
+        for odd in (float("nan"), float("inf"), float("-inf"), 10**400, -10**400, _EvilFloatInt(5000)):
+            self.assertEqual(until(odd, 7000.0), 7000.0, type(odd))
+            self.assertIsNone(until(odd, float("nan")), type(odd))
+            self.assertIsNone(until(None, odd), type(odd))
+        self.assertEqual(until(5000, None), 5000)
+
+    def test_route_decision_needs_the_connections_kind_and_id(self) -> None:  # ds F5
+        for connection in ({}, {"kind": "subscription"}, {"id": "claude-main"}):
+            self.assertIsNone(router.route_decision({**self.d, "connection": connection}), connection)
+
+    def test_an_attempt_naming_only_its_connection_counts_as_tried(self) -> None:  # ds F6
+        out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [{"connection": self.word}]}})
+        self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]), ("ask", "fallback_exhausted", "already_tried"))
+
+    # F1's class one step further: a member that IS a str (a subclass) passes an isinstance check and can still
+    # raise, or answer anything, when compared or formatted outside the guard.
+    def test_a_decision_word_that_is_a_str_subclass_is_no_decision(self) -> None:  # ds F1
+        rule = router.decide(self.cfg, SENTRY, {"task_kind": "review"})
+        conn = self.d["connection"]
+        for decision in ({**self.d, "reason": _AlwaysEqStr("config")}, {**rule, "rule": _EvilEqStr(rule["rule"])},
+                         {**self.d, "connection": {**conn, "kind": _EvilFormatStr(conn["kind"])}},
+                         {**self.d, "connection": {**conn, "id": _EvilFormatStr(conn["id"])}},
+                         {**self.d, "engine": _EvilEqStr(self.d["engine"])}, {**self.d, "model": _AlwaysEqStr("x")}):
+            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), {"action": "none", "reason": "no_decision"},
+                             decision)
+
+    def test_an_attempt_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:  # ds F1
+        m, conn = CODEX["model"], CODEX["connection"]
+        for entry in ({"engine": _EvilEqStr("codex"), "model": m, "connection": self.word},
+                      {"engine": "codex", "model": _EvilEqStr(m), "connection": self.word},
+                      {"engine": "codex", "model": m, "connection": _EvilEqStr(self.word)},
+                      {"engine": "codex", "model": m, "connection": {"kind": _EvilFormatStr(conn["kind"]), "id": conn["id"]}},
+                      _EvilEqStr(self.word)):
+            out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [entry]}})
+            self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]),
+                             ("ask", "fallback_exhausted", "already_tried"), entry)
+
+    def test_a_limit_code_that_is_a_str_subclass_is_not_a_limit(self) -> None:  # ds F1
+        for code in (_EvilEqStr(c.PLAN_LIMIT), _AlwaysEqStr("x")):
+            self.assertEqual(router.next_after_limit(self.cfg, self.d, {**LIMIT, "code": code}),
+                             {"action": "none", "reason": "not_a_limit"}, type(code))
+
+    def test_route_decision_needs_plain_words(self) -> None:  # ds F5: what next_after_limit refuses is not published
+        conn = self.d["connection"]
+        for odd in ({"connection": {**conn, "kind": 5}}, {"connection": {**conn, "id": None}},
+                    {"connection": {**conn, "kind": _EvilFormatStr(conn["kind"])}}, {"reason": _AlwaysEqStr("x")},
+                    {"engine": _EvilEqStr(self.d["engine"])}, {"model": _EvilEqStr(self.d["model"])}):
+            decision = {**self.d, **odd}
+            self.assertIsNone(router.route_decision(decision), odd)
+            self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), {"action": "none", "reason": "no_decision"},
+                             odd)
 
 
 if __name__ == "__main__":

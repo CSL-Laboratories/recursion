@@ -318,6 +318,42 @@ class DetachWhileCallingTest(unittest.TestCase):
         self.assertLessEqual({str(a) for a in answers}, {"None", str(refused("needs_read"))})
 
 
+class _UnreadableGrant:
+    """A principal whose grant context cannot be read (Sol's round-2 C2 on #385): not a principal without one."""
+    kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+    @property
+    def grant(self):
+        raise RuntimeError("the trusted grant context is unavailable")
+
+
+class _UnreadableOwnerGrant(_UnreadableGrant):
+    kind, id = "owner", "local"
+
+
+@NEEDS_POSIX
+class UnreadableGrantThroughS5Test(unittest.TestCase):
+    """The round-2 reads of #385 (Codex GPT-6.1 Sol, C2; the rule came with #377's 6c109b31): through S5, with the
+    service started on a real store, a principal whose grant cannot be read holds nothing, even where its identity
+    has live grants, and as registered an owner-kind one holds nothing either."""
+
+    def test_an_unreadable_grant_holds_nothing_through_s5(self) -> None:
+        base = tempfile.mkdtemp(prefix="scopes-unreadable-")
+        self.addCleanup(shutil.rmtree, base, True)
+        state = os.path.join(base, "state")
+        os.mkdir(state, 0o700)
+        CredentialStore(os.path.join(state, "control", "credentials.json")).mint("plugin", "plugin.alpha",
+                                                                                   ["read", "run"])
+        hooks, service = with_service()
+        service.start(H.ServiceContext(state_dir=state, control_registry=Registry()))
+        self.assertIsNone(hooks.authorize(H.Principal("plugin", "plugin.alpha"), "run.list", {}))   # absent grant
+        self.assertEqual(hooks.authorize(_UnreadableGrant(), "run.list", {}), refused("needs_read"))
+        self.assertEqual(hooks.authorize(_UnreadableGrant(), "run.stop", {"run_id": "run-alpha"}), refused("needs_run"))
+        as_registered = composed()
+        self.assertIsNone(as_registered.authorize(H.OWNER, "run.list", {}))
+        self.assertEqual(as_registered.authorize(_UnreadableOwnerGrant(), "run.list", {}), refused("needs_read"))
+
+
 @NEEDS_POSIX
 class BearerWithoutGrantTest(unittest.TestCase):
     """Until SPINE's Principal carries ``grant``, a device, session or agent principal holds nothing, live grants

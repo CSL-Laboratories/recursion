@@ -364,29 +364,70 @@ class InstallTests(unittest.TestCase):
                 self.assertFalse(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), mode)
 
-    def test_a_unit_removed_after_it_is_read_is_answered_not_raised(self) -> None:
-        # Review 4 of #382, DeepSeek L4-1: a concurrent uninstall removes the unit between install's (or
-        # upgrade's) read and its owner-and-mode check. The check uses the descriptor's fstat, so nothing
-        # is looked up again: the answer is the one for the file that was read, never a raw error.
+    def test_a_unit_removed_or_replaced_while_it_is_read_is_refused_not_answered(self) -> None:
+        # Review 4 of #382, DeepSeek L4-1, and review 5, M5-1: a concurrent uninstall removes the unit while
+        # install or upgrade reads it. Neither raises nor answers for a file that is gone: the path must still
+        # name the file read (its device and inode), or the command refuses and writes nothing.
         real_read = os.read
 
-        def read_then_remove(fd, size):
-            data = real_read(fd, size)
-            if not data and os.path.lexists(self.unit):
-                os.unlink(self.unit)
-            return data
-        for step in (install, upgrade):
-            with self.subTest(step=step.__name__):
-                install(self.roots, EXEC)
-                with mock.patch("os.read", side_effect=read_then_remove):
-                    plan = step(self.roots, EXEC)
-                self.assertEqual((plan.action, plan.changed), (step.__name__, False))
-                self.assertFalse(os.path.lexists(self.unit))
+        def at_the_end(change):
+            def read(fd, size):
+                data = real_read(fd, size)
+                if not data and os.path.lexists(self.unit):
+                    change()
+                return data
+            return read
+
+        def replace_it():
+            os.unlink(self.unit)
+            with open(self.unit, "wb") as handle:
+                handle.write(render_unit(EXEC).encode())  # the same bytes, another file
+
+        for change, code in ((lambda: os.unlink(self.unit), "unit_missing"), (replace_it, "unit_changed")):
+            for step in (install, upgrade):
+                with self.subTest(step=step.__name__, code=code):
+                    if os.path.lexists(self.unit):
+                        os.unlink(self.unit)
+                    install(self.roots, EXEC)
+                    with self.assertRaises(InstallRefused) as caught, mock.patch("os.read", side_effect=at_the_end(change)):
+                        step(self.roots, EXEC)
+                    self.assertEqual(caught.exception.kind, code)
+                    self.assertIn(self.unit, caught.exception.detail)
+        if os.path.lexists(self.unit):
+            os.unlink(self.unit)
         install(self.roots, EXEC)
         os.chmod(self.unit, 0o666)
-        with self.assertRaises(InstallRefused) as caught, mock.patch("os.read", side_effect=read_then_remove):
-            install(self.roots, EXEC)  # the file read could be changed by others: still refused, typed
-        self.assertEqual(caught.exception.kind, "unit_untrusted")
+        with self.assertRaises(InstallRefused) as caught, mock.patch("os.read", side_effect=at_the_end(lambda: os.unlink(self.unit))):
+            install(self.roots, EXEC)  # removed: no answer about the file that was read
+        self.assertEqual(caught.exception.kind, "unit_missing")
+
+    def test_a_unit_removed_before_it_is_opened_is_missing_not_of_the_wrong_type(self) -> None:
+        # Review 5 of #382, DeepSeek L5-1: removed between the lexists and the open. install and upgrade
+        # refuse unit_missing (not not_regular); uninstall finds nothing left to remove.
+        real_open = os.open
+
+        def remove_then_open(path, flags, *args, **kwargs):
+            if os.fspath(path) == self.unit and os.path.lexists(self.unit):
+                os.unlink(self.unit)
+            return real_open(path, flags, *args, **kwargs)
+        for step in (install, upgrade):
+            with self.subTest(step=step.__name__):
+                if not os.path.lexists(self.unit):
+                    install(self.roots, EXEC)
+                with self.assertRaises(InstallRefused) as caught, mock.patch("os.open", side_effect=remove_then_open):
+                    step(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_missing")
+                self.assertEqual(caught.exception.detail, f"{self.unit} was removed before it could be read; run the command again")
+        install(self.roots, EXEC)
+        with mock.patch("os.open", side_effect=remove_then_open):
+            plan = uninstall(self.roots)
+        self.assertEqual((plan.action, plan.changed), ("uninstall", False))
+        self.assertFalse(os.path.lexists(self.unit))
+        with open(self.unit, "w", encoding="utf-8") as handle:
+            handle.write("[Service]\nExecStart=/bin/true\n")  # another's unit is still left in place
+        with self.assertRaises(InstallRefused) as caught:
+            uninstall(self.roots)
+        self.assertEqual(caught.exception.kind, "unit_not_ours")
 
     def test_uninstall_removes_the_unit_and_nothing_else(self) -> None:
         before = _tree(self.home)

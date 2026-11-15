@@ -883,6 +883,53 @@ class BreakItPins(GuiHarness):
                 self.assertEqual(self.headers_without_length(got), ok_headers)
         self.assertEqual(self.api.calls, [])
 
+    def test_round6_each_request_value_is_read_once_and_the_door_alone_refuses_a_bad_method(self) -> None:
+        # DeepSeek round 6, F1: the method that was checked is the method that is compared. An environ
+        # whose second read of a key would answer with a raising object is read once per key and the
+        # request is answered normally. F3: the door function on its own refuses a method that is not
+        # a str exactly instead of admitting it.
+        class Boom:
+            def __eq__(self, other):
+                raise RuntimeError("SECOND-READ-BOOM")
+
+            __ne__ = __eq__
+            __hash__ = None
+
+        class OnceEnviron(dict):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.reads = {}
+
+            def _count(self, key):
+                self.reads[key] = self.reads.get(key, 0) + 1
+                return self.reads[key]
+
+            def get(self, key, default=None):
+                if self._count(key) > 1 and key in ("REQUEST_METHOD", "PATH_INFO", "HTTP_HOST",
+                                                    "HTTP_ORIGIN", "HTTP_SEC_FETCH_SITE"):
+                    return Boom()
+                return super().get(key, default)
+
+            def __getitem__(self, key):
+                self._count(key)
+                return super().__getitem__(key)
+
+        for method, path, body in (("GET", "/", b""), ("POST", "/stop", b"run_id=run-1&confirm=explicit")):
+            with self.subTest(method=method):
+                env = OnceEnviron({"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": "", "HTTP_HOST": HOST,
+                                   "HTTP_ORIGIN": ORIGIN, "HTTP_SEC_FETCH_SITE": "same-origin",
+                                   "CONTENT_LENGTH": str(len(body)), "CONTENT_TYPE": "application/x-www-form-urlencoded",
+                                   "wsgi.input": io.BytesIO(body), "wsgi.errors": sys.stderr})
+                status = []
+                self.app(env, lambda s, h: status.append(s))
+                self.assertEqual(status, ["200 OK"])
+                for key in ("REQUEST_METHOD", "PATH_INFO", "HTTP_HOST", "HTTP_ORIGIN", "HTTP_SEC_FETCH_SITE"):
+                    self.assertEqual(env.reads.get(key), 1, key)
+        for bad in (7, None, ["GET"], Boom()):
+            with self.subTest(standalone=type(bad).__name__):
+                env = {"HTTP_HOST": HOST, "HTTP_ORIGIN": ORIGIN, "HTTP_SEC_FETCH_SITE": "same-origin"}
+                self.assertIsNotNone(self.app._refusal(env, bad))
+
 
 if __name__ == "__main__":
     unittest.main()

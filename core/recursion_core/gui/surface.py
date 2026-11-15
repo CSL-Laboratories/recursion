@@ -8,6 +8,10 @@ its own).
 
 The door, in order, on every request:
 
+0. ``REQUEST_METHOD`` and ``PATH_INFO`` are each read once and must be a ``str`` exactly,
+   before anything compares them; otherwise the answer is 400. The checked method is the one
+   the door's steps compare, and ``Host``, ``Origin`` and ``Sec-Fetch-Site`` must be a ``str``
+   exactly too;
 1. ``Host`` must be one of the configured hosts;
 2. any ``Origin`` must be exactly one configured origin (a list or ``null`` is
    refused); a POST must carry one. ``Sec-Fetch-Site``, when sent, must be
@@ -153,8 +157,11 @@ class Application:
         self._origins = frozenset(origins)
 
     # -- door ---------------------------------------------------------------------------
-    def _refusal(self, env: dict) -> str | None:
-        method = env.get("REQUEST_METHOD")
+    def _refusal(self, env: dict, method) -> str | None:
+        # ``method`` is the request line's method as __call__ read it, once; the environ is not
+        # asked again, so the value checked is the value compared (DeepSeek round 6).
+        if type(method) is not str:
+            return "request_line_invalid"
         host = env.get("HTTP_HOST")
         # A str exactly: a subclass could make its own equality and hash match a configured host.
         if type(host) is not str or host not in self._hosts:
@@ -183,7 +190,7 @@ class Application:
         if type(method) is not str or type(path) is not str:
             return self._send(start_response, "400 Bad Request",
                               self._page("Bad request", "<p>Bad request: request line</p>"))
-        refusal = self._refusal(env)
+        refusal = self._refusal(env, method)
         if refusal is not None:
             status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
             return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))

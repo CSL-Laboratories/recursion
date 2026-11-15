@@ -417,7 +417,7 @@ class InstallTests(unittest.TestCase):
                 with self.assertRaises(InstallRefused) as caught, mock.patch("os.open", side_effect=remove_then_open):
                     step(self.roots, EXEC)
                 self.assertEqual(caught.exception.kind, "unit_missing")
-                self.assertEqual(caught.exception.detail, f"{self.unit} was removed before it could be read; run the command again")
+                self.assertEqual(caught.exception.detail, f"{self.unit} is not there; run the command again")
         install(self.roots, EXEC)
         with mock.patch("os.open", side_effect=remove_then_open):
             plan = uninstall(self.roots)
@@ -428,6 +428,78 @@ class InstallTests(unittest.TestCase):
         with self.assertRaises(InstallRefused) as caught:
             uninstall(self.roots)
         self.assertEqual(caught.exception.kind, "unit_not_ours")
+
+    def test_the_unit_is_looked_up_again_while_it_is_still_open(self) -> None:
+        # Review 6 of #382, DeepSeek M6-1 and L6-2: looked up after its descriptor is closed, a unit removed and
+        # made again in that window can take the freed inode number (189 of 200 in the read) and pass as the
+        # file read. So the path is compared while the descriptor is open (the inode cannot be reused then),
+        # and uninstall removes the unit while it still holds the file it read.
+        real_open, real_close, real_lstat, real_unlink = os.open, os.close, os.lstat, os.unlink
+        events, unit_fds = [], set()
+
+        def opening(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == self.unit:
+                unit_fds.add(fd)
+                events.append("open")
+            return fd
+
+        def closing(fd):
+            if fd in unit_fds:
+                unit_fds.discard(fd)
+                events.append("close")
+            return real_close(fd)
+
+        def looking(path, *args, **kwargs):
+            if os.fspath(path) == self.unit:
+                events.append("lstat")
+            return real_lstat(path, *args, **kwargs)
+
+        def unlinking(path, *args, **kwargs):
+            if os.fspath(path) == self.unit:
+                events.append("unlink")
+            return real_unlink(path, *args, **kwargs)
+        install(self.roots, EXEC)
+        for name, step in (("install", lambda: install(self.roots, EXEC)), ("upgrade", lambda: upgrade(self.roots, EXEC)),
+                           ("uninstall", lambda: uninstall(self.roots))):
+            with self.subTest(step=name):
+                events.clear()
+                with mock.patch("os.open", side_effect=opening), mock.patch("os.close", side_effect=closing), \
+                        mock.patch("os.lstat", side_effect=looking), mock.patch("os.unlink", side_effect=unlinking):
+                    step()
+                opened, closed = events.index("open"), events.index("close")
+                self.assertIn("lstat", events[opened:closed], events)
+        self.assertLess(events.index("unlink"), events.index("close"), events)  # uninstall, the last step
+        self.assertFalse(os.path.lexists(self.unit))
+
+    def test_uninstall_refuses_a_unit_replaced_while_it_is_read_and_leaves_it(self) -> None:
+        # Review 6 of #382, DeepSeek L6-2: uninstall removed by name a file it had not checked.
+        install(self.roots, EXEC)
+        real_read = os.read
+
+        def replace_at_the_end(fd, size):
+            data = real_read(fd, size)
+            if not data and os.path.lexists(self.unit):
+                os.unlink(self.unit)
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write("[Service]\nExecStart=/bin/true\n")
+            return data
+        with self.assertRaises(InstallRefused) as caught, mock.patch("os.read", side_effect=replace_at_the_end):
+            uninstall(self.roots)
+        self.assertEqual(caught.exception.kind, "unit_changed")
+        self.assertEqual(_read(self.unit), "[Service]\nExecStart=/bin/true\n")  # another's file is left as it is
+
+    def test_a_unit_gone_before_it_is_replaced_is_missing_not_of_the_wrong_type(self) -> None:
+        # Review 6 of #382, DeepSeek L6-1: upgrade's write found the unit gone and answered not_regular.
+        os.makedirs(self.unit_dir, 0o700)
+        with self.assertRaises(InstallRefused) as caught:
+            layout.replace_regular(self.unit, b"x", 0o644)
+        self.assertEqual(caught.exception.kind, "unit_missing")
+        self.assertFalse(os.path.lexists(self.unit))
+        os.mkdir(self.unit)  # something there that is not a file is still of the wrong type
+        with self.assertRaises(InstallRefused) as caught:
+            layout.replace_regular(self.unit, b"x", 0o644)
+        self.assertEqual(caught.exception.kind, "not_regular")
 
     def test_uninstall_removes_the_unit_and_nothing_else(self) -> None:
         before = _tree(self.home)

@@ -9,10 +9,13 @@ store again (recovery, ``quick_check``, the epoch) and checks, on a connection o
 - those transactions are 1..K with no hole (one writer, in order), and the log's seq is 1..K;
 - ``PRAGMA integrity_check`` is ok and the epoch rose by one at each open.
 
+A full file system is real: the writer runs in a private user and mount namespace (``unshare``, no root and
+nothing installed) on a one-MiB tmpfs mounted only inside it, until SQLite reports SQLITE_FULL; the test is
+skipped where such a namespace is refused. A file size limit (RLIMIT_FSIZE) gives a refused write of the
+other kind, an I/O error.
+
 What this does not show: a power cut or an operating-system crash (synchronous=FULL is what covers those, and
-nothing here emulates one; that needs a block-level fault device and root). The "full disk" here is a file
-size limit (RLIMIT_FSIZE) on the writer, the nearest refusal of a write available without root: SQLite
-sees a failed write, as it would on a full disk, but the error it reports is an I/O error, not SQLITE_FULL.
+nothing here emulates one; that needs a block-level fault device and root).
 """
 
 from __future__ import annotations
@@ -40,6 +43,50 @@ CORE = pathlib.Path(__file__).resolve().parents[3]
 SEED = int(os.environ.get('EVENTS_DURABILITY_SEED', '20261114'))
 ROUNDS = int(os.environ.get('EVENTS_DURABILITY_ROUNDS', '12'))
 POSIX = D.fcntl is not None and hasattr(signal, 'SIGKILL')
+
+
+MOUNTED = 'namespace-ready'      # what the namespace prints once its tmpfs is mounted, before the writer starts
+
+
+# What ``unshare`` says when the kernel or a security module refuses an unprivileged namespace: the namespace
+# itself, or the uid or gid map (Ubuntu 24.04's restriction says the latter). Nothing else is a refusal.
+REFUSALS = ('unshare: unshare failed: ', 'unshare: write failed /proc/self/uid_map: ', 'unshare: write failed /proc/self/gid_map: ')
+REFUSED_BECAUSE = ('Operation not permitted', 'Permission denied')
+
+
+def full_disk_verdict(run) -> tuple:
+    """How a run of the full-file-system writer ended. ``('skip', why)`` only when the namespace or the mount was
+    refused BEFORE the mount was confirmed: ``unshare`` names a refused namespace or map (``REFUSALS``, ending in
+    ``REFUSED_BECAUSE``), or the mount failed (exit 77). ``('ran', the child's lines)`` once the mount was
+    confirmed, whatever happened next: the test then holds those lines to the whole proof. ``('broken', why)``
+    for anything else, a command that could not run or was given a wrong option among them, which fails the
+    test (review 3 of #373)."""
+    lines = run.stdout.splitlines()
+    if lines and lines[0] == MOUNTED:
+        return 'ran', lines[1:]
+    first = (run.stderr.strip().splitlines() or [''])[0].rstrip()
+    refused = run.returncode != 0 and first.startswith(REFUSALS) and first.endswith(REFUSED_BECAUSE)
+    if run.returncode == 77 or refused:
+        return 'skip', f'no private mount namespace here (exit {run.returncode}): {run.stderr.strip()[-200:]}'
+    return 'broken', f'the namespace step ended unexpectedly (exit {run.returncode}): {run.stderr.strip()[-300:]}'
+
+
+def assert_full_disk_proof(case: unittest.TestCase, run, lines: list) -> None:
+    """The whole proof a mounted writer must give; anything less fails."""
+    case.assertEqual(run.returncode, 0, run.stderr)
+    case.assertEqual(len(lines), 4, f'the writer gave no complete proof: {lines!r} {run.stderr[-300:]!r}')
+    case.assertTrue(lines[0].startswith('open '), lines[0])
+    failure, after, survived = json.loads(lines[1]), lines[2], json.loads(lines[3])
+    case.assertEqual((failure['size'], failure['free']), (1024 * 1024, 0), 'the file system was full')
+    case.assertEqual((failure['error'], failure['code'], failure['cause']),
+                     ('CommitUnknown', 'commit_outcome_unknown', 'SQLITE_FULL'), lines[1])
+    case.assertEqual(after, 'after StoreError store_failed', 'a failed store refuses the next transaction')
+    acked, rows = failure['acked'], survived['rows']
+    case.assertGreaterEqual(acked, 1)
+    case.assertEqual(survived['integrity'], [['ok']])
+    case.assertIn(len(rows), (acked, acked + 1), 'the failed commit is there whole or not at all')
+    case.assertEqual(rows, list(range(1, len(rows) + 1)))
+    case.assertEqual((survived['seqs'], survived['ks'], survived['receipts']), (rows, rows, rows))
 
 
 def interpreter() -> list:
@@ -108,7 +155,7 @@ class DurabilityTest(unittest.TestCase):
         self.epoch = store.epoch
         store.register_tables('durability', 1, C.LANE_DDL)
         with store.transaction() as tx:
-            rows = [k for (k,) in tx.execute('SELECT k FROM durable ORDER BY k')]
+            rows = [k for (k,) in tx.execute('SELECT k FROM durability_rows ORDER BY k')]
         store.close()
         with contextlib.closing(sqlite3.connect(self.path)) as conn:
             self.assertEqual(conn.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
@@ -191,6 +238,77 @@ class DurabilityTest(unittest.TestCase):
             C.write(tx, survived + 1)
         store.close()
         self.assertEqual(self.check(), survived + 1)
+
+
+    def test_a_full_file_system_fails_the_commit_and_the_store_and_loses_nothing_committed(self) -> None:
+        if shutil.which('unshare') is None or shutil.which('mount') is None:
+            self.skipTest('no unshare or mount on this machine')
+        folder = tempfile.mkdtemp(prefix='events-full-disk-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        inner = f'mount -n -t tmpfs -o size=1m,mode=700 tmpfs "$1" || exit 77; echo {MOUNTED}; shift; exec "$@"'
+        argv = ['unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private', '/bin/sh', '-c', inner, 'sh',
+                folder, *interpreter(), '-m', 'recursion_core.events.tests.crash_child',
+                os.path.join(folder, 'events.sqlite3'), 'full-disk', '1']
+        run = subprocess.run(argv, capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(CORE)),
+                             timeout=BOUND_S)
+        verdict, detail = full_disk_verdict(run)
+        if verdict == 'skip':
+            self.skipTest(detail)
+        self.assertEqual(verdict, 'ran', detail)
+        assert_full_disk_proof(self, run, detail)
+
+
+class FullDiskVerdictTest(unittest.TestCase):
+    """Only a refused namespace or mount skips the full-file-system test; a writer that fails after the mount
+    fails it (review 2 of #373). Runs everywhere: it needs no namespace."""
+
+    @staticmethod
+    def run_of(code: int, out: str, err: str = '') -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(['unshare'], code, out, err)
+
+    def test_only_a_refused_namespace_or_mount_is_a_skip(self) -> None:
+        cases = [
+            (self.run_of(1, '', 'unshare: unshare failed: Operation not permitted\n'), 'skip'),
+            (self.run_of(1, '', 'unshare: write failed /proc/self/uid_map: Operation not permitted\n'), 'skip'),
+            (self.run_of(1, '', 'unshare: write failed /proc/self/gid_map: Permission denied\n'), 'skip'),
+            (self.run_of(77, '', 'mount: /x: permission denied.\n'), 'skip'),
+            # Review 3: a broken command is not a refused namespace.
+            (self.run_of(127, '', 'unshare: failed to execute /missing/shell: No such file or directory\n'), 'broken'),
+            (self.run_of(1, '', "unshare: unrecognized option '--bad-option'\nTry 'unshare --help' for more information.\n"),
+             'broken'),
+            (self.run_of(1, '', 'unshare: unshare failed: Invalid argument\n'), 'broken'),
+            (self.run_of(2, '', 'sh: 1: cannot create /var/tmp/x: Permission denied\n'), 'broken'),   # not unshare's
+            (self.run_of(77, f'{MOUNTED}\n', 'mount: permission denied.\n'), 'ran'),       # after the mount, never a skip
+            (self.run_of(1, f'{MOUNTED}\n', 'unshare: unshare failed: Operation not permitted\n'), 'ran'),
+            (self.run_of(0, f'{MOUNTED}\n'), 'ran'),                          # mounted, and the writer said nothing
+            (self.run_of(1, f'{MOUNTED}\nopen 1\n', 'Traceback (most recent call last):\n'), 'ran'),
+            (self.run_of(1, '', 'Traceback (most recent call last):\n'), 'broken'),
+            (self.run_of(0, 'open 1\n'), 'broken'),                           # output without the mount's word
+        ]
+        for run, expected in cases:
+            with self.subTest(code=run.returncode, out=run.stdout, err=run.stderr):
+                self.assertEqual(full_disk_verdict(run)[0], expected)
+
+    def test_a_whole_looking_proof_with_the_wrong_first_line_fails(self) -> None:
+        failure = {'size': 1024 * 1024, 'free': 0, 'error': 'CommitUnknown', 'code': 'commit_outcome_unknown',
+                   'cause': 'SQLITE_FULL', 'acked': 1}
+        survived = {'rows': [1], 'integrity': [['ok']], 'seqs': [1], 'ks': [1], 'receipts': [1]}
+        good = ['open 1', json.dumps(failure), 'after StoreError store_failed', json.dumps(survived)]
+        run = self.run_of(0, MOUNTED + '\n' + '\n'.join(good) + '\n')
+        assert_full_disk_proof(self, run, full_disk_verdict(run)[1])      # the whole proof passes as given
+        bad = ['not the open line'] + good[1:]
+        run = self.run_of(0, MOUNTED + '\n' + '\n'.join(bad) + '\n')
+        with self.assertRaises(AssertionError):
+            assert_full_disk_proof(self, run, full_disk_verdict(run)[1])
+
+    def test_a_mounted_writer_without_its_whole_proof_fails(self) -> None:
+        for out, code in ((f'{MOUNTED}\n', 0), (f'{MOUNTED}\nopen 1\n', 0), (f'{MOUNTED}\nopen 1\n', 1)):
+            with self.subTest(out=out, code=code):
+                run = self.run_of(code, out)
+                verdict, lines = full_disk_verdict(run)
+                self.assertEqual(verdict, 'ran')
+                with self.assertRaises(AssertionError):
+                    assert_full_disk_proof(self, run, lines)
 
 
 if __name__ == '__main__':

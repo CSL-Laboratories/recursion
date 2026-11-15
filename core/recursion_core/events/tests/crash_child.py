@@ -13,19 +13,27 @@ so that a commit spans several WAL frames. After each commit returns it prints `
                      bytes> (RLIMIT_FSIZE, SIGXFSZ ignored), commit until a commit fails, print
                      ``failed <k> <error class> <code> <cause>``, try one more transaction, print
                      ``after <error class> <code>``, and exit 0.
+    full-disk        <path>'s folder is a small file system of its own (the parent mounts a tmpfs in a private
+                     namespace). Keep a reserve file, commit until the file system is full, print the failure
+                     as JSON, try one more transaction, free the reserve, open the store again and print what
+                     survived as JSON. Everything is checked here because the file system ends with this
+                     process.
 
 Waiting is a read of stdin that never gets an answer: the parent kills the process.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import os
+import sqlite3
 import sys
 
 from recursion_core.events.db import EventStore
 
-LANE_DDL = 'CREATE TABLE durable (k INTEGER PRIMARY KEY, note TEXT NOT NULL)'
+LANE_DDL = 'CREATE TABLE durability_rows (k INTEGER PRIMARY KEY, note TEXT NOT NULL)'
 LOG = 'run:durability'
 
 
@@ -34,7 +42,7 @@ def write(tx, k: int) -> None:
     tx.append({'session_id': LOG, 'run_id': 'durability', 'turn_id': None, 'type': 'result', 'source': 'core',
                'trust': 'trusted', 'payload': {'k': k, 'note': note}})
     tx.receipt_put('tenant', 'durability.write', f'command-{k:08d}', hashlib.sha256(str(k).encode()).hexdigest(), {'k': k})
-    tx.execute('INSERT INTO durable (k, note) VALUES (?, ?)', (k, note))
+    tx.execute('INSERT INTO durability_rows (k, note) VALUES (?, ?)', (k, note))
 
 
 def say(text: str) -> None:
@@ -42,8 +50,57 @@ def say(text: str) -> None:
     sys.stdout.flush()
 
 
+def full_disk(path: str) -> int:
+    folder = os.path.dirname(path)
+    reserve = os.path.join(folder, 'reserve')
+    with open(reserve, 'wb') as out:
+        out.write(b'r' * (192 * 1024))
+        out.flush()
+        os.fsync(out.fileno())
+    store = EventStore(path)
+    store.register_tables('durability', 1, LANE_DDL)
+    say(f'open {store.epoch}')
+    acked = 0
+    for k in range(1, 100_000):
+        try:
+            with store.transaction() as tx:
+                write(tx, k)
+        except Exception as exc:              # noqa: BLE001 - the failure is what this mode reports
+            cause = exc
+            while cause.__cause__ is not None:
+                cause = cause.__cause__
+            space = os.statvfs(folder)
+            say(json.dumps({'failed': k, 'error': type(exc).__name__, 'code': str(exc),
+                            'cause': getattr(cause, 'sqlite_errorname', None), 'free': space.f_bavail * space.f_frsize,
+                            'size': space.f_blocks * space.f_frsize, 'acked': acked}))
+            break
+        acked = k
+    try:
+        with store.transaction() as tx:
+            write(tx, acked + 1)
+        say('after committed')
+    except Exception as again:                # noqa: BLE001
+        say(f'after {type(again).__name__} {again}')
+    store.close()
+    os.unlink(reserve)
+    again = EventStore(path)
+    again.register_tables('durability', 1, LANE_DDL)
+    with again.transaction() as tx:
+        rows = [k for (k,) in tx.execute('SELECT k FROM durability_rows ORDER BY k')]
+    again.close()
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        integrity = conn.execute('PRAGMA integrity_check').fetchall()
+        events = [json.loads(text) for (text,) in conn.execute('SELECT event FROM event_log ORDER BY position')]
+        receipts = sorted(int(command[len('command-'):]) for (command,) in conn.execute('SELECT command_id FROM receipts'))
+    say(json.dumps({'rows': rows, 'seqs': [e['seq'] for e in events], 'ks': [e['payload']['k'] for e in events],
+                    'receipts': receipts, 'integrity': integrity}))
+    return 0
+
+
 def main(argv) -> int:
     path, mode, k = argv[1], argv[2], int(argv[3])
+    if mode == 'full-disk':
+        return full_disk(path)
     store = EventStore(path)
     store.register_tables('durability', 1, LANE_DDL)
     say(f'open {store.epoch}')

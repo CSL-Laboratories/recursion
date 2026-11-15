@@ -17,7 +17,9 @@ THE PROTOCOL (the lanes' preamble, version 3.3, "Shared state"; these are the pu
         tx.execute(sql, params)       one statement, reads and writes of rows of tables a lane declared and
                                       nothing else; returns the rows as a list of tuples. To learn which rows
                                       a write changed, use ``RETURNING``.
-    db.register_tables(lane, version, ddl)   once per lane per process, at composition.
+    db.register_tables(lane, version, ddl)   once per lane per process, at composition; every table is named
+                                      <lane>_<name> (``sessions_work``); a lane's handler runs SQL only on
+                                      its own tables (by review: a tx does not know which lane holds it).
     db.subscribe(fn)                  ``fn(events)`` after each commit that appended events, outside every
                                       lock of the helper, in commit order; returns an unsubscribe function.
 
@@ -47,13 +49,17 @@ the control API, so the helper itself never calls them; subscribers run with no 
 DURABILITY. The real store is SQLite in WAL mode with ``synchronous=FULL`` (the brief's working choice;
 the contract: "No evidence picks JSONL over SQLite, and both have durability traps"): a commit that has
 returned survives the process being killed, and under FULL the WAL is synced at every commit. Opening
-checks that both settings took effect, that the file is this store's (``application_id``) and passes
-``quick_check``, takes an exclusive ``flock`` on ``<path>.lock`` for the life of the store (one writer
-process), and raises the epoch by one. The kill -9 test and the file-size-limit test in
-``events/tests/test_durability.py`` are the evidence; a power cut was not emulated.
+checks that both settings took effect, that the file, its WAL and shared-memory files and its lock file are
+regular files of this user that nobody else can read or write (one that is open to others is refused, not
+narrowed), that the file is this store's (``application_id``) and passes ``quick_check``, takes an
+exclusive ``flock`` on ``<path>.lock`` for the life of the store (one writer process), and raises the epoch
+by one. The kill -9, full file system and file-size-limit tests in ``events/tests/test_durability.py`` are
+the evidence; a power cut was not emulated.
 
 FAILURES. A statement that fails inside a transaction raises to the block; the transaction is rolled back
-when the block ends. If SQLite rolled the transaction back on its own (it may on a full disk or an I/O
+when the block ends. A statement's rows are fetched under the same rule as the statement (SQLite can find
+corruption while it steps through rows), and an append is one write, so a failed append that a caller
+catches leaves no hole in the log. If SQLite rolled the transaction back on its own (it may on a full disk or an I/O
 error), every later use of that tx raises ``transaction_aborted``, so no write can slip out in autocommit
 mode. An I/O error, corruption or a failed rollback marks the store FAILED: every later transaction
 raises ``store_failed`` until the store is opened again (after a failed sync the page cache cannot be
@@ -106,7 +112,7 @@ MAX_DEPTH = 64                   # of a stored value
 
 _HELPER_DDL = (
     'CREATE TABLE store_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)',
-    'CREATE TABLE event_logs (log_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL CHECK (last_seq >= 1))',
+    # A log's next seq is one more than its highest (the UNIQUE index answers that), so an append is ONE write.
     'CREATE TABLE event_log (position INTEGER PRIMARY KEY AUTOINCREMENT, log_id TEXT NOT NULL, '
     'seq INTEGER NOT NULL CHECK (seq >= 1), event TEXT NOT NULL, UNIQUE (log_id, seq))',
     'CREATE TABLE receipts (tenant TEXT NOT NULL, method TEXT NOT NULL, command_id TEXT NOT NULL, '
@@ -292,7 +298,7 @@ def _envelope(event) -> dict:
 
 
 def _receipt_key(tenant, method, command_id) -> None:
-    if not isinstance(tenant, str) or not tenant or '\x00' in tenant:
+    if not isinstance(tenant, str) or not tenant:          # common.v1: a tenant is any non-empty string
         raise TypeError('a receipt is keyed by a tenant: non-empty text')
     if not isinstance(method, str) or not _TOKEN.fullmatch(method):
         raise TypeError('a receipt is keyed by a method name')
@@ -327,31 +333,31 @@ class Transaction:
         if self._store._failed is not None:
             raise StoreError('store_failed')
 
-    def _run(self, sql: str, params=()):
+    def _run(self, sql: str, params=()) -> list:
+        """Run one statement and fetch ALL its rows inside the same handler: SQLite can find corruption or an I/O
+        error while it steps through rows, after the statement began, and that must fail the store too."""
         conn = self._store._conn
         if not conn.in_transaction:          # SQLite ended it on its own: nothing more may be written
             raise StoreError('transaction_aborted')
         try:
-            return conn.execute(sql, params)
+            return conn.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
             if _fatal(exc):
                 self._store._fail(exc)
             raise
 
     def append(self, event) -> int:
-        """One event.v1 without ``seq`` and ``time``; returns its seq, which is gapless in its log."""
+        """One event.v1 without ``seq`` and ``time``; returns its seq, which is gapless in its log. The seq is
+        read from the log itself and the event is ONE insert, so an append that fails writes nothing: a caller
+        that catches the failure and goes on leaves no hole."""
         self._use()
         record = _envelope(event)
         log = record['session_id']
-        row = self._run('SELECT last_seq FROM event_logs WHERE log_id = ?', (log,)).fetchone()
-        seq = 1 if row is None else row[0] + 1
+        (highest,), = self._run('SELECT COALESCE(MAX(seq), 0) FROM event_log WHERE log_id = ?', (log,))
+        seq = highest + 1
         record['seq'] = seq
         record['time'] = _timestamp(self._store._clock())
         text = _wire(record)
-        if row is None:
-            self._run('INSERT INTO event_logs (log_id, last_seq) VALUES (?, ?)', (log, seq))
-        else:
-            self._run('UPDATE event_logs SET last_seq = ? WHERE log_id = ?', (seq, log))
         self._run('INSERT INTO event_log (log_id, seq, event) VALUES (?, ?, ?)', (log, seq, text))
         self._events.append(text)
         return seq
@@ -360,9 +366,9 @@ class Transaction:
         """None, or ``Receipt(payload_digest, answer)``; the answer is the caller's own copy."""
         self._use()
         _receipt_key(tenant, method, command_id)
-        row = self._run('SELECT payload_digest, answer FROM receipts WHERE tenant = ? AND method = ? AND command_id = ?',
-                        (tenant, method, command_id)).fetchone()
-        return None if row is None else Receipt(row[0], json.loads(row[1]))
+        rows = self._run('SELECT payload_digest, answer FROM receipts WHERE tenant = ? AND method = ? AND command_id = ?',
+                         (tenant, method, command_id))
+        return None if not rows else Receipt(rows[0][0], json.loads(rows[0][1]))
 
     def receipt_put(self, tenant, method, command_id, payload_digest, answer) -> None:
         """Keep the receipt in this transaction. One that exists is never replaced: ``ReceiptExists``."""
@@ -386,7 +392,7 @@ class Transaction:
         conn = self._store._conn
         conn.set_authorizer(self._store._lane_tables_only)
         try:
-            return self._run(sql, params).fetchall()
+            return self._run(sql, params)
         finally:
             conn.set_authorizer(None)
 
@@ -456,9 +462,20 @@ class EventStore:
         self._epoch = 0
 
     @staticmethod
+    def _private(info, code: str) -> None:
+        """A file of the store is a regular file of this user that nobody else can read or write."""
+        if not stat.S_ISREG(info.st_mode):
+            raise StoreError(f'{code}_not_a_regular_file')
+        if hasattr(os, 'geteuid') and info.st_uid != os.geteuid():
+            raise StoreError(f'{code}_owned_by_another_user')
+        if info.st_mode & 0o077:
+            raise StoreError(f'{code}_not_private')
+
+    @staticmethod
     def _take_file_lock(path: str) -> int:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         try:
+            EventStore._private(os.fstat(fd), 'store_lock')
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
@@ -471,15 +488,20 @@ class EventStore:
     @staticmethod
     def _make_file(path: str) -> None:
         """The database file: made here, 0600, with its directory synced; or one that exists, that is a regular
-        file of this user and not a link."""
+        file of this user, not a link, and open to nobody else, and so are the WAL and shared-memory files
+        beside it if they exist (SQLite gives those the database file's mode). A file open to others is
+        refused, never quietly narrowed: what it held may already have been read. The sidecars are checked
+        first, whether the database file exists or is about to be made: SQLite would open either."""
+        for suffix in ('-wal', '-shm'):
+            try:
+                info = os.lstat(path + suffix)
+            except FileNotFoundError:
+                continue
+            EventStore._private(info, 'store_sidecar')
         try:
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         except FileExistsError:
-            info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode):
-                raise StoreError('store_path_not_a_regular_file') from None
-            if hasattr(os, 'geteuid') and info.st_uid != os.geteuid():
-                raise StoreError('store_path_owned_by_another_user') from None
+            EventStore._private(os.lstat(path), 'store_path')
             return
         os.close(fd)
         folder = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | os.O_DIRECTORY)
@@ -664,8 +686,12 @@ class EventStore:
             self._fail(exc, 'rollback_failed')
 
     def _statement(self, sql: str) -> None:
+        self._query(sql)
+
+    def _query(self, sql: str, params=()) -> list:
+        """The helper's own statement, outside a lane's transaction: every row fetched under the fatal rule."""
         try:
-            self._conn.execute(sql)
+            return self._conn.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
             if _fatal(exc):
                 self._fail(exc)
@@ -696,14 +722,14 @@ class EventStore:
         function that unsubscribes."""
         if not callable(fn):
             raise TypeError('a subscriber is a function of one argument')
-        entry = [fn]                 # its own identity, so the same function can subscribe twice
+        entry = (object(), fn)       # a registration of its own: the same function may subscribe twice
         with self._publish_guard:
             self._subscribers.append(entry)
 
         def unsubscribe() -> None:
+            """Remove THIS registration (by identity, not by equality); a second call does nothing."""
             with self._publish_guard:
-                if entry in self._subscribers:
-                    self._subscribers.remove(entry)
+                self._subscribers = [other for other in self._subscribers if other is not entry]
         return unsubscribe
 
     def _publish(self) -> None:
@@ -721,7 +747,7 @@ class EventStore:
                         self._publishing = False
                         return
                     batch = self._pending.popleft()
-                    subscribers = [entry[0] for entry in self._subscribers]
+                    subscribers = [entry[1] for entry in self._subscribers]
                 for fn in subscribers:
                     try:
                         fn(tuple(json.loads(text) for text in batch))
@@ -767,54 +793,44 @@ class EventStore:
 
     def _declare(self, lane: str, version: int, ddl: str, digest: str) -> frozenset:
         conn = self._conn
-        row = conn.execute('SELECT version, ddl_sha256, tables FROM lane_tables WHERE lane = ?', (lane,)).fetchone()
-        if row is not None:
-            if (row[0], row[1]) != (version, digest):
+        rows = self._query('SELECT version, ddl_sha256, tables FROM lane_tables WHERE lane = ?', (lane,))
+        if rows:
+            if (rows[0][0], rows[0][1]) != (version, digest):
                 raise StoreError('declaration_changed')
-            return frozenset(json.loads(row[2]))
-        taken = {name for (name,) in conn.execute("SELECT name FROM sqlite_master")}
-        created: set = set()
-        indexes: set = set()
-
-        # A temporary table and an attached file are other action codes, refused by the default below; a name
-        # that exists (the helper's tables among them) is refused here, so CREATE TABLE IF NOT EXISTS cannot
-        # pass quietly; a name beginning sqlite_ SQLite refuses itself.
-        def declaration_only(action, first, second, database, source) -> int:
-            if action == sqlite3.SQLITE_CREATE_TABLE:
-                if first in taken:
-                    return sqlite3.SQLITE_DENY
-                created.add(first)
-                return sqlite3.SQLITE_OK
-            if action == sqlite3.SQLITE_CREATE_INDEX:
-                indexes.add(first)          # only on a table of its own: indexing READs the table, refused below
-                return sqlite3.SQLITE_OK
-            if action == sqlite3.SQLITE_REINDEX:          # what creating an index asks for, of that same index
-                return sqlite3.SQLITE_OK if first in indexes else sqlite3.SQLITE_DENY
-            if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE) and first in ('sqlite_master', 'sqlite_schema'):
-                return sqlite3.SQLITE_OK                   # what a CREATE writes, and nothing a statement can name
-            if action == sqlite3.SQLITE_READ and (first in created or first in ('sqlite_master', 'sqlite_schema')):
-                return sqlite3.SQLITE_OK
-            if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
-                return sqlite3.SQLITE_OK
-            return sqlite3.SQLITE_DENY
-
+            return frozenset(json.loads(rows[0][2]))
+        taken = {name for (name,) in self._query("SELECT name FROM sqlite_master")}
+        rules = _DeclarationRules(taken, lane + '_')
         self._statement('BEGIN IMMEDIATE')
         try:
-            conn.set_authorizer(declaration_only)
-            try:
-                for statement in _statements(ddl):
+            for statement in _statements(ddl):
+                if not _has_sql(statement):
+                    continue                    # a comment or blank text after the last statement
+                (before,), = conn.execute('SELECT count(*) FROM sqlite_master').fetchall()
+                conn.set_authorizer(rules)
+                try:
                     conn.execute(statement)
-            finally:
-                conn.set_authorizer(None)
-            added = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")} - taken
+                finally:
+                    conn.set_authorizer(None)
+                (after,), = conn.execute('SELECT count(*) FROM sqlite_master').fetchall()
+                if after == before:             # CREATE ... IF NOT EXISTS on a name that exists, or a bare SELECT
+                    raise StoreError('declaration_statement_made_nothing')
+            added = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()} - taken
             if not added:
                 raise StoreError('declaration_made_no_table')
+            # CREATE TABLE ... AS SELECT makes rows without an INSERT the authorizer could refuse: a declaration
+            # declares, so every table it made must be empty.
+            for table in sorted(added):
+                quoted = '"' + table.replace('"', '""') + '"'
+                if conn.execute(f'SELECT 1 FROM {quoted} LIMIT 1').fetchall():
+                    raise StoreError('declaration_wrote_rows')
             conn.execute('INSERT INTO lane_tables (lane, version, ddl_sha256, tables) VALUES (?, ?, ?, ?)',
                          (lane, version, digest, json.dumps(sorted(added))))
         except BaseException as exc:
             if _fatal(exc):
                 self._fail(exc)
             self._rollback(counted=False)       # a declaration is not a transaction of the counts
+            if rules.misnamed and isinstance(exc, sqlite3.DatabaseError):
+                raise StoreError(f'table_not_named_for_lane:{rules.misnamed[0]}') from exc
             raise
         try:
             conn.execute('COMMIT')
@@ -850,6 +866,69 @@ class EventStore:
             self._lock_fd = None
 
 
+class _DeclarationRules:
+    """The SQLite authorizer of one declaration: what each action of its statements may do. A temporary table and
+    an attached file are other action codes, refused by the default; a name that exists (the helper's tables
+    among them) is refused, so CREATE TABLE IF NOT EXISTS cannot pass quietly; a name beginning sqlite_ SQLite
+    refuses itself. Every table is named <lane>_<name> (the Liaison's ruling of Nov 14, 4:03 PM). Its decisions
+    are tested one by one as well as through SQLite, because SQLite does not ask about every object a statement
+    touches (an index of a constant reads no column, review 2 of #373)."""
+
+    _SCHEMA = ('sqlite_master', 'sqlite_schema')
+
+    def __init__(self, taken, prefix: str) -> None:
+        self.taken, self.prefix = frozenset(taken), prefix
+        self.created: set = set()
+        self.indexes: set = set()
+        self.misnamed: list = []
+
+    def __call__(self, action, first, second, database, source) -> int:
+        if action == sqlite3.SQLITE_CREATE_TABLE:
+            if first in self.taken:
+                return sqlite3.SQLITE_DENY
+            if not first.startswith(self.prefix) or first == self.prefix:
+                self.misnamed.append(first)
+                return sqlite3.SQLITE_DENY
+            self.created.add(first)
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_CREATE_INDEX:
+            # Only on a table this declaration made. A name that exists is refused by the statement rule:
+            # CREATE INDEX IF NOT EXISTS on it makes no call here at all, and makes nothing.
+            if second not in self.created:
+                return sqlite3.SQLITE_DENY
+            self.indexes.add(first)
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_REINDEX:              # what creating an index asks for, of that same index
+            return sqlite3.SQLITE_OK if first in self.indexes else sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE) and first in self._SCHEMA:
+            return sqlite3.SQLITE_OK                       # what a CREATE writes, and nothing a statement can name
+        if action == sqlite3.SQLITE_READ and (first in self.created or first in self._SCHEMA):
+            return sqlite3.SQLITE_OK
+        if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+
+def _has_sql(statement: str) -> bool:
+    """Whether a piece of declaration text holds more than blanks, semicolons and comments. It reads from the start
+    in order, as SQLite does: a ``--`` comment runs to the end of its line, a ``/*`` comment to its ``*/`` or to the
+    end of the text, and the first character of anything else is SQL. So a comment marker inside another comment
+    never hides a statement (review 3 of #373). The text that is executed is never altered."""
+    position, end = 0, len(statement)
+    while position < end:
+        if statement[position] in ' \t\n\f\r;':
+            position += 1
+        elif statement.startswith('--', position):
+            newline = statement.find('\n', position + 2)
+            position = end if newline < 0 else newline + 1
+        elif statement.startswith('/*', position):
+            closing = statement.find('*/', position + 2)
+            position = end if closing < 0 else closing + 2
+        else:
+            return True
+    return False
+
+
 def _statements(ddl: str):
     statement = ''
     for line in ddl.splitlines(keepends=True):
@@ -880,7 +959,7 @@ class FakeStore(EventStore):
     _SYNCHRONOUS = 'OFF'
     _SYNCHRONOUS_LEVEL = 0
 
-    def __init__(self, *, clock: Callable[[], float] | None = None, log: list | None = None) -> None:
+    def __init__(self, log: list | None = None, *, clock: Callable[[], float] | None = None) -> None:
         folder = tempfile.mkdtemp(prefix='events-fake-store-')
         self._finalizer = weakref.finalize(self, shutil.rmtree, folder, True)
         self._setup(os.path.join(folder, 'events.sqlite3'), clock)

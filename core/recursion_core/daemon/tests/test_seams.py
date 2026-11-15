@@ -7,6 +7,7 @@ the documented arguments. With nothing registered the composition is the one it 
 """
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,11 +19,13 @@ import threading
 import unittest
 from unittest import mock
 
+import recursion_core.control.tests.test_seams as control_seams
 import recursion_core.daemon as daemon_module
 from recursion_core.control import hooks as H, methods
 from recursion_core.control.client import SocketAPI
 from recursion_core.control.tests.test_seams import (
-    FakeStore, Service, WatchedLock as OwnerLock, answered_from_another_thread, quiet, row_names_service, watch)
+    LANDED_WITH_AN_ENGINE, FakeLanes, FakeStore, RegionWalk, Service, WatchedLock as OwnerLock,
+    answered_from_another_thread, landed, quiet, row_names_service, watch)
 from recursion_core.daemon import Daemon, Registry, control_adapter as adapter, launcher
 from recursion_core.daemon.tests.test_composition import (
     BOOT, LINUX, LINUX_ONLY, STANDIN, ProcessUnitManager, Units, until,
@@ -96,9 +99,16 @@ def close_waits(case, made, store, close, entered, leave, admitted=1):
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
 class Composed(unittest.TestCase):
-    """A composed daemon, as in ``test_composition.ComposedDaemonTest``."""
+    """A composed daemon, as in ``test_composition.ComposedDaemonTest``.
+
+    A ``boot()`` that is given no hooks composes them from the installed registrants, which is the daemon's own
+    path. These tests are about a tree in which no lane has landed, whatever this tree holds on the day they run:
+    every registrant that is really here gets a stand-in that registers nothing, for the test (the fixture of the
+    control-side tests). A test's own fake lane is installed over that. Each lane tests its own registration."""
 
     def setUp(self):
+        self.lanes = FakeLanes(self)                # made first, so it is cleaned last: after the composition has closed
+        self.lanes.stand_in_for_the_installed()
         self.tmp = Path(tempfile.mkdtemp(prefix='rc-seams-'))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         os.chmod(self.tmp, 0o700)
@@ -244,7 +254,6 @@ class NothingRegisteredTest(Composed):
     def test_a_registrant_that_is_absent_changes_nothing_and_one_that_is_broken_stops_the_composition(self):
         # The composition imports its registrants by their own names, so a lane is faked under its real name, for
         # as long as the block lasts.
-        from recursion_core.control.tests.test_seams import FakeLanes
         with contextlib.ExitStack() as installed:
             lanes = FakeLanes(mock.Mock(addCleanup=installed.callback))
             lanes.lane('keys')                                                # a lane's package with no hooks module
@@ -263,6 +272,23 @@ class NothingRegisteredTest(Composed):
                 self.assertEqual(self.open, [])
         _, composed = self.boot()  # and the next composition starts
         self.assertEqual(self.api(composed).call('run.list')['code'], 'ok')
+
+
+class LandedLaneTest(Composed):
+    """What ``Composed.setUp`` promises, held: a lane that has really landed does not change what these tests
+    compose. A module that plays a lane's real registrant is in the tree BEFORE the fixture is made."""
+
+    def setUp(self):
+        real, _, _ = landed(self, LANDED_WITH_AN_ENGINE)
+        self.assertEqual(importlib.util.find_spec('recursion_core.control.scopes').origin, real.__file__,
+                         'it is installed: a composition would find it, and its engine')
+        super().setUp()
+
+    def test_a_boot_that_is_given_no_hooks_is_the_bare_composition_whatever_has_landed(self):
+        _, composed = self.boot()
+        made = composed.hooks
+        self.assertEqual((made.gate.enabled, made.methods.registered(), made.commands.names(), tuple(made.engines.names())),
+                         (False, (), (), ('claude_code', 'codex')))
 
 
 class AuthorizeSeamTest(Composed):
@@ -1509,6 +1535,60 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 starter._settle(ctx)
             self.assertEqual((ctx.process.fence.call_args_list, ctx.process.close.call_count), (fenced, 1))
 
+    @quiet
+    def test_an_owner_registered_alone_is_waited_for_and_its_settling_fences_nothing_once_closing_began(self):
+        """The fourth reads. A lane can register ``drive_owner`` and nothing else: no service, no handler, no
+        store. The gate is on all the same (``Admission`` in ``control/hooks.py``), so what S9 says of closing
+        holds for that owner too. It fails before it has made any worker, what it launched is being settled, and
+        closing begins in that moment: the close WAITS for the settling, which is inside the hand-over, and the
+        settling fences nothing, on its next time round and after its moment has run out. No tracing is used."""
+        for when in ('its next time round', 'after its moment has run out'):
+            process, ended = mock.Mock(), mock.Mock(closed=False)
+            inside, leave, asked = threading.Event(), threading.Event(), []
+            self.addCleanup(leave.set)
+
+            class Owner:
+                def run(self, ctx, request, service, record_result, fault_run, settle, release):
+                    ctx.process = process
+                    raise RuntimeError('failed before it made any worker')
+
+            def reconcile(run_id, asked=asked, inside=inside, leave=leave):
+                asked.append(run_id)
+                inside.set()
+                leave.wait(HELD_BOUND_S)
+                return mock.Mock(state='running')
+            made = hooks_of(drive_owner=lambda ctx, request: Owner())
+            self.assertEqual((sorted(made._single), made.gate.enabled), (['drive_owner'], True), 'the owner alone: the gate is on')
+            folder = tempfile.mkdtemp(prefix='rc-seams-settle-')
+            self.addCleanup(shutil.rmtree, folder, True)
+            starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False, reconcile=reconcile),
+                                           folder, hooks=made, start_timeout_s=0, exit_grace_s=HELD_BOUND_S)
+            clock = (lambda asked=asked: 10 * HELD_BOUND_S if asked else 0.0) if when == 'after its moment has run out' else adapter.time.monotonic
+
+            def close(made=made, ended=ended):
+                made.begin_close()
+                made.finish_close(H.ServiceContext())
+                ended.closed = True     # there is no store here: this flag says the close has ended, as a store's does
+            with self.subTest(closing_is_seen=when), mock.patch.object(adapter.time, 'monotonic', clock):
+                with self.assertRaises(adapter.StartRefused):
+                    starter(dict(DriveOwnerSeamTest.PARAMS))
+                close_waits(self, made, ended, close, inside, leave)
+                process.fence.assert_not_called()
+                process.close.assert_called_once_with()
+                self.assertEqual(len(asked), 1, 'it did not go on asking after closing had begun')
+            self.assertTrue(until(lambda: not starter.active('run-1')), 'released')
+
+    def test_with_an_owner_registered_alone_a_run_is_refused_once_closing_has_begun(self):
+        asked = []
+        made = hooks_of(drive_owner=lambda ctx, request: asked.append(ctx.run_id))
+        starter, service = self.starter(made, HELD_BOUND_S)
+        made.begin_close()
+        with self.assertRaises(adapter.StartRefused) as caught:
+            starter(dict(DriveOwnerSeamTest.PARAMS))
+        self.assertEqual((caught.exception.code, caught.exception.detail), (c.LAUNCH_REFUSED, 'daemon_closing'))
+        self.assertEqual((asked, service.requests), ([], []), 'the owner was not asked and nothing was driven')
+        self.assertTrue(until(lambda: not starter.active('run-1')))
+
     def test_once_closing_has_begun_a_run_is_refused_before_its_chooser_is_asked(self):
         store, asked = FakeStore(), []
         made = self.made(store, drive_owner=lambda ctx, request: asked.append(ctx.run_id))
@@ -1661,6 +1741,86 @@ class FakeConsumer:
 
 def doc(run_id, **more):
     return json.dumps({'run_id': run_id, **more}, sort_keys=True)
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class CompositionCloseRegionTest(RegionWalk, unittest.TestCase):
+    """The composition's own close, walked like the four regions of ``control/hooks.py`` (the walk, and what it
+    asserts at every point, are in ``control/tests/test_seams.py``). Every traceable point between the entry of
+    ``Composition.close`` and its return is interrupted once: in the close and its steps here, and in the hooks'
+    whole teardown under them. Each time the interruption reaches the caller, the close's ownership is free, and
+    the close is complete or nothing of it was done and it can be asked for again. The same oracles as there:
+    the service instances say that a stop of each returned, both references to the store are gone, each of the
+    three locks the close can take is free (its own, the lifecycle, the gate's), and a close that did not finish
+    left everything it touches as it was. How the interruption is delivered (raised from the trace callback of
+    the point it is aimed at, which is stricter than a real signal) is said once, in that file's
+    ``OwnershipRegionTest``, with what pure Python cannot protect and the one kind of point 3.14 lets pass."""
+
+    FILES = (*RegionWalk.FILES, adapter.__file__)
+
+    def at_the_marker(self) -> bool:
+        """Here a region is under a region: the lifecycle's close under the composition's. The marker of that
+        INNER region's own function is the same point one level down (3.14 only, and only a trace callback raises
+        there). What it leaves the outer close cannot mend: the lifecycle stays owned by this thread, the close
+        asks for the teardown again and is refused as a call from inside a lifecycle method, and it ends
+        unfinished. It is let pass by the same name, in that one function and no other."""
+        code, offset, outermost, event = self.raised_at
+        self.raised_at = (code, offset, outermost or code is H.Hooks.finish_close.__code__, event)
+        return super().at_the_marker()
+
+    def composition(self):
+        """A composition over stand-ins, around the hooks the control-side walk makes: a store open, two services
+        started (two, so that every loop of the teardown under the close goes round), two waiters on the closing
+        signal, and service instances that count the stops of them that returned. Cheap enough to make a few
+        hundred times. ``(the composition, its store, what its close closed)``."""
+        made, store = control_seams.OwnershipRegionTest('test_the_gates_close_at_every_event').lifecycle()
+        closed: list = []
+
+        def part(name):
+            return mock.Mock(close=lambda: closed.append(name))
+        composed = adapter.Composition(mock.Mock(), part('server'), part('door'), plugins=part('plugins'), breaker=part('breaker'),
+                                       hooks=made, context=H.ServiceContext(registry=mock.Mock(mark_changed=None)))
+        return composed, store, closed
+
+    REGIONS = {
+        'Composition.close': (lambda self: self.composition(), lambda trio: trio[0].close(), lambda trio: trio[0]._closing,
+                              lambda trio: trio[0]._closed and control_seams._lifecycle_closed((trio[0].hooks, trio[1]))
+                              and {'server', 'door', 'plugins', 'breaker'} <= set(trio[2])),
+    }
+    LOCKS = {       # the close's own ownership, and the two under it
+        'Composition.close': lambda trio: (trio[0]._closing, trio[0].hooks._lifecycle, trio[0].hooks.gate._lock),
+    }
+    STATE = {       # everything the close touches: what the teardown touches, how far the close has got, what it closed
+        'Composition.close': lambda trio: (control_seams._teardown_touches((trio[0].hooks, trio[1])), trio[0]._closed,
+                                           trio[0]._close_step, tuple(trio[2])),
+    }
+
+    def test_the_compositions_close_has_no_loop_and_no_try_written_in_it(self):
+        self.straight(adapter, 'Composition', 'close')
+
+    def test_a_close_called_from_inside_the_close_is_refused_and_takes_nothing_from_the_one_under_way(self):
+        """The refusal is before the region, where the region's own "this thread owns it already" could not tell a
+        close gone round again from a close called from inside the close: the refused call closes nothing and
+        does not release the ownership of the close that is under way."""
+        composed, store, closed = self.composition()
+        composed._closing.acquire()         # this thread is inside the close
+        try:
+            with self.assertRaises(H.HookError):
+                composed.close()
+            self.assertTrue(composed._closing._is_owned(), 'the close under way still owns the close')
+            self.assertEqual((composed._closed, store.closed, closed), (False, False, []), 'and nothing was closed')
+        finally:
+            composed._closing.release()
+        composed.close()
+        self.assertEqual((composed._closed, store.closed, composed._closing._is_owned()), (True, True, False))
+
+    @quiet
+    def test_the_compositions_close_at_every_event(self):
+        self.walk('Composition.close', self.EVENTS)
+
+    @quiet
+    def test_the_compositions_close_at_every_instruction(self):
+        self.by_instruction('Composition.close')
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
@@ -2273,7 +2433,7 @@ class ServicesSeamTest(Composed):
         import sys
         method = adapter.Composition.close
         lines, start = inspect.getsourcelines(method)
-        target = start + next(index for index, line in enumerate(lines) if line.strip() == 'while not self._closed:')
+        target = start + next(index for index, line in enumerate(lines) if line.strip() == 'self._close_until_done(kept)')
         for where in ('the call of the taking', 'the return of the taking', 'the first line after it'):
             made, store, composed, counts = self.about_to_close()
             fired = []

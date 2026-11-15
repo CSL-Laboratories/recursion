@@ -478,8 +478,9 @@ class RouteStarter:
                 self.results[run_id] = result
 
     def _composition_closing(self):
-        """The composition is closing with something registered into it (the gate is on and shut). With nothing
-        registered this is never true, so everything that asks it is then what it was before the seams."""
+        """The composition is closing with something registered into it that the gate guards (the gate is on and
+        shut): a handler, a service, an event store, or a drive owner, alone or not. With nothing registered
+        this is never true, so everything that asks it is then what it was before the seams."""
         gate = self._hooks.gate if self._hooks is not None else None
         return gate is not None and gate.enabled and gate.closed
 
@@ -1067,29 +1068,41 @@ class Composition:
         One case ends it unfinished: a step that must return and cannot (see ``_close``). The close then raises
         with the composition NOT closed and nothing after that step touched; a later close goes on from it.
 
-        The taking of the ownership, the way back from it and the steps are ONE protected region, as in the
-        lifecycle (``control/hooks.py``): an interruption on the return from the taking is kept like any other,
-        the ownership is released where this thread has it, and the close is taken up again. A close called
-        from inside the close is refused before any of it. (Not claimed: an interruption inside the release.)"""
+        The taking of the ownership, the steps AND THE RELEASE are one protected region, in the form of the
+        lifecycle's (the comment OWNERSHIP in ``control/hooks.py``, with what that form cannot cover): an
+        interruption anywhere in it is kept and the region is gone round again, and it is left only when the
+        steps are done, or cannot go on, and what this thread held is released. A close called from inside the
+        close is refused before any of it."""
         kept = []
         if self._closing._is_owned():
             raise control_hooks.HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+        done = False
         while True:
             try:
-                control_hooks.own_teardown(self._closing, kept)
-                while not self._closed:
-                    try:
-                        if not self._close(kept):
-                            break  # a step that must return cannot, on this thread: unfinished, and raised below
-                    except BaseException as exc:  # noqa: BLE001 - between two steps: kept, and the close goes on
-                        kept.append(exc)
-                break
-            except BaseException as exc:  # noqa: BLE001 - on the way back from the taking: kept, and tried again
-                kept.append(exc)
-            finally:
+                if not done:
+                    if not self._closing._is_owned():
+                        control_hooks.own_teardown(self._closing, kept)
+                    self._close_until_done(kept)
+                    done = True
                 if self._closing._is_owned():
                     self._closing.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                kept.append(exc)
         control_hooks.raise_kept(kept)
+
+    def _close_until_done(self, kept):
+        """Take the steps until the close is complete, or until a step that must return cannot (it is then left
+        unfinished, which what was kept says). The caller owns the close. This is a method of its own because a
+        protected region has no loop and no try written in it (OWNERSHIP): whatever interrupts this, between two
+        steps as anywhere else, either is kept here or reaches the region as one out of this call, which the
+        region covers, and this is gone into again."""
+        while not self._closed:
+            try:
+                if not self._close(kept):
+                    return
+            except BaseException as exc:  # noqa: BLE001 - between two steps: kept, and the close goes on
+                kept.append(exc)
 
     def _close(self, kept):
         """Seam S13. First no new client call is admitted, on any entry, and whoever waits is told. Then the

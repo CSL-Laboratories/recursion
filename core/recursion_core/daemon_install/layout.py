@@ -224,7 +224,8 @@ def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
     again and must still name the file read (``still_names``): while the descriptor is open its inode
     cannot be given to another file, so the comparison holds (after the close, a file made again at
     the path could take the freed number). A file not there at the open is ``unit_missing`` (the
-    installer's code, as for every refusal here), not a file of the wrong type."""
+    installer's code, as for every refusal here), not a file of the wrong type. The ``fstat`` returned
+    is for ``file_untrusted``; a caller that must compare the path again uses ``held_regular``."""
 
     with held_regular(path) as read:
         return read
@@ -233,8 +234,9 @@ def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
 @contextlib.contextmanager
 def held_regular(path: str):
     """``read_regular_and_stat``'s read, yielding ``(bytes, fstat)`` with the descriptor still open, after
-    ``still_names`` has passed; what the caller does by name inside the block (``uninstall`` removes the
-    unit) is done to the file it read, up to that one lookup."""
+    ``still_names`` has passed. What the caller then does by name inside the block (``uninstall`` removes
+    the unit) meets the file read unless another file was put at the name since that lookup: no
+    call by name can close that last window, which this keeps to the few statements in the block."""
 
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -304,12 +306,15 @@ def write_exclusive(path: str, data: bytes, mode: int) -> None:
 
 
 def replace_regular(path: str, data: bytes, mode: int) -> None:
-    """Replace a regular file with ``data``. A link at ``path`` is refused, not followed; a file no longer
-    there (a concurrent ``uninstall``) is ``unit_missing``, not a file of the wrong type."""
+    """Replace a regular file with ``data``. One lookup decides: nothing there (a concurrent
+    ``uninstall``) is ``unit_missing``; a link (refused, not followed) or anything but a regular file
+    is ``not_regular``; a regular file is replaced (one removed after the lookup is written anew)."""
 
-    if not os.path.lexists(path):
-        raise InstallRefused("unit_missing", f"{path} is not there; run the command again")
-    if os.path.islink(path) or not os.path.isfile(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise InstallRefused("unit_missing", f"{path} is not there; run the command again") from None
+    if not stat.S_ISREG(info.st_mode):
         raise InstallRefused("not_regular", path)
     tmp = _write_temp(path, data, mode)
     try:
@@ -321,13 +326,19 @@ def replace_regular(path: str, data: bytes, mode: int) -> None:
 
 
 def unlink_regular(path: str) -> bool:
-    """Remove the regular file at ``path``. Missing is not an error (False); a link or folder is refused."""
+    """Remove the regular file at ``path``. Missing is not an error (False), also when another caller
+    removed it between this function's one lookup and its unlink; a link or folder is refused."""
 
-    if not os.path.lexists(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
         return False
-    if os.path.islink(path) or not os.path.isfile(path):
+    if not stat.S_ISREG(info.st_mode):
         raise InstallRefused("not_regular", path)
-    os.unlink(path)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:  # removed by another caller since the lookup above
+        return False
     _fsync_dir(os.path.dirname(path))
     return True
 

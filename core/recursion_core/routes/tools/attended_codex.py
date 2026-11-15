@@ -13,8 +13,31 @@ exact literal texts the driver matches on (today one: the ChatGPT-auth error of 
     python core/recursion_core/routes/tools/attended_codex.py schema \\
         --out core/recursion_core/routes/engines/fixtures/codex [--codex codex] [--native <codex binary>]
 
-The founder-attended run of the driver (two turns, a resume, an approval denied then approved, the
-process tree, stdout captured as fixtures) is a later mode of this tool and is not built yet.
+Mode ``run`` is the founder-attended run of the session driver (``routes/engines/codex.py``), for Lucas,
+signed in with his own ``codex login`` (the tool never reads, copies or asks for a credential; the child's
+environment keeps only the names Codex needs to find its own login and drops every API-key name, so the
+run uses that login). It starts ONE app-server worker in a scratch working folder, and turns what is
+typed into driver calls:
+
+    text           a user message: a new turn, or, while a turn is in progress, a steer into it
+    y / n          approve / deny the oldest approval the engine asked for (shown in full first)
+    /interrupt     the protocol's turn interrupt
+    /stop          end the worker (standard input ended), keeping the thread id
+    /resume        a new worker that resumes that thread (thread/resume)
+    /quit          end the worker and the tool
+
+Everything is captured under ``--out``: ``version.txt`` (``codex --version``), and per worker
+``worker-N.stdout.jsonl``, ``worker-N.stdin.jsonl``, ``worker-N.stderr.txt`` and ``worker-N.drafts.jsonl``
+(what the driver made of each line). The steps Lucas runs, in a scratch git folder:
+"list the files", then "count them"; /stop, then /resume and one more message; ask Codex to create a
+file, n, ask again, y; while a turn runs, list the worker's child processes (the tool prints the pid
+and the command): no updater may appear; /quit. The captures become the driver's fixtures (PR 4).
+
+    python core/recursion_core/routes/tools/attended_codex.py run --workdir <scratch git folder> \\
+        --out <scratch capture folder> [--codex <codex binary>] [--model <model>]
+
+This mode uses a plain local launcher in the working folder; the daemon's own launcher (the brief's
+"through the daemon's launcher in a scratch state folder") is Linux-only and not wired here yet.
 """
 
 from __future__ import annotations
@@ -23,9 +46,13 @@ import argparse
 import hashlib
 import json
 import mmap
+import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 NO_UPDATE = ("-c", "check_for_update_on_startup=false")  # the same override routes/codex.py launches with
@@ -170,6 +197,212 @@ def schema_mode(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- mode run ---------------------------------------------------------------------------------------------
+# Names a Codex child may inherit for the founder run: what it needs to find its own login and run tools.
+# Every API-key name is left out, so the run uses Codex's own login (Lucas, Nov 8: "Codex's own login only").
+CHILD_ENV_NAMES = ("PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+                   "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "LANG",
+                   "LC_ALL", "LC_CTYPE", "TERM", "TZ", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                   "XDG_STATE_HOME", "XDG_RUNTIME_DIR")
+_EOF = object()
+
+
+def child_env(parent: dict) -> dict:
+    return {k: v for k, v in parent.items() if k.upper() in CHILD_ENV_NAMES}
+
+
+class LocalProcess:
+    """routes.launch's EngineProcess over a plain child process, capturing both directions."""
+
+    def __init__(self, argv: list[str], env: dict, cwd: str, out: Path, tag: str) -> None:
+        self._stdout = (out / f"{tag}.stdout.jsonl").open("w", encoding="utf-8", newline="\n")
+        self._stdin = (out / f"{tag}.stdin.jsonl").open("w", encoding="utf-8", newline="\n")
+        self._stderr = (out / f"{tag}.stderr.txt").open("wb")
+        # Binary pipes: each line is exactly its UTF-8 bytes and one LF, on Windows too (no CRLF translation).
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
+                                     cwd=cwd, env=env)
+        self._lines: queue.Queue = queue.Queue()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        for raw in self.proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            self._stdout.write(line + "\n")
+            self._stdout.flush()
+            self._lines.put(line)
+        self._stdout.close()
+        self.proc.stdout.close()
+        self._lines.put(_EOF)
+
+    def send(self, line: str) -> None:
+        self._stdin.write(line + "\n")
+        self._stdin.flush()
+        self.proc.stdin.write(line.encode("utf-8") + b"\n")
+        self.proc.stdin.flush()
+
+    def close_stdin(self) -> None:
+        if not self.proc.stdin.closed:
+            self.proc.stdin.close()
+
+    def read_line(self, timeout_s: float):
+        from recursion_core.routes.launch import ReadTimeout
+
+        try:
+            item = self._lines.get(timeout=max(timeout_s, 0.001))
+        except queue.Empty:
+            raise ReadTimeout() from None
+        return None if item is _EOF else item
+
+    def fence(self, reason: str) -> None:
+        """End the worker (the founder run's stand-in for the daemon's fence) and close the captures."""
+        self.close_stdin()
+        if self.proc.poll() is None:
+            self.proc.terminate()
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        self._stdin.close()
+        self._stderr.close()
+
+
+class Console:
+    """The approvals port for the founder run: it keeps each request and the person at the keyboard answers."""
+
+    def __init__(self, say) -> None:
+        self.say, self.pending, self.count = say, [], 0
+
+    def request(self, effect: dict, binding: dict) -> str:
+        self.count += 1
+        approval_id = f"apr-attended-{self.count}"
+        self.pending.append((approval_id, effect))
+        self.say(f"APPROVAL {approval_id}: {json.dumps(effect, indent=1, sort_keys=True)}\n  answer y or n")
+        return approval_id
+
+
+def session_loop(driver, commands, say, console, *, env: dict | None = None, session_id: str = "ses-attended",
+                 route: dict | None = None, read_s: float = 1.0) -> dict:
+    """Run the founder's commands against ``driver``. Returns what it saw, for the capture and for tests.
+
+    After each command it reads the worker's output until the turn has ended or an approval waits for an
+    answer, so a steer is not offered here (``input()`` is not read during a turn)."""
+
+    from recursion_core.routes.driver import DriverRefused, DriverStateError
+    from recursion_core.routes.launch import ReadTimeout
+
+    route = route or {"engine": "codex", "model": None, "connection": {"kind": "subscription", "id": "own-login"}}
+    seen = {"threads": [], "drafts": [], "workers": 0}
+    state = {"handle": None, "turn": 0, "delivery": 0}
+
+    def start(esid):
+        seen["workers"] += 1
+        record = {"session_id": session_id, "run_id": f"attended-{seen['workers']}", "workspace": None,
+                  "route": route, "engine_session_id": esid}
+        call = driver.start if esid is None else driver.resume
+        state["handle"] = call(record, env or {})
+        seen["threads"].append(state["handle"].engine_session_id)
+        say(f"worker {seen['workers']} on thread {state['handle'].engine_session_id}")
+
+    def pump():
+        handle = state["handle"]
+        while True:
+            try:
+                drafts = driver.pump(handle, read_s)
+            except ReadTimeout:
+                if handle.live_turn is None or console.pending:
+                    return
+                continue
+            if drafts is None:
+                say("the worker ended its output")
+                return
+            for d in drafts:
+                seen["drafts"].append(d)
+                say(f"{d['type']}: {json.dumps(d['payload'], sort_keys=True)}")
+
+    def step(line: str) -> bool:
+        handle = state["handle"]
+        if line in ("y", "n") and console.pending:
+            approval_id, _ = console.pending.pop(0)
+            driver.send(handle, {"kind": "approval_answer", "approval_id": approval_id,
+                                 "decision": "approve" if line == "y" else "deny"})
+        elif line == "/interrupt":
+            if handle.live_turn is not None:
+                driver.interrupt(handle, handle.live_turn)
+        elif line in ("/stop", "/quit"):
+            driver.send(handle, {"kind": "close"})
+            pump()
+            console.pending.clear()
+            return line == "/quit"
+        elif line == "/resume":
+            start(seen["threads"][-1])
+            return False
+        else:
+            state["delivery"] += 1
+            if handle.live_turn is None:
+                state["turn"] += 1
+            driver.send(handle, {"kind": "user_message", "turn_id": handle.live_turn or f"turn-{state['turn']}",
+                                 "text": line, "delivery_id": f"dlv-{state['delivery']}"})
+        pump()
+        return False
+
+    start(None)
+    for raw in commands:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            if step(line):
+                break
+        except (DriverRefused, DriverStateError) as err:
+            say(f"refused: {err}")
+    return seen
+
+
+def run_mode(args: argparse.Namespace) -> int:
+    from recursion_core.routes.engines.codex import CodexDriver
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "version.txt").write_text(_run([args.codex, "--version"]) + "\n", encoding="utf-8", newline="\n")
+    workers = []
+
+    def launcher(argv, *, env, shell=False):
+        proc = LocalProcess(argv, env=env, cwd=args.workdir, out=out, tag=f"worker-{len(workers) + 1}")
+        workers.append(proc)
+        pid = proc.proc.pid
+        tree = (f"Get-CimInstance Win32_Process -Filter ParentProcessId={pid}" if os.name == "nt"
+                else f"ps --forest -o pid,ppid,args -g $(ps -o sid= -p {pid})")
+        print(f"[worker pid {pid}; list its children with: {tree}]")
+        return proc
+
+    drafts = (out / "drafts.jsonl").open("w", encoding="utf-8", newline="\n")
+
+    def say(text: str) -> None:
+        print(text, flush=True)
+
+    console = Console(say)
+    driver = CodexDriver(launcher, time.monotonic, binary=args.codex, approvals=console)
+    route = {"engine": "codex", "model": args.model, "connection": {"kind": "subscription", "id": "own-login"}}
+
+    def typed():
+        while True:
+            try:
+                yield input("> ")
+            except EOFError:
+                yield "/quit"
+                return
+
+    seen = session_loop(driver, typed(), say, console, env=child_env(dict(os.environ)), route=route)
+    for d in seen["drafts"]:
+        drafts.write(json.dumps(d, sort_keys=True) + "\n")
+    drafts.close()
+    for proc in workers:
+        proc.fence("attended_run_over")
+    print(f"captured in {out}: threads {seen['threads']}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="mode", required=True)
@@ -177,8 +410,13 @@ def main(argv: list[str] | None = None) -> int:
     schema.add_argument("--out", required=True, help="the fixtures folder (routes/engines/fixtures/codex)")
     schema.add_argument("--codex", default="codex", help="the codex command (default: codex)")
     schema.add_argument("--native", help="the native codex binary, to check the driver's literal texts")
+    run = sub.add_parser("run", help="the founder-attended run of the session driver")
+    run.add_argument("--workdir", required=True, help="a scratch git folder the worker runs in")
+    run.add_argument("--out", required=True, help="a scratch folder for the captures")
+    run.add_argument("--codex", default="codex", help="the codex binary (default: codex)")
+    run.add_argument("--model", default=None, help="a model to ask for (default: Codex's own)")
     args = parser.parse_args(argv)
-    return schema_mode(args)
+    return schema_mode(args) if args.mode == "schema" else run_mode(args)
 
 
 if __name__ == "__main__":

@@ -36,31 +36,59 @@ not run by this lane):
 
 How a run ends (``OneShotParser.finish``), first match wins:
 
-1. a line that is not one JSON object with a string ``type``, or a second ``end``: ``protocol_error``;
-2. the process ended on a signal (a negative return code, 130 or 143): ``engine_exited``;
-3. an ``error`` line: ``short_fault`` when its text sounds like a quota (the shared rule,
+1. a line that is not blank and is not one JSON object with a string ``type``, a tool line whose
+   ``toolCallId`` or ``status`` is not a string, or a second ``end``: ``protocol_error``. The last line
+   counts here only if it ends with its newline;
+2. the process ended on a signal (a negative return code, 130 or 143): ``engine_exited``. A kill that
+   lands inside a write leaves a last line with no newline; it is a cut line, not a protocol fault;
+3. a last line with no newline that is not one typed JSON object, with no signal: ``protocol_error``;
+4. an ``error`` line: ``short_fault`` when its text sounds like a quota (the shared rule,
    ``contract.sounds_like_quota``, decided by Lucas as grill Q23), else ``engine_error``. Never a plan
    limit: text never trips a connection;
-4. an ``end`` line whose stop reason is ``end_turn``, with exit 0: success (code null);
-5. an ``end`` line with any other stop reason, or after ``max_turns_reached``: ``engine_error``, the
+5. an ``end`` line whose stop reason is ``end_turn``, with exit 0: success (code null);
+6. an ``end`` line with any other stop reason, or after ``max_turns_reached``: ``engine_error``, the
    stop reason in the detail; an ``end_turn`` with a non-zero exit is ``engine_error`` too;
-6. no ``end`` and no ``error``: ``engine_error`` for exit 1, else ``engine_exited``.
+7. no ``end`` and no ``error``: ``engine_error`` for exit 1, else ``engine_exited``.
+Whatever the code, the detail ends with how many tool calls got no draft because their input has no
+RFC 8785 form, when there were any, so such a run never looks complete.
 
 Usage is never 0 because it was not known (event.v1, ``token_count``): a per-response ``usage`` line
-whose five counts are all 0 is unknown, not free; the turn's counts are a lower bound when
-``usage_is_incomplete`` is set; the cost is known only from ``total_cost_usd_ticks`` or
-``total_cost_usd`` when neither withholding flag is set. A per-response line covers one model call
-(span ``call``); the totals on ``end`` or ``error`` cover the turn (span ``turn``). Neither names the
-model, except the totals when ``modelUsage`` names exactly one.
+or turn totals with no count above 0 are unknown, not free; the turn's counts are a lower bound when
+``usage_is_incomplete`` is set; the cost is known only from ``total_cost_usd_ticks`` or a finite
+``total_cost_usd`` when neither withholding flag is set. Two things print a ``usage`` line
+(``headless/reducer/acp.rs:147-169``): one model response (``ResponseCompleted``, with an optional
+``messageId``, ``stopReason`` and ``signature``) and the whole turn summed over every model call
+(``TurnUsage``, ``extensions/notification.rs:1188-1190``, with none of them). A line that carries any of
+the three is one call (span ``call``). A line with none of them may be either, so it gets no draft (it
+is counted in ``ignored``; its raw line is in ``engine.output``): the totals on ``end`` or ``error``
+cover the turn (span ``turn``). Neither names the model, except the totals when ``modelUsage`` names
+exactly one.
 
 A ``tool.call`` carries ``input_digest``, the SHA-256 of the input as RFC 8785 writes it, taken with
-the core's own writer (``control.methods.canonical_text``). An input with no RFC 8785 form (an
-integer beyond 2**53, a lone surrogate) gets no ``tool.call`` draft; its raw line is still in
-``engine.output`` and the case is counted in ``OneShotParser.ignored``.
+the core's own writer (``control.methods.canonical_text``); the input itself is carried only when it
+is an object whose RFC 8785 text is at most ``MAX_TOOL_INPUT_BYTES`` UTF-8 bytes. An input with no
+RFC 8785 form (an integer beyond 2**53, a lone surrogate) gets no ``tool.call`` draft; its raw line is
+still in ``engine.output``, the case is counted in ``OneShotParser.ignored`` and named in the
+result's detail. A tool line whose ``toolCallId`` or ``status`` is not a string is a protocol fault; a
+string id that is empty, too long or holds a line break is counted and drafts nothing. A
+``tool.result`` text is the call's text content blocks, else its raw output as RFC 8785 writes it;
+raw output with no RFC 8785 form gives an empty text marked truncated (counted), never another
+spelling such as ``Infinity``.
+
+What is public. ``OneShotParser`` (``parse``, ``finish``, ``outcome``), ``parse_run``,
+``decode_line``, ``GrokProtocolError``, ``DECLARATION`` (read-only) and ``declaration()`` (a plain
+copy), ``oneshot_argv`` and the constants above the first class. The parser's attributes (``text``, ``engine_session_id``, ``request_id``,
+``stop_reason``, ``offset``, ``ignored``) describe one run in memory; they are not a format to resume
+from, and ``start_offset`` restores only the byte count, not what the parser had seen.
 
 Byte offsets. ``engine.output`` names a span of the output file by byte offsets. Pass each line
 exactly as it stands in that file, with its newline; the parser counts UTF-8 bytes from
-``start_offset``.
+``start_offset`` (a byte kept by ``surrogateescape`` counts as the one byte it was).
+
+Text no UTF-8 writer can write. A lone surrogate (from a JSON escape such as ``\\ud800``, or a byte that
+is not UTF-8 kept by the reader) is written as U+FFFD before anything is read from the line, in the
+``engine.output`` text and in every string of the decoded line; so a digest is of the cleaned input.
+A count or a tick total above 2**53 - 1 has no exact RFC 8785 form and is unknown.
 """
 
 from __future__ import annotations
@@ -70,6 +98,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 
 from recursion_core.routes import contract as c
 
@@ -83,11 +112,12 @@ UPDATER_OFF_ENV = (("GROK_DISABLE_AUTOUPDATER", "1"),)
 
 # driver.v2's declaration of the one-shot drive. One prompt per process, nothing written to it after
 # the start, no typed limit; usage is read from typed fields. Resume (``--resume <id>``) exists on this
-# drive but is not claimed before a driver and a test show it.
-DECLARATION = {
+# drive but is not claimed before a driver and a test show it. Read-only (a consumer cannot change it
+# for everyone); ``declaration()`` gives a plain copy, for a schema check or a record.
+DECLARATION = MappingProxyType({
     "engine": ENGINE,
     "driver": 2,
-    "flags": {
+    "flags": MappingProxyType({
         "multi_turn": False,
         "mid_turn_input": False,
         "interrupt": False,
@@ -96,9 +126,14 @@ DECLARATION = {
         "permission_bridge": False,
         "typed_limits": False,
         "usage": True,
-    },
+    }),
     "input_ack": False,
-}
+})
+
+
+def declaration() -> dict:
+    """``DECLARATION`` as a new plain dict (driver.v2's root record)."""
+    return {**DECLARATION, "flags": dict(DECLARATION["flags"])}
 
 # Stop reasons the headless guide names for ``end`` (14-headless-mode.md:239-243).
 STOP_END_TURN = "end_turn"
@@ -107,12 +142,19 @@ STOP_MAX_TURN_REQUESTS = "max_turn_requests"
 _TERMINAL_TOOL_STATUS = {"completed": "ok", "failed": "error"}
 _SIGNAL_EXITS = {130: 2, 143: 15}   # 128 + SIGINT, 128 + SIGTERM (headless guide, "Exit Codes")
 _TICKS_PER_USD = 10 ** 10
-_CONNECTION = re.compile(r"(subscription|api_key|passthrough):.+")
+# The largest integer RFC 8785 can write (2**53 - 1): a count or a tick total above it has no exact
+# canonical form, so it is unknown, never a known value.
+_MAX_EXACT_INT = 2 ** 53 - 1
+# common.v1's connection_id: '<kind>:<id>', at most 256 characters, no CR and no LF.
+_CONNECTION = re.compile(r"(subscription|api_key|passthrough):[^\r\n]+")
 _ONE_LINE = re.compile(r"[^\r\n]+")
+# A usage line that carries any of these is one model response (ResponseCompleted).
+_RESPONSE_IDENTITY = ("messageId", "stopReason", "signature")
 
-# Caps. An input larger than this is not carried (its digest still is); a result text longer than this
-# is cut and marked truncated; an error detail is cut.
-MAX_TOOL_INPUT_CHARS = 64 * 1024
+# Caps. An input whose RFC 8785 text is longer than this many UTF-8 bytes is not carried (its digest
+# still is); a result text longer than this many characters is cut and marked truncated; an error
+# detail is cut to this many characters.
+MAX_TOOL_INPUT_BYTES = 64 * 1024
 MAX_TOOL_RESULT_CHARS = 16 * 1024
 MAX_DETAIL_CHARS = 2000
 
@@ -133,33 +175,66 @@ def oneshot_argv(*, prompt_file: str, model: str | None, binary: str | None = No
     executable = DEFAULT_EXECUTABLE if binary is None else binary
     if not isinstance(executable, str) or not executable or "\x00" in executable:
         raise c.RouteError(c.LAUNCH_REFUSED, "grok: no executable")
-    if not isinstance(prompt_file, str) or not prompt_file or "\x00" in prompt_file:
+    if not isinstance(prompt_file, str) or not _ONE_LINE.fullmatch(prompt_file) or "\x00" in prompt_file:
         raise c.RouteError(c.REQUEST_INVALID, "grok: prompt file")
     argv = [executable, "--prompt-file", prompt_file, "--output-format", OUTPUT_FORMAT]
     if model is not None:
-        if not isinstance(model, str) or not model or "\x00" in model or model.startswith("-"):
+        if (not isinstance(model, str) or not _ONE_LINE.fullmatch(model) or "\x00" in model
+                or model.startswith("-")):
             raise c.RouteError(c.REQUEST_INVALID, "route.model")
         argv += ["--model", model]
     return argv
 
 
 def decode_line(line: str) -> dict:
-    """One ``streaming-json`` line as a dict with a string ``type``. Raises ``GrokProtocolError``."""
+    """One ``streaming-json`` line as a dict with a string ``type``, every lone surrogate written as
+    U+FFFD. Raises ``GrokProtocolError``."""
+
+    return _decode(line)[0]
+
+
+def _decode(line: str) -> tuple[dict, bool]:
+    """``decode_line``, and whether cleaning changed a string."""
 
     try:
-        message = json.loads(line, parse_constant=_refuse_constant)
+        raw = json.loads(line, parse_constant=_refuse_constant)
     except (ValueError, RecursionError):
         raise GrokProtocolError("stdout line is not JSON") from None
-    if not isinstance(message, dict):
+    if not isinstance(raw, dict):
         raise GrokProtocolError("stdout line is not a JSON object")
+    message = _clean_value(raw)
     kind = message.get("type")
     if not isinstance(kind, str) or not kind:
         raise GrokProtocolError("stdout line has no type")
-    return message
+    return message, message != raw
 
 
 def _refuse_constant(name: str) -> object:
     raise ValueError(name)   # NaN and Infinity are not JSON
+
+
+def _clean_text(text: str) -> str:
+    """``text`` with every lone surrogate written as U+FFFD. A lone surrogate comes from a JSON escape
+    such as ``\\ud800`` or from a reader that kept a byte that is not UTF-8 (``surrogateescape``); no
+    UTF-8 writer can write it, so no draft may carry one."""
+
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return "".join("\ufffd" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
+
+
+def _clean_value(value: object) -> object:
+    """A decoded JSON value with ``_clean_text`` applied to every string, keys included."""
+
+    if isinstance(value, str):
+        return _clean_text(value)
+    if isinstance(value, list):
+        return [_clean_value(item) for item in value]
+    if isinstance(value, dict):
+        return {_clean_text(key): _clean_value(item) for key, item in value.items()}
+    return value
 
 
 class OneShotParser:
@@ -168,11 +243,13 @@ class OneShotParser:
     ``parse(line)`` gives the drafts of one stdout line: always one ``engine.output`` (the raw line and
     its byte span), then any ``tool.call``, ``tool.result`` and ``usage`` it carries. ``finish(code)``
     gives the run's ``result`` draft from what was seen and the process's return code. Not shared
-    between threads; one parser per run.
+    between threads: one parser per run, and ``finish`` is called by the thread that calls ``parse``,
+    after the last line (a Stop or a watchdog on another thread ends the process, not the parser).
     """
 
     def __init__(self, connection_id: str, *, start_offset: int = 0) -> None:
-        if not isinstance(connection_id, str) or len(connection_id) > 256 or not _CONNECTION.fullmatch(connection_id):
+        if (not isinstance(connection_id, str) or len(connection_id) > 256 or not _CONNECTION.fullmatch(connection_id)
+                or _clean_text(connection_id) is not connection_id):
             raise ValueError("connection_id")
         if isinstance(start_offset, bool) or not isinstance(start_offset, int) or start_offset < 0:
             raise ValueError("start_offset")
@@ -187,6 +264,8 @@ class OneShotParser:
         self._max_turns = False
         self._error: str | None = None           # the first error line's message
         self._protocol: str | None = None        # the first protocol fault
+        self._cut_line: str | None = None        # why a last line with no newline did not decode
+        self._undrafted_calls = 0                # tool calls whose input has no RFC 8785 form
         self._open_calls: set[str] = set()       # tool calls drafted and not yet given a result
         self._done_calls: set[str] = set()
         self._finished = False
@@ -201,18 +280,30 @@ class OneShotParser:
             raise RuntimeError("parse after finish")
         if not isinstance(line, str):
             raise TypeError("line")
+        if self._cut_line is not None:
+            # A line with no newline was not the last after all: it is a fault like any other.
+            self._fault(self._cut_line)
+            self._cut_line = None
         start = self.offset
-        self.offset += _byte_length(line)
-        drafts = [_draft("engine.output", {"stream": "stdout", "text": line,
+        self.offset += _byte_length(line)   # the file's own bytes, before any cleaning
+        text = _clean_text(line)
+        if text is not line:
+            self._count("text_not_utf8")
+        drafts = [_draft("engine.output", {"stream": "stdout", "text": text,
                                            "offset_start": start, "offset_end": self.offset})]
         if not line.strip():
             self._count("blank_line")
             return drafts
         try:
-            message = decode_line(line)
+            message, cleaned = _decode(line)
         except GrokProtocolError as err:
-            self._fault(str(err))
+            if line.endswith("\n"):
+                self._fault(str(err))
+            else:
+                self._cut_line = str(err)   # a write cut by a kill, or a fault: finish decides
             return drafts
+        if cleaned and text is line:
+            self._count("text_not_utf8")
         kind = message["type"]
         if self._ended and kind == "end":
             self._fault("a second end line")
@@ -230,20 +321,30 @@ class OneShotParser:
 
         if self._finished:
             raise RuntimeError("finish twice")
-        if isinstance(returncode, bool) or not isinstance(returncode, int):
-            raise TypeError("returncode")
-        self._finished = True
         code, detail = self.outcome(returncode)
+        self._finished = True
         return [_draft("result", {"code": code, "detail": detail})]
 
     def outcome(self, returncode: int) -> tuple[str | None, str]:
-        """``(code, detail)`` for the run: the module docstring's table, first match wins."""
+        """``(code, detail)`` for the run: the module docstring's table, first match wins. It may be
+        asked before ``finish``; it changes nothing."""
 
+        if isinstance(returncode, bool) or not isinstance(returncode, int):
+            raise TypeError("returncode")
+        code, detail = self._outcome(returncode)
+        if self._undrafted_calls:
+            detail += (f"; {self._undrafted_calls} tool call(s) not drafted: their input has no RFC 8785 form")
+        return code, detail
+
+    def _outcome(self, returncode: int) -> tuple[str | None, str]:
         if self._protocol is not None:
             return c.PROTOCOL_ERROR, self._protocol
         signal = -returncode if returncode < 0 else _SIGNAL_EXITS.get(returncode)
         if signal is not None:
-            return c.ENGINE_EXITED, f"ended by signal {signal} (exit {returncode})"
+            cut = "; its last line was cut" if self._cut_line is not None else ""
+            return c.ENGINE_EXITED, f"ended by signal {signal} (exit {returncode}){cut}"
+        if self._cut_line is not None:
+            return c.PROTOCOL_ERROR, f"{self._cut_line} (the last line, with no newline)"
         if self._error is not None:
             code = c.SHORT_FAULT if c.sounds_like_quota(self._error) else c.ENGINE_ERROR
             return code, _cut(self._error, MAX_DETAIL_CHARS)
@@ -271,6 +372,8 @@ class OneShotParser:
 
     def _tool_call(self, message: dict, drafts: list) -> None:
         call_id = message.get("toolCallId")
+        if not self._well_typed_tool_line(message):
+            return
         if not _is_one_line(call_id, 128):
             self._count("tool_call_without_id")
             return
@@ -285,19 +388,36 @@ class OneShotParser:
             return
         tool_input = message.get("rawInput")
         try:
-            text = _canonical_text(tool_input)
-        except ValueError:
+            encoded = _canonical_text(tool_input).encode("utf-8")
+        except (ValueError, RecursionError):
             self._count("tool_input_without_rfc8785_form")
+            self._undrafted_calls += 1
             return
-        carried = tool_input if isinstance(tool_input, dict) and len(text) <= MAX_TOOL_INPUT_CHARS else None
+        carried = tool_input if isinstance(tool_input, dict) and len(encoded) <= MAX_TOOL_INPUT_BYTES else None
         drafts.append(_draft("tool.call", {
             "call_id": call_id,
             "name": name,
-            "input_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "input_digest": hashlib.sha256(encoded).hexdigest(),
             "input": carried,
         }))
         self._open_calls.add(call_id)
         self._tool_result(message, drafts)   # a call can be reported already finished
+
+    def _tool_update(self, message: dict, drafts: list) -> None:
+        if self._well_typed_tool_line(message):
+            self._tool_result(message, drafts)
+
+    def _well_typed_tool_line(self, message: dict) -> bool:
+        """A tool line's ``toolCallId`` must be a string and its ``status``, when present, a string:
+        anything else is a malformed record, a protocol fault."""
+
+        if not isinstance(message.get("toolCallId"), str):
+            self._fault(f"{message['type']} line whose toolCallId is not a string")
+            return False
+        if message.get("status") is not None and not isinstance(message["status"], str):
+            self._fault(f"{message['type']} line whose status is not a string")
+            return False
+        return True
 
     def _tool_result(self, message: dict, drafts: list) -> None:
         status = _TERMINAL_TOOL_STATUS.get(message.get("status"))
@@ -307,7 +427,9 @@ class OneShotParser:
         if call_id not in self._open_calls:
             self._count("tool_result_without_call")
             return
-        text, truncated = _result_text(message.get("content"), message.get("rawOutput"))
+        text, truncated, written = _result_text(message.get("content"), message.get("rawOutput"))
+        if not written:
+            self._count("tool_output_without_rfc8785_form")
         drafts.append(_draft("tool.result", {
             "call_id": call_id, "status": status, "text": text, "output_ref": None, "truncated": truncated,
         }))
@@ -319,9 +441,14 @@ class OneShotParser:
         if not isinstance(usage, Mapping):
             self._count("usage_line_without_usage")
             return
+        if not any(isinstance(message.get(key), str) and message[key] for key in _RESPONSE_IDENTITY):
+            # The turn's sum (TurnUsage) prints the same line with none of these; so may a response on a
+            # backend that reports none of them. Not one call, as far as can be told: no draft.
+            self._count("usage_line_without_response_identity")
+            return
         counts = [_count_of(usage.get(key)) for key in _RESPONSE_KEYS]
-        if all(value == 0 for value in counts):
-            known = None   # every bucket 0: the backend reported nothing, which is not "free"
+        if _nothing_reported(counts):
+            known = None   # no bucket above 0: the backend reported nothing, which is not "free"
         else:
             known = counts
         drafts.append(_usage_draft(self.connection_id, None, "call", known, lower_bound=False, cost=None))
@@ -360,6 +487,8 @@ class OneShotParser:
                 drafts.append(_usage_draft(self.connection_id, None, "turn", None, lower_bound=False, cost=None))
             return
         counts = [_count_of(usage.get(key)) for key in _RESPONSE_KEYS]
+        if _nothing_reported(counts):
+            counts = None   # no bucket above 0: nothing was reported, which is not "free" (as for a call)
         withheld = incomplete or message.get("cost_is_partial") is True
         drafts.append(_usage_draft(self.connection_id, _single_model(message.get("modelUsage")), "turn",
                                    counts, lower_bound=incomplete, cost=None if withheld else _cost(message)))
@@ -377,7 +506,7 @@ class OneShotParser:
 _HANDLERS = {
     "text": OneShotParser._text,
     "tool_call": OneShotParser._tool_call,
-    "tool_call_update": OneShotParser._tool_result,
+    "tool_call_update": OneShotParser._tool_update,
     "usage": OneShotParser._usage_line,
     "max_turns_reached": OneShotParser._max_turns_line,
     "end": OneShotParser._end,
@@ -428,8 +557,13 @@ def _canonical_text(value: object) -> str:
     return canonical_text(value)
 
 
+def _nothing_reported(counts: list) -> bool:
+    """No bucket above 0 (each is 0 or not a count): the engine reported nothing, which is not "free"."""
+    return all(value is None or value == 0 for value in counts)
+
+
 def _count_of(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > _MAX_EXACT_INT:
         return None
     return value
 
@@ -452,7 +586,7 @@ def _usage_draft(connection_id: str, model: str | None, span: str, counts: list 
 
 def _cost(message: dict) -> float | None:
     ticks = message.get("total_cost_usd_ticks")
-    if not isinstance(ticks, bool) and isinstance(ticks, int) and ticks >= 0:
+    if not isinstance(ticks, bool) and isinstance(ticks, int) and ticks >= 0 and ticks <= _MAX_EXACT_INT:
         return ticks / _TICKS_PER_USD
     dollars = message.get("total_cost_usd")
     if not isinstance(dollars, bool) and isinstance(dollars, (int, float)) and math.isfinite(dollars) and dollars >= 0:
@@ -468,8 +602,10 @@ def _single_model(model_usage: object) -> str | None:
     return None
 
 
-def _result_text(content: object, raw_output: object) -> tuple[str, bool]:
-    """A tool result as text: its text content blocks, else its raw output written as RFC 8785 JSON."""
+def _result_text(content: object, raw_output: object) -> tuple[str, bool, bool]:
+    """``(text, truncated, written)`` for a tool result: its text content blocks, else its raw output as
+    RFC 8785 writes it. Raw output with no RFC 8785 form gives ``("", True, False)``: an empty text that
+    says it is shorter than the output, never a spelling RFC 8785 would refuse."""
 
     parts = []
     if isinstance(content, list):
@@ -486,11 +622,11 @@ def _result_text(content: object, raw_output: object) -> tuple[str, bool]:
     else:
         try:
             text = _canonical_text(raw_output)
-        except ValueError:
-            text = json.dumps(raw_output, sort_keys=True, ensure_ascii=False, default=str)
+        except (ValueError, RecursionError):
+            return "", True, False
     if len(text) > MAX_TOOL_RESULT_CHARS:
-        return text[:MAX_TOOL_RESULT_CHARS], True
-    return text, False
+        return text[:MAX_TOOL_RESULT_CHARS], True, True
+    return text, False, True
 
 
 def _cut(text: str, limit: int) -> str:

@@ -7,7 +7,7 @@
     {"type": "end", "stopReason": "end_turn", "sessionId": "aa11bb22-cc33-4d44-8e55-ff6677889900", "requestId": "req_14", "usage": {"input_tokens": 50, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 5, "reasoning_tokens": 0, "total_tokens": 55}, "num_turns": 1, "modelUsage": {"grok-4.6": {"inputTokens": 50, "outputTokens": 5, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "modelCalls": 1, "costUSD": 0.0001}}, "total_cost_usd": 0.0001, "total_cost_usd_ticks": 1000000},
     {"type": "memory_flush_started"},
     {"type": "text", "data": "Saved: the answer is 42."},
-    {"type": "usage", "usage": {"input_tokens": 60, "output_tokens": 8, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
+    {"type": "usage", "messageId": "resp_flush_1", "stopReason": "end_turn", "usage": {"input_tokens": 60, "output_tokens": 8, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
     {"type": "memory_flush_completed", "result": "flushed", "path": "memory/notes.md"}
   ],
   "exit_code": 0,

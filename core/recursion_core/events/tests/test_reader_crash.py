@@ -13,8 +13,9 @@ the log against the registry, reading the store's file on a connection of its ow
 - the lane's table holds, for every logged run, the digest of its last event;
 - nothing logged before the restart has changed.
 
-The points: after a registry publish and before the reader's append, with the mark not yet taken and with it
-taken and the image read; just after the store's commit of the reader's transaction (the store's, so a reader
+The points: while the first pass ever made on the store is cut short (one page logged); after a registry
+publish and before the reader's append, with the mark not yet taken and with it taken and the image read;
+just after the store's commit of the reader's transaction (the store's, so a reader
 that split the event and the digest into two transactions is killed between them); and anywhere, in seeded
 rounds of random writes and reader steps. The stdout and result proofs are the tailer's and the S8 reader's
 (slice 3).
@@ -127,13 +128,16 @@ class ReaderCrashTest(unittest.TestCase):
         self.assertEqual(word, 'caught-up')
         return child
 
-    def restart(self) -> tuple:
+    def restart(self, change=None) -> tuple:
         """Start again as the daemon would and let the reader catch up. Returns (what this start logged, the
-        whole log), after checking the whole log against the registry."""
+        whole log), after checking the whole log against the registry. ``change(registry)``, when given, is a
+        registry write made before the reader exists (its mark is lost, as at a daemon start)."""
         registry = Registry(self.state)
         try:
             store = C.open_store(self.state)
             try:
+                if change is not None:
+                    change(registry)
                 before = read_log(store.path)
                 marker = H.ChangeMarker()
                 registry.mark_changed = marker.mark
@@ -180,6 +184,15 @@ class ReaderCrashTest(unittest.TestCase):
     @staticmethod
     def changed(events: list) -> list:
         return [(e['run_id'], e['payload']['reason']) for e in events if e['type'] == 'state.changed']
+
+    def test_kill_9_while_the_first_pass_is_cut_short_logs_a_run_already_logged_as_reconcile(self) -> None:
+        child = Child(self, self.state, 'cut')
+        self.assertEqual(child.line(), 'cut 0', 'one page of the first pass ever is logged; the pass is not complete')
+        child.kill()
+        new, log = self.restart(change=lambda registry: registry.state(R.RUN_A, 'running'))
+        self.assertEqual(self.changed(log), [(R.RUN_A, 'snapshot'), (R.RUN_A, 'reconcile'), (R.RUN_B, 'snapshot')],
+                         'a run this log already holds is not a first record again; one it never reached is')
+        self.assertEqual(new[0]['payload']['post_image']['daemon_row']['state'], 'running')
 
     def test_kill_9_after_a_registry_publish_and_before_the_append_gives_one_reconcile_image_per_run(self) -> None:
         child = self.start('published')

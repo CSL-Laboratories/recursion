@@ -7,7 +7,12 @@ real event store that ``changes.open_store`` opens in the same folder, SPINE's `
 registry's ``mark_changed``, and the ``ChangeReader`` bound to both. The reader is stepped here, on this thread,
 so the parent knows where the process is when it kills it.
 
-Every mode first makes the base runs if they are missing (``run-aaaa``, a daemon row; ``run-bbbb``, a control
+Mode ``cut`` is different: on an empty folder it makes two runs (``run-aaaa``, ``run-bbbb``) with their marks
+lost, steps a reader
+whose page is one run once, so the first pass ever made on the store logs ``run-aaaa`` and is not complete,
+prints ``cut <ready, 0 or 1>`` and waits.
+
+Every other mode first makes the base runs if they are missing (``run-aaaa``, a daemon row; ``run-bbbb``, a control
 record), then catches up: the reader steps until no scan is in progress and nothing is pending. It prints
 ``caught-up <number of events in the log>``. Then:
 
@@ -75,6 +80,17 @@ def main(argv) -> int:
     store = C.open_store(folder)
     marker = H.ChangeMarker()
     registry.mark_changed = marker.mark
+    if mode == 'cut':
+        reader = C.ChangeReader(marker, page=1)
+        reader.bind(registry, store)
+        registry.mark_changed = None              # no marks: only the scan logs, one page at this step
+        registry.add(RUN_A, 'boot-1')
+        registry.add(RUN_B, 'boot-1')
+        registry.mark_changed = marker.mark
+        reader.step()
+        say(f'cut {int(reader.ready)}')
+        return wait()
+
     reader = C.ChangeReader(marker)
     reader.bind(registry, store)
 

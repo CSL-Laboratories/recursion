@@ -7,31 +7,47 @@ service (S13). The marker's text is the protocol; this module follows it:
   from the registry's own file under its own lock. Nothing else is read: never the control registry's
   in-memory copy, never ``all``, ``control_all`` or ``list`` in a loop, never the file itself, never a
   connection of this lane's own, and never while a transaction of the event store is open (this module
-  calls ``events.db.require_no_transaction`` before every registry read).
+  calls ``events.db.require_no_transaction`` before every registry read: each page and each snapshot).
 - The post-image is typed, ``{daemon_row, control_record}`` (either may be null); its digest is SHA-256 of
   its RFC 8785 text (``control.methods.canonical_text``), taken after the registry's lock is released.
 - Dedupe is against the LAST image logged for that run, kept in this lane's own table: a run seen as A,
   then B, then A gives three events. The event and the run's new last digest commit in ONE transaction;
   there is no other checkpoint and nothing is acknowledged to the registry.
-- A taken batch stays pending until its commits succeed; a failure leaves it pending for the next step.
-- Scans page with ``Registry.run_ids(after, PAGE)``, one page per step, interleaved with one slice of
-  marked runs, so new marks never put off a scan that is due. A scan begins at the first step after a
-  start, and again no later than ``scan_interval_s`` after a pass completes; a dropped mark asks for a
-  scan and does not send a scan in progress back to its first page. ``ready`` is true once the first pass
-  of this start has completed.
-- ``reason``: ``commit`` for a run read because it was marked; ``snapshot`` for a run found by the first
-  pass ever made on this store (logging began after the run existed); ``reconcile`` for a run found by any
-  later scan. ``coalesced`` is null, always: the marker keeps which runs changed, not how many times.
-- A run with no session logs under ``run:<run_id>``; one whose control record names a session logs under
-  that session. The first time a run is logged with a ``launch.route_decision``, one ``route.decision``
-  event is appended from it, in the same transaction.
+- One consumer owns the order from snapshot to commit. An image whose transaction fails is HELD, and its
+  transaction is retried before any later image of that run is read. At most one image is held: no other
+  work is done after a failed transaction until the held image commits. There is no queue of old texts.
+- Waiting. After a refused page or a failed transaction the reader does nothing but take marks until a
+  wait has passed: the marker's poll interval at first, doubling at each further failure up to
+  ``scan_interval_s``, and none again after the next success. A run the registry refuses to read waits on
+  a backoff of its own and stays pending; it holds up neither the scan (the cursor moves past it) nor the
+  other runs. ``failing`` is true while anything is held or waited for.
+- A taken batch stays pending until its runs are logged. Scans page with ``Registry.run_ids(after, page)``,
+  one page per step, interleaved with one slice of at most ``slice_size`` marked runs, so new marks never
+  put off a scan that is due. A scan begins at the first step after a start, and again no later than
+  ``scan_interval_s`` after a pass completes; a dropped mark asks for a scan and does not send a scan in
+  progress back to its first page. ``ready`` is true once the first pass of this start has completed.
+- ``reason``: ``commit`` for a run read because it was marked; ``snapshot`` for a run's first record in
+  this log made by the first pass ever made on this store (logging began after the run existed);
+  ``reconcile`` for a run found by any other scan, and for a run this log already holds when a first pass
+  was cut short by a crash. ``coalesced`` is null, always: the marker keeps which runs changed, not how
+  many times.
+- A run logs under the session its current control record names; until it names one, under
+  ``run:<run_id>``. The run's log is kept beside its last digest and changed in the same transaction as
+  the event. The first time a run is logged with a ``launch.route_decision`` that is an object (event.v1's
+  payload for ``route.decision`` is one), one ``route.decision`` event is appended from it, in the same
+  transaction; a value of any other type is not logged.
+- A run whose stored record has no typed post-image (a control text that is not a JSON object, or that has
+  no RFC 8785 text: an integer past 2**53, a lone surrogate, nesting past 64), or whose event the store
+  refuses, is NOT logged: event.v1 has no typed form for it (the lane's ``questions.md``, Q12). It is listed
+  in ``unlogged`` with its code, logged at ERROR, and read again at every scan; it is logged as soon as its
+  record has a typed post-image.
 
 What this gives, and what it does not. Replay of the log reaches the registry's durable state for every
-run: the last image logged for a run equals what the registry holds once the reader has caught up.
-Changes between two reads appear as the last image: the log does NOT claim every intermediate transition
-(a transition-exact log would need a write inside Stop's durable path, which is lane STOP's to propose).
-Its source reads take the registry's lock, so a paused reader CAN delay a Stop; SPINE's S12 text states
-that cost, and nothing here adds a registry write.
+run not listed in ``unlogged``: the last image logged for a run equals what the registry holds once the
+reader has caught up. Changes between two reads appear as the last image: the log does NOT claim every
+intermediate transition (a transition-exact log would need a write inside Stop's durable path, which is
+lane STOP's to propose). Its source reads take the registry's lock, so a paused reader CAN delay a Stop;
+SPINE's S12 text states that cost, and nothing here adds a registry write.
 """
 
 from __future__ import annotations
@@ -39,6 +55,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -51,8 +68,10 @@ LOG = logging.getLogger(__name__)
 
 LANE = 'events'
 LANE_VERSION = 1
-LANE_DDL = ('CREATE TABLE events_run_images (run_id TEXT PRIMARY KEY, log_id TEXT NOT NULL, '
-            'digest TEXT NOT NULL CHECK (length(digest) = 64), route_logged INTEGER NOT NULL); '
+LANE_DDL = ('CREATE TABLE events_run_images (run_id TEXT PRIMARY KEY, '
+            "log_id TEXT NOT NULL CHECK (log_id LIKE 'ses-%' OR log_id LIKE 'run:%'), "
+            'digest TEXT NOT NULL CHECK (length(digest) = 64), '
+            'route_logged INTEGER NOT NULL CHECK (route_logged IN (0, 1))); '
             'CREATE TABLE events_scan_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL)')
 PAGE = 64
 SLICE = 64
@@ -60,10 +79,16 @@ STORE_FILE = 'events.sqlite3'
 
 _SESSION_ID = re.compile(r'ses-[A-Za-z0-9_-]{1,60}')
 _TURN_ID = re.compile(r'turn-[A-Za-z0-9_-]{1,59}')
+_RUN_FIELDS = ('run_id', 'unit', 'stop_requested', 'state', 'boot_id', 'detail')
+
+# What logging one run came to.
+_DONE = 'done'            # logged, unchanged, or listed in ``unlogged``: the run leaves the pending set
+_DEFERRED = 'deferred'    # the registry refused to read it: it stays pending, on a backoff of its own
+_HELD = 'held'            # its transaction failed: the image is held and nothing more is done this step
 
 
 class BadImage(ValueError):
-    """What the registry holds for a run has no typed post-image (a control text that is not a JSON object)."""
+    """What the registry holds for a run has no typed post-image. The message is a code."""
 
 
 def _strict_object(text: str) -> dict:
@@ -71,6 +96,8 @@ def _strict_object(text: str) -> dict:
         raise BadImage(f'control_text_not_json:{name}')
     try:
         value = json.loads(text, parse_constant=refuse)
+    except BadImage:
+        raise
     except ValueError as exc:
         raise BadImage('control_text_not_json') from exc
     if not isinstance(value, dict):
@@ -79,16 +106,25 @@ def _strict_object(text: str) -> dict:
 
 
 def post_image(row, control_text) -> dict:
-    """The typed post-image of a run, from what ``Registry.snapshot`` returned."""
+    """The typed post-image of a run, from what ``Registry.snapshot`` returned: a daemon ``Run`` or None, and
+    the control text (a ``str``) or None. Anything else is ``BadImage``."""
+    if control_text is not None and not isinstance(control_text, str):
+        raise BadImage('control_text_not_text')
     daemon_row = None
     if row is not None:
+        if not all(hasattr(row, name) for name in _RUN_FIELDS):
+            raise BadImage('daemon_row_not_a_run')
         daemon_row = {'run_id': row.run_id, 'unit': row.unit, 'stop': bool(row.stop_requested), 'state': row.state,
                       'boot_id': row.boot_id, 'detail': row.detail}
     return {'daemon_row': daemon_row, 'control_record': None if control_text is None else _strict_object(control_text)}
 
 
 def image_digest(image: dict) -> str:
-    """SHA-256 of the post-image's RFC 8785 text (digest form rfc8785/v1, as event.v1 names it)."""
+    """SHA-256 of the post-image's RFC 8785 text (digest form rfc8785/v1, as event.v1 names it). A value that
+    is not a run's post-image is ``BadImage``; one with no RFC 8785 text is ``NoCanonicalText`` (both are
+    ``ValueError``)."""
+    if not isinstance(image, dict) or set(image) != {'daemon_row', 'control_record'}:
+        raise BadImage('not_a_post_image')
     return hashlib.sha256(canonical_text(image).encode('utf-8')).hexdigest()
 
 
@@ -99,9 +135,15 @@ def _launch(image: dict) -> dict:
 
 
 def log_id_of(run_id: str, image: dict) -> str:
-    """The run's session, when its record names one; otherwise ``run:<run_id>``."""
+    """The session the run's record names, when it names one that is a log id; otherwise ``run:<run_id>``."""
     session = _launch(image).get('session_id')
     return session if isinstance(session, str) and _SESSION_ID.fullmatch(session) else f'run:{run_id}'
+
+
+def _code(exc: ValueError) -> str:
+    if isinstance(exc, BadImage):
+        return str(exc)
+    return f'{type(exc).__name__}:{exc}'[:120]
 
 
 class ChangeReader:
@@ -111,20 +153,37 @@ class ChangeReader:
 
     def __init__(self, marker, *, scan_interval_s: float = 60.0, page: int = PAGE, slice_size: int = SLICE,
                  monotonic=time.monotonic) -> None:
+        if not callable(getattr(marker, 'take', None)):
+            raise TypeError('marker')
+        for field, value in (('page', page), ('slice_size', slice_size)):
+            if type(value) is not int or value < 1:
+                raise ValueError(field)
+        if (isinstance(scan_interval_s, bool) or not isinstance(scan_interval_s, (int, float))
+                or not math.isfinite(scan_interval_s) or scan_interval_s <= 0):
+            raise ValueError('scan_interval_s')
         self._marker = marker
-        self._interval = scan_interval_s
+        self._interval = float(scan_interval_s)
         self._page, self._slice = page, slice_size
         self._monotonic = monotonic
         self._pending: set = set()
+        self._held = None                 # (run_id, image, digest, reason): read, its transaction not yet done
+        self._deferred: dict = {}         # run_id -> (refusals, the time before which it is not read again, reason)
+        self._unlogged: dict = {}         # run_id -> code: no typed post-image, or an event the store refuses
+        self._registry = self._store = None
+        self._stopping = threading.Event()
+        self._thread = None
+        self._reset()
+
+    def _reset(self) -> None:
+        """What every start begins with."""
         self._scan_wanted = True          # a start scans
         self._scan_cursor = None
         self._scanning = False
         self._next_scan_at = float('inf')   # the clock schedules a scan only once a pass has completed
         self._first_pass_ever = None      # read from the store at the first scan of this start
         self._ready = False
-        self._registry = self._store = None
-        self._stopping = threading.Event()
-        self._thread = None
+        self._backoff = 0.0
+        self._wait_until = None           # after a refused page or a failed transaction: no work before this
 
     # -- the service
 
@@ -132,17 +191,32 @@ class ChangeReader:
     def ready(self) -> bool:
         return self._ready
 
+    @property
+    def failing(self) -> bool:
+        """True while an image is held, a refused page or failed transaction is waited out, or a run the
+        registry refused to read is waiting for its next read."""
+        return self._held is not None or self._wait_until is not None or bool(self._deferred)
+
+    @property
+    def unlogged(self) -> dict:
+        """``{run_id: code}``: the runs this reader cannot log as the registry holds them (a copy)."""
+        return dict(self._unlogged)
+
     def bind(self, registry, store) -> None:
         """The two things the reader reads and writes. ``start`` binds them from the service context."""
         self._registry, self._store = registry, store
 
     def start(self, context) -> None:
+        if self._thread is not None:
+            raise RuntimeError('the change reader is already started')
         self.bind(context.registry, context.store)
         if self._store is None:
             raise RuntimeError('the change reader needs the event store')
+        self._reset()
         self._stopping.clear()
-        self._thread = threading.Thread(target=self._run, name='events-change-reader', daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=self._run, name='events-change-reader', daemon=True)
+        thread.start()                    # a start that raises here leaves no thread for stop to join
+        self._thread = thread
 
     def stop(self, context) -> None:
         self._stopping.set()
@@ -164,39 +238,69 @@ class ChangeReader:
     # -- one turn of the loop
 
     def step(self) -> bool:
-        """Take the marks, do one page of a scan when one is due or running, and one slice of marked runs.
-        True when a scan is still in progress (the loop does not sleep then)."""
+        """Take the marks; then, unless a wait is running: the held image's transaction, one page of a scan
+        when one is due or running, and one slice of marked runs. True only when a scan is in progress and
+        this step advanced it (the loop does not sleep then); False after any refusal, so the loop waits."""
+        if self._registry is None or self._store is None:
+            raise RuntimeError('the change reader is not bound')
         ids, dropped = self._marker.take()
         self._pending |= set(ids)
         if dropped:
             self._scan_wanted = True
-        if not self._scanning and (self._scan_wanted or self._monotonic() >= self._next_scan_at):
+        now = self._monotonic()
+        if self._wait_until is not None and now < self._wait_until:
+            return False
+        if self._held is not None and not self._commit_held():
+            return False
+        if not self._scanning and (self._scan_wanted or now >= self._next_scan_at):
             self._scanning, self._scan_cursor, self._scan_wanted = True, None, False
+        advanced = False
         if self._scanning:
-            self._scan_page()
-        for run_id in sorted(self._pending)[:self._slice]:
-            if not self._log_run(run_id, 'commit'):
-                break                          # the registry or the store refused: the rest waits for the next step
-            self._pending.discard(run_id)
-        return self._scanning
+            advanced = self._scan_page()
+            if self._held is not None or self._wait_until is not None:
+                return False
+        due = [run_id for run_id in sorted(self._pending) if self._deferred.get(run_id, (0, now, None))[1] <= now]
+        for run_id in due[:self._slice]:
+            # A run a scan could not read keeps the scan's reason; a marked one is a commit.
+            outcome = self._log_run(run_id, self._deferred.get(run_id, (0, 0.0, 'commit'))[2])
+            if outcome is _HELD:
+                return False
+            if outcome is _DONE:
+                self._pending.discard(run_id)
+        return self._scanning and advanced
 
-    def _scan_page(self) -> None:
+    def _scan_page(self) -> bool:
+        """One page of the scan. True when the cursor advanced or the pass completed."""
         if self._first_pass_ever is None:
-            self._first_pass_ever = not self._first_pass_done()
+            try:
+                self._first_pass_ever = not self._first_pass_done()
+            except Exception:                 # noqa: BLE001 - the store failed: wait, as after any failed transaction
+                LOG.error('the change reader could not read its scan state; it waits and tries again', exc_info=True)
+                self._wait()
+                return False
         events_db.require_no_transaction('daemon.registry')
         try:
             ids = self._registry.run_ids(self._scan_cursor, self._page)
         except Exception:                     # noqa: BLE001 - the registry refuses reads for now; the same page later
-            LOG.warning('the change reader could not page the registry; it tries again', exc_info=True)
-            return
+            LOG.warning('the change reader could not page the registry; it waits and tries again', exc_info=True)
+            self._wait()
+            return False
+        self._waited()
         if not ids:
-            self._finish_pass()
-            return
+            try:
+                self._finish_pass()
+            except Exception:                 # noqa: BLE001 - the store failed: the pass completes at a later step
+                LOG.error('the change reader could not record its completed pass; it waits and tries again',
+                          exc_info=True)
+                self._wait()
+                return False
+            return True
         reason = 'snapshot' if self._first_pass_ever else 'reconcile'
         for run_id in ids:
-            if not self._log_run(run_id, reason):
-                return                         # the same page again at the next step, from the same cursor
-            self._scan_cursor = run_id
+            if self._log_run(run_id, reason) is _HELD:
+                return False                   # the same run again, from the same cursor, once its image commits
+            self._scan_cursor = run_id        # a run the registry refused is pending and deferred; the scan goes on
+        return True
 
     def _first_pass_done(self) -> bool:
         with self._store.transaction() as tx:
@@ -211,28 +315,68 @@ class ChangeReader:
         self._next_scan_at = self._monotonic() + self._interval
         self._ready = True
 
-    def _log_run(self, run_id: str, reason: str) -> bool:
-        """Read one image and log it if it differs from the last one logged. False when the registry or the
-        store refused (the run stays pending); True when it is logged, unchanged, or has no typed image."""
+    # -- waiting
+
+    def _wait(self) -> None:
+        base = self._marker.poll_interval_s
+        self._backoff = min(self._interval, self._backoff * 2 if self._backoff else base)
+        self._wait_until = self._monotonic() + self._backoff
+
+    def _waited(self) -> None:
+        self._backoff, self._wait_until = 0.0, None
+
+    def _defer(self, run_id: str, reason: str) -> None:
+        refusals = min(self._deferred.get(run_id, (0, 0.0, reason))[0] + 1, 32)
+        delay = min(self._interval, self._marker.poll_interval_s * 2 ** (refusals - 1))
+        self._deferred[run_id] = (refusals, self._monotonic() + delay, reason)
+        self._pending.add(run_id)
+
+    # -- one run
+
+    def _log_run(self, run_id: str, reason: str) -> str:
+        """Read one image and log it if it differs from the last one logged."""
         events_db.require_no_transaction('daemon.registry')
         try:
             row, text = self._registry.snapshot(run_id)
         except Exception:                     # noqa: BLE001 - e.g. a publish whose directory sync is unfinished
-            LOG.warning('the change reader could not read run %s; it tries again', run_id, exc_info=True)
-            return False
+            LOG.warning('the change reader could not read run %s; it tries again later', run_id, exc_info=True)
+            self._defer(run_id, reason)
+            return _DEFERRED
+        self._deferred.pop(run_id, None)
         # The registry's lock is released: parse, canonicalise and hash now.
         try:
             image = post_image(row, text)
             digest = image_digest(image)
-        except ValueError:
-            LOG.error('run %s has no typed post-image in the registry; a later scan reads it again', run_id, exc_info=True)
-            return True
+        except ValueError as exc:
+            self._unlog(run_id, exc)
+            return _DONE
+        return self._commit_or_hold(run_id, image, digest, reason)
+
+    def _commit_held(self) -> bool:
+        run_id, image, digest, reason = self._held
+        self._held = None
+        return self._commit_or_hold(run_id, image, digest, reason) is not _HELD
+
+    def _commit_or_hold(self, run_id: str, image: dict, digest: str, reason: str) -> str:
         try:
             self._commit(run_id, image, digest, reason)
-        except Exception:                     # noqa: BLE001 - the store failed or refused: the run stays pending
-            LOG.error('the change reader could not log run %s; it tries again', run_id, exc_info=True)
-            return False
-        return True
+        except ValueError as exc:             # the store refuses this event itself: no retry can log it as it is
+            self._unlog(run_id, exc)
+            return _DONE
+        except Exception:                     # noqa: BLE001 - the store failed: the image is held and retried first
+            LOG.error('the change reader could not log run %s; it holds the image and tries again', run_id,
+                      exc_info=True)
+            self._held = (run_id, image, digest, reason)
+            self._wait()
+            return _HELD
+        self._waited()
+        self._unlogged.pop(run_id, None)
+        return _DONE
+
+    def _unlog(self, run_id: str, exc: ValueError) -> None:
+        code = _code(exc)
+        self._unlogged[run_id] = code
+        LOG.error('run %s cannot be logged as the registry holds it (%s); every scan reads it again', run_id, code)
 
     def _commit(self, run_id: str, image: dict, digest: str, reason: str) -> None:
         both_null = image['daemon_row'] is None and image['control_record'] is None
@@ -242,7 +386,11 @@ class ChangeReader:
                 return
             if not last and both_null:
                 return                         # a run the registry does not hold and this log never saw
-            log_id = last[0][0] if last else log_id_of(run_id, image)
+            if last and reason == 'snapshot':
+                reason = 'reconcile'           # a first pass cut short by a crash: this log already holds the run
+            log_id = log_id_of(run_id, image)
+            if last and log_id == f'run:{run_id}':
+                log_id = last[0][0]            # a record that names no session keeps the run's log
             route_logged = bool(last and last[0][2])
             tx.append({'session_id': log_id, 'run_id': run_id, 'turn_id': None, 'type': 'state.changed',
                        'source': 'core', 'trust': 'trusted',
@@ -256,7 +404,8 @@ class ChangeReader:
                            'type': 'route.decision', 'source': 'core', 'trust': 'trusted', 'payload': decision})
                 route_logged = True
             tx.execute('INSERT INTO events_run_images (run_id, log_id, digest, route_logged) VALUES (?, ?, ?, ?) '
-                       'ON CONFLICT (run_id) DO UPDATE SET digest = excluded.digest, route_logged = excluded.route_logged',
+                       'ON CONFLICT (run_id) DO UPDATE SET log_id = excluded.log_id, digest = excluded.digest, '
+                       'route_logged = excluded.route_logged',
                        (run_id, log_id, digest, int(route_logged)))
 
 

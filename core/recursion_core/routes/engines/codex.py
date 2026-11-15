@@ -12,19 +12,26 @@ reports becomes the handle's ``engine_session_id``. Nothing names an approval po
 driver.v2's start record, so neither is sent: Codex applies its own (Lucas, grill Q20: "We shouldn't
 restrict the CLIs more than the provider's harness restricts them"), and the effective values the server
 reports back are kept on the session (``effective``). A resume the server refuses (an unknown thread, or
-one another process is writing) is ``request_invalid`` and nothing else is written.
+one another process is writing) is ``request_invalid`` and nothing else is written; a typed
+``unauthorized`` or ``usageLimitExceeded`` keeps its own code (``auth_failed``, ``plan_limit``), as for
+``thread/start``. A launcher that raises an OS error (no such binary) is ``engine_error``; so is an OS
+error of the worker's input pipe at any write.
 
 SEND. A user_message that begins a turn is ``turn/start`` on the open thread, carrying the delivery id as
 ``clientUserMessageId``; one sent while a turn is in progress is ``turn/steer`` with the engine's id of
-that turn as ``expectedTurnId`` (held until the server has reported that id, then written). ``close``
-closes standard input. Standard input stays open between turns.
+that turn as ``expectedTurnId`` (held until the server has reported that id, then written by the reader;
+a write sent meanwhile queues behind the held ones, so the engine gets them in the gate's order).
+``close`` ends standard input, and nothing is written after it: no held steer or interrupt, no answer to
+a server request (none is even put to the approvals port). Standard input stays open between turns.
 
 ACCEPTANCE. The server's own typed answer to that request is the acceptance: a ``turn/start`` result
 naming a turn gives ``input.accepted`` with ``how: new_turn``; a ``turn/steer`` result whose ``turnId``
 is the turn in progress gives ``how: mid_turn``. Nothing read out of a notification or out of text is
 taken as an acceptance, and an error answer gives none. So this driver declares ``input_ack: true`` and
 ``mid_turn_input: true``: a fact about the protocol (the Liaison's ruling of 3:42 AM Nov 13), recorded
-from the schema and to be confirmed by Lucas's attended capture.
+from the schema and to be confirmed by Lucas's attended capture. A ``turn/start`` answer that names no
+turn ends that turn with a ``protocol_error`` result. A ``turn/completed`` that arrives before the answer
+to our ``turn/start`` waits for it, so the acceptance always comes before the turn's end.
 
 INTERRUPT is the protocol's own ``turn/interrupt`` (held, like a steer, until the turn's id is known).
 
@@ -34,28 +41,37 @@ A TURN ENDS at ``turn/completed``: the driver calls ``turn_ended`` and drafts, i
 never reports, are null with quality ``unknown``; with no usage notice in the turn every count is
 unknown), a ``limit`` when the turn failed on a typed usage limit, and a ``result`` whose code is null
 for ``completed``. No engine text reaches a ``detail``. A ``limit`` is also drafted when
-``account/rateLimits/updated`` reports a window at 100 percent: scope ``connection`` with the vendor's
-bucket named (R3 finding 10, the option the brief recommends and Lucas has not yet chosen: a named
-bucket fences the whole connection until a bucket-to-model mapping is recorded). ``error``
-notifications are not outcomes: Codex sends them for retries too (``willRetry``), and the outcome is the
-turn's own status.
+``account/rateLimits/updated`` reports a window at 100 percent: scope ``connection``, with the vendor's
+bucket named when the snapshot names one (``limitId``) and null otherwise (R3 finding 10, the option the
+brief recommends and Lucas has not yet chosen: a named bucket fences the whole connection until a
+bucket-to-model mapping is recorded). ``error`` notifications are not outcomes: Codex sends them for
+retries too (``willRetry``), and the outcome is the turn's own status. What the driver kept for the turn
+(announced items, results drafted, approval requests seen, the engine's id of it) goes with it.
 
 APPROVALS (CONTRACT 3430-3431, "forward provider approvals"; 919, "The core draws every approval").
 Given an approvals port (``approvals=``: APPROVALS' ``request(effect, binding) -> approval_id``, a fake
 until that lane's interface lands), the driver declares ``permission_bridge: true`` and turns each
-command or file-change approval request of the server into ONE approval: an approval.v1 ``engine_tool``
-effect (the engine, the session and run, the tool, its cwd, and its input as the engine gave it, the file
-changes included from the item the server announced) and the private binding without its id
-(``run_id``, ``engine``, ``engine_request_id``, ``bound_at``), which the port completes with the
-approval id it mints. The JSON-RPC request id, and the thread, turn and item it names, stay in this
+command or file-change approval request of the server (the two methods in ``APPROVAL_REQUESTS``) into ONE
+approval: an approval.v1 ``engine_tool`` effect (the engine, the session and run, the tool, its cwd, and
+its input as the engine gave it) and the private binding without its id (``run_id``, ``engine``,
+``engine_request_id``, ``bound_at``), which the port completes with the approval id it mints. The effect
+names the exact action or none is opened: a command needs its command line and folder, from the request
+or, where the request leaves one null, from the command item the server announced in that turn; a file
+change needs the changes of the file-change item the server announced; without them the request is
+declined at once. A request is put to the port only when it names this worker's thread and its turn in
+progress; the same request id again withdraws the approval and is declined once (or, if it was answered
+already, gets nothing). The JSON-RPC request id, and the thread, turn and item it names, stay in this
 driver's private table. Only driver.v2's ``approval_answer {approval_id, decision}`` reaches the engine:
 ``approve`` is the protocol's ``accept`` (that call, once; never ``acceptForSession``), ``deny`` is
 ``decline``. It is written on the request id of that same pending call, once, and only while the server
-still waits for it: an answer after the server resolved the request itself (``serverRequest/resolved``)
-or after the turn ended writes nothing and is refused. A port that raises, or none, means the typed
-``decline`` at once, so no tool runs unapproved and the turn is not left hanging. The deadline is
-APPROVALS' (it writes the deny at ``expires_at`` and sends it as ``approval_answer``). No approval request
-is ever refused -32601. Every other server request is answered with JSON-RPC error -32601.
+still waits for it: the binding is taken and the answer written as one step under the write lock, which
+the reader also holds to drop bindings, so an answer after the reader has seen the server resolve the
+request itself (``serverRequest/resolved``) or the turn end writes nothing and is refused. A port that
+raises, or none, means the typed ``decline`` at once, so no tool runs unapproved and the turn is not left
+hanging; a port interrupted by ``KeyboardInterrupt`` or ``SystemExit`` gets the decline written, then the
+interruption goes on. The deadline is APPROVALS' (it writes the deny at ``expires_at`` and sends it as
+``approval_answer``). No request of those two methods is ever refused -32601; every other server request
+is answered with JSON-RPC error -32601. A handle made by another driver is refused.
 
 THE UPDATER. The worker is ``codex -c check_for_update_on_startup=false app-server`` (routes/codex.py's
 override) and this module starts no other process.
@@ -64,8 +80,11 @@ TOOLS. A command, file-change, MCP or dynamic tool item the server announces (``
 ``tool.call`` draft: the item id as ``call_id``, the tool's name, its input as the engine gave it (the
 command and cwd, the changes, or the arguments) and ``input_digest``, the SHA-256 of that input as RFC
 8785 writes it (``control.methods.canonical_text``, SPINE's); an input over 64 KiB is not carried
-(``input: null``, the digest still of the whole). Its ``item/completed`` is the ``tool.result``:
-``ok``, ``error`` or ``denied`` from the item's status, the output text (cut at 64 KiB, ``truncated``).
+(``input: null``, the digest still of the whole). An input RFC 8785 cannot write (a number such as
+``1e999``) is drafted too, with ``input: null`` and the digest of its sorted compact JSON text. Its
+``item/completed`` is the ``tool.result``: ``ok``, ``error`` or ``denied`` from the item's status, the
+output text (cut at 64 KiB, ``truncated``); a repeated completion drafts nothing. Tool drafts are made
+only while a turn is in progress.
 
 Not here yet: ``fork`` (false until SESSIONS asks), APPROVALS' real port, who owns a live handle between
 turns (DRIVER-CC's S9 drive owner, ``routes/workers.py``).
@@ -109,13 +128,22 @@ _USAGE_FIELDS = (("input_tokens", "inputTokens"), ("output_tokens", "outputToken
 
 
 class _Session:
-    """What the driver keeps for one live worker. Its lock is never held while writing to the engine."""
+    """What the driver keeps for one live worker. ``lock`` guards the tables and is never held while writing
+    to the engine; ``write_lock`` is held across a write and whatever decides it, and is always taken before
+    ``lock``, never after."""
 
-    def __init__(self, process, connection_id: str) -> None:
+    def __init__(self, process, connection_id: str, owner: object = None) -> None:
         self.process = process
         self.connection_id = connection_id
+        self.owner = owner                       # the driver that made this worker; another driver is refused
         self.lock = threading.Lock()
         self.write_lock = threading.Lock()
+        self.closed = False                      # standard input ended: nothing more is ever written
+        self.flushing: set[str] = set()          # core turns whose held writes are being written now
+        self.awaiting: set[str] = set()          # core turns whose turn/start has no answer yet
+        self.deferred: dict[str, dict] = {}      # core turn -> its turn/completed, kept until that answer
+        self.done_calls: set[str] = set()        # tool call ids given their result in the turn in progress
+        self.seen_requests: set[str] = set()     # approval requests (JSON ids) of the turn in progress
         self.next_id = 1
         self.pending: dict[int, tuple] = {}      # our request id -> what it was
         self.thread_id: str | None = None
@@ -128,7 +156,7 @@ class _Session:
         self.effective: dict = {}                # approvalPolicy and sandbox the server applied
         self.early: list[str] = []               # notifications read during start, parsed with the next line
         self.offset = 0                          # bytes of standard output read so far
-        self.items: dict[str, dict] = {}         # item id -> the command or file-change item the server announced
+        self.items: dict[str, tuple] = {}        # item id -> (engine turn, the command or file-change item)
         self.calls: set[str] = set()             # tool call ids drafted and not yet given a result
         self.bindings: dict[str, dict] = {}      # approval id -> the pending engine request it answers (PRIVATE)
         self.session_id: str | None = None
@@ -140,9 +168,32 @@ class _Session:
             self.pending[rid] = record
             return rid
 
-    def write(self, message: dict) -> None:
+    def write(self, message: dict) -> bool:
+        """Write one line unless standard input has ended (then nothing, and False)."""
+
         with self.write_lock:
+            return self.write_held(message)
+
+    def write_held(self, message: dict) -> bool:
+        """``write`` for a caller that already holds ``write_lock``. An OS error of the pipe is engine_error."""
+
+        if self.closed:
+            return False
+        try:
             self.process.send(json.dumps(message, separators=(",", ":")))
+        except OSError as err:
+            raise c.RouteError(c.ENGINE_ERROR, f"engine io: {type(err).__name__}") from None
+        return True
+
+    def close(self) -> None:
+        """End standard input. Nothing is written after this, held writes included."""
+
+        with self.write_lock:
+            self.closed = True
+            try:
+                self.process.close_stdin()
+            except OSError:
+                pass  # the pipe is already gone: input has ended either way
 
 
 class CodexDriver(Driver):
@@ -168,8 +219,11 @@ class CodexDriver(Driver):
         route = request["route"]
         conn = route.get("connection") if isinstance(route.get("connection"), dict) else {}
         connection_id = f"{conn.get('kind')}:{conn.get('id')}"
-        process = self._launcher(self.argv(), env=env, shell=False)
-        session = _Session(process, connection_id)
+        try:
+            process = self._launcher(self.argv(), env=env, shell=False)
+        except OSError as err:  # e.g. no such binary: a typed refusal, as the one-turn path gives
+            raise c.RouteError(c.ENGINE_ERROR, f"launch failed: {type(err).__name__}") from None
+        session = _Session(process, connection_id, owner=self)
         session.session_id, session.run_id = request["session_id"], request["run_id"]
         handle._codex = session
         deadline = self._clock() + self._start_timeout_s
@@ -185,7 +239,10 @@ class CodexDriver(Driver):
             else:
                 try:
                     answer = self._call(session, "thread/resume", {"threadId": esid, **params}, deadline)
-                except _RpcError:
+                except _RpcError as err:
+                    code = _code_of(err.error)
+                    if code in (c.AUTH_FAILED, c.PLAN_LIMIT):  # typed, as for thread/start (the #402 read, R8)
+                        raise c.RouteError(code, "the engine refused the start") from None
                     raise c.RouteError(c.REQUEST_INVALID, "thread/resume refused: no such engine session, or "
                                        "another worker is writing it") from None
             thread = answer.get("thread") if isinstance(answer, dict) else None
@@ -240,17 +297,18 @@ class CodexDriver(Driver):
                 session.early.append(line)
 
     def _abandon(self, session: _Session, reason: str) -> None:
-        try:
-            session.process.close_stdin()
-        except OSError:
-            pass
+        session.close()
         session.process.fence(reason)
 
     # -- send, interrupt ------------------------------------------------------------------------------
+    # One write discipline (the #402 reads, GPT-6 Astra R3): every write goes through the session, which
+    # writes nothing once ``close`` has ended standard input; a write held for a turn whose engine id is not
+    # known yet is written by the reader when the id arrives, and a later write for that turn queues behind
+    # it until the held ones are out (``flushing``), so writes reach the engine in the order the gate made.
     def _send(self, handle: Handle, item: dict) -> None:
-        session = _session(handle)
+        session = self._session(handle)
         if item["kind"] == "close":
-            session.process.close_stdin()
+            session.close()
             return
         if item["kind"] == "approval_answer":
             self._answer_approval(session, item["approval_id"], item["decision"])
@@ -262,6 +320,7 @@ class CodexDriver(Driver):
             started = turn in session.held or engine_turn is not None
             if not started:  # the gate made this the turn in progress: it begins a turn
                 session.held[turn] = []
+                session.awaiting.add(turn)
         if not started:
             rid = session.reserve(("turn/start", delivery, turn))
             session.write({"id": rid, "method": "turn/start", "params": {
@@ -271,17 +330,18 @@ class CodexDriver(Driver):
         self._write_for_turn(session, turn, ("turn/steer", delivery, turn), "turn/steer", params, "expectedTurnId")
 
     def _interrupt(self, handle: Handle, turn_id: str) -> None:
-        session = _session(handle)
+        session = self._session(handle)
         params = {"threadId": session.thread_id}
         self._write_for_turn(session, turn_id, ("turn/interrupt", turn_id), "turn/interrupt", params, "turnId")
 
     def _write_for_turn(self, session: _Session, turn: str, record: tuple, method: str, params: dict,
                         key: str) -> None:
-        """Write a request that names the engine's id of ``turn``; hold it until that id is known."""
+        """Write a request that names the engine's id of ``turn``; hold it until that id is known, and queue it
+        behind held writes that are being written."""
 
         with session.lock:
             engine_turn = session.engine_turn.get(turn)
-            if engine_turn is None:
+            if engine_turn is None or turn in session.flushing:
                 if turn not in session.held:
                     raise DriverStateError(f"{turn} is not a turn this worker began")
                 session.held[turn].append((record, method, params, key))
@@ -290,12 +350,24 @@ class CodexDriver(Driver):
         session.write({"id": rid, "method": method, "params": {**params, key: engine_turn}})
 
     def _release_held(self, session: _Session, turn: str) -> None:
-        with session.lock:
-            held, session.held[turn] = session.held.get(turn, []), []
-            engine_turn = session.engine_turn[turn]
-        for record, method, params, key in held:
-            rid = session.reserve(record)
-            session.write({"id": rid, "method": method, "params": {**params, key: engine_turn}})
+        """Write what waited for ``turn``'s engine id, in order, then what queued behind it meanwhile."""
+
+        try:
+            while True:
+                with session.lock:
+                    held = session.held.get(turn) or []
+                    if not held:
+                        session.flushing.discard(turn)
+                        return
+                    session.held[turn] = []
+                    engine_turn = session.engine_turn[turn]
+                for record, method, params, key in held:
+                    rid = session.reserve(record)
+                    session.write({"id": rid, "method": method, "params": {**params, key: engine_turn}})
+        except BaseException:
+            with session.lock:
+                session.flushing.discard(turn)
+            raise
 
     def _fork(self, engine_session_id: str, at: str) -> str:  # refused by the gate: fork is false
         raise DriverStateError("fork is not offered by this driver")
@@ -304,11 +376,11 @@ class CodexDriver(Driver):
     def pump(self, handle: Handle, timeout_s: float) -> list[dict] | None:
         """Read one line of the worker's output and parse it; None at EOF. For the drive owner and tests."""
 
-        line = _session(handle).process.read_line(timeout_s)
+        line = self._session(handle).process.read_line(timeout_s)
         return None if line is None else self.parse(handle, line)
 
     def _parse(self, handle: Handle, line: str) -> list[dict]:
-        session = _session(handle)
+        session = self._session(handle)
         with session.lock:
             early, session.early = session.early, []
         drafts: list[dict] = []
@@ -336,20 +408,22 @@ class CodexDriver(Driver):
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             if item.get("type") in ("commandExecution", "fileChange") and isinstance(item.get("id"), str):
                 with session.lock:
-                    session.items[item["id"]] = item
-            return self._tool_call(session, item)
+                    session.items[item["id"]] = (params.get("turnId"), item)
+            return self._tool_call(session, item) if handle.live_turn is not None else []
         if method == "serverRequest/resolved":
-            with session.lock:
-                for approval_id, bound in list(session.bindings.items()):
-                    if bound["rpc_id"] == params.get("requestId"):
-                        del session.bindings[approval_id]  # the server stopped waiting: no answer is written
+            key = _json_id(params.get("requestId"))
+            with session.write_lock:  # not while an answer to it is being written (the #402 read, F1)
+                with session.lock:
+                    for approval_id, bound in list(session.bindings.items()):
+                        if bound["key"] == key:
+                            del session.bindings[approval_id]  # the server stopped waiting: no answer is written
             return []
         if method == "item/completed":
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str) and span is not None:
                 return [{"type": "engine.output", "payload": {"stream": "stdout", "text": item["text"],
                                                                "offset_start": span[0], "offset_end": span[1]}}]
-            return self._tool_result(session, item)
+            return self._tool_result(session, item) if handle.live_turn is not None else []
         if method == "thread/tokenUsage/updated":
             if isinstance(params.get("turnId"), str) and isinstance(params.get("tokenUsage"), dict):
                 with session.lock:
@@ -373,6 +447,10 @@ class CodexDriver(Driver):
             record = session.pending.pop(rid, None) if isinstance(rid, int) else None
         if record is None:
             return []
+        if record[0] == "turn/start":
+            with session.lock:
+                session.awaiting.discard(record[2])
+                deferred = session.deferred.pop(record[2], None)
         if "error" in msg and msg["error"] is not None:
             if record[0] == "turn/start":
                 return self._turn_refused(handle, session, record[2], msg["error"])
@@ -381,9 +459,14 @@ class CodexDriver(Driver):
         if record[0] == "turn/start":
             turn = result.get("turn") if isinstance(result.get("turn"), dict) else {}
             if not isinstance(turn.get("id"), str) or not turn["id"]:
-                return []
-            drafts = self._adopt_turn(session, turn["id"], record[2])
-            return [_accepted(record[1], record[2], "new_turn"), *drafts]
+                # Our own turn/start answered without a turn (the #402 read, F10): the turn never began, and
+                # the core hears so, instead of a turn left in progress for ever.
+                return self._turn_refused(handle, session, record[2], None, code=c.PROTOCOL_ERROR,
+                                          detail="the answer to turn/start names no turn")
+            drafts = [_accepted(record[1], record[2], "new_turn"), *self._adopt_turn(session, turn["id"], record[2])]
+            if deferred is not None:  # its end arrived first: it follows its acceptance (the #402 read, R4)
+                drafts += self._turn_completed(handle, session, deferred)
+            return drafts
         if record[0] == "turn/steer":
             with session.lock:
                 current = session.engine_turn.get(record[2])
@@ -409,35 +492,53 @@ class CodexDriver(Driver):
                 return []
             session.engine_turn[core_turn] = engine_turn
             session.core_turn[engine_turn] = core_turn
+            session.flushing.add(core_turn)  # a write sent from now on queues behind the held ones
         self._release_held(session, core_turn)
         return []
 
-    def _turn_refused(self, handle: Handle, session: _Session, turn: str, error: object) -> list[dict]:
+    def _turn_refused(self, handle: Handle, session: _Session, turn: str, error: object, *,
+                      code: str | None = None, detail: str = "the engine refused the turn") -> list[dict]:
         error = error if isinstance(error, dict) else {}
         with session.lock:
             session.held.pop(turn, None)
+            session.flushing.discard(turn)
+            engine_turn = session.engine_turn.pop(turn, None)  # learnt from turn/started, if it came first
+            if engine_turn is not None:
+                session.core_turn.pop(engine_turn, None)
         self.turn_ended(handle, turn)
-        code = _code_of(error)
+        code = code or _code_of(error)
         drafts = []
         if code == c.PLAN_LIMIT:
             drafts.append(self._limit_draft(session))
-        drafts.append({"type": "result", "payload": {"code": code, "detail": "the engine refused the turn"}})
+        drafts.append({"type": "result", "payload": {"code": code, "detail": detail}})
         return drafts
 
     def _turn_completed(self, handle: Handle, session: _Session, params: dict) -> list[dict]:
         turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
         engine_turn = turn.get("id")
-        with session.lock:
-            core_turn = session.core_turn.get(engine_turn) if isinstance(engine_turn, str) else None
-            if core_turn is None:
-                return []  # not a turn this worker began (or one it already ended)
-            del session.core_turn[engine_turn]
-            session.held.pop(core_turn, None)
-            usage = session.usage.pop(engine_turn, None)
-            seen, session.bucket_limit = session.bucket_limit, None  # a window seen in this turn
-            for approval_id, bound in list(session.bindings.items()):
-                if bound["turn"] == engine_turn:
-                    del session.bindings[approval_id]  # the turn is over: its pending requests are gone
+        with session.write_lock:  # not while an approval answer is being written (the #402 read, F1)
+            with session.lock:
+                core_turn = session.core_turn.get(engine_turn) if isinstance(engine_turn, str) else None
+                if core_turn is None:
+                    return []  # not a turn this worker began (or one it already ended)
+                if core_turn in session.awaiting:
+                    # The end arrived before the answer to our turn/start, which carries the acceptance: it
+                    # waits for that answer, so the core sees the turn accepted before it ends (#402, R4).
+                    session.deferred[core_turn] = params
+                    return []
+                del session.core_turn[engine_turn]
+                session.engine_turn.pop(core_turn, None)
+                session.held.pop(core_turn, None)
+                session.flushing.discard(core_turn)
+                usage = session.usage.pop(engine_turn, None)
+                seen, session.bucket_limit = session.bucket_limit, None  # a window seen in this turn
+                for approval_id, bound in list(session.bindings.items()):
+                    if bound["turn"] == engine_turn:
+                        del session.bindings[approval_id]  # the turn is over: its pending requests are gone
+                # What was kept for this turn only goes with it (the #402 read, F13).
+                session.items = {k: v for k, v in session.items.items() if v[0] != engine_turn}
+                session.done_calls.clear()
+                session.seen_requests.clear()
         self.turn_ended(handle, core_turn)
         drafts = [self._usage_draft(session, usage)]
         status = turn.get("status")
@@ -465,13 +566,18 @@ class CodexDriver(Driver):
         try:
             from recursion_core.control.methods import canonical_text
             text = canonical_text(tool_input)
+            canonical = True
         except (ImportError, ValueError):
-            return []  # no RFC 8785 text for this input (or no canonicaliser): no digest, so no draft
+            # No RFC 8785 text for this input (a number RFC 8785 cannot write, e.g. 1e999), or no
+            # canonicaliser: the call is still drafted, so its result has one (the #402 read, F3), with the
+            # input not carried and the digest of its sorted compact JSON text instead.
+            text = json.dumps(tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            canonical = False
         with session.lock:
-            if call_id in session.calls:
+            if call_id in session.calls or call_id in session.done_calls:
                 return []
             session.calls.add(call_id)
-        carried = tool_input if len(text.encode("utf-8")) <= CARRY_LIMIT else None
+        carried = tool_input if canonical and len(text.encode("utf-8")) <= CARRY_LIMIT else None
         return [{"type": "tool.call", "payload": {
             "call_id": call_id, "name": name, "input_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "input": carried}}]
@@ -484,11 +590,12 @@ class CodexDriver(Driver):
             return []
         with session.lock:
             drafted = item["id"] in session.calls
-        drafts = [] if drafted else self._tool_call(session, item)
+        drafts = [] if drafted else self._tool_call(session, item)  # none for a call that has its result
         with session.lock:
             if item["id"] not in session.calls:
                 return []
             session.calls.discard(item["id"])
+            session.done_calls.add(item["id"])  # a repeated start or completion drafts nothing (#402, F4)
         text, truncated = _cut(_tool_output(item))
         drafts.append({"type": "tool.result", "payload": {"call_id": item["id"], "status": status, "text": text,
                                                          "output_ref": None, "truncated": truncated}})
@@ -527,53 +634,83 @@ class CodexDriver(Driver):
                                              "reset_at": seen["reset_at"]}}
 
     def _answer_server_request(self, session: _Session, msg: dict) -> None:
+        if session.closed:
+            return  # standard input has ended: nothing can be answered, and no approval is opened
         tool = APPROVAL_REQUESTS.get(msg.get("method"))
         if tool is None:
             session.write({"id": msg["id"], "error": {"code": -32601, "message": "unsupported"}})
             return
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        approval_id = self._ask(session, msg["id"], tool, params) if self._approvals is not None else None
-        if approval_id is None:
+        try:
+            outcome = self._ask(session, msg["id"], tool, params) if self._approvals is not None else _DECLINE_NOW
+        except BaseException:
+            # The port was interrupted (KeyboardInterrupt, SystemExit): decline first, so the engine is not
+            # left waiting, then let the interruption go on (the #402 read, F9).
+            session.write({"id": msg["id"], "result": dict(DECLINE)})
+            raise
+        if outcome is _DECLINE_NOW:
             session.write({"id": msg["id"], "result": dict(DECLINE)})
 
-    def _ask(self, session: _Session, rpc_id: object, tool: str, params: dict) -> str | None:
-        """One approval through the port; None when there is none to wait for (then the caller declines)."""
+    def _ask(self, session: _Session, rpc_id: object, tool: str, params: dict) -> object:
+        """One approval through the port for one pending engine request. Returns the approval id to wait on,
+        ``_DECLINE_NOW`` (the caller declines at once) or ``_ANSWERED`` (nothing more is written)."""
 
         thread, turn, item_id = params.get("threadId"), params.get("turnId"), params.get("itemId")
         if thread != session.thread_id or not isinstance(turn, str) or not isinstance(item_id, str):
-            return None
-        with session.lock:
-            item = dict(session.items.get(item_id) or {})
-        tool_input = {k: v for k, v in params.items() if k not in ("threadId", "turnId", "itemId", "startedAtMs")}
-        if tool == "fileChange" and "changes" in item:
-            tool_input["changes"] = item["changes"]
-        if tool == "commandExecution" and "command" not in tool_input and isinstance(item.get("command"), str):
-            tool_input["command"] = item["command"]
-        cwd = params.get("cwd") if isinstance(params.get("cwd"), str) and params.get("cwd") else None
-        effect = {"kind": "engine_tool", "engine": ENGINE, "session_id": session.session_id,
-                  "run_id": session.run_id, "tool": tool, "cwd": cwd, "input": tool_input}
-        binding = {"run_id": session.run_id, "engine": ENGINE, "engine_request_id": json.dumps(rpc_id),
+            return _DECLINE_NOW
+        key = _json_id(rpc_id)
+        with session.write_lock:  # against an answer to the same request being written now (#402, F1)
+            with session.lock:
+                if key in session.seen_requests:
+                    # The same pending request again (#402: R2, F7): its approval is withdrawn and the request
+                    # declined once; if it was already answered or settled, nothing more is written.
+                    for approval_id, bound in list(session.bindings.items()):
+                        if bound["key"] == key:
+                            del session.bindings[approval_id]
+                            return _DECLINE_NOW
+                    return _ANSWERED
+                session.seen_requests.add(key)
+                if turn not in session.core_turn:
+                    return _DECLINE_NOW  # not this handle's turn in progress (#402: R2, F8)
+                announced = session.items.get(item_id)
+        item = announced[1] if announced is not None and announced[0] == turn else {}
+        effect = _effect(session, tool, params, item)
+        if effect is None:
+            return _DECLINE_NOW  # the exact action is not known: nothing approvable is opened (#402, R1)
+        binding = {"run_id": session.run_id, "engine": ENGINE, "engine_request_id": key,
                    "bound_at": _timestamp_ms(self._wall())}
         try:
             approval_id = self._approvals.request(effect, binding)
         except Exception:  # noqa: BLE001 - any failure of the port: deny now, never leave the engine waiting
-            return None
+            return _DECLINE_NOW
         if not isinstance(approval_id, str) or not approval_id:
-            return None
+            return _DECLINE_NOW
         with session.lock:
             if approval_id in session.bindings:
-                return None
-            session.bindings[approval_id] = {"rpc_id": rpc_id, "thread": thread, "turn": turn, "item": item_id}
+                return _DECLINE_NOW
+            session.bindings[approval_id] = {"rpc_id": rpc_id, "key": key, "thread": thread, "turn": turn,
+                                             "item": item_id}
         return approval_id
 
     def _answer_approval(self, session: _Session, approval_id: str, decision: str) -> None:
-        """Write the queue's answer on the request id of that same pending call, once."""
+        """Write the queue's answer on the request id of that same pending call, once, and only while the
+        server still waits: the binding is taken and the answer written as one step under the write lock,
+        which the reader also takes to drop bindings (the #402 read, F1)."""
 
-        with session.lock:
-            bound = session.bindings.pop(approval_id, None)
-        if bound is None:  # unknown, answered already, resolved by the server, or of a turn that ended
-            raise DriverStateError(f"{approval_id} names no request this worker is waiting on")
-        session.write({"id": bound["rpc_id"], "result": dict(_DECISIONS[decision])})
+        with session.write_lock:
+            with session.lock:
+                bound = session.bindings.pop(approval_id, None)
+            if bound is None:  # unknown, answered already, resolved by the server, or of a turn that ended
+                raise DriverStateError(f"{approval_id} names no request this worker is waiting on")
+            session.write_held({"id": bound["rpc_id"], "result": dict(_DECISIONS[decision])})
+
+    def _session(self, handle: Handle) -> _Session:
+        session = getattr(handle, "_codex", None)
+        if not isinstance(session, _Session):
+            raise DriverStateError("this handle has no Codex worker")
+        if session.owner is not self:
+            raise DriverStateError("this handle belongs to another driver")  # the #402 read, F14
+        return session
 
 
 class _RpcError(Exception):
@@ -582,11 +719,38 @@ class _RpcError(Exception):
         self.error = error
 
 
-def _session(handle: Handle) -> _Session:
-    session = getattr(handle, "_codex", None)
-    if not isinstance(session, _Session):
-        raise DriverStateError("this handle has no Codex worker")
-    return session
+_DECLINE_NOW = object()  # _ask: decline the request at once
+_ANSWERED = object()     # _ask: the request was answered or settled already; write nothing
+
+
+def _json_id(rpc_id: object) -> str:
+    """A JSON-RPC id as its JSON text, so 7 and "7" stay two ids."""
+
+    return json.dumps(rpc_id, sort_keys=True)
+
+
+def _effect(session: _Session, tool: str, params: dict, item: dict) -> dict | None:
+    """The approval.v1 ``engine_tool`` effect of one approval request, or None when the exact action is not
+    known (the #402 read, GPT-6 Astra R1). A command needs its command line and its folder, from the request
+    or, where the request leaves one null, from the command item the server announced in that turn; a file
+    change needs the changes of the file-change item the server announced."""
+
+    tool_input = {k: v for k, v in params.items() if k not in ("threadId", "turnId", "itemId", "startedAtMs")}
+    if tool == "commandExecution":
+        announced = item if item.get("type") == "commandExecution" else {}
+        command = next((v for v in (params.get("command"), announced.get("command")) if isinstance(v, str) and v),
+                       None)
+        cwd = next((v for v in (params.get("cwd"), announced.get("cwd")) if isinstance(v, str) and v), None)
+        if command is None or cwd is None:
+            return None
+        tool_input["command"], tool_input["cwd"] = command, cwd
+    else:
+        if item.get("type") != "fileChange" or not isinstance(item.get("changes"), list):
+            return None
+        tool_input["changes"] = item["changes"]
+        cwd = None
+    return {"kind": "engine_tool", "engine": ENGINE, "session_id": session.session_id, "run_id": session.run_id,
+            "tool": tool, "cwd": cwd, "input": tool_input}
 
 
 def _message(line: str) -> dict:

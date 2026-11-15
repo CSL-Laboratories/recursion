@@ -416,6 +416,27 @@ class ExtractToolTest(unittest.TestCase):
         self.assertEqual(set(doc["sha256"]), {"ClientRequest.json", "ClientNotification.json",
                                               "ServerNotification.json", "ServerRequest.json"})
 
+    def test_extract_follows_refs_to_every_depth(self):
+        # The #402 read (GPT-6 Astra R5): the fixture holds every definition its definitions refer to.
+        tool = self.tool()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = {"definitions": {
+                "ClientInfo": {"type": "object", "required": ["name"], "properties": {
+                    "name": {"$ref": "#/definitions/LegacyName"}}},
+                "LegacyName": {"type": "object", "properties": {"text": {"$ref": "#/definitions/Deep"},
+                                                                "gone": {"$ref": "#/definitions/NotInBundle"}}},
+                "Deep": {"type": "string"},
+                "Unrelated": {"type": "integer"}}}
+            (root / "codex_app_server_protocol.schemas.json").write_text(json.dumps(bundle), encoding="utf-8")
+            for name in tool.TABLES.values():
+                (root / name).write_text(json.dumps({"oneOf": []}), encoding="utf-8")
+            doc = tool.extract(root, "codex-cli 9.9.9")
+        self.assertEqual(doc["definitions"]["LegacyName"]["properties"]["text"], "ref:Deep")
+        self.assertEqual(doc["definitions"]["Deep"], {"type": "string"})
+        self.assertNotIn("Unrelated", doc["definitions"])
+        self.assertIn("NotInBundle", doc["missing"])
+
     def test_brief_keeps_const_array_items_and_a_single_allof(self):
         # GPT-6 Astra's three structural cases (#393 read), on _brief itself as well as through extract above.
         brief = self.tool()._brief

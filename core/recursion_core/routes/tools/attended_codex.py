@@ -23,12 +23,14 @@ typed into driver calls:
     y / n          approve / deny the oldest approval the engine asked for (shown in full first)
     /interrupt     the protocol's turn interrupt
     /stop          end the worker (standard input ended), keeping the thread id
-    /resume        a new worker that resumes that thread (thread/resume)
+    /resume        a new worker that resumes that thread (thread/resume); only after /stop
     /quit          end the worker and the tool
 
-Everything is captured under ``--out``: ``version.txt`` (``codex --version``), and per worker
-``worker-N.stdout.jsonl``, ``worker-N.stdin.jsonl``, ``worker-N.stderr.txt`` and ``worker-N.drafts.jsonl``
-(what the driver made of each line). The steps Lucas runs, in a scratch git folder:
+Commands are read while a turn runs too, so /interrupt and /stop work without waiting for the turn.
+Everything is captured under ``--out``: ``version.txt`` (``codex --version``), per worker
+``worker-N.stdout.jsonl``, ``worker-N.stdin.jsonl`` and ``worker-N.stderr.txt``, and for the whole run one
+``drafts.jsonl`` (what the driver made of each line). Every worker is ended and every
+capture closed however the run ends, an exception or Ctrl-C included. The steps Lucas runs, in a scratch git folder:
 "list the files", then "count them"; /stop, then /resume and one more message; ask Codex to create a
 file, n, ask again, y; while a turn runs, list the worker's child processes (the tool prints the pid
 and the command): no updater may appear; /quit. The captures become the driver's fixtures (PR 4).
@@ -152,6 +154,20 @@ def extract(schema_dir: Path, version: str, *, experimental: bool = False, liter
         path = schema_dir / name
         if path.is_file():
             digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    # DEFINITIONS and every definition they refer to, however deep (the #402 read, GPT-6 Astra R5), so a
+    # value can be checked all the way down. A name referred to but not in the bundle is recorded as missing.
+    briefs: dict = {}
+    missing: list = []
+    queue = list(DEFINITIONS)
+    while queue:
+        name = queue.pop(0)
+        if name in briefs or name in missing:
+            continue
+        if name not in definitions:
+            missing.append(name)
+            continue
+        briefs[name] = _brief(definitions[name])
+        queue.extend(sorted(_refs(briefs[name])))
     return {
         "codex_version": version,
         "generator": ["codex", *NO_UPDATE, "app-server", "generate-json-schema",
@@ -160,10 +176,22 @@ def extract(schema_dir: Path, version: str, *, experimental: bool = False, liter
         "sha256": digests,
         **{key: _method_table(json.loads((schema_dir / name).read_text(encoding="utf-8")))
            for key, name in TABLES.items()},
-        "definitions": {name: _brief(definitions[name]) for name in DEFINITIONS if name in definitions},
-        "missing": [name for name in DEFINITIONS if name not in definitions],
+        "definitions": dict(sorted(briefs.items())),
+        "missing": missing,
         "binary_literals": literals or {},
     }
+
+
+def _refs(node: object) -> set:
+    """The definition names a summary refers to (``ref:<name>``), at any depth."""
+
+    if isinstance(node, str):
+        return {node[4:]} if node.startswith("ref:") else set()
+    if isinstance(node, dict):
+        return set().union(*(_refs(v) for v in node.values())) if node else set()
+    if isinstance(node, list):
+        return set().union(*(_refs(v) for v in node)) if node else set()
+    return set()
 
 
 def scan_literals(native: Path, texts: tuple[str, ...] = LITERALS) -> dict:
@@ -242,7 +270,10 @@ class LocalProcess:
 
     def close_stdin(self) -> None:
         if not self.proc.stdin.closed:
-            self.proc.stdin.close()
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass  # the child is gone and its pipe with it: input has ended either way
 
     def read_line(self, timeout_s: float):
         from recursion_core.routes.launch import ReadTimeout
@@ -254,17 +285,20 @@ class LocalProcess:
         return None if item is _EOF else item
 
     def fence(self, reason: str) -> None:
-        """End the worker (the founder run's stand-in for the daemon's fence) and close the captures."""
-        self.close_stdin()
-        if self.proc.poll() is None:
-            self.proc.terminate()
+        """End the worker (the founder run's stand-in for the daemon's fence) and close the captures, also
+        when the child is already dead (the #402 read, DeepSeek F2)."""
         try:
-            self.proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
-        self._stdin.close()
-        self._stderr.close()
+            self.close_stdin()
+            if self.proc.poll() is None:
+                self.proc.terminate()
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        finally:
+            self._stdin.close()
+            self._stderr.close()
 
 
 class Console:
@@ -281,19 +315,43 @@ class Console:
         return approval_id
 
 
+_NOTHING_YET = object()
+
+
+def takes_now(line: str, approval_waiting: bool) -> bool:
+    """Whether a command typed while a turn runs is acted on at once (else it waits for the turn to end):
+    /interrupt, /stop and /quit always; y and n when an approval waits for them; a message, as a steer, when
+    an approval waits (the turn is paused on it); /resume never (it needs the stopped worker's output done)."""
+
+    if line in ("/interrupt", "/stop", "/quit"):
+        return True
+    if line == "/resume":
+        return False
+    return approval_waiting
+
+
 def session_loop(driver, commands, say, console, *, env: dict | None = None, session_id: str = "ses-attended",
-                 route: dict | None = None, read_s: float = 1.0) -> dict:
+                 route: dict | None = None, read_s: float = 1.0, seen: dict | None = None, on_draft=None) -> dict:
     """Run the founder's commands against ``driver``. Returns what it saw, for the capture and for tests.
 
-    After each command it reads the worker's output until the turn has ended or an approval waits for an
-    answer, so a steer is not offered here (``input()`` is not read during a turn)."""
+    While a turn runs, the worker's output is read and, between reads, a waiting command is taken at once
+    when ``takes_now`` says so, so /interrupt and /stop work without waiting for the turn (the #402 read,
+    GPT-6 Astra R6); any other command waits until the turn has ended. ``commands`` is any iterator; one with a
+    ``ready()`` method (the typed input of ``run_mode``) is asked before taking a command during a turn,
+    so the loop never blocks on the keyboard while a turn runs. A worker whose output is not the
+    protocol's ends the loop with a message; a refused or failed write is said and the loop goes on
+    (DeepSeek F5). ``/resume`` is refused while the worker runs: a running worker is never replaced (R7)."""
 
+    from recursion_core.routes import contract as c
     from recursion_core.routes.driver import DriverRefused, DriverStateError
     from recursion_core.routes.launch import ReadTimeout
 
     route = route or {"engine": "codex", "model": None, "connection": {"kind": "subscription", "id": "own-login"}}
-    seen = {"threads": [], "drafts": [], "workers": 0}
-    state = {"handle": None, "turn": 0, "delivery": 0}
+    seen = seen if seen is not None else {}
+    for key, empty in (("threads", []), ("drafts", []), ("workers", 0)):
+        seen.setdefault(key, empty)
+    state = {"handle": None, "turn": 0, "delivery": 0, "eof": False}
+    source, held = iter(commands), []
 
     def start(esid):
         seen["workers"] += 1
@@ -304,61 +362,101 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
             state["handle"] = driver.start(session, None, env or {})
         else:
             state["handle"] = driver.resume(esid, session, None, env or {})
+        state["eof"] = False
         seen["threads"].append(state["handle"].engine_session_id)
         say(f"worker {seen['workers']} on thread {state['handle'].engine_session_id}")
 
-    def pump():
+    def record(drafts):
+        for d in drafts:
+            seen["drafts"].append(d)
+            if on_draft is not None:
+                on_draft(d)
+            say(f"{d['type']}: {json.dumps(d['payload'], sort_keys=True)}")
+
+    def read_once() -> None:
+        try:
+            drafts = driver.pump(state["handle"], read_s)
+        except ReadTimeout:
+            return
+        if drafts is None:
+            state["eof"] = True
+            say("the worker ended its output")
+            return
+        record(drafts)
+
+    def busy() -> bool:
         handle = state["handle"]
-        while True:
-            try:
-                drafts = driver.pump(handle, read_s)
-            except ReadTimeout:
-                if handle.live_turn is None or console.pending:
-                    return
-                continue
-            if drafts is None:
-                say("the worker ended its output")
-                return
-            for d in drafts:
-                seen["drafts"].append(d)
-                say(f"{d['type']}: {json.dumps(d['payload'], sort_keys=True)}")
+        return not state["eof"] and (handle.live_turn is not None or bool(console.pending))
+
+    def next_command(block: bool):
+        if held:
+            return held.pop(0)
+        ready = getattr(source, "ready", None)
+        if not block and ready is not None and not ready():
+            return _NOTHING_YET
+        return next(source, None)
 
     def step(line: str) -> bool:
         handle = state["handle"]
-        if line in ("y", "n") and console.pending:
-            approval_id, _ = console.pending.pop(0)
-            driver.send(handle, {"kind": "approval_answer", "approval_id": approval_id,
-                                 "decision": "approve" if line == "y" else "deny"})
+        if line in ("y", "n"):
+            if console.pending:
+                approval_id, _ = console.pending.pop(0)
+                driver.send(handle, {"kind": "approval_answer", "approval_id": approval_id,
+                                     "decision": "approve" if line == "y" else "deny"})
         elif line == "/interrupt":
             if handle.live_turn is not None:
                 driver.interrupt(handle, handle.live_turn)
         elif line in ("/stop", "/quit"):
-            driver.send(handle, {"kind": "close"})
-            pump()
+            if not handle.closed:
+                driver.send(handle, {"kind": "close"})
             console.pending.clear()
             return line == "/quit"
         elif line == "/resume":
+            if not handle.closed:
+                say("refused: /stop the worker first; a running worker is never replaced")
+                return False
             start(seen["threads"][-1])
-            return False
         else:
             state["delivery"] += 1
             if handle.live_turn is None:
                 state["turn"] += 1
             driver.send(handle, {"kind": "user_message", "turn_id": handle.live_turn or f"turn-{state['turn']}",
                                  "text": line, "delivery_id": f"dlv-{state['delivery']}"})
-        pump()
         return False
 
     start(None)
-    for raw in commands:
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            if step(line):
+    try:
+        while True:
+            during_turn = busy()
+            raw = next_command(block=not during_turn)
+            if raw is None:
+                break  # no more commands
+            if raw is not _NOTHING_YET:
+                line = raw.strip()
+                if during_turn and line and not takes_now(line, bool(console.pending)):
+                    held.insert(0, raw)  # it waits for the turn to end
+                    raw = _NOTHING_YET
+            if raw is _NOTHING_YET:
+                read_once()
+                continue
+            if not line:
+                continue
+            try:
+                if step(line):
+                    break
+            except (DriverRefused, DriverStateError, c.RouteError) as err:
+                say(f"refused: {err}")
+        handle = state["handle"]
+        while not state["eof"] and handle.closed:  # what the worker still writes after /quit, while it has some
+            try:
+                drafts = driver.pump(handle, read_s)
+            except ReadTimeout:
                 break
-        except (DriverRefused, DriverStateError) as err:
-            say(f"refused: {err}")
+            if drafts is None:
+                break
+            record(drafts)
+    except c.RouteError as err:
+        say(f"the worker's output failed: {err}; the run ends")
     return seen
 
 
@@ -384,26 +482,61 @@ def run_mode(args: argparse.Namespace) -> int:
     def say(text: str) -> None:
         print(text, flush=True)
 
+    def on_draft(d: dict) -> None:
+        drafts.write(json.dumps(d, sort_keys=True) + "\n")
+
     console = Console(say)
     driver = CodexDriver(launcher, time.monotonic, binary=args.codex, approvals=console)
     route = {"engine": "codex", "model": args.model, "connection": {"kind": "subscription", "id": "own-login"}}
+    seen: dict = {}
+    # Every worker is ended and every capture closed however the loop ends, an exception or Ctrl-C included;
+    # one worker that cannot be ended does not stop the others (the #402 reads: GPT-6 Astra R7, DeepSeek F2).
+    try:
+        session_loop(driver, Typed(), say, console, env=child_env(dict(os.environ)), route=route, seen=seen,
+                     on_draft=on_draft)
+    finally:
+        drafts.close()
+        for proc in workers:
+            try:
+                proc.fence("attended_run_over")
+            except Exception as err:  # noqa: BLE001 - say it and go on to the next worker
+                print(f"[worker pid {proc.proc.pid} could not be ended: {type(err).__name__}: {err}]")
+    print(f"captured in {out}: threads {seen.get('threads')}")
+    return 0
 
-    def typed():
+
+class Typed:
+    """The keyboard as a command iterator: a thread reads lines (started on first use), ``ready()`` says
+    whether one is waiting, and the end of input reads as ``/quit``."""
+
+    def __init__(self) -> None:
+        self._lines: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+
+    def _read(self) -> None:
         while True:
             try:
-                yield input("> ")
+                line = input("> ")
             except EOFError:
-                yield "/quit"
+                self._lines.put("/quit")
                 return
+            self._lines.put(line)
 
-    seen = session_loop(driver, typed(), say, console, env=child_env(dict(os.environ)), route=route)
-    for d in seen["drafts"]:
-        drafts.write(json.dumps(d, sort_keys=True) + "\n")
-    drafts.close()
-    for proc in workers:
-        proc.fence("attended_run_over")
-    print(f"captured in {out}: threads {seen['threads']}")
-    return 0
+    def _started(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._read, daemon=True)
+            self._thread.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        self._started()
+        return self._lines.get()
+
+    def ready(self) -> bool:
+        self._started()
+        return not self._lines.empty()
 
 
 def main(argv: list[str] | None = None) -> int:

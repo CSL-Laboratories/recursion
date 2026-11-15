@@ -40,12 +40,14 @@ THE TYPED LIMIT. Only a typed status of 429 is a plan limit: on 1.x ``error.data
 ``error.status``, each an integer. OpenCode retries a rate limit itself, up to five times, before it prints the
 error (1.19.5 packages/opencode/src/session/retry.ts:31, :85-98), so the line is the outcome and not one attempt.
 ``reset_at`` comes from the wait the vendor asked for: on 1.x the response header ``retry-after-ms`` when it holds a
-number (then nothing else is read, as in OpenCode), else ``retry-after`` as seconds, else as an HTTP date with a
-named zone and a real calendar day and time (retry.ts:47-75); on 2.x ``retryAfterMs``. The wait is counted from the moment the line is parsed, on the clock given, so a reset is never
-earlier than the vendor's. No wait, or one that is not a positive finite number, leaves ``reset_at`` null and the
-breaker uses its own cooldown. The limit is on the connection, never on another one, and names no model or bucket:
-OpenCode's stream names neither. Any other error is not a limit: free text in an error envelope that sounds like a
-quota makes the result a ``short_fault`` (``contract.sounds_like_quota``, grill Q23), and nothing else does.
+number (then nothing else is read, as in OpenCode), else ``retry-after`` as seconds, else as an HTTP date in either
+form RFC 9110 has a recipient read with a zone, IMF-fixdate or rfc850-date, with a real calendar day and time
+(``_http_date``; retry.ts:47-75); on 2.x ``retryAfterMs``. The wait is counted from the moment the line is parsed, on
+the clock given, so a reset is never earlier than the vendor's. No wait, or one that is not a positive finite number,
+leaves ``reset_at`` null and the breaker uses its own cooldown. The limit is on the connection, never on another one,
+and names no model or bucket: OpenCode's stream names neither. Any other error is not a limit: free text in an error
+envelope that sounds like a quota makes the result a ``short_fault`` (``contract.sounds_like_quota``, grill Q23), and
+nothing else does.
 
 USAGE. ``step_finish`` carries ``tokens`` ``{input, output, reasoning, cache: {read, write}}`` and ``cost``. Both
 lines compute them the same way: ``input`` excludes the cached tokens, ``output`` excludes reasoning, and a count
@@ -94,7 +96,6 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_tz
 from types import MappingProxyType
 
 from recursion_core.routes import contract as c
@@ -135,10 +136,17 @@ _FIRST_EPOCH = -62135596800.0  # 0001-01-01T00:00:00Z
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 _CONNECTION = re.compile(r"(subscription|api_key|passthrough):.+")
-# The whole HTTP date, in the form RFC 9110 sends: an optional weekday, day, month, four-digit year, one time, and one
-# zone Date.parse names (in any case). Nothing else may stand before, between or after.
-_HTTP_DATE = re.compile(r"\s*(?:[A-Za-z]+,\s*)?[0-9]{1,2}\s+[A-Za-z]{3}\s+[0-9]{4}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?"
-                        r"\s+(?:GMT|UTC|UT|Z|[+-][0-9]{4})\s*", re.IGNORECASE)
+# The two HTTP-date forms RFC 9110 (5.6.7) has a recipient read that carry a zone, matched whole and parsed here (not
+# by parsedate_tz, which rewrites a year below 100 and skips words it does not know). Fields are separated by spaces
+# only; whitespace may surround the value. Names (weekday, month, zone) are read in any case, as Date.parse reads
+# them. IMF-fixdate, with its usual leniencies: an optional weekday, a day of one or two digits, optional seconds.
+_IMF_DATE = re.compile(r"\s*(?:[A-Za-z]+, *)?([0-9]{1,2}) +([A-Za-z]{3}) +([0-9]{4}) +([0-9]{1,2}):([0-9]{2})"
+                       r"(?::([0-9]{2}))? +(GMT|UTC|UT|Z|[+-][0-9]{4})\s*", re.IGNORECASE)
+# rfc850-date: weekday, DD-Mon-YY, a time with seconds, a zone; its two-digit year is read by RFC 9110's 50-year rule.
+_RFC850_DATE = re.compile(r"\s*[A-Za-z]+, *([0-9]{2})-([A-Za-z]{3})-([0-9]{2}) +([0-9]{2}):([0-9]{2}):([0-9]{2})"
+                          r" +(GMT|UTC|UT|Z|[+-][0-9]{4})\s*", re.IGNORECASE)
+_MONTHS = {name: number for number, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
 _SURROGATE = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + "]")
 REPLACEMENT = chr(0xFFFD)
 _JS_FLOAT = re.compile(r"\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
@@ -227,9 +235,11 @@ class Parser:
             raise ValueError("one line at a time")
         if not raw:
             return []
-        # What the line may change, taken before anything moves: if reading it raises (an injected clock, an
-        # interruption, a memory error), all of it is put back, so the line counts as not read and feeding it again
-        # gives the same drafts at the same offsets, with no text, usage, error or anomaly counted twice.
+        # What the line may change, taken before anything moves: if reading it raises inside this method (an injected
+        # clock, an interruption, a memory error), up to and including the return, all of it is put back, so the line
+        # counts as not read and feeding it again gives the same drafts at the same offsets, with no text, usage,
+        # error or anomaly counted twice. An interruption that lands in the CALLER after the return finds the line
+        # read: its drafts are the caller's to keep or lose.
         start, lines, session, limit = self._offset, self._lines, self.engine_session_id, self._limit
         kept = [(kept_list, len(kept_list)) for kept_list in (self.anomalies, self._text, self._usage, self._errors)]
         try:
@@ -240,12 +250,13 @@ class Parser:
             event = self._load(raw)
             if event is not None:
                 drafts.extend(self._typed(event))
+            # Inside the try: an interruption on the return itself is put back too.
+            return drafts
         except BaseException:
             self._offset, self._lines, self.engine_session_id, self._limit = start, lines, session, limit
             for kept_list, length in kept:
                 del kept_list[length:]
             raise
-        return drafts
 
     def end(self, exit_code: int | None) -> list[dict]:
         """The run's ``result`` draft, once its process has exited (``exit_code`` None: no status was read)."""
@@ -493,12 +504,7 @@ def _retry_after_s(headers: object, now: float) -> float | None:
 
     ``now`` is the wall clock's reading for this line. ``retry-after-ms`` when it holds a number (then nothing else
     is read, as in OpenCode, even when that number is not a usable wait), else ``retry-after`` as seconds, else as
-    an HTTP date. A wait that is not a positive number is None. Header names are matched in any case. An HTTP date
-    counts only when the WHOLE value has the shape ``_HTTP_DATE`` gives (one time, then one zone ``GMT``, ``UT``,
-    ``UTC``, ``Z`` or a numeric offset, then nothing): ``parsedate_tz`` reads an unknown zone, no zone, a word between
-    the time and the zone, and a second time as offset 0 or skips them, where ``Date.parse`` refuses them or reads
-    them in the machine's own zone. And only with a real calendar day and time (``Date.parse`` refuses "32 Nov" or
-    "25:00", which ``calendar.timegm`` would roll forward).
+    an HTTP date (``_http_date``). A wait that is not a positive number is None. Header names are matched in any case.
     """
     if not isinstance(headers, Mapping):
         return None
@@ -514,20 +520,45 @@ def _retry_after_s(headers: object, now: float) -> float | None:
     number = _js_float(after)
     if number is not None:
         return number if number > 0 else None
-    try:
-        parts = parsedate_tz(after)
-        if parts is None or not _HTTP_DATE.fullmatch(after):
-            return None
-        year, month, day, hour, minute, second = parts[:6]
-        # parsedate_tz has already refused a month it does not name.
-        if not (1 <= day <= calendar.monthrange(year, month)[1] and 0 <= hour <= 23 and 0 <= minute <= 59
-                and 0 <= second <= 59):
-            return None
-        moment = calendar.timegm(parts[:6] + (0, 0, 0)) - parts[9]
-    except (TypeError, ValueError, IndexError, OverflowError):
+    moment = _http_date(after, now)
+    if moment is None:
         return None
     wait = moment - now
     return wait if wait > 0 else None
+
+
+def _http_date(text: str, now: float) -> float | None:
+    """An HTTP date as Unix seconds, or None.
+
+    Only the two forms with a zone are read, each matched WHOLE (``_IMF_DATE``, ``_RFC850_DATE``): one time and one
+    zone ``GMT``, ``UT``, ``UTC``, ``Z`` or a numeric offset (``-2500`` is 25 hours, as ``Date.parse`` reads it), and
+    nothing else. An unknown zone, no zone (asctime-date, which ``Date.parse`` reads in the machine's own zone), a word
+    or a second time between the time and the zone, a tab or a line break between fields, and an impossible day or
+    time ("32 Nov", "25:00", which ``calendar.timegm`` would roll forward) give None. A four-digit year is the year
+    written (0068 is the year 68, long past); a two-digit rfc850 year is the century of ``now`` that is not more than
+    50 years ahead of it (RFC 9110, 5.6.7).
+    """
+    match = _IMF_DATE.fullmatch(text) or _RFC850_DATE.fullmatch(text)
+    if match is None:
+        return None
+    day, month_name, year_text, hour, minute, second, zone = match.groups()
+    month = _MONTHS.get(month_name.lower())
+    if month is None:
+        return None
+    day, hour, minute, second = int(day), int(hour), int(minute), int(second or 0)
+    year = int(year_text)
+    if len(year_text) == 2:
+        if not _FIRST_EPOCH <= now <= _LAST_EPOCH:
+            return None
+        this_year = (_UNIX_EPOCH + timedelta(seconds=now)).year
+        year += this_year // 100 * 100
+        if year > this_year + 50:
+            year -= 100
+    if not (1 <= year and 1 <= day <= calendar.monthrange(year, month)[1] and hour <= 23 and minute <= 59
+            and second <= 59):
+        return None
+    offset = 0 if zone[0] not in "+-" else (-1 if zone[0] == "-" else 1) * (int(zone[1:3]) * 3600 + int(zone[3:]) * 60)
+    return calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0)) - offset
 
 
 def _timestamp(epoch: float) -> str | None:

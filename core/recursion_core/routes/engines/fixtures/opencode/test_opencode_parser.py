@@ -375,6 +375,20 @@ class LimitTests(Shape, unittest.TestCase):
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 00:06:00 GMT"}, None),       # is looked for
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 XYZ 9:06 +0000"}, None),
                  ({"retry-after": "Sat, 14 Nov 26 00:05:00 GMT"}, None),            # a two-digit year
+                 ({"retry-after": "Sunday, 15-Nov-26 00:05:00 GMT"}, "2026-11-15T00:05:00.000Z"),   # rfc850-date
+                 ({"retry-after": "sunday, 15-nov-26 00:05:00 gmt"}, "2026-11-15T00:05:00.000Z"),
+                 ({"retry-after": "Sunday, 15-Nov-76 00:05:00 GMT"}, "2076-11-15T00:05:00.000Z"),   # 50 years on
+                 ({"retry-after": "Sunday, 15-Nov-77 00:05:00 GMT"}, None),         # 1977: more than 50 ahead
+                 ({"retry-after": "Sunday, 15-Nov-2026 00:05:00 GMT"}, None),       # rfc850 has two digits
+                 ({"retry-after": "Sunday, 15-Nov-26 00:05 GMT"}, None),            # and seconds
+                 ({"retry-after": "Sun Nov 15 00:05:00 2026"}, None),               # asctime-date: no zone
+                 ({"retry-after": "Sat, 14 Nov 0068 00:05:00 GMT"}, None),          # the year 68, not 2068
+                 ({"retry-after": "Sat, 14 Nov 0000 00:05:00 GMT"}, None),          # there is no year 0
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00\tGMT"}, None),         # fields are separated by
+                 ({"retry-after": "Sat, 14 Nov 2026 00:05:00\nGMT"}, None),         # spaces only
+                 ({"retry-after": "Sat, 14\tNov 2026 00:05:00 GMT"}, None),
+                 ({"retry-after": "Sat,  14  Nov  2026  00:05:00  GMT"}, "2026-11-14T00:05:00.000Z"),
+                 ({"retry-after": "Sat, 14 Nov 2026 01:35:00 +0130"}, "2026-11-14T00:05:00.000Z"),  # offset minutes
                  ({"retry-after": "Saturday, 14 Nov 2026 00:05:00 GMT"}, "2026-11-14T00:05:00.000Z"),
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 GMT\t"}, "2026-11-14T00:05:00.000Z"),
                  ({"retry-after": "Sat, 14 Nov 2026 00:05:00 utc  "}, "2026-11-14T00:05:00.000Z"),
@@ -760,7 +774,8 @@ class ReviewOneTests(Shape, unittest.TestCase):
 
     def test_m17_quota_words_in_the_models_own_text_change_nothing(self):
         p = parser()
-        p.feed(line({"type": "text", "sessionID": "ses_x", "part": {"type": "text", "text": "quota rate limit exceeded"}}))
+        p.feed(line({"type": "text", "sessionID": "ses_x",
+                     "part": {"type": "text", "text": "quota rate limit exceeded"}}))
         p.end(0)
         self.assertEqual((p.route_result("r1")["code"], p.text), (None, "quota rate limit exceeded"))
 
@@ -998,20 +1013,45 @@ class ReviewOneTests(Shape, unittest.TestCase):
         self.assertEqual((p._offset, p._lines), (0, 0))
         self.assertEqual(p.feed(line({"type": "step_start"}))[0]["payload"]["offset_start"], 0)
 
-    def test_f1_an_interruption_just_after_the_offset_moved_is_put_back(self):
-        # A signal can land between any two lines; a line tracer raises one exactly before the line count moves,
-        # after the offset has.
-        lines, first = inspect.getsourcelines(oc.Parser.feed)
-        target = first + next(i for i, text in enumerate(lines) if text.strip() == "self._lines += 1")
+    def tracer_at(self, function, text: str):
+        """A tracer that raises KeyboardInterrupt just before the line of ``function`` whose text is ``text``."""
+        lines, first = inspect.getsourcelines(function)
+        target = first + next(i for i, line_text in enumerate(lines) if line_text.strip() == text)
+        fired = []
 
         def local(frame, event, arg):
             if event == "line" and frame.f_lineno == target:
+                fired.append(target)
                 raise KeyboardInterrupt
             return local
 
         def tracer(frame, event, arg):
-            return local if frame.f_code is oc.Parser.feed.__code__ else None
+            return local if frame.f_code is function.__code__ else None
+        return tracer, fired
 
+    def test_r4_an_interruption_on_the_return_leaves_the_line_unread(self):
+        for raw in (line({"type": "text", "sessionID": "ses_new", "part": {"type": "text", "text": "tail "}}),
+                    line(step({"input": 7})),
+                    line(v1_error({"message": "x", "statusCode": 429, "isRetryable": True,
+                                   "responseHeaders": {"retry-after": "11"}}))):
+            with self.subTest(raw[:20]):
+                p = parser()
+                p.feed(line({"type": "text", "sessionID": "ses_kept", "part": {"type": "text", "text": "prefix "}}))
+                before = self.state(p)
+                tracer, fired = self.tracer_at(oc.Parser.feed, "return drafts")
+                sys.settrace(tracer)
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        p.feed(raw)
+                finally:
+                    sys.settrace(None)
+                self.assertTrue(fired)
+                self.assertEqual(self.state(p), before)
+
+    def test_r4_an_interruption_on_the_line_after_the_offset_moves_is_put_back(self):
+        lines, first = inspect.getsourcelines(oc.Parser.feed)
+        text = lines[next(i for i, t in enumerate(lines) if t.strip() == "self._offset += len(raw)") + 1].strip()
+        tracer, fired = self.tracer_at(oc.Parser.feed, text)
         p = parser()
         sys.settrace(tracer)
         try:
@@ -1019,7 +1059,24 @@ class ReviewOneTests(Shape, unittest.TestCase):
                 p.feed(line({"type": "step_start"}))
         finally:
             sys.settrace(None)
+        self.assertTrue(fired)
         self.assertEqual((p._offset, p._lines), (0, 0))
+
+    def test_r4_a_two_digit_year_under_a_wall_clock_out_of_range_is_no_reset(self):
+        headers = {"retry-after": "Sunday, 15-Nov-26 00:05:00 GMT"}
+        for wall in (-1e18, 1e18):
+            with self.subTest(wall):
+                p = parser(wall=wall)
+                error = v1_error({"message": "x", "statusCode": 429, "isRetryable": True, "responseHeaders": headers})
+                (limit,) = typed(p.feed(line(error)), "limit")
+                self.assertIsNone(limit["reset_at"])
+
+    def test_r4_the_first_and_last_writable_instants(self):
+        self.assertEqual(oc._timestamp(oc._FIRST_EPOCH), "0001-01-01T00:00:00.000Z")
+        self.assertEqual(oc._timestamp(oc._FIRST_EPOCH + 0.125), "0001-01-01T00:00:00.125Z")
+        self.assertEqual(oc._timestamp(oc._LAST_EPOCH), "9999-12-31T23:59:58.000Z")
+        for value in (oc._FIRST_EPOCH - 1, oc._LAST_EPOCH + 1, float("nan"), float("inf"), float("-inf")):
+            self.assertIsNone(oc._timestamp(value))
 
     def test_f2_a_reset_before_the_year_1_is_none_and_every_year_has_four_digits(self):
         for wall in (-1e12, -1e18):

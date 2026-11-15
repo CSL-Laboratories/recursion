@@ -237,6 +237,34 @@ class AcpDraftsTest(unittest.TestCase):
         for one, two in zip(spans, spans[1:]):
             self.assertEqual(one["offset_end"], two["offset_start"])   # the refused line left no partial span
 
+    def test_f2_ended_takes_both_ids_of_common_v1_form_or_neither(self) -> None:
+        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "hi")
+        drafts = ag.AcpDrafts()
+        for turn_id, delivery_id in ((5, "dlv-1"), ("turn-1", {"d": 1}), ("x", "dlv-1"), ("turn-1", "dlv-"),
+                                     ("turn-a b", "dlv-1"), ("turn-1" + chr(10), "dlv-1"), ("turn-1", None),
+                                     (None, "dlv-1")):
+            with self.subTest(turn_id=turn_id, delivery_id=delivery_id), self.assertRaises(TypeError):
+                drafts.ended(out, turn_id, delivery_id)
+        self.assertEqual(drafts.drafts, [])
+        good = drafts.ended(out, "turn-1", "dlv-1")
+        self.assertEqual([d["type"] for d in good], ["input.accepted", "result"])
+        if schema_check.AVAILABLE:
+            for draft in good:
+                self.assertTrue(schema_check.fits("driver.v2.json#/$defs/event_draft", draft), draft)
+
+    def test_r3_acp_drafts_given_the_key_mask_it_and_keep_the_offsets(self) -> None:
+        key = "r4-made-up-custody-value-0e5"
+        line = json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s", "update": {
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "the key is " + key}}}})
+        plain, masked = ag.AcpDrafts(offset=3), ag.AcpDrafts(offset=3, redact=(key,))
+        plain.on_line(line)
+        masked.on_line(line)
+        got, want = masked.drafts[0]["payload"], plain.drafts[0]["payload"]
+        self.assertNotIn(key, got["text"])
+        self.assertEqual((got["offset_start"], got["offset_end"]), (want["offset_start"], want["offset_end"]))
+        out = acp.TurnOutcome(1, c.ENGINE_ERROR, None, False, False, None, None, None, "acp error 1: " + key, "")
+        self.assertNotIn(key, json.dumps(masked.ended(out)))
+
     @unittest.skipUnless(schema_check.AVAILABLE, schema_check.SKIP_REASON)
     def test_every_acp_draft_fits_driver_v2(self) -> None:
         for script, cancel in (([("chunk", "hi"), ("end", "end_turn")], False),

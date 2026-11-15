@@ -42,7 +42,8 @@ WHAT THE CLIENT DOES, in the order of a run:
    (``auth_failed``). No other method is ever tried: there is no fallback between methods.
 3. ``session/new`` with the workspace folder as ``cwd`` and no MCP servers, or ``session/load`` when the
    caller resumes and the agent advertised ``loadSession``. When it did not, the load is refused before a
-   byte is written (``AcpUnsupported``, code ``launch_refused``). A load the agent refuses can be tried again.
+   byte is written (``AcpUnsupported``, code ``launch_refused``). A load the agent refuses can be tried again,
+   even when its refusal is a malformed error object (that is still a protocol error).
 4. ``session/prompt``: one turn at a time. A prompt while another prompt is unanswered is refused
    (``AcpStateError``), so a late update of one turn can never be filed under the next. A prompt whose
    deadline has already passed is refused before anything is written (``deadline_exceeded``). A turn
@@ -92,7 +93,10 @@ WHAT THE CLIENT DOES, in the order of a run:
     progress ends ``engine_exited`` (an outcome it already had stays); an open in progress raises
     ``AcpError(engine_exited)``. A write that fails on the pumping thread ends the turn before the next
     read; one that fails on another thread is noticed when the pump's current read returns, before
-    anything that line says is taken.
+    anything that line says is taken. The connection itself is told at once (``note_input_lost``), under
+    its lock: an answer to the prompt that it takes after that moment ends the turn ``engine_exited``,
+    never a success, however the threads interleave. An interrupted write while opening closes the
+    connection before the interruption is raised.
     A line that is not a JSON-RPC 2.0 object (including one too deeply nested to read) is a protocol error.
 11. Recursion's deadline is checked when a step that starts work holds the ordering lock, and again after
     each read: an answer read after the deadline never makes a success. A deadline is a finite number of
@@ -107,8 +111,10 @@ of the route contract's CODES: a caller on the route contract maps it (the one-s
 ``engine_error``). Every ``AcpError`` raised carries a route contract code, and every refusal of a call is
 an ``AcpError``: an argument the caller got wrong is ``AcpInvalid`` (``request_invalid``; also a
 ``ValueError``), a call the state does not allow is ``AcpStateError`` (``request_invalid``, or
-``engine_exited`` once the agent is gone; also a ``RuntimeError``). ``answer_permission`` raises
-``KeyError`` for a token this connection never issued.
+``engine_exited`` once the agent is gone; also a ``RuntimeError``). ``feed`` given something that is not a
+str, or ``expire`` given a ``now`` that is not a finite number, is ``AcpInvalid`` too. ``answer_permission``
+and ``ask`` raise ``KeyError`` for a token this connection never issued, ``pending_result`` for an id it
+never minted.
 
 WHAT IT DOES NOT DO (yet): map ``tool_call`` updates to tool.call drafts (their ``rawInput`` arrives late
 and differs by agent), read usage (stable ACP has only ``usage_update``: context size, and an optional
@@ -371,6 +377,7 @@ class AcpConnection:
         self.stray_updates = 0
         self.late_answers = 0
         self.hook_failures = 0
+        self._input_lost = False             # a write to the agent failed (note_input_lost)
         self.closed = False
 
     def _now(self) -> float | None:
@@ -514,7 +521,9 @@ class AcpConnection:
 
     def expire(self, now: float) -> list[str]:
         """Deny every open ask whose deadline has passed, except a claimed one (its claimer decides it
-        against the clock). The lines to write."""
+        against the clock). The lines to write. ``now`` is a finite number of the clock's seconds."""
+        if not _finite_number(now):
+            raise AcpInvalid("now must be a finite number of the clock's seconds")
         with self._lock:
             if self.closed:
                 return []
@@ -534,7 +543,10 @@ class AcpConnection:
 
     # -- reading ----------------------------------------------------------------------------------------
     def feed(self, line: str) -> Fed:
-        """One line of the agent's stdout. Raises ``AcpProtocolError`` for a line that is not JSON-RPC 2.0."""
+        """One line of the agent's stdout, as a str. Raises ``AcpProtocolError`` for a line that is not JSON-RPC
+        2.0, and ``AcpInvalid`` for a ``line`` that is not a str (the caller's error, not the agent's)."""
+        if not isinstance(line, str):
+            raise AcpInvalid("feed takes one line of the agent's stdout as a str")
         try:
             message = json.loads(line)
         except (ValueError, RecursionError):
@@ -571,6 +583,14 @@ class AcpConnection:
         """A write to the agent's stdin failed: nothing more can reach it, so it is gone as at the end of its
         output. Every unanswered request fails; a turn in progress ends engine_exited."""
         return self._gone("the agent's input closed", "the agent's input closed before the turn ended")
+
+    def note_input_lost(self) -> None:
+        """A write to the agent's stdin failed (on any thread). From now on an answer to the prompt in progress,
+        read on any thread, cannot make a success: the turn ends engine_exited when it is taken. An outcome
+        recorded before this call stays. Unlike ``input_closed`` this ends nothing by itself, so the caller
+        that pumps the turn still gets its outcome (``AcpSession`` calls ``input_closed`` from the pump)."""
+        with self._lock:
+            self._input_lost = True
 
     def abandon(self, code: str, detail: str, *, rpc_id: int | None = None) -> TurnOutcome | None:
         """End the turn in progress here with ``code`` (a route contract code), while its prompt is still
@@ -723,6 +743,8 @@ class AcpConnection:
                     # The prompt is answered, if badly: its turn is over, so nothing waits for another answer.
                     del self._pending[rpc_id]
                     self._close_turn(pending)
+                elif pending.method == SESSION_LOAD:
+                    self._loading = None   # refused, if badly: the connection can still load again
                 raise AcpProtocolError("error object without an integer code and a message")
             pending.error = RpcError(err["code"], err["message"], err.get("data"))
         else:
@@ -736,6 +758,14 @@ class AcpConnection:
                 self._loading = None       # a refused load leaves the connection able to load again
         elif pending.method == SESSION_PROMPT:
             del self._pending[rpc_id]      # nobody reads a prompt's request after its answer
+            if self._input_lost:
+                # The agent's input was lost before this answer was taken: whatever it says cannot make a
+                # success (or reach the hook). Decided under this lock, the same one note_input_lost takes.
+                turn = self._close_turn(pending)
+                if turn is not None and turn.outcome is None:
+                    fed.ended = self._end(turn, code=c.ENGINE_EXITED,
+                                          detail="the agent's input closed before the turn ended")
+                return None
             answered = self._prompt_answered(pending)
             if isinstance(answered, _HookNeeded):
                 return answered
@@ -879,7 +909,8 @@ class AcpSession:
         ANY failure of ``send`` loses the input, not only an ``OSError``: after a write that raised, the agent
         may hold part of a line, so nothing more can be written to it safely. An ``Exception`` is not raised
         (False); an interruption (a ``BaseException`` that is not an ``Exception``) is raised, with the input
-        already marked lost."""
+        already marked lost. The connection is told under its own lock (``note_input_lost``) before anything
+        else happens, so a prompt's answer the pump takes after this point can never be a success."""
         with self._order:
             if self.input_lost:
                 return False
@@ -888,6 +919,7 @@ class AcpSession:
                     self.process.send(line)
                 except BaseException as error:
                     self.input_lost = True
+                    self.connection.note_input_lost()
                     if isinstance(error, Exception):
                         return False
                     raise
@@ -951,7 +983,14 @@ class AcpSession:
         return conn.session_id
 
     def _open_step(self, make, method: str, code: str, deadline_at: float) -> None:
-        rpc_id, written = self._step(make)
+        try:
+            rpc_id, written = self._step(make)
+        except BaseException:
+            # The step's write was interrupted: the agent is gone with its input, and the connection is
+            # closed before the interruption is raised, so a later open or prompt is refused engine_exited.
+            if self.input_lost:
+                self.connection.input_closed()
+            raise
         if not written:
             self.connection.input_closed()
             raise AcpError(c.ENGINE_EXITED, f"{method}: the agent's input is closed")

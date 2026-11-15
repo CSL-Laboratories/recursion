@@ -1757,6 +1757,219 @@ class ReviewRoundThreeTest(unittest.TestCase):
                 self.assertEqual(ask.option_id is not None, want)
 
 
+class ReviewRoundFourTest(unittest.TestCase):
+    """Regressions for the three reads of #396 at b94c2cd1 that concern the shared client (Sol R1, R2 = Astra
+    E3, DeepSeek F1 and F3). Each fails on that head, except the guards marked as such."""
+
+    def answer_fails_during_the_turn(self, *, during_clock: bool):
+        """Sol's two schedules: the prompt's answer is read; before the connection takes it, another thread's
+        permission answer meets a real EPIPE."""
+        writer = broken_pipe()
+        self.addCleanup(os.close, writer)
+        agent = FakeAcpAgent([[("ask", TOOL_CALL, OPTIONS_ALL)]])
+        tokens, answers, fired = [], [], []
+        s = opened(agent, on_ask=lambda ask: tokens.append(ask.token))
+        original_send, original_read, original_feed = agent.send, agent.read_line, s.connection.feed
+
+        def send(line):
+            if json.loads(line).get("id") == "perm-1":
+                os.write(writer, line.encode("utf-8"))
+            else:
+                original_send(line)
+
+        def read_line(timeout_s):
+            if tokens:
+                return json.dumps({"jsonrpc": "2.0", "id": agent._prompt_id, "result": {"stopReason": "end_turn"}})
+            return original_read(timeout_s)
+
+        def fail_once():
+            if tokens and not fired:
+                fired.append(True)
+                t = threading.Thread(target=lambda: answers.append(s.answer_permission(tokens[0], acp.APPROVE)))
+                t.start()
+                t.join(10)
+                self.assertTrue(s.input_lost)
+
+        def clock():
+            if during_clock and fired == [] and tokens and agent.received[-1].get("method") == "session/prompt":
+                fail_once()
+            return agent.clock()
+
+        def feed(line):
+            if not during_clock and "stopReason" in line:
+                fail_once()
+            return original_feed(line)
+
+        agent.send, agent.read_line = send, read_line
+        s.connection._clock, s.connection.feed = clock, feed
+        out = s.prompt("x", FAR)
+        return answers, out
+
+    def test_r1_a_failed_answer_while_feed_reads_the_clock_cannot_make_a_success(self) -> None:
+        answers, out = self.answer_fails_during_the_turn(during_clock=True)
+        self.assertEqual(answers, [False])
+        self.assertEqual(out.code, c.ENGINE_EXITED)
+
+    def test_r1_a_failed_answer_just_before_feed_cannot_make_a_success(self) -> None:
+        answers, out = self.answer_fails_during_the_turn(during_clock=False)
+        self.assertEqual(answers, [False])
+        self.assertEqual(out.code, c.ENGINE_EXITED)
+
+    def test_r1_after_note_input_lost_the_prompts_answer_ends_engine_exited_and_no_hook_is_asked(self) -> None:
+        asked = []
+
+        class Hooks(acp.EngineHooks):
+            def limit(self, method, error):
+                asked.append(error)
+                return c.limit_signal("connection", "synthetic")
+
+        for answer in ({"result": {"stopReason": "end_turn"}}, {"error": {"code": -32001, "message": "x"}}):
+            with self.subTest(answer=list(answer)[0]):
+                conn = opened(FakeAcpAgent(), hooks=Hooks()).connection
+                rpc_id, _ = conn.prompt("x", FAR)
+                conn.note_input_lost()
+                fed = conn.feed(json.dumps(dict({"jsonrpc": "2.0", "id": rpc_id}, **answer)))
+                self.assertEqual(fed.ended.code, c.ENGINE_EXITED)
+                self.assertIsNone(conn.turn_in_progress)
+        self.assertEqual(asked, [])
+
+    def test_d1_nothing_a_line_read_after_a_loss_says_reaches_the_callbacks(self) -> None:
+        agent = FakeAcpAgent([[("chunk", "first"), ("chunk", "after"), ("end", "end_turn")]])
+        seen, lines = [], []
+        s = opened(agent, on_update=lambda p: seen.append(p["update"]["content"]["text"]), on_line=lines.append)
+        original_read = agent.read_line
+
+        def read_line(timeout_s):
+            line = original_read(timeout_s)
+            if line and '"after"' in line:
+                agent.stdin_closed = True                   # a cancel on another thread fails during this read
+                t = threading.Thread(target=s.cancel)
+                t.start()
+                t.join(10)
+            return line
+
+        agent.read_line = read_line
+        out = s.prompt("x", FAR)
+        self.assertEqual(out.code, c.ENGINE_EXITED)
+        self.assertEqual(seen, ["first"])                     # the update read after the loss reached no one
+        self.assertTrue(any('"after"' in line for line in lines))   # though its raw line was given to on_line
+
+    def test_r1_an_abandoned_turn_gets_no_second_outcome_from_an_answer_after_the_loss(self) -> None:  # guard
+        conn = opened(FakeAcpAgent()).connection
+        rpc_id, _ = conn.prompt("x", FAR)
+        self.assertEqual(conn.deadline().code, c.DEADLINE_EXCEEDED)
+        conn.note_input_lost()
+        fed = conn.feed(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": {"stopReason": "end_turn"}}))
+        self.assertIsNone(fed.ended)
+        self.assertIsNone(conn.abandoned_turn)
+
+    def test_r1_an_outcome_taken_before_the_loss_stays(self) -> None:                       # guard
+        conn = opened(FakeAcpAgent()).connection
+        rpc_id, _ = conn.prompt("x", FAR)
+        fed = conn.feed(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": {"stopReason": "end_turn"}}))
+        conn.note_input_lost()
+        self.assertIsNone(fed.ended.code)
+        self.assertIsNone(conn.input_closed())                  # nothing in progress: no second outcome
+
+    def test_e3_r2_an_interrupted_write_while_opening_closes_the_connection(self) -> None:
+        for stage in ("initialize", "authenticate", "session/new", "session/load"):
+            for failure in (KeyboardInterrupt, SystemExit, GeneratorExit):
+                with self.subTest(stage=stage, failure=failure.__name__):
+                    agent = FakeAcpAgent(load_session=True)
+                    original = agent.send
+
+                    def send(line, stage=stage, failure=failure, original=original):
+                        if json.loads(line).get("method") == stage:
+                            raise failure("synthetic")
+                        original(line)
+
+                    agent.send = send
+                    s = session(agent)
+                    load = {"load_session_id": "old"} if stage == "session/load" else {}
+                    with self.assertRaises(failure):
+                        s.open("gemini-api-key", CWD, FAR, **load)
+                    self.assertTrue(s.input_lost and s.connection.closed)
+                    before = len(agent.received)
+                    for later in (lambda: s.open("gemini-api-key", CWD, FAR, **load), lambda: s.prompt("x", FAR)):
+                        with self.assertRaises(acp.AcpError) as ctx:
+                            later()
+                        self.assertEqual(ctx.exception.code, c.ENGINE_EXITED)
+                    self.assertEqual(len(agent.received), before)
+
+    def test_f1_a_load_refused_with_a_malformed_error_can_be_tried_again(self) -> None:
+        conn = acp.AcpConnection()
+        conn.agent_capabilities = {"loadSession": True}
+        rpc_id, _ = conn.load_session("old-1", CWD)
+        with self.assertRaises(acp.AcpProtocolError):
+            conn.feed(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": "x", "message": 5}}))
+        rpc_id, _ = conn.load_session("old-2", CWD)
+        conn.feed(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": {}}))
+        self.assertEqual(conn.session_id, "old-2")
+
+    def test_f3_feed_and_expire_refuse_a_wrong_argument_as_acp_invalid(self) -> None:
+        conn = opened(FakeAcpAgent(), permission_timeout_s=5).connection
+        conn.prompt("x", FAR)
+        conn.feed(permission_line(conn))                     # an ask with a deadline, so expire compares
+        for call in (lambda: conn.feed(None), lambda: conn.feed(5), lambda: conn.feed(b"{}"),
+                     lambda: conn.expire("soon"), lambda: conn.expire(float("nan")), lambda: conn.expire(None),
+                     lambda: conn.expire(True)):
+            with self.assertRaises(acp.AcpInvalid) as ctx:
+                call()
+            self.assertEqual(ctx.exception.code, c.REQUEST_INVALID)
+
+    # -- the reads' other new cases, kept as guards ----------------------------------------------------------
+    def test_an_interruption_on_an_error_answer_line_leaves_the_next_turn_usable(self) -> None:
+        for failure in (KeyboardInterrupt, SystemExit, GeneratorExit):
+            with self.subTest(failure=failure.__name__):
+                agent = FakeAcpAgent([[("error", -32001, "synthetic")], [("chunk", "new"), ("end", "end_turn")]])
+                once = []
+
+                def on_line(line, once=once, failure=failure):
+                    if not once and "error" in line and "-32001" in line:
+                        once.append(True)
+                        raise failure("synthetic")
+
+                s = opened(agent, on_line=on_line)
+                with self.assertRaises(failure):
+                    s.prompt("first", FAR)
+                self.assertIsNone(s.connection.abandoned_turn)
+                self.assertEqual(s.prompt("next", FAR).text, "new")
+
+    def test_a_grouped_interruption_on_the_answering_line_leaves_the_next_turn_usable(self) -> None:
+        agent = FakeAcpAgent([[("end", "end_turn")], [("chunk", "next"), ("end", "end_turn")]])
+        seen = []
+
+        def on_line(line):
+            if not seen and "stopReason" in line:
+                seen.append(True)
+                raise BaseExceptionGroup("synthetic", [KeyboardInterrupt(), ValueError()])
+
+        s = opened(agent, on_line=on_line)
+        with self.assertRaises(BaseExceptionGroup):
+            s.prompt("first", FAR)
+        self.assertEqual(s.prompt("second", FAR).text, "next")
+
+    def test_negative_huge_deadlines_are_refused_and_the_largest_float_works(self) -> None:
+        import sys
+        agent = FakeAcpAgent()
+        s = opened(agent)
+        for bad in (-(10 ** 1000), 10 ** 10000):
+            with self.assertRaises(acp.AcpInvalid):
+                s.prompt("x", bad)
+        self.assertIsNone(s.prompt("x", sys.float_info.max).code)
+
+    def test_no_option_at_all_is_never_an_answer_taken(self) -> None:
+        for decision in (acp.APPROVE, acp.DENY):
+            with self.subTest(decision=decision):
+                agent = FakeAcpAgent([[("ask", TOOL_CALL, []), ("end", "end_turn")]])
+                taken, holder = [], {}
+                holder["s"] = opened(agent, on_ask=lambda ask, d=decision: taken.append(
+                    holder["s"].answer_permission(ask.token, d)))
+                self.assertIsNone(holder["s"].prompt("x", FAR).code)
+                self.assertEqual(taken, [False])
+                self.assertEqual(agent.permission_answers["perm-1"], {"outcome": {"outcome": "cancelled"}})
+
+
 class DeadlineTest(unittest.TestCase):
     def test_the_deadline_ends_the_turn_and_a_late_answer_never_reaches_a_later_turn(self) -> None:
         agent = FakeAcpAgent([[("chunk", "slow"), ("wait_cancel",), ("end", "cancelled")],

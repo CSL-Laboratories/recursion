@@ -356,9 +356,22 @@ def prepared(route, method_id) -> str:
     return f"/var/tmp/route-homes/antigravity-{method_id}"
 
 
-def adapter(launcher, clock, *, binary=None, home=prepared) -> ag.AntigravityOneShotAdapter:
+class FakeBoundary:
+    """A stand-in for the launch side's output boundary: it records the values it was told to keep out of
+    the capture and hands back the test's launcher. It persists nothing, so there is nothing to mask."""
+
+    def __init__(self, launcher) -> None:
+        self.launcher, self.asked = launcher, []
+
+    def __call__(self, values):
+        self.asked.append(tuple(values))
+        return self.launcher
+
+
+def adapter(launcher, clock, *, binary=None, home=prepared, boundary=None) -> ag.AntigravityOneShotAdapter:
     return ag.AntigravityOneShotAdapter(launcher, clock, lambda conn_id, name: "made-up-key-for-tests", PARENT,
-                                        binary=binary, prepared_home=home)
+                                        binary=binary, prepared_home=home,
+                                        output_boundary=boundary if boundary is not None else FakeBoundary(launcher))
 
 
 class AdapterTest(unittest.TestCase):
@@ -590,6 +603,130 @@ class ReviewRoundThreeParserTest(unittest.TestCase):
         launcher = Launcher([], clock)
         res = adapter(launcher, clock, home=lambda *args: b"/var/tmp/synthetic").run(request(), clock() + 10)
         self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertEqual(launcher.calls, [])
+
+
+SYNTHETIC_KEY = "r4-made-up-custody-value-0e5"   # invented here; no real key, custody or auth file is read
+
+
+def echoing_launcher(clock, calls, *, status="SUCCESS", echo=True, name="GEMINI_API_KEY"):
+    """A launcher whose child echoes the key it was given in its answer, error text and a tool's output."""
+    def launch(argv, *, env, shell=False, **kwargs):
+        calls.append({"argv": list(argv), "env": dict(env), "shell": shell})
+        said = env.get(name, "") if echo else "hello"
+        tool = json.dumps({"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "tool", "state": "DONE",
+            "tool_info": {"name": "t", "parameters": {"k": said}, "output": "out " + said}}})
+        result = json.dumps({"event": "result", "result": {"status": status, "response": said, "error": said,
+                                                           "num_turns": 1}})
+        return FakeProcess([tool, result, None], clock)
+    return launch
+
+
+class ReviewRoundFourAdapterTest(unittest.TestCase):
+    """Regressions for the three reads of #396 at b94c2cd1 that concern the one-shot adapter and parser
+    (Astra E2, Sol R3, DeepSeek F4). Each fails on that head, except the guards marked as such."""
+
+    def test_e2_a_key_route_without_an_output_boundary_is_refused_before_custody_home_or_launch(self) -> None:
+        touched = []
+
+        def must_not(*args, **kwargs):
+            touched.append(args)
+            raise AssertionError("reached without an output boundary")
+
+        made = ag.AntigravityOneShotAdapter(must_not, Clock(), must_not, PARENT, prepared_home=must_not)
+        for req in (request(), request("agent-platform", "api_key", "GOOGLE_API_KEY")):
+            with self.subTest(method=req["route"]["auth_method"]):
+                res = made.run(req, Clock()() + 60)
+                self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.OUTPUT_UNPROTECTED))
+                with self.assertRaises(c.RouteError) as ctx:
+                    made.env(req)
+                self.assertEqual(ctx.exception.detail, ag.OUTPUT_UNPROTECTED)
+        self.assertEqual(touched, [])
+
+    def test_e2_a_route_without_a_key_launches_without_a_boundary_with_exactly_its_names(self) -> None:  # guard
+        for method, kind in (("oauth-business", "subscription"), ("agent-platform", "passthrough")):
+            with self.subTest(method=method, kind=kind):
+                clock, calls = Clock(), []
+
+                def custody(*args):
+                    raise AssertionError("a route without a key asked custody")
+
+                made = ag.AntigravityOneShotAdapter(echoing_launcher(clock, calls, echo=False), clock, custody, PARENT,
+                                                    prepared_home=prepared)
+                res = made.run(request(method, kind, None), clock() + 60)
+                self.assertEqual(res["code"], None)
+                self.assertEqual(calls[0]["env"], {"PATH": "/usr/bin", "LANG": "C.UTF-8", "AGY_CLI_DISABLE_AUTO_UPDATE":
+                                                   "true", "HOME": f"/var/tmp/route-homes/antigravity-{method}"})
+
+    def test_r3_a_key_the_child_echoes_never_reaches_the_result_and_the_boundary_is_told_it_first(self) -> None:
+        for status in ("SUCCESS", "ERROR"):
+            with self.subTest(status=status):
+                clock, calls = Clock(), []
+                launch = echoing_launcher(clock, calls, status=status)
+                boundary = FakeBoundary(launch)
+                made = ag.AntigravityOneShotAdapter(launch, clock, lambda conn_id, name: SYNTHETIC_KEY, PARENT,
+                                                    prepared_home=prepared, output_boundary=boundary)
+                res = made.run(request(), clock() + 60)
+                self.assertEqual(boundary.asked, [(SYNTHETIC_KEY,)])          # asked before the launch
+                self.assertEqual(calls[0]["env"]["GEMINI_API_KEY"], SYNTHETIC_KEY)
+                self.assertNotIn(SYNTHETIC_KEY, json.dumps(res))
+                stars = "*" * len(SYNTHETIC_KEY)
+                self.assertIn(stars, res["text"] if status == "SUCCESS" else res["detail"])
+
+    def test_r3_a_parser_given_the_key_masks_every_draft_and_keeps_the_byte_offsets(self) -> None:
+        for key in (SYNTHETIC_KEY, 'made"up' + chr(0xE9) + "key-0e5"):        # also its JSON-escaped forms
+            with self.subTest(key=key):
+                lines_ = [json.dumps({"event": "step_update", "step_update": {
+                              "step_index": 1, "step_type": "tool", "state": "DONE",
+                              "tool_info": {"name": "t", "parameters": {"k": key}, "output": key}}}, ensure_ascii=asc)
+                          for asc in (True, False)]
+                for line in lines_:
+                    plain, masked = ag.OneShotParser(CONN, MODEL, offset=7), ag.OneShotParser(CONN, MODEL, offset=7,
+                                                                                               redact=(key,))
+                    want = of_type(plain.parse(line), "engine.output")[0]
+                    drafts = masked.parse(line)
+                    got = of_type(drafts, "engine.output")[0]
+                    for form in ag.mask_forms((key,)):
+                        self.assertNotIn(form, got["text"])
+                    call = of_type(drafts, "tool.call")[0]
+                    self.assertNotIn(key, json.dumps(call["input"], ensure_ascii=False))
+                    self.assertNotIn(key, of_type(drafts, "tool.result")[0]["text"])
+                    self.assertEqual((got["offset_start"], got["offset_end"]),
+                                     (want["offset_start"], want["offset_end"]))
+                    self.assertEqual(len(got["text"].encode("utf-8")), len(want["text"].encode("utf-8")))
+
+    def test_r3_a_launch_refusal_that_names_the_key_is_masked(self) -> None:
+        clock = Clock()
+
+        def refusing(argv, *, env, shell=False, **kwargs):
+            raise c.RouteError(c.LAUNCH_REFUSED, "the child environment refused " + env["GEMINI_API_KEY"])
+
+        made = ag.AntigravityOneShotAdapter(refusing, clock, lambda *a: SYNTHETIC_KEY, PARENT, prepared_home=prepared,
+                                            output_boundary=FakeBoundary(refusing))
+        res = made.run(request(), clock() + 60)
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertNotIn(SYNTHETIC_KEY, json.dumps(res))
+
+    def test_r3_a_line_the_mask_leaves_unreadable_fails_closed(self) -> None:
+        with self.assertRaises(ag.OneShotProtocolError):           # the value stands where a number is
+            ag.OneShotParser(CONN, MODEL, redact=("12345",)).parse(
+                '{"event":"result","result":{"status":"SUCCESS","num_turns":12345}}')
+        for bad in ("", None, 5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ag.mask_forms((bad,))
+
+    def test_f4_a_route_home_or_key_with_a_nul_is_refused_before_launch(self) -> None:
+        clock = Clock()
+        launcher = Launcher(lines("synthetic-ok.jsonl"), clock)
+        res = adapter(launcher, clock, home=lambda *a: "/var/tmp/a" + chr(0) + "b").run(
+            request("oauth-business", "subscription", None), clock() + 60)
+        self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.NOT_PREPARED))
+        made = ag.AntigravityOneShotAdapter(launcher, clock, lambda *a: "made" + chr(0) + "up", PARENT,
+                                            prepared_home=prepared, output_boundary=FakeBoundary(launcher))
+        res = made.run(request(), clock() + 60)
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertNotIn("made", res["detail"])
         self.assertEqual(launcher.calls, [])
 
 

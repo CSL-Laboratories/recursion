@@ -55,6 +55,7 @@ class AcpConnection(*, hooks=NO_HOOKS, clock=None, permission_timeout_s=None)   
     cancel() -> [lines]; answer_permission(token, 'approve'|'deny') -> line | None; expire(now) -> [lines]
     feed(line) -> Fed(updates, asks, replies, ended); release(rpc_id)
     end_of_output(); input_closed()       the agent is gone: a turn in progress ends engine_exited
+    note_input_lost()                     a write failed: a prompt's answer taken after this ends engine_exited
     abandon(code, detail, *, rpc_id=None); deadline()      end the turn here, its prompt still unanswered
     abandoned_turn; next_deadline(); ask(token); pending_result(rpc_id); turn_in_progress
     counters: stray_responses, stray_updates, late_answers, hook_failures
@@ -88,6 +89,20 @@ to the agent's answer to the abandoned prompt (those lines go to `on_line` only)
 keeps working. A line `on_line` raised on, even with an interruption, is still read by the connection. A
 write that fails, on any thread and whatever `send` raised, loses the agent's input: the turn ends
 `engine_exited` before anything more is read or taken, and every later call is refused `engine_exited`.
+The session tells the connection at once (`note_input_lost`, under the connection's lock), so a prompt's
+answer the connection takes after the failure can never be a success, however the threads interleave; an
+interrupted write while opening closes the connection before the interruption is raised. `feed` takes a
+str, and `expire` a finite `now`; anything else is `AcpInvalid`.
+
+A SELECTED CREDENTIAL never reaches a draft or a result. The engine that holds one (an API-key route's key)
+passes it to the draft makers: Antigravity's `OneShotParser(..., redact=(key,))` and
+`AcpDrafts(redact=(key,))` mask it (as it is and as JSON escapes it) with asterisks of the same UTF-8 length,
+so the byte offsets of `engine.output` still match a capture masked the same way. Antigravity's one-shot
+adapter launches a keyed route only through an `output_boundary` (a launcher, asked for by the values to
+keep out, whose capture masks them before anything is persisted) and refuses it without one, before custody
+is asked (`antigravity_output_boundary_missing`). E4, E6, E7 and E9 need the same for their keyed routes.
+`AcpDrafts.ended` takes `turn_id` (`turn-...`) and `delivery_id` (`dlv-...`) of common.v1's form, both or
+neither.
 A permission answer is decided when it claims the ask, against a clock read after the claim, so a wait for
 a lock never lets a late answer approve. The deadline of a step that starts work is checked once the step
 holds the session's ordering lock.

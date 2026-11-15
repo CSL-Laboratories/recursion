@@ -39,6 +39,17 @@ exactly the route's method (settings written, nothing else in it), or agy would 
 home holds: a fallback between methods. That home is the guard's and the route-home loader's to make (not
 open to this lane yet). The adapter therefore takes a ``prepared_home`` callable and REFUSES every launch
 without one; the factory cannot be given one, so a factory-built adapter refuses every launch.
+
+A SELECTED CREDENTIAL NEVER REACHES OUTPUT. An API-key route gives the child its one key, and the child
+could echo it. So a launch that carries a key needs an OUTPUT BOUNDARY (``output_boundary``): a launcher,
+asked for by the values to keep out, whose capture masks them before anything is persisted. Without one
+every such launch is refused before the key is fetched from custody (``antigravity_output_boundary_missing``);
+no boundary exists in the tree yet and the factory cannot be given one. With one, the adapter also masks the
+key in every result text and detail it returns, and the parser in every draft it makes. A mask keeps the
+value's UTF-8 length (asterisks), so the byte offsets of an ``engine.output`` draft still match a capture
+masked the same way. A route with no key (``oauth-business``, ``agent-platform`` over ``passthrough``)
+launches without a boundary; ``agent-platform`` over ``passthrough`` gets no key at all and relies on the
+Application Default Credentials the prepared route home holds for that method.
 """
 
 from __future__ import annotations
@@ -46,6 +57,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
@@ -178,15 +190,21 @@ class OneShotParser:
     Unknown events and fields are skipped (agy's own rule for its stdin). A line that is not a JSON object
     is a protocol error. Nothing in the agent's text decides a code, except that a failed run's ``error``
     text that sounds like a quota is a short fault (grill Q23), never a plan limit.
+
+    ``redact`` names the values no draft may carry (the route's selected credential): each line is masked
+    before anything is read from it (``mask``), so no draft, result or code detail holds them. A line whose
+    mask leaves no JSON object (a value inside a key or a number) is a protocol error: it fails closed.
     """
 
-    def __init__(self, connection_id: str, model: str | None, *, offset: int = 0) -> None:
+    def __init__(self, connection_id: str, model: str | None, *, offset: int = 0, redact=()) -> None:
         self.connection_id, self.model, self.offset = connection_id, model, offset
         self.conversation_id: str | None = None
         self.result: dict | None = None
         self._tool_steps: set = set()
+        self._redact = mask_forms(redact)
 
     def parse(self, line: str) -> list[dict]:
+        line = mask(line, self._redact)
         raw = line + "\n"
         start, self.offset = self.offset, self.offset + _utf8_length(raw, OneShotProtocolError)
         drafts = [{"type": "engine.output",
@@ -294,6 +312,26 @@ class OneShotParser:
         }
 
 
+def mask_forms(values) -> tuple[str, ...]:
+    """What ``mask`` looks for: each value as it is and as JSON writes it inside a string (with and without
+    ASCII escapes), longest first. Every value must be a non-empty str."""
+    forms = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ValueError("a value to mask is a non-empty str")
+        forms.update((value, json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]))
+    return tuple(sorted(forms, key=len, reverse=True))
+
+
+def mask(text: str, forms: tuple[str, ...]) -> str:
+    """``text`` with every occurrence of each form replaced by asterisks of the same UTF-8 length, so a byte
+    offset into text masked this way is the offset into the text as it was."""
+    for form in forms:
+        if form in text:
+            text = text.replace(form, "*" * len(form.encode("utf-8", "surrogatepass")))
+    return text
+
+
 def _utf8_length(raw: str, error: type) -> int:
     """The line's length in the stdout file. A line that cannot be written as UTF-8 (a lone surrogate, which a
     reader produces from bytes that were not UTF-8) is the agent's protocol error, not the parser's crash."""
@@ -398,20 +436,30 @@ def input_digest(value) -> str:
 # RouteError. Composition has no way to give one yet.
 PreparedHome = Callable[[Mapping, str], str]
 NOT_PREPARED = "antigravity_route_home_not_prepared"
+# output_boundary(values) -> a launcher (as ``routes.launch``) whose capture of the child's stdout and stderr
+# replaces every occurrence of each value, as ``mask`` does, before anything is persisted. The launch side's
+# to give; there is none in the tree yet.
+OutputBoundary = Callable[[tuple], Callable]
+OUTPUT_UNPROTECTED = "antigravity_output_boundary_missing"
 
 
 class AntigravityOneShotAdapter(RouteAdapter):
-    """One prompt through ``agy -p``. argv[0] is the ``binary`` option when given, else ``agy``, nothing else."""
+    """One prompt through ``agy -p``. argv[0] is the ``binary`` option when given, else ``agy``, nothing else.
+
+    A route that carries a key launches only through ``output_boundary`` (see the module's docstring); the
+    run loop is this class's own so that each run's key stays local to that run."""
 
     engine = ENGINE
 
     def __init__(self, launcher, clock, credentials, parent_env, *, binary: str | None = None,
-                 prepared_home: PreparedHome | None = None, wall_clock=None) -> None:
+                 prepared_home: PreparedHome | None = None, output_boundary: OutputBoundary | None = None,
+                 wall_clock=None) -> None:
         if binary is not None and (not isinstance(binary, str) or not binary.startswith("/") or "\x00" in binary):
             raise ValueError("binary must be an absolute path")
         super().__init__(launcher, clock, credentials, parent_env, wall_clock=wall_clock)
         self._binary = binary
         self._prepared_home = prepared_home
+        self._output_boundary = output_boundary
 
     @property
     def executable(self) -> str:
@@ -438,33 +486,71 @@ class AntigravityOneShotAdapter(RouteAdapter):
             return c.result(rid, c.REQUEST_INVALID, detail="route.connection")
         if not isinstance(route.get("model"), str):
             return c.result(rid, c.REQUEST_INVALID, detail="route.model")
-        return super().run(request, deadline_at)
+        # The base class's loop, with one difference: the key selected for this run decides the launcher (the
+        # output boundary) and what the parser and the result mask, and it never leaves this call.
+        try:
+            argv = self.argv(request)
+            env, secret = self._prepare(request)
+        except c.RouteError as err:
+            return c.result(rid, err.code, detail=err.detail)
+        secrets = () if secret is None else (secret,)
+        forms = mask_forms(secrets)
+        try:
+            launcher = self._launcher if not secrets else self._output_boundary(secrets)
+            process = launcher(argv, env=env, shell=False)
+        except c.RouteError as err:
+            return c.result(rid, err.code, detail=mask(err.detail, forms))
+        except OSError as err:
+            return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
+        events: list[dict] = []
+        try:
+            return self.drive(process, request, deadline_at, events, redact=secrets)
+        except Deadline:
+            process.fence("deadline")
+            return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
+        except _Protocol as err:
+            process.fence("protocol_error")
+            return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))   # fixed texts only
+        except OSError as err:
+            process.fence("io_error")
+            return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
 
     def argv(self, request: dict) -> list[str]:
         route_method(request["route"])
         return one_shot_argv(self.executable, request["route"]["model"])
 
     def env(self, request: dict) -> dict[str, str]:
+        return self._prepare(request)[0]
+
+    def _prepare(self, request: dict) -> tuple[dict[str, str], str | None]:
+        """The child's environment and the key it carries (None for a route without one)."""
         route = request["route"]
         method = route_method(route)
         if self._prepared_home is None:
             raise c.RouteError(c.LAUNCH_REFUSED, NOT_PREPARED)
+        if route["connection"].get("kind") == "api_key" and self._output_boundary is None:
+            # Refused before the route home is asked for and before custody is: no key is fetched for a run
+            # whose output nothing keeps it out of.
+            raise c.RouteError(c.LAUNCH_REFUSED, OUTPUT_UNPROTECTED)
         home = self._prepared_home(route, method.id)
-        if not isinstance(home, str) or not home.startswith("/"):
+        if not isinstance(home, str) or not home.startswith("/") or "\x00" in home:
             raise c.RouteError(c.LAUNCH_REFUSED, NOT_PREPARED)
         credential = self.credential(request, method.credential_env) if method.credential_env else None
+        if credential is not None and "\x00" in credential[1]:
+            raise c.RouteError(c.LAUNCH_REFUSED, f"the credential for {route['connection']['id']} is not usable")
         # The child gets the base names, its own HOME, the updater switch and the method's one key: no
         # other Google name from the daemon's environment can reach it.
         env = child_env(self._parent_env, never=("HOME",), credential=credential)
         env["HOME"] = home
         env.update(UPDATER_ENV)
-        return env
+        return env, (credential[1] if credential is not None else None)
 
-    def drive(self, process: EngineProcess, request: dict, deadline_at: float, events: list[dict]) -> dict:
+    def drive(self, process: EngineProcess, request: dict, deadline_at: float, events: list[dict], *,
+              redact=()) -> dict:
         rid, route = request["request_id"], request["route"]
         process.send(one_shot_stdin(request["prompt"]))
         process.close_stdin()
-        parser = OneShotParser(c.connection_key(route), route["model"])
+        parser = OneShotParser(c.connection_key(route), route["model"], redact=redact)
         while parser.result is None:
             remaining = deadline_at - self._clock()
             if remaining <= 0:
@@ -544,16 +630,19 @@ class AcpDrafts:
 
     ``on_line`` is the session's ``on_line``. ``ended(outcome, turn_id, delivery_id)`` gives the result
     draft and, when the agent answered the prompt (a typed answer to the client's own request id), the
-    ``input.accepted`` draft of the delivery that began the turn."""
+    ``input.accepted`` draft of the delivery that began the turn. The two ids are given together or not at
+    all, each of common.v1's form (``turn-...``, ``dlv-...``). ``redact`` names the values no draft may carry
+    (the route's selected credential), masked as ``mask`` does."""
 
-    def __init__(self, *, offset: int = 0) -> None:
+    def __init__(self, *, offset: int = 0, redact=()) -> None:
         self.offset = offset
         self.drafts: list[dict] = []
+        self._redact = mask_forms(redact)
 
     def on_line(self, line: str) -> None:
         if not isinstance(line, str):
             raise TypeError("on_line takes the line as a str")
-        raw = line + "\n"
+        raw = mask(line, self._redact) + "\n"
         start, self.offset = self.offset, self.offset + _utf8_length(raw, acp_module().AcpProtocolError)
         self.drafts.append({"type": "engine.output", "payload": {
             "stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
@@ -561,10 +650,20 @@ class AcpDrafts:
     def ended(self, outcome, turn_id: str | None = None, delivery_id: str | None = None) -> list[dict]:
         if not isinstance(outcome, acp_module().TurnOutcome):
             raise TypeError("ended takes the TurnOutcome the session gave")
+        if (turn_id is None) != (delivery_id is None):
+            raise TypeError("ended takes turn_id and delivery_id together, or neither")
+        if turn_id is not None and not (isinstance(turn_id, str) and TURN_ID.fullmatch(turn_id)
+                                        and isinstance(delivery_id, str) and DELIVERY_ID.fullmatch(delivery_id)):
+            raise TypeError("ended takes a turn_id of the form turn-<id> and a delivery_id of the form dlv-<id>")
         out = []
-        if outcome.stop_reason is not None and turn_id is not None and delivery_id is not None:
+        if outcome.stop_reason is not None and turn_id is not None:
             out.append({"type": "input.accepted",
                         "payload": {"delivery_id": delivery_id, "turn_id": turn_id, "how": "new_turn"}})
-        out.append({"type": "result", "payload": {"code": outcome.code, "detail": outcome.detail}})
+        out.append({"type": "result", "payload": {"code": outcome.code, "detail": mask(outcome.detail, self._redact)}})
         self.drafts += out
         return out
+
+
+# common.v1 $defs/turn_id and $defs/delivery_id.
+TURN_ID = re.compile(r"turn-[A-Za-z0-9_-]{1,59}")
+DELIVERY_ID = re.compile(r"dlv-[A-Za-z0-9_-]{1,60}")

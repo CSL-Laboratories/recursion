@@ -210,7 +210,9 @@ class FakeStore:
                     created.add(first)
                     return sqlite3.SQLITE_OK
                 if action == sqlite3.SQLITE_CREATE_INDEX:
-                    indexes.add(first)      # only on a table of its own: indexing a table READs it, refused below
+                    if second not in created:
+                        return sqlite3.SQLITE_DENY      # an index on a table this declaration did not make. An index
+                    indexes.add(first)                  # on a constant reads no column, so no later check sees it.
                     return sqlite3.SQLITE_OK
                 if action == sqlite3.SQLITE_REINDEX:        # what creating an index asks for, of that same index
                     return sqlite3.SQLITE_OK if first in indexes else sqlite3.SQLITE_DENY
@@ -218,8 +220,8 @@ class FakeStore:
                     return sqlite3.SQLITE_OK        # what creating a table writes, and nothing a statement can name
                 if action == sqlite3.SQLITE_READ and first in created:
                     return sqlite3.SQLITE_OK
-                if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
-                    return sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_FUNCTION:
+                    return sqlite3.SQLITE_OK        # in a default or a check; a declaration SELECTs nothing
                 return sqlite3.SQLITE_DENY
 
             with contextlib.closing(self._connect()) as db:
@@ -445,6 +447,25 @@ class RegistrationTest(unittest.TestCase):
         called = {node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, 'id', None)
                   for node in ast.walk(tree) if isinstance(node, ast.Call)}
         self.assertEqual(called & {'import_module', '__import__', 'exec', 'eval', 'reload'}, set())
+        # The whole module, not only its sixteen loaders (the third read): nothing is imported FROM importlib under
+        # another name, no builtin that imports or evaluates is named at all, and the one thing importlib is used
+        # for anywhere is importlib.util.find_spec with literal text.
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertNotEqual((node.module or '').split('.')[0], 'importlib', 'no importer is brought in under another name')
+            if isinstance(node, ast.Name):
+                self.assertNotIn(node.id, {'__import__', 'exec', 'eval', 'reload', '__builtins__'})
+                if node.id == 'importlib':
+                    util = parents.get(node)
+                    spec = parents.get(util)
+                    call = parents.get(spec)
+                    self.assertTrue(isinstance(util, ast.Attribute) and util.attr == 'util'
+                                    and isinstance(spec, ast.Attribute) and spec.attr == 'find_spec'
+                                    and isinstance(call, ast.Call) and call.func is spec,
+                                    'importlib is used for a guarded find_spec and nothing else')
+                    self.assertTrue(len(call.args) == 1 and not call.keywords and isinstance(call.args[0], ast.Constant)
+                                    and isinstance(call.args[0].value, str), 'every find_spec in the module takes literal text')
         functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
         for package in CORE_PACKAGES:
             self.assertIsNotNone(importlib.util.find_spec(package), 'a package of the core itself is always there')
@@ -870,7 +891,7 @@ class MethodTableTest(unittest.TestCase):
         table = methods.MethodTable()
         table.register('session.list', lambda ctx, params: {'code': 'ok', 'sessions': []})
         answer = table.dispatch('methods.list', {}, H.DEVICE, None)
-        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.9'))
+        self.assertEqual((answer['code'], answer['table_version']), ('ok', '1.0-draft.10'))
         self.assertEqual([row['name'] for row in answer['methods']], list(methods.METHODS), 'every row, in the table\'s order')
         self.assertEqual([row['name'] for row in answer['methods'] if row['implemented']],
                          [*methods.BUILT_IN, 'session.list', 'methods.list'])
@@ -1447,6 +1468,23 @@ class ServicesTest(unittest.TestCase):
                          ['daemon', 'registry', 'control_registry', 'control', 'store', 'state_dir', 'clock', 'closing'])
 
 
+def watch(gate):
+    """Put a lock that can be made to interrupt its next taker under the gate's condition, and return it."""
+    lock = WatchedLock()
+    gate._lock, gate._changed = lock, threading.Condition(lock)
+    return lock
+
+
+def answered_from_another_thread(case, gate):
+    """What ``gate.enter()`` answers a thread that never held the condition. A condition left owned by somebody
+    else makes that thread wait for ever; the bound only ends the test then, and the answer is missing."""
+    answers = []
+    other = threading.Thread(target=lambda: answers.append(gate.enter()), daemon=True)
+    other.start()
+    other.join(BOUND_S)
+    return answers
+
+
 class AdmissionTest(unittest.TestCase):
     def test_with_nothing_registered_the_gate_refuses_nobody_and_waits_for_nothing(self) -> None:
         made = H.bare()
@@ -1544,34 +1582,43 @@ class AdmissionTest(unittest.TestCase):
         gate.enabled = True
         gate.enter()
         gate.close()
-        condition = gate._changed
-        first, second = KeyboardInterrupt('as it takes the condition'), KeyboardInterrupt('while it waits')
-        seen = []
+        lock = watch(gate)
+        second, seen = KeyboardInterrupt('while it waits'), []
 
-        class Interrupted:
-            def __enter__(self):
-                seen.append(('take', gate.admitted))
-                if len(seen) == 1:
-                    raise first
-                return condition.__enter__()
-
-            def __exit__(self, *exc):
-                return condition.__exit__(*exc)
-
-            def wait(self, timeout=None):
-                seen.append(('wait', gate.admitted))
-                if [what for what, _ in seen].count('wait') == 1:
-                    raise second
-                gate._changed = condition      # the call leaves while the drain waits, as another thread's would
-                gate.leave()
-                return True
-        gate._changed = Interrupted()
+        def waiting(timeout=None):
+            seen.append((gate.admitted, lock._is_owned()))
+            if len(seen) == 1:
+                raise second
+            gate.leave()                    # the call leaves while the drain waits, as another thread's would
+            return True
+        gate._changed.wait = waiting
+        lock.interrupt_next = 'before'      # the first: as the drain asks for the condition
         with self.assertRaises(KeyboardInterrupt) as raised:
             gate.drain()
-        self.assertEqual(seen, [('take', 1), ('take', 1), ('wait', 1), ('take', 1), ('wait', 1)],
-                         'after each interruption it asked again, with the call still inside')
+        self.assertEqual(seen, [(1, True), (1, True)], 'after each interruption it waited again, with the call still inside')
         self.assertEqual(gate.admitted, 0, 'it raised only after the last call had left')
-        self.assertIs(raised.exception, first, 'and what it raises is the first interruption')
+        self.assertIsNot(raised.exception, second, 'and what it raises is the first interruption')
+        self.assertEqual((lock._is_owned(), answered_from_another_thread(self, gate)), (False, [False]))
+
+    @quiet
+    def test_an_interruption_that_lands_as_the_condition_is_taken_does_not_leave_it_owned(self) -> None:
+        """The third read's finding C. A close and a drain are interrupted as they take the admission condition:
+        before it is taken, and after it was taken, on the way back from taking it. Either way the gate does its
+        work, raises the interruption after it, and the condition is free: a call from another thread is
+        answered at once, where a condition left owned would make it wait for ever."""
+        for step in ('close', 'drain'):
+            for when in ('before', 'after'):
+                gate = H.Admission()
+                gate.enabled = True
+                lock = watch(gate)
+                if step == 'drain':
+                    gate.close()
+                lock.interrupt_next = when
+                with self.subTest(step=step, interrupted=when):
+                    with self.assertRaises(KeyboardInterrupt):
+                        getattr(gate, step)()
+                    self.assertEqual((gate.closed, lock._is_owned()), (True, False))
+                    self.assertEqual(answered_from_another_thread(self, gate), [False])
 
     @quiet
     def test_a_teardown_error_is_raised_only_after_everything_was_stopped_and_closed(self) -> None:
@@ -1902,7 +1949,7 @@ class FakeStoreTest(unittest.TestCase):
         store = work_store()
         with self.assertRaises(RuntimeError):
             store.register_tables('sessions', 2, 'CREATE TABLE more (a TEXT)')
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises((RuntimeError, sqlite3.Error)):
             store.register_tables('queue', 1, 'SELECT 1')
         store.register_tables('queue', 1, 'CREATE TABLE queue_items (item_id TEXT PRIMARY KEY, state TEXT)')
         with store.transaction() as tx:
@@ -2036,9 +2083,14 @@ class FakeStoreBoundaryTest(unittest.TestCase):
             "the helper's own table declared again, quietly, and indexed":
                 'CREATE TABLE mine (id TEXT); CREATE TABLE IF NOT EXISTS receipts (id TEXT); '
                 'CREATE INDEX on_receipts ON receipts (tenant)',
+            # The third read's witnesses. An index on a constant reads no column of the table it is put on.
+            "a unique index on a constant over the helper's receipts": 'CREATE TABLE mine (id TEXT); CREATE UNIQUE INDEX sabotage ON receipts (1)',
+            "the same over the helper's events": 'CREATE TABLE mine (id TEXT); CREATE UNIQUE INDEX sabotage ON events (NULL)',
+            "the same over another lane's table": 'CREATE TABLE mine (id TEXT); CREATE UNIQUE INDEX sabotage ON work ((1 + 1))',
+            'a table made with rows in it': 'CREATE TABLE mine AS SELECT 1 AS id',
             'no table at all': 'SELECT 1',
         }
-        made = {'own', 'leaked', 'seen', 'peek', 't1', 'sneak', 'mine', 'on_work', 'on_receipts'}
+        made = {'own', 'leaked', 'seen', 'peek', 't1', 'sneak', 'mine', 'on_work', 'on_receipts', 'sabotage'}
         for what, ddl in refused.items():
             with self.subTest(declaration=what):
                 with self.assertRaises((sqlite3.Error, RuntimeError)):
@@ -2052,6 +2104,9 @@ class FakeStoreBoundaryTest(unittest.TestCase):
         with store.transaction() as tx:
             tx.execute('INSERT INTO queue_items VALUES (?, ?)', ('item-1', 'queued'))
             self.assertEqual(tx.execute('SELECT item_id FROM queue_items WHERE state = ?', ('queued',)), [('item-1',)])
+            # And two unrelated receipts are both kept: no declaration left a constraint on the helper's table.
+            tx.receipt_put('t1', 'session.turn', 'c2', 'digest-2', {'code': 'ok'})
+            tx.receipt_put('t2', 'session.start', 'c3', 'digest-3', {'code': 'ok'})
 
     def test_a_foreign_key_a_declaration_states_is_enforced(self) -> None:
         store = FakeStore()
@@ -2700,6 +2755,9 @@ class WatchedLock:
     def _is_owned(self) -> bool:
         return self._inner._is_owned()
 
+    def locked(self) -> bool:             # a Condition of Python 3.14 asks its lock for this name when it is made
+        return self._held.is_set()
+
     def __enter__(self):
         self.acquire()
         return self
@@ -2930,59 +2988,61 @@ class LifecycleTest(unittest.TestCase):
 
     @quiet
     def test_an_interruption_while_the_drain_takes_its_condition_does_not_end_the_wait(self) -> None:
-        """The second reads' witness. The drain is interrupted as it TAKES the admission condition, not while it
-        waits on it, with one call inside. The close goes on waiting: nothing is stopped and the store stays
-        open until the call has left. (The close used to take the interruption as the end of the drain.)"""
-        made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store))
-        context = H.ServiceContext()
-        made.open_store('/state')
-        made.start_services(context)
-        self.assertTrue(made.gate.enter())                 # a call is inside
-        condition, drain, stop = made.gate._changed, made.gate.drain, events.stop
-        moved_on, admitted_at_teardown, state = threading.Event(), [], {'draining': False, 'taken': 0}
+        """The second reads' witness, and the third's. The drain is interrupted as it TAKES the admission
+        condition, not while it waits on it, with one call inside: before the condition is taken, and after it
+        was taken. The close goes on waiting: nothing is stopped and the store stays open until the call has
+        left. Afterwards the condition is free. (The close once took the interruption as the end of the drain,
+        and then left the condition owned.)"""
+        for when in ('before', 'after'):
+            made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store))
+            context = H.ServiceContext()
+            made.open_store('/state')
+            made.start_services(context)
+            self.assertTrue(made.gate.enter())                 # a call is inside
+            lock = watch(made.gate)
+            drain, stop, wait = made.gate.drain, events.stop, made.gate._changed.wait
+            # No schedule decides this. After the interruption the close moves on in one of two ways: it waits
+            # (right) or it begins to tear down (wrong). Either sets ``moved_on``, and what the teardown saw is
+            # written down at the moment it begins.
+            moved_on, admitted_at_teardown, outcome, armed = threading.Event(), [], [], [when]
 
-        class InterruptedOnce:
-            def __enter__(self):
-                if state['draining']:
-                    state['taken'] += 1
-                    if state['taken'] == 1:
-                        raise KeyboardInterrupt        # as a signal would, while the drain asks for the condition
-                    moved_on.set()                     # the drain asked again: it went on
-                return condition.__enter__()
+            def draining():
+                if armed:                                       # once: as a signal would, while the drain asks for the condition
+                    lock.interrupt_next = armed.pop()
+                return drain()
 
-            def __exit__(self, *exc):
-                return condition.__exit__(*exc)
+            def waiting(timeout=None):
+                moved_on.set()
+                return wait(timeout)
 
-            def __getattr__(self, name):
-                return getattr(condition, name)
+            def stopping(context):
+                admitted_at_teardown.append(made.gate.admitted)
+                moved_on.set()
+                return stop(context)
 
-        def draining():
-            state['draining'] = True
-            return drain()
-
-        def stopping(context):
-            admitted_at_teardown.append(made.gate.admitted)
-            moved_on.set()
-            return stop(context)
-        made.gate._changed, made.gate.drain, events.stop = InterruptedOnce(), draining, stopping
-        outcome = []
-
-        def close():
-            try:
-                made.finish_close(context)
-                outcome.append('returned')
-            except KeyboardInterrupt:
-                outcome.append('interrupted')
-        closer = threading.Thread(target=close, daemon=True)
-        closer.start()
-        self.assertTrue(moved_on.wait(BOUND_S), 'the close went on after the interruption, one way or the other')
-        self.assertEqual((admitted_at_teardown, store.closed, outcome), ([], False, []),
-                         'it went on WAITING: nothing is torn down while the call is inside')
-        state['draining'] = False                          # the test's own leave is not the drain
-        made.gate.leave()
-        closer.join(BOUND_S)
-        self.assertEqual((outcome, admitted_at_teardown, events.stop_calls, alive_at_close, store.closed),
-                         (['interrupted'], [0], 1, [[]], True), 'the interruption is raised once everything is torn down')
+            def close():
+                try:
+                    made.finish_close(context)
+                    outcome.append('returned')
+                except KeyboardInterrupt:
+                    outcome.append('interrupted')
+            made.gate.drain, made.gate._changed.wait, events.stop = draining, waiting, stopping
+            closer = threading.Thread(target=close, daemon=True)
+            with self.subTest(interrupted=when):
+                closer.start()
+                self.assertTrue(moved_on.wait(BOUND_S), 'the close went on after the interruption, one way or the other')
+                self.assertEqual((admitted_at_teardown, store.closed, outcome), ([], False, []),
+                                 'it went on WAITING: nothing is torn down while the call is inside')
+                # The call leaves from a thread of its own, with a bound: a condition that the interrupted drain
+                # left owned would hold the leaving for ever, and that must fail this test, not stop the run.
+                leaver = threading.Thread(target=made.gate.leave, daemon=True)
+                leaver.start()
+                leaver.join(BOUND_S)
+                self.assertFalse(leaver.is_alive(), 'the call could leave: the drain waits with the condition free')
+                closer.join(BOUND_S)
+                self.assertEqual((outcome, admitted_at_teardown, events.stop_calls, alive_at_close, store.closed),
+                                 (['interrupted'], [0], 1, [[]], True), 'the interruption is raised once everything is torn down')
+                self.assertEqual((lock._is_owned(), answered_from_another_thread(self, made.gate)), (False, [False]))
 
     def test_a_second_close_that_is_interrupted_while_it_waits_for_the_first_goes_on_waiting(self) -> None:
         made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
@@ -3033,9 +3093,9 @@ class LifecycleTest(unittest.TestCase):
     @unittest.skipUnless(hasattr(signal, 'pthread_kill'), 'needs a signal that can be aimed at one thread')
     def test_a_real_interrupt_while_a_close_waits_for_the_lifecycle_is_kept_until_the_owner_has_finished(self) -> None:
         """The same with a real SIGINT, sent to this thread while it waits for the lifecycle that another close
-        owns. On a runtime where a blocked lock is interrupted by a signal, the interruption is kept and the
-        wait begins again; on one where it is not (free-threaded 3.14 on this machine), the interruption
-        arrives once the lock has been taken. Either way it is raised only after the owner has finished."""
+        owns. The signal may interrupt the blocked wait, and the wait then begins again; or it may arrive once
+        the lock has been taken. The test does not depend on which: either way the interruption is raised only
+        after the owner has finished."""
         if threading.current_thread() is not threading.main_thread():
             self.skipTest('a signal is handled by the main thread only')
         made, store, (events,), alive_at_close = self.made(lambda store: WorkerService('events', store), serial_lock=True)
@@ -3109,6 +3169,77 @@ class LifecycleTest(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             made.finish_close(context)
         self.assertEqual((events.stop_calls, alive_at_close, store.closed), (3, [[]], True))
+
+    @quiet
+    def test_the_clean_up_of_a_failed_start_keeps_what_interrupts_it(self) -> None:
+        """The third read's finding B. A service's start fails, or closing begins while the services start. The
+        ones already started are stopped, and the stop of one is interrupted once. Every service is stopped all
+        the same, and what the start raises is the interruption, before the start's own ordinary error."""
+        for why in ('a start that fails', 'closing that begins'):
+            log = []
+
+            class Closes(Service):
+                def start(inner, context):
+                    super().start(context)
+                    made.begin_close()
+            first = WorkerService('events', FakeStore(), fail_stops=1, failure=KeyboardInterrupt)
+            second = Service('sessions', log, fail_start=True) if why == 'a start that fails' else Closes('sessions', log)
+            made = H.Hooks()
+            for service in (first, second, Service('queue', log)):
+                made.service(service)
+            made.freeze()
+            made.stop_retry_s = 0
+            self.addCleanup(first._quit.set)
+            with self.subTest(why=why):
+                with self.assertRaises(KeyboardInterrupt):
+                    made.start_services(H.ServiceContext())
+                self.assertEqual((first.stop_calls, first.alive(), made._started), (2, False, []),
+                                 'the interrupted stop was tried again, and nothing is left tracked')
+                self.assertNotIn(('start', 'queue'), [(what, name) for what, name, _ in log], 'and no later service was started')
+
+    def test_every_lifecycle_entry_refuses_the_thread_that_is_already_inside_one(self) -> None:
+        """The third read's finding D. A store's factory, a service's start and a service's stop each call the
+        two entries the refusal had been left off, ``open_store`` and ``start_services``, from inside a
+        lifecycle method. Each is refused: no second store is made and no service is started twice."""
+        seen, stores, asked = [], [], set()
+
+        def reenter(where):
+            if where in asked:           # once from each place, whatever comes of it: an entry that did re-enter ends, and is seen
+                return
+            asked.add(where)
+            for entry, argument in ((made.open_store, '/again'), (made.start_services, H.ServiceContext())):
+                try:
+                    entry(argument)
+                    seen.append((where, entry.__name__, 'ran'))
+                except H.HookError:
+                    seen.append((where, entry.__name__, 'refused'))
+
+        def factory(state_dir):
+            reenter('factory')
+            stores.append(FakeStore())
+            return stores[-1]
+
+        class Reenters(Service):
+            def start(inner, context):
+                reenter('start')
+                super().start(context)
+
+            def stop(inner, context):
+                reenter('stop')
+                super().stop(context)
+        log = []
+        made = H.Hooks()
+        made.service(Reenters('events', log))
+        made.set('event_store', factory)
+        made.freeze()
+        context = H.ServiceContext()
+        made.open_store('/state')
+        made.start_services(context)
+        made.finish_close(context)
+        self.assertEqual(seen, [(where, entry, 'refused') for where in ('factory', 'start', 'stop')
+                                for entry in ('open_store', 'start_services')])
+        self.assertEqual((len(stores), stores[0].closed, [(what, name) for what, name, _ in log]),
+                         (1, True, [('start', 'events'), ('stop', 'events')]), 'one store, one start, one stop')
 
     @quiet
     def test_a_service_whose_stop_failed_is_still_tracked_while_its_stop_is_tried_again(self) -> None:

@@ -150,6 +150,10 @@ class AllowedMethodsTest(unittest.TestCase):
             with self.subTest(action["action"]):
                 self.assertEqual("schema_gap" in action, not listed)
                 self.assertEqual(action["params"]["surface"], "desktop")
+                if not listed:
+                    gap = action["schema_gap"]
+                    self.assertEqual((gap["at"], gap["rule"], gap["value"]), ("surface", "enum", "desktop"))
+                    self.assertTrue(gap["why"])
 
     def test_stops_and_answers_are_confirmed_first(self) -> None:
         for action in ACTIONS["actions"]:
@@ -167,6 +171,16 @@ class AllowedMethodsTest(unittest.TestCase):
     def test_action_names_are_unique(self) -> None:
         names = [a["action"] for a in ACTIONS["actions"]]
         self.assertEqual(len(names), len(set(names)))
+
+    def test_the_recorded_answers_belong_to_the_actions_and_to_the_same_head(self) -> None:
+        answers = json.loads((FIXTURES / "answers.json").read_text(encoding="utf-8"))
+        self.assertEqual(answers["spine_head"], ACTIONS["spine_head"])
+        methods = {a["action"]: a["method"] for a in ACTIONS["actions"]}
+        for answer in answers["answers"]:
+            with self.subTest(answer["file"]):
+                self.assertEqual(answer["method"], methods[answer["action"]])
+                self.assertRegex(answer["sha256"], SHA256)
+                self.assertIsInstance(answer["answer"].get("code"), str)
 
 
 if __name__ == "__main__":

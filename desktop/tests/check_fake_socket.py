@@ -126,12 +126,52 @@ class FakeDaemonTest(unittest.TestCase):
         self.assertEqual([f.get("op") for f in daemon.frames], ["ping", "control", "control", "nope"])
         self.assertEqual(daemon.requests(), [("run.list", {}), ("run.kill", {})])
 
+    def test_a_control_frame_of_the_wrong_shape_is_refused_before_any_answer_is_made(self) -> None:
+        from recursion_core.control_transport import UnixControlClient
+
+        asked = []
+        answers = {"run.list": lambda params: asked.append(params) or {"code": "ok", "runs": []}}
+        invalid = {"ok": False, "error": {"code": "request_invalid"}}
+        with FakeDaemon(self.dir, answers) as daemon:
+            client = UnixControlClient(daemon.path)
+            try:
+                for frame in ({"op": "control", "method": 5, "params": {}},
+                              {"op": "control", "params": {}},
+                              {"op": "control", "method": "run.list", "params": []},
+                              {"op": "control", "method": "run.list", "params": "all"}):
+                    with self.subTest(frame):
+                        self.assertEqual(client.request(frame), invalid)
+                self.assertEqual(asked, [])
+                # No params at all is the CLI's empty request, as the daemon reads it.
+                self.assertEqual(client.request({"op": "control", "method": "run.list", "params": None}),
+                                 {"ok": True, "result": {"code": "ok", "runs": []}})
+            finally:
+                client.close()
+        self.assertEqual(asked, [{}])
+        self.assertEqual(len(daemon.frames), 5)
+
     def test_it_refuses_a_directory_others_can_enter(self) -> None:
         open_dir = os.path.join(self.dir, "open")
         os.mkdir(open_dir, 0o755)
         os.chmod(open_dir, 0o755)
         with self.assertRaises(InsecureSocketPath):
             FakeDaemon(open_dir).__enter__()
+
+    def test_the_silent_daemon_keeps_the_same_directory_rule(self) -> None:
+        open_dir = os.path.join(self.dir, "open")
+        os.mkdir(open_dir, 0o755)
+        os.chmod(open_dir, 0o755)
+        private = os.path.join(self.dir, "private")
+        os.mkdir(private, 0o700)
+        link = os.path.join(self.dir, "link")
+        os.symlink(private, link)
+        not_dir = os.path.join(self.dir, "file")
+        Path(not_dir).write_text("", encoding="utf-8")
+        for place in (open_dir, link, not_dir):
+            with self.subTest(os.path.basename(place)), self.assertRaises(PermissionError):
+                SilentDaemon(place)
+        with SilentDaemon(private) as daemon:
+            self.assertEqual(os.lstat(daemon.path).st_mode & 0o777, 0o600)
 
     def test_its_socket_is_owner_only(self) -> None:
         with FakeDaemon(self.dir) as daemon:

@@ -118,8 +118,56 @@ test("input the schema refuses is refused before anything is sent", () => {
     ["transcript.read", { cursor: { epoch: 1, session_id: "bogus", seq: 0 } }],
     ["sessions.refresh", { state: "running" }],
     ["session.start", { tenant: "t1", engine: "Claude Code" }],
+    // common.v1 cursor: epoch 1 or more (epoch 0 is no daemon's), seq 0 or more, whole numbers.
+    ["transcript.read", { cursor: { epoch: 0, session_id: "ses-1", seq: 0 } }],
+    ["transcript.follow", { cursor: { epoch: 0, session_id: "ses-1", seq: 0 }, wait_ms: 0 }],
+    ["transcript.read", { cursor: { epoch: 1.5, session_id: "ses-1", seq: 0 } }],
+    ["transcript.read", { cursor: { epoch: 1, session_id: "ses-1", seq: -1 } }],
+    ["transcript.follow", { cursor: { epoch: 1, session_id: "ses-1", seq: 0.5 }, wait_ms: 0 }],
+    // limits: 1 to 1000.
+    ["sessions.refresh", { limit: 0 }],
+    ["sessions.refresh", { limit: 1001 }],
+    ["sessions.refresh", { limit: 2.5 }],
+    ["transcript.read", { cursor: { epoch: 1, session_id: "ses-1", seq: 0 }, limit: 0 }],
+    ["transcript.read", { cursor: { epoch: 1, session_id: "ses-1", seq: 0 }, limit: 1001 }],
+    // session.start: a workspace is a folder and a mode the schema names; a hand-picked model is a name or null.
+    ["session.start", { tenant: "t1", workspace: { path: "/w", mode: "copy" } }],
+    ["session.start", { tenant: "t1", workspace: { path: "" } }],
+    ["session.start", { tenant: "t1", workspace: { mode: "direct" } }],
+    ["session.start", { tenant: "t1", engine: "codex", model: "" }],
+    ["session.start", { tenant: "t1", engine: "codex", model: 5 }],
+    // ids by their patterns.
+    ["session.interrupt", { session_id: "ses-1", expected_turn_id: "t-1" }],
+    ["session.interrupt", { session_id: "ses-1" }],
+    ["approval.open", { approval_id: "apr 1" }],
+    ["approval.open", { approval_id: "x-1" }],
+    ["diff.read", { session_id: "ses-1", turn_id: "turn 1" }],
+    // approval.v1 state: one of its six words.
+    ["approvals.refresh", { state: "live" }],
+    ["approvals.refresh", { state: "bogus" }],
+    ["approvals.refresh", { state: "" }],
   ];
   for (const [name, input] of bad) assert.throws(() => actions[name](input), ActionError, `${name} ${JSON.stringify(input)}`);
+});
+
+test("input at each bound the schema allows is built", () => {
+  const actions = fixedActions();
+  const at = { epoch: 1, session_id: "ses-1", seq: 0 };
+  assert.deepEqual(actions["transcript.read"]({ cursor: at }).params.cursor, at);
+  assert.deepEqual(actions["transcript.follow"]({ cursor: at, wait_ms: 0 }).params.cursor, at);
+  for (const limit of [1, 1000]) {
+    assert.equal(actions["sessions.refresh"]({ limit }).params.limit, limit);
+    assert.equal(actions["transcript.read"]({ cursor: at, limit }).params.limit, limit);
+  }
+  for (const mode of ["direct", "worktree"]) {
+    assert.equal(actions["session.start"]({ tenant: "t1", workspace: { path: "/w", mode } }).params.workspace.mode, mode);
+  }
+  assert.deepEqual(actions["session.start"]({ tenant: "t1", engine: "codex", model: "gpt-6" }).params.hand_pick,
+    { engine: "codex", model: "gpt-6" });
+  for (const state of ["pending", "approved", "denied", "expired", "consumed", "vetoed"]) {
+    assert.deepEqual(actions["approvals.refresh"]({ state }).params, { state });
+  }
+  assert.deepEqual(actions["approvals.refresh"]().params, { state: "pending" });
 });
 
 test("the inert transport sends nothing and says so", async () => {
@@ -133,6 +181,13 @@ test("send refuses a held action and a method the desktop may not call, and call
   await assert.rejects(send(transport, "approval.open", fixedActions()["approval.open"]({ approval_id: "apr-1" })), RefusedHere);
   await assert.rejects(send(transport, "anything", { method: "workspace.publish", params: {} }), RefusedHere);
   await assert.rejects(send(transport, "anything", { method: "run.kill", params: {} }), RefusedHere);
+  // A held method stays held under another action's name.
+  for (const method of Object.keys(HELD)) {
+    const built = method === "approval.open"
+      ? fixedActions()["approval.open"]({ approval_id: "apr-1" })
+      : fixedActions()["approval.answer"]({ approval: OPENED, answer: "deny" });
+    await assert.rejects(send(transport, "runs.refresh", built), RefusedHere, method);
+  }
   assert.deepEqual(transport.calls, []);
 });
 

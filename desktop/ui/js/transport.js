@@ -40,10 +40,13 @@ export function replayTransport(exchanges) {
   };
 }
 
-// The one way a view sends: only a method the desktop may call, never a held action, and only through the
-// transport. action is the actions.json name, built is the builder's {method, params}.
+// The one way a view sends: only a method the desktop may call, never a held action or a held method under
+// another action's name, and only through the transport. action is the actions.json name, built is the
+// builder's {method, params}.
 export async function send(transport, action, built) {
-  if (Object.prototype.hasOwnProperty.call(HELD, action)) throw new RefusedHere(`${action} is held: ${HELD[action]}`);
+  for (const name of [action, built.method]) {
+    if (Object.prototype.hasOwnProperty.call(HELD, name)) throw new RefusedHere(`${name} is held: ${HELD[name]}`);
+  }
   if (!METHODS.includes(built.method)) throw new RefusedHere(`${built.method} is not a method the desktop may call`);
   return transport.call(built.method, built.params);
 }

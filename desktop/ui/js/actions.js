@@ -31,6 +31,7 @@ const LOG_ID = /^(ses-[A-Za-z0-9_-]{1,60}|run:[A-Za-z0-9_-]{1,64})$/;
 const ENGINE = /^[a-z][a-z0-9_]{0,31}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const SESSION_STATES = new Set(["idle", "live", "stop_pending", "ended"]);
+const APPROVAL_STATES = new Set(["pending", "approved", "denied", "expired", "consumed", "vetoed"]);
 
 export class ActionError extends Error {}
 
@@ -57,7 +58,8 @@ function cursor(value) {
   need(value !== null && typeof value === "object" && !Array.isArray(value), "cursor must be the cursor last given");
   const keys = Object.keys(value).sort().join(",");
   need(keys === "epoch,seq,session_id", "cursor must be the cursor last given, unchanged");
-  count(value.epoch, 0, Number.MAX_SAFE_INTEGER, "cursor.epoch");
+  // common.v1 epoch: 1 or more (a fresh log is read from epoch 1, seq 0).
+  count(value.epoch, 1, Number.MAX_SAFE_INTEGER, "cursor.epoch");
   count(value.seq, 0, Number.MAX_SAFE_INTEGER, "cursor.seq");
   id(value.session_id, LOG_ID, "log id");
   return { epoch: value.epoch, session_id: value.session_id, seq: value.seq };
@@ -158,7 +160,10 @@ export function makeActions(mint = commandIdMinter()) {
       projection: "transcript",
       wait_ms: count(wait_ms, 0, 30000, "wait"),
     }),
-    "approvals.refresh": ({ state = "pending" } = {}) => request("approval.list", { state: text(state, "state") }),
+    "approvals.refresh": ({ state = "pending" } = {}) => {
+      need(APPROVAL_STATES.has(state), "state is not an approval state");
+      return request("approval.list", { state });
+    },
     "approval.open": ({ approval_id }) => request("approval.open", {
       command_id: mint(),
       approval_id: id(approval_id, APPROVAL_ID, "approval id"),

@@ -34,6 +34,11 @@ class ConditionsTest(unittest.TestCase):
 
 
 class WalkTest(unittest.TestCase):
+    def test_the_frontend_stops_a_walk_at_the_tuis_page_ceiling(self) -> None:
+        # desktop/tests/js/check_model.mjs walks to this ceiling; here it is held to the TUI's own constant.
+        model = (Path(__file__).resolve().parent.parent / "ui" / "js" / "model.js").read_text(encoding="utf-8")
+        self.assertIn(f"export const LIST_FOLLOW_MAX_PAGES = {protocol.LIST_FOLLOW_MAX_PAGES};", model)
+
     def test_each_walk_makes_the_calls_and_shows_the_list_the_cli_does(self) -> None:
         for vector in load("walks.json")["vectors"]:
             with self.subTest(vector["name"]):

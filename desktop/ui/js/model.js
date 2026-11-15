@@ -37,7 +37,9 @@ export function stopUnconfirmed(run) {
   return run.state === "stop_pending" || isMapping(run.stop);
 }
 
-// [label, subject, text] for each condition one answer exposes. Nothing the answer says is dropped.
+// [label, subject, text] for each condition one answer exposes. Nothing the answer says is dropped. This is
+// the TUI's rule for an answer to a run method, held to its vectors; a view reads every answer through
+// conditionsFor below, which hands only run answers to it.
 export function keyedConditions(answer) {
   const code = get(answer, "code", null);
   const found = [];
@@ -64,8 +66,66 @@ export function keyedConditions(answer) {
   return found;
 }
 
-export function answerConditions(answer) {
-  return keyedConditions(answer).map(([label, , text]) => [label, text]);
+// The session an answer is about: session.stop names it, the other session methods return the record.
+function sessionOf(answer) {
+  if (typeof answer.session_id === "string") return answer.session_id;
+  return isMapping(answer.session) && typeof answer.session.session_id === "string" ? answer.session.session_id : null;
+}
+
+// The Stop results (stop.result.v1) an answer carries: session.stop's one per run, and the Stop
+// session.interrupt fell back to.
+function stopResults(answer) {
+  const found = Array.isArray(answer.runs) ? answer.runs.filter(isMapping) : [];
+  if (isMapping(answer.stop)) found.push(answer.stop);
+  return found;
+}
+
+// stop.result.v1: "stopped" was attested, "ended" had ended before the Stop; any other code, known or not,
+// is a run that is not stopped.
+const STOP_SETTLED = new Set(["stopped", "ended"]);
+
+// The conditions of an answer to `method`. A run method's answer is read exactly as the CLI and the TUI read
+// it. The CLI has no command for the other methods, so their answers are read by the desktop's own rule,
+// with the same labels and no run-only words: a pending answer is not confirmed and names its session and
+// why, any code but ok is refused, every Stop result in it that is not settled is a Stop not confirmed (with
+// its run, state and reason), and so is every run it lists as pending.
+export function conditionsFor(method, answer) {
+  if (typeof method === "string" && method.startsWith("run.")) return keyedConditions(isMapping(answer) ? answer : {});
+  if (!isMapping(answer)) return [["REFUSED", "answer", "the answer is not an object"]];
+  const code = get(answer, "code", null);
+  const session = sessionOf(answer);
+  const found = [];
+  if (code === UNAVAILABLE) {
+    found.push(["UNAVAILABLE", "api", `control API unavailable: ${field(get(answer, "detail", "no answer"))}`]);
+  } else if (UNCERTAIN_CODES.has(code)) {
+    // Why: the answer's detail or reason, else what became of an interrupt (fell_back_to_stop), else pending.
+    const outcome = isMapping(answer.interrupt) && has(answer.interrupt, "outcome") ? answer.interrupt.outcome : undefined;
+    let why = "pending";
+    if (has(answer, "detail")) why = field(answer.detail);
+    else if (has(answer, "reason")) why = field(answer.reason);
+    else if (outcome !== undefined) why = `interrupt ${field(outcome)}`;
+    found.push(session === null
+      ? ["UNCERTAIN", "answer", `${field(method)} not confirmed: ${why}`]
+      : ["UNCERTAIN", `session=${pyStr(session)}`, `${field(method)} for session=${field(session)} not confirmed: ${why}`]);
+  } else if (code !== "ok") {
+    found.push(["REFUSED", "answer", `${field(code)} ${field(get(answer, "detail", ""))}`.trim()]);
+  }
+  if (answer.stale === true) found.push(["STALE", "answer", "API marked this answer stale"]);
+  const named = new Set();
+  for (const stop of stopResults(answer)) {
+    const runId = get(stop, "run_id", null);
+    named.add(runId);
+    if (STOP_SETTLED.has(stop.code)) continue;
+    found.push(["UNCERTAIN", `run=${pyStr(runId)}`,
+      `run=${field(runId)} state=${field(get(stop, "state", null))} reason=${field(get(stop, "reason", null))}: ` +
+      "stop requested, not confirmed"]);
+  }
+  if (Array.isArray(answer.pending)) {
+    for (const runId of answer.pending) {
+      if (!named.has(runId)) found.push(["UNCERTAIN", `run=${pyStr(runId)}`, `run=${field(runId)}: stop requested, not confirmed`]);
+    }
+  }
+  return found;
 }
 
 // Read every run: run.list, then run.list {after: next_after} until a page has none. call(method, params)

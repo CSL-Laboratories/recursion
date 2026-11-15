@@ -1,0 +1,8 @@
+{
+  "method": "workspace.publish",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "remote": "origin",
+    "draft_pr": false
+  }
+}

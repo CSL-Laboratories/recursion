@@ -20,6 +20,7 @@ not prove scopes, device tokens or anything the phone page will need: the socket
 | `ssh_transport.py` | The other machine's side: `RelayAPI(target).call(method, params)`, the same answers as `control.client.SocketAPI` |
 | `pairing.py` | One-time pairing offers (128-bit code, two-minute deadline, single use, five wrong codes lock it, rate limits) |
 | `device_state.py` | A paired device's lifecycle (scopes without manage, expiry, revocation that names live connections) |
+| `qr.py` | A QR encoder with no dependency, for the pairing link: byte mode, level M, versions 1 to 10 (up to 213 bytes); drawn as terminal half blocks or as SVG |
 
 ## The relay's wire
 

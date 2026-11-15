@@ -619,6 +619,120 @@ class RoundFiveSeamsTest(unittest.TestCase):
         self.assertEqual(store.verify(token, peer="p").id, "p1")
 
 
+class RoundSixSeamsTest(unittest.TestCase):
+    """The round-6 read of #385 by DeepSeek V4.1 Flash. F1 (STRICT): one call read the principal's kind and id
+    twice, and the second read chose the Stop rule, so a principal answering plugin and then device or owner
+    stopped the host's run, another plugin's, or an unattributed one. F2: the Stop's run_id and params were read
+    through the caller's own types."""
+
+    RUNS = {
+        "run-host": {"launch": {"owner": "host", "session_id": None}},
+        "run-other": {"launch": {"owner": "plugin.gamma", "session_id": None}},
+        "run-bare": {"launch": {"session_id": None}},
+        "run-beta": {"launch": {"owner": "plugin.beta", "session_id": None}},
+        "run-s9": {"launch": {"owner": "host", "session_id": "s9"}},
+    }
+
+    class Store:
+        """plugin.beta holds read and run by identity; session s1's grant g-s1 holds read and run."""
+
+        def held(self, kind, principal_id):
+            return frozenset({"read", "run"}) if (kind, principal_id) == ("plugin", "plugin.beta") else frozenset()
+
+        def grant_scopes(self, grant, kind, principal_id):
+            return frozenset({"read", "run"}) if (grant, kind, principal_id) == ("g-s1", "session", "s1") \
+                else frozenset()
+
+    def authorizer(self):
+        return scopes.Authorizer(scope_of=SCOPE_COLUMN.get, credentials=self.Store(), run_record=self.RUNS.get)
+
+    @staticmethod
+    def answering(kinds, ids, grant=None):
+        """A principal whose kind and id answer each read with the next value (the last one repeats)."""
+
+        class Answering:
+            in_run_unit = False
+
+            def __init__(self):
+                self.reads = {"kind": list(kinds), "id": list(ids)}
+
+            def _next(self, name):
+                values = self.reads[name]
+                return values.pop(0) if len(values) > 1 else values[0]
+
+            @property
+            def kind(self):
+                return self._next("kind")
+
+            @property
+            def id(self):
+                return self._next("id")
+
+        if grant is not None:
+            Answering.grant = grant
+        return Answering()
+
+    def test_a_principal_that_answers_twice_is_judged_on_its_first_answer(self) -> None:
+        auth = self.authorizer()
+        cases = [
+            (("plugin", "device"), ("plugin.beta",), "run-host", "run_not_owned"),
+            (("plugin", "device"), ("plugin.beta",), "run-bare", "run_not_owned"),
+            (("plugin", "owner"), ("plugin.beta",), "run-host", "run_not_owned"),
+            (("plugin", "owner"), ("plugin.beta",), "run-bare", "run_not_owned"),
+            (("plugin",), ("plugin.beta", "plugin.gamma"), "run-other", "run_not_owned"),
+            (("session",), ("s1", "s9"), "run-s9", "run_outside_session"),
+        ]
+        for kinds, ids, run_id, detail in cases:
+            grant = "g-s1" if kinds == ("session",) else None
+            with self.subTest(kinds=kinds, ids=ids, run=run_id):
+                principal = self.answering(kinds, ids, grant)
+                self.assertEqual(auth(principal, "run.stop", {"run_id": run_id}), ("scope_refused", detail))
+        self.assertIsNone(auth(self.answering(("plugin",), ("plugin.beta",)), "run.stop", {"run_id": "run-beta"}))
+
+    def test_a_kind_flipped_by_another_thread_never_widens_the_stop(self) -> None:
+        # DeepSeek saw 49 allows in 200 rounds on 3.14t with the GIL off; one read leaves none.
+        auth = self.authorizer()
+
+        class Flipping:
+            in_run_unit = False
+            kind, id = "plugin", "plugin.beta"
+
+        principal, done = Flipping(), threading.Event()
+
+        def flip():
+            while not done.is_set():
+                principal.kind = "device"
+                principal.kind = "plugin"
+
+        flipper = threading.Thread(target=flip)
+        flipper.start()
+        try:
+            answers = [auth(principal, "run.stop", {"run_id": "run-host"}) for _ in range(2000)]
+        finally:
+            done.set()
+            flipper.join(30)
+        self.assertNotIn(None, answers)
+
+    def test_the_stop_names_exactly_the_run_sent(self) -> None:
+        class Liar(str):
+            def __eq__(self, other):
+                return True
+
+            def __hash__(self):
+                return hash("run-beta")
+
+        class SaysBeta(dict):
+            def get(self, key, default=None):
+                return "run-beta" if key == "run_id" else default
+
+        auth = self.authorizer()
+        principal = self.answering(("plugin",), ("plugin.beta",))
+        for params in ({"run_id": Liar("zzz")}, SaysBeta()):
+            with self.subTest(params=type(params).__name__):
+                self.assertEqual(auth(principal, "run.stop", params), ("scope_refused", "run_not_owned"))
+        self.assertIsNone(auth(principal, "run.stop", {"run_id": "run-beta"}))
+
+
 @NEEDS_POSIX
 class BearerWithoutGrantTest(unittest.TestCase):
     """Until SPINE's Principal carries ``grant``, a device, session or agent principal holds nothing, live grants

@@ -169,7 +169,7 @@ def _get(mapping, key):
     """``mapping.get(key)`` for a dict; None for anything else, and None when the read raises (a dict subclass
     can): a target that cannot be read is not shown to be owned."""
 
-    if not isinstance(mapping, dict):
+    if type(mapping) is not dict:   # exactly a dict: no get of a subclass picks the target (round 6, DeepSeek F2)
         return None
     try:
         return mapping.get(key)
@@ -184,6 +184,14 @@ def _exact(value):
     comparing equal to ``page`` held the page's)."""
 
     return value if type(value) is str else None
+
+
+def _identity(principal) -> tuple[str | None, str | None]:
+    """The principal's kind and id, each read ONCE, as exact text. One call decides everything from these two
+    values: read twice, a principal answering ``plugin`` to the scope check and ``device`` or ``owner`` to the
+    Stop fence stopped runs no plugin may stop (the round-6 read of #385 by DeepSeek, F1)."""
+
+    return _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
 
 
 def _attr(principal, name: str, default):
@@ -251,7 +259,11 @@ class Authorizer:
         A credential store that cannot be read raises here (``CredentialStoreError``, or whatever the store
         raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``."""
 
-        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
+        return self._held(principal, *_identity(principal))
+
+    def _held(self, principal, kind: str | None, pid: str | None) -> frozenset[str]:
+        """``held`` for a kind and id already read once by the caller."""
+
         try:
             # Each class's own dictionary first, read past any metaclass: a metaclass answering __dict__ hid a
             # declaration from getattr_static (round 7, Sol 1); then the instance and the metaclass as before.
@@ -293,8 +305,9 @@ class Authorizer:
     def __call__(self, principal, method, params) -> Verdict:
         if _attr(principal, "in_run_unit", True) is not False:
             return (SCOPE_REFUSED, "peer is inside a run unit")
+        kind, pid = _identity(principal)   # read once; the whole decision below uses only these (round 6, F1)
         try:
-            held = self.held(principal)
+            held = self._held(principal, kind, pid)
         except Exception:  # noqa: BLE001 - a credential store that cannot be read refuses; it never lets through
             log.exception("the credential store could not be read; the call is refused")
             return (SCOPE_REFUSED, "credentials_unavailable")
@@ -315,16 +328,17 @@ class Authorizer:
             if "run" not in held:
                 # The Stop row's own rule, whatever the table's scope column says for run.stop.
                 return (SCOPE_REFUSED, "needs_run")
-            return self._stop(principal, params)
+            return self._stop(kind, pid, params)
         return None
 
-    def _stop(self, principal, params) -> Verdict:
-        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
+    def _stop(self, kind: str | None, pid: str | None, params) -> Verdict:
         if kind in ("owner", "device"):
             return None    # with run: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):
             return (SCOPE_REFUSED, "stop_not_granted_to_kind")
-        run_id = _get(params, "run_id")   # each read of params, record and launch is guarded (round 5, DeepSeek F1)
+        # Each read of params, record and launch is guarded (round 5, DeepSeek F1), and the run named is exactly
+        # the text sent (round 6 of #385, DeepSeek F2: a str subclass or a dict subclass chose another record).
+        run_id = _exact(_get(params, "run_id"))
         record, run_record = None, self._run_record   # read once, like the store in held()
         if isinstance(run_id, str) and run_record is not None:
             try:

@@ -1,16 +1,18 @@
-"""The fourth outside reads of #400 (two Codex reads of ``9c7c9c92..f60879d4``), each required change in this lane's
-queue taken as a test that fails on ``f60879d4`` with #369's ``a95945ca`` merged:
+"""The fourth outside reads of #400 (two Codex reads of ``9c7c9c92..f60879d4``), each required change taken as a
+test that fails on ``f60879d4`` with #369's ``a95945ca`` merged:
 
 * a surface that subscribes while a start runs, before recovery has offered the backlog, is offered nothing until
   the start has launched its worker, and nothing at all when the launch fails; a request committed meanwhile
   waits for it too (Astra R1, Sol M1);
 * a launch interrupted once the worker's thread has launched can never publish ``ready``; the worker is kept for
-  ``stop`` to join, and a start after that works (Astra R2).
+  ``stop`` to join, and a start after that works (Astra R2);
+* a command id outside common.v1's grammar is refused before the receipt lookup, with no receipt kept and
+  nothing changed, and a well-formed one is kept and replayed in the install's namespace as before (Astra R3,
+  Sol M2).
 
 The lock-discipline checks both reads offered as later coverage are taken too (Astra's ``readiness_check.py``,
-Sol's ``coverage_probes.py``). The third required change of both reads (Astra R3, Sol M2: the command id checked
-before the receipt lookup) is with the Liaison, since the lookup is in SPINE's dispatcher. Each reviewer's check is
-taken as written, with names and layout changed. Every thread a test starts is a daemon with a bounded join.
+Sol's ``coverage_probes.py``). Each reviewer's check is taken as written, with names and layout changed. Every
+thread a test starts is a daemon with a bounded join.
 """
 
 from __future__ import annotations
@@ -20,9 +22,19 @@ import types
 import unittest
 from unittest import mock
 
+from recursion_core.approvals import model
 from recursion_core.approvals import store as rows
+from recursion_core.approvals.tests import test_methods
+from recursion_core.approvals.tests.test_methods import needs_seams
 from recursion_core.approvals.tests.test_queue import needs_fakes
 from recursion_core.approvals.tests.test_review1 import _Base
+
+REFUSED = {"code": "request_invalid", "detail": "command_id"}
+# Too short, too long, and a sign outside [A-Za-z0-9._:-] (a tab, a NUL, a line feed, a DEL and a non-ASCII
+# letter among them): the readers' own cases, round 2's, and sol's DEL of round 5.
+BAD_IDS = ("short", "_seven_", "z" * 129, "command%id", "command" + chr(9) + "id", "cmd-12" + chr(0) + "x",
+           "bad id 1", "bad/id/1", "bad-id-1" + chr(10), chr(0xE9) + "tait-un-id", "command-" + chr(0x7F))
+BOUND_IDS = ("A._:-012", "Z" * 128)  # the shortest, with every allowed sign, and the longest
 
 
 def _context(store) -> types.SimpleNamespace:
@@ -297,6 +309,83 @@ class ReadyLockTests(_Base):
         self.assertFalse(stopper.is_alive())
         self.assertIsNone(queue._worker)
         self.assertFalse(queue.ready, "a ready publication under way outlived the stop")
+
+
+class CommandIdGrammarTests(unittest.TestCase):
+    def test_the_tenant_and_the_handler_hold_a_command_id_to_its_grammar(self) -> None:  # Astra R3, Sol M2
+        for command_id in BAD_IDS + (None, 7, ""):
+            with self.subTest(command_id=repr(command_id)):
+                params = {"command_id": command_id, "approval_id": "apr-1", "surface": "cli"}
+                self.assertEqual(model.command_id_refusal(params), REFUSED)
+                self.assertEqual(model.params_refusal("approval.open", params), REFUSED)
+        self.assertEqual(model.command_id_refusal("not params"), REFUSED)
+        for command_id in BOUND_IDS:
+            self.assertIsNone(model.command_id_refusal({"command_id": command_id}))
+
+
+@needs_seams
+class CommandIdBeforeReceiptTests(unittest.TestCase):
+    setUp = test_methods.MethodTests.setUp
+    call = test_methods.MethodTests.call
+    _cid = test_methods.MethodTests._cid
+    open = test_methods.MethodTests.open
+    answer = test_methods.MethodTests.answer
+
+    def _record(self) -> dict:
+        with self.store.transaction() as tx:
+            return rows.load(tx, self.approval_id)
+
+    def test_a_malformed_command_id_is_refused_before_any_receipt_is_looked_up(self) -> None:  # Astra R3, Sol M2
+        shown = self.open()["approval"]
+        record, receipts, events = self._record(), dict(self.store.receipts), len(self.store.events)
+        with self.store.transaction() as tx:
+            kind = type(tx)
+        real, lookups = kind.receipt_get, []
+
+        def lookup(tx, *args):
+            lookups.append(args)
+            return real(tx, *args)
+
+        with mock.patch.object(kind, "receipt_get", lookup):
+            for method in ("approval.open", "approval.answer"):
+                for command_id in BAD_IDS:
+                    with self.subTest(method=method, command_id=repr(command_id)):
+                        got = (self.open(command_id=command_id) if method == "approval.open"
+                               else self.answer(shown, command_id=command_id))
+                        self.assertEqual(got, REFUSED)
+        self.assertEqual(lookups, [], "a malformed command id reached the receipt lookup")
+        self.assertEqual(dict(self.store.receipts), receipts)
+        self.assertEqual(len(self.store.events), events)
+        self.assertEqual(self._record(), record)
+        self.assertEqual(self.answer(shown)["approval"]["state"], "approved")  # a well-formed one goes through
+
+    def test_well_formed_command_ids_at_the_bounds_are_kept_and_replayed(self) -> None:  # Astra R3, Sol M2
+        for command_id in BOUND_IDS:
+            with self.subTest(command_id=command_id):
+                receipts = len(self.store.receipts)
+                first = self.open(command_id=command_id)
+                self.assertEqual(first["code"], "ok")
+                self.assertEqual(self.open(command_id=command_id), first)
+                self.assertEqual(len(self.store.receipts), receipts + 1)
+
+    def test_a_receipt_kept_under_the_install_tenant_still_replays(self) -> None:
+        # The namespace of the receipts is unchanged: one kept by a registration with the constant tenant (as on
+        # f60879d4) is replayed by this one.
+        from recursion_core.control.hooks import Hooks
+        from recursion_core.control.methods import INSTALL_TENANT
+        from recursion_core.control.methods.approval import handlers
+
+        before = Hooks()
+        for name, handler in handlers(self.queue).items():
+            before.methods.register(name, handler, tenant=None if name == "approval.list" else INSTALL_TENANT)
+        before.freeze()
+        before.methods.store = self.store
+        params = {"command_id": "cmd-before-1", "approval_id": self.approval_id, "surface": "cli"}
+        first = before.methods.dispatch("approval.open", dict(params), self.owner, lambda m, p: None)
+        self.assertEqual(first["code"], "ok")
+        receipts = len(self.store.receipts)
+        self.assertEqual(self.call("approval.open", dict(params)), first)
+        self.assertEqual(len(self.store.receipts), receipts)
 
 
 if __name__ == "__main__":

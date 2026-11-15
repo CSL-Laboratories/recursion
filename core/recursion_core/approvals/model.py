@@ -28,7 +28,7 @@ import re
 
 from recursion_core.approvals import effects
 from recursion_core.approvals.effects import EffectRefused
-from recursion_core.approvals.record import (APPROVER_KINDS, STATES, SURFACES, TimestampRefused, binding_problem,
+from recursion_core.approvals.record import (STATES, SURFACES, TimestampRefused, approver_problem, binding_problem,
                                              effect_problem, milliseconds, shape_problem)
 
 __all__ = ["ApprovalRefused", "TARGET_MEMBERS", "answer_prompt", "change", "consume", "expire_if_due",
@@ -64,9 +64,10 @@ def restored(record: dict) -> dict:
 
 
 def principal_refusal(principal: object):
-    """``scope_refused`` unless the caller is an owner or a device with an id; ``None`` when it may answer."""
-    if type(principal) is not dict or principal.get("kind") not in APPROVER_KINDS \
-            or type(principal.get("id")) is not str or not principal["id"]:
+    """``scope_refused`` unless the caller is an approver exactly as a record keeps one (an owner or a device,
+    ``{"kind", "id"}`` and nothing else, its id a token: ``record.approver_problem``); ``None`` when it may
+    answer. So what approval.open or approval.answer writes for it never leaves the record unreadable."""
+    if approver_problem(principal) is not None:
         return {"code": "scope_refused", "detail": "approve"}
     return None
 
@@ -76,6 +77,16 @@ _COMMAND_ID = re.compile(r"[A-Za-z0-9._:-]{8,128}")  # common.v1 command_id
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _LOG_ID = re.compile(r"ses-[A-Za-z0-9_-]{1,60}|run:[A-Za-z0-9_-]{1,64}")
 _LIST_PARAMS = ("session_id", "state", "limit", "after")
+
+
+def command_id_refusal(params: object):
+    """``request_invalid``/``command_id`` unless ``params`` carries a command id in common.v1's grammar;
+    ``None`` when it does. The registrant derives the receipt's tenant through this, so a malformed id is
+    refused before any receipt is looked up or kept."""
+    value = params.get("command_id") if type(params) is dict else None
+    if type(value) is not str or not _COMMAND_ID.fullmatch(value):
+        return {"code": "request_invalid", "detail": "command_id"}
+    return None
 
 
 def params_refusal(method: str, params: object):

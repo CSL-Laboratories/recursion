@@ -36,7 +36,6 @@ import copy
 import decimal
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 
 from recursion_core.approvals.record import effect_problem
@@ -322,12 +321,6 @@ def _field_lines(fields: dict) -> list:
     return lines
 
 
-# What may be drawn as the core's own (trusted) words from an engine's effect: a plain id, no space, no line
-# break. bind holds the engine, session and run to their exact grammars first; this keeps the drawer safe on
-# its own, whoever calls it.
-_DRAWN_ID = re.compile(r"[A-Za-z0-9:_-]{1,64}")
-
-
 def lines_of(source: str, effect: dict) -> list:
     """The rendered lines (``csl-approval-lines/v0``) of a bound effect, or a typed refusal."""
     def core(text):
@@ -339,10 +332,12 @@ def lines_of(source: str, effect: dict) -> list:
     if source == "engine_tool":
         call = {"cwd": effect["cwd"], "input": effect["input"], "tool": effect["tool"]}
         check_call(call)
-        session = effect["session_id"] if effect["session_id"] is not None else "none"
-        if any(type(value) is not str or not _DRAWN_ID.fullmatch(value)
-               for value in (effect["engine"], session, effect["run_id"])):
+        # The engine, session and run are drawn as the core's own (trusted) words, so the drawer holds the effect
+        # to its published shape itself, whoever calls it (bind checks it first): each id in the exact grammar the
+        # record publishes (record.effect_problem), so no space and no line break, and the longest id it takes.
+        if effect_problem("engine_tool", effect) is not None:
             raise EffectRefused("effect")
+        session = effect["session_id"] if effect["session_id"] is not None else "none"
         lines = (core("Tool call waiting for an answer") + core("engine: " + effect["engine"])
                  + core("session: " + session) + core("run: " + effect["run_id"])
                  + theirs("tool: ", call["tool"]) + theirs("directory: ", call["cwd"])

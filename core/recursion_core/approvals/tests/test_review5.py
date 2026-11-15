@@ -1,5 +1,6 @@
-"""The fifth outside read of #400 (a DeepSeek break-it read of ``77897d4c``), each change taken as a test that fails
-on ``77897d4c``:
+"""The fifth outside read of #400 (a DeepSeek break-it read of ``77897d4c``), each change taken as a test; nine of
+the eleven fail on ``77897d4c``. The other two pass there and hold what F1's change must keep: every surface
+subscribed before the start is offered the backlog, and one that unsubscribes during the start is offered nothing.
 
 * F2: a deadline worker whose generation has ended (kept after an interrupted launch) changes ``ready`` no more:
   its failure does not withdraw the next worker's ``ready``, and its sweep does not publish ``ready`` over the

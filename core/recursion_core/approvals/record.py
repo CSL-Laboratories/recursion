@@ -12,8 +12,8 @@ from __future__ import annotations
 import datetime
 import re
 
-__all__ = ["APPROVER_KINDS", "STATES", "SURFACES", "TimestampRefused", "binding_problem", "effect_problem",
-           "milliseconds", "shape_problem", "summary_of", "summary_problem"]
+__all__ = ["APPROVER_KINDS", "STATES", "SURFACES", "TimestampRefused", "approver_problem", "binding_problem",
+           "effect_problem", "milliseconds", "shape_problem", "summary_of", "summary_problem"]
 
 STATES = ("pending", "approved", "denied", "expired", "consumed", "vetoed")
 SURFACES = ("cli", "tui", "page", "phone")
@@ -92,6 +92,12 @@ def _approver_problem(value, where: str):
     if not _id(value["id"], _TOKEN):
         return where + ".id"
     return None
+
+
+def approver_problem(value: object):
+    """Where a principal leaves the shape a record keeps for an approver (each ``opened_by`` principal and
+    ``answered_by``: ``{"kind", "id"}`` and nothing else, an owner or a device, its id a token), or ``None``."""
+    return _approver_problem(value, "principal")
 
 
 def _engine_effect_problem(effect):

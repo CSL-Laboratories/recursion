@@ -475,11 +475,14 @@ class UnixControlServer:
                 if reserved:
                     return  # one priority request per reserved connection
         finally:
-            conn.close()
-            slots.release()
+            # The slot is freed before the connection is closed, so a client that has seen the close finds it
+            # free: a Stop sent right after it is served, not refused busy. For that instant the connection
+            # being closed and the next one overlap; the cap still bounds the handlers that run.
             with self._lock:
                 self._workers.discard(threading.current_thread())
                 self._conns.discard(conn)
+            slots.release()
+            conn.close()
 
 
     def _is_priority(self, request: Message) -> bool:

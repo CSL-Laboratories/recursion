@@ -383,6 +383,16 @@ class FrameDeadlineTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
 
 
+def _one_frame(path: str, message: dict) -> tuple[dict | None, bytes]:
+    """``message`` on a fresh connection: the reply, then the next byte the server sends (``b""`` once it has
+    closed the connection, which it does only after freeing the connection's slot)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+        raw.settimeout(30.0)   # a fail-safe only
+        raw.connect(path)
+        raw.sendall(framing.encode_frame(message))
+        return framing.read_frame(raw), raw.recv(1)
+
+
 def _wait_for(predicate, timeout_s: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -580,11 +590,17 @@ class ConnectionBoundTests(_TmpCase):
             self.assertEqual(admitted.request({"op": "ping"})["op"], "pong")
 
     def test_a_reserved_connection_serves_one_priority_request_when_every_slot_is_held(self) -> None:
-        """ADV1-4: with all ordinary slots held, Stop still gets through; anything else is busy, undelivered."""
+        """ADV1-4: with all ordinary slots held, Stop still gets through; anything else is busy, undelivered.
+
+        Nothing here depends on how fast the machine is (on master this test gave ok, FAIL and ERROR under
+        load): the reserved deadline is long, since every reserved connection here carries a request, and each
+        step reads the server's close of the last connection before the next one connects. The short deadline
+        is the next test's."""
+        from recursion_core.control_transport.unix import _is_busy
         recorder = _Recorder()
         srv = self.server(ct.with_ping_health(recorder), max_connections=1, idle_timeout_s=30.0,
                           priority=lambda request: request.get("op") == "stop", reserved_connections=1,
-                          reserved_timeout_s=0.5)
+                          reserved_timeout_s=30.0)
         holder = UnixControlClient(srv.path)
         self.addCleanup(holder.close)
         self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
@@ -593,20 +609,78 @@ class ConnectionBoundTests(_TmpCase):
             with self.assertRaises((ConnectionError, OSError)):  # one request per reserved connection
                 stopper.request({"op": "stop", "run_id": "r2"})
         self.assertEqual([message["run_id"] for message in recorder.seen], ["r1"])
-        with self.assertRaises(ct.TransportBusy):
-            UnixControlClient(srv.path).request({"op": "ping"})
-        # A reserved connection that sends nothing is closed at its short deadline and frees the slot.
-        idle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        with idle:
-            idle.settimeout(5)
-            idle.connect(srv.path)
-            started = time.monotonic()
-            self.assertEqual(idle.recv(1), b"")
-            self.assertLess(time.monotonic() - started, 3.0)
-        with UnixControlClient(srv.path) as stopper:
-            self.assertTrue(stopper.request({"op": "stop", "run_id": "r3"})["ok"])
+        # The failed r2 was the server's close, so the reserved slot is free: a ping takes it, is answered busy
+        # (not delivered) and closed, and the slot is free again for r3. (The client reads that frame as
+        # TransportBusy: test_stop_with_every_slot_held_gets_a_typed_refusal_not_a_silent_close.)
+        reply, after = _one_frame(srv.path, {"op": "ping"})
+        self.assertTrue(_is_busy(reply), reply)
+        self.assertEqual(after, b"")
+        reply, after = _one_frame(srv.path, {"op": "stop", "run_id": "r3"})
+        self.assertEqual((reply["ok"], reply["run_id"], after), (True, "r3", b""))
+        self.assertEqual([message["run_id"] for message in recorder.seen], ["r1", "r3"])
         with self.assertRaises(ValueError):
             self.server(name="other.sock", reserved_connections=1)
+
+    def test_an_idle_reserved_connection_is_closed_at_its_deadline_and_a_stop_after_it_is_served_at_once(self) -> None:
+        """Witness W2 (the reserved-connection test's FAIL and one ERROR): the worker closed the idle connection,
+        then freed its slot, so a Stop sent as soon as the close was seen could be refused busy. Now the slot is
+        free before the close: each Stop here is served on its first try, ten times running."""
+        recorder = _Recorder()
+        srv = self.server(ct.with_ping_health(recorder), max_connections=1, idle_timeout_s=30.0,
+                          priority=lambda request: request.get("op") == "stop", reserved_connections=1,
+                          reserved_timeout_s=0.2)
+        holder = UnixControlClient(srv.path)
+        self.addCleanup(holder.close)
+        self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
+        for n in range(10):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as idle:
+                idle.settimeout(30.0)   # a fail-safe only; the server closes it at its deadline
+                idle.connect(srv.path)
+                self.assertEqual(idle.recv(1), b"")
+            reply, after = _one_frame(srv.path, {"op": "stop", "run_id": f"r{n}"})
+            self.assertEqual((reply.get("ok"), after), (True, b""), reply)
+        self.assertEqual([message["run_id"] for message in recorder.seen], [f"r{n}" for n in range(10)])
+
+    def test_a_worker_frees_its_slot_before_it_closes_its_connection(self) -> None:
+        """Witness W1, recorded, not timed: the order of the slot's release and the socket's close in the worker
+        that served a reserved connection."""
+        from unittest import mock
+        events: list[str] = []
+        released = threading.Event()
+        srv = UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), max_connections=1,
+                                idle_timeout_s=30.0, priority=lambda request: request.get("op") == "stop",
+                                reserved_connections=1, reserved_timeout_s=0.2)
+        inner = srv._reserved
+
+        class RecordingSlots:
+            def acquire(self, blocking=True, timeout=-1):
+                return inner.acquire(blocking) if timeout == -1 else inner.acquire(blocking, timeout)
+
+            def release(self):
+                events.append("release")
+                inner.release()
+                released.set()
+
+        srv._reserved = RecordingSlots()
+        srv.start()
+        self.addCleanup(srv.close)
+        holder = UnixControlClient(srv.path)
+        self.addCleanup(holder.close)
+        holder.request({"op": "ping"})
+        real_close = socket.socket.close
+
+        def close(sock):
+            if threading.current_thread().name == "control-transport-conn":
+                events.append("close")
+            return real_close(sock)
+
+        with mock.patch.object(socket.socket, "close", close):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as idle:
+                idle.settimeout(30.0)   # a fail-safe only
+                idle.connect(srv.path)
+                self.assertEqual(idle.recv(1), b"")
+            self.assertTrue(released.wait(30.0))   # a fail-safe only
+        self.assertEqual(events, ["release", "close"])
 
     def test_stop_with_every_slot_held_gets_a_typed_refusal_not_a_silent_close(self) -> None:
         """S6/D3: a Stop the server cannot take must come back as 'not delivered', typed."""
@@ -633,7 +707,7 @@ class ConnectionBoundTests(_TmpCase):
                 with UnixControlClient(srv.path) as client:
                     replies.append(client.request({"op": "stop", "run_id": "r1", "id": "s2"}))
                     return True
-            except ct.TransportBusy:  # the freed slot is released just after the close
+            except ct.TransportBusy:  # the server frees the slot once it has read the holder's close
                 return False
 
         self.assertTrue(_wait_for(stop_delivered))

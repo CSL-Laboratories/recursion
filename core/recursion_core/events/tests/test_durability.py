@@ -9,10 +9,13 @@ store again (recovery, ``quick_check``, the epoch) and checks, on a connection o
 - those transactions are 1..K with no hole (one writer, in order), and the log's seq is 1..K;
 - ``PRAGMA integrity_check`` is ok and the epoch rose by one at each open.
 
+A full file system is real: the writer runs in a private user and mount namespace (``unshare``, no root and
+nothing installed) on a one-MiB tmpfs mounted only inside it, until SQLite reports SQLITE_FULL; the test is
+skipped where such a namespace is refused. A file size limit (RLIMIT_FSIZE) gives a refused write of the
+other kind, an I/O error.
+
 What this does not show: a power cut or an operating-system crash (synchronous=FULL is what covers those, and
-nothing here emulates one; that needs a block-level fault device and root). The "full disk" here is a file
-size limit (RLIMIT_FSIZE) on the writer, the nearest refusal of a write available without root: SQLite
-sees a failed write, as it would on a full disk, but the error it reports is an I/O error, not SQLITE_FULL.
+nothing here emulates one; that needs a block-level fault device and root).
 """
 
 from __future__ import annotations
@@ -108,7 +111,7 @@ class DurabilityTest(unittest.TestCase):
         self.epoch = store.epoch
         store.register_tables('durability', 1, C.LANE_DDL)
         with store.transaction() as tx:
-            rows = [k for (k,) in tx.execute('SELECT k FROM durable ORDER BY k')]
+            rows = [k for (k,) in tx.execute('SELECT k FROM durability_rows ORDER BY k')]
         store.close()
         with contextlib.closing(sqlite3.connect(self.path)) as conn:
             self.assertEqual(conn.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
@@ -191,6 +194,34 @@ class DurabilityTest(unittest.TestCase):
             C.write(tx, survived + 1)
         store.close()
         self.assertEqual(self.check(), survived + 1)
+
+
+    def test_a_full_file_system_fails_the_commit_and_the_store_and_loses_nothing_committed(self) -> None:
+        if shutil.which('unshare') is None or shutil.which('mount') is None:
+            self.skipTest('no unshare or mount on this machine')
+        folder = tempfile.mkdtemp(prefix='events-full-disk-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        inner = 'mount -n -t tmpfs -o size=1m,mode=700 tmpfs "$1" || exit 77; shift; exec "$@"'
+        argv = ['unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private', '/bin/sh', '-c', inner, 'sh',
+                folder, *interpreter(), '-m', 'recursion_core.events.tests.crash_child',
+                os.path.join(folder, 'events.sqlite3'), 'full-disk', '1']
+        run = subprocess.run(argv, capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(CORE)),
+                             timeout=BOUND_S)
+        lines = run.stdout.splitlines()
+        if not lines or not lines[0].startswith('open '):
+            self.skipTest(f'no private mount namespace here (exit {run.returncode}): {run.stderr.strip()[-200:]}')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        failure, after, survived = json.loads(lines[1]), lines[2], json.loads(lines[3])
+        self.assertEqual((failure['size'], failure['free']), (1024 * 1024, 0), 'the file system was full')
+        self.assertEqual((failure['error'], failure['code'], failure['cause']),
+                         ('CommitUnknown', 'commit_outcome_unknown', 'SQLITE_FULL'), lines[1])
+        self.assertEqual(after, 'after StoreError store_failed', 'a failed store refuses the next transaction')
+        acked, rows = failure['acked'], survived['rows']
+        self.assertGreaterEqual(acked, 1)
+        self.assertEqual(survived['integrity'], [['ok']])
+        self.assertIn(len(rows), (acked, acked + 1), 'the failed commit is there whole or not at all')
+        self.assertEqual(rows, list(range(1, len(rows) + 1)))
+        self.assertEqual((survived['seqs'], survived['ks'], survived['receipts']), (rows, rows, rows))
 
 
 if __name__ == '__main__':

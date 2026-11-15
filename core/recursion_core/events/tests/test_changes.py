@@ -10,9 +10,11 @@ test_db.py and test_durability.py; the reader's own crash points, by kill -9, ar
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -98,6 +100,10 @@ class ChangeReaderTest(unittest.TestCase):
     def changed(self, run_id=None) -> list:
         return [e for e in self.store.events if e['type'] == 'state.changed'
                 and (run_id is None or e['run_id'] == run_id)]
+
+    def unlogged_table(self) -> dict:
+        with self.store.transaction() as tx:
+            return dict(tx.execute('SELECT run_id, code FROM events_unlogged'))
 
     # -- the image and its digest
 
@@ -369,10 +375,11 @@ class ChangeReaderTest(unittest.TestCase):
         self.assertTrue(self.reader.ready)
         self.assertEqual({e['run_id'] for e in self.changed()}, {'run-ok'})
         self.assertEqual(self.reader.unlogged, {
-            'run-bigint': 'NoCanonicalText:integer', 'run-inf': 'NoCanonicalText:number',
-            'run-surrogate': 'NoCanonicalText:surrogate', 'run-nan': 'control_text_not_json:NaN',
+            'run-bigint': 'no_canonical_text:integer', 'run-inf': 'no_canonical_text:number',
+            'run-surrogate': 'no_canonical_text:surrogate', 'run-nan': 'control_text_not_json:NaN',
             'run-notjson': 'control_text_not_json', 'run-list': 'control_text_not_an_object',
-            'run-deep': 'ValueError:value_too_deep'})
+            'run-deep': 'store_refused:value_too_deep'})
+        self.assertEqual(self.unlogged_table(), self.reader.unlogged, "the lane's table holds the same")
         self.assertEqual((self.reader._pending, self.reader.failing), (set(), False), 'none is spun on')
         self.now[0] += 61
         with self.assertLogs(C.LOG, 'ERROR') as again:
@@ -747,6 +754,454 @@ class ChangeReaderTest(unittest.TestCase):
         self.now[0] += 61                                      # the drop can race with take; the periodic scan cannot
         self.drain()
         self.assertEqual(self.changed(RUN)[-1]['payload']['post_image']['daemon_row']['state'], 'terminated')
+
+    # -- round 2 of #403's reads
+
+    def test_a_start_interrupted_after_its_thread_launched_keeps_it_owned_and_stop_joins_it(self) -> None:
+        # Sol r2, required 1: an interruption inside Thread.start's own wait, after the thread was launched.
+        self.registry.add(RUN, 'boot-1')
+        inside, resume, done = threading.Event(), threading.Event(), threading.Event()
+        real_thread, real_read, workers = threading.Thread, self.registry.snapshot, []
+
+        def make_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            if thread.name == 'events-change-reader':
+                workers.append(thread)
+                started_wait = thread._started.wait
+
+                def wait_then_interrupt(*a, **kw):
+                    started_wait(*a, **kw)
+                    raise KeyboardInterrupt('start interrupted after the launch')
+                thread._started.wait = wait_then_interrupt
+            return thread
+
+        def paused(run_id):
+            if threading.current_thread().name == 'events-change-reader':
+                inside.set()
+                resume.wait(BOUND_S)
+            return real_read(run_id)
+        service, context = C.ChangeReader(self.marker), self.context()
+        closer = threading.Thread(target=lambda: (service.stop(context), done.set()))
+        with mock.patch.object(self.registry, 'snapshot', paused), mock.patch.object(threading, 'Thread', make_thread):
+            try:
+                with self.assertRaisesRegex(KeyboardInterrupt, 'after the launch'):
+                    service.start(context)
+                self.assertTrue(inside.wait(BOUND_S), 'the launched thread is inside a source read')
+                closer.start()
+                self.assertFalse(done.wait(NOT_YET_S), 'stop has not returned while that thread is inside the read')
+            finally:
+                resume.set()
+                if closer.ident is not None:
+                    closer.join(BOUND_S)
+                else:
+                    service.stop(context)
+        self.assertTrue(done.is_set())
+        self.assertFalse(workers[0].is_alive(), 'stop returned after joining it')
+        self.assertIsNone(service._thread)
+
+    def test_a_thread_whose_start_raised_before_it_ran_does_nothing_when_it_runs_late(self) -> None:
+        # Each start has its own stop signal: a launch that runs only after stop and a new start reads its own.
+        made, steps = [], []
+
+        class Launch:                                          # a thread that runs only when the test runs it
+            def __init__(self, target, args, name, daemon) -> None:
+                self.target, self.args = target, args
+                made.append(self)
+
+            def start(self) -> None:
+                if len(made) == 1:
+                    raise KeyboardInterrupt('start interrupted before the thread ran')
+
+            def is_alive(self) -> bool:
+                return False
+        service, context = C.ChangeReader(self.marker), self.context()
+
+        def step():
+            steps.append(1)
+            service._stopping.set()                            # ends a loop that reads the current start's signal
+            return False
+        with mock.patch.object(threading, 'Thread', Launch):
+            with self.assertRaises(KeyboardInterrupt):
+                service.start(context)
+            service.stop(context)
+            self.assertIsNone(service._thread, 'a thread that never began is not joined')
+            service.start(context)                             # a new start, with a signal of its own, not set
+            with mock.patch.object(service, 'step', step):
+                made[0].target(*made[0].args)                  # the first launch runs late: it reads its own signal
+        self.assertEqual(steps, [], 'the late thread did no step')
+        service.stop(context)
+
+    def test_a_scan_does_not_read_a_deferred_run_before_its_own_wait_has_passed(self) -> None:
+        # Sol r2, required 2 (its first probe): dropped marks ask for scans; the clock does not move.
+        self.registry.add(RUN, 'boot-1')
+        self.registry.add(RUN2, 'boot-1')
+        real, refused = self.registry.snapshot, []
+
+        def refuse_one(run_id):
+            if run_id == RUN:
+                refused.append(self.now[0])
+                raise OSError('unreadable row')
+            return real(run_id)
+        with mock.patch.object(self.registry, 'snapshot', refuse_one), self.assertLogs(C.LOG, 'WARNING'):
+            self.reader.step()
+            self.reader.step()
+            self.assertTrue(self.reader.ready)
+            for _ in range(4):
+                self.marker._dropped = True
+                self.assertTrue(self.reader.step(), 'a scan pages past the deferred run')
+                self.reader.step()
+        self.assertEqual(refused, [0.0], 'read once, then not before its own wait had passed')
+
+    def test_a_deferred_run_keeps_the_reason_it_was_first_read_for_through_later_scans(self) -> None:
+        # Sol r2, required 2 (its second probe).
+        self.registry.add(RUN, 'boot-1')
+        with mock.patch.object(self.registry, 'snapshot', side_effect=OSError('unreadable row')):
+            with self.assertLogs(C.LOG, 'WARNING'):
+                self.reader.step()
+                self.reader.step()
+                self.marker._dropped = True
+                self.reader.step()
+                self.reader.step()
+        self.now[0] = self.reader._deferred[RUN][1]
+        self.drain()
+        self.assertEqual([e['payload']['reason'] for e in self.changed(RUN)], ['snapshot'])
+
+    def test_failed_records_of_a_completed_pass_double_the_wait(self) -> None:
+        # Sol r2, required 3: the page read between two failed records of the pass does not end the backoff.
+        self.registry.add(RUN, 'boot-1')
+        reader = self.new_reader(page=1)
+        self.assertTrue(reader.step())
+        self.store.fail_commit = True
+        waits = []
+        with self.assertLogs(C.LOG, 'ERROR'):
+            for _ in range(4):
+                self.assertFalse(reader.step())
+                waits.append(round(reader._wait_until - self.now[0], 6))
+                self.now[0] = reader._wait_until
+        self.assertEqual(waits, [0.1, 0.2, 0.4, 0.8])
+        self.store.fail_commit = False
+        self.drain(reader)
+        self.assertEqual((reader.ready, reader.failing, reader._backoff), (True, False, 0.0))
+
+    def unloggable_after_a_pass(self, text='not json') -> None:
+        self.drain()
+        self.registry.mark_changed = None                      # only a scan finds it
+        self.registry.control_put(RUN, text)
+        self.now[0] += 61
+
+    def test_failed_listings_of_an_unlogged_run_double_the_wait_and_keep_the_scan_at_it(self) -> None:
+        self.unloggable_after_a_pass()
+        self.store.fail_commit = True
+        waits = []
+        with self.assertLogs(C.LOG, 'ERROR'):
+            for _ in range(4):
+                self.assertFalse(self.reader.step())
+                waits.append(round(self.reader._wait_until - self.now[0], 6))
+                self.now[0] = self.reader._wait_until
+        self.assertEqual(waits, [0.1, 0.2, 0.4, 0.8])
+        self.assertEqual((self.reader._scan_cursor, self.reader.unlogged), (None, {}), 'the scan stays at the run')
+        self.store.fail_commit = False
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.assertEqual(self.unlogged_table(), {RUN: 'control_text_not_json'})
+        self.assertEqual((self.reader.failing, self.reader._backoff), (False, 0.0), 'the written listing ends the backoff')
+
+    def test_a_refusal_of_the_other_source_starts_its_own_wait(self) -> None:
+        self.unloggable_after_a_pass()
+        self.store.fail_commit = True
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.reader.step()
+            self.now[0] = self.reader._wait_until
+            self.reader.step()                                 # the store refused twice: 0.1, then 0.2
+        self.assertEqual(round(self.reader._wait_until - self.now[0], 6), 0.2)
+        self.now[0] = self.reader._wait_until
+        with mock.patch.object(self.registry, 'run_ids', side_effect=OSError('unavailable for now')):
+            with self.assertLogs(C.LOG, 'WARNING'):
+                self.reader.step()
+        self.assertEqual(round(self.reader._wait_until - self.now[0], 6), 0.1, 'a page refused: its own first wait')
+
+    def test_a_page_read_after_refused_pages_ends_their_backoff(self) -> None:
+        refused = mock.patch.object(self.registry, 'run_ids', side_effect=OSError('unavailable for now'))
+        with refused, self.assertLogs(C.LOG, 'WARNING'):
+            for _ in range(6):
+                self.reader.step()
+                self.now[0] = self.reader._wait_until
+        self.assertEqual(round(self.reader._backoff, 6), 3.2)
+        self.reader.step()                                     # the page is read: an empty registry, a pass completed
+        self.assertTrue(self.reader.ready)
+        self.marker._dropped = True
+        with refused, self.assertLogs(C.LOG, 'WARNING'):
+            self.reader.step()
+        self.assertEqual(round(self.reader._wait_until - self.now[0], 6), 0.1, 'a new refusal waits the first wait')
+
+    def test_the_poll_interval_is_read_as_a_number_from_the_floor_to_the_scan_interval(self) -> None:
+        cases = ((0.05, 0.05), (0, C.MIN_POLL_S), (-5, C.MIN_POLL_S), (float('nan'), C.MIN_POLL_S),
+                 (True, C.MIN_POLL_S), ('0.1', C.MIN_POLL_S), (float('inf'), 60.0), (1e9, 60.0))
+        for value, read in cases:
+            with self.subTest(value=value):
+                self.marker.poll_interval_s = value
+                self.assertEqual(self.reader._poll_s(), read)
+
+        class Bare:                                            # a marker with take and no poll interval
+            def take(self):
+                return [], False
+        self.assertEqual(C.ChangeReader(Bare())._poll_s(), C.MIN_POLL_S)
+
+    def test_a_marker_whose_poll_interval_is_0_or_less_still_makes_a_refusal_wait(self) -> None:
+        # DeepSeek r2, M1: at 0 the reader paged 42,244 times a second; below 0 a step raised OverflowError.
+        def refuse(after, limit):                              # a new exception each time: one raised again grows
+            raise OSError('unavailable')                       # its traceback at every raise
+        for value in (0, -5):
+            with self.subTest(value=value):
+                reader = self.new_reader()
+                self.marker.poll_interval_s = value
+                with mock.patch.object(self.registry, 'run_ids', side_effect=refuse) as reads:
+                    with self.assertLogs(C.LOG, 'WARNING'):
+                        for _ in range(1100):
+                            if reader._wait_until is not None:
+                                self.now[0] = reader._wait_until
+                            self.assertFalse(reader.step())
+                    self.assertEqual(reads.call_count, 1100)
+                    self.assertEqual(reader._backoff, 60.0)
+                    self.assertGreater(reader._wait_until, self.now[0])
+                    self.assertFalse(reader.step(), 'no read before the wait has passed')
+                    self.assertEqual(reads.call_count, 1100)
+
+    def test_the_loop_sleeps_the_poll_interval_as_the_reader_reads_it(self) -> None:
+        class Stopping:                                        # the loop's stop signal: counts turns, records waits
+            def __init__(self) -> None:
+                self.turns, self.waits = 0, []
+
+            def is_set(self) -> bool:
+                self.turns += 1
+                return self.turns > 3
+
+            def wait(self, seconds) -> None:
+                self.waits.append(seconds)
+        stopping = self.reader._stopping = Stopping()
+        self.marker.poll_interval_s = -5
+        with mock.patch.object(self.registry, 'run_ids', side_effect=OSError('unavailable')), self.assertLogs(C.LOG, 'WARNING'):
+            self.reader._run()
+        self.assertEqual(stopping.waits, [C.MIN_POLL_S] * 3)
+
+    def test_a_refused_runs_first_wait_is_the_poll_interval_as_the_reader_reads_it(self) -> None:
+        self.marker.poll_interval_s = 0
+        self.registry.add(RUN, 'boot-1')
+        with mock.patch.object(self.registry, 'snapshot', side_effect=OSError('unreadable row')):
+            with self.assertLogs(C.LOG, 'WARNING'):
+                self.reader.step()
+        self.assertEqual(round(self.reader._deferred[RUN][1] - self.now[0], 6), C.MIN_POLL_S)
+
+    def test_a_deferred_run_takes_no_place_in_a_slice(self) -> None:
+        reader = self.new_reader(slice_size=1)
+        self.drain(reader)
+        self.registry.add(RUN, 'boot-1')
+        self.registry.add(RUN2, 'boot-1')
+        real, reads = self.registry.snapshot, []
+
+        def refuse_one(run_id):
+            reads.append(run_id)
+            if run_id == RUN:
+                raise OSError('unreadable row')
+            return real(run_id)
+        with mock.patch.object(self.registry, 'snapshot', refuse_one), self.assertLogs(C.LOG, 'WARNING'):
+            reader.step()
+            reads.clear()
+            reader.step()
+        self.assertEqual(reads, [RUN2], 'the slice of one is the run that is due')
+
+    def test_a_failed_listing_ends_the_step(self) -> None:
+        self.drain()
+        self.registry.control_put(RUN, 'not json')
+        self.put('B', RUN2)
+        self.store.fail_commit = True
+        with mock.patch.object(self.registry, 'snapshot', wraps=self.registry.snapshot) as reads:
+            with self.assertLogs(C.LOG, 'ERROR'):
+                self.assertFalse(self.reader.step())
+        self.assertEqual([call.args[0] for call in reads.call_args_list], [RUN], 'nothing more after the failed listing')
+        self.assertEqual(self.reader._pending, {RUN, RUN2})
+        self.store.fail_commit = False
+        self.now[0] = self.reader._wait_until
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.assertEqual((self.unlogged_table(), self.notes(RUN2)), ({RUN: 'control_text_not_json'}, ['B']))
+
+    def test_an_unlogged_run_is_in_the_lanes_table_and_a_new_start_reads_it_back(self) -> None:
+        # DeepSeek r2, M2: unlogged was in memory only.
+        self.put('typed', RUN)
+        self.registry.control_put(RUN2, 'not json')
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.assertEqual((self.unlogged_table(), self.reader.ready), ({RUN2: 'control_text_not_json'}, True))
+        restarted = self.new_reader(page=1)
+        self.assertEqual(restarted.unlogged, {})
+        self.assertTrue(restarted.step())                      # the scan state, then a page of one run: RUN alone
+        self.assertEqual(restarted._scan_cursor, RUN)
+        self.assertEqual(restarted.unlogged, {RUN2: 'control_text_not_json'}, 'read back before the scan reaches it')
+        self.registry.control_put(RUN2, '[1, 2]')
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain(restarted)
+        self.assertEqual(self.unlogged_table(), {RUN2: 'control_text_not_an_object'}, 'a new code replaces the old')
+        self.put('typed now', RUN2)
+        self.drain(restarted)
+        self.assertEqual((self.unlogged_table(), restarted.unlogged, self.notes(RUN2)), ({}, {}, ['typed now']))
+
+    def test_an_unlogged_run_whose_code_is_unchanged_is_not_written_again(self) -> None:
+        self.registry.control_put(RUN, 'not json')
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.now[0] += 61
+        with mock.patch.object(self.store, 'transaction', wraps=self.store.transaction) as opened:
+            with self.assertLogs(C.LOG, 'ERROR'):
+                self.drain()
+        self.assertEqual(opened.call_count, 0, 'the scan read it again and wrote nothing')
+
+    def test_a_held_image_the_store_then_refuses_whose_listing_fails_ends_the_step(self) -> None:
+        self.drain()
+        self.put('A')
+        self.put('B', RUN2)
+        real, calls = self.reader._commit, []
+
+        def commit(run_id, image, digest, reason):
+            calls.append(run_id)
+            if len(calls) == 1:
+                raise OSError('the commit failed')
+            if len(calls) == 2:
+                self.store.fail_commit = True                  # and the listing that follows fails too
+                raise ValueError('event_refused')
+            return real(run_id, image, digest, reason)
+        with mock.patch.object(self.reader, '_commit', commit), self.assertLogs(C.LOG, 'ERROR'):
+            self.assertFalse(self.reader.step())
+            self.assertEqual(self.reader._held[0], RUN)
+            self.now[0] = self.reader._wait_until
+            with mock.patch.object(self.registry, 'snapshot', wraps=self.registry.snapshot) as reads:
+                self.assertFalse(self.reader.step())
+            self.assertEqual(reads.call_count, 0, 'nothing more after the failed listing')
+        self.store.fail_commit = False
+        self.now[0] = self.reader._wait_until
+        self.drain()
+        self.assertEqual((self.notes(), self.notes(RUN2)), (['A'], ['B']))
+
+    def test_the_codes_have_one_shape(self) -> None:
+        # DeepSeek r2, L2.
+        self.assertEqual(C._code(C.BadImage('control_text_not_json:NaN'), 'store_refused'), 'control_text_not_json:NaN')
+        self.assertEqual(C._code(ValueError('source_not_allowed_for:state.changed'), 'store_refused'),
+                         'store_refused:source_not_allowed_for:state.changed')
+        self.assertEqual(C._code(ValueError('a sentence, not a code'), 'store_refused'), 'store_refused')
+        self.assertEqual(C._code(ValueError('x' * 81), 'no_canonical_text'), 'no_canonical_text')
+
+    def test_the_lanes_tables_change_only_with_their_version(self) -> None:
+        # DeepSeek r2, M3: the text changed at version 1. A new text needs a new version (and a new digest here).
+        self.assertEqual((C.LANE_VERSION, hashlib.sha256(C.LANE_DDL.encode('utf-8')).hexdigest()),
+                         (2, 'ecd17983f503d37f5e9e4e4b4a704cf2d07d0249b73460b0314abfbaaf9a9691'))
+
+    def test_a_store_declared_by_another_version_is_refused_with_the_version_it_holds(self) -> None:
+        state = self.folder / 'old'
+        state.mkdir()
+        old = D.EventStore(str(state / C.STORE_FILE))
+        old.register_tables(C.LANE, 1, C.LANE_DDL.rsplit('; CREATE TABLE events_unlogged', 1)[0])
+        old.close()
+        with self.assertRaises(D.StoreError) as caught:
+            C.open_store(state)
+        self.assertTrue(str(caught.exception).startswith('declaration_changed: '), str(caught.exception))
+        self.assertIn('tables of version 1; this code declares version 2', str(caught.exception))
+        C.open_store(state.parent / 'state').close()           # and a store of this version opens
+
+    def test_open_store_and_register_refuse_with_their_own_errors(self) -> None:
+        # DeepSeek r2, L3.
+        a_file = self.folder / 'a-file'
+        a_file.write_text('x')
+        for state_dir in (None, b'/var/tmp', a_file, self.folder / 'missing'):
+            with self.subTest(state_dir=state_dir):
+                with self.assertRaises(D.StoreError) as caught:
+                    C.open_store(state_dir)
+                self.assertEqual(str(caught.exception), 'state_dir_not_a_folder')
+        with self.assertRaises(TypeError) as caught:
+            C.register(None)
+        self.assertEqual(str(caught.exception), 'hooks')
+
+    def test_a_refused_option_leaves_the_hooks_as_they_were(self) -> None:
+        # Sol r2, later: a registration refused for an option can be made again on the same hooks.
+        hooks = H.Hooks()
+        with self.assertRaisesRegex(ValueError, 'page'):
+            C.register(hooks, page=0)
+        C.register(hooks, page=1)
+
+    def test_log_id_of_refuses_a_run_id_that_is_not_text(self) -> None:
+        # DeepSeek r2, L4.
+        for run_id in (None, '', 5):
+            with self.subTest(run_id=run_id):
+                with self.assertRaisesRegex(TypeError, 'run_id'):
+                    C.log_id_of(run_id, {'daemon_row': None, 'control_record': None})
+
+    def test_a_session_id_too_long_to_be_a_log_id_logs_under_the_run(self) -> None:
+        # DeepSeek r2, L1 (third guard).
+        self.put('long', session_id='ses-' + 'x' * 61)
+        self.drain()
+        self.assertEqual([e['session_id'] for e in self.changed(RUN)], ['run:' + RUN])
+
+    def test_a_run_in_a_page_and_gone_by_its_read_is_not_logged(self) -> None:
+        # DeepSeek r2, L1 (second guard): no all-null image for a run the registry does not hold.
+        real = self.registry.run_ids
+
+        def a_ghost_first(after, limit):
+            return ['run-ghost'] if after is None else real(after, limit)
+        with mock.patch.object(self.registry, 'run_ids', a_ghost_first):
+            self.drain()
+        self.assertEqual((self.store.events, self.reader.ready), ([], True))
+
+    def test_start_refuses_a_context_with_no_store(self) -> None:
+        # DeepSeek r2, L1 (first guard).
+        context = self.context()
+        context.store = None
+        service = C.ChangeReader(self.marker)
+        with self.assertRaisesRegex(RuntimeError, 'needs the event store'):
+            service.start(context)
+        self.assertIsNone(service._thread)
+
+    def test_a_finished_thread_is_owned_until_stop(self) -> None:
+        # Sol r2's F10 probe.
+        service = C.ChangeReader(self.marker)
+        service._run = lambda stopping=None: None
+        service.start(self.context())
+        service._thread.join(BOUND_S)
+        with self.assertRaisesRegex(RuntimeError, 'already started'):
+            service.start(self.context())
+        service.stop(self.context())
+        service.start(self.context())
+        service.stop(self.context())
+        self.assertIsNone(service._thread)
+
+    def test_a_control_text_nested_past_the_json_readers_own_limit_is_listed(self) -> None:
+        # Sol r2's F1 probe: 1,500 levels.
+        self.registry.control_put(RUN, '{"a":' * 1500 + '0' + '}' * 1500)
+        self.put('healthy', RUN2)
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.assertIn(RUN, self.reader.unlogged)
+        self.assertEqual(self.notes(RUN2), ['healthy'])
+
+    def test_the_lane_tables_checks_hold(self) -> None:
+        # Sol r2's coverage guard: the CHECKs on log_id and route_logged.
+        for log_id, route in (('invalid-log', 0), ('run:run-check', 2)):
+            with self.subTest(log_id=log_id, route=route):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    with self.store.transaction() as tx:
+                        tx.execute('INSERT INTO events_run_images VALUES (?, ?, ?, ?)', ('run-check', log_id, 'a' * 64, route))
+
+    def test_a_deferred_runs_wait_doubles_up_to_the_scan_interval(self) -> None:
+        # Sol r2's coverage guard: the doubling and the cap of a run's own backoff.
+        self.registry.add(RUN, 'boot-1')
+        waits = []
+        with mock.patch.object(self.registry, 'snapshot', side_effect=OSError('unreadable row')):
+            with self.assertLogs(C.LOG, 'WARNING'):
+                self.reader.step()
+                self.reader.step()
+                for _ in range(12):
+                    self.now[0] = self.reader._deferred[RUN][1]
+                    self.reader.step()
+                    waits.append(round(self.reader._deferred[RUN][1] - self.now[0], 6))
+        self.assertEqual((waits[:3], waits[-2:]), ([0.2, 0.4, 0.8], [60.0, 60.0]))
 
 
 class RealStore(D.EventStore):

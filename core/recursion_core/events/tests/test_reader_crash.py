@@ -5,8 +5,10 @@ killed with SIGKILL at a point it names. The parent then starts again as the dae
 on the same folder, ``changes.open_store``, a new marker and a new reader), lets the reader catch up, and checks
 the log against the registry, reading the store's file on a connection of its own:
 
-- every run the registry holds is in the log, and the last image logged for it is the registry's
-  (``post_image(*registry.snapshot(run))``, compared by image and by digest);
+- every run the registry holds whose record has a typed post-image is in the log, and the last image logged
+  for it is the registry's (``post_image(*registry.snapshot(run))``, compared by image and by digest); every
+  other run it holds is listed in the lane's table ``events_unlogged`` with its code, and no run is listed
+  there but those; the restarted reader's ``unlogged`` is that table;
 - no image is logged twice in a row for a run (dedupe is against the last image), and each event's digest is
   its image's;
 - every log's seq is 1..n with no hole, and ``coalesced`` is null;
@@ -16,8 +18,9 @@ the log against the registry, reading the store's file on a connection of its ow
 The points: while the first pass ever made on the store is cut short (one page logged); after a registry
 publish and before the reader's append, with the mark not yet taken and with it taken and the image read;
 just after the store's commit of the reader's transaction (the store's, so a reader
-that split the event and the digest into two transactions is killed between them); and anywhere, in seeded
-rounds of random writes and reader steps. The stdout and result proofs are the tailer's and the S8 reader's
+that split the event and the digest into two transactions is killed between them); after a run was listed as
+unlogged; and anywhere, in seeded rounds of random writes (control texts with no typed post-image among them)
+and reader steps. The stdout and result proofs are the tailer's and the S8 reader's
 (slice 3).
 """
 
@@ -147,14 +150,14 @@ class ReaderCrashTest(unittest.TestCase):
                 self.assertTrue(reader.ready, 'the first pass of this start has completed')
                 after = read_log(store.path)
                 self.assertEqual(after[:len(before)], before, 'nothing logged before the restart has changed')
-                self.check_log(registry, store.path, after)
+                self.check_log(registry, store.path, after, reader.unlogged)
             finally:
                 store.close()
         finally:
             registry.close()
         return after[len(before):], after
 
-    def check_log(self, registry, path: str, events: list) -> None:
+    def check_log(self, registry, path: str, events: list, unlogged: dict) -> None:
         seqs, digests, last = {}, {}, {}
         for event in events:
             seqs.setdefault(event['session_id'], []).append(event['seq'])
@@ -171,13 +174,20 @@ class ReaderCrashTest(unittest.TestCase):
             for one, then in zip(logged, logged[1:]):
                 self.assertNotEqual(one, then, f'{run_id}: the same image logged twice in a row')
         ids = every_run_id(registry)
-        self.assertEqual(sorted(last), ids, 'every run the registry holds is in the log, and no other')
-        for run_id in ids:
-            image = C.post_image(*registry.snapshot(run_id))
-            self.assertEqual(last[run_id], json.loads(json.dumps(image)), f'{run_id}: the last image is the registry\'s')
-            self.assertEqual(digests[run_id][-1], C.image_digest(image))
         with contextlib.closing(sqlite3.connect(path)) as conn:
             table = dict(conn.execute('SELECT run_id, digest FROM events_run_images'))
+            listed = dict(conn.execute('SELECT run_id, code FROM events_unlogged'))
+        untyped = {}
+        for run_id in ids:
+            try:
+                image = C.post_image(*registry.snapshot(run_id))
+            except C.BadImage as exc:
+                untyped[run_id] = str(exc)
+                continue
+            self.assertEqual(last.get(run_id), json.loads(json.dumps(image)), f'{run_id}: the last image is the registry\'s')
+            self.assertEqual(digests[run_id][-1], C.image_digest(image))
+        self.assertEqual(set(last) - set(ids), set(), 'the log holds no run the registry does not hold')
+        self.assertEqual((listed, unlogged), (untyped, untyped), 'the runs with no typed image are listed, and no other')
         self.assertEqual(table, {run_id: logged[-1] for run_id, logged in digests.items()},
                          'the lane\'s table holds the digest of every run\'s last event')
 
@@ -225,6 +235,19 @@ class ReaderCrashTest(unittest.TestCase):
         mine = [e for e in log if e['type'] == 'state.changed' and e['run_id'] == R.RUN_A]
         self.assertEqual([(e['payload']['reason'], e['payload']['post_image']['daemon_row']['state']) for e in mine],
                          [('snapshot', 'starting'), ('commit', 'running')])
+
+    def test_kill_9_after_a_run_was_listed_unlogged_keeps_the_listing(self) -> None:
+        child = self.start('unlogged')
+        self.assertEqual(child.line(), 'unlogged')
+        child.kill()
+        with contextlib.closing(sqlite3.connect(str(self.state / C.STORE_FILE))) as conn:
+            self.assertEqual(dict(conn.execute('SELECT run_id, code FROM events_unlogged')),
+                             {R.RUN_B: 'control_text_not_json'}, 'the listing is in the file the process left')
+        new, _log = self.restart()
+        self.assertEqual(new, [], 'the restart logs nothing for it and lists it again from the file')
+        new, _log = self.restart(change=lambda registry: registry.control_put(R.RUN_B, R.record(R.RUN_B, 'b2')))
+        self.assertEqual(self.changed(new), [(R.RUN_B, 'reconcile')])
+        self.assertEqual(new[0]['payload']['post_image']['control_record']['note'], 'b2')
 
     def test_kill_9_anywhere_in_random_writes_leaves_the_log_equal_to_the_registry(self) -> None:
         rng = random.Random(SEED)

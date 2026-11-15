@@ -24,8 +24,11 @@ record), then catches up: the reader steps until no scan is in progress and noth
                 that returns (the reader's: the event and the run's new last digest), print ``committed`` and
                 wait, before the step returns. The point is the store's commit, not the reader's, so a reader
                 that wrote the event and the digest in two transactions would be killed between them.
-    churn       forever: one registry write chosen by a generator seeded with <seed>, then zero to three reader
-                steps; print ``wrote <n>`` after each write.
+    unlogged    publish a control text that is not JSON to run-bbbb and catch up: the reader lists the run in
+                its table ``events_unlogged``; print ``unlogged`` and wait.
+    churn       forever: one registry write chosen by a generator seeded with <seed> (some of them control
+                texts with no typed post-image), then zero to three reader steps; print ``wrote <n>`` after
+                each write.
 
 Waiting is a read of stdin that never gets an answer: the parent kills the process.
 """
@@ -46,6 +49,7 @@ from recursion_core.events import changes as C
 RUN_A, RUN_B, RUN_C = 'run-aaaa', 'run-bbbb', 'run-cccc'
 CHURN_RUNS = ('run-c1', 'run-c2', 'run-c3', 'run-c4')
 STATES = ('running', 'stopping', 'terminated')
+UNTYPED = ('not json', '[1, 2]', '{"n": NaN}')     # control texts with no typed post-image
 
 
 def record(run_id: str, note: str) -> str:
@@ -107,6 +111,12 @@ def main(argv) -> int:
         say('published')
         return wait()
 
+    if mode == 'unlogged':
+        registry.control_put(RUN_B, 'not json')
+        catch_up(reader)
+        say('unlogged')
+        return wait()
+
     if mode == 'taken':
         def reading(run_id, image, digest, reason):
             say(f'reading {run_id}')
@@ -134,7 +144,7 @@ def main(argv) -> int:
         n = 0
         while True:
             run_id = rng.choice(CHURN_RUNS)
-            kind = rng.randrange(4)
+            kind = rng.randrange(5)
             if run_id not in present or kind == 0:
                 if run_id not in present:
                     registry.add(run_id, 'boot-1')
@@ -145,6 +155,8 @@ def main(argv) -> int:
                 registry.state(run_id, rng.choice(STATES), f'detail {rng.randrange(1_000)}')
             elif kind == 2:
                 registry.request_stop(run_id)
+            elif kind == 3:
+                registry.control_put(run_id, rng.choice(UNTYPED))
             else:
                 registry.control_put(run_id, record(run_id, f'note {rng.randrange(1_000_000)}'))
             n += 1

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -264,6 +265,131 @@ class StdioTest(unittest.TestCase):
         self.assertEqual(set(range(1, 10)), {child.recv()["id"] for _ in range(9)})
         self.assertEqual(0, child.end()[0])
 
+    def test_with_the_default_limits_a_stop_is_sent_behind_a_busy_answer_while_stdout_is_full(self) -> None:
+        # Eight large answers fill the pipe nobody reads and hold the eight ordinary slots; sixteen calls
+        # wait; the next is refused Server busy; the stop behind it must still be read and sent.
+        stop_seen = threading.Event()
+        changed = threading.Condition()
+        entered: list[str] = []
+
+        class Padded:
+            def call(self, method, params=None):
+                with changed:
+                    entered.append(method)
+                    changed.notify_all()
+                if method == "methods.list":  # a daemon from before the method table: the legacy four
+                    return {"code": "method_unknown", "detail": "methods.list"}
+                if method == "run.status":
+                    return {"code": "ok", "run": {"run_id": "r"}, "padding": "x" * 40000}
+                if method == "run.stop":
+                    stop_seen.set()
+                    return {"code": "pending", "run_id": params["run_id"], "state": "pending"}
+                return {"code": "ok", "runs": []}
+
+        def status(request_id) -> dict:
+            return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                    "params": {"name": "recursion_run_status", "arguments": {"run_id": "r"}}}
+
+        self.daemon(Padded())
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        for n in range(2, 10):
+            child.send(status(n))
+        with changed:
+            self.assertTrue(changed.wait_for(lambda: entered.count("run.status") == 8, HANG_GUARD_S))
+        for n in range(10, 27):  # sixteen wait, and the seventeenth (26) is refused
+            child.send(status(n))
+        child.send({"jsonrpc": "2.0", "id": 27, "method": "tools/call",
+                    "params": {"name": "recursion_run_stop", "arguments": {"run_id": "r"}}})
+        self.assertTrue(stop_seen.wait(HANG_GUARD_S), "the stop was not sent while stdout was full")
+        with changed:
+            self.assertEqual(8, entered.count("run.status"))  # the waiting calls were not sent meanwhile
+        answers = {}
+        for _ in range(26):  # reading stdout lets everything through
+            answer = child.recv()
+            answers[answer["id"]] = answer
+        self.assertEqual(set(range(2, 28)), set(answers))
+        self.assertEqual(-32000, answers[26]["error"]["code"])
+        self.assertEqual("pending", answers[27]["result"]["structuredContent"]["code"])
+        self.assertEqual(0, child.end()[0])
+        with changed:
+            self.assertEqual((24, 1), (entered.count("run.status"), entered.count("run.stop")))
+
+    def test_with_stderr_full_the_reader_goes_on_and_an_interrupt_exits_130(self) -> None:
+        # The client never reads stderr. Six thousand cancellation lines (about 300 KB) fill that pipe and
+        # the diagnostics queue; the reader still reads all of them, a ping is answered and a stop is sent.
+        # An interrupt then ends the process with 130 and no fatal error at the interpreter's end: the
+        # diagnostics thread waits in a write to fd 2 and holds no lock of sys.stderr.
+        stop_seen = threading.Event()
+
+        class Stops:
+            def call(self, method, params=None):
+                if method == "methods.list":  # a daemon from before the method table: the legacy four
+                    return {"code": "method_unknown", "detail": "methods.list"}
+                if method == "run.stop":
+                    stop_seen.set()
+                    return {"code": "pending", "run_id": params["run_id"], "state": "pending"}
+                return {"code": "ok", "runs": []}
+
+        self.daemon(Stops())
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        note = encode({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 999}})
+        child.proc.stdin.write(note * 6000)  # returns only once the reader has read nearly all of it
+        child.proc.stdin.flush()
+        self.assertEqual({}, child.request(2, "ping")["result"])
+        stopped = child.tool(3, "recursion_run_stop", {"run_id": "r"})
+        self.assertEqual("pending", stopped["structuredContent"]["code"])
+        self.assertTrue(stop_seen.is_set())
+        child.proc.send_signal(signal.SIGINT)
+        status = child.proc.wait(timeout=HANG_GUARD_S)
+        child._guard.cancel()
+        stderr = child.proc.stderr.read().decode("ascii", "replace")
+        self.assertEqual(130, status, stderr[-2000:])
+        self.assertNotIn("Fatal Python error", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_with_stderr_full_end_of_input_still_ends_the_process_with_status_0(self) -> None:
+        # The diagnostics left in the queue get at most the drain budget (2 s), then the process ends.
+        self.daemon(make_api()[0])
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        note = encode({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 999}})
+        child.proc.stdin.write(note * 6000)
+        child.proc.stdin.flush()
+        self.assertEqual({}, child.request(2, "ping")["result"])
+        child.proc.stdin.close()
+        status = child.proc.wait(timeout=HANG_GUARD_S)  # stderr is never read
+        child._guard.cancel()
+        self.assertEqual(0, status)
+
+    def test_an_argument_the_control_frame_cannot_carry_is_answered_not_delivered(self) -> None:
+        # 1.2 MiB: under the 2 MiB line limit, over the control socket's 1 MiB frame. Nothing is written.
+        self.daemon(make_api()[0])
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        answer = child.tool(2, "recursion_run_stop", {"run_id": "r" * 1_200_000})
+        self.assertEqual({"code": "control_api_unavailable", "delivered": False, "detail": "request:frame_too_large"},
+                         answer["structuredContent"])
+        self.assertEqual(["run.list", "methods.list"], [m["method"] for m in self.seen])  # the probe and the choice only
+        self.assertEqual(0, child.end()[0])
+
+    def test_a_run_id_utf8_cannot_encode_is_answered_not_delivered(self) -> None:
+        # A lone surrogate is legal JSON text ("\\ud800") and passes the schema; the control socket's UTF-8
+        # frame cannot carry it, so nothing is written and the answer says so.
+        self.daemon(make_api()[0])
+        child = Child(self, self.runtime)
+        self.initialize(child)
+        line = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": "recursion_run_stop", "arguments": {"run_id": chr(0xD800)}}})
+        child.proc.stdin.write(line.encode("ascii") + b"\n")
+        child.proc.stdin.flush()
+        answer = child.recv()["result"]["structuredContent"]
+        self.assertEqual({"code": "control_api_unavailable", "delivered": False,
+                          "detail": "request:frame_unencodable:UnicodeEncodeError"}, answer)
+        self.assertEqual(["run.list", "methods.list"], [m["method"] for m in self.seen])  # the probe and the choice only
+        self.assertEqual(0, child.end()[0])
+
     def test_stdout_that_fails_ends_the_process_with_status_0_and_sends_nothing_more(self) -> None:
         release, status_seen = threading.Event(), threading.Event()
         seen: list[str] = []
@@ -323,6 +449,50 @@ class StdioTest(unittest.TestCase):
         status, rest, events = Child(self, self.runtime).end()
         self.assertEqual((1, b"", "socket_dir_mode"), (status, rest, events[0]["reason"]))
         self.assertEqual([], self.seen)
+
+    def test_a_tool_choice_the_daemon_refuses_ends_with_one_json_line_and_status_1(self) -> None:
+        # The refusal goes to fd 2 like every other line of the process, so it is one JSON line, not a crash.
+        class Unlisted:
+            def call(self, method, params=None):
+                if method == "methods.list":  # a listing in no shape this server reads
+                    return {"code": "ok", "methods": []}
+                return {"code": "ok", "runs": []}
+
+        self.daemon(Unlisted())
+        status, rest, events = Child(self, self.runtime).end()
+        self.assertEqual((1, b""), (status, rest))
+        self.assertEqual([("tools_unavailable", "listing_invalid")], [(e["code"], e["reason"]) for e in events])
+        self.assertEqual(["run.list", "methods.list"], [m["method"] for m in self.seen])
+
+
+class ClosedStderrTest(unittest.TestCase):
+    """The process's stderr lines go to fd 2 directly: a client that closes stderr before the first line is
+    written leaves nothing buffered for the interpreter's final flush (which would exit 120)."""
+
+    def run_with_stderr_closed(self, args: list[str], stdin: bytes) -> tuple[int, bytes]:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (CORE, env.get("PYTHONPATH", "")) if p)
+        proc = subprocess.Popen([sys.executable, "-B", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env)
+        proc.stderr.close()  # before the process writes anything there
+        proc.stderr = None   # so communicate() does not read it (on Windows it would, from a thread)
+        try:
+            out, _ = proc.communicate(stdin, timeout=HANG_GUARD_S)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        return proc.returncode, out
+
+    def test_serving_with_stderr_closed_ends_with_status_0(self) -> None:
+        legacy = "type('Legacy', (), {'call': lambda self, method, params=None: {'code': 'method_unknown'}})()"
+        code = f"from recursion_core.control.mcp.__main__ import main; raise SystemExit(main([], check=lambda env: {legacy}))"
+        status, out = self.run_with_stderr_closed(["-c", code], encode({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        self.assertEqual((0, {"jsonrpc": "2.0", "id": 1, "result": {}}), (status, json.loads(out)))
+
+    def test_a_usage_error_with_stderr_closed_still_exits_2(self) -> None:
+        status, out = self.run_with_stderr_closed(["-m", "recursion_core.control.mcp", "--stdio"], b"")
+        self.assertEqual((2, b""), (status, out))
 
 
 if __name__ == "__main__":

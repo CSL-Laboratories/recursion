@@ -30,38 +30,66 @@ One ``LegacySession`` serves one client over one stdio pair (``serve``). What it
     Accepted; requests after the ``initialize`` answer are served whether or not it has arrived.
 ``notifications/cancelled``
     Names one request by its id (a string or an integer; ``"1"`` and ``1`` are different requests).
-    A call still WAITING for a slot is dropped and never sent. A call RUNNING has its answer dropped; the
-    call already sent to the daemon is not withdrawn. A call whose answer is already being written is not
-    affected: the answer was committed before the cancellation arrived, as for a call that has finished
-    (the specification lets a receiver ignore a cancellation that comes too late). Which of these happened
-    is decided under the session's lock, so a cancellation and an answer never both win. No Stop is ever
-    sent for a cancellation, and a cancellation for an id that is not in flight is ignored.
+    A call still WAITING for a slot is dropped and never sent. A call ADMITTED (it holds a slot, its worker
+    has not sent it yet) is never sent either: the worker decides to send under the session's lock and
+    finds it cancelled. A call SENT to the daemon has its answer dropped; the call is not withdrawn. A call
+    whose answer is already being written is not affected: the answer was committed before the
+    cancellation arrived, as for a call that has finished (the specification lets a receiver ignore a
+    cancellation that comes too late). Which of these happened is decided under the session's lock, so a
+    cancellation and a send, or a cancellation and an answer, never both win, and the logged outcome
+    (``never_sent``, ``answer_dropped``, ``answer_already_written``) is what the daemon saw. No Stop is ever
+    sent for a cancellation, and a cancellation for an id that is not in flight is ignored. A cancellation
+    names an id, not a request: the 2025-06-18 basic protocol says a request id MUST NOT have been used
+    before in the same session, and a client that reuses a finished id anyway, while a late cancellation of
+    the earlier request is on its way, cancels the newer call (logged as that call's outcome).
 
 The MCP face has no Stop path of its own: ``recursion_run_stop`` forwards to ``run.stop`` and answers
 what it answered (``stopped`` only when cleanup is confirmed, otherwise ``pending``). A call that raises,
 or whose answer is not an object, answers ``control_api_unavailable`` with ``delivered: "unknown"``.
 
-ADMISSION AND OVERLOAD. The reader never waits for capacity, so a Stop or a cancellation behind a busy
-moment is still read. A call takes one of ``max_in_flight`` ordinary slots; the stop tool may also take
-one of ``reserved_stop`` extra slots (the daemon keeps reserved connections for Stop in the same way). A
-slot is held until the call's answer has been written (or dropped), so the number of worker threads and
-of answers waiting for stdout is bounded by the slots. A call that finds no slot waits in a queue:
+ADMISSION AND OVERLOAD. The reader never waits for capacity, nor for stdout (REPLIES), so a Stop or a
+cancellation behind a busy moment is still read. A call takes one of ``max_in_flight`` ordinary slots; the
+stop tool may also take one of ``reserved_stop`` extra slots (the daemon keeps reserved connections for
+Stop in the same way). A slot is held until the call's answer has been written (or dropped), so the
+number of worker threads and of answers waiting for stdout is bounded by the slots. A call that finds no
+slot waits in a queue:
 ordinary calls in one of ``max_waiting`` places, stop calls in one of ``max_waiting_stops`` places of their
 own, which are served first. A call that finds its queue full is refused at once with ``-32000`` "Server
 busy" and ``data.delivered: false``: nothing was sent, so it is safe to send again. A request whose id is
 still in flight (waiting, running or being answered) is refused.
 
 END OF INPUT. The client ending stdin ends reading: calls already admitted are run (waiting ones as slots
-free) and answered while stdout stays open, then ``serve`` returns 0. It never stops a run: the runs it
-started go on (detach, not stop).
+free) and answered while stdout stays open, then ``serve`` returns 0. An answer is never dropped, so a
+client that ends stdin and stops reading stdout without shutting it holds ``serve`` until it reads again
+or stdout fails. It never stops a run: the runs it started go on (detach, not stop).
+
+REPLIES. The reader never writes to stdout. The answers it owes (every refusal, ``Server busy`` included,
+``ping``, ``initialize`` and ``tools/list``) go to ``reply``, which takes an answer without waiting and
+says whether it took it; ``serve`` gives it a ``replies.ReplyQueue``, written by a thread of its own. So
+however slow stdout is, the reader goes on reading: a Stop behind a busy answer is admitted to its
+reserved slot and sent, and a cancellation is applied. A call's answer is written by its worker, which
+holds the call's slot until then. The reply queue is bounded; an answer it cannot take (only a client that
+has stopped reading stdout while it goes on writing fills it) is dropped and its request treated as never
+received: each of those requests sent nothing to the daemon, and a dropped ``initialize`` answer leaves
+the session uninitialized (``replies.py``, EXHAUSTION). An in-process session given no ``reply`` writes
+those answers with ``write``.
+
+DIAGNOSTICS. Nor does any thread of ``serve`` wait for stderr while it serves. Every event for ``log`` (a
+cancellation, a response the client sent, ``initialize``, a stretch of dropped answers, ``output_lost``,
+the last line) goes to a ``diagnostics.DiagnosticQueue``, which takes it without waiting and delivers it on
+a thread of its own; it is bounded, and an event that does not fit is dropped and counted. So a client
+that captures stderr and stops reading it never stops the reader either. At its end ``serve`` waits for
+the events still queued, its last line included, for at most ``max_diagnostic_drain_s`` (2 s) and then
+returns, so a client that never reads stderr does not keep the process alive after end of input; what
+stderr has not taken by then is lost. An in-process session calls its ``log`` directly.
 
 OUTPUT FAILURE. When a write to stdout fails, the session stops forwarding: no frame read afterwards and no
-waiting call is sent, a call that has been admitted but not yet sent is not sent, calls already sent are
-left to finish at the daemon (no Stop is sent in their place), and ``serve`` returns without waiting for
-more input. Reading runs on its own thread for that reason.
-
-Synchronous answers (pings, refusals, ``initialize``, ``tools/list``) are written by the reader itself; a
-client that stops reading stdout altogether therefore stops the reader once the pipe is full.
+waiting call is sent, a call that has been admitted but not yet sent is not sent, the reader's answers not
+yet written are discarded, calls already sent are left to finish at the daemon (no Stop is sent in their
+place), and ``serve`` returns without waiting for more input. Reading runs on its own thread for that
+reason. The failure is known at the first write that fails: a call read before then is sent if its worker
+starts before then. A ``write`` that raises instead of failing quietly (an in-process session's) counts
+as a failed output too: ``{"event": "write_failed", "detail": ...}`` is logged and nothing more is sent.
 """
 
 from __future__ import annotations
@@ -75,6 +103,8 @@ from typing import Any, BinaryIO
 
 from . import jsonrpc
 from .framing import MAX_INT_DIGITS, NOT_JSON, NOT_UTF8, NUMBER_TOO_LONG, TOO_LARGE, Frame, FrameWriter, read_frames
+from .diagnostics import DIAGNOSTIC_DRAIN_S, MAX_PENDING_DIAGNOSTIC_BYTES, DiagnosticQueue, check_seconds
+from .replies import MAX_PENDING_REPLY_BYTES, ReplyQueue
 from .tools import Tool, check_arguments, forward, tool_table
 
 LEGACY_PROTOCOL = "2025-06-18"
@@ -95,7 +125,9 @@ SERVER_BUSY = -32000
 
 UNAVAILABLE = "control_api_unavailable"
 _KNOWN_AFTER_INIT = frozenset({"tools/list", "tools/call"})
-WAITING, RUNNING, ANSWERING = "waiting", "running", "answering"
+# A call's states: WAITING (no slot yet), ADMITTED (holds a slot, not sent), SENT (sent to the daemon),
+# ANSWERING (its answer is being written). Each change is made under the session's lock.
+WAITING, ADMITTED, SENT, ANSWERING = "waiting", "admitted", "sent", "answering"
 
 Log = Callable[[dict], None]
 
@@ -144,9 +176,12 @@ class _Call:
 
 class LegacySession:
     """One client's session. ``api`` is anything with ``call(method, params) -> dict``; ``write`` puts one
-    message on the wire; ``output_open()`` says whether stdout still takes answers."""
+    call's answer on the wire (from the call's worker); ``reply`` takes one answer the reader owes without
+    waiting and returns whether it took it (REPLIES; ``write`` when left out); ``output_open()`` says
+    whether stdout still takes answers."""
 
-    def __init__(self, api: Any, write: Callable[[dict], Any], *, tools: Iterable[Tool] | None = None,
+    def __init__(self, api: Any, write: Callable[[dict], Any], *, reply: Callable[[dict], bool] | None = None,
+                 tools: Iterable[Tool] | None = None,
                  max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP,
                  max_waiting: int = MAX_WAITING, max_waiting_stops: int = MAX_WAITING_STOPS,
                  log: Log | None = None, output_open: Callable[[], bool] = _always_open) -> None:
@@ -154,6 +189,7 @@ class LegacySession:
             raise ValueError("max_in_flight must be positive and the other limits not negative")
         self._api = api
         self._write = write
+        self._reply = reply if reply is not None else self._write_now
         self._log = log or _quiet
         self._output_open = output_open
         self._tools = {t.name: t for t in (tool_table() if tools is None else tools)}
@@ -169,22 +205,28 @@ class LegacySession:
         self._output_lost = False
         self.initialized = False
 
+    def _write_now(self, message: dict) -> bool:
+        """``reply`` of an in-process session: the answer is written at once, by the reader."""
+
+        self._write(message)
+        return True
+
     # -- input --------------------------------------------------------------------------------------
     def receive(self, frame: Frame) -> None:
         if frame.error == TOO_LARGE:
-            self._write(jsonrpc.error(None, jsonrpc.INVALID_REQUEST, "Invalid Request: message too large"))
+            self._reply(jsonrpc.error(None, jsonrpc.INVALID_REQUEST, "Invalid Request: message too large"))
             return
         if frame.error == NUMBER_TOO_LONG:
-            self._write(jsonrpc.error(None, jsonrpc.INVALID_REQUEST,
+            self._reply(jsonrpc.error(None, jsonrpc.INVALID_REQUEST,
                                       f"Invalid Request: an integer longer than {MAX_INT_DIGITS} digits"))
             return
         if frame.error in (NOT_UTF8, NOT_JSON):
             detail = "not UTF-8" if frame.error == NOT_UTF8 else "not JSON"
-            self._write(jsonrpc.error(None, jsonrpc.PARSE_ERROR, f"Parse error: {detail}"))
+            self._reply(jsonrpc.error(None, jsonrpc.PARSE_ERROR, f"Parse error: {detail}"))
             return
         message = jsonrpc.classify(frame.message)
         if isinstance(message, jsonrpc.Invalid):
-            self._write(jsonrpc.error(message.id, message.code, message.message))
+            self._reply(jsonrpc.error(message.id, message.code, message.message))
         elif isinstance(message, jsonrpc.Response):
             self._log({"event": "ignored_response"})
         elif isinstance(message, jsonrpc.Notification):
@@ -209,7 +251,10 @@ class LegacySession:
                 del self._in_flight[request_id]
                 self._cond.notify_all()
                 outcome = "never_sent"
-            elif call.state == RUNNING:
+            elif call.state == ADMITTED:  # its worker finds it cancelled before sending (_run)
+                call.cancelled = True
+                outcome = "never_sent"
+            elif call.state == SENT:
                 call.cancelled = True
                 outcome = "answer_dropped"
             else:
@@ -220,28 +265,28 @@ class LegacySession:
         with self._cond:
             busy = req.id in self._in_flight
         if busy:
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST,
+            self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST,
                                       "Invalid Request: this id belongs to a request still in flight"))
             return
         if req.method == "initialize":
             self._initialize(req)
         elif req.method == "ping":
-            self._write(jsonrpc.result(req.id, {}))
+            self._reply(jsonrpc.result(req.id, {}))
         elif req.method in _KNOWN_AFTER_INIT:
             if not self.initialized:
-                self._write(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST,
+                self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST,
                                           "Invalid Request: not initialized; send initialize first"))
             elif req.method == "tools/list":
                 self._tools_list(req)
             else:
                 self._tools_call(req)
         else:
-            self._write(jsonrpc.error(req.id, jsonrpc.METHOD_NOT_FOUND, f"Method not found: {req.method}"))
+            self._reply(jsonrpc.error(req.id, jsonrpc.METHOD_NOT_FOUND, f"Method not found: {req.method}"))
 
     # -- lifecycle ------------------------------------------------------------------------------------
     def _initialize(self, req: jsonrpc.Request) -> None:
         if self.initialized:
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST, "Invalid Request: already initialized"))
+            self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_REQUEST, "Invalid Request: already initialized"))
             return
         params = req.params
         requested, info = params.get("protocolVersion"), params.get("clientInfo")
@@ -253,43 +298,45 @@ class LegacySession:
         elif not (isinstance(info, dict) and isinstance(info.get("name"), str) and isinstance(info.get("version"), str)):
             problem = "clientInfo must be an object with a string name and version"
         if problem is not None:
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Invalid params: {problem}"))
+            self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Invalid params: {problem}"))
             return
         answered = negotiate(requested)
-        self.initialized = True
-        self._log({"event": "initialize", "requested": requested, "answered": answered, "client": info["name"]})
-        self._write(jsonrpc.result(req.id, {
+        taken = self._reply(jsonrpc.result(req.id, {
             "protocolVersion": answered,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE, "version": SERVER_VERSION},
             "instructions": INSTRUCTIONS,
         }))
+        if not taken:  # the answer was dropped (REPLIES): the client never sees it, so nothing changes
+            return
+        self.initialized = True
+        self._log({"event": "initialize", "requested": requested, "answered": answered, "client": info["name"]})
 
     # -- tools ------------------------------------------------------------------------------------------
     def _tools_list(self, req: jsonrpc.Request) -> None:
         if "cursor" in req.params:
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, "Invalid params: unknown cursor"))
+            self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, "Invalid params: unknown cursor"))
             return
-        self._write(jsonrpc.result(req.id, {"tools": self._descriptors}))
+        self._reply(jsonrpc.result(req.id, {"tools": self._descriptors}))
 
     def _tools_call(self, req: jsonrpc.Request) -> None:
         name = req.params.get("name")
         if not isinstance(name, str):
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, "Invalid params: name must be a string"))
+            self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, "Invalid params: name must be a string"))
             return
         tool = self._tools.get(name)
         if tool is None:
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Unknown tool: {name}"))
+            self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Unknown tool: {name}"))
             return
         arguments = req.params["arguments"] if "arguments" in req.params else {}
         try:
             problem = check_arguments(tool.input_schema, arguments)
         except Exception:  # noqa: BLE001 - a schema the checker cannot apply: refuse, send nothing, keep reading
-            self._write(jsonrpc.error(req.id, jsonrpc.INTERNAL_ERROR,
+            self._reply(jsonrpc.error(req.id, jsonrpc.INTERNAL_ERROR,
                                       "Internal error: the tool's input schema could not be applied", {"tool": name}))
             return
         if problem is not None:
-            self._write(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Invalid params: {problem}",
+            self._reply(jsonrpc.error(req.id, jsonrpc.INVALID_PARAMS, f"Invalid params: {problem}",
                                       {"tool": name}))
             return
         try:
@@ -297,17 +344,17 @@ class LegacySession:
         except _OutputLost:  # no answer could be seen: nothing is sent and nothing is written
             return
         except _Busy:
-            self._write(jsonrpc.error(req.id, SERVER_BUSY, "Server busy: this call was not sent; it may be sent again",
+            self._reply(jsonrpc.error(req.id, SERVER_BUSY, "Server busy: this call was not sent; it may be sent again",
                                       {"delivered": False}))
             return
         with self._cond:
             call.arguments, call.ready = arguments, True
-            start = [call] if call.state == RUNNING else self._startable()
+            start = [call] if call.state == ADMITTED else self._startable()
         for each in start:
             self._start(each)
 
     def _admit(self, request_id: Any, tool: Tool) -> _Call:
-        """Record the call as in flight, holding a slot (``running``) or a place in its queue (``waiting``);
+        """Record the call as in flight, holding a slot (``admitted``) or a place in its queue (``waiting``);
         never waits. ``_Busy`` when its queue is full, ``_OutputLost`` once stdout has failed."""
 
         with self._cond:
@@ -315,7 +362,7 @@ class LegacySession:
                 raise _OutputLost()
             call = _Call(request_id, tool)
             if self._take_slot(call):
-                call.state = RUNNING
+                call.state = ADMITTED
             elif tool.is_stop and len(self._waiting_stops) < self._max_waiting_stops:
                 self._waiting_stops.append(call)
             elif not tool.is_stop and len(self._waiting) < self._max_waiting:
@@ -339,7 +386,7 @@ class LegacySession:
         return True
 
     def _startable(self) -> list[_Call]:
-        """Under the lock: waiting calls that can now take a slot, stop calls first; each is moved to running."""
+        """Under the lock: waiting calls that can now take a slot, stop calls first; each is moved to admitted."""
 
         started: list[_Call] = []
         if self._output_lost:
@@ -349,7 +396,7 @@ class LegacySession:
                 if not call.ready or not self._take_slot(call):
                     continue
                 queue.remove(call)
-                call.state = RUNNING
+                call.state = ADMITTED
                 started.append(call)
         return started
 
@@ -358,29 +405,40 @@ class LegacySession:
         try:
             worker.start()
         except RuntimeError:  # no thread could be started: nothing was sent to the daemon
-            self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR, "Internal error: no worker for this call"))
+            self._reply(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR, "Internal error: no worker for this call"))
             self._finish(call)
 
     def _run(self, call: _Call) -> None:
         try:
-            if self._output_open() and not self._output_lost:
+            with self._cond:  # the send is decided here: a cancellation before this point means never sent
+                send = not call.cancelled and not self._output_lost and self._output_open()
+                if send:
+                    call.state = SENT
+            if send:
                 try:
                     outcome = forward(self._api, call.tool, call.arguments)
-                except Exception as exc:  # noqa: BLE001 - an answer is owed; the call's effect is unknown
+                except BaseException as exc:  # noqa: BLE001 - an answer is owed; the call's effect is unknown
                     outcome = _unknown_outcome(exc)
                 with self._cond:
-                    send = not call.cancelled
-                    if send:
+                    answer = not call.cancelled
+                    if answer:
                         call.state = ANSWERING
-                if send:
-                    try:
-                        self._write(jsonrpc.result(call.request_id, outcome))
-                    except (TypeError, ValueError):  # an answer JSON cannot hold; it claims nothing either way
-                        self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR,
-                                                  "Internal error: the answer is not JSON"))
-            # Output already lost: the call is not sent at all.
+                if answer:
+                    self._answer(call, outcome)
+            # Cancelled before the send, or output already lost: the call is not sent at all.
         finally:
             self._finish(call)
+
+    def _answer(self, call: _Call, outcome: dict) -> None:
+        try:
+            try:
+                self._write(jsonrpc.result(call.request_id, outcome))
+            except (TypeError, ValueError):  # an answer JSON cannot hold; it claims nothing either way
+                self._write(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR,
+                                          "Internal error: the answer is not JSON"))
+        except BaseException as exc:  # noqa: BLE001 - a write that raises anything is an output that failed
+            self._log({"event": "write_failed", "detail": type(exc).__name__})
+            self.output_lost()
 
     def _finish(self, call: _Call) -> None:
         """The call is over and its answer, if wanted, written: give its slot and id back, start what waits."""
@@ -428,27 +486,39 @@ class LegacySession:
 
 def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None = None,
           tools: Iterable[Tool] | None = None, max_in_flight: int = MAX_IN_FLIGHT, reserved_stop: int = RESERVED_STOP,
-          max_waiting: int = MAX_WAITING, max_waiting_stops: int = MAX_WAITING_STOPS) -> int:
+          max_waiting: int = MAX_WAITING, max_waiting_stops: int = MAX_WAITING_STOPS,
+          max_pending_reply_bytes: int = MAX_PENDING_REPLY_BYTES,
+          max_pending_diagnostic_bytes: int = MAX_PENDING_DIAGNOSTIC_BYTES,
+          max_diagnostic_drain_s: float = DIAGNOSTIC_DRAIN_S) -> int:
     """Serve one client until end of input or until stdout fails; returns the process exit status (0).
 
     Reading runs on a thread of its own, so that a failure of stdout ends the session even while the
-    reader waits for input. An exception raised while reading (an interrupt included) is raised here.
+    reader waits for input; the reader's answers are written by the reply queue's thread (REPLIES), and
+    every event for ``log`` is delivered by a diagnostics thread (DIAGNOSTICS). An exception raised while
+    reading (an interrupt included) is raised here at once; diagnostics not yet delivered then may be lost.
+    ``max_diagnostic_drain_s`` is ``None`` for no limit or a number of seconds from 0 to a day
+    (``diagnostics.check_seconds``); anything else is a ``ValueError`` before anything is read, as the queues'
+    bounds and the session's limits are.
     """
 
-    log = log or _quiet
+    check_seconds(max_diagnostic_drain_s, "max_diagnostic_drain_s")  # refused before anything is read
+    diagnostics = DiagnosticQueue(log or _quiet, max_bytes=max_pending_diagnostic_bytes)
+    log = diagnostics.offer
     done = threading.Event()
     failure: list[BaseException] = []
     writer = FrameWriter(outstream)
-    session = LegacySession(api, writer.write, tools=tools, log=log, max_in_flight=max_in_flight,
-                            reserved_stop=reserved_stop,
-                            max_waiting=max_waiting, max_waiting_stops=max_waiting_stops,
-                            output_open=lambda: not writer.broken)
+    replies = ReplyQueue(writer, max_bytes=max_pending_reply_bytes, log=log)
+    session = LegacySession(api, writer.write, reply=replies.offer, tools=tools, log=log,
+                            max_in_flight=max_in_flight, reserved_stop=reserved_stop, max_waiting=max_waiting,
+                            max_waiting_stops=max_waiting_stops, output_open=lambda: not writer.broken)
 
     def output_failed() -> None:
-        session.output_lost()
+        session.output_lost()  # the reply queue sees the failure at its next write (replies.py)
         done.set()
 
     writer.on_broken = output_failed
+    diagnostics.start()
+    replies.start()
 
     def read() -> None:
         try:
@@ -464,5 +534,7 @@ def serve(api: Any, instream: BinaryIO, outstream: BinaryIO, *, log: Log | None 
     if failure:
         raise failure[0]
     session.close()
-    log({"event": "end_of_input" if not writer.broken else "output_failed", "stdout_broken": writer.broken})
+    replies.close()
+    diagnostics.close(last={"event": "end_of_input" if not writer.broken else "output_failed",
+                            "stdout_broken": writer.broken}, timeout=max_diagnostic_drain_s)
     return 0

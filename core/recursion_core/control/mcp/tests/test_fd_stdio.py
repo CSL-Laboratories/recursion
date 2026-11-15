@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import threading
 import unittest
+from unittest import mock
 
+from recursion_core.control.mcp import stdio
 from recursion_core.control.mcp.framing import Frame, read_frames
 from recursion_core.control.mcp.stdio import FdReader, FdWriter
 
@@ -37,6 +39,15 @@ class FdReaderTest(unittest.TestCase):
         self.assertEqual([Frame(message={"n": 1}), Frame(error="too_large"), Frame(message={"n": 2})],
                          list(read_frames(self.pipe_with(data), max_bytes=100)))
 
+    def test_reads_that_split_lines_anywhere(self) -> None:
+        chunks = iter([b"ab", b"c\ndef", b"\n", b""])
+        with mock.patch.object(stdio.os, "read", side_effect=lambda fd, count: next(chunks)):
+            reader = FdReader(123)
+            self.assertEqual(b"a", reader.readline(1))
+            self.assertEqual(b"bc\n", reader.readline(3))
+            self.assertEqual(b"def\n", reader.readline(4))
+            self.assertEqual(b"", reader.readline())
+
     def test_a_line_longer_than_one_read(self) -> None:
         big = b"y" * 200_000
         read_fd, write_fd = os.pipe()
@@ -57,6 +68,18 @@ class FdWriterTest(unittest.TestCase):
         writer.flush()
         os.close(write_fd)
         self.assertEqual(b"hello", os.read(read_fd, 100))
+
+    def test_a_short_write_is_finished(self) -> None:
+        written = bytearray()
+
+        def two_bytes_at_a_time(fd, data):
+            piece = bytes(data[:2])
+            written.extend(piece)
+            return len(piece)
+
+        with mock.patch.object(stdio.os, "write", side_effect=two_bytes_at_a_time):
+            self.assertEqual(7, FdWriter(123).write(b"answer\n"))
+        self.assertEqual(b"answer\n", bytes(written))
 
     @unittest.skipIf(os.name == "nt", "a pipe with no reader raises another error on Windows")
     def test_a_pipe_nobody_reads_raises_broken_pipe(self) -> None:

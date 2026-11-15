@@ -282,22 +282,207 @@ class CancellationWindowTest(SessionCase):
         self.assertEqual([], writer.drain())
         self.assertEqual({"event": "cancelled", "outcome": "answer_dropped"}, events[-1])
 
-    def test_a_cancelled_waiting_call_is_never_sent(self) -> None:
-        events: list[dict] = []
+    def test_a_stop_cancelled_after_admission_and_before_its_send_is_never_sent(self) -> None:
+        # The call holds its slot and its worker exists but has not run: the cancellation comes in between.
+        # The worker then decides under the session's lock and does not send (round 4 of #395, DeepSeek F1).
+        for tool in (STOP, STATUS):
+            with self.subTest(tool=tool[0]):
+                events: list[dict] = []
+                api = GateAPI()
+                session, writer = self.session(api, log=events.append)
+                held: list[threading.Thread] = []
+                real_start = threading.Thread.start
+                with mock.patch.object(server.threading.Thread, "start", lambda thread, held=held: held.append(thread)):
+                    self.feed(session, call(2, *tool))
+                self.assertEqual(1, len(held))
+                with session._cond:
+                    self.assertEqual(server.ADMITTED, session._in_flight[2].state)
+                self.feed(session, cancel(2))
+                self.assertEqual({"event": "cancelled", "outcome": "never_sent"}, events[-1])
+                real_start(held[0])
+                held[0].join(HANG_GUARD_S)
+                self.assertFalse(held[0].is_alive())
+                session.close()
+                api.assert_nothing_entered(self)
+                self.assertEqual(([], [], 0), (api.calls, writer.drain(), session.in_flight()))
+
+    def test_a_cancellation_cannot_come_between_the_send_decision_and_the_sent_state(self) -> None:
+        # The worker's decision is held inside the session's lock (output_open() is called there); a
+        # cancellation meanwhile waits for the lock, then finds the call SENT and drops only its answer.
+        deciding, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def output_open():
+            if threading.current_thread().name == "mcp-tools-call":
+                deciding.set()
+                release.wait(HANG_GUARD_S)
+            return True
+
         api = GateAPI()
-        session, writer = self.session(api, max_in_flight=1, reserved_stop=0, log=events.append)
-        self.feed(session, call(2, *START))
-        start = api.next_entered()
-        self.feed(session, call(3, *STATUS))
-        self.feed(session, cancel(3))
+        writer = QueueWriter()
+        events: list[dict] = []
+        session = server.LegacySession(api, writer, log=events.append, output_open=output_open)
+        self.feed(session, INIT)
+        writer.next()
+        self.feed(session, call(2, *STOP))
+        self.assertTrue(deciding.wait(HANG_GUARD_S))
+        cancelling = threading.Thread(target=lambda: (self.feed(session, cancel(2)), finished.set()), daemon=True)
+        cancelling.start()
+        self.assertFalse(finished.wait(SHORT), "the cancellation got in while the send was being decided")
+        release.set()
+        sent = api.next_entered()
+        self.assertTrue(finished.wait(HANG_GUARD_S))
+        sent[2].set()
+        cancelling.join(HANG_GUARD_S)
+        session.close()
+        self.assertEqual({"event": "cancelled", "outcome": "answer_dropped"}, events[-1])
+        self.assertEqual(([("run.stop", {"run_id": "run-1"})], []), (api.calls, writer.drain()))
+
+    def test_a_promoted_waiting_stop_is_never_sent_when_cancelled_before_its_worker_sends(self) -> None:
+        api = GateAPI()
+        events: list[dict] = []
+        session, writer = self.session(api, log=events.append, max_in_flight=1, reserved_stop=1)
+        self.feed(session, call(2, *STATUS))
+        first = api.next_entered()
+        self.feed(session, call(3, *STOP))   # the reserved slot
+        second = api.next_entered()
+        self.feed(session, call(4, *STOP))   # waits in the stop queue
+        held: list = []
+        promoted = threading.Event()
+        real_start = session._start
+
+        def start(each):
+            if each.request_id == 4:
+                held.append(each)
+                promoted.set()
+            else:
+                real_start(each)
+
+        with mock.patch.object(session, "_start", start):
+            second[2].set()  # the reserved slot frees: call 4 is promoted, its worker held
+            self.assertTrue(promoted.wait(HANG_GUARD_S))
+        with session._cond:
+            self.assertEqual(server.ADMITTED, held[0].state)
+        self.feed(session, cancel(4))
         self.assertEqual({"event": "cancelled", "outcome": "never_sent"}, events[-1])
-        start[2].set()
+        session._run(held.pop())
+        first[2].set()
+        session.close()
+        self.assertEqual(["run.status", "run.stop"], [m for m, _ in api.calls])
+        self.assertEqual({2, 3}, {m["id"] for m in writer.drain()})
+
+    def test_a_late_cancellation_for_a_reused_id_cancels_the_newer_call(self) -> None:
+        # MCP forbids reusing an id in a session; a client that does it anyway gets what the docstring says.
+        api = GateAPI()
+        events: list[dict] = []
+        session, writer = self.session(api, log=events.append)
+        self.feed(session, call(2, *STATUS))
+        api.next_entered()[2].set()
         self.assertEqual(2, writer.next()["id"])
         session.close()
+        self.feed(session, call(2, *STOP))  # the same id, a new call
+        stop = api.next_entered()
+        self.feed(session, cancel(2))       # meant for the first call, applied to the second
+        stop[2].set()
+        session.close()
+        self.assertEqual({"event": "cancelled", "outcome": "answer_dropped"}, events[-1])
+        self.assertEqual((["run.status", "run.stop"], []), ([m for m, _ in api.calls], writer.drain()))
+
+    def test_a_cancelled_waiting_call_is_never_sent(self) -> None:
+        for waiting in (STATUS, STOP):
+            with self.subTest(waiting=waiting[0]):
+                self.check_a_cancelled_waiting_call_is_never_sent(waiting)
+
+    def check_a_cancelled_waiting_call_is_never_sent(self, waiting) -> None:
+        # Every worker the session starts is recorded and joined, so a cancelled call that was left queued
+        # and started later (after close() returned) is seen; nothing here depends on scheduling.
+        first_entered, release_first = threading.Event(), threading.Event()
+        calls: list[str] = []
+
+        class FirstHeld:
+            def call(self, method, params=None):
+                calls.append(method)
+                if len(calls) == 1:
+                    first_entered.set()
+                    release_first.wait(HANG_GUARD_S)
+                return {"code": "ok"}
+
+        workers: list[threading.Thread] = []
+        real_start = threading.Thread.start
+
+        def recording_start(thread):
+            workers.append(thread)
+            return real_start(thread)
+
+        events: list[dict] = []
+        session, writer = self.session(FirstHeld(), max_in_flight=1, reserved_stop=0, log=events.append)
+        with mock.patch.object(server.threading.Thread, "start", recording_start):
+            self.feed(session, call(2, *START))
+            self.assertTrue(first_entered.wait(HANG_GUARD_S))
+            self.feed(session, call(3, *waiting))
+            self.feed(session, cancel(3))
+            self.assertEqual({"event": "cancelled", "outcome": "never_sent"}, events[-1])
+            release_first.set()
+            self.assertEqual(2, writer.next()["id"])
+            session.close()
+            joined = 0
+            while joined < len(workers):  # a worker that finishes may start another: join until none is left
+                workers[joined].join(HANG_GUARD_S)
+                self.assertFalse(workers[joined].is_alive())
+                joined += 1
+        self.assertEqual(1, len(workers))
         self.assertEqual([], writer.drain())
-        self.assertEqual(["run.start"], [m for m, _ in api.calls])
+        self.assertEqual(["run.start"], calls)
         self.feed(session, cancel(99))
         self.assertEqual({"event": "cancelled", "outcome": "not_in_flight"}, events[-1])
+
+    def test_a_waiting_call_is_started_only_once_its_arguments_are_attached(self) -> None:
+        # The reader admits a call (a place in the queue) and then attaches its arguments. A slot that
+        # frees in between must not start it: the call is not ready yet. Once attached, it is started with
+        # its own arguments.
+        first_entered, release_first, first_finished = threading.Event(), threading.Event(), threading.Event()
+        admitted, attach = threading.Event(), threading.Event()
+        calls: list[tuple[str, dict]] = []
+
+        class FirstHeld:
+            def call(self, method, params=None):
+                calls.append((method, params))
+                if len(calls) == 1:
+                    first_entered.set()
+                    release_first.wait(HANG_GUARD_S)
+                return {"code": "ok"}
+
+        session, writer = self.session(FirstHeld(), max_in_flight=1, reserved_stop=0)
+        real_finish, real_admit = session._finish, session._admit
+
+        def finish(each):
+            real_finish(each)
+            if each.request_id == 2:
+                first_finished.set()
+
+        def admit(request_id, tool):
+            made = real_admit(request_id, tool)
+            admitted.set()
+            attach.wait(HANG_GUARD_S)
+            return made
+
+        with mock.patch.object(session, "_finish", finish):
+            self.feed(session, call(2, *STATUS))
+            self.assertTrue(first_entered.wait(HANG_GUARD_S))
+            with mock.patch.object(session, "_admit", admit):
+                reader = self.feed_in_thread(session, call(3, "recursion_run_status", {"run_id": "second"}))
+                try:
+                    self.assertTrue(admitted.wait(HANG_GUARD_S))
+                    release_first.set()
+                    self.assertTrue(first_finished.wait(HANG_GUARD_S))
+                    with session._cond:
+                        before = (session._in_flight[3].state, len(calls))
+                finally:
+                    attach.set()
+                    reader.join(HANG_GUARD_S)
+            session.close()
+        self.assertEqual((server.WAITING, 1), before, "a slot was given before the arguments were attached")
+        self.assertEqual([("run.status", {"run_id": "run-1"}), ("run.status", {"run_id": "second"})], calls)
+        self.assertEqual({2, 3}, {writer.next()["id"], writer.next()["id"]})
 
 
 class SlotTest(SessionCase):
@@ -555,6 +740,81 @@ class AnswerTest(SessionCase):
             "code": -32603, "message": "Internal error: the answer is not JSON"}}, writer.next())
         session.close()
 
+    def test_an_api_that_raises_a_base_exception_answers_delivery_unknown(self) -> None:
+        class Exiting:
+            def call(self, method, params=None):
+                raise SystemExit("bye")
+
+        hooks: list = []
+        session, writer = self.session(Exiting())
+        with mock.patch.object(threading, "excepthook", hooks.append):
+            self.feed(session, call(2, *STOP))
+            answer = writer.next()
+            session.close()
+        self.assertEqual([], hooks)  # nothing escaped the worker
+        self.assertEqual({"code": "control_api_unavailable", "delivered": "unknown", "detail": "mcp:SystemExit"},
+                         answer["result"]["structuredContent"])
+
+    def test_a_write_that_raises_is_a_failed_output(self) -> None:
+        for raised in (OSError("stdout is gone"), SystemExit("bye")):
+            with self.subTest(raised=type(raised).__name__):
+                self.check_a_write_that_raises_is_a_failed_output(raised)
+
+    def check_a_write_that_raises_is_a_failed_output(self, raised: BaseException) -> None:
+        class RaisesOnTwo(QueueWriter):
+            def __call__(self, message):
+                if message.get("id") == 2:
+                    raise raised
+                return super().__call__(message)
+
+        hooks: list = []
+        events: list[dict] = []
+        api = GateAPI()
+        writer = RaisesOnTwo()
+        session = server.LegacySession(api, writer, log=events.append)
+        self.feed(session, INIT)
+        writer.next()
+        with mock.patch.object(threading, "excepthook", hooks.append):
+            self.feed(session, call(2, *STATUS))
+            api.next_entered()[2].set()
+            session.close()
+        self.assertEqual([], hooks)  # no traceback on the process's stderr
+        self.assertIn({"event": "write_failed", "detail": type(raised).__name__}, events)
+        self.assertEqual({"event": "output_lost", "dropped_unsent": 0}, events[-1])
+        self.feed(session, call(3, *STATUS))  # stdout failed: nothing more is sent
+        api.assert_nothing_entered(self)
+        self.assertEqual(0, session.in_flight())
+
+    def test_a_failed_fallback_write_also_discards_a_waiting_stop(self) -> None:
+        # The answer is not JSON, so the fallback -32603 is written; that write raises too: the output has
+        # failed, and the stop waiting behind the call is never sent.
+        calls: list[str] = []
+        events: list[dict] = []
+        written = QueueWriter()
+
+        class NotJson:
+            def call(self, method, params=None):
+                calls.append(method)
+                return {"code": "ok", "value": float("nan")}
+
+        def write(message):
+            if message.get("error", {}).get("code") == -32603:
+                raise OSError("stdout is gone")
+            return written(message)
+
+        session = server.LegacySession(NotJson(), write, log=events.append, max_in_flight=1, reserved_stop=0)
+        self.feed(session, INIT)
+        written.next()
+        held: list = []
+        with mock.patch.object(session, "_start", held.append):
+            self.feed(session, call(2, *STATUS))
+            self.feed(session, call(3, *STOP))  # waits for the one slot
+        session._run(held.pop())
+        session.close()
+        self.assertEqual((["run.status"], []), (calls, written.drain()))
+        self.assertEqual([{"event": "write_failed", "detail": "OSError"}, {"event": "output_lost", "dropped_unsent": 1}],
+                         events[-2:])
+
 
 class EndOfInputTest(unittest.TestCase):
     def test_end_of_input_waits_for_calls_in_flight_and_writes_their_answers(self) -> None:
@@ -649,10 +909,22 @@ class EndOfInputTest(unittest.TestCase):
             def write(self, data):
                 raise BrokenPipeError("client went away")
 
-        api, _, _, starter = make_api()
-        stdin = io.BytesIO(b"".join(encode(m) for m in (INIT, call(2, *START), call(3, *START))))
-        self.assertEqual(0, server.serve(api, stdin, Broken()))
-        self.assertEqual([], starter.calls)  # the initialize answer failed: nothing after it was forwarded
+        api = GateAPI()
+        read_fd, write_fd = os.pipe()
+        instream = os.fdopen(read_fd, "rb")
+        self.addCleanup(instream.close)
+        status: list[int] = []
+        serving = threading.Thread(target=lambda: status.append(server.serve(api, instream, Broken())), daemon=True)
+        serving.start()
+        os.write(write_fd, encode(INIT))  # its answer, written by the reply queue, is the write that fails
+        serving.join(HANG_GUARD_S)
+        self.assertFalse(serving.is_alive(), "serve should end when stdout fails, with stdin still open")
+        self.assertEqual([0], status)
+        os.write(write_fd, encode(call(2, *START)) + encode(call(3, *START)))  # read, and refused at admission
+        os.close(write_fd)
+        with self.assertRaises(queue.Empty):
+            api.entered.get(timeout=SHORT)  # time only shows that nothing was sent after the failure
+        self.assertEqual([], api.calls)
 
     def test_output_is_one_ascii_line_per_message(self) -> None:
         odd = "caf\u00e9\nline\u2028two\x00"

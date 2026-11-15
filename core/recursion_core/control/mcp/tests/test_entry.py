@@ -84,9 +84,11 @@ class EntryTest(unittest.TestCase):
              "params": {"name": "recursion_run_status", "arguments": {"run_id": "run-1"}}})))
         out, err = io.BytesIO(), io.StringIO()
         self.assertEqual(0, entry.main([], stdin=stdin, stdout=out, stderr=err, check=lambda environ: api))
-        answers = [json.loads(line) for line in out.getvalue().splitlines()]
-        self.assertEqual([1, 2], [a["id"] for a in answers])
-        self.assertEqual("run_unknown", answers[1]["result"]["structuredContent"]["code"])
+        # The two answers come from two threads (the reply queue's and the call's worker): any order.
+        lines = out.getvalue().splitlines()
+        answers = {a["id"]: a for a in map(json.loads, lines)}
+        self.assertEqual((2, {1, 2}), (len(lines), set(answers)))
+        self.assertEqual("run_unknown", answers[2]["result"]["structuredContent"]["code"])
         events = stderr_lines(err)
         self.assertEqual({"event": "serving", "protocol": "2025-06-18"}, events[0])
         self.assertEqual({"event": "tools", "table": "legacy", "reason": "daemon_without_method_table"}, events[1])
@@ -144,6 +146,13 @@ class EntryTest(unittest.TestCase):
         self.assertEqual(3, entry.main([], stdin=Failing(), stdout=io.BytesIO(), stderr=err,
                                        check=lambda environ: legacy))
         self.assertEqual({"code": "internal_error", "detail": "RuntimeError: the input broke"}, stderr_lines(err)[-1])
+
+    def test_a_stderr_line_that_cannot_be_written_is_dropped_quietly(self) -> None:
+        class Gone:
+            def write(self, data):
+                raise BrokenPipeError("stderr is closed")
+
+        self.assertIsNone(entry._fd_line(Gone(), {"event": "x"}))  # no exception reaches the caller
 
     @unittest.skipUnless(os.name == "nt", "Windows-only: the real socket check refuses the platform")
     def test_windows_refuses_with_the_real_check(self) -> None:

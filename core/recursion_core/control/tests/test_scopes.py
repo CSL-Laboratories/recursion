@@ -844,6 +844,32 @@ class RoundSevenScopesTest(unittest.TestCase):
                 self.assertEqual(auth.held(principal), frozenset())
 
 
+class RoundEightScopesTest(unittest.TestCase):
+    """The round-8 read of #377 by DeepSeek V4.1 Flash, 2 (coverage): with the instance half of the declaration
+    check removed, every test stayed green, and a grant declared on the instance whose read fails fell through to
+    the plugin's identity grants."""
+
+    def test_a_grant_declared_on_the_instance_whose_read_fails_holds_nothing(self) -> None:
+        class RejectIdentity:
+            def held(self, *args):
+                raise AssertionError("an instance-declared unreadable grant reached the identity store")
+
+        class InstanceDeclares:
+            kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+            def __getattribute__(self, name):
+                if name == "grant":
+                    raise AttributeError("synthetic context unavailable")
+                return object.__getattribute__(self, name)
+
+        principal = InstanceDeclares()
+        object.__setattr__(principal, "grant", "g-plugin-plugin.alpha")   # declared on the instance only
+        self.assertEqual(authorizer(credentials=RejectIdentity()).held(principal), frozenset())
+        live = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        self.assertEqual(live.held(principal), frozenset())
+        self.assertEqual(live(principal, "run.start", {}), ("scope_refused", "needs_run"))
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

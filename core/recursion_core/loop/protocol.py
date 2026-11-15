@@ -5,26 +5,37 @@ In (one object per line; the shapes of driver.v2's inputs, plus interrupt):
     {"kind": "approval_answer", "approval_id": "apr-...", "decision": "approve" | "deny"}
     {"kind": "interrupt", "turn_id": "turn-..."}
     {"kind": "close"}
-A line that is not one of these gets a ``protocol_error`` line and changes nothing.
+A blank line is skipped. Any other line that is not one of these gets a ``protocol_error`` line and changes
+nothing, whatever it holds, and reading goes on.
 
 Out (one object per line; standard output carries nothing else, diagnostics go to standard error):
     ready           once, at start: protocol version, provider, model, tool names
     input_accepted  {delivery_id, turn_id, how: "new_turn"}, written the moment the loop takes a message and
                     before anything is sent to the model; never for a message the loop did not take
-    text            {turn_id, text}: one finished block of the model's text
+    text            {turn_id, text}: one block of the model's text, written when its model call ends
     tool_call       {turn_id, call_id, name, input}
     tool_result     {turn_id, call_id, status, text, output_ref, truncated, spill}
-    usage           {turn_id, span: "call", model, input_tokens, ...}: one per model call that returned
+    usage           {turn_id, span: "call", model, input_tokens, ...}: one per model call, a failed or
+                    interrupted one included (what it had measured; unknown, never 0, where nothing was)
     limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
     turn_ended      {turn_id, outcome, result, reason}
     interrupt       {turn_id, delivered}
     protocol_error  {code, detail}
     closed          once, when the loop exits after close or the end of its input
 
-The payload fields match event.v1's payloads of the same name, so the driver (routes/engines/recursion_loop.py,
-the lane's third pull request) adds only what the loop cannot know: the connection id and the bucket on usage
-and limit, the input digest on tool_call, and the envelope. ``reason`` and ``spill`` are the loop's own and are
-dropped or mapped there.
+Where a line shares a name with an event.v1 payload, its fields are that payload's fields as far as the loop
+knows them; the driver (routes/engines/recursion_loop.py, the lane's third pull request) maps the rest:
+    tool_call       adds the input digest (RFC 8785) and the envelope
+    tool_result     drops ``spill`` (the loop's own; the text the model saw names the saved copy)
+    usage, limit    add the connection id and the bucket; limit drops ``retry_after_s`` (event.v1 has only
+                    ``reset_at``, which the loop also writes)
+    text            becomes engine.output, which adds the stream and the byte offsets
+    turn_ended      is not a driver draft (driver.v2 has seven); the core's turn.ended is SPINE's and DRIVER-CC's
+                    to settle, and this line carries what the loop knows of the outcome
+    ready, interrupt, protocol_error, closed
+                    are the driver's to act on, not event drafts
+Values keep event.v1's limits before they are written: token counts are whole numbers, a call id is 1 to 128
+characters and a tool name 1 to 256 (``providers/base.py`` refuses others).
 
 Every string written (field names included) passes through the redactor, which removes every secret the loop
 holds, before the line is serialised.
@@ -100,7 +111,7 @@ def parse_input(line: bytes | str) -> Input:
     if not isinstance(doc, dict):
         raise InputError("not_an_object", "the line is not a JSON object")
     kind = doc.get("kind")
-    if kind not in _FIELDS:
+    if not isinstance(kind, str) or kind not in _FIELDS:
         raise InputError("unknown_kind", f"kind {kind!r} is not one of {sorted(_FIELDS)}")
     extra = sorted(set(doc) - _FIELDS[kind])
     missing = sorted(_FIELDS[kind] - set(doc))
@@ -150,6 +161,12 @@ class Redactor:
             if secret in text:
                 text = text.replace(secret, "[redacted]")
         return text
+
+    def holds(self, value: Any) -> bool:
+        """Whether ``value`` (text, or anything JSON can write) holds a secret."""
+
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        return any(secret in text for secret in self._secrets)
 
     def scrub_obj(self, value: Any) -> Any:
         if isinstance(value, str):

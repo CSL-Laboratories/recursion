@@ -129,7 +129,10 @@ class FakeProvider:
             cancel.wait()
             raise b.Cancelled()
         if isinstance(step, Mapping):
-            step = step_from_json(step)
+            try:
+                step = step_from_json(step)
+            except ValueError as exc:  # a value the wire refuses (an over-long call id, a fractional count)
+                raise b.ProtocolError(f"the scripted reply is refused: {exc}") from None
         if isinstance(step, BaseException):
             raise step
         response = step(request) if callable(step) else step

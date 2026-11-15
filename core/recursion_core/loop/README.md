@@ -23,9 +23,12 @@ python -m recursion_core.loop --provider anthropic --model <the route's model id
 
 Inputs are driver.v2's inputs plus `interrupt`: `user_message`, `approval_answer`, `interrupt` and `close`.
 Outputs are `ready`, `input_accepted`, `text`, `tool_call`, `tool_result`, `usage`, `limit`, `turn_ended`,
-`interrupt`, `protocol_error` and `closed`. `protocol.py` gives every field. The payload fields match
-event.v1's payloads of the same name, so the driver adds only the connection id, the bucket, the input
-digest and the envelope.
+`interrupt`, `protocol_error` and `closed`. `protocol.py` gives every field. Where a line shares a name
+with an event.v1 payload its fields are that payload's as far as the loop knows them; `protocol.py` lists
+what the driver maps (the connection id, the bucket, the input digest, the stream offsets of text, the
+envelope; `retry_after_s` and `spill` dropped; `turn_ended` is not a driver draft). Text is written when its
+model call ends, not while it streams. Every model call has one `usage` line, a failed or interrupted one
+included, with what it had measured (unknown, never 0, where nothing was).
 
 `input_accepted` is written the moment the loop takes a message, before the model sees it, and never for a
 message it did not take. A turn the model finishes ends `candidate_done`; the harness, not the model,
@@ -40,7 +43,7 @@ decides when work is done.
 | `providers/fake.py` | A scripted provider |
 | `providers/sse.py` | The event-stream reader the providers share |
 | `tools/registry.py` | Input checks and the one output cap, with spill, that every tool passes through |
-| `tools/read.py`, `tools/search.py` | Reading files and folders; searching contents (in a child process) |
+| `tools/read.py`, `tools/search.py` | Reading files and folders; searching contents (in a child process). A tool runs only through `ToolRegistry.dispatch`, which checks its input first; its `run` called directly assumes checked input |
 | `tools/workspace.py` | Path confinement, the spill store, and the record of what was read |
 | `engine.py`, `protocol.py` | The turn loop, and the input and output lines |
 

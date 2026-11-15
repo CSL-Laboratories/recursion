@@ -9,11 +9,25 @@ the caller has to read: ``LimitError`` (with the vendor's retry time when it giv
 
 Vendor specifics stay behind this interface: wire formats, headers, model names and stop-reason spellings are
 the provider module's business. A provider never reads a key from anywhere but what it was constructed with,
-and never puts a key into an exception, an event or a return value.
+and never puts a key into an exception, an event or a return value: text the vendor sends back that holds the
+key is scrubbed (streamed text too, holding back a fragment that could be the start of the key until the next
+fragment shows it is not), and a vendor block that cannot be changed without breaking it (a signed thinking
+block) and holds the key is refused with ``ProtocolError``, never altered.
+
+A failed or interrupted call still has a usage record: every ``ProviderError`` and ``Cancelled`` carries
+``usage`` (a ``Usage`` of what the provider had measured when the call ended: counts the vendor had reported
+are ``known``, a count that was still growing is a ``lower_bound``, the rest ``unknown``; None when nothing was
+measured, which the loop records as all unknown, never as 0) and ``served_model`` (None when unknown).
+
+Values a provider returns keep the wire's limits (event.v1): token counts are whole numbers of 0 or more,
+every measurement is finite, a call id is 1 to 128 characters and a tool name 1 to 256, neither with a CR or a
+LF. A provider refuses a reply that breaks them with ``ProtocolError``; the dataclasses below refuse such
+values with ``ValueError``.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -39,8 +53,9 @@ class Measurement:
             if self.value is not None or self.provenance != UNAVAILABLE:
                 raise ValueError("an unknown measurement has no value and provenance 'unavailable'")
         else:
-            if self.value is None or isinstance(self.value, bool) or self.value < 0:
-                raise ValueError("a known measurement has a value of 0 or more")
+            if (self.value is None or isinstance(self.value, bool) or not isinstance(self.value, (int, float))
+                    or not math.isfinite(self.value) or self.value < 0):
+                raise ValueError("a known measurement has a finite value of 0 or more")
             if self.provenance not in (OBSERVED, MODELLED, INFERRED):
                 raise ValueError("measurement provenance")
 
@@ -56,6 +71,13 @@ def unknown() -> Measurement:
     return Measurement(None, UNKNOWN, UNAVAILABLE)
 
 
+def at_least(value: int | float) -> Measurement:
+    """A count that was still growing when it was read (a call that ended early): the true value is at least
+    this."""
+
+    return Measurement(value, LOWER_BOUND, OBSERVED)
+
+
 @dataclass(frozen=True)
 class Usage:
     """One provider call's usage. ``input_tokens`` counts the uncached input only, as Anthropic reports it;
@@ -69,12 +91,20 @@ class Usage:
     cache_write_tokens: Measurement = field(default_factory=unknown)
     cost_usd: Measurement = field(default_factory=unknown)
 
+    def __post_init__(self) -> None:
+        for name in USAGE_FIELDS:
+            m = getattr(self, name)
+            if not isinstance(m, Measurement):
+                raise ValueError(f"{name} is not a measurement")
+            if name in TOKEN_FIELDS and m.value is not None and not isinstance(m.value, int):
+                raise ValueError(f"{name} is a count of tokens: a whole number")
+
     def to_wire(self) -> dict:
         return {name: getattr(self, name).to_wire() for name in USAGE_FIELDS}
 
 
-USAGE_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens",
-                "cost_usd")
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens")
+USAGE_FIELDS = TOKEN_FIELDS + ("cost_usd",)
 
 # ---------------------------------------------------------------------------------------------------------
 # The conversation, vendor-neutral.
@@ -92,6 +122,20 @@ class TextPart:
     text: str
 
 
+MAX_CALL_ID = 128
+MAX_TOOL_NAME = 256
+
+
+def call_id_problem(call_id: object, name: object) -> str | None:
+    """What is wrong with a vendor's call id and tool name for the wire (event.v1), or None."""
+
+    if not isinstance(call_id, str) or not 1 <= len(call_id) <= MAX_CALL_ID or "\r" in call_id or "\n" in call_id:
+        return f"a tool call id must be 1 to {MAX_CALL_ID} characters without a line break"
+    if not isinstance(name, str) or not 1 <= len(name) <= MAX_TOOL_NAME or "\r" in name or "\n" in name:
+        return f"a tool name must be 1 to {MAX_TOOL_NAME} characters without a line break"
+    return None
+
+
 @dataclass(frozen=True)
 class ToolCall:
     """The model asked for a tool. ``input`` is the parsed object, or None when the text the vendor sent was
@@ -102,6 +146,13 @@ class ToolCall:
     input: Mapping[str, Any] | None
     raw_input: str = ""
     input_error: str | None = None
+
+    def __post_init__(self) -> None:
+        problem = call_id_problem(self.call_id, self.name)
+        if problem:
+            raise ValueError(problem)
+        if self.input is not None and not isinstance(self.input, Mapping):
+            raise ValueError("a tool call's input is a JSON object, or None when it did not parse as one")
 
 
 @dataclass(frozen=True)
@@ -187,7 +238,11 @@ OnEvent = Callable[[StreamEvent], None]
 
 
 class Cancelled(Exception):
-    """The turn was interrupted. Not a provider fault."""
+    """The turn was interrupted. Not a provider fault. A provider sets ``usage`` and ``served_model`` to what it
+    had measured of the interrupted call (None when nothing)."""
+
+    usage: "Usage | None" = None
+    served_model: str | None = None
 
 
 class CancelToken:
@@ -216,6 +271,8 @@ class CancelToken:
     def on_cancel(self, fn: Callable[[], None]) -> Callable[[], None]:
         """Run ``fn`` when cancelled (now, if already cancelled). Returns a function that unregisters it."""
 
+        if not callable(fn):
+            raise TypeError("on_cancel needs something it can call")
         with self._lock:
             if not self._event.is_set():
                 key = self._next
@@ -243,16 +300,22 @@ class CancelToken:
 
 
 class ProviderError(Exception):
+    """``usage`` is what the provider had measured of the failed call (None when nothing), ``served_model`` the
+    model the vendor named before it failed (None when it named none)."""
+
     code = "provider_error"
     retryable = False
 
     def __init__(self, detail: str = "", *, status: int | None = None, vendor_type: str | None = None,
-                 request_id: str | None = None) -> None:
+                 request_id: str | None = None, usage: Usage | None = None,
+                 served_model: str | None = None) -> None:
         super().__init__(detail)
         self.detail = detail
         self.status = status
         self.vendor_type = vendor_type
         self.request_id = request_id
+        self.usage = usage
+        self.served_model = served_model
 
 
 class LimitError(ProviderError):

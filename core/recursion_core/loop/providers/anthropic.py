@@ -27,7 +27,14 @@ from memory:
   ends the turn with a typed code instead.
 
 The key is held in this object only. It goes into one request header, never into an exception, a return value,
-an event or a log; vendor text that echoes it is scrubbed before it leaves this module.
+an event or a log. Vendor text that holds it is scrubbed before it leaves this module: error details, finished
+text blocks, tool inputs, and streamed text (a fragment that could be the start of the key is held back until
+the next fragment or the end of its block). A thinking or other vendor block that holds it is refused
+(``ProtocolError``), since changing it would break its signature.
+
+A call that fails or is interrupted after the stream began still reports what it measured: the exception's
+``usage`` holds the counts the stream had given (an output count is a lower bound until ``message_stop``) and
+``served_model`` the model ``message_start`` named.
 """
 
 from __future__ import annotations
@@ -238,6 +245,26 @@ class AnthropicProvider:
     def _scrub(self, text: str) -> str:
         return text.replace(self._key, "[redacted]") if self._key and self._key in text else text
 
+    def _scrub_obj(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._scrub(value)
+        if isinstance(value, dict):
+            return {self._scrub(str(k)): self._scrub_obj(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._scrub_obj(v) for v in value]
+        return value
+
+    def _holds_key(self, value: Any) -> bool:
+        return self._key in json.dumps(value, ensure_ascii=False)
+
+    def _held_back(self, text: str) -> int:
+        """How many characters at the end of ``text`` could be the start of the key (held until more comes)."""
+
+        for k in range(min(len(self._key) - 1, len(text)), 0, -1):
+            if text.endswith(self._key[:k]):
+                return k
+        return 0
+
     # -- call --------------------------------------------------------------------------------------------
 
     def stream_turn(self, request: b.TurnRequest, *, on_event: b.OnEvent | None = None,
@@ -336,21 +363,29 @@ class AnthropicProvider:
 
         state = _StreamState(request_id)
         try:
-            for event in iter_events(read):
+            try:
+                for event in iter_events(read):
+                    cancel.raise_if_cancelled()
+                    try:
+                        data = json.loads(event.data)
+                    except ValueError:
+                        raise b.ProtocolError(f"event {event.event!r} is not JSON", request_id=request_id) from None
+                    if not isinstance(data, dict):
+                        raise b.ProtocolError(f"event {event.event!r} is not an object", request_id=request_id)
+                    if state.feed(data, on_event, self) == "stop":
+                        break
+            except SSEError as exc:
                 cancel.raise_if_cancelled()
-                try:
-                    data = json.loads(event.data)
-                except ValueError:
-                    raise b.ProtocolError(f"event {event.event!r} is not JSON", request_id=request_id) from None
-                if not isinstance(data, dict):
-                    raise b.ProtocolError(f"event {event.event!r} is not an object", request_id=request_id)
-                if state.feed(data, on_event, self) == "stop":
-                    break
-        except SSEError as exc:
+                raise b.ProtocolError(str(exc), request_id=request_id) from None
             cancel.raise_if_cancelled()
-            raise b.ProtocolError(str(exc), request_id=request_id) from None
-        cancel.raise_if_cancelled()
-        return state.finish()
+            return state.finish()
+        except (b.ProviderError, b.Cancelled) as exc:
+            # The call still happened: what the stream had measured goes with the failure.
+            if exc.usage is None:
+                exc.usage = state.partial_usage()
+            if exc.served_model is None:
+                exc.served_model = state.model
+            raise
 
 
 class _StreamState:
@@ -366,6 +401,7 @@ class _StreamState:
         self.blocks: dict[int, dict] = {}
         self.order: list[int] = []
         self.done: dict[int, b.Part] = {}
+        self.unsent: dict[int, str] = {}  # streamed text held back because it could be the start of the key
 
     def _protocol(self, what: str) -> b.ProtocolError:
         return b.ProtocolError(what, request_id=self.request_id)
@@ -393,6 +429,8 @@ class _StreamState:
             message = data.get("message")
             if not isinstance(message, dict):
                 raise self._protocol("message_start without a message")
+            if self.started:
+                raise self._protocol("a second message_start")
             self.started = True
             self.model = message.get("model") if isinstance(message.get("model"), str) else None
             self._take_usage(message.get("usage"))
@@ -415,7 +453,13 @@ class _StreamState:
             if dtype == "text_delta" and isinstance(delta.get("text"), str):
                 entry["text"].append(delta["text"])
                 if on_event is not None and delta["text"]:
-                    on_event(b.TextDelta(index, delta["text"]))
+                    pending = provider._scrub(self.unsent.pop(index, "") + delta["text"])
+                    keep = provider._held_back(pending)
+                    if keep:
+                        self.unsent[index] = pending[-keep:]
+                        pending = pending[:-keep]
+                    if pending:
+                        on_event(b.TextDelta(index, pending))
             elif dtype == "input_json_delta" and isinstance(delta.get("partial_json"), str):
                 entry["json"].append(delta["partial_json"])
             elif dtype == "thinking_delta" and isinstance(delta.get("thinking"), str):
@@ -429,7 +473,10 @@ class _StreamState:
             entry = self.blocks.get(index) if isinstance(index, int) else None
             if entry is None or index in self.done:
                 raise self._protocol("content_block_stop for no open block")
-            self.done[index] = self._finish_block(entry)
+            self.done[index] = self._finish_block(entry, provider)
+            rest = self.unsent.pop(index, "")
+            if on_event is not None and rest:
+                on_event(b.TextDelta(index, provider._scrub(rest)))
             return None
         if kind == "message_delta":
             delta = data.get("delta")
@@ -442,32 +489,62 @@ class _StreamState:
             return "stop"
         return None  # an event type this client does not know is skipped, as the stream format allows
 
-    def _finish_block(self, entry: dict) -> b.Part:
+    def _finish_block(self, entry: dict, provider: AnthropicProvider) -> b.Part:
         block = entry["block"]
         btype = block.get("type")
         if btype == "text":
-            return b.TextPart((block.get("text") or "") + "".join(entry["text"]))
+            return b.TextPart(provider._scrub((block.get("text") or "") + "".join(entry["text"])))
         if btype == "tool_use":
             call_id, name = block.get("id"), block.get("name")
-            if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
-                raise self._protocol("tool_use block without an id or a name")
-            raw = "".join(entry["json"])
+            problem = b.call_id_problem(call_id, name)
+            if problem:
+                raise self._protocol(f"tool_use block: {problem}")
+            raw = provider._scrub("".join(entry["json"]))
             if not raw.strip():
                 start = block.get("input")
-                return b.ToolCall(call_id, name, dict(start) if isinstance(start, dict) else {}, raw)
+                return b.ToolCall(call_id, name, provider._scrub_obj(dict(start)) if isinstance(start, dict) else {},
+                                  raw)
             try:
                 parsed = json.loads(raw)
             except ValueError as exc:
                 return b.ToolCall(call_id, name, None, raw, f"input is not valid JSON: {exc.msg}")
             if not isinstance(parsed, dict):
                 return b.ToolCall(call_id, name, None, raw, "input is not a JSON object")
-            return b.ToolCall(call_id, name, parsed, raw)
+            clean = provider._scrub_obj(parsed)
+            if clean != parsed:  # the key was there, spelt with JSON escapes the text scrub cannot see
+                raw = json.dumps(clean, ensure_ascii=False)
+            return b.ToolCall(call_id, name, clean, raw)
         if btype == "thinking":
             data = dict(block)
             data["thinking"] = (block.get("thinking") or "") + "".join(entry["thinking"])
             data["signature"] = (block.get("signature") or "") + "".join(entry["signature"])
-            return b.OpaquePart(NAME, data)
-        return b.OpaquePart(NAME, dict(block))  # redacted_thinking and anything else: sent back as received
+        else:
+            data = dict(block)  # redacted_thinking and anything else: sent back as received
+        if provider._holds_key(data):
+            # It cannot be scrubbed without breaking its signature, and it must not be sent back as it is.
+            raise self._protocol(f"a {btype or 'vendor'} block holds the connection's key; it is not kept")
+        return b.OpaquePart(NAME, data)
+
+    def partial_usage(self) -> b.Usage | None:
+        """What the stream had measured when the call ended early (None when nothing). Input and cache counts
+        come with message_start and are exact; the output count keeps growing until message_stop."""
+
+        if not self.usage:
+            return None
+
+        def measure(key: str, final: bool) -> b.Measurement:
+            if key not in self.usage:
+                return b.unknown()
+            return b.observed(self.usage[key]) if final else b.at_least(self.usage[key])
+
+        return b.Usage(
+            input_tokens=measure("input_tokens", True),
+            output_tokens=measure("output_tokens", self.stopped),
+            reasoning_tokens=b.unknown(),
+            cache_read_tokens=measure("cache_read_input_tokens", True),
+            cache_write_tokens=measure("cache_creation_input_tokens", True),
+            cost_usd=b.unknown(),
+        )
 
     def finish(self) -> b.TurnResponse:
         if not self.stopped:

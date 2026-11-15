@@ -419,20 +419,22 @@ def _no_duplicate_members(pairs: list) -> dict:
     return out
 
 
-def load(config_dir: os.PathLike | str, keys: object) -> Config | None:
-    """Read ``routes.json`` (with ``load_routes`` itself) and ``routing.json`` beside it, and validate them.
+def load(config_dir: os.PathLike | str, keys: object, *, engines=None) -> Config | None:
+    """Read ``routing.json`` and ``routes.json`` beside it (with ``load_routes`` itself), and validate them.
 
-    None only when there is no routing file. Raises ``RoutingUnreadable`` (either file) or ``ConfigError``
-    (a routing file that is present but holds null or anything else that is not a valid config).
+    None only when there is no routing file; then ``routes.json`` is not read at all. ``engines``: the engines a
+    ``routes.json`` entry may name, as the daemon passes them to ``load_routes`` (its engine table's names);
+    None keeps ``load_routes``' own default. Raises ``RoutingUnreadable`` (either file) or ``ConfigError`` (a
+    routing file that is present but holds null or anything else that is not a valid config).
     """
     from recursion_core.daemon.control_adapter import ROUTES_FILE, RoutesUnreadable, load_routes  # Linux only
 
     folder = Path(config_dir)
-    try:
-        routes = load_routes(folder / ROUTES_FILE)
-    except RoutesUnreadable as exc:
-        raise RoutingUnreadable(f"routes.json: {exc}") from None
     raw = read_routing_file(folder / CONFIG_FILE)
     if raw is None:
         return None
+    try:
+        routes = load_routes(folder / ROUTES_FILE) if engines is None else load_routes(folder / ROUTES_FILE, tuple(engines))
+    except RoutesUnreadable as exc:
+        raise RoutingUnreadable(f"routes.json: {exc}") from None
     return load_config(raw, routes, keys)

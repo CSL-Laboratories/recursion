@@ -25,8 +25,10 @@ import recursion_core
 
 CORE = Path(recursion_core.__file__).resolve().parents[1]
 TEST_MODULES = ("recursion_core.routing.tests.test_config", "recursion_core.routing.tests.test_router",
-                "recursion_core.routing.tests.test_detect", "recursion_core.routing.tests.test_explain_and_limits")
+                "recursion_core.routing.tests.test_detect", "recursion_core.routing.tests.test_explain_and_limits",
+                "recursion_core.routing.tests.test_hooks")
 CONFIG, ROUTER, DETECT = "recursion_core.routing.config", "recursion_core.routing.router", "recursion_core.routing.detect"
+HOOKS = "recursion_core.routing.hooks"
 
 MUTANTS = {
     "M1 rules evaluated before the hand pick": (
@@ -175,6 +177,33 @@ MUTANTS = {
         '            raise ConfigError("key_metadata_invalid", key_id)\n'
         '        put(key_id, meta["provider"], "api_key", "key store")\n',
         {"test_a_key_of_a_provider_outside_the_vendor_list_leaves_loading_alone"}),
+    # Slice 3: the start registrant (seam S6).
+    "M29 a start that names its engine routed all the same": (
+        HOOKS,
+        "        if engine is not None and hand is None:\n            return {}\n",
+        "",
+        {"test_a_named_engine_is_not_routed_and_nothing_is_read"}),
+    "M30 an engine with a hand pick of another engine let through": (
+        HOOKS,
+        '        if engine is not None and isinstance(hand, Mapping) and hand.get("engine") != engine:\n'
+        '            return _refusal("engine_and_hand_pick_differ")\n',
+        "",
+        {"test_an_engine_and_a_hand_pick_of_another_engine_is_refused"}),
+    "M31 a refused decision let the start go on as today's": (
+        HOOKS,
+        '        if not decision["ok"]:\n            reason = decision.get("reason")\n',
+        '        if not decision["ok"]:\n            return {}\n            reason = decision.get("reason")\n',
+        {"test_a_hand_pick_of_an_engine_that_is_not_routable_is_refused_and_nothing_is_chosen"}),
+    "M32 the routing file's limits left out of the chosen entry": (
+        HOOKS,
+        '    if source == "routing":\n        entry["route"]["limits"] = limits\n',
+        "",
+        {"test_no_engine_named_runs_the_default"}),
+    "M33 the decision's model left out of the chosen entry": (
+        HOOKS,
+        '    entry["route"]["model"] = decision["model"]\n',
+        "",
+        {"test_a_hand_pick_wins_over_the_default"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

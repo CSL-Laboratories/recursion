@@ -338,6 +338,10 @@ def mask_forms(values) -> tuple[str, ...]:
 # asterisks only is masked with "#"), so a masked stretch never spells a value. None of them needs a JSON
 # escape, so a fill inside a JSON string leaves the string valid.
 _FILLS = "*#%~=+@^_xXoO0123456789"
+# The bound on ``mask``'s work: layers of escapes read per round (JSON inside a JSON string, the layers a
+# serializer writes, is two or three) and rounds per text.
+MASK_DEPTH = 8
+MASK_ROUNDS = 8
 # One JSON string escape: a backslash and u with four hex digits, or a backslash and the character after it.
 _ESCAPE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|.)", re.S)
 _SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
@@ -352,14 +356,20 @@ def mask(text: str, forms: tuple[str, ...]) -> str:
     BMP), or once they are read again for JSON written inside a JSON string, to any depth. Whatever spelling
     the agent chose, the value it decodes to is masked. Text that is not JSON is read the same way. Masking
     repeats until no spelling is left, since a fill could complete a value partly made of the fill
-    character; each round turns at least one character that is not the fill into it, so it ends."""
+    character.
+
+    THE WORK IS BOUNDED: a round reads at most ``MASK_DEPTH`` layers of escapes, each in one linear pass, and
+    at most ``MASK_ROUNDS`` rounds run. Text that still has an escape to read after the last layer (escapes
+    nested deeper than any serializer writes, or built to peel one layer at a time), or that is not masked
+    within the rounds, keeps nothing: it becomes fill of its whole UTF-8 length, which no reader takes for
+    JSON, so the parser fails closed on it."""
     if not forms:
         return text
     fill = _fill(forms)
-    while True:
+    for _round in range(MASK_ROUNDS):
         cuts = []
         level, starts = text, None          # starts: where each character of ``level`` begins in ``text``
-        while True:
+        for _layer in range(MASK_DEPTH + 1):
             for form in forms:
                 at = level.find(form)
                 while at >= 0:
@@ -374,6 +384,8 @@ def mask(text: str, forms: tuple[str, ...]) -> str:
                 break
             starts = inner if starts is None else array("q", map(starts.__getitem__, inner))
             level = decoded
+        else:                               # escapes deeper than MASK_DEPTH: keep nothing
+            return fill * _bytes(text)
         if not cuts:
             return text
         pieces, pos = [], 0
@@ -387,6 +399,7 @@ def mask(text: str, forms: tuple[str, ...]) -> str:
         if masked == text:                  # never with a fill no value is made of; were it so, keep nothing
             return fill * _bytes(text)
         text = masked
+    return fill * _bytes(text)              # not masked within MASK_ROUNDS rounds: keep nothing
 
 
 def _fill(forms) -> str:
@@ -554,6 +567,8 @@ def input_digest(value) -> str:
 PreparedHome = Callable[[Mapping, str], str]
 NOT_PREPARED = "antigravity_route_home_not_prepared"
 ROUTE_HOME_IS_DAEMON_HOME = "antigravity_route_home_is_daemon_home"
+DAEMON_HOME_UNKNOWN = "antigravity_daemon_home_unknown"
+CREDENTIAL_UNAVAILABLE = "antigravity_credential_unavailable"
 # output_boundary(values) -> a launcher (as ``routes.launch``) whose capture of the child's stdout and stderr
 # masks each line with ``mask(line, mask_forms(values))`` (every JSON spelling of each value) before anything
 # is persisted, so the capture's bytes and the drafts' offsets agree. The launch side's to give; there is
@@ -667,11 +682,16 @@ class AntigravityOneShotAdapter(RouteAdapter):
         # The daemon's own HOME never reaches the child, however the callable came to name it (a fallback, an
         # alias, a caller override): compared by resolved path, it or any path inside it is refused. The
         # brief has no own-login route ("never reuse a Google login another program holds").
-        real = posixpath.realpath(home)
         own = self._daemon_home()
-        if own is not None and (real == own or real.startswith(own + "/")):
+        if own is None:   # the daemon's HOME cannot be told: no route home can be shown not to be it
+            raise c.RouteError(c.LAUNCH_REFUSED, DAEMON_HOME_UNKNOWN)
+        real = posixpath.realpath(home)
+        if real == own or own == "/" or real.startswith(own + "/"):   # "/" holds every path
             raise c.RouteError(c.LAUNCH_REFUSED, ROUTE_HOME_IS_DAEMON_HOME)
-        credential = self.credential(request, method.credential_env) if method.credential_env else None
+        try:
+            credential = self.credential(request, method.credential_env) if method.credential_env else None
+        except OSError:      # custody (a keychain) could not give the key: refused, typed, nothing launched
+            raise c.RouteError(c.LAUNCH_REFUSED, CREDENTIAL_UNAVAILABLE) from None
         if credential is not None and "\x00" in credential[1]:
             raise c.RouteError(c.LAUNCH_REFUSED, f"the credential for {route['connection']['id']} is not usable")
         # The child gets the base names, its own HOME, the updater switch and the method's one key: no
@@ -686,8 +706,10 @@ class AntigravityOneShotAdapter(RouteAdapter):
 
     def _daemon_home(self) -> str | None:
         """The daemon's own HOME, resolved, from the parent environment the adapter was given (its one view of
-        the daemon; never the process's own environment, so with none there it has no HOME a child could
-        inherit). When it is "/" (a container with no home), "/" itself is refused, not every path."""
+        the daemon; never the process's own environment). None when that environment gives no absolute HOME
+        without a NUL: then no launch is made (``antigravity_daemon_home_unknown``), since the daemon's real
+        HOME could be anything. "/" (a container with no home) holds every path, so every route home is
+        refused then."""
         given = self._parent_env.get("HOME")
         if not isinstance(given, str) or not given.startswith("/") or "\x00" in given:
             return None
@@ -713,6 +735,8 @@ class AntigravityOneShotAdapter(RouteAdapter):
                 drafts = parser.parse(line)
             except OneShotProtocolError as err:
                 raise _Protocol(str(err)) from None
+            if self._clock() >= deadline_at:   # the line's reading and masking ran past the deadline
+                raise Deadline()
             for draft in drafts:
                 if draft["type"] == "usage":
                     events.append(c.event("usage", "result.usage", _usage_data(draft["payload"])))

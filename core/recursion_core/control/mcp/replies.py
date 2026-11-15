@@ -85,7 +85,8 @@ class ReplyQueue:
         self._thread.start()
 
     def offer(self, message: dict) -> bool:
-        """Take one answer without waiting; ``False`` when it was dropped (no room, or output lost)."""
+        """Take one answer without waiting; ``False`` when it was dropped (no room, or output lost). A
+        message JSON cannot hold raises, as ``framing.encode`` does; the reader builds none."""
 
         size = len(encode(message))  # what a direct write would refuse is refused here, on the reader's thread
         event = None
@@ -133,7 +134,7 @@ class ReplyQueue:
     def close(self, timeout: float | None = DIAGNOSTIC_DRAIN_S) -> bool:
         """Wait until every answer taken has been written (or discarded), with no limit: an answer is never
         dropped. Then give the queue's diagnostics at most ``timeout`` seconds (``None``: no limit); ``True``
-        when they were all delivered."""
+        when nothing of theirs is left (delivered, or discarded by a log that failed)."""
 
         check_seconds(timeout, "timeout")  # before anything changes
         self.start()  # a queue never started still writes what it took

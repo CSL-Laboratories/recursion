@@ -215,6 +215,60 @@ class WriterTest(unittest.TestCase):
         self.assertFalse(writer.broken)
         self.assertTrue(writer.write({"a": 1}))
 
+    def test_an_exit_from_the_stream_breaks_the_writer_and_goes_on(self) -> None:
+        # Round 7 of #395 (DeepSeek's F1): the writer is broken and on_broken runs, then the exit goes on.
+        class Exiting(io.RawIOBase):
+            def writable(self):
+                return True
+
+            def write(self, data):
+                raise SystemExit("the stream raised an exit")
+
+        calls: list[bool] = []
+        writer = FrameWriter(Exiting(), on_broken=lambda: calls.append(True))
+        with self.assertRaises(SystemExit):
+            writer.write({"a": 1})
+        self.assertTrue(writer.broken)
+        self.assertFalse(writer.write({"a": 2}))
+        self.assertEqual([True], calls)
+
+    def test_a_short_write_is_given_the_rest(self) -> None:
+        # Round 7 of #395 (DeepSeek's F2): a stream may take fewer bytes than it is given.
+        class FiveAtATime(io.RawIOBase):
+            def __init__(self):
+                super().__init__()
+                self.got = bytearray()
+
+            def writable(self):
+                return True
+
+            def write(self, data):
+                self.got += bytes(data[:5])
+                return min(5, len(data))
+
+        stream = FiveAtATime()
+        writer = FrameWriter(stream)
+        message = {"id": 1, "jsonrpc": "2.0", "result": {}}
+        self.assertTrue(writer.write(message))
+        self.assertEqual(encode(message), bytes(stream.got))
+        self.assertFalse(writer.broken)
+
+    def test_a_stream_that_takes_nothing_has_failed(self) -> None:
+        for took in (0, None):  # None: what a raw stream returns when it would block
+            with self.subTest(took=took):
+                class Taking(io.RawIOBase):
+                    def writable(self):
+                        return True
+
+                    def write(self, data, took=took):
+                        return took
+
+                calls: list[bool] = []
+                writer = FrameWriter(Taking(), on_broken=lambda calls=calls: calls.append(True))
+                self.assertFalse(writer.write({"a": 1}))
+                self.assertTrue(writer.broken)
+                self.assertEqual([True], calls)
+
     def test_line_limit_leaves_room_for_a_full_control_frame(self) -> None:
         from recursion_core.control_transport.framing import MAX_FRAME_BYTES
         self.assertGreater(framing.MAX_LINE_BYTES, MAX_FRAME_BYTES)

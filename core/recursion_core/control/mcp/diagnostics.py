@@ -21,7 +21,7 @@ and ``close`` takes no ``last`` (that log takes nothing more).
 ``close(last, timeout)`` takes ``last`` whatever the bound (``serve``'s last line, so the bound never drops
 it), then nothing more, and waits until every event taken has been delivered (or discarded) or until
 ``timeout`` seconds have passed, whichever comes first (``None``, the default, is no limit); it returns
-whether everything was delivered.
+``True`` when nothing is left: every event delivered, or discarded by a log that failed.
 ``serve`` gives it ``DIAGNOSTIC_DRAIN_S``, so a client that never reads stderr does not keep the process
 alive after end of input: what stderr has not taken by then is lost with the queue's thread, a daemon
 thread. ``close`` starts the thread if ``start`` was never called, so events offered before it are still

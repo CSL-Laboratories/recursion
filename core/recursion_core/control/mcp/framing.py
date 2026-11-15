@@ -131,20 +131,41 @@ class FrameWriter:
         self.on_broken = on_broken
 
     def write(self, message: dict) -> bool:
-        """Write one message; ``False`` when it was not written (the stream failed now or earlier). A stream
-        that raises any ``Exception`` has failed: a pipe the client stopped reading, a stream already shut, a
-        text stream given bytes. A message ``encode`` refuses raises before anything is written."""
+        """Write one message; ``False`` when it was not written (the stream failed now or earlier).
+
+        A stream that takes part of a message is given the rest. One that takes nothing (``0``, or ``None``,
+        which a raw stream returns when it would block) has failed, and so has one that raises any
+        ``Exception``: a pipe the client stopped reading, a stream already shut, a text stream given bytes.
+        One that raises an exit or an interrupt has failed too (``broken``, ``on_broken``), and that exception
+        then goes on to the caller. A message ``encode`` refuses raises before anything is written."""
 
         data = encode(message)
+        raised: BaseException | None = None
         with self._lock:
             if self.broken:
                 return False
             try:
-                self._stream.write(data)
-                self._stream.flush()
-                return True
+                if self._write_all(data):
+                    self._stream.flush()
+                    return True
             except Exception:  # noqa: BLE001 - whatever the stream raises, it took no whole message
-                self.broken = True
+                pass
+            except BaseException as exc:  # an exit or an interrupt: the stream failed, and the exception goes on
+                raised = exc
+            self.broken = True
         if self.on_broken is not None:
             self.on_broken()
+        if raised is not None:
+            raise raised
         return False
+
+    def _write_all(self, data: bytes) -> bool:
+        """Under the lock: every byte of ``data``, in as many writes as the stream needs; ``False`` when a
+        write takes nothing."""
+
+        while data:
+            taken = self._stream.write(data)
+            if not taken:  # 0, or None from a raw stream that would block: no progress, and none to come
+                return False
+            data = data[taken:]
+        return True

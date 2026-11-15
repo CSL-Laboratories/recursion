@@ -363,7 +363,8 @@ class PermissionTest(unittest.TestCase):
                 self.assertEqual(agent.permission_answers["perm-1"], {"outcome": {"outcome": "cancelled"}})
 
     def test_an_ask_that_arrives_after_a_cancel_is_answered_cancelled_and_never_reaches_the_caller(self) -> None:
-        agent = FakeAcpAgent([[("chunk", "x"), ("wait_cancel",), ("ask", TOOL_CALL, OPTIONS_ALL), ("end", "cancelled")]])
+        agent = FakeAcpAgent([[("chunk", "x"), ("wait_cancel",), ("ask", TOOL_CALL, OPTIONS_ALL),
+                               ("end", "cancelled")]])
         asks = []
         s = None
 

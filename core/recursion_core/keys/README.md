@@ -13,7 +13,7 @@ The same four actions are available as `recursion-control key ...` (once SPINE's
 | `remove ID [--yes]` | Asks first (`--yes` skips the question), then deletes the key and says from where. |
 | `audit [--path P] [--no-journal]` | Looks for every saved value in Recursion's state and config folders, the given paths and the user journal. It names each place a value was found, never the value. |
 
-`ID` is the route's connection id (`route.connection.id` in `routes.json`). `VARIABLE` is the variable the engine reads the key from: `ANTHROPIC_API_KEY` for Claude Code, `CODEX_API_KEY` or `OPENAI_API_KEY` for Codex.
+`ID` is the route's connection id (`route.connection.id` in `routes.json`). `VARIABLE` is the variable the engine reads the key from: `ANTHROPIC_API_KEY` for Claude Code, `CODEX_API_KEY` or `OPENAI_API_KEY` for Codex. `VENDOR` is one of `anthropic`, `openai`, `google`, `xai`, `cursor`, `opencode`, `nous` and `refuseless`: one id per vendor whose API key the product contract names. The list, with the contract line behind each id, is `PROVIDERS` in `validate.py`, and lane ROUTING reads its vendor ids from it.
 
 ## Where keys are kept
 

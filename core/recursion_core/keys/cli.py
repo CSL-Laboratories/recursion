@@ -43,7 +43,8 @@ def configure(parser: argparse.ArgumentParser) -> None:
                              description='Save a user-entered API key. The key is read from the terminal with no '
                                          'echo (or from standard input with --stdin), never from the command line.')
     add.add_argument('key_id', metavar='ID', help="the route's connection id, for example codex-key")
-    add.add_argument('--provider', dest='key_provider', required=True, help='the vendor, for example openai')
+    add.add_argument('--provider', dest='key_provider', required=True,
+                     help=f'the vendor, one of: {", ".join(v.PROVIDER_IDS)}')
     add.add_argument('--env', dest='key_env', required=True, metavar='VARIABLE',
                      help='the variable the engine reads the key from, for example CODEX_API_KEY')
     add.add_argument('--stdin', dest='key_stdin', action='store_true',

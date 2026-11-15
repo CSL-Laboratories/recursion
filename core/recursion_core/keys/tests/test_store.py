@@ -178,12 +178,24 @@ class ValidationTest(TempStoreCase):
                 self.refused('id_invalid', key_id=bad)
 
     def test_providers_and_variable_names(self) -> None:
-        for bad in ('', 'OpenAI', 'open ai', '-x', 'a' * 65, 'x\n'):
+        for bad in ('', 'OpenAI', 'Anthropic', 'openai\n', ' openai', 'acme', 'deepseek', 'github', 'copilot', 7, None):
             with self.subTest(provider=bad):
                 self.refused('provider_invalid', provider=bad)
         for bad in ('', 'codex_api_key', '1KEY', 'KEY-NAME', 'KEY\n', 'A' * 129):
             with self.subTest(env=bad):
                 self.refused('env_name_invalid', env_name=bad)
+
+    def test_every_published_provider_id_is_accepted(self) -> None:
+        from recursion_core.keys import validate
+
+        self.assertEqual(validate.PROVIDER_IDS, ('anthropic', 'openai', 'google', 'xai', 'cursor', 'opencode', 'nous',
+                                                 'refuseless'))
+        self.assertTrue(all(why.startswith('CONTRACT ') for _, why in validate.PROVIDERS))
+        store = self.store()
+        for number, provider in enumerate(validate.PROVIDER_IDS):
+            with self.subTest(provider=provider):
+                record = self.add(store, key_id=f'key-{number}', provider=provider)
+                self.assertEqual(store.list().keys[record.key_id].provider, provider)
 
     def test_values(self) -> None:
         for bad in ('short', 'has space inside it', 'tab\tinside-it', 'newline\ninside', 'nul\x00inside-it',
@@ -235,6 +247,7 @@ class IndexShapeTest(TempStoreCase):
             'cap as text': self.entry(cap_usd='5'),
             'bad timestamp': self.entry(created_at='2025-11-14 22:40:00Z'),
             'bad variable': self.entry(env_name='codex_api_key'),
+            'unpublished provider': self.entry(provider='acme'),
             'missing field': json.dumps({**self.good, 'keys': {'codex-key': {'provider': 'openai'}}}),
             'not JSON': '{"version": 1,',
             'not ASCII': good.replace('openai', 'open\u00e4i'),

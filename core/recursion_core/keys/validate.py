@@ -3,8 +3,8 @@
 - key id: 1 to 128 of ``A-Z a-z 0-9 . _ : -``, starting with a letter or digit. It is the route's connection
   id (``route.connection.id``), the ``token`` of ``schemas/control/v1/common.v1.json`` narrowed so that it can
   never be read as a helper's option.
-- provider: a lower-case vendor name, 1 to 64 of ``a-z 0-9 . _ -``, starting with a letter or digit. Any vendor
-  (CONTRACT 275, "API keys are configurable for every vendor"); the store keeps it to show it, nothing else.
+- provider: one of ``PROVIDER_IDS`` below, exactly (no case folding). The key store owns this list (the
+  Liaison's ruling of Nov 14, 2026); lane ROUTING matches a routing login's vendor against it.
 - variable name: the environment variable the engine reads the key from, 1 to 128 of ``A-Z 0-9 _``, not
   starting with a digit. The engine adapters check their own allowlists (``ANTHROPIC_API_KEY`` for Claude
   Code, ``CODEX_API_KEY`` or ``OPENAI_API_KEY`` for Codex); the store checks only the shape.
@@ -18,7 +18,22 @@ import re
 from decimal import Decimal, InvalidOperation
 
 KEY_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
-PROVIDER = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}')
+
+# The provider ids ``key add --provider`` accepts: one per vendor whose API key the product contract names
+# ("API keys are configurable for every vendor", CONTRACT 275; contract lines are the pinned PRODUCT.md at
+# d84cdd26). A vendor the contract adds is one more line here. GitHub Copilot is not one: the own loop reaches it
+# on the user's own Copilot sign-in and "Recursion ... holds no GitHub or Copilot token" (CONTRACT 715-719).
+PROVIDERS = (
+    ('anthropic', 'CONTRACT 272-274: an Anthropic API key serves the own loop and any other harness'),
+    ('openai', 'CONTRACT 612: Codex reads CODEX_API_KEY or OPENAI_API_KEY'),
+    ('google', 'CONTRACT 571-573 and 612: paid Gemini API keys (GEMINI_API_KEY); E5 Antigravity and E7 Gemini CLI'),
+    ('xai', 'CONTRACT 548, 591-600: E4 Grok CLI, and the own loop\'s xai adapter'),
+    ('cursor', 'CONTRACT 548 and 565: E6 Cursor CLI'),
+    ('opencode', 'CONTRACT 548 and 582: E3 OpenCode CLI'),
+    ('nous', 'CONTRACT 603: the own loop on the nous adapter (Lucas, Nov 8)'),
+    ('refuseless', 'CONTRACT 5079: "I use refuseless.com a lot" (Lucas, Nov 8, asking for a way to store API keys)'),
+)
+PROVIDER_IDS = tuple(provider for provider, _ in PROVIDERS)
 ENV_NAME = re.compile(r'[A-Z_][A-Z0-9_]{0,127}')
 CAP_TEXT = re.compile(r'[0-9]{1,6}(\.[0-9]{1,2})?')
 TIMESTAMP = re.compile(r'[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]'
@@ -36,7 +51,7 @@ def valid_key_id(text: object) -> bool:
 
 
 def valid_provider(text: object) -> bool:
-    return _full(PROVIDER, text)
+    return isinstance(text, str) and text in PROVIDER_IDS
 
 
 def valid_env_name(text: object) -> bool:

@@ -171,7 +171,7 @@ class KeyStore:
         if not v.valid_key_id(key_id):
             raise KeyStoreError('id_invalid', 'a key id is 1 to 128 of A-Z a-z 0-9 . _ : -, starting with a letter or digit')
         if not v.valid_provider(provider):
-            raise KeyStoreError('provider_invalid', 'a provider is a lower-case name: a-z 0-9 . _ -')
+            raise KeyStoreError('provider_invalid', f'a provider is one of: {", ".join(v.PROVIDER_IDS)}')
         if not v.valid_env_name(env_name):
             raise KeyStoreError('env_name_invalid', 'a variable name is A-Z 0-9 _, not starting with a digit')
         if not v.valid_value(value):

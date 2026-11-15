@@ -478,17 +478,20 @@ class RouteStarter:
                 self.results[run_id] = result
 
     def _composition_closing(self):
-        """The composition is closing with something registered into it that the gate guards (the gate is on and
-        shut): a handler, a service, an event store, or a drive owner, alone or not. With nothing registered
-        this is never true, so everything that asks it is then what it was before the seams."""
+        """The composition is closing and something was registered into it (the gate is on and shut): anything
+        at all, alone or not (``Hooks.anything_registered``). With nothing registered this is never true, so
+        everything that asks it is then what it was before the seams."""
         gate = self._hooks.gate if self._hooks is not None else None
         return gate is not None and gate.enabled and gate.closed
 
     def _settle(self, ctx):
         """After the route result: give the engine a moment to exit, then end what is left of its tree.
 
-        A settling that is under way when the composition begins to close fences nothing either: that is asked
-        each time round, and once more just before the fence. Its descriptors are closed whichever way it ends."""
+        A settling that is under way when the composition begins to close fences nothing either. That is asked
+        each time round. For the fence itself it is not asked and then acted on, which a close could get between:
+        the fence is made with the gate held open (``Admission.while_open``), so a close that begins at that
+        moment waits until the fence is made, and one that had begun is seen and nothing is fenced: the unit is
+        left alive for the next daemon. Its descriptors are closed whichever way it ends."""
         process = ctx.process
         try:
             deadline = time.monotonic() + self._exit_grace_s
@@ -502,9 +505,10 @@ class RouteStarter:
                     log.exception('observing %s after its result failed', ctx.run_id)
                     break
                 time.sleep(0.2)
-            if self._composition_closing():
-                return  # closing began while this waited: the unit is left alive for the next daemon
-            process.fence('result_recorded')
+            if self._hooks is None:
+                process.fence('result_recorded')
+            else:  # with nothing registered the gate is off, and this is the fence it always was
+                self._hooks.gate.while_open(lambda: process.fence('result_recorded'))
         finally:
             process.close()
 

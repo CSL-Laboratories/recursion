@@ -55,6 +55,7 @@ import importlib
 import importlib.util
 import inspect
 import io
+import itertools
 import json
 import logging
 import os
@@ -760,6 +761,7 @@ class RegistrationTest(unittest.TestCase):
         self.assertIn('ModuleNotFoundError', str(caught.exception))
         self.assertIn('recursion_core.keys.hooks', str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, ModuleNotFoundError)
+        self.assertEqual(caught.exception.registrant, 'recursion_core.keys.hooks', 'and it is told beside the text')
 
     def test_a_hooks_module_that_raises_on_import_fails_composition(self) -> None:
         self.fake.lane('keys', hooks='raise RuntimeError("at import")\n')
@@ -816,6 +818,39 @@ class RegistrationTest(unittest.TestCase):
         with self.assertRaises(H.HookError) as caught:
             H.compose()
         self.assertIn('authorize', str(caught.exception))
+        # An error of the hooks' own keeps its text; the registrant composition stopped at is told beside it.
+        self.assertEqual((caught.exception.registrant, str(caught.exception)),
+                         ('recursion_core.events.hooks', "hook 'authorize' already has a registrant"))
+
+    def test_an_error_that_takes_no_attribute_leaves_composition_as_the_lane_raised_it(self) -> None:
+        """A lane's own error class may refuse an attribute. Composition then raises the lane's error as it was
+        raised, the same object, and no registrant is told beside it: the name is an aid to the CLI's line and
+        never worth another exception in the error's place. (An eighth read: the note itself had raised.)"""
+        package = self.fake.lane('keys', hooks=(
+            'from recursion_core.control import hooks as H\n\n\n'
+            'class Locked(H.HookError):\n'
+            '    def __setattr__(self, key, value):\n'
+            '        if not key.startswith("__"):       # (what Python and unittest themselves set on an error stays settable)\n'
+            '            raise RuntimeError("this error takes no attribute")\n'
+            '        super().__setattr__(key, value)\n\n\n'
+            'REFUSAL = Locked("the refusal of the lane itself")\n\n\n'
+            'def register(hooks):\n'
+            '    raise REFUSAL\n'))
+        with self.assertRaises(H.HookError) as caught:
+            H.compose()
+        self.assertIs(caught.exception, sys.modules[f'{package}.hooks'].REFUSAL)
+        self.assertEqual((str(caught.exception), caught.exception.registrant), ('the refusal of the lane itself', None))
+
+    def test_what_fails_after_the_last_registrant_names_no_registrant(self) -> None:
+        """The check that is made when the tables close is no one registrant's, and neither is an error that no
+        composition raised: each names none. (The CLI's line then says only that the registrants could not be
+        composed.)"""
+        nobodys = H.HookError("method 'session.list' needs the service 'sessions', which nobody registered")
+        self.assertIsNone(nobodys.registrant)
+        with mock.patch.object(H.Hooks, 'freeze', side_effect=nobodys), self.assertRaises(H.HookError) as caught:
+            H.compose()
+        self.assertIs(caught.exception, nobodys)
+        self.assertIsNone(caught.exception.registrant)
 
     def test_two_registrants_for_one_method_fail_composition(self) -> None:
         text = 'def register(hooks):\n    hooks.methods.register("session.list", lambda ctx, params: {"code": "ok"})\n'
@@ -1497,7 +1532,7 @@ class CommandTableTest(unittest.TestCase):
                 with self.assertRaises(commands.CommandTableError):
                     table.register((name,), lambda sub: None, lambda args, client: 0)
         table.register(('session',), lambda sub: sub.add_parser('session'), lambda args, client: 0)
-        for names in (('session',), ('queue', 'session'), ('a', 'a'), (), 'session', ('',)):
+        for names in (('session',), ('queue', 'session'), ('a', 'a'), (), 'session', ('',), (' ',), ('\n',), ('queue', ' ')):
             with self.subTest(names=names):
                 with self.assertRaises(commands.CommandTableError):
                     table.register(names, lambda sub: None, lambda args, client: 0)
@@ -1577,6 +1612,15 @@ class EngineTableTest(unittest.TestCase):
             table.register('claude_code', factory, replace=True)
         with self.assertRaises(engines.EngineTableError):
             table.register('hermes', 'not a function')
+
+    def test_the_table_says_which_engines_a_lane_registered(self) -> None:
+        table, factory = engines.EngineTable(), lambda *a, **k: None
+        self.assertEqual(table.registered(), (), 'a new table: its two factories are nobody\'s registration')
+        table.register('pi', factory)
+        self.assertEqual(table.registered(), ('pi',))
+        table.register('codex', CodexAdapter, replace=True)
+        self.assertEqual(table.registered(), ('codex', 'pi'), 'a seeded factory replaced, by itself even, is a registration')
+        self.assertEqual(engines.EngineTable().registered(), (), 'and another table knows nothing of it')
 
     def test_two_compositions_do_not_share_a_table(self) -> None:
         one, two = H.bare(), H.bare()
@@ -1757,31 +1801,174 @@ class AdmissionTest(unittest.TestCase):
             register(made)
             made.freeze()
             self.assertTrue(made.gate.enabled)
-        made = H.Hooks()
-        made.set('authorize', lambda principal, method, params: None)
-        made.freeze()
-        self.assertFalse(made.gate.enabled, 'a hook that holds no resource does not need the gate')
 
-    def test_a_drive_owner_turns_the_gate_on_by_itself_and_the_other_single_hooks_do_not(self) -> None:
-        """A drive owner with no service beside it: the run it accepts is handed over under a lifetime reference,
-        which counts only where the gate is on. The other single hooks registered alone leave it off; that is
-        the gate's text, held here so that a change of it is a decision and not an accident."""
-        made = H.Hooks()
-        made.set('drive_owner', lambda ctx, request: None)
-        made.freeze()
-        self.assertTrue(made.gate.enabled)
-        self.assertTrue(made.gate.enter())
-        made.gate.leave()
-        made.begin_close()
-        self.assertFalse(made.gate.enter(), 'once closing has begun nothing is admitted, with the owner alone')
-        others = [name for name in H.SINGLE if name not in ('drive_owner', 'event_store')]
-        self.assertEqual(len(others), 6, 'every single hook is on one side or the other of this test')
-        for name in others:
-            with self.subTest(hook=name):
-                made = H.Hooks()
-                made.set(name, lambda *args: None)
+    # Every way there is to register something into the hooks, each as a lane would do it and nothing else.
+    REGISTRATIONS = {
+        **{f'the single hook {name}': (lambda made, name=name: made.set(name, lambda *args: None)) for name in H.SINGLE},
+        'a start registrant': lambda made: made.start_registrant('routing', (), (), lambda principal, request: {}),
+        'a service': lambda made: made.service(Service('events')),
+        'the change marker': lambda made: made.enable_changes(),
+        'a method handler': lambda made: made.methods.register('session.list', lambda ctx, params: {'code': 'ok'}),
+        'a command family': lambda made: made.commands.register(('x',), lambda sub: None, lambda args, client: 0),
+        'an engine factory': lambda made: made.engines.register('pi', lambda *a, **k: None),
+        'a seeded engine factory, replaced': lambda made: made.engines.register('codex', lambda *a, **k: None, replace=True),
+        'a seeded engine factory, replaced by itself': lambda made: made.engines.register('claude_code', ClaudeCodeAdapter, replace=True),
+    }
+
+    def test_the_gate_is_on_when_anything_at_all_is_registered_and_off_only_for_the_bare_composition(self) -> None:
+        """ONE RULE, with no exemption (``Hooks.anything_registered``). Three rounds of reads each found another
+        set of hooks that left the gate off. This holds the rule for every way of registering there is, each
+        alone and each pair: with any of them the gate is on, admits a call, and once closing has begun admits
+        none and does no work that was to be done while it is open. With nothing registered it is off, and a
+        call is admitted and the work is done after closing has begun, as before the seams.
+
+        The list of ways is held against the code, so that one which is added later and forgotten here fails
+        this test: every name of ``SINGLE``; every method of ``Hooks`` that registers (each asks whether the
+        hooks are frozen); every table the hooks carry; and in each table every method that refuses once the
+        table is closed, which is one, ``register``."""
+        kinds = self.REGISTRATIONS
+        self.assertEqual(len(kinds), 16)
+        self.assertEqual([name for name in H.SINGLE if f'the single hook {name}' not in kinds], [])
+        registering = sorted(name for name, function in vars(H.Hooks).items()
+                             if inspect.isfunction(function) and 'self._open(' in inspect.getsource(function) and name != '_open')
+        self.assertEqual(registering, ['enable_changes', 'service', 'set', 'start_registrant'], 'the methods of Hooks that register')
+        looked_at = H.Hooks()
+        looked_at.engines                 # the engine table is made on first use
+        tables = {name: value for name, value in vars(looked_at).items() if callable(getattr(value, 'register', None))}
+        self.assertEqual(sorted(tables), ['_engines', 'commands', 'methods'], 'the tables a lane registers into')
+        for name, table in tables.items():
+            refusing = sorted(method for method, function in vars(type(table)).items()
+                              if inspect.isfunction(function) and 'if self._frozen' in inspect.getsource(function))
+            self.assertEqual(refusing, ['register'], f'{name}: the methods that refuse once the table is closed')
+        self.assertEqual((looked_at.methods.registered(), looked_at.commands.names(), looked_at.engines.registered()), ((), (), ()))
+        for made, what in ((H.Hooks(), 'nothing registered'), (looked_at, 'tables that were only looked at')):
+            done = []
+            made.freeze()
+            self.assertEqual((made.anything_registered(), made.gate.enabled), (False, False), what)
+            made.begin_close()
+            self.assertEqual((made.gate.enter(), made.gate.while_open(lambda: done.append(1)), done), (True, True, [1]),
+                             f'{what}: a call is admitted and the work is done, as before the seams')
+        for names in itertools.chain(itertools.combinations(kinds, 1), itertools.combinations(kinds, 2)):
+            with self.subTest(registered=names):
+                made, done = H.Hooks(), []
+                for name in names:
+                    kinds[name](made)
                 made.freeze()
-                self.assertFalse(made.gate.enabled)
+                self.assertEqual((made.anything_registered(), made.gate.enabled), (True, True))
+                self.assertTrue(made.gate.enter())
+                made.gate.leave()
+                made.begin_close()
+                self.assertEqual((made.gate.enter(), made.gate.while_open(lambda: done.append(1)), done), (False, False, []),
+                                 'once closing has begun nothing is admitted and nothing is done while_open')
+
+    @quiet
+    def test_an_interrupted_rollback_changes_the_admitted_count_once(self) -> None:
+        """Asked for by both round-4 reads of the scopes lane's draft (#385), which stands on these files. A call
+        is admitted and then interrupted, so ``enter`` steps back out of the count. Stepping back is interrupted
+        too, inside ``notify_all``, and the region goes round again. The count it steps back from is the one it
+        read the first time round (``back``), so the second time takes nothing more away: 0, and not -1."""
+        gate = H.Admission()
+        gate.enabled = True
+        first, second = KeyboardInterrupt('while taking the gate'), KeyboardInterrupt('while waking the drain')
+        take, notify, counts = H.take_once, gate._changed.notify_all, []
+
+        def interrupted_take(lock, errors):
+            take(lock, errors)
+            errors.append(first)
+
+        def interrupted_notify():
+            counts.append(gate._admitted)
+            if len(counts) == 1:
+                raise second
+            notify()
+        with mock.patch.object(H, 'take_once', interrupted_take), mock.patch.object(gate._changed, 'notify_all', interrupted_notify):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                gate.enter()
+        self.assertIs(caught.exception, first)
+        self.assertEqual(counts, [0, 0], 'going round again takes no second admission away')
+        self.assertEqual((gate.admitted, gate._lock._is_owned()), (0, False))
+        self.assertTrue(gate.enter(), 'and the gate still admits')
+        gate.leave()
+        self.assertEqual(gate.admitted, 0)
+
+    def test_while_open_does_its_work_with_the_gate_held_open_and_a_close_that_begins_then_waits_for_it(self) -> None:
+        """To ask whether the gate is closed and then to act is two steps, and a close can begin between them.
+        ``while_open`` makes them one step for ``close``: the work is inside when a close begins, the close finds
+        the gate's condition taken and WAITS, and the gate is open from the work's first moment to its last.
+        Nothing is traced: the condition itself says whether the closing thread found it free, which no schedule
+        decides once the work is inside. Once the gate is closed the work is not done at all."""
+        gate, inside, leave, moved = H.Admission(), threading.Event(), threading.Event(), threading.Event()
+        gate.enabled = True
+        seen, found_taken, answers = [], [], []
+        self.addCleanup(leave.set)
+        condition = gate._lock
+
+        class Asked:
+            """The gate's condition's lock, writing down whether the closing thread found it taken."""
+
+            def acquire(inner, *how):
+                if threading.current_thread().name == 'the close' and not how:
+                    free = condition.acquire(False)
+                    found_taken.append(not free)
+                    moved.set()
+                    if free:
+                        return True
+                return condition.acquire(*how)
+
+            def release(inner) -> None:
+                condition.release()
+
+            def _is_owned(inner) -> bool:
+                return condition._is_owned()
+        gate._lock = Asked()
+
+        def work() -> None:
+            seen.append(gate.closed)
+            inside.set()
+            leave.wait(BOUND_S)
+            seen.append(gate.closed)
+        working = threading.Thread(target=lambda: answers.append(gate.while_open(work)), daemon=True)
+        close = threading.Thread(target=gate.close, name='the close', daemon=True)
+        working.start()
+        self.assertTrue(inside.wait(BOUND_S), 'the work is inside')
+        close.start()
+        self.assertTrue(moved.wait(BOUND_S), 'the close asked for the gate')
+        self.assertEqual((found_taken, gate.closed), ([True], False), 'the close WAITS, with the gate still open')
+        leave.set()
+        working.join(BOUND_S)
+        close.join(BOUND_S)
+        self.assertEqual((answers, seen, gate.closed), ([True], [False, False], True))
+        self.assertEqual((gate.while_open(lambda: seen.append('late')), seen), (False, [False, False]), 'closed: nothing is done')
+
+    def test_while_open_with_the_gate_off_simply_does_its_work(self) -> None:
+        """With nothing registered the gate is off, and what asks it is what it was before the seams: a close
+        of the composition, which shuts that gate all the same, does not keep the work from being done."""
+        gate, done = H.Admission(), []
+        gate.close()
+        self.assertEqual((gate.enabled, gate.closed, gate.while_open(lambda: done.append(1)), done), (False, True, True, [1]))
+
+    def test_what_ends_the_work_of_while_open_is_raised_with_the_gate_free_again(self) -> None:
+        """A failure of the work is raised and the work is not asked again. An interruption may have landed
+        before the work began, which nothing can tell from outside it: the work is asked once more, and what ends
+        that second asking is final, so a piece of work that is interrupted every time is not asked for ever."""
+        for ending, times in ((ValueError('the work failed'), 1), (KeyboardInterrupt('the work was interrupted'), 2)):
+            with self.subTest(ending=type(ending).__name__):
+                gate, asked = H.Admission(), []
+                gate.enabled = True
+
+                def work(gate=gate, asked=asked, ending=ending) -> None:
+                    asked.append(gate._lock._is_owned())
+                    if len(asked) < 6:      # so that a gate which asked for ever would fail here, and not hang
+                        raise ending
+                with self.assertRaises(type(ending)) as caught:
+                    gate.while_open(work)
+                self.assertIs(caught.exception, ending)
+                self.assertEqual((asked, gate._lock._is_owned(), gate.closed), ([True] * times, False, False),
+                                 'asked holding the condition; the condition is free again and the gate is open')
+                self.assertTrue(gate.enter(), 'the gate goes on admitting')
+                gate.leave()
+                gate.close()
+                self.assertTrue(gate.closed)
 
     def test_no_call_is_admitted_after_closing_began(self) -> None:
         gate = H.Admission()
@@ -3571,6 +3758,8 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         'Admission.leave': (lambda self: self.leaving(), lambda gate: gate.leave(), lambda gate: gate._lock,
                             lambda gate: gate.admitted == 0),
         'Admission.close': (lambda self: self.gate(), lambda gate: gate.close(), lambda gate: gate._lock, lambda gate: gate.closed),
+        'Admission.while_open': (lambda self: (self.gate(), []), lambda pair: pair[0].while_open(lambda: pair[1].append('done')),
+                                 lambda pair: pair[0]._lock, lambda pair: len(pair[1]) >= 1),
         'Admission.drain': (lambda self: self.draining(), lambda gate: gate.drain(), lambda gate: gate._lock,
                             lambda gate: gate.admitted == 0),
         'Hooks.stop_services': (lambda self: self.lifecycle(), lambda pair: pair[0].stop_services(H.ServiceContext()),
@@ -3589,6 +3778,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         'Admission.enter': lambda gate: (gate.closed, gate.admitted),
         'Admission.leave': lambda gate: (gate.closed, gate.admitted),
         'Admission.close': lambda gate: (gate.closed, gate.admitted),
+        'Admission.while_open': lambda pair: (pair[0].closed, pair[0].admitted, len(pair[1])),
         'Admission.drain': lambda gate: (gate.closed, gate.admitted),
         'Hooks.stop_services': _teardown_touches,
         'Hooks.finish_close': _teardown_touches,
@@ -3599,7 +3789,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
 
     def test_the_regions_have_no_loop_no_try_and_no_with_written_in_them(self) -> None:
         for owner, name in (('Admission', 'enter'), ('Admission', 'leave'), ('Admission', 'close'), ('Admission', 'drain'),
-                            ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
+                            ('Admission', 'while_open'), ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
             with self.subTest(region=f'{owner}.{name}'):
                 self.straight(H, owner, name)
 
@@ -3637,6 +3827,13 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         self.walk('Admission.drain', self.EVENTS)
 
     @quiet
+    def test_work_done_while_the_gate_is_held_open_at_every_event(self) -> None:
+        """The work is the caller's, here one line of the test's own, which is not walked: every point of the
+        region around it is. An interruption that lands as the work has just returned has it done a second time,
+        which is why the work is something that may be done twice; "done" is read as at least once."""
+        self.walk('Admission.while_open', self.EVENTS)
+
+    @quiet
     def test_stopping_the_services_at_every_event(self) -> None:
         self.walk('Hooks.stop_services', self.EVENTS)
 
@@ -3663,6 +3860,10 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     @quiet
     def test_the_gates_drain_at_every_instruction(self) -> None:
         self.by_instruction('Admission.drain')
+
+    @quiet
+    def test_work_done_while_the_gate_is_held_open_at_every_instruction(self) -> None:
+        self.by_instruction('Admission.while_open')
 
     @quiet
     def test_stopping_the_services_at_every_instruction(self) -> None:
@@ -3813,6 +4014,81 @@ class ClosingSignalTest(unittest.TestCase):
         for thread in threads:
             thread.join(BOUND_S)
         self.assertEqual((woken, closing._waiters), ([True, True, True], []))
+
+    def test_a_wait_whose_time_ran_out_keeps_its_answer_when_the_signal_is_set_just_after(self) -> None:
+        """The order is an ordinary one, with nothing interrupted: the timed wait on the waiter's own lock ends
+        with nothing having let that lock go, THEN a set runs, THEN the wait returns. It answers False, which is
+        whether it was woken; ``is_set()`` is what says that the signal is set by now."""
+        closing, timed, native = methods.Signal(), [], threading.Lock
+
+        class SetJustAfter:
+            """A waiter's lock; a set runs the moment its timed wait has ended."""
+
+            def __init__(inner) -> None:
+                inner.lock = native()
+
+            def acquire(inner, *how):
+                got = inner.lock.acquire(*how)
+                if len(how) == 2:           # the timed wait
+                    timed.append(got)
+                    closing.set()
+                return got
+
+            def release(inner) -> None:
+                inner.lock.release()
+        with mock.patch.object(methods, 'threading', mock.Mock(Lock=SetJustAfter)):
+            answer = closing.wait(0.001)
+        self.assertEqual(timed, [False], 'the time ran out before anything had set the signal')
+        self.assertEqual((answer, closing.is_set(), closing._waiters), (False, True, []))
+        self.assertEqual(closing.wait(0.001), True, 'the next wait finds it set and does not wait')
+
+    def test_a_waiter_that_leaves_comes_off_the_list_in_one_call_and_never_looks_first(self) -> None:
+        """Looking for itself and then removing itself is two steps. On the free-threaded interpreter the look
+        walks the list while other waiters shorten it, so it can pass its own entry by, and that waiter then
+        stays on the list for good. Here the list answers every look as such a look was answered: not there."""
+        closing = methods.Signal()
+
+        class Overtaken(list):
+            def __contains__(inner, item) -> bool:
+                return False
+        closing._waiters = Overtaken()
+        self.assertEqual((closing.wait(0), closing.wait(0.001), list(closing._waiters)), (False, False, []))
+        closing.set()
+        self.assertEqual((closing.wait(0), self.waited(closing, None), list(closing._waiters)), (True, [True], []))
+
+    def test_waiters_that_leave_all_at_once_leave_nothing_on_the_list(self) -> None:
+        """Sixteen threads ask a signal that is never set, a thousand times each, most with no time to wait and
+        some with a little. Nothing is interrupted and nothing is traced. Every answer is False and the list
+        ends empty: every waiter that left took its own lock off."""
+        closing, answers, errors, go = methods.Signal(), [], [], threading.Barrier(16)
+
+        def ask() -> None:
+            try:
+                go.wait(BOUND_S)
+                for turn in range(1000):
+                    answers.append(closing.wait(0.0001 if turn % 8 == 0 else 0))
+            except BaseException as exc:  # noqa: BLE001 - it is reported below
+                errors.append(repr(exc))
+        threads = [threading.Thread(target=ask, daemon=True) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(BOUND_S)
+        self.assertEqual((errors, sum(thread.is_alive() for thread in threads)), ([], 0))
+        self.assertEqual((len(answers), any(answers), closing.is_set()), (16000, False, False))
+        self.assertEqual(closing._waiters, [], 'a waiter that left is still on the list')
+
+    def test_a_wait_interrupted_before_it_is_on_the_list_raises_what_interrupted_it(self) -> None:
+        """It then finds nothing of its own to take off, and that is not an error of its own."""
+        closing = methods.Signal()
+
+        class Interrupted(list):
+            def append(inner, item) -> None:
+                raise KeyboardInterrupt
+        closing._waiters = Interrupted()
+        with self.assertRaises(KeyboardInterrupt):
+            closing.wait(BOUND_S)
+        self.assertEqual(list(closing._waiters), [])
 
     def test_a_set_that_was_interrupted_is_finished_by_asking_again(self) -> None:
         """What makes it safe to ask again: the flag is stored first, and a waiter's lock that was released
@@ -4585,8 +4861,9 @@ class CliSeamTest(unittest.TestCase):
                 self.assertEqual((status, out.getvalue(), client.calls), (base_status, base_out, base_calls))
                 self.assertNotEqual(client.calls, [], 'the command reached the client')
                 compose.assert_not_called()
-        # Anything else needs the families, and then the broken registrant stops it, loudly, before the client.
-        for argv in (['session', 'ses-1'], [], ['--help']):
+        # A NAMED command that is not one of the five needs the families, and then the broken registrant stops it,
+        # loudly, before the client: a registered name, and a name nobody could tell from one.
+        for argv in (['session', 'ses-1'], ['bogus']):
             with self.subTest(argv=argv):
                 client = Client()
                 with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')), \
@@ -4594,6 +4871,46 @@ class CliSeamTest(unittest.TestCase):
                     self.assertEqual(cli.run(argv, lambda: client), cli.EXIT_ERROR)
                 self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
                 self.assertEqual(client.calls, [])
+
+    def test_a_broken_registrant_does_not_take_away_the_clis_own_help_or_its_own_usage_error(self) -> None:
+        """An argv that names no command is the CLI's own business: help, or its own usage error. With a
+        registrant that is installed and broken both are answered exactly as with no table at all, after one line
+        on stderr which says that a registrant is broken, and which, so that the help is never taken for the whole
+        of it. The registrants here are composed, not stood in for: one whose import fails, two that claim one
+        hook (the second is where composition stops), and a failure that is no one registrant's, which names
+        none. (A seventh read; before it help and the usage error were stopped too.)"""
+        claims = 'def register(hooks):\n    hooks.set("authorize", lambda principal, method, params: None)\n'
+        for lanes, what in (({'keys': 'raise RuntimeError("at import")\n'}, 'registrant recursion_core.keys.hooks is broken'),
+                            ({'keys': claims, 'events': claims}, 'registrant recursion_core.events.hooks is broken'),
+                            ({}, 'the registrants could not be composed')):
+            fake = FakeLanes(self)
+            fake.stand_in_for_the_installed()
+            for lane, text in lanes.items():
+                fake.lane(lane, hooks=text)
+            note = f"{what} (hooks:HookError): registered commands are missing, these are only the CLI's own\n"
+            # (An eighth read: an empty word and a blank one name no command either, and no family can register one.)
+            for argv in ([], [''], [' '], ['\n'], ['--help'], ['-h'], ['--no-such-option']):
+                with self.subTest(lanes=sorted(lanes), argv=argv):
+                    answers = []
+                    for composed in (False, True):  # the CLI with no table; then the same argv, composed
+                        client, out, err = Client(), io.StringIO(), io.StringIO()
+                        # With no lane installed, what fails is the check made after the last registrant.
+                        fails = mock.patch.object(H.Hooks, 'freeze', side_effect=H.HookError('of no one registrant'))
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            try:
+                                if not composed:
+                                    status = cli.main(argv, client)
+                                else:
+                                    with contextlib.nullcontext() if lanes else fails:
+                                        status = cli.run(argv, lambda: client)
+                            except SystemExit as left:  # argparse prints its help and leaves
+                                status = ('left', left.code)
+                        answers.append((status, out.getvalue(), err.getvalue(), client.calls))
+                    (status, out, err, calls), under_the_broken_one = answers
+                    self.assertEqual(under_the_broken_one, (status, out, note + err, calls))
+                    self.assertEqual(calls, [], 'no command was named, so the client is not asked')
+                    self.assertIn(status, (('left', 0), cli.EXIT_USAGE))
+            self.doCleanups()       # this case's lanes are gone before the next case installs its own
 
 
 class CliImportTest(unittest.TestCase):
@@ -4954,6 +5271,44 @@ class StartPathOnTest(unittest.TestCase):
         # A start for which no registrant chose an entry has nothing to compare, and needs nobody.
         named = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'hand_pick': {'engine': 'none'}}
         self.assertEqual(with_none.call('run.start', named)['code'], 'started')
+
+    def test_a_stored_entry_of_another_shape_is_refused_on_a_relaunch_and_never_reaches_the_comparator(self) -> None:
+        """A seventh read. The comparator the composition gives reads the engine out of an entry, so it is handed
+        only an entry of the shape a new start accepts, and of the engine its record launches. A stored record may
+        hold another (an earlier composition wrote it, or a lane that holds the control registry): its retry is
+        refused as a chosen entry of that kind is on a new start, the record is left as it was, and nothing is
+        launched. It was an exception out of the call, or a launch of one engine under another's entry."""
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}
+        api, registry, starter = self.api(Recorder(fail=1))
+        self.assertEqual(api.call('run.start', request)['code'], 'start_failed')
+        kept = registry.get('run-1')
+        self.assertEqual((kept['engine'], kept['launch']['route_entry']), ('codex', entry('codex')))
+        seen = []
+
+        def reads_the_engine(chosen):       # as the composition's own comparator does, and it has both engines
+            seen.append(chosen)
+            return chosen['route']['engine'] in ('codex', 'claude_code')
+        other = entry('claude_code')        # well formed, and launchable here: but it is not this record's engine
+        stored = [('codex', shape) for shape in ({'route': 'codex'}, {'binary': None}, {'route': ['codex']}, 'codex',
+                                                 {'route': {}}, {'route': {'engine': ''}}, {'route': {'engine': 7}}, 7, other)]
+        # A record whose own engine is not a name agrees with an entry that has none: that is refused all the same.
+        stored += [(None, {'route': {}}), ('', {'route': {'engine': ''}}), (7, {'route': {'engine': 7}})]
+        for engine, shape in stored:
+            with self.subTest(engine=engine, stored=shape):
+                record = copy.deepcopy(kept)
+                record['engine'], record['launch']['route_entry'] = engine, shape
+                self.registry = InMemoryRunRegistry([record])
+                before = self.registry.get('run-1')
+                later, ran = Recorder(), len(self.log)
+                retried, _, _ = self.api(later, comparator=reads_the_engine)
+                self.assertEqual(retried.call('run.start', request), {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+                self.assertEqual((self.registry.get('run-1'), later.calls, seen, len(self.log)), (before, [], [], ran),
+                                 'the record is as it was, nothing was launched, the comparator and the registrants were not asked')
+        # The control: the same record with its entry as it was written is relaunched, and the comparator is asked.
+        self.registry = InMemoryRunRegistry([copy.deepcopy(kept)])
+        retried, _, later = self.api(Recorder(), comparator=reads_the_engine)
+        self.assertEqual(retried.call('run.start', request)['code'], 'started')
+        self.assertEqual((seen, len(later.calls)), ([entry('codex')], 1))
 
     def test_a_failed_start_that_was_stopped_and_an_unconfirmed_one_are_answered_as_the_base_answers_them(self) -> None:
         api, registry, starter = self.api(Recorder(fail=2))

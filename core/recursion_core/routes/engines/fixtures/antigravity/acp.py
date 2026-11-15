@@ -112,9 +112,10 @@ of the route contract's CODES: a caller on the route contract maps it (the one-s
 an ``AcpError``: an argument the caller got wrong is ``AcpInvalid`` (``request_invalid``; also a
 ``ValueError``), a call the state does not allow is ``AcpStateError`` (``request_invalid``, or
 ``engine_exited`` once the agent is gone; also a ``RuntimeError``). ``feed`` given something that is not a
-str, or ``expire`` given a ``now`` that is not a finite number, is ``AcpInvalid`` too. ``answer_permission``
-and ``ask`` raise ``KeyError`` for a token this connection never issued, ``pending_result`` for an id it
-never minted.
+str, or ``expire`` given a ``now`` that is not a finite number, is ``AcpInvalid`` too, and so is a token
+that is not a str (``answer_permission``, ``ask``) or a request id that is not an int (``release``,
+``pending_result``). ``answer_permission`` and ``ask`` raise ``KeyError`` for a str token this connection
+never issued, ``pending_result`` for an int id it never minted.
 
 WHAT IT DOES NOT DO (yet): map ``tool_call`` updates to tool.call drafts (their ``rawInput`` arrives late
 and differs by agent), read usage (stable ACP has only ``usage_update``: context size, and an optional
@@ -259,6 +260,18 @@ def _limit_signal(value: object) -> dict | None:
     if reset_at is not None and not _finite_number(reset_at):
         return None
     return dict(value)
+
+
+def _ask_token(token: object) -> None:
+    """A token is the str an ask was given; anything else (a list, a dict) is the caller's error."""
+    if not isinstance(token, str):
+        raise AcpInvalid("token must be the str an ask was given")
+
+
+def _request_id(rpc_id: object) -> None:
+    """A request id is the int the connection minted; anything else is the caller's error."""
+    if type(rpc_id) is not int:
+        raise AcpInvalid("rpc_id must be the int a request was given")
 
 
 def _finite_number(value: object) -> bool:
@@ -476,6 +489,7 @@ class AcpConnection:
 
     def release(self, rpc_id: int) -> None:
         """Forget a request the caller has read the answer of (an open step's)."""
+        _request_id(rpc_id)
         with self._lock:
             pending = self._pending.get(rpc_id)
             if pending is not None and pending.done:
@@ -491,6 +505,7 @@ class AcpConnection:
         ``deadline``. However long the claim waited for the lock, a late answer never approves."""
         if decision not in (APPROVE, DENY):
             raise AcpInvalid("decision must be approve or deny")
+        _ask_token(token)
         with self._lock:
             ask = self._asks.get(token)
             if ask is None:
@@ -538,6 +553,7 @@ class AcpConnection:
             return min(open_) if open_ else None
 
     def ask(self, token: str) -> PermissionAsk:
+        _ask_token(token)
         with self._lock:
             return self._asks[token]
 
@@ -622,6 +638,7 @@ class AcpConnection:
             return turn.number if turn is not None and turn.outcome is not None else None
 
     def pending_result(self, rpc_id: int) -> _Pending:
+        _request_id(rpc_id)
         with self._lock:
             return self._pending[rpc_id]
 

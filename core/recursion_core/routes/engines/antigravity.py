@@ -45,9 +45,12 @@ could echo it. So a launch that carries a key needs an OUTPUT BOUNDARY (``output
 asked for by the values to keep out, whose capture masks them before anything is persisted. Without one
 every such launch is refused before the key is fetched from custody (``antigravity_output_boundary_missing``);
 no boundary exists in the tree yet and the factory cannot be given one. With one, the adapter also masks the
-key in every result text and detail it returns, and the parser in every draft it makes. A mask keeps the
-value's UTF-8 length (asterisks), so the byte offsets of an ``engine.output`` draft still match a capture
-masked the same way. A route with no key (``oauth-business``, ``agent-platform`` over ``passthrough``)
+key in every result text and detail it returns, and the parser in every draft it makes. The mask (``mask``)
+finds the value in every spelling JSON allows (each character as it stands or as any escape of it), not only
+the spellings a serializer writes, and replaces what spells it with a fill of the same UTF-8 length, so the
+byte offsets of an ``engine.output`` draft still match a capture masked the same way; a decoded line that
+still holds the value anywhere (a number that spells it) fails closed.
+A route with no key (``oauth-business``, ``agent-platform`` over ``passthrough``)
 launches without a boundary; ``agent-platform`` over ``passthrough`` gets no key at all and relies on the
 Application Default Credentials the prepared route home holds for that method.
 """
@@ -57,7 +60,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import posixpath
 import re
+from array import array
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
@@ -143,9 +148,11 @@ def one_shot_argv(executable: str, model: str) -> list[str]:
 def one_shot_stdin(prompt: str) -> str:
     """The one stdin line: a ``user`` event whose content is the prompt (headless page, stdin messages).
 
-    A prompt that cannot be written as UTF-8 (a lone surrogate) is refused ``request_invalid``: the line could
-    never reach agy's stdin. The adapter refuses it before anything starts; this is the same rule for any
-    other caller."""
+    A prompt that is not a str, or cannot be written as UTF-8 (a lone surrogate), is refused
+    ``request_invalid``: the line could never carry it to agy's stdin. The adapter refuses it before anything
+    starts; this is the same rule for any other caller."""
+    if not isinstance(prompt, str):
+        raise c.RouteError(c.REQUEST_INVALID, "prompt is not a str")
     line = json.dumps({"event": "user", "message": {"content": prompt}}, separators=(",", ":"), ensure_ascii=False)
     try:
         line.encode("utf-8")
@@ -192,8 +199,10 @@ class OneShotParser:
     text that sounds like a quota is a short fault (grill Q23), never a plan limit.
 
     ``redact`` names the values no draft may carry (the route's selected credential): each line is masked
-    before anything is read from it (``mask``), so no draft, result or code detail holds them. A line whose
-    mask leaves no JSON object (a value inside a key or a number) is a protocol error: it fails closed.
+    before anything is read from it (``mask``, which reads every JSON spelling of them), so no draft, result
+    or code detail holds them. A line whose mask leaves no JSON object (a value where a number or a literal
+    stands), or whose decoded object still holds one anywhere (a number whose text spells it), is a protocol
+    error: it fails closed.
     """
 
     def __init__(self, connection_id: str, model: str | None, *, offset: int = 0, redact=()) -> None:
@@ -215,6 +224,8 @@ class OneShotParser:
             raise OneShotProtocolError("stdout line is not JSON (or is nested too deeply to read)") from None
         if not isinstance(message, dict):
             raise OneShotProtocolError("stdout line is not a JSON object")
+        if self._redact and _number_spells(message, self._redact):
+            raise OneShotProtocolError("a value to keep out is still in the line once it is read")
         if self.result is not None:
             raise OneShotProtocolError("a line after the result")
         event = message.get("event")
@@ -313,23 +324,129 @@ class OneShotParser:
 
 
 def mask_forms(values) -> tuple[str, ...]:
-    """What ``mask`` looks for: each value as it is and as JSON writes it inside a string (with and without
-    ASCII escapes), longest first. Every value must be a non-empty str."""
+    """What ``mask`` looks for: each value, longest first. Every value must be a non-empty str. ``mask`` reads
+    every JSON spelling of each, also in JSON written inside a JSON string, so no escaped form is listed."""
     forms = set()
     for value in values:
         if not isinstance(value, str) or not value:
             raise ValueError("a value to mask is a non-empty str")
-        forms.update((value, json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]))
+        forms.add(value)
     return tuple(sorted(forms, key=len, reverse=True))
 
 
+# The fill ``mask`` writes: the first of these that is not the one character a value is made of (a value of
+# asterisks only is masked with "#"), so a masked stretch never spells a value. None of them needs a JSON
+# escape, so a fill inside a JSON string leaves the string valid.
+_FILLS = "*#%~=+@^_xXoO0123456789"
+# One JSON string escape: a backslash and u with four hex digits, or a backslash and the character after it.
+_ESCAPE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|.)", re.S)
+_SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
 def mask(text: str, forms: tuple[str, ...]) -> str:
-    """``text`` with every occurrence of each form replaced by asterisks of the same UTF-8 length, so a byte
-    offset into text masked this way is the offset into the text as it was."""
-    for form in forms:
-        if form in text:
-            text = text.replace(form, "*" * len(form.encode("utf-8", "surrogatepass")))
-    return text
+    """``text`` with every spelling of each form replaced by a fill character (``_FILLS``) of the same UTF-8
+    length, so a byte offset into text masked this way is the offset into the text as it was.
+
+    A spelling is any stretch of ``text`` that reads as the form: as it stands, once its JSON string escapes
+    are read (a u-escape of any character, an escaped slash, a surrogate pair for a character beyond the
+    BMP), or once they are read again for JSON written inside a JSON string, to any depth. Whatever spelling
+    the agent chose, the value it decodes to is masked. Text that is not JSON is read the same way. Masking
+    repeats until no spelling is left, since a fill could complete a value partly made of the fill
+    character; each round turns at least one character that is not the fill into it, so it ends."""
+    if not forms:
+        return text
+    fill = _fill(forms)
+    while True:
+        cuts = []
+        level, starts = text, None          # starts: where each character of ``level`` begins in ``text``
+        while True:
+            for form in forms:
+                at = level.find(form)
+                while at >= 0:
+                    end = at + len(form)
+                    if starts is None:
+                        cuts.append((at, end))
+                    else:
+                        cuts.append((starts[at], starts[end] if end < len(starts) else len(text)))
+                    at = level.find(form, at + 1)
+            decoded, inner = _decode(level) if "\\" in level else (level, None)
+            if len(decoded) == len(level):  # no escape left to read: every depth has been read
+                break
+            starts = inner if starts is None else array("q", map(starts.__getitem__, inner))
+            level = decoded
+        if not cuts:
+            return text
+        pieces, pos = [], 0
+        for start, end in sorted(cuts):
+            start = max(start, pos)
+            if end > start:
+                pieces += [text[pos:start], fill * _bytes(text[start:end])]
+                pos = end
+        pieces.append(text[pos:])
+        masked = "".join(pieces)
+        if masked == text:                  # never with a fill no value is made of; were it so, keep nothing
+            return fill * _bytes(text)
+        text = masked
+
+
+def _fill(forms) -> str:
+    made_of_one = {form[0] for form in forms if len(set(form)) == 1}
+    for fill in _FILLS:
+        if fill not in made_of_one:
+            return fill
+    raise ValueError("every fill character is a value to mask")
+
+
+def _bytes(text: str) -> int:
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def _decode(text: str) -> tuple[str, array]:
+    """``text`` with its JSON string escapes read, and for each character of the result the index in ``text``
+    where its spelling starts. Two u-escapes of a surrogate pair read as one character, as JSON reads them; an
+    escape JSON does not allow reads leniently as the character after the backslash."""
+    out: list[str] = []
+    starts = array("q")
+    pos, high = 0, False      # high: the last character read is a u-escape of a high surrogate
+    for match in _ESCAPE.finditer(text):
+        if match.start() > pos:
+            out.append(text[pos:match.start()])
+            starts.extend(range(pos, match.start()))
+            high = False
+        body = match.group()[1:]
+        if len(body) == 5:
+            point = int(body[1:], 16)
+            if high and 0xDC00 <= point <= 0xDFFF:
+                out[-1] = chr(0x10000 + ((ord(out[-1]) - 0xD800) << 10) + (point - 0xDC00))
+                high, pos = False, match.end()
+                continue
+            out.append(chr(point))
+            high = 0xD800 <= point <= 0xDBFF
+        else:
+            out.append(_SIMPLE_ESCAPES.get(body, body))
+            high = False
+        starts.append(match.start())
+        pos = match.end()
+    if pos < len(text):
+        out.append(text[pos:])
+        starts.extend(range(pos, len(text)))
+    return "".join(out), starts
+
+
+def _number_spells(value, forms) -> bool:
+    """Whether a float in a decoded JSON value spells a form once read (``1.2345e4`` is ``12345.0``). Strings
+    and keys need no check here: ``mask`` has read every spelling of them. An integer has one JSON spelling,
+    its own digits, which ``mask`` has already matched as they stand."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            stack += item.values()
+        elif isinstance(item, list):
+            stack += item
+        elif isinstance(item, float) and any(form in repr(item) for form in forms):
+            return True
+    return False
 
 
 def _utf8_length(raw: str, error: type) -> int:
@@ -436,9 +553,11 @@ def input_digest(value) -> str:
 # RouteError. Composition has no way to give one yet.
 PreparedHome = Callable[[Mapping, str], str]
 NOT_PREPARED = "antigravity_route_home_not_prepared"
+ROUTE_HOME_IS_DAEMON_HOME = "antigravity_route_home_is_daemon_home"
 # output_boundary(values) -> a launcher (as ``routes.launch``) whose capture of the child's stdout and stderr
-# replaces every occurrence of each value, as ``mask`` does, before anything is persisted. The launch side's
-# to give; there is none in the tree yet.
+# masks each line with ``mask(line, mask_forms(values))`` (every JSON spelling of each value) before anything
+# is persisted, so the capture's bytes and the drafts' offsets agree. The launch side's to give; there is
+# none in the tree yet. A boundary that raises ``OSError`` while setting up is a refused launch.
 OutputBoundary = Callable[[tuple], Callable]
 OUTPUT_UNPROTECTED = "antigravity_output_boundary_missing"
 
@@ -495,8 +614,15 @@ class AntigravityOneShotAdapter(RouteAdapter):
             return c.result(rid, err.code, detail=err.detail)
         secrets = () if secret is None else (secret,)
         forms = mask_forms(secrets)
+        launcher = self._launcher
+        if secrets:
+            try:
+                launcher = self._output_boundary(secrets)
+            except c.RouteError as err:
+                return c.result(rid, err.code, detail=mask(err.detail, forms))
+            except OSError:      # the boundary could not set its capture up: nothing is launched
+                return c.result(rid, c.LAUNCH_REFUSED, detail=OUTPUT_UNPROTECTED)
         try:
-            launcher = self._launcher if not secrets else self._output_boundary(secrets)
             process = launcher(argv, env=env, shell=False)
         except c.RouteError as err:
             return c.result(rid, err.code, detail=mask(err.detail, forms))
@@ -532,18 +658,40 @@ class AntigravityOneShotAdapter(RouteAdapter):
             # Refused before the route home is asked for and before custody is: no key is fetched for a run
             # whose output nothing keeps it out of.
             raise c.RouteError(c.LAUNCH_REFUSED, OUTPUT_UNPROTECTED)
-        home = self._prepared_home(route, method.id)
+        try:
+            home = self._prepared_home(route, method.id)
+        except OSError:      # the route-home loader works on the filesystem: its failure is a home not prepared
+            raise c.RouteError(c.LAUNCH_REFUSED, NOT_PREPARED) from None
         if not isinstance(home, str) or not home.startswith("/") or "\x00" in home:
             raise c.RouteError(c.LAUNCH_REFUSED, NOT_PREPARED)
+        # The daemon's own HOME never reaches the child, however the callable came to name it (a fallback, an
+        # alias, a caller override): compared by resolved path, it or any path inside it is refused. The
+        # brief has no own-login route ("never reuse a Google login another program holds").
+        real = posixpath.realpath(home)
+        own = self._daemon_home()
+        if own is not None and (real == own or real.startswith(own + "/")):
+            raise c.RouteError(c.LAUNCH_REFUSED, ROUTE_HOME_IS_DAEMON_HOME)
         credential = self.credential(request, method.credential_env) if method.credential_env else None
         if credential is not None and "\x00" in credential[1]:
             raise c.RouteError(c.LAUNCH_REFUSED, f"the credential for {route['connection']['id']} is not usable")
         # The child gets the base names, its own HOME, the updater switch and the method's one key: no
-        # other Google name from the daemon's environment can reach it.
+        # other Google name from the daemon's environment can reach it. ``never=("HOME",)`` is not what keeps
+        # the daemon's HOME out (the next line overwrites any HOME it copied): that is
+        # the overwrite with the route home together with the check above that the route home is not the
+        # daemon's HOME.
         env = child_env(self._parent_env, never=("HOME",), credential=credential)
         env["HOME"] = home
         env.update(UPDATER_ENV)
         return env, (credential[1] if credential is not None else None)
+
+    def _daemon_home(self) -> str | None:
+        """The daemon's own HOME, resolved, from the parent environment the adapter was given (its one view of
+        the daemon; never the process's own environment, so with none there it has no HOME a child could
+        inherit). When it is "/" (a container with no home), "/" itself is refused, not every path."""
+        given = self._parent_env.get("HOME")
+        if not isinstance(given, str) or not given.startswith("/") or "\x00" in given:
+            return None
+        return posixpath.realpath(given)
 
     def drive(self, process: EngineProcess, request: dict, deadline_at: float, events: list[dict], *,
               redact=()) -> dict:

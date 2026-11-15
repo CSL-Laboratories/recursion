@@ -80,7 +80,8 @@ What each call raises: an argument the caller got wrong is `AcpInvalid` (`reques
 anything is written (`open` checks all of its arguments first); a call the state does not allow is
 `AcpStateError` (`request_invalid`, or `engine_exited` once the agent is gone); a failure of the run is an
 `AcpError` with its code. So one `except AcpError` catches every refusal and failure of the client.
-`answer_permission` raises `KeyError` for a token this connection never issued. A deadline, a permission
+`answer_permission` raises `KeyError` for a str token this connection never issued; a token that is not a
+str, or a request id that is not an int (`ask`, `release`, `pending_result`), is `AcpInvalid`. A deadline, a permission
 timeout or a limit's `reset_at` must be a finite float-sized number: NaN, an infinity, or an integer too
 large for a float is refused (`AcpInvalid`), or counts as a bad hook answer. A failure while a turn's lines
 are handled (a protocol error, or `on_line`, `on_update` or `on_ask` raising, an interruption included) is
@@ -96,8 +97,10 @@ str, and `expire` a finite `now`; anything else is `AcpInvalid`.
 
 A SELECTED CREDENTIAL never reaches a draft or a result. The engine that holds one (an API-key route's key)
 passes it to the draft makers: Antigravity's `OneShotParser(..., redact=(key,))` and
-`AcpDrafts(redact=(key,))` mask it (as it is and as JSON escapes it) with asterisks of the same UTF-8 length,
-so the byte offsets of `engine.output` still match a capture masked the same way. Antigravity's one-shot
+`AcpDrafts(redact=(key,))` mask it in every spelling JSON allows (as it stands, as a serializer escapes it, and
+with any character written as an escape), with a fill of the same UTF-8 length (asterisks, or `#` for a value
+made only of asterisks), so the byte offsets of `engine.output` still match a capture masked the same way
+(`mask(line, mask_forms(values))`). A decoded one-shot line that still holds the value fails closed. Antigravity's one-shot
 adapter launches a keyed route only through an `output_boundary` (a launcher, asked for by the values to
 keep out, whose capture masks them before anything is persisted) and refuses it without one, before custody
 is asked (`antigravity_output_boundary_missing`). E4, E6, E7 and E9 need the same for their keyed routes.

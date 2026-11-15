@@ -1987,5 +1987,33 @@ class DeadlineTest(unittest.TestCase):
         self.assertEqual(s.prompt("again", FAR).text, "second")
 
 
+
+class ReviewRoundFiveTest(unittest.TestCase):
+    """DeepSeek r5 L1: a token or request id of the wrong type is ``AcpInvalid``, never a ``TypeError`` from
+    the connection's tables. Fails on 69a1b194."""
+
+    def test_l1_a_token_or_id_that_cannot_be_one_is_acp_invalid(self) -> None:
+        agent = FakeAcpAgent()
+        s = opened(agent)
+        conn = s.connection
+        calls = {"connection.answer_permission": lambda v: conn.answer_permission(v, acp.APPROVE),
+                 "connection.ask": conn.ask, "connection.pending_result": conn.pending_result,
+                 "connection.release": conn.release,
+                 "session.answer_permission": lambda v: s.answer_permission(v, acp.APPROVE)}
+        takes_id = ("connection.pending_result", "connection.release")
+        for name, call in calls.items():
+            wrong = ("1", 1.5, True) if name in takes_id else (None, 5)
+            for value in ([], {}, set()) + wrong:
+                with self.subTest(call=name, value=repr(value)), self.assertRaises(acp.AcpInvalid):
+                    call(value)
+        with self.assertRaises(KeyError):           # a well-typed one it never issued stays a KeyError
+            conn.answer_permission("ask-999", acp.APPROVE)
+        with self.assertRaises(KeyError):
+            conn.ask("ask-999")
+        with self.assertRaises(KeyError):
+            conn.pending_result(999)
+        conn.release(999)
+        self.assertIsNone(s.prompt("still usable", FAR).code)
+
 if __name__ == "__main__":
     unittest.main()

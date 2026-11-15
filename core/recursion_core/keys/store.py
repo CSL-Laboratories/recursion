@@ -6,17 +6,23 @@ are never logged, never put in a prompt and never sent to CSL; engine sign-ins s
 store; any vendor's key can be kept.
 
 TWO PLACES. The INDEX (``index.json``) holds what is safe to show: per key id, the provider, the variable name
-the engine reads it from, when it was saved, which backend holds it, and its spend opt-in and cap. It never
-holds a value. The VALUE is in the BACKEND: the Secret Service, or the owner-only file (``backends.py``). Both
-files live in one owner-only folder, ``$XDG_CONFIG_HOME/recursion/keys`` (``~/.config/recursion/keys``), with
-the checks of ``files.py``. Nothing here is in the event database: no key state changes with an event, and no
-secret sits beside the event log.
+the engine reads it from, when it was saved, which backend holds it, and its spend opt-in and cap; and the
+operations that were started on a backend and not finished. It never holds a value. The VALUE is in the
+BACKEND: the Secret Service, or the owner-only file (``backends.py``). Both files live in one owner-only folder,
+``$XDG_CONFIG_HOME/recursion/keys`` (``~/.config/recursion/keys``), with the checks of ``files.py``. Nothing here
+is in the event database: no key state changes with an event, and no secret sits beside the event log.
+
+THE INDEX FORMAT, version 1: ``{"version": 1, "backend": <store or null>, "keys": {<id>: {"provider",
+"env_name", "created_at", "store", "metered_spend_allowed", "cap_usd"}}, "pending": {<id>: {"op": "add" |
+"remove", "started_at"}}}``, at most 1 MiB. Anything else is refused ``index_invalid``. A listing says what the
+index holds; it does not say that a keychain is reachable or unlocked now.
 
 PINNING. The first save records the backend the host offered then (``system.detect``) in the index. Every
 later operation that touches a value asks again and refuses when the answer differs: ``keychain_unavailable``
 when a keychain was pinned and the host now offers only the file, ``backend_changed`` otherwise. A locked or
-failing keychain is refused with its own code and is never answered from the file. The pin is released only
-when no key is left, so the next save is a first save again.
+failing keychain is refused with its own code and is never answered from the file. One exception: a key pinned
+to the owner-only file can always be REMOVED, the file being always reachable, so that once a keychain appears
+the keys can be removed and added again into it. The pin is released when nothing is left in the index.
 
 SPEND. Every key has ``metered_spend_allowed`` and ``cap_usd``, typed when it is added; with no opt-in the cap
 is 0. ``credentials()`` hands a key out only when both say spend is allowed (opt-in and a cap above 0):
@@ -24,30 +30,40 @@ is 0. ``credentials()`` hands a key out only when both say spend is allowed (opt
 is Lucas's to confirm. QUOTA enforces the cap; until it does, the console's own spend limit is the stop.
 
 THE CREDENTIAL SOURCE. ``credentials(connection_id, env_name)`` is ``routes.base.Credentials``: the value
-only when the id is known AND its saved variable name is ``env_name``. An unknown id, or a known one asked for
+only when the id is known AND its saved variable name is ``env_name`` AND its provider is one of the published
+vendors (``validate.PROVIDERS``): a key saved for any other vendor is kept and listed and handed to no engine
+(``provider_unrouted``), because no route or grant names a provider yet. An unknown id, or a known one asked for
 under another name, raises ``KeyError(connection_id)``, exactly as seam S7's default does; a known id the store
-refuses raises ``KeyRefused`` (a ``KeyError`` with a code). It never returns None or an empty string. Lane
-KEYS' ``hooks.py`` registers it into S7 when SPINE's seams land; until then a test passes it where the daemon
-passes ``no_custody``.
+refuses raises ``KeyRefused`` (a ``KeyError`` with a code). It never returns None or an empty string. The
+index is read and the value fetched under the folder's SHARED lock, which every writer takes exclusively, so
+the authorization and the value come from one state of the store: a key removed and added again meanwhile is
+never handed out under the old one's variable name or opt-in. Lane KEYS' ``hooks.py`` registers it into S7 when
+SPINE's seams land; until then a test passes it where the daemon passes ``no_custody``.
 
-Order of writes. Add: the value goes into the backend, then the index; if the index cannot be written the
-value is taken out again. Remove: the value comes out of the backend, then the index. So a reader that holds
-no lock can see an index entry whose value is missing (refused ``secret_missing``), never a value the index
-does not name for longer than one operation.
+ORDER OF WRITES, and what a failure leaves. Every write holds the folder's exclusive lock. An add first writes
+the index with a PENDING entry for the id (the intent, before anything outside the folder happens), then saves
+the value in the backend, then writes the index with the key and without the intent. A remove does the same
+with a pending ``remove``. A backend that refused for certain (an error, a locked keychain, a full file) leaves
+nothing, and the intent is dropped again. An outcome that is not certain (the helper ran out of time) or a
+failure after the value was saved leaves the intent in the index: ``list`` shows it, ``credential`` refuses
+that id (``operation_pending``), the next add or remove recovers it (deletes the orphaned value, or finishes the
+removal), and ``remove <id>`` clears it on request. Both index states are checked against the size limit
+before anything is changed (``store_full``).
 """
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from recursion_core.keys import validate as v
-from recursion_core.keys.backends import BACKENDS
+from recursion_core.keys.backends import OwnerFile, SecretService
 from recursion_core.keys.errors import KeyRefused, KeyStoreError
 from recursion_core.keys.files import Folder, open_folder
 from recursion_core.keys.system import System, detect
@@ -65,6 +81,8 @@ INDEX_NAME = 'index.json'
 INDEX_MAX = 1 << 20
 INDEX_VERSION = 1
 FIELDS = ('provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd')
+PENDING_FIELDS = ('op', 'started_at')
+OPS = ('add', 'remove')
 
 
 @dataclass(frozen=True)
@@ -87,9 +105,22 @@ class KeyRecord:
 
 
 @dataclass(frozen=True)
+class Pending:
+    """An operation started on the backend and not finished: ``op`` is ``add`` or ``remove``."""
+
+    key_id: str
+    op: str
+    started_at: str
+
+
+@dataclass(frozen=True)
 class Index:
-    backend: str | None          # the pinned backend; None before the first save, or once no key is left
-    keys: dict                   # key id -> KeyRecord
+    backend: str | None                            # the pinned backend; None while nothing is in the index
+    keys: dict                                     # key id -> KeyRecord
+    pending: dict = field(default_factory=dict)    # key id -> Pending
+
+    def live(self) -> bool:
+        return bool(self.keys or self.pending)
 
 
 def default_root(system: System | None = None) -> Path:
@@ -107,6 +138,15 @@ def _now(clock) -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(whole)) + f'.{int((moment - whole) * 1000):03d}Z'
 
 
+def index_bytes(index: Index) -> bytes:
+    """The index file exactly as it is written."""
+    keys = {kid: {name: getattr(record, name) for name in FIELDS} for kid, record in sorted(index.keys.items())}
+    pending = {kid: {'op': p.op, 'started_at': p.started_at} for kid, p in sorted(index.pending.items())}
+    body = json.dumps({'version': INDEX_VERSION, 'backend': index.backend if index.live() else None, 'keys': keys,
+                       'pending': pending}, indent=1, ensure_ascii=True)
+    return (body + '\n').encode('ascii')
+
+
 class KeyStore:
     """One user's key store. Every call opens and checks the folder again; nothing is cached between calls."""
 
@@ -114,6 +154,8 @@ class KeyStore:
         self.system = system or System()
         self.root = Path(root) if root is not None else default_root(self.system)
         self._clock = clock
+        # Names this store in a keychain shared by all of the user's stores: a digest of its folder.
+        self.store_id = hashlib.sha256(os.fsencode(str(self.root))).hexdigest()[:32]
 
     def __repr__(self) -> str:
         return f'KeyStore({str(self.root)!r})'
@@ -139,11 +181,15 @@ class KeyStore:
         return index
 
     @staticmethod
-    def _write_index(folder: Folder, index: Index) -> None:
-        keys = {kid: {field: getattr(record, field) for field in FIELDS} for kid, record in sorted(index.keys.items())}
-        body = json.dumps({'version': INDEX_VERSION, 'backend': index.backend if keys else None, 'keys': keys},
-                          indent=1, ensure_ascii=True)
-        folder.write(INDEX_NAME, (body + '\n').encode('ascii'))
+    def _sized(index: Index) -> bytes:
+        data = index_bytes(index)
+        if len(data) > INDEX_MAX:
+            raise KeyStoreError('store_full', f'the index would be larger than {INDEX_MAX} bytes; remove a key first')
+        return data
+
+    @classmethod
+    def _write_index(cls, folder: Folder, index: Index) -> None:
+        folder.write(INDEX_NAME, cls._sized(index))
 
     def _backend(self, pinned: str | None):
         """The backend object to use now. With a pin, the host must still offer the pinned backend."""
@@ -155,23 +201,53 @@ class KeyStore:
                                     'they are not looked for anywhere else')
             raise KeyStoreError('backend_changed',
                                 f'keys were saved in {STORE_TEXT[pinned]}, but this host now offers {STORE_TEXT[offered]}; '
-                                'remove and add them again to move them')
+                                'remove each key (it can be removed) and add it again to move it')
         name = pinned or offered
-        if name not in BACKENDS:
-            raise KeyStoreError('backend_not_built',
-                                f'the {STORE_TEXT[name]} backend is not built yet; no key is written to a file on a host '
-                                'that has a keychain')
-        backend = BACKENDS[name]
-        return backend(self.system) if name == 'secret_service' else backend()
+        if name == 'owner_file':
+            return OwnerFile()
+        if name == 'secret_service':
+            return SecretService(self.system, self.store_id)
+        raise KeyStoreError('backend_not_built',
+                            f'the {STORE_TEXT[name]} backend is not built yet; no key is written to a file on a host '
+                            'that has a keychain')
+
+    def _removal_backend(self, pinned: str | None):
+        """The backend a removal uses: the owner-only file is always reachable, whatever the host offers now."""
+        return OwnerFile() if pinned == 'owner_file' else self._backend(pinned)
+
+    def _recover(self, folder: Folder, index: Index, backend, *, but: str | None = None) -> Index:
+        """Finish or undo what earlier writes left pending (not ``but``). An entry that still cannot be reached stays."""
+        if not index.pending:
+            return index
+        keys, pending = dict(index.keys), dict(index.pending)
+        for kid, entry in sorted(index.pending.items()):
+            if kid == but:
+                continue
+            if entry.op == 'add' and kid in keys:
+                del pending[kid]                 # the add finished; only its intent was left behind
+                continue
+            try:
+                backend.delete(kid, folder, frozenset(k for k in keys if k != kid))
+            except KeyStoreError:
+                continue                         # still unreachable: the intent stays, and list shows it
+            keys.pop(kid, None)                  # an unfinished remove is finished; an orphaned add is undone
+            del pending[kid]
+        if pending == index.pending:
+            return index
+        recovered = Index(index.backend, keys, pending)
+        self._write_index(folder, recovered)
+        return recovered
 
     # -- commands ----------------------------------------------------------------------------------
     def add(self, key_id: str, provider: str, env_name: str, value: str, *, metered_spend_allowed: bool = False,
             cap_usd: float = 0) -> KeyRecord:
         """Save a new key. An id that is already saved is refused (``key_exists``); remove it first."""
-        if not v.valid_key_id(key_id):
-            raise KeyStoreError('id_invalid', 'a key id is 1 to 128 of A-Z a-z 0-9 . _ : -, starting with a letter or digit')
+        problem = v.id_problem(key_id)
+        if problem is not None:
+            raise KeyStoreError('id_invalid', problem)
         if not v.valid_provider(provider):
-            raise KeyStoreError('provider_invalid', f'a provider is one of: {", ".join(v.PROVIDER_IDS)}')
+            raise KeyStoreError('provider_invalid', 'a provider is a lower-case vendor id: a-z 0-9 . _ -, starting with '
+                                f'a letter or digit (published ids: {", ".join(v.PROVIDER_IDS)})')
         if not v.valid_env_name(env_name):
             raise KeyStoreError('env_name_invalid', 'a variable name is A-Z 0-9 _, not starting with a digit')
         if not v.valid_value(value):
@@ -187,67 +263,103 @@ class KeyStore:
             existing.close()
         with self._folder(create=True) as folder, folder.locked():
             index = self._read_index(folder)
+            backend = self._backend(index.backend)       # None while nothing is in the index: a first save pins
+            index = self._recover(folder, index, backend)
             if key_id in index.keys:
                 raise KeyStoreError('key_exists', f'{key_id} is already saved; remove it first')
-            backend = self._backend(index.backend)       # None once no key is left: the pin is released
-            record = KeyRecord(key_id, provider, env_name, _now(self._clock), backend.name,
-                               metered_spend_allowed, cap_usd)
-            keys = dict(index.keys)
-            keys[key_id] = record
-            keep = frozenset(keys)
-            backend.put(key_id, value, folder, keep)
+            if key_id in index.pending:
+                raise KeyStoreError('operation_pending', f'an earlier operation on {key_id} is not finished and its '
+                                    'backend could not be reached; remove the key to clear it')
+            now = _now(self._clock)
+            record = KeyRecord(key_id, provider, env_name, now, backend.name, metered_spend_allowed, cap_usd)
+            keys = {**index.keys, key_id: record}
+            intent = Index(backend.name, index.keys, {**index.pending, key_id: Pending(key_id, 'add', now)})
+            done = Index(backend.name, keys, index.pending)
+            self._sized(Index(backend.name, keys, intent.pending))     # both states fit, before anything changes
+            self._write_index(folder, intent)                           # 1. the intent, before the outside effect
             try:
-                self._write_index(folder, Index(backend.name, keys))
+                backend.put(key_id, value, folder, frozenset(keys))     # 2. the value
+            except KeyStoreError as exc:
+                if exc.code != 'keychain_timeout':                      # refused for certain: nothing was saved
+                    with contextlib.suppress(Exception):
+                        self._write_index(folder, index)
+                raise
+            try:
+                self._write_index(folder, done)                         # 3. the key, and no intent
             except BaseException:
-                with contextlib.suppress(Exception):
+                try:
                     backend.delete(key_id, folder, frozenset(index.keys))
+                    undone = True
+                except Exception:  # noqa: BLE001 - the intent stays in the index: the next write recovers it
+                    undone = False
+                if undone:
+                    with contextlib.suppress(Exception):
+                        self._write_index(folder, index)
                 raise
             return record
 
-    def remove(self, key_id: str) -> KeyRecord:
-        """Delete a key's value from its backend, then its entry from the index."""
-        if not v.valid_key_id(key_id):
-            raise KeyStoreError('id_invalid', 'not a key id')
+    def remove(self, key_id: str) -> KeyRecord | None:
+        """Delete a key's value from its backend, then its entry from the index.
+
+        Returns the key's record, or None when the id was only an unfinished operation (an interrupted add) whose
+        orphaned value this removal cleared.
+        """
+        problem = v.id_problem(key_id)
+        if problem is not None:
+            raise KeyStoreError('id_invalid', problem)
         folder = self._folder(create=False)
         if folder is None:
             raise KeyStoreError('key_unknown', f'{key_id} is not saved')
         with folder, folder.locked():
             index = self._read_index(folder)
             record = index.keys.get(key_id)
-            if record is None:
+            if record is None and key_id not in index.pending:
                 raise KeyStoreError('key_unknown', f'{key_id} is not saved')
-            backend = self._backend(index.backend)
+            backend = self._removal_backend(index.backend)
+            index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
+            others = {kid: p for kid, p in index.pending.items() if kid != key_id}
+            now = _now(self._clock)
+            self._write_index(folder, Index(index.backend, index.keys, {**others, key_id: Pending(key_id, 'remove', now)}))
             backend.delete(key_id, folder, frozenset(keys))
-            self._write_index(folder, Index(index.backend, keys))
+            self._write_index(folder, Index(index.backend, keys, others))
             return record
 
     def list(self) -> Index:
-        """The index: the pinned backend and every key's record. Touches no backend and no keychain."""
+        """The index: the pinned backend, every key's record and every unfinished operation. Touches no backend."""
         folder = self._folder(create=False)
         if folder is None:
             return Index(None, {})
-        with folder:
-            return self._read_index(folder)
+        with folder, folder.locked(shared=True) as held:
+            index = self._read_index(folder)
+            if index.live() and not held:
+                raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
+            return index
 
     def values(self) -> tuple:
-        """For ``audit`` only: ``({key id: value}, {key id: refusal code})``, every value from the pinned backend."""
+        """For ``audit`` only: ``({key id: value}, {key id: refusal code})``, from the pinned backend.
+
+        Includes the value of an interrupted add the backend still holds, so that the audit looks for it too.
+        """
         folder = self._folder(create=False)
         if folder is None:
             return {}, {}
-        with folder:
+        with folder, folder.locked(shared=True) as held:
             index = self._read_index(folder)
-            if not index.keys:
+            if not index.live():
                 return {}, {}
+            if not held:
+                raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
             backend = self._backend(index.backend)
             found, missing = {}, {}
-            for kid in sorted(index.keys):
+            for kid in sorted(set(index.keys) | set(index.pending)):
                 try:
                     found[kid] = backend.get(kid, folder)
                 except KeyStoreError as exc:
                     if exc.code not in ('secret_missing', 'value_invalid'):
                         raise           # the backend itself cannot be read: no audit can be complete
-                    missing[kid] = exc.code
+                    if kid in index.keys:
+                        missing[kid] = exc.code
             return found, missing
 
     def owner_file(self) -> Path:
@@ -264,14 +376,24 @@ class KeyStore:
             folder = self._folder(create=False)
             if folder is None:
                 raise KeyError(connection_id)
-            with folder:
+            with folder, folder.locked(shared=True) as held:
                 index = self._read_index(folder)
                 record = index.keys.get(connection_id)
                 if record is None or record.env_name != env_name:
                     raise KeyError(connection_id)
+                if not held:
+                    raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
+                if connection_id in index.pending:
+                    raise KeyStoreError('operation_pending', f'an operation on {connection_id} is not finished')
+                if not v.known_provider(record.provider):
+                    # A vendor outside the published list is kept and listed, never handed to an engine: no route
+                    # or grant can name a provider yet, so nothing could tell that this route is meant for it.
+                    raise KeyStoreError('provider_unrouted', f'{record.provider} is not a published vendor; the key is '
+                                        'kept and listed, and handed to no engine until the vendor is published')
                 if not record.spend_allowed():
                     raise KeyStoreError('spend_not_allowed',
-                                        'this key has no metered-spend opt-in and cap; add it again with one')
+                                        'this key has no metered-spend opt-in and cap; remove it and add it again '
+                                        'with one')
                 return self._backend(index.backend).get(connection_id, folder)
         except KeyRefused:
             raise
@@ -288,17 +410,20 @@ class KeyStore:
 
 
 def _parse_index(raw: bytes) -> Index | None:
-    """The index exactly as ``_write_index`` writes it, or None. Nothing raises with the text attached."""
+    """The index exactly as ``index_bytes`` writes it, or None. Nothing raises with the text attached."""
     try:
         doc = json.loads(raw.decode('ascii'), object_pairs_hook=_pairs, parse_constant=_constant)
     except (ValueError, _Duplicate):
         doc = None
-    if not isinstance(doc, dict) or set(doc) != {'version', 'backend', 'keys'}:
+    if not isinstance(doc, dict) or set(doc) != {'version', 'backend', 'keys', 'pending'}:
         return None
-    if type(doc['version']) is not int or doc['version'] != INDEX_VERSION or not isinstance(doc['keys'], dict):
+    if type(doc['version']) is not int or doc['version'] != INDEX_VERSION:
         return None
+    if not isinstance(doc['keys'], dict) or not isinstance(doc['pending'], dict):
+        return None
+    live = bool(doc['keys'] or doc['pending'])
     backend = doc['backend']
-    if not (backend is None and not doc['keys']) and backend not in STORES:
+    if (backend not in STORES) if live else (backend is not None):
         return None
     keys = {}
     for key_id, entry in doc['keys'].items():
@@ -311,7 +436,14 @@ def _parse_index(raw: bytes) -> Index | None:
             return None
         keys[key_id] = KeyRecord(key_id, entry['provider'], entry['env_name'], entry['created_at'], entry['store'],
                                  allowed, cap)
-    return Index(backend if keys else None, keys)
+    pending = {}
+    for key_id, entry in doc['pending'].items():
+        if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != set(PENDING_FIELDS):
+            return None
+        if entry['op'] not in OPS or not v.valid_timestamp(entry['started_at']):
+            return None
+        pending[key_id] = Pending(key_id, entry['op'], entry['started_at'])
+    return Index(backend if live else None, keys, pending)
 
 
 class _Duplicate(Exception):

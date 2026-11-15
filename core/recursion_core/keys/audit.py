@@ -11,10 +11,15 @@ It fetches each saved value from the pinned backend and searches, as bytes:
 - the user's journal (``journalctl --user -o cat``), where the daemon's log lines go when it runs as a user
   service, unless ``--no-journal``.
 
-Each value is looked for as it was saved and as JSON would write it inside a string. Symlinks are not followed
-and only regular files are read (a FIFO cannot block the search). A file that cannot be read is counted and
-named, not skipped in silence. The report names files and key ids only: no value, no part of one, no
+It also searches for the value of an interrupted add that the backend still holds. Each value is looked for as
+it was saved and as JSON would write it inside a string. Symlinks are not followed and only regular files are
+read (a FIFO cannot block the search). The report names files and key ids only: no value, no part of one, no
 surrounding text.
+
+COMPLETE OR NOT. The audit is incomplete (``key audit`` exits 4 when it found nothing) when a saved value could
+not be read, a file could not be read, or the journal was asked for and not searched to the end: no
+``journalctl``, one that cannot start, or one that exits with a failure. Only ``--no-journal`` leaves the
+journal out without making the audit incomplete.
 """
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from recursion_core.keys.store import KeyStore
-from recursion_core.keys.system import ToolMissing
+from recursion_core.keys.system import ToolFailed, ToolMissing
 
 CHUNK = 1 << 16
 _NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
@@ -41,7 +46,12 @@ class Report:
     found: list = field(default_factory=list)        # (place, key id)
     missing: dict = field(default_factory=dict)      # key id -> refusal code: no value to search for
     journal: str = 'not searched'
+    journal_incomplete: bool = False   # asked for and not searched to the end
+    pending: dict = field(default_factory=dict)      # key id -> op: an operation left unfinished
     keys: int = 0
+
+    def complete(self) -> bool:
+        return not (self.missing or self.unreadable or self.journal_incomplete or self.pending)
 
 
 def default_roots(store: KeyStore) -> list:
@@ -63,9 +73,10 @@ def needles(values: dict) -> dict:
 
 def run(store: KeyStore, *, extra=(), journal: bool = True) -> Report:
     values, missing = store.values()
-    report = Report(missing=missing, keys=len(values) + len(missing))
+    pending = {kid: entry.op for kid, entry in store.list().pending.items()}
+    report = Report(missing=missing, pending=pending, keys=len(set(values) | set(missing)))
     if not values:
-        report.journal = 'not searched (no value to look for)' if journal else 'not searched'
+        report.journal = 'not searched (no value to look for)' if journal else 'not searched (--no-journal)'
         report.roots = [str(root) for root in default_roots(store)] + [str(Path(p)) for p in extra]
         return report
     found = needles(values)
@@ -153,14 +164,19 @@ def _scan(chunks, found: dict, longest: int, place: str, report: Report) -> None
 
 
 def _search_journal(store: KeyStore, found: dict, longest: int, report: Report) -> None:
+    """Search the user journal. A journal that was asked for and could not be searched to the end makes the audit
+    incomplete: no ``journalctl``, one that cannot start, or one that exits with a failure."""
     tool = store.system.which('journalctl')
     if tool is None:
-        report.journal = 'not searched (journalctl is not installed)'
+        report.journal, report.journal_incomplete = 'not searched (journalctl is not installed)', True
         return
     try:
         _scan(store.system.stream([tool, '--user', '--no-pager', '-o', 'cat']), found, longest, 'the user journal',
               report)
     except ToolMissing:
-        report.journal = 'not searched (journalctl could not be started)'
+        report.journal, report.journal_incomplete = 'not searched (journalctl could not be started)', True
+        return
+    except ToolFailed as exc:
+        report.journal, report.journal_incomplete = f'not searched to the end (journalctl exited {exc.args[0]})', True
         return
     report.journal = 'searched'

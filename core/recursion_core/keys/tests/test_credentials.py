@@ -145,6 +145,14 @@ class RouteTest(TempStoreCase):
         self.assertEqual((res['code'], res['detail']), (c.LAUNCH_REFUSED, 'no credential for claude-key'))
         self.assertEqual(h.launcher.calls, [])
 
+    def test_a_key_for_an_unpublished_vendor_is_never_injected(self) -> None:
+        # The key's variable is one an existing engine reads; the route names its id; it is still refused.
+        self.add(self.keys, key_id='other-key', value=MARKER + 'z', env='ANTHROPIC_API_KEY', provider='mistral')
+        h, res = self.claude(self.keys.credential, conn='other-key')
+        self.assertEqual((res['status'], res['code'], res['detail']), ('error', c.LAUNCH_REFUSED,
+                                                                        'no credential for other-key'))
+        self.assertEqual(h.launcher.calls, [])
+
     def test_no_spend_opt_in_refuses_before_launch(self) -> None:
         self.keys.remove('codex-key')
         self.add(self.keys, key_id='codex-key', value=MARKER, env='CODEX_API_KEY', cap=0)

@@ -115,16 +115,26 @@ class Folder:
         os.fsync(self.fd)
 
     @contextlib.contextmanager
-    def locked(self):
-        """Hold the folder's write lock (``flock`` on ``.lock``) for the block."""
+    def locked(self, *, shared: bool = False):
+        """Hold the folder's lock (``flock`` on ``.lock``) for the block: exclusive for a writer, shared for a reader.
+
+        A writer creates the lock file if it is missing. A reader creates nothing: with no lock file there has never
+        been a save in this folder, and the block runs with no lock held (``yield False``); the reader then finds no
+        index, or refuses one that exists without a lock beside it.
+        """
         import fcntl
 
+        flags = os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC | (0 if shared else os.O_CREAT)
         try:
             # Read-only is enough for flock, and opens a lock a umask left at 0400.
-            fd = os.open(LOCK_NAME, os.O_RDONLY | os.O_CREAT | _NOFOLLOW | _NONBLOCK | _CLOEXEC, FILE_MODE,
-                         dir_fd=self.fd)
+            fd = os.open(LOCK_NAME, flags, FILE_MODE, dir_fd=self.fd)
+        except FileNotFoundError:
+            fd = None
         except OSError as exc:
             raise KeyStoreError('file_invalid', f'{self.path / LOCK_NAME}: cannot be opened ({_why(exc)})') from None
+        if fd is None:
+            yield False
+            return
         try:
             st = os.fstat(fd)
             # The lock holds nothing; a umask may have made it 0400 when it was created, so a lock that is
@@ -134,8 +144,8 @@ class Folder:
                 raise KeyStoreError('file_invalid', f'{self.path / LOCK_NAME}: not an owner-only file')
             if stat.S_IMODE(st.st_mode) != FILE_MODE:
                 os.fchmod(fd, FILE_MODE)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
+            fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            yield True
         finally:
             os.close(fd)        # releases the lock
 

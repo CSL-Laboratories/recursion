@@ -21,12 +21,13 @@ CODES = (
     # what a command was given
     'id_invalid', 'provider_invalid', 'env_name_invalid', 'value_invalid', 'cap_invalid',
     'value_from_argv', 'no_terminal', 'stdin_is_terminal', 'key_exists', 'key_unknown', 'not_confirmed',
+    'operation_pending', 'provider_unrouted',
     # the owner-only folder and its files
-    'folder_invalid', 'file_invalid', 'index_invalid', 'owner_file_invalid', 'store_failed',
+    'folder_invalid', 'file_invalid', 'index_invalid', 'owner_file_invalid', 'store_failed', 'store_full',
     'platform_unsupported',
     # the backend, its pin and the keychain
     'backend_changed', 'backend_not_built', 'keychain_unavailable', 'keychain_locked', 'keychain_failed',
-    'keychain_timeout', 'keychain_tool_missing', 'keychain_undetermined', 'secret_missing',
+    'keychain_timeout', 'keychain_tool_missing', 'keychain_undetermined', 'keychain_unsupported', 'secret_missing',
     # spend
     'spend_not_allowed',
 )

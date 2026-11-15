@@ -54,7 +54,8 @@ class SecretToolTest(TempStoreCase):
         stored = calls[0]
         self.assertEqual(stored['stdin_sha256'], hashlib.sha256(MARKER.encode()).hexdigest())
         self.assertEqual(stored['argv'], ['store', '--label=Recursion API key codex-key', 'application', 'recursion',
-                                          'recursion_key_id', 'codex-key'])
+                                          'recursion_store', store.store_id, 'recursion_key_id', 'codex-key'])
+        self.assertRegex(store.store_id, r'^[0-9a-f]{32}$')
         for call in calls:
             self.assertNotIn(MARKER, json.dumps(call['argv']))
             self.assertNotIn(MARKER, json.dumps(call['env']))
@@ -73,7 +74,7 @@ class SecretToolTest(TempStoreCase):
         with self.assertRaises(KeyStoreError) as caught:
             self.add(store, key_id='second', value=OTHER)
         self.assertEqual(caught.exception.code, 'keychain_locked')
-        self.assertIn('locked collection', caught.exception.detail)
+        self.assertEqual(caught.exception.detail, 'secret-tool store exited 1: the collection is locked')
         self.assertFalse((self.root / 'secrets.json').exists())
 
     def test_without_secret_tool_a_keychain_host_is_refused(self) -> None:

@@ -60,12 +60,16 @@ class FakeSystem(System):
         yield done.stdout
 
 
-def busctl(owner: bool = False, activatable: bool = False):
+def busctl(owner: bool = False, activatable: bool = False, kwallet: bool = False):
+    """A stand-in ``busctl``: ``ListNames`` and ``ListActivatableNames`` as ``busctl --user call`` prints them."""
     def run(argv, input):
-        if 'NameHasOwner' in argv:
-            return Completed(0, b'b true\n' if owner else b'b false\n', b'')
-        names = '"org.freedesktop.DBus" "org.freedesktop.secrets"' if activatable else '"org.freedesktop.DBus"'
-        return Completed(0, f'as {names.count(chr(34)) // 2} {names}\n'.encode(), b'')
+        names = ['org.freedesktop.DBus']
+        if ('ListNames' in argv and owner) or ('ListActivatableNames' in argv and activatable):
+            names.append('org.freedesktop.secrets')
+        if 'ListNames' in argv and kwallet:
+            names.append('org.kde.kwalletd6')
+        text = f'as {len(names)} ' + ' '.join(f'"{name}"' for name in names) + '\n'
+        return Completed(0, text.encode(), b'')
     return run
 
 
@@ -94,8 +98,8 @@ class FakeKeychain:
                 return Completed(0, self.items[key], b'')
             return Completed(1, b'', b'')
         if action == 'clear':
-            self.items.pop(key, None)
-            return Completed(0, b'', b'')
+            # As libsecret: clear reports whether it removed something; secret-tool exits 1, silently, if not.
+            return Completed(0, b'', b'') if self.items.pop(key, None) is not None else Completed(1, b'', b'')
         return Completed(2, b'', b'secret-tool: unknown action\n')
 
 
@@ -167,7 +171,8 @@ elif action == 'lookup':
         sys.exit(1)
     sys.stdout.write(items[key]); sys.stdout.flush(); sys.exit(0)
 elif action == 'clear':
-    items.pop(key, None)
+    if items.pop(key, None) is None:
+        sys.exit(1)
 else:
     sys.stderr.write('secret-tool: unknown\n'); sys.exit(2)
 with open(items_path, 'w') as fh:
@@ -176,8 +181,8 @@ with open(items_path, 'w') as fh:
 
 _BUSCTL = r'''#!{python} -I
 import sys
-if 'NameHasOwner' in sys.argv:
-    print('b true')
+if 'ListNames' in sys.argv:
+    print('as 2 "org.freedesktop.DBus" "org.freedesktop.secrets"')
 else:
     print('as 1 "org.freedesktop.DBus"')
 '''

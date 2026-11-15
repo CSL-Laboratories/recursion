@@ -17,12 +17,12 @@ class _Usage(Exception):
 
 
 class QuietParser(argparse.ArgumentParser):
-    """An ``ArgumentParser`` whose errors keep argparse's own wording only when it repeats nothing typed."""
+    """An ``ArgumentParser`` whose usage errors are returned, not printed with an exit. What reaches ``error`` has
+    already been made safe by ``cli.configure``, which keeps argparse's wording only where it repeats nothing
+    typed (the same for this entry and for ``recursion-control key``)."""
 
     def error(self, message):
-        if message.startswith('the following arguments are required:'):
-            raise _Usage(message)
-        raise _Usage('the command line could not be read (what was typed is not repeated here)')
+        raise _Usage(message)
 
 
 def parser() -> QuietParser:

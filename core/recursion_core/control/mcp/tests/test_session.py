@@ -815,6 +815,27 @@ class AnswerTest(SessionCase):
         self.assertEqual([{"event": "write_failed", "detail": "OSError"}, {"event": "output_lost", "dropped_unsent": 1}],
                          events[-2:])
 
+    def test_a_reader_answer_whose_write_raises_is_a_failed_output(self) -> None:
+        # Round 7 of #395 (DeepSeek's F4): a session given no reply writes the reader's own answers; a write
+        # that raises there is a failed output too, and an exit then goes on to the caller of receive.
+        for raised in (TypeError("a text stream"), SystemExit("bye")):
+            with self.subTest(raised=type(raised).__name__):
+                def write(message, raised=raised):
+                    raise raised
+
+                api = GateAPI()
+                events: list[dict] = []
+                session = server.LegacySession(api, write, log=events.append)
+                if isinstance(raised, Exception):
+                    self.feed(session, INIT)
+                else:
+                    with self.assertRaises(SystemExit):
+                        self.feed(session, INIT)
+                self.assertFalse(session.initialized)  # the answer was never written
+                self.assertEqual([{"event": "write_failed", "detail": type(raised).__name__},
+                                  {"event": "output_lost", "dropped_unsent": 0}], events)
+                api.assert_nothing_entered(self)
+
 
 class EndOfInputTest(unittest.TestCase):
     def test_end_of_input_waits_for_calls_in_flight_and_writes_their_answers(self) -> None:

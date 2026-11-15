@@ -89,7 +89,10 @@ yet written are discarded, calls already sent are left to finish at the daemon (
 place), and ``serve`` returns without waiting for more input. Reading runs on its own thread for that
 reason. The failure is known at the first write that fails: a call read before then is sent if its worker
 starts before then. A ``write`` that raises instead of failing quietly (an in-process session's) counts
-as a failed output too: ``{"event": "write_failed", "detail": ...}`` is logged and nothing more is sent.
+as a failed output too, for a call's answer and for an answer the reader writes itself (a session given no
+``reply``): ``{"event": "write_failed", "detail": ...}`` is logged and nothing more is sent. On the
+reader's thread an exit or an interrupt then goes on to the caller of ``receive``. ``serve``'s writer
+(``framing.FrameWriter``) is failed by any of them, so ``serve`` ends as for a failed stdout.
 """
 
 from __future__ import annotations
@@ -206,10 +209,19 @@ class LegacySession:
         self.initialized = False
 
     def _write_now(self, message: dict) -> bool:
-        """``reply`` of an in-process session: the answer is written at once, by the reader."""
+        """``reply`` of an in-process session: the answer is written at once, by the reader. A write that
+        raises is a failed output (OUTPUT FAILURE) and the answer is not taken; an exit or an interrupt then
+        goes on to the caller."""
 
-        self._write(message)
-        return True
+        try:
+            self._write(message)
+            return True
+        except BaseException as exc:
+            self._log({"event": "write_failed", "detail": type(exc).__name__})
+            self.output_lost()
+            if not isinstance(exc, Exception):
+                raise
+            return False
 
     # -- input --------------------------------------------------------------------------------------
     def receive(self, frame: Frame) -> None:

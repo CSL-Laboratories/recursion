@@ -165,6 +165,13 @@ class ReplyQueueTest(unittest.TestCase):
             ReplyQueue(FrameWriter(Capture()), max_bytes=0)
 
 
+class ExitingStdout(Capture):
+    """A stdout whose write raises an exit, not an ``Exception``."""
+
+    def write(self, data: bytes) -> int:
+        raise SystemExit("stdout raised an exit")
+
+
 class TextStdoutTest(unittest.TestCase):
     def test_serve_over_a_text_stdout_returns_as_for_a_failed_stdout(self) -> None:
         # Round 6 of #395 (DeepSeek's F1): a consumer gives serve a text stream for stdout. The first answer
@@ -178,6 +185,39 @@ class TextStdoutTest(unittest.TestCase):
         self.assertFalse(serving.is_alive(), "serve never returned")
         self.assertEqual([0], status)
         self.assertEqual({"event": "output_failed", "stdout_broken": True}, events.all[-1])
+
+    def test_serve_whose_stdout_raises_an_exit_returns_as_for_a_failed_stdout(self) -> None:
+        # Round 7 of #395 (DeepSeek's F1): the reply thread survived the exit, but nobody was told stdout had
+        # failed, and the last line said it had not.
+        events = Events()
+        status: list = []
+        serving = threading.Thread(target=lambda: status.append(
+            server.serve(GateAPI(), io.BytesIO(encode(INIT)), ExitingStdout(), log=events)), daemon=True)
+        serving.start()
+        serving.join(HANG_GUARD_S)
+        self.assertFalse(serving.is_alive(), "serve never returned")
+        self.assertEqual([0], status)
+        self.assertEqual({"event": "output_failed", "stdout_broken": True}, events.all[-1])
+
+    def test_an_exit_raised_by_stdout_on_a_reader_answer_ends_forwarding(self) -> None:
+        # Round 7 of #395 (DeepSeek's F1): a Stop read after the reply's write raised an exit was still sent.
+        api = GateAPI()
+        events = Events()
+        writer = FrameWriter(ExitingStdout())
+        replies = ReplyQueue(writer)
+        session = server.LegacySession(api, writer.write, reply=replies.offer, log=events,
+                                       output_open=lambda: not writer.broken)
+        writer.on_broken = session.output_lost
+        replies.start()
+        session.receive(Frame(message=INIT))  # its answer's write raises the exit, on the reply thread
+        with replies._cond:
+            self.assertTrue(replies._cond.wait_for(lambda: not replies._pending, HANG_GUARD_S))
+        self.assertTrue(writer.broken)
+        self.assertIn({"event": "output_lost", "dropped_unsent": 0}, events.all)
+        session.receive(Frame(message=call(2, *STOP)))
+        self.assertEqual(0, session.in_flight())  # refused at admission: nothing is sent
+        api.assert_nothing_entered(self)
+        replies.close()
 
 
 class SessionReplyTest(unittest.TestCase):

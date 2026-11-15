@@ -247,6 +247,38 @@ class StaleWatchOnlyTest(unittest.TestCase):
         self.assertNotIn("run=run-1", app._uncertain)
         self.assertNotIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
 
+    def test_unrecorded_pending_stop_stays_uncertain_across_refresh(self) -> None:
+        from recursion_core.control.tests.fakes import run_ids
+        from recursion_core.control.tests.test_stop import FailingRegistry
+
+        reg = FailingRegistry()
+        api = ControlAPI(reg, FakeKillTree([POPULATED]), lambda params: {"cgroup": f"/cg/{params['run_id']}"},
+                         clock=lambda: 1000.0, new_run_id=run_ids())
+        run_id = api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"})["run"]["run_id"]
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        reg.fail_puts = True
+        app.press("s")
+        app.press("y")
+        self.assertEqual((app.last["code"], app.last["recorded"]), ("pending", False))
+        self.assertIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
+        app.press("r")
+        self.assertIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
+        self.assertFalse(any("UNCERTAIN cleared" in e.text for e in app.log))
+
+    def test_an_unconfirmed_stop_stays_uncertain_when_the_run_ends_any_other_way(self) -> None:
+        # Review of #372 (Astra, M01): only an attested stop clears it; ended and lost_reboot do not.
+        api = ScriptedAPI({"run.list": {"code": "ok", "runs": []}})
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        app.on_answer("run.stop", {"run_id": "run-1"}, {"code": "pending", "run_id": "run-1", "recorded": False})
+        for state in ("ended", "lost_reboot", "unknown", "running"):
+            with self.subTest(state=state):
+                app.on_answer("run.list", {}, {"code": "ok", "runs": [{"run_id": "run-1", "state": state}]})
+                self.assertIn("run=run-1", app._uncertain)
+        app.on_answer("run.list", {}, {"code": "ok", "runs": [{"run_id": "run-1", "state": "stopped"}]})
+        self.assertNotIn("run=run-1", app._uncertain)
+
     def test_stale_list_stays_stale_after_a_fresh_status(self) -> None:
         # 4503920848: attaching replaced the stale list answer and watch_only turned off.
         run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}
@@ -332,10 +364,6 @@ class ErrorStaysTest(unittest.TestCase):
         self.assertIn("usage error", app.errors[-1])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class StopBeforeLaunchRecordedTest(unittest.TestCase):
     """Red-team round 3 finding 1: a Stop sent while the launch is unrecorded stays visible after refresh."""
 
@@ -393,3 +421,7 @@ class StopBeforeLaunchRecordedTest(unittest.TestCase):
         for run, want in cases:
             with self.subTest(run=run):
                 self.assertIs(p.stop_unconfirmed({"run_id": "r", **run}), want)
+
+
+if __name__ == "__main__":
+    unittest.main()

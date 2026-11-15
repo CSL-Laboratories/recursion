@@ -1,0 +1,15 @@
+{
+  "engine": "claude_code",
+  "driver": 2,
+  "flags": {
+    "multi_turn": true,
+    "mid_turn_input": true,
+    "interrupt": true,
+    "resume": true,
+    "fork": false,
+    "permission_bridge": true,
+    "typed_limits": true,
+    "usage": true
+  },
+  "input_ack": true
+}

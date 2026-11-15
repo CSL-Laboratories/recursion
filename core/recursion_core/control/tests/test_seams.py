@@ -3771,6 +3771,81 @@ class ClosingSignalTest(unittest.TestCase):
             thread.join(BOUND_S)
         self.assertEqual((woken, closing._waiters), ([True, True, True], []))
 
+    def test_a_wait_whose_time_ran_out_keeps_its_answer_when_the_signal_is_set_just_after(self) -> None:
+        """The order is an ordinary one, with nothing interrupted: the timed wait on the waiter's own lock ends
+        with nothing having let that lock go, THEN a set runs, THEN the wait returns. It answers False, which is
+        whether it was woken; ``is_set()`` is what says that the signal is set by now."""
+        closing, timed, native = methods.Signal(), [], threading.Lock
+
+        class SetJustAfter:
+            """A waiter's lock; a set runs the moment its timed wait has ended."""
+
+            def __init__(inner) -> None:
+                inner.lock = native()
+
+            def acquire(inner, *how):
+                got = inner.lock.acquire(*how)
+                if len(how) == 2:           # the timed wait
+                    timed.append(got)
+                    closing.set()
+                return got
+
+            def release(inner) -> None:
+                inner.lock.release()
+        with mock.patch.object(methods, 'threading', mock.Mock(Lock=SetJustAfter)):
+            answer = closing.wait(0.001)
+        self.assertEqual(timed, [False], 'the time ran out before anything had set the signal')
+        self.assertEqual((answer, closing.is_set(), closing._waiters), (False, True, []))
+        self.assertEqual(closing.wait(0.001), True, 'the next wait finds it set and does not wait')
+
+    def test_a_waiter_that_leaves_comes_off_the_list_in_one_call_and_never_looks_first(self) -> None:
+        """Looking for itself and then removing itself is two steps. On the free-threaded interpreter the look
+        walks the list while other waiters shorten it, so it can pass its own entry by, and that waiter then
+        stays on the list for good. Here the list answers every look as such a look was answered: not there."""
+        closing = methods.Signal()
+
+        class Overtaken(list):
+            def __contains__(inner, item) -> bool:
+                return False
+        closing._waiters = Overtaken()
+        self.assertEqual((closing.wait(0), closing.wait(0.001), list(closing._waiters)), (False, False, []))
+        closing.set()
+        self.assertEqual((closing.wait(0), self.waited(closing, None), list(closing._waiters)), (True, [True], []))
+
+    def test_waiters_that_leave_all_at_once_leave_nothing_on_the_list(self) -> None:
+        """Sixteen threads ask a signal that is never set, a thousand times each, most with no time to wait and
+        some with a little. Nothing is interrupted and nothing is traced. Every answer is False and the list
+        ends empty: every waiter that left took its own lock off."""
+        closing, answers, errors, go = methods.Signal(), [], [], threading.Barrier(16)
+
+        def ask() -> None:
+            try:
+                go.wait(BOUND_S)
+                for turn in range(1000):
+                    answers.append(closing.wait(0.0001 if turn % 8 == 0 else 0))
+            except BaseException as exc:  # noqa: BLE001 - it is reported below
+                errors.append(repr(exc))
+        threads = [threading.Thread(target=ask, daemon=True) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(BOUND_S)
+        self.assertEqual((errors, sum(thread.is_alive() for thread in threads)), ([], 0))
+        self.assertEqual((len(answers), any(answers), closing.is_set()), (16000, False, False))
+        self.assertEqual(closing._waiters, [], 'a waiter that left is still on the list')
+
+    def test_a_wait_interrupted_before_it_is_on_the_list_raises_what_interrupted_it(self) -> None:
+        """It then finds nothing of its own to take off, and that is not an error of its own."""
+        closing = methods.Signal()
+
+        class Interrupted(list):
+            def append(inner, item) -> None:
+                raise KeyboardInterrupt
+        closing._waiters = Interrupted()
+        with self.assertRaises(KeyboardInterrupt):
+            closing.wait(BOUND_S)
+        self.assertEqual(list(closing._waiters), [])
+
     def test_a_set_that_was_interrupted_is_finished_by_asking_again(self) -> None:
         """What makes it safe to ask again: the flag is stored first, and a waiter's lock that was released
         already is simply passed over."""

@@ -391,7 +391,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
         for missing in ("reason", "rule", "engine", "model", "connection"):
             partial = {k: v for k, v in d.items() if k != missing}
             self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, missing)
-        for connection in ({"id": "claude-main"}, ["kind", "id"]):
+        for connection in ({"id": "claude-main"}, ["kind", "id"], _LikeAMapping(("kind", "id"), "x")):
             self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT),
                              {"action": "none", "reason": "no_decision"}, connection)
         refused = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "pi", "model": None}})
@@ -1046,6 +1046,79 @@ class ReviewEightRegressionTests(unittest.TestCase):
                 self.assertEqual(router.snapshot(detection), (None, "detection_malformed"))
                 decision = router.decide(cfg, detection, {"task_kind": "review"})
                 self.assertEqual((decision["ok"], decision["reason"]), (False, "detection_malformed"))
+
+
+class _GoesOnSecondAsking(dict):
+    """A decision (or connection) whose one member goes the second time its presence is asked: a member deleted
+    while the decision is read (sol's stateful witness)."""
+
+    def __init__(self, values, key):
+        super().__init__(values)
+        self.key, self.asked = key, 0
+
+    def __contains__(self, key):
+        if key == self.key:
+            self.asked += 1
+            if self.asked > 1:
+                self.pop(key, None)
+                return False
+        return super().__contains__(key)
+
+
+class _UnformattableId(str):
+    def __format__(self, spec):
+        raise RuntimeError("connection id formatting")
+
+
+class DisappearingMemberTests(unittest.TestCase):
+    """The fifth Codex read of #399 (gpt-6.1-sol, 477fa308..8984581e), change 1: a required member that goes while
+    the decision is read (sol's stateful_case, by its names)."""
+
+    def test_a_required_member_lost_while_reading_is_no_decision(self) -> None:  # sol 1
+        cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        d = router.decide(cfg, SENTRY, {})
+        for key in ("reason", "rule", "engine", "model"):
+            with self.subTest(key=key):
+                decision = _GoesOnSecondAsking(d, key)
+                actual = router.next_after_limit(cfg, decision, LIMIT)
+                if not dict.__contains__(decision, key):
+                    self.assertEqual(actual, {"action": "none", "reason": "no_decision"})
+                else:
+                    self.assertEqual(actual, router.next_after_limit(cfg, d, LIMIT))
+
+    def test_a_primary_cannot_be_reoffered_when_a_member_disappears(self) -> None:  # sol 1
+        primary = copy.deepcopy(ROUTES["claude_code"]["route"])
+        cfg = with_limits({"on_limit": "fallback", "fallback": [primary, CODEX]})
+        d = router.decide(cfg, SENTRY, {})
+        control = router.next_after_limit(cfg, d, LIMIT)
+        self.assertEqual((control["action"], control["place"], control["route"]["engine"]), ("switch", 2, "codex"))
+        for key in ("reason", "rule", "engine", "model"):
+            with self.subTest(key=key):
+                decision = _GoesOnSecondAsking(d, key)
+                self.assertEqual(router.next_after_limit(cfg, decision, LIMIT), control)
+                self.assertEqual(decision.asked, 1)  # each member's presence is asked for once
+        for key in ("kind", "id"):  # the connection's members are walked once, and nothing asks for one again
+            with self.subTest(connection=key):
+                connection = _GoesOnSecondAsking(d["connection"], key)
+                self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT), control)
+
+
+class RequiredRegressionTests(unittest.TestCase):
+    """The fifth Codex read of #399, changes 2 and 3: two rules that no test pinned (sol's required_regressions,
+    by its names)."""
+
+    def setUp(self) -> None:
+        self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        self.decision = router.decide(self.cfg, SENTRY, {})
+
+    def test_route_decision_refuses_a_connection_id_str_subclass(self) -> None:  # sol 2
+        conn = self.decision["connection"]
+        decision = {**self.decision, "connection": {**conn, "id": _UnformattableId(conn["id"])}}
+        self.assertIsNone(router.route_decision(decision))
+
+    def test_next_after_limit_refuses_unknown_reason(self) -> None:  # sol 3
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.decision, "reason": "learned"}, LIMIT),
+                         {"action": "none", "reason": "no_decision"})
 
 
 if __name__ == "__main__":

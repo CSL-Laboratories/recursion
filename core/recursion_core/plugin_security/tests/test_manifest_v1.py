@@ -78,6 +78,22 @@ class ParseV1Tests(unittest.TestCase):
         self.assertEqual(manifest.raw, raw)
         self.assertEqual(manifest.permissions, ("read", "panel"))
 
+    def test_the_parsed_lists_are_immutable_tuples(self) -> None:
+        # DeepSeek V4.1 Flash, round 2, L4: what the manifest keeps cannot be changed after the checks.
+        manifest = parse_manifest(v1(permissions=("read", "network", "credential"), network=("api.example.org",),
+                                     credentials=("vault:test",), install_scripts=("setup",)))
+        for name in ("permissions", "network_destinations", "credential_refs", "install_scripts", "files"):
+            with self.subTest(field=name):
+                self.assertIs(type(getattr(manifest, name)), tuple)
+
+    def test_a_hand_built_version_1_manifest_with_no_files_does_not_name_every_file(self) -> None:
+        # DeepSeek V4.1 Flash, round 2, L2.
+        from recursion_core.plugin_security.manifest import Manifest
+        empty = Manifest("demo.plugin", "1", sha(PLUGIN_SOURCE), None, (), FAKE_KEY, ("read",), (), (), b"",
+                         MANIFEST_SCHEMA_V1, "python-inprocess/1", "csl-plugin-api/1", ())
+        self.assertFalse(empty.names_every_file)
+        self.assertTrue(parse_manifest(v1()).names_every_file)
+
     def test_vnext_still_parses_and_names_no_file_but_its_artifact(self) -> None:
         manifest = parse_manifest(manifest_bytes(FAKE_KEY))
         self.assertEqual(manifest.schema, MANIFEST_SCHEMA)
@@ -220,10 +236,14 @@ class FilesTests(unittest.TestCase):
                       {"manifest.json.": sha(b"")}, {"notes/x.": sha(b"")}):
             with self.subTest(paths=sorted(extra)):
                 self.assertRefused(self.files(**extra), "manifest_files_path")
-        for name in ("CON.txt", "con", "Nul", "aux.py", "prn.tar.gz", "COM1", "lpt9.log", "notes/com0"):
+        for name in ("CON.txt", "con", "Nul", "aux.py", "prn.tar.gz", "COM1", "lpt9.log", "notes/com9",
+                     "con/x.py", "notes/AUX/y.py", "a/nul.d/b.py", "lpt1/com2/z.py", "notes./x.py"):
+            # a device name or a trailing dot in any segment, folders included (Codex GPT-6 Astra, round 2)
             with self.subTest(name=name):
                 self.assertRefused(self.files(**{name: sha(b"")}), "manifest_files_path")
-        for name in ("console.py", "conn", "nullable.py", "com10", "lpt", "auxiliary/x.py", "x.con"):
+        # Windows reserves COM1-COM9 and LPT1-LPT9, not COM0 or LPT0 (DeepSeek V4.1 Flash, round 2, L1).
+        for name in ("console.py", "conn", "nullable.py", "com10", "com11", "lpt99.txt", "lpt", "auxiliary/x.py", "x.con",
+                     "com0", "lpt0.py", "notes/com0/x.py"):
             with self.subTest(accepted=name):
                 self.assertIn(name, dict(parse_manifest(v1(files=self.files(**{name: sha(b"")}))).files))
 

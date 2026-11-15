@@ -92,6 +92,9 @@ class ReservedNormalFormTests(unittest.TestCase):
                 self.assertFalse(host_in_normal_form(char + ".example"))
                 self.assertFalse(host_in_normal_form("api.x" + char + ".example"))
                 self.assertFalse(host_in_normal_form("api.example." + char + "x"))  # in the last label too
+                for last in ("x" + char + "y", "xy" + char):  # inside and at the end of it (Codex GPT-6.1 Sol, round 2)
+                    self.assertFalse(host_in_normal_form("api." + last))
+                    self.assertFalse(destination_in_normal_form("api." + last + ":443"))
                 self.assertEqual(refusal(ReservedEffects, credential_prefixes=(char + ":",)), INSTALL_CONFIG)
                 self.assertEqual(refusal(ReservedEffects, credential_prefixes=("vault" + char,)), INSTALL_CONFIG)
 
@@ -127,6 +130,14 @@ class ReservedNormalFormTests(unittest.TestCase):
                 self.assertEqual(refusal(ReservedEffects, credential_prefixes=value), INSTALL_CONFIG)
         # Every letter of "venue" is itself a prefix in normal form, so only the type check refuses it.
         self.assertEqual(refusal(ReservedEffects, credential_prefixes="venue"), INSTALL_CONFIG)
+        # A set is refused too (DeepSeek V4.1 Flash, round 2, M1): reading a set another thread is still changing
+        # raises RuntimeError, not this refusal. A frozenset, tuple or list is taken.
+        self.assertEqual(refusal(ReservedEffects, hosts={"venue.example"}), INSTALL_CONFIG)
+        self.assertEqual(refusal(ReservedEffects, credential_prefixes={"venue:"}), INSTALL_CONFIG)
+        for kind in (frozenset, tuple, list):
+            with self.subTest(kind=kind.__name__):
+                policy = ReservedEffects(kind(["venue.example"]), kind(["venue:"]))
+                self.assertEqual((policy.hosts, policy.credential_prefixes), (frozenset({"venue.example"}), ("venue:",)))
 
     @unittest.skipUnless(os.name == "posix", "the daemon's plugin reader opens files with O_NOFOLLOW (Linux)")
     def test_the_daemon_refuses_an_install_file_with_a_reserved_entry_not_in_normal_form(self) -> None:
@@ -324,6 +335,15 @@ class GrantBoundToDeveloperKeyTests(unittest.TestCase):
         perms, dropped = effective_permissions(self.m1, "unsigned", None, grant, key_id(K1), 1)
         self.assertEqual(perms, ("read", "propose"))
         self.assertEqual(dropped, [("signer_key_revoked_order_off", key_id(K1))])
+
+    def test_what_is_not_a_manifest_or_a_grant_is_refused_with_a_code(self) -> None:
+        # DeepSeek V4.1 Flash, round 2, L3: an install.json entry as a dict, or raw manifest bytes.
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
+        as_dict = {"plugin_id": "demo.plugin", "artifact_sha256": DIGEST, "signer_key_id": None, "permissions": list(ALL)}
+        self.assertEqual(refusal(effective_permissions, self.m1, "unsigned", None, as_dict), "grant_invalid")
+        self.assertEqual(refusal(effective_permissions, manifest_bytes(K1), "unsigned", None, grant), "manifest_invalid")
+        self.assertEqual(refusal(effective_permissions, manifest_bytes(K1), "unsigned", None, None), "manifest_invalid")
+        self.assertEqual(effective_permissions(self.m1, "unsigned", None, None)[1][0][0], "no_grant")
 
     def test_the_older_checks_still_come_first(self) -> None:
         grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K2))

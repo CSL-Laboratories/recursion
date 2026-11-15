@@ -118,8 +118,9 @@ _VERSION_V1 = re.compile(r"[ -~]{1,64}")
 _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
 # Refused so that one package names one set of files on every system: a segment ending in '.'
 # (Windows drops it, so "lib." is "lib") and a name Windows reserves for a device, in any case and
-# with any extension ("CON.txt").
-_WINDOWS_DEVICE = re.compile(r"(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?")
+# with any extension ("CON.txt"): CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (Microsoft, "Naming
+# Files, Paths, and Namespaces"; its superscript-digit forms cannot occur in this ASCII grammar).
+_WINDOWS_DEVICE = re.compile(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?")
 
 
 @dataclass(frozen=True)
@@ -143,12 +144,14 @@ class Manifest:
 
     @property
     def names_every_file(self) -> bool:
-        """True when the signed bytes list every file of the package (version 1).
+        """True when the manifest is version 1 and lists at least one file.
 
         A statement about the manifest, not about the package on disk: only
-        ``verify_package`` shows that the files match it.
+        ``verify_package`` shows that the files match it. Only a manifest from
+        ``parse_manifest`` is known to hold what its signed bytes say; one built by hand
+        is not, and one with no files is never taken as naming every file.
         """
-        return self.schema == MANIFEST_SCHEMA_V1
+        return self.schema == MANIFEST_SCHEMA_V1 and bool(self.files)
 
 
 def host_in_normal_form(host: object) -> bool:
@@ -170,7 +173,7 @@ def _matches(pattern: re.Pattern):
 def _str_list(value: object, ok, code: str, ordered: bool = True) -> tuple:
     if type(value) is not list:
         raise Refused(code)
-    items = tuple(value)  # one snapshot: every check below reads the same items
+    items = tuple(value)  # the manifest keeps an immutable tuple, and every check below reads it
     if not all(ok(v) for v in items):
         raise Refused(code)
     if len(set(items)) != len(items) or (ordered and list(items) != sorted(items)):
@@ -217,7 +220,10 @@ def parse_manifest(raw: bytes) -> Manifest:
     """Parse and check manifest bytes, either form. Refuses anything malformed; never guesses.
 
     ``csl-plugin-manifest/1`` is told apart by its ``schema``; anything else is read as
-    vNext, exactly as before, so a vNext manifest's refusals are unchanged.
+    vNext. A vNext manifest is checked as before except for its declared destinations, which
+    now follow ``_HOST`` (D0 and Lucas's B44): a raw IP address, a port outside 1 to 65535 or
+    with a leading zero, a label of 64 characters or more and a host of more than 253 are
+    refused, as ``manifest_network_destinations``, where the earlier parser accepted them.
     """
     data = parse(raw)
     v1 = type(data) is dict and data.get("schema") == MANIFEST_SCHEMA_V1
@@ -439,7 +445,9 @@ class Grant:
 
 
 def _bound_developer_key(grant: Grant) -> str | None:
-    """The developer key id a grant is bound to, or None when it names none."""
+    """The developer key id a grant names for itself: ``developer_key_id`` when set; for a
+    manual grant (no signer) otherwise ``order_after_revoked_key``; else None. A signed grant
+    is bound through its signer, so its ``order_after_revoked_key`` is not read here."""
     if grant.developer_key_id is not None:
         return grant.developer_key_id
     if grant.signer_key_id is None:
@@ -464,9 +472,12 @@ class ReservedEffects:
     credential_prefixes: tuple = ()
 
     def __post_init__(self) -> None:
-        if (type(self.hosts) not in (frozenset, set, tuple, list)
-                or type(self.credential_prefixes) not in (frozenset, set, tuple, list)):
-            raise Refused("plugin_install_config_invalid", "reserved: hosts and credential_prefixes are lists")
+        # A frozenset, tuple or list is read in one copy; a set is refused, because reading a set
+        # another thread is still changing raises RuntimeError instead of this refusal.
+        if (type(self.hosts) not in (frozenset, tuple, list)
+                or type(self.credential_prefixes) not in (frozenset, tuple, list)):
+            raise Refused("plugin_install_config_invalid",
+                          "reserved: hosts and credential_prefixes are lists (a frozenset, tuple or list)")
         hosts, prefixes = tuple(self.hosts), tuple(self.credential_prefixes)  # one snapshot each
         for host in hosts:
             if not host_in_normal_form(host):
@@ -518,8 +529,12 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
     its identity is never inferred from the unsigned manifest on disk.
     """
     dropped: list[tuple[str, str]] = []
+    if type(manifest) is not Manifest:
+        raise Refused("manifest_invalid", "effective_permissions takes a parsed Manifest")
     if grant is None:
         return (), [("no_grant", "no installer grant for this plugin")]
+    if type(grant) is not Grant:
+        raise Refused("grant_invalid", "effective_permissions takes a Grant (not an install.json entry)")
     if grant.plugin_id != manifest.plugin_id or grant.artifact_sha256 != manifest.artifact_sha256:
         return (), [("grant_artifact_mismatch", "grant is for another artifact; grant again")]
     if grant.signer_key_id != signer_key_id:

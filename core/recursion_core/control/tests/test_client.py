@@ -40,6 +40,15 @@ class _Connect:
 class NotSentTest(unittest.TestCase):
     PATH = "/nonexistent/recursion/control.sock"
 
+    def setUp(self) -> None:
+        # The client as on a POSIX host, on every host: on native Windows SocketAPI refuses before framing
+        # (finding 13, D9), which the Windows test below checks by setting this stand-in's name to "nt".
+        # (The read of #385 by Codex GPT-6.1 Sol, R6: these tests failed on native Windows 3.12.)
+        patcher = mock.patch.object(client_mod, "os", types.SimpleNamespace(name="posix", getuid=lambda: 1000,
+                                                                            environ={}, getcwd=os.getcwd))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def api(self) -> tuple[SocketAPI, _Connect]:
         connect = _Connect({"ok": True, "result": {"code": "ok", "runs": []}})
         return SocketAPI(self.PATH, timeout_s=3.0, connect=connect), connect
@@ -78,6 +87,19 @@ class NotSentTest(unittest.TestCase):
         with mock.patch.object(client_mod, "os", no_uids):
             self.assertEqual(SocketAPI(self.PATH, connect=recorded).call("run.list", {}), refusal)
         self.assertEqual(recorded.calls, [])
+
+    def test_params_that_are_not_an_object_are_refused_typed_and_connect_nothing(self) -> None:
+        # The reads of #377 and #385 by DeepSeek V4.1 Flash (F9, F6): these raised TypeError or ValueError,
+        # or (a list of pairs, a list of two-letter strings) were framed as an object nobody sent.
+        api, connect = self.api()
+        for params in (5, [1, 2], [("a", 1)], ["ab"], "ab", b"ab", [], ()):
+            with self.subTest(params=repr(params)):
+                self.assertEqual(api.call("run.list", params), {"code": "control_api_unavailable",
+                                                                "delivered": False,
+                                                                "detail": "not_sent:params_not_object"})
+        self.assertEqual(connect.calls, [])
+        self.assertEqual(api.call("run.list", None), {"code": "ok", "runs": []})
+        self.assertEqual(connect.calls[0][2].requests[0]["params"], {})
 
     def test_a_request_that_frames_is_sent_as_before(self) -> None:
         api, connect = self.api()

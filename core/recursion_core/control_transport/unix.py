@@ -532,9 +532,11 @@ def _is_busy(response: Message) -> bool:
 
 
 def _send_quietly(conn: socket.socket, message: Message) -> None:
+    """Best effort, and it never raises: a refusal that cannot be written must not be what ends the worker
+    (the read of #385 by DeepSeek V4.1 Flash, F1)."""
     try:
         write_frame(conn, message)
-    except (OSError, FrameError):
+    except (OSError, FrameError, TypeError, ValueError):
         pass
 
 

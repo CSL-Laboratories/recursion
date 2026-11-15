@@ -8,16 +8,30 @@ answer here is the answer there. The entry points themselves are tested when tho
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
+from dataclasses import dataclass
 
 from recursion_core.control import hooks as H
 from recursion_core.control import scopes
 from recursion_core.control.credentials import CredentialStore
 from recursion_core.control.methods import METHODS
 from recursion_core.control.tests.test_scopes import SCOPE_COLUMN
+
+
+@dataclass(frozen=True)
+class Granted:
+    """A principal made from a verified token, as this lane asks SPINE to let ``Principal`` carry it: SPINE's
+    fields (kind, id, in_run_unit) and ``grant``, the verified grant's id. Until SPINE's ``Principal`` has that
+    field, a token principal built with it holds nothing (``BearerWithoutGrantTest``)."""
+    kind: str
+    id: str | None = None
+    in_run_unit: bool = False
+    grant: str | None = None
 
 POSIX = os.name != "nt" and hasattr(os, "getuid") and hasattr(os, "O_NOFOLLOW")
 NEEDS_POSIX = unittest.skipUnless(POSIX, "the credential store needs uids and O_NOFOLLOW (POSIX)")
@@ -137,10 +151,10 @@ class ServiceTest(unittest.TestCase):
 
     def test_started_it_honours_live_grants_and_reads_records_for_stop(self) -> None:
         self.mint("plugin", "plugin.alpha", ["read", "run"])
-        self.mint("session", "s1", ["read", "run"])
+        _, session_grant = self.mint("session", "s1", ["read", "run"])
         self.service.start(self.context())
         self.assertTrue(self.service.ready)
-        plugin, session = H.Principal("plugin", "plugin.alpha"), H.Principal("session", "s1")
+        plugin, session = H.Principal("plugin", "plugin.alpha"), Granted("session", "s1", grant=session_grant.token_id)
         self.assertIsNone(self.hooks.authorize(plugin, "run.stop", {"run_id": "run-alpha"}))
         self.assertEqual(self.hooks.authorize(plugin, "run.stop", {"run_id": "run-host"}), refused("run_not_owned"))
         self.assertEqual(self.hooks.authorize(plugin, "run.stop", {"run_id": "run-legacy"}), refused("run_not_owned"))
@@ -176,6 +190,155 @@ class ServiceTest(unittest.TestCase):
                          refused("run_not_owned"))
 
 
+@NEEDS_POSIX
+class ServiceStoreFailureTest(unittest.TestCase):
+    """The reads of #385 (Astra R2, Sol R4): a store the service cannot use, malformed included, is logged and
+    leaves token principals holding nothing; start never raises."""
+
+    def test_a_malformed_record_is_logged_and_the_service_still_starts(self) -> None:
+        base = tempfile.mkdtemp(prefix="scopes-svc-bad-")
+        self.addCleanup(shutil.rmtree, base, True)
+        private = os.path.join(base, "state", "control")
+        os.makedirs(private, 0o700)
+        os.chmod(os.path.dirname(private), 0o700)
+        path = os.path.join(private, "credentials.json")
+        for bad_kind in ([], {}, 5):
+            with self.subTest(kind=repr(bad_kind)):
+                record = {"token_id": "ctk-x", "token_sha256": "0" * 64, "kind": bad_kind, "id": "x",
+                          "scopes": ["read"], "issued_at": 0, "expires_at": None, "revoked_at": None}
+                with open(path, "w", encoding="ascii") as handle:
+                    json.dump({"version": 1, "credentials": [record]}, handle)
+                os.chmod(path, 0o600)
+                hooks, service = with_service()
+                with self.assertLogs("recursion_core.control.scopes", "ERROR"):
+                    service.start(H.ServiceContext(state_dir=os.path.join(base, "state"), control_registry=Registry()))
+                self.assertTrue(service.ready)
+                self.assertEqual(hooks.authorize(H.Principal("plugin", "x"), "run.list", {}), refused("needs_read"))
+                self.assertIsNone(hooks.authorize(H.OWNER, "run.list", {}))
+
+
+class ServiceStartNeverRaisesTest(unittest.TestCase):
+    """The read of #385 by DeepSeek V4.1 Flash, F3: a state_dir that is not a path raised TypeError out of start."""
+
+    def test_a_state_dir_that_is_not_a_path_is_logged_and_honours_no_credential(self) -> None:
+        for state_dir in (5, b"x", ["x"], "/var/tmp/a\x00b"):
+            with self.subTest(state_dir=repr(state_dir)):
+                hooks, service = with_service()
+                with self.assertLogs("recursion_core.control.scopes", "ERROR"):
+                    service.start(H.ServiceContext(state_dir=state_dir, control_registry=Registry()))
+                self.assertTrue(service.ready)
+                self.assertEqual(hooks.authorize(H.Principal("plugin", "plugin.alpha"), "run.list", {}),
+                                 refused("needs_read"))
+                self.assertIsNone(hooks.authorize(H.OWNER, "run.list", {}))
+
+    def test_a_method_that_is_not_a_str_has_no_row(self) -> None:
+        for method in ([], {}, 5, None, ("run.list",)):
+            self.assertIsNone(scopes.table_scope(method), repr(method))
+
+
+class _DetachedAfterOneRead(scopes.Authorizer):
+    """The authorizer, except that its store and its run reader each answer one read and then read as None: a
+    service stop landing between two reads of one call. Deterministic, where the race needs 3.14t and luck."""
+
+    @property
+    def _credentials(self):
+        value, self._store_once = self._store_once, None
+        return value
+
+    @_credentials.setter
+    def _credentials(self, value):
+        self._store_once = value
+
+    @property
+    def _run_record(self):
+        value, self._reader_once = self._reader_once, None
+        return value
+
+    @_run_record.setter
+    def _run_record(self, value):
+        self._reader_once = value
+
+
+@NEEDS_POSIX
+class DetachWhileCallingTest(unittest.TestCase):
+    """The read of #385 by DeepSeek V4.1 Flash, F4: held() read the store twice, so a stop between the reads
+    raised AttributeError and S5 answered authorizer_failed (credentials_unavailable since bc3ea902)."""
+
+    def setUp(self) -> None:
+        base = tempfile.mkdtemp(prefix="scopes-detach-")
+        self.addCleanup(shutil.rmtree, base, True)
+        state = os.path.join(base, "state")
+        os.mkdir(state, 0o700)
+        self.store = CredentialStore(os.path.join(state, "control", "credentials.json"))
+        self.store.mint("plugin", "plugin.alpha", ["read", "run"])
+        _, self.session_grant = self.store.mint("session", "s1", ["read", "run"])
+
+    def test_a_token_principal_reads_the_store_once(self) -> None:
+        session = Granted("session", "s1", grant=self.session_grant.token_id)
+        authorizer = _DetachedAfterOneRead(scope_of=scopes.table_scope)
+        authorizer.attach(credentials=self.store, run_record=None)
+        self.assertIsNone(authorizer(session, "run.list", {}))
+
+    def test_one_call_reads_the_store_and_the_run_reader_once(self) -> None:
+        plugin = H.Principal("plugin", "plugin.alpha")
+        authorizer = _DetachedAfterOneRead(scope_of=scopes.table_scope)
+        authorizer.attach(credentials=self.store, run_record=Registry().get)
+        self.assertIsNone(authorizer(plugin, "run.list", {}))
+        authorizer.attach(credentials=self.store, run_record=Registry().get)
+        with self.assertNoLogs("recursion_core.control.scopes", "ERROR"):
+            self.assertEqual(authorizer.held(plugin), frozenset({"read", "run"}))
+        self.assertEqual(authorizer(plugin, "run.list", {}), ("scope_refused", "needs_read"))   # detached now
+
+    def test_the_stop_fence_reads_the_run_reader_once(self) -> None:
+        plugin = H.Principal("plugin", "plugin.alpha")
+        authorizer = _DetachedAfterOneRead(scope_of=scopes.table_scope)
+        authorizer.attach(credentials=None, run_record=Registry().get)
+        authorizer._credentials = self.store            # the store read by held(), the reader by the fence
+        self.assertIsNone(authorizer(plugin, "run.stop", {"run_id": "run-alpha"}))
+
+    def test_calls_racing_a_stop_and_start_never_fail_the_authorizer(self) -> None:
+        hooks, service = with_service()
+        authorizer = service._authorizer   # the one with_service() put into S5
+        authorizer.attach(credentials=self.store, run_record=None)
+        plugin, answers, done = H.Principal("plugin", "plugin.alpha"), [], threading.Event()
+
+        def toggle() -> None:
+            while not done.is_set():
+                authorizer.attach(credentials=None, run_record=None)
+                authorizer.attach(credentials=self.store, run_record=None)
+
+        toggler = threading.Thread(target=toggle)
+        toggler.start()
+        try:
+            for _ in range(2000):
+                answers.append(hooks.authorize(plugin, "run.list", {}))
+        finally:
+            done.set()
+            toggler.join(10)
+        self.assertLessEqual({str(a) for a in answers}, {"None", str(refused("needs_read"))})
+
+
+@NEEDS_POSIX
+class BearerWithoutGrantTest(unittest.TestCase):
+    """Until SPINE's Principal carries ``grant``, a device, session or agent principal holds nothing, live grants
+    or not; a host-attributed plugin holds its identity's grants."""
+
+    def test_a_real_principal_of_a_bearer_kind_holds_nothing(self) -> None:
+        base = tempfile.mkdtemp(prefix="scopes-bearer-")
+        self.addCleanup(shutil.rmtree, base, True)
+        state = os.path.join(base, "state")
+        os.mkdir(state, 0o700)
+        store = CredentialStore(os.path.join(state, "control", "credentials.json"))
+        store.mint("device", "phone-1", ["read", "run"])
+        store.mint("session", "s1", ["read", "run"])
+        store.mint("plugin", "plugin.alpha", ["read"])
+        hooks, service = with_service()
+        service.start(H.ServiceContext(state_dir=state, control_registry=Registry()))
+        for principal in (H.Principal("device", "phone-1"), H.Principal("session", "s1")):
+            self.assertEqual(hooks.authorize(principal, "run.list", {}), refused("needs_read"), principal)
+        self.assertIsNone(hooks.authorize(H.Principal("plugin", "plugin.alpha"), "run.list", {}))
+
+
 def stat_mode(path: str) -> int:
     return os.lstat(path).st_mode & 0o7777
 
@@ -192,16 +355,19 @@ class MatrixThroughS5Test(unittest.TestCase):
             def held(self, kind, principal_id):
                 return frozenset(grants.get((kind, principal_id), ()))
 
+            def grant_scopes(self, grant, kind, principal_id):
+                return self.held(kind, principal_id) if grant == f"g-{kind}-{principal_id}" else frozenset()
+
         hooks = composed()
         hooks._single["authorize"].attach(credentials=Grants(), run_record=Registry().get)
         principals = {
             "owner": (H.OWNER, {"read", "run", "approve", "manage"}),
             "internal": (H.Principal("internal", "quota"), {"read", "run", "approve", "manage"}),
             "page": (H.DEVICE, {"read", "run", "approve"}),
-            "device-run": (H.Principal("device", "phone-1"), {"read", "run"}),
-            "device-read": (H.Principal("device", "phone-2"), {"read"}),
+            "device-run": (Granted("device", "phone-1", grant="g-device-phone-1"), {"read", "run"}),
+            "device-read": (Granted("device", "phone-2", grant="g-device-phone-2"), {"read"}),
             "plugin": (H.Principal("plugin", "plugin.alpha"), {"read", "run"}),
-            "session": (H.Principal("session", "s1"), {"read", "run"}),
+            "session": (Granted("session", "s1", grant="g-session-s1"), {"read", "run"}),
             "nobody": (H.Principal("plugin", "plugin.none"), set()),
         }
         lines = ["method".ljust(22) + "scope".ljust(9) + " ".join(name[:11].ljust(11) for name in principals)]

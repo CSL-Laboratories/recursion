@@ -1,7 +1,8 @@
 """Control API credentials: principal kinds, the scopes each may hold, and tokens the daemon mints.
 
-Lane CONTROL, frontier plan v3.3, step 2. Nothing in the daemon reads this module yet: the authorizer
-in ``scopes.py`` takes a ``CredentialStore`` when it is registered into seam S5 (a later pull request).
+Lane CONTROL, frontier plan v3.3, step 2. The authorizer in ``scopes.py``, registered into seam S5, holds
+every principal to ``CEILING``. The store itself is read only by the scopes service (seam S13), which is
+built but not registered yet, so the daemon honours no token today.
 
 SCOPES are the four of the method table (``schemas/control/v1/methods.v1.json``, ``$defs/scope``):
 ``read`` looks, ``run`` starts, steers and stops work, ``approve`` shows and answers approvals, and
@@ -76,7 +77,7 @@ import secrets
 import stat
 import threading
 import time
-from collections.abc import Callable, Hashable, Iterable
+from collections.abc import Callable, Collection, Hashable, Iterable
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
@@ -233,7 +234,9 @@ class CredentialStore:
                  wall: Callable[[], float] = time.time, limit: FailedAuthLimit | None = None) -> None:
         if os.name == "nt" or not hasattr(os, "getuid") or not hasattr(os, "O_NOFOLLOW"):
             raise CredentialStoreError("platform_unsupported: the credential store needs uids and O_NOFOLLOW")
-        if not isinstance(path, str) or not os.path.isabs(path):
+        if not isinstance(path, str):
+            raise CredentialStoreError("the store path must be a str")
+        if not os.path.isabs(path):
             raise CredentialStoreError("the store path must be absolute")
         self._path, self._emit, self._wall = path, emit, wall
         self._limit = limit if limit is not None else FailedAuthLimit()
@@ -380,7 +383,7 @@ class CredentialStore:
     def _now(self) -> int:
         return int(self._wall())
 
-    def mint(self, kind: str, principal_id: str, scopes: Iterable[str], *,
+    def mint(self, kind: str, principal_id: str, scopes: Collection[str], *,
              expires_at: int | None = None) -> tuple[str, Credential]:
         """Mint a token for ``(kind, principal_id)`` holding ``scopes``. Returns ``(token, credential)``.
 

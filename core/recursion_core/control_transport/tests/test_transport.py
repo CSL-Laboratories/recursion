@@ -393,6 +393,50 @@ class RoundTripTests(_TmpCase):
             self.assertEqual(client.request({"op": "ping", "id": "p"}), {"ok": True, "op": "pong", "id": "p"})
         self.assertEqual(seen, ["nan", "object", "ping"])
 
+    # The reads of #385 and #377 by DeepSeek V4.1 Flash (F1, F8): a lone surrogate in the id reached the
+    # handler, then neither the reply nor the internal_error carrying that id could be encoded, and the
+    # worker died with the peer told nothing.
+    def test_a_lone_surrogate_is_refused_before_the_handler_and_the_worker_lives(self) -> None:
+        for body in (b'{"op":"ping","id":"\\ud800"}', b'{"op":"ping","v":"x\\uDC00"}',
+                     b'{"op":"ping","v":["\\ude00\\ud83d"]}'):
+            with self.assertRaises(ct.FrameError) as caught:
+                framing.decode_body(body)
+            self.assertEqual(str(caught.exception), "frame_not_json", body)
+        self.assertEqual(framing.decode_body(b'{"id":"\\ud83d\\ude00"}'), {"id": "\U0001f600"})
+        self.assertEqual(framing.decode_body(b'{"id":"\\\\ud800"}'), {"id": "\\ud800"})
+        seen: list[dict] = []
+        died: list[BaseException] = []
+        hook = threading.excepthook
+        threading.excepthook = lambda args: died.append(args.exc_value)
+        self.addCleanup(setattr, threading, "excepthook", hook)
+
+        def handler(message: dict, conn: ct.Connection) -> dict:
+            seen.append(message)
+            return {"ok": True, "op": "pong"}
+
+        srv = self.server(handler)
+        bad = b'{"op":"stop","run_id":"r1","id":"\\ud800"}'
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+            raw.settimeout(5.0)
+            raw.connect(srv.path)
+            raw.sendall(framing.HEADER.pack(len(bad)) + bad)
+            reply = framing.read_frame(raw)
+        self.assertEqual(reply, {"ok": False, "error": {"code": "bad_frame", "detail": "frame_not_json"}})
+        with UnixControlClient(srv.path) as client:
+            self.assertEqual(client.request({"op": "ping", "id": "p"}), {"ok": True, "op": "pong", "id": "p"})
+        self.assertEqual([m["op"] for m in seen], ["ping"])
+        self.assertEqual(died, [])
+
+    def test_a_refusal_that_cannot_be_encoded_never_raises_out_of_the_worker(self) -> None:
+        from recursion_core.control_transport.unix import _send_quietly
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        for message in ({"ok": False, "id": "\ud800"}, {"ok": False, "id": float("nan")},
+                        {"ok": False, "id": object()}):
+            with self.subTest(message=repr(message)):
+                self.assertIsNone(_send_quietly(left, message))
+
     # t1430u X1b: a handler reply that claims layer "transport" busy was read by the client as
     # "not delivered" (TransportBusy) although the handler saw and acted on the request, which
     # invites a duplicate retry of a Stop.

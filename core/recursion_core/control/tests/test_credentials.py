@@ -682,5 +682,20 @@ class SourceTest(unittest.TestCase):
                 self.assertNotRegex(line, r"\btoken\b(?!_)", line)
 
 
+@NEEDS_POSIX
+class StorePathRefusalTest(unittest.TestCase):
+    """The read of #385 by DeepSeek V4.1 Flash: an absolute pathlib path was refused as "must be absolute"."""
+
+    def test_a_path_that_is_not_a_str_and_a_relative_path_are_refused_each_for_its_reason(self) -> None:
+        import pathlib
+        for path, reason in ((pathlib.PurePosixPath("/var/tmp/x/credentials.json"), "must be a str"),
+                             (b"/var/tmp/x/credentials.json", "must be a str"), (None, "must be a str"),
+                             ("credentials.json", "must be absolute")):
+            with self.subTest(path=repr(path)):
+                with self.assertRaises(CredentialStoreError) as caught:
+                    CredentialStore(path)
+                self.assertIn(reason, str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

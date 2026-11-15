@@ -9,10 +9,11 @@ the owner, the page) keep every answer they have.
 
 ``ScopesService`` (seam S13, ``control.scopes``) is built and tested here but NOT registered: once
 started it hands the authorizer the credential store (``<state_dir>/control/credentials.json``) and the
-control registry's run records, which a plugin or session principal needs. No entry point makes such a
-principal yet, and registering a service turns the composition's admission gate on for every daemon,
-so it is registered by the change that brings the first such principal (``questions.md``). A store
-that cannot be opened is logged and leaves token principals holding nothing; it never stops the daemon.
+control registry's run records, which any principal backed by a grant needs: a plugin, a session, a
+paired device other than the page, an agent. No entry point makes such a principal yet, and registering
+a service turns the composition's admission gate on for every daemon, so it is registered by the change
+that brings the first such principal (``questions.md``). A store that cannot be used (malformed
+included) is logged and leaves token principals holding nothing; it never stops the daemon.
 
 S5's contract (``control/hooks.py``, SPINE): ``authorize(principal, method, params)`` is called for every
 client call, before the method runs, and answers None (go on), a refusal code, or ``(code, detail)``. A
@@ -64,8 +65,6 @@ from recursion_core.control.methods import METHODS
 
 log = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
-
 PAGE_PRINCIPAL_ID = PAGE_DEVICE_ID   # control/hooks.py DEVICE: the page's door; reserved against every grant
 # The page's device principal: read, run, approve (the brief's recommended option (a); the owner decides).
 PAGE_SCOPES = frozenset({"read", "run", "approve"})
@@ -80,7 +79,7 @@ Verdict = tuple[str, str] | None
 def table_scope(method: str) -> str | None:
     """The method's scope in the method table this daemon runs (``control.methods.METHODS``), or None."""
 
-    row = METHODS.get(method)
+    row = METHODS.get(method) if isinstance(method, str) else None   # a list asked directly is no method
     return row.scope if row is not None else None
 
 
@@ -118,6 +117,9 @@ class ScopesService:
                 store = CredentialStore(os.path.join(os.fspath(state_dir), *CREDENTIALS_PATH))
             except CredentialStoreError as exc:
                 log.error("control.scopes: the credential store cannot be used (%s); no credential is honoured", exc)
+            except (TypeError, ValueError) as exc:   # a state_dir that is not a path (the read of #385 by DeepSeek, F3)
+                log.error("control.scopes: the state directory is not a path (%s); no credential is honoured",
+                          type(exc).__name__)
         registry = getattr(context, "control_registry", None)
         reader = getattr(registry, "get", None)
         self._authorizer.attach(credentials=store, run_record=reader if callable(reader) else None)
@@ -158,7 +160,9 @@ class Authorizer:
         self._page_scopes = frozenset(page_scopes)   # cut to the device ceiling by held(), like every set
 
     def attach(self, *, credentials: CredentialStore | None, run_record: Callable[[str], dict | None] | None) -> None:
-        """What the service hands over at start (and takes back at stop). Before any call is served."""
+        """What the service hands over at start (and takes back at stop). A call in flight reads each of the two
+        once, so it sees the old one or the new one, never a store that vanished between two reads (the read of
+        #385 by DeepSeek V4.1 Flash, F4: on 3.14t a stop landing between them raised AttributeError)."""
 
         self._credentials, self._run_record = credentials, run_record
 
@@ -167,16 +171,17 @@ class Authorizer:
 
         kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
         grant = _attr(principal, "grant", None)
+        credentials = self._credentials   # read once: attach may replace it while this call runs
         if kind in ("owner", "internal"):
             held = ALL_SCOPES
         elif grant is not None:
             # A token principal: its one verified grant, while it is live, and only if it is this identity's.
-            held = (self._credentials.grant_scopes(grant, kind, pid)
-                    if self._credentials is not None and isinstance(grant, str) else frozenset())
+            held = (credentials.grant_scopes(grant, kind, pid)
+                    if credentials is not None and isinstance(grant, str) else frozenset())
         elif kind == "device" and pid == PAGE_PRINCIPAL_ID:
             held = self._page_scopes
-        elif kind == "plugin" and self._credentials is not None and isinstance(pid, str):
-            held = self._credentials.held(kind, pid)   # host-attributed: the identity's live grants
+        elif kind == "plugin" and credentials is not None and isinstance(pid, str):
+            held = credentials.held(kind, pid)   # host-attributed: the identity's live grants
         else:
             held = frozenset()   # a device, session or agent principal holds only what its own grant gives
         return held & ceiling(kind)
@@ -212,10 +217,10 @@ class Authorizer:
         if kind not in ("session", "plugin"):
             return (SCOPE_REFUSED, "stop_not_granted_to_kind")
         run_id = params.get("run_id") if isinstance(params, dict) else None
-        record = None
-        if isinstance(run_id, str) and self._run_record is not None:
+        record, run_record = None, self._run_record   # read once, like the store in held()
+        if isinstance(run_id, str) and run_record is not None:
             try:
-                record = self._run_record(run_id)
+                record = run_record(run_id)
             except Exception:  # noqa: BLE001 - a target that cannot be read is not shown to be owned
                 record = None
         launch = record.get("launch") if isinstance(record, dict) else None

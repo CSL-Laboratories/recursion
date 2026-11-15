@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import socket
 import struct
 import time
@@ -46,11 +47,20 @@ def encode_frame(message: dict[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -
     return HEADER.pack(len(body)) + body
 
 
+# A JSON escape in the range \uD800-\uDFFF: the only way a lone surrogate gets into a decoded frame, since a
+# strict UTF-8 decode refuses an encoded one.
+_SURROGATE_ESCAPE = re.compile(rb"\\u[dD][89a-fA-F]")
+
+
 def decode_body(body: bytes) -> dict[str, Any]:
     """One frame body as a dict. A body that is not strict JSON (a non-finite number included) is
-    ``frame_not_json``, refused before anything sees it."""
+    ``frame_not_json``, refused before anything sees it. So is a string holding a lone surrogate (I-JSON,
+    RFC 7493 section 2.1): no UTF-8 frame can carry it back, so a reply echoing it could not be written
+    (the reads of #377 and #385 by DeepSeek V4.1 Flash, F8 and F1)."""
     try:
         message = json.loads(body.decode("utf-8"), parse_constant=_no_constant, parse_float=_finite_float)
+        if _SURROGATE_ESCAPE.search(body):
+            json.dumps(message, ensure_ascii=False).encode("utf-8")   # a lone surrogate raises here
     except RecursionError:
         # A 1 MiB frame can nest ~500k deep; json.loads would raise RecursionError, which is
         # not a ValueError and used to escape the server worker. Refuse it as a frame error.

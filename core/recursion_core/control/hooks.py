@@ -107,6 +107,10 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
     not raise. That fallback is for an ordinary exception out of ``owner.run`` itself. A failure after
     the hand-over, in the owner's own worker, is the driver's own try/finally, and the fallback is no
     promise to record a final result or to call ``fault_run``.
+    A hand-over is all or nothing. ``owner.run`` either raises with no worker holding the run, or
+    returns with the worker holding it. It never raises once the worker has the run: the fallback
+    would settle a run that a worker is still driving. The finish step runs on the worker, never
+    inside ``owner.run``.
     On today's path (no owner, or one that declined) no lifetime reference is held for the whole of
     an engine's stream: closing the daemon leaves the run alive.
 S10 ``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's

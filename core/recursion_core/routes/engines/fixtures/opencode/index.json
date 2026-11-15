@@ -1,0 +1,145 @@
+{
+  "description": "OpenCode stdout fixtures for routes/engines/opencode.py (lane ENGINE-E3). Each .jsonl file is what `opencode run --format json` would print for one run; exit_code is the status it would exit with. fake_opencode.py replays a file by name.",
+  "synthetic": "EVERY file listed here is SYNTHETIC: written by hand from the source reads under `sources`, never captured from a real OpenCode run. No engine binary ran and nothing was signed in. A captured run, when Lucas makes one, gets its own entry with synthetic false.",
+  "sources": {
+    "opencode-ai@1.19.5": [
+      "anomalyco/opencode@810c0eba packages/opencode/src/cli/cmd/run.ts:668-681 (the envelope {type, timestamp, sessionID, ...}), :710-781 (which parts and errors are printed), :457-468 (a missing --session id: 'Session not found' on stderr, exit 1), :823-866 (exit 1 after an error)",
+      "anomalyco/opencode@810c0eba packages/schema/src/v1/session.ts:102-128 (text and reasoning parts), :233-256 (step-start and step-finish), :259-322 (the tool part and its states)",
+      "anomalyco/opencode@810c0eba packages/core/src/v1/session.ts:48-67 (APIError, ProviderAuthError and the other errors) and packages/core/src/util/error.ts (NamedError.toObject: {name, data})",
+      "anomalyco/opencode@810c0eba packages/opencode/src/session/retry.ts:31 (five retries), :47-75 (retry-after-ms, retry-after, HTTP date)",
+      "anomalyco/opencode@810c0eba packages/opencode/src/session/session.ts:338-372 (input excludes cached tokens, output excludes reasoning, a missing count is 0)"
+    ],
+    "@opencode/cli@2.2.6": [
+      "anomalyco/opencode@dc2ffcf8 packages/cli/src/run/noninteractive.ts:363-366 (the envelope), :375-408 (text printed as deltas), :410-461 (the tool part: id is the call, partID the part; the steps), :478-506 (retry and step events)",
+      "anomalyco/opencode@dc2ffcf8 packages/core/src/session/to-session-error.ts:34-143 (error types, status, retryAfterMs)",
+      "anomalyco/opencode@dc2ffcf8 packages/core/src/session/usage.ts:9-19 (nonCachedInputTokens, visibleOutputTokens, a missing count is 0)"
+    ]
+  },
+  "fixtures": [
+    {
+      "file": "synthetic-v1-success.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5", "exit_code": 0,
+      "shows": "one step with text; usage with cache reads, reasoning and a cost, and a cache-write count of 0",
+      "expect": {"types": ["engine.output", "engine.output", "engine.output", "usage", "result"], "code": null,
+                 "engine_session_id": "ses_synthv1success0000000001", "text": "The tests pass.", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v1-tool-use.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5", "exit_code": 0,
+      "shows": "two steps: a completed tool call and a failed one, each with its usage",
+      "expect": {"types": ["engine.output", "engine.output", "tool.call", "tool.result", "engine.output", "usage",
+                           "engine.output", "engine.output", "tool.call", "tool.result", "engine.output",
+                           "engine.output", "usage", "result"], "code": null,
+                 "engine_session_id": "ses_synthv1tools000000000001",
+                 "text": "41 tests pass; /work/missing.txt does not exist.", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v1-limit-429.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5", "exit_code": 1,
+      "shows": "an APIError with statusCode 429 and retry-after 120 (seconds), after OpenCode's own retries",
+      "expect": {"types": ["engine.output", "engine.output", "limit", "result"], "code": "plan_limit",
+                 "engine_session_id": "ses_synthv1limit000000000001", "text": "", "anomalies": 0, "wait_s": 120}
+    },
+    {
+      "file": "synthetic-v1-limit-429-retry-after-ms.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5",
+      "exit_code": 1,
+      "shows": "a 429 with both retry-after-ms (1500) and retry-after (2): the milliseconds header wins, as in OpenCode",
+      "expect": {"types": ["engine.output", "engine.output", "limit", "result"], "code": "plan_limit",
+                 "engine_session_id": "ses_synthv1limit000000000001", "text": "", "anomalies": 0, "wait_s": 1.5}
+    },
+    {
+      "file": "synthetic-v1-limit-429-http-date.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5",
+      "exit_code": 1,
+      "shows": "a 429 whose retry-after is an HTTP date, one hour after 2026-11-14T00:00:00Z",
+      "expect": {"types": ["engine.output", "engine.output", "limit", "result"], "code": "plan_limit",
+                 "engine_session_id": "ses_synthv1limit000000000001", "text": "", "anomalies": 0,
+                 "reset_at_with_wall_2026_11_14": "2026-11-14T01:00:00.000Z"}
+    },
+    {
+      "file": "synthetic-v1-limit-429-no-reset.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5",
+      "exit_code": 1,
+      "shows": "a 429 with no wait header: a plan limit whose reset is not known",
+      "expect": {"types": ["engine.output", "engine.output", "limit", "result"], "code": "plan_limit",
+                 "engine_session_id": "ses_synthv1limit000000000001", "text": "", "anomalies": 0, "wait_s": null}
+    },
+    {
+      "file": "synthetic-v1-error-no-status.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5",
+      "exit_code": 1,
+      "shows": "an APIError with no status code: an engine error, not a limit",
+      "expect": {"types": ["engine.output", "engine.output", "result"], "code": "engine_error",
+                 "engine_session_id": "ses_synthv1error000000000001", "text": "", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v1-error-500-quota-text.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5",
+      "exit_code": 1,
+      "shows": "an APIError with status 500 whose message sounds like a quota: a short fault, not a plan limit",
+      "expect": {"types": ["engine.output", "result"], "code": "short_fault",
+                 "engine_session_id": "ses_synthv1error000000000001", "text": "", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v1-auth-error.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5", "exit_code": 1,
+      "shows": "a ProviderAuthError",
+      "expect": {"types": ["engine.output", "result"], "code": "auth_failed",
+                 "engine_session_id": "ses_synthv1error000000000001", "text": "", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v1-exit-1-no-output.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5",
+      "exit_code": 1,
+      "shows": "nothing on stdout and exit 1, as a missing --session id gives (the message goes to stderr)",
+      "expect": {"types": ["result"], "code": "engine_exited", "engine_session_id": null, "text": "",
+                 "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v1-noise.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5", "exit_code": 0,
+      "shows": "a line that is not JSON, a JSON array, reasoning and a type not known here (none of them typed), and a step whose every count and cost is 0 (all unknown)",
+      "expect": {"types": ["engine.output", "engine.output", "engine.output", "engine.output", "engine.output",
+                           "engine.output", "engine.output", "usage", "result"], "code": null,
+                 "engine_session_id": "ses_synthv1noise000000000001", "text": "Done.", "anomalies": 2}
+    },
+    {
+      "file": "synthetic-v1-tool-input-out-of-range.jsonl", "synthetic": true, "package": "opencode-ai@1.19.5",
+      "exit_code": 0,
+      "shows": "a tool input holding a whole number outside the exact range: it has no RFC 8785 text, so no tool draft",
+      "expect": {"types": ["engine.output", "result"], "code": null,
+                 "engine_session_id": "ses_synthv1range000000000001", "text": "", "anomalies": 1}
+    },
+    {
+      "file": "synthetic-v2-success.jsonl", "synthetic": true, "package": "@opencode/cli@2.2.6", "exit_code": 0,
+      "shows": "text printed as two deltas of one part, and one step's usage",
+      "expect": {"types": ["engine.output", "engine.output", "engine.output", "engine.output", "usage", "result"],
+                 "code": null, "engine_session_id": "ses_synthv2success0000000001", "text": "Hello world.",
+                 "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v2-tool-use.jsonl", "synthetic": true, "package": "@opencode/cli@2.2.6", "exit_code": 0,
+      "shows": "a 2.x tool part (id is the call, partID the part) and a step with reasoning tokens",
+      "expect": {"types": ["engine.output", "engine.output", "tool.call", "tool.result", "engine.output", "usage",
+                           "result"], "code": null, "engine_session_id": "ses_synthv2tools000000000001",
+                 "text": "", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v2-rate-limit.jsonl", "synthetic": true, "package": "@opencode/cli@2.2.6", "exit_code": 1,
+      "shows": "two retry events carrying status 429 (OpenCode is still retrying: not a limit), then the error with status 429 and retryAfterMs 30000",
+      "expect": {"types": ["engine.output", "engine.output", "engine.output", "engine.output", "limit", "result"],
+                 "code": "plan_limit", "engine_session_id": "ses_synthv2limit000000000001", "text": "",
+                 "anomalies": 0, "wait_s": 30}
+    },
+    {
+      "file": "synthetic-v2-chatgpt-limit-no-status.jsonl", "synthetic": true, "package": "@opencode/cli@2.2.6",
+      "exit_code": 1,
+      "shows": "provider.chatgpt-limit with no status: not a plan limit under the brief's rule (questions.md Q1); its text makes it a short fault",
+      "expect": {"types": ["engine.output", "result"], "code": "short_fault",
+                 "engine_session_id": "ses_synthv2error000000000001", "text": "", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v2-transport-error.jsonl", "synthetic": true, "package": "@opencode/cli@2.2.6",
+      "exit_code": 1,
+      "shows": "provider.transport: an engine error",
+      "expect": {"types": ["engine.output", "result"], "code": "engine_error",
+                 "engine_session_id": "ses_synthv2error000000000001", "text": "", "anomalies": 0}
+    },
+    {
+      "file": "synthetic-v2-auth-error.jsonl", "synthetic": true, "package": "@opencode/cli@2.2.6", "exit_code": 1,
+      "shows": "provider.auth with status 401",
+      "expect": {"types": ["engine.output", "result"], "code": "auth_failed",
+                 "engine_session_id": "ses_synthv2error000000000001", "text": "", "anomalies": 0}
+    }
+  ]
+}

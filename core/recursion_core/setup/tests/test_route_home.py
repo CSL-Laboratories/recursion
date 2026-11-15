@@ -115,9 +115,11 @@ class RouteHomeTests(unittest.TestCase):
         self.refused("route_home_untrusted", os.path.join(root_file, "claude_code"), root_file)
 
     def test_any_group_or_world_bit_on_the_root_or_below_it_is_refused(self):
+        # Each of the six bits on its own, at the root, a folder between and the route home itself
+        # (review 1 of #401, Codex Astra R2): a check that ignored any one of them would fail here.
         os.makedirs(os.path.join(self.path, "nested"), 0o700)
-        for folder in (self.root, self.path):
-            for mode in (0o750, 0o705, 0o701, 0o710, 0o740):
+        for folder in (self.root, self.path, os.path.join(self.path, "nested")):
+            for mode in (0o740, 0o720, 0o710, 0o704, 0o702, 0o701):
                 with self.subTest(folder=folder, mode=oct(mode)):
                     os.chmod(folder, mode)
                     error = self.refused("route_home_untrusted", os.path.join(self.path, "nested"))
@@ -131,6 +133,81 @@ class RouteHomeTests(unittest.TestCase):
             with self.subTest(folder=folder), _owned_by(folder):
                 error = self.refused("route_home_untrusted", self.path)
             self.assertEqual(error.detail, f"{folder} is owned by another user")
+
+    def test_check_raises_nothing_but_its_refusal(self):
+        # Review 1 of #401 (DeepSeek F1, F2, F3): a name no file can hold, a link above the root that
+        # goes away between its lstat and its readlink, and a password database that does not answer.
+        lone = chr(0xD800)  # a lone surrogate: os.fsencode cannot write it
+        self.refused("route_home_untrusted", self.path + lone)
+        self.refused("route_home_untrusted", os.path.join(self.root + lone, "claude_code"), self.root + lone)
+        link = os.path.join(self.base, "state-link")
+        os.symlink(self.state, link)
+        for raised, code in ((FileNotFoundError(2, "gone"), "route_home_missing"),
+                             (OSError(22, "not a link"), "route_home_untrusted")):
+            with self.subTest(raised=type(raised).__name__), mock.patch("os.readlink", side_effect=raised):
+                self.refused(code, os.path.join(link, "homes", "claude_code"), os.path.join(link, "homes"))
+        with mock.patch("pwd.getpwuid", side_effect=OSError(5, "the name service did not answer")):
+            self.assertIn("password database", self.refused("route_home_untrusted", self.path).detail)
+        long_name = os.path.join(self.root, "x" * 300)  # ENAMETOOLONG: a failure that is not EACCES
+        self.assertIn("OSError", self.refused("route_home_untrusted", long_name).detail)
+
+        class Text(str):
+            pass
+        self.refused("route_home_untrusted", Text(self.path))  # only a plain str is a path here
+
+    def test_an_operators_home_that_cannot_be_resolved_refuses_rather_than_passes(self):
+        # Review 1 of #401, Codex Sol R1: $HOME is a link to the candidate, behind a folder that cannot
+        # be searched; a resolution that stopped there would no longer match, and the home would pass.
+        home = os.path.join(self.root, "operator-home")
+        os.mkdir(home, 0o700)
+        hidden = os.path.join(self.base, "hidden")
+        os.mkdir(hidden, 0o700)
+        alias = os.path.join(hidden, "alias")
+        os.symlink(home, alias)
+        with mock.patch.dict(os.environ, {"HOME": alias}):
+            self.refused("route_home_is_operator_home", home)
+            os.chmod(hidden, 0o600)
+            try:
+                error = self.refused("route_home_untrusted", home)
+            finally:
+                os.chmod(hidden, 0o700)
+        self.assertEqual(error.detail, "the operator's home cannot be resolved: PermissionError")
+        missing = os.path.join(self.root, "not-made-yet")  # a home that does not exist yet still counts
+        with mock.patch.dict(os.environ, {"HOME": missing}):
+            self.refused("route_home_is_operator_home", missing)
+
+    def test_with_no_operators_home_known_the_check_refuses_rather_than_passes(self):
+        # DeepSeek F4: an empty set of homes would let any path through the operator's-home rule.
+        no_entry = mock.patch("pwd.getpwuid", side_effect=KeyError(os.geteuid()))
+        with mock.patch.dict(os.environ), no_entry:
+            os.environ.pop("HOME", None)
+            self.assertIn("unknown", self.refused("route_home_untrusted", self.path).detail)
+        with mock.patch.dict(os.environ, {"HOME": "relative/home"}), no_entry:
+            self.refused("route_home_untrusted", self.path)  # a relative HOME names no home
+        os.mkdir(self.path, 0o700)
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            # A relative HOME is not read against the working folder: "claude_code" here would be the route home.
+            with mock.patch.dict(os.environ, {"HOME": "claude_code"}):
+                check(self.path, self.root)
+        finally:
+            os.chdir(cwd)
+
+    def test_exactly_forty_links_above_the_root_are_followed_and_one_more_is_refused(self):
+        # DeepSeek F6: the limit is the kernel's own, inclusive.
+        for count, accepted in ((40, True), (41, False)):
+            with self.subTest(links=count):
+                prefix = os.path.join(self.base, f"chain{count}-")
+                for index in range(1, count):
+                    os.symlink(f"chain{count}-{index + 1}", f"{prefix}{index}")
+                os.symlink("state", f"{prefix}{count}")
+                root = os.path.join(f"{prefix}1", "homes")
+                if accepted:
+                    check(os.path.join(root, "claude_code"), root)
+                else:
+                    error = self.refused("route_home_untrusted", os.path.join(root, "claude_code"), root)
+                    self.assertEqual(error.detail, "more than 40 links above the root")
 
     def test_a_folder_that_cannot_be_searched_is_refused_untrusted_not_raised(self):
         os.chmod(self.root, 0o600)  # ours and owner-only, but nothing in it can be looked up
@@ -166,7 +243,7 @@ class RouteHomeTests(unittest.TestCase):
 
     def test_a_folder_above_the_root_another_user_could_change_is_refused(self):
         for folder in (self.base, self.state):
-            for mode in (0o777, 0o770, 0o722):
+            for mode in (0o777, 0o770, 0o722, 0o720, 0o702):  # group and world write each alone too (Sol R3)
                 with self.subTest(folder=folder, mode=oct(mode)):
                     os.chmod(folder, mode)
                     error = self.refused("route_home_untrusted", self.path)

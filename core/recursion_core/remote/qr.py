@@ -315,18 +315,18 @@ def encode(data: bytes | str, *, mask: int | None = None) -> QrCode:
     version = _choose_version(len(raw))
     codewords = _interleave(_data_codewords(raw, version), version)
     best: tuple[int, int, list[list[bool]]] | None = None
-    for mask in (range(8) if mask is None else (mask,)):
+    for choice in (range(8) if mask is None else (mask,)):
         matrix = _Matrix(version)
         matrix.draw_function_patterns()
         matrix.place(codewords)
-        matrix.apply_mask(mask)
-        matrix.draw_format(mask)
+        matrix.apply_mask(choice)
+        matrix.draw_format(choice)
         score = penalty(matrix.dark)
         if best is None or score < best[0]:
-            best = (score, mask, matrix.dark)
+            best = (score, choice, matrix.dark)
     assert best is not None
-    _, mask, modules = best
-    return QrCode(version, mask, tuple(tuple(row) for row in modules))
+    _, chosen, modules = best
+    return QrCode(version, chosen, tuple(tuple(row) for row in modules))
 
 
 # -- drawing ---------------------------------------------------------------------------------------

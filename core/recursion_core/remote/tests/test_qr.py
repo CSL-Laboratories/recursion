@@ -147,7 +147,7 @@ def read_qr(modules) -> tuple[bytes, int]:
             ec_blocks[b].append(codewords[k])
             k += 1
     assert k == total
-    for data, ec in zip(data_blocks, ec_blocks):
+    for data, ec in zip(data_blocks, ec_blocks, strict=True):
         assert syndromes_are_zero(data + ec, ec_length), "a block's Reed-Solomon syndromes are not zero"
     stream = "".join(f"{w:08b}" for block in data_blocks for w in block)
     assert stream[:4] == "0100", "not byte mode"

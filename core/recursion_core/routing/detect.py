@@ -90,6 +90,8 @@ def _engine_reason(engine: str, entry: object, *, route_refusal, breaker_state, 
         if state == "not_opted_in":
             return "key_not_opted_in"
         if state != "ready":
+            # A key source that answers anything but the three words (a source of the caller's, so it may)
+            # is not ready: never routable on a word it did not mean. Same as ``state not in KEY_STATES`` here.
             return "key_state_unknown"
     return None
 

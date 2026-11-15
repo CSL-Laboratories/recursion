@@ -69,13 +69,15 @@ def snapshot(detection: object) -> tuple[dict | None, str | None]:
     boolean ``routable``, a ``reason`` that is null (or absent) exactly when the entry is routable and
     otherwise a typed code. Other keys are allowed and ignored.
     """
-    if not isinstance(detection, Mapping) or "engines" not in detection:
+    if not isinstance(detection, Mapping):
         return None, "detection_unavailable"
-    engines = detection["engines"]
-    if not isinstance(engines, Mapping):
-        return None, "detection_malformed"
     out: dict[str, dict] = {}
     try:
+        if "engines" not in detection:
+            return None, "detection_unavailable"
+        engines = detection["engines"]
+        if not isinstance(engines, Mapping):
+            return None, "detection_malformed"
         for eng, entry in engines.items():
             if not _entry_ok(eng, entry):
                 return None, "detection_malformed"
@@ -237,6 +239,8 @@ def route_decision(decision: Mapping) -> dict | None:
     carries; the start path that stores it is a later slice."""
     if not isinstance(decision, Mapping) or not decision.get("ok"):
         return None
+    if any(key not in decision for key in ("reason", "engine", "model", "connection", "candidates", "hand_pick")):
+        return None  # carries ok without decide's members: not a routed decision
     return {
         "chosen": {"engine": decision["engine"], "model": decision["model"],
                    "connection": dict(decision["connection"])},
@@ -325,7 +329,8 @@ def explain_answer(config: Config, detection: object, params: object) -> dict:
 
     The params' ``task_kind``, ``tags`` and ``hand_pick`` are the task; ``session_id`` is the caller's to
     resolve and is not read here. A member the method does not have is refused with its name as the detail
-    (``params`` when the name is not a code word).
+    (``params`` when the name is not a code word); params that cannot be read are refused ``params``, and a
+    hand pick that cannot be read ``hand_pick``, never raised through.
     ``hand_pick`` carries both ``engine`` and ``model`` (common.v1). An ``engine`` with a ``hand_pick`` of
     another engine is refused, ``engine_and_hand_pick_differ`` (the Liaison's ruling of 4:20 PM); with a hand
     pick of the same engine, the hand pick decides. An ``engine`` alone is refused, ``engine_named_not_routed``:
@@ -334,18 +339,27 @@ def explain_answer(config: Config, detection: object, params: object) -> dict:
     """
     if not isinstance(params, Mapping):
         return {"code": "request_invalid", "detail": "params"}
-    for name in params:
+    try:
+        names = list(params)
+        given = {name: params[name] for name in EXPLAIN_PARAMS if name in params}
+    except Exception:  # noqa: BLE001 - params that cannot be read are refused, never raised through
+        return {"code": "request_invalid", "detail": "params"}
+    for name in names:
         if name not in EXPLAIN_PARAMS:
             return {"code": "request_invalid", "detail": name if isinstance(name, str) and _CODE.fullmatch(name) else "params"}
-    hand = params.get("hand_pick")
-    if "hand_pick" in params and not (isinstance(hand, Mapping) and set(hand) == {"engine", "model"}):
+    hand = given.get("hand_pick")
+    try:
+        hand_engine = hand["engine"] if isinstance(hand, Mapping) and set(hand) == {"engine", "model"} else None
+    except Exception:  # noqa: BLE001 - a hand pick that cannot be read is not a hand pick
+        hand_engine = None
+    if "hand_pick" in given and hand_engine is None:
         return {"code": "request_invalid", "detail": "hand_pick"}
-    if "engine" in params:
+    if "engine" in given:
         if hand is None:
             return {"code": "request_invalid", "detail": "engine_named_not_routed"}
-        if hand["engine"] != params["engine"]:
+        if hand_engine != given["engine"]:
             return {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"}
-    task = {key: params[key] for key in ("task_kind", "tags", "hand_pick") if key in params}
+    task = {key: given[key] for key in ("task_kind", "tags", "hand_pick") if key in given}
     decision = decide(config, detection, task)
     if not decision["ok"]:
         detail = decision["code"] if decision.get("reason") is None else f'{decision["code"]}:{decision["reason"]}'
@@ -410,7 +424,12 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     if (any(key not in decision for key in ("reason", "rule", "engine", "model"))
             or not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)):
         return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
-    code = limit.get("code") if isinstance(limit, Mapping) else None
+    if not isinstance(decision["engine"], str) or not isinstance(decision["model"], (str, type(None))):
+        return {"action": "none", "reason": "no_decision"}  # an engine or model decide never gives
+    try:
+        code = limit.get("code") if isinstance(limit, Mapping) else None
+    except Exception:  # noqa: BLE001 - a limit result that cannot be read is not a limit: no blind retry
+        return {"action": "none", "reason": "not_a_limit"}
     if code not in route_limits.LIMIT_CODES:
         return {"action": "none", "reason": "not_a_limit"}
     limits, source = _route_limits(config, decision)

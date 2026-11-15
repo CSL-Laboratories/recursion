@@ -153,7 +153,7 @@ MUTANTS = {
     # providers routing does not list.
     "M25 an engine with a hand pick of another engine: the hand pick taken silently": (
         ROUTER,
-        '        if hand["engine"] != params["engine"]:\n'
+        '        if hand_engine != given["engine"]:\n'
         '            return {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"}\n',
         "",
         {"test_an_engine_and_a_hand_pick"}),
@@ -317,6 +317,63 @@ MUTANTS = {
         '    if not isinstance(decision, Mapping) or not decision.get("ok"):\n        return None\n',
         '    if not decision.get("ok"):\n        return None\n',
         {"test_route_decision_of_anything_but_a_routed_decision_is_none"}),
+    # The third reads of #399 (1bf3254d): sol 1-2 (its M55-M60 as proposed), DeepSeek N1-N5.
+    "M55 reason missing from a routed decision accepted": (
+        ROUTER,
+        '("reason", "rule", "engine", "model")',
+        '("rule", "engine", "model")',
+        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+    "M56 engine missing from a routed decision accepted": (
+        ROUTER,
+        '("reason", "rule", "engine", "model")',
+        '("reason", "rule", "model")',
+        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+    "M57 model missing from a routed decision accepted": (
+        ROUTER,
+        '("reason", "rule", "engine", "model")',
+        '("reason", "rule", "engine")',
+        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+    "M58 a non-mapping connection accepted": (
+        ROUTER,
+        'not isinstance(connection, Mapping) or not {"kind", "id"} <= set(connection)',
+        'connection is None or not {"kind", "id"} <= set(connection)',
+        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+    "M59 connection kind missing from a routed decision accepted": (
+        ROUTER,
+        'not {"kind", "id"} <= set(connection)',
+        'not {"id"} <= set(connection)',
+        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+    "M60 an unreadable hand pick raises": (
+        ROUTER,
+        "    except Exception:  # noqa: BLE001 - null, a string or a hand pick that cannot be read: not a hand pick",
+        "    except (AttributeError, TypeError):",
+        {"test_a_hand_pick_that_cannot_be_read_is_refused"}),
+    "M61 a detection object read before the guard": (
+        ROUTER,
+        '    try:\n        if "engines" not in detection:\n',
+        '    if "engines" not in detection:\n        return None, "detection_unavailable"\n'
+        '    try:\n        if "engines" not in detection:\n',
+        {"test_a_detection_object_that_cannot_be_read_refuses_every_task"}),
+    "M62 params that cannot be read raising": (
+        ROUTER,
+        "    except Exception:  # noqa: BLE001 - params that cannot be read are refused, never raised through\n",
+        "    except ZeroDivisionError:\n",
+        {"test_explain_answer_refuses_params_it_cannot_read"}),
+    "M63 an engine decide never gives used as a key": (
+        ROUTER,
+        '        return {"action": "none", "reason": "no_decision"}  # an engine or model decide never gives\n',
+        "        pass\n",
+        {"test_a_decision_with_an_engine_decide_never_gives_is_no_decision"}),
+    "M64 route_decision of a mapping routed in name only raising": (
+        ROUTER,
+        "        return None  # carries ok without decide's members: not a routed decision\n",
+        "        pass\n",
+        {"test_route_decision_of_anything_but_a_routed_decision_is_none"}),
+    "M65 a limit result that cannot be read raising": (
+        ROUTER,
+        "    except Exception:  # noqa: BLE001 - a limit result that cannot be read is not a limit: no blind retry\n",
+        "    except ZeroDivisionError:\n",
+        {"test_a_limit_result_that_cannot_be_read_is_not_a_limit"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

@@ -386,6 +386,13 @@ class ReviewTwoRegressionTests(unittest.TestCase):
                         {**d, "connection": None}, {**d, "connection": {"kind": "subscription"}},
                         {k: v for k, v in d.items() if k != "rule"}):
             self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, partial)
+        # Third reads, sol 1: each member alone, and a connection that is not a mapping or has no kind.
+        for missing in ("reason", "rule", "engine", "model", "connection"):
+            partial = {k: v for k, v in d.items() if k != missing}
+            self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, missing)
+        for connection in ({"id": "claude-main"}, ["kind", "id"]):
+            self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT),
+                             {"action": "none", "reason": "no_decision"}, connection)
         refused = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "pi", "model": None}})
         self.assertEqual(router.next_after_limit(cfg, refused, LIMIT), {"action": "none", "reason": "no_route"})
 
@@ -430,9 +437,87 @@ class ReviewTwoRegressionTests(unittest.TestCase):
             self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_task", "task"), broken)
             self.assertEqual(router.explain(config(), SENTRY, Hostile(broken))["decision"], d)
 
-    def test_route_decision_of_anything_but_a_routed_decision_is_none(self) -> None:  # ds R7
-        for value in (None, 5, "x", {}, {"ok": False}):
+    def test_route_decision_of_anything_but_a_routed_decision_is_none(self) -> None:  # ds R7; third reads N4
+        for value in (None, 5, "x", {}, {"ok": False}, {"ok": True}):
             self.assertIsNone(router.route_decision(value), value)
+        d = router.decide(config(), SENTRY, {})
+        for missing in ("reason", "engine", "model", "connection", "candidates", "hand_pick"):
+            self.assertIsNone(router.route_decision({k: v for k, v in d.items() if k != missing}), missing)
+        self.assertEqual(router.route_decision(d)["chosen"]["engine"], "claude_code")
+
+    def test_a_hand_pick_that_cannot_be_read_is_refused(self) -> None:  # third reads, sol 2
+        class HostileGet(dict):
+            def get(self, key, default=None):
+                raise RuntimeError("hand_pick get")
+
+        class HostileIter(dict):
+            def __iter__(self):
+                raise RuntimeError("hand_pick iter")
+
+        for hand in (HostileGet(engine="codex", model=None), HostileIter(engine="codex", model=None)):
+            task = {"hand_pick": hand}
+            d = router.decide(config(), SENTRY, task)
+            self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_hand_pick", "hand_pick"))
+            self.assertEqual(router.explain(config(), SENTRY, task)["decision"], d)
+
+
+class _Unreadable(Mapping):
+    """A mapping every read of which raises: a caller's object that is broken."""
+
+    def __init__(self, broken: str) -> None:
+        self.broken = broken
+
+    def __contains__(self, key):
+        if self.broken in ("contains", "all"):
+            raise RuntimeError("contains")
+        return key in ("engines", "task_kind")  # so that reading its value is what breaks
+
+    def __getitem__(self, key):
+        raise RuntimeError("getitem")
+
+    def get(self, key, default=None):
+        raise RuntimeError("get")
+
+    def __iter__(self):
+        if self.broken in ("iter", "all"):
+            raise RuntimeError("iter")
+        return iter(("engines",))
+
+    def __len__(self) -> int:
+        return 1
+
+
+class ReviewThreeRegressionTests(unittest.TestCase):
+    """The third reads of #399 (1bf3254d): DeepSeek V4.1 Flash N1-N5 (Sol's two are beside the code they pin)."""
+
+    def test_a_detection_object_that_cannot_be_read_refuses_every_task(self) -> None:  # ds N1
+        for broken in ("contains", "getitem"):
+            self.assertEqual(router.snapshot(_Unreadable(broken)), (None, "detection_malformed"), broken)
+            d = router.decide(config(), _Unreadable(broken), {})
+            self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "default_engine_unavailable", "detection_malformed"))
+
+    def test_explain_answer_refuses_params_it_cannot_read(self) -> None:  # ds N2
+        for broken in ("contains", "iter", "getitem"):
+            self.assertEqual(router.explain_answer(config(), SENTRY, _Unreadable(broken)),
+                             {"code": "request_invalid", "detail": "params"}, broken)
+
+        class HostileHand(dict):
+            def __iter__(self):
+                raise RuntimeError("iter")
+        self.assertEqual(router.explain_answer(config(), SENTRY, {"hand_pick": HostileHand(engine="codex", model=None)}),
+                         {"code": "request_invalid", "detail": "hand_pick"})
+
+    def test_a_decision_with_an_engine_decide_never_gives_is_no_decision(self) -> None:  # ds N3
+        cfg = config()  # the default route has no limits of its own, so routes.json's are looked up by engine
+        d = router.decide(cfg, SENTRY, {})
+        for odd in ({**d, "engine": ["codex"]}, {**d, "engine": None}, {**d, "model": ["m"]}):
+            self.assertEqual(router.next_after_limit(cfg, odd, LIMIT), {"action": "none", "reason": "no_decision"}, odd)
+        self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "ask")
+
+    def test_a_limit_result_that_cannot_be_read_is_not_a_limit(self) -> None:  # ds N5
+        cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        d = router.decide(cfg, SENTRY, {})
+        self.assertEqual(router.next_after_limit(cfg, d, _Unreadable("all")), {"action": "none", "reason": "not_a_limit"})
 
 
 if __name__ == "__main__":

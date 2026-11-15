@@ -52,7 +52,8 @@ class EarlyRefusalTest(unittest.TestCase):
 
     def test_openai_api_key_is_refused_before_custody_and_launch(self):
         res = self.run_route(PARENT, kind="api_key", conn_id="key-1", credential_env="OPENAI_API_KEY")
-        self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, "credential_env OPENAI_API_KEY not allowed for codex"))
+        self.assertEqual((res["code"], res["detail"]),
+                         (c.LAUNCH_REFUSED, "credential_env OPENAI_API_KEY not allowed for codex"))
         self.assertEqual((self.custody.asked, self.launcher.calls), ([], []))
 
     def test_codex_api_key_is_the_selectable_key(self):
@@ -65,7 +66,8 @@ class EarlyRefusalTest(unittest.TestCase):
         self.assertEqual(codex_module.CODEX_API_KEY_ENV, ("CODEX_API_KEY",))
 
     def test_a_set_codex_home_is_refused_on_every_route_kind_before_custody_and_launch(self):
-        for req in ({"kind": "subscription"}, {"kind": "api_key", "conn_id": "key-1", "credential_env": "CODEX_API_KEY"}):
+        key_route = {"kind": "api_key", "conn_id": "key-1", "credential_env": "CODEX_API_KEY"}
+        for req in ({"kind": "subscription"}, key_route):
             for home in ("/home/op/.codex", ""):
                 with self.subTest(kind=req["kind"], home=home):
                     res = self.run_route({**PARENT, "CODEX_HOME": home}, **req)

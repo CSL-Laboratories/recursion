@@ -1,0 +1,51 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/02-parse-error-keeps-serving",
+  "protocol": "2025-06-18",
+  "summary": "A line that is not JSON gets a parse error; serving goes on.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send_text": "{not json\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "Parse error: not JSON"
+          }
+        }
+      ]
+    },
+    {
+      "send_text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "Parse error: not JSON"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {}
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

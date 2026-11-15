@@ -1,0 +1,450 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "tools/02-start-status-stop-list",
+  "protocol": "2025-06-18",
+  "summary": "A run is started (client_key forwarded unchanged), read, stopped while a member lives (pending, which the control API's success codes leave as isError true), stopped again once the attested walk is empty (stopped), and listed. Each answer is the control API's, unchanged.",
+  "source": "MCP 2025-06-18 server/tools (Listing Tools, Calling Tools, Error Handling); control/api.py run verbs; D3 (CONTRACT 1712): a Stop answers stopped or pending truthfully",
+  "api": [
+    {
+      "method": "run.start",
+      "params": {
+        "tenant": "t1",
+        "engine": "codex",
+        "prompt": "say hello",
+        "client_key": "k-1"
+      },
+      "answer": {
+        "code": "started",
+        "duplicate": false,
+        "run": {
+          "cgroup": "/sys/fs/cgroup/fake/run-1",
+          "cgroup_marker": "cg-1",
+          "engine": "codex",
+          "generation": 2,
+          "members": [],
+          "run_id": "run-1",
+          "start_key": {
+            "client_key": "k-1",
+            "engine": "codex",
+            "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+          },
+          "started_at": 1000.0,
+          "state": "running",
+          "stop": null,
+          "stop_attestation": null,
+          "tenant": "t1"
+        }
+      }
+    },
+    {
+      "method": "run.status",
+      "params": {
+        "run_id": "run-1"
+      },
+      "answer": {
+        "code": "ok",
+        "run": {
+          "cgroup": "/sys/fs/cgroup/fake/run-1",
+          "cgroup_marker": "cg-1",
+          "engine": "codex",
+          "generation": 2,
+          "members": [],
+          "run_id": "run-1",
+          "start_key": {
+            "client_key": "k-1",
+            "engine": "codex",
+            "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+          },
+          "started_at": 1000.0,
+          "state": "running",
+          "stop": null,
+          "stop_attestation": null,
+          "tenant": "t1"
+        }
+      }
+    },
+    {
+      "method": "run.stop",
+      "params": {
+        "run_id": "run-1"
+      },
+      "answer": {
+        "code": "pending",
+        "reason": "cgroup_populated",
+        "run_id": "run-1",
+        "state": "pending"
+      }
+    },
+    {
+      "method": "run.stop",
+      "params": {
+        "run_id": "run-1"
+      },
+      "answer": {
+        "code": "stopped",
+        "repeat": true,
+        "run_id": "run-1",
+        "state": "stopped"
+      }
+    },
+    {
+      "method": "run.list",
+      "params": {},
+      "answer": {
+        "code": "ok",
+        "runs": [
+          {
+            "cgroup": "/sys/fs/cgroup/fake/run-1",
+            "cgroup_marker": "cg-1",
+            "engine": "codex",
+            "generation": 4,
+            "members": [],
+            "run_id": "run-1",
+            "start_key": {
+              "client_key": "k-1",
+              "engine": "codex",
+              "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+            },
+            "started_at": 1000.0,
+            "state": "stopped",
+            "stop": {
+              "cgroup": "/sys/fs/cgroup/fake/run-1",
+              "cgroup_marker": "cg-1",
+              "checks": 2,
+              "reason": null,
+              "requested": true,
+              "requested_at": 1000.0
+            },
+            "stop_attestation": {
+              "cgroup": "/sys/fs/cgroup/fake/run-1",
+              "cgroup_marker": "cg-1",
+              "generation": 3,
+              "member_ids": [],
+              "proof": "empty"
+            },
+            "tenant": "t1"
+          }
+        ]
+      }
+    },
+    {
+      "method": "run.status",
+      "params": {
+        "run_id": "nope"
+      },
+      "answer": {
+        "code": "run_unknown",
+        "run_id": "nope"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "fixture-client",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {
+              "tools": {
+                "listChanged": false
+              }
+            },
+            "serverInfo": {
+              "name": "recursion-control",
+              "title": "Recursion control",
+              "version": "0.0.0"
+            },
+            "instructions": "Starts, reads and stops agent runs on this machine's Recursion daemon. recursion_run_stop answers \"stopped\" only when cleanup is confirmed and \"pending\" otherwise; read recursion_run_status before retrying a stop or a start."
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_start",
+          "arguments": {
+            "tenant": "t1",
+            "engine": "codex",
+            "prompt": "say hello",
+            "client_key": "k-1"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"started\", \"duplicate\": false, \"run\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"engine\": \"codex\", \"generation\": 2, \"members\": [], \"run_id\": \"run-1\", \"start_key\": {\"client_key\": \"k-1\", \"engine\": \"codex\", \"prompt_sha256\": \"3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7\"}, \"started_at\": 1000.0, \"state\": \"running\", \"stop\": null, \"stop_attestation\": null, \"tenant\": \"t1\"}}"
+              }
+            ],
+            "structuredContent": {
+              "code": "started",
+              "duplicate": false,
+              "run": {
+                "cgroup": "/sys/fs/cgroup/fake/run-1",
+                "cgroup_marker": "cg-1",
+                "engine": "codex",
+                "generation": 2,
+                "members": [],
+                "run_id": "run-1",
+                "start_key": {
+                  "client_key": "k-1",
+                  "engine": "codex",
+                  "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+                },
+                "started_at": 1000.0,
+                "state": "running",
+                "stop": null,
+                "stop_attestation": null,
+                "tenant": "t1"
+              }
+            },
+            "isError": false
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_status",
+          "arguments": {
+            "run_id": "run-1"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"ok\", \"run\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"engine\": \"codex\", \"generation\": 2, \"members\": [], \"run_id\": \"run-1\", \"start_key\": {\"client_key\": \"k-1\", \"engine\": \"codex\", \"prompt_sha256\": \"3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7\"}, \"started_at\": 1000.0, \"state\": \"running\", \"stop\": null, \"stop_attestation\": null, \"tenant\": \"t1\"}}"
+              }
+            ],
+            "structuredContent": {
+              "code": "ok",
+              "run": {
+                "cgroup": "/sys/fs/cgroup/fake/run-1",
+                "cgroup_marker": "cg-1",
+                "engine": "codex",
+                "generation": 2,
+                "members": [],
+                "run_id": "run-1",
+                "start_key": {
+                  "client_key": "k-1",
+                  "engine": "codex",
+                  "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+                },
+                "started_at": 1000.0,
+                "state": "running",
+                "stop": null,
+                "stop_attestation": null,
+                "tenant": "t1"
+              }
+            },
+            "isError": false
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_stop",
+          "arguments": {
+            "run_id": "run-1"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"pending\", \"reason\": \"cgroup_populated\", \"run_id\": \"run-1\", \"state\": \"pending\"}"
+              }
+            ],
+            "structuredContent": {
+              "code": "pending",
+              "reason": "cgroup_populated",
+              "run_id": "run-1",
+              "state": "pending"
+            },
+            "isError": true
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_stop",
+          "arguments": {
+            "run_id": "run-1"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"stopped\", \"repeat\": true, \"run_id\": \"run-1\", \"state\": \"stopped\"}"
+              }
+            ],
+            "structuredContent": {
+              "code": "stopped",
+              "repeat": true,
+              "run_id": "run-1",
+              "state": "stopped"
+            },
+            "isError": false
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_list",
+          "arguments": {}
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 6,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"ok\", \"runs\": [{\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"engine\": \"codex\", \"generation\": 4, \"members\": [], \"run_id\": \"run-1\", \"start_key\": {\"client_key\": \"k-1\", \"engine\": \"codex\", \"prompt_sha256\": \"3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7\"}, \"started_at\": 1000.0, \"state\": \"stopped\", \"stop\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"checks\": 2, \"reason\": null, \"requested\": true, \"requested_at\": 1000.0}, \"stop_attestation\": {\"cgroup\": \"/sys/fs/cgroup/fake/run-1\", \"cgroup_marker\": \"cg-1\", \"generation\": 3, \"member_ids\": [], \"proof\": \"empty\"}, \"tenant\": \"t1\"}]}"
+              }
+            ],
+            "structuredContent": {
+              "code": "ok",
+              "runs": [
+                {
+                  "cgroup": "/sys/fs/cgroup/fake/run-1",
+                  "cgroup_marker": "cg-1",
+                  "engine": "codex",
+                  "generation": 4,
+                  "members": [],
+                  "run_id": "run-1",
+                  "start_key": {
+                    "client_key": "k-1",
+                    "engine": "codex",
+                    "prompt_sha256": "3cad3da3dbbe1c106b3219f6c278a565f411cee74f0848956aff65d3df4846a7"
+                  },
+                  "started_at": 1000.0,
+                  "state": "stopped",
+                  "stop": {
+                    "cgroup": "/sys/fs/cgroup/fake/run-1",
+                    "cgroup_marker": "cg-1",
+                    "checks": 2,
+                    "reason": null,
+                    "requested": true,
+                    "requested_at": 1000.0
+                  },
+                  "stop_attestation": {
+                    "cgroup": "/sys/fs/cgroup/fake/run-1",
+                    "cgroup_marker": "cg-1",
+                    "generation": 3,
+                    "member_ids": [],
+                    "proof": "empty"
+                  },
+                  "tenant": "t1"
+                }
+              ]
+            },
+            "isError": false
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_status",
+          "arguments": {
+            "run_id": "nope"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 7,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"code\": \"run_unknown\", \"run_id\": \"nope\"}"
+              }
+            ],
+            "structuredContent": {
+              "code": "run_unknown",
+              "run_id": "nope"
+            },
+            "isError": true
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

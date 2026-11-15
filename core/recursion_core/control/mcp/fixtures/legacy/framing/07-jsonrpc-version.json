@@ -1,0 +1,78 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/07-jsonrpc-version",
+  "protocol": "2025-06-18",
+  "summary": "jsonrpc must be exactly \"2.0\"; a readable id is echoed.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "1.0",
+        "id": 7,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 7,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: jsonrpc must be \"2.0\""
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "id": 8,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 8,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: jsonrpc must be \"2.0\""
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": 2.0,
+        "id": 9,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 9,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: jsonrpc must be \"2.0\""
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "1.0",
+        "id": null,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: jsonrpc must be \"2.0\""
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

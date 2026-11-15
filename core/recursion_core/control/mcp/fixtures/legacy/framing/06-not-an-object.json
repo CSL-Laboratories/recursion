@@ -1,0 +1,63 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/06-not-an-object",
+  "protocol": "2025-06-18",
+  "summary": "A JSON value that is not an object is an invalid request with id null.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send_text": "\"ping\"\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: a message must be a JSON object"
+          }
+        }
+      ]
+    },
+    {
+      "send_text": "42\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: a message must be a JSON object"
+          }
+        }
+      ]
+    },
+    {
+      "send_text": "null\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: a message must be a JSON object"
+          }
+        }
+      ]
+    },
+    {
+      "send_text": "true\n",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: a message must be a JSON object"
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

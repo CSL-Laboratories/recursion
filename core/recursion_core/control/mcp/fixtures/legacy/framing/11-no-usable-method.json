@@ -1,0 +1,61 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/11-no-usable-method",
+  "protocol": "2025-06-18",
+  "summary": "A message with neither a method nor a result is invalid.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 4
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: no method"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": 5
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 9,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: method must be a non-empty string"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": ""
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 10,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: method must be a non-empty string"
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

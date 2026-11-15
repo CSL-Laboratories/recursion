@@ -32,7 +32,8 @@ infinity (``INPUT_NOT_FINITE``), which Python's decoder takes but JSON cannot wr
 Python to write. Text parts and tool results hold text; the dataclasses refuse anything else. Text UTF-8
 cannot encode (a lone surrogate, which a
 ``\\ud800`` escape gives Python's decoder) can be neither written on a line nor sent in a request:
-``holds_unencodable`` finds it, and the loop refuses a reply that holds it.
+``holds_unencodable`` finds it, the loop refuses a reply that holds it, and a user message that holds it is
+refused before it is taken.
 """
 
 from __future__ import annotations

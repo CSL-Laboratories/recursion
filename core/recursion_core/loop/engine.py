@@ -166,6 +166,10 @@ class Session:
         """Run one turn to its end and return its outcome."""
 
         self._cancel = cancel
+        if b.holds_unencodable(text):
+            # parse_input refuses such a message; a caller in-process could still pass one. Refused before it
+            # joins the conversation, where every later request would have to carry it.
+            raise ValueError("the user's text is not valid Unicode (a lone surrogate)")
         self._append(b.Message("user", (b.TextPart(self.redactor.scrub(text)),)))
         steps = 0
         while True:

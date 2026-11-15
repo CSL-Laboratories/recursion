@@ -5,8 +5,9 @@ In (one object per line; the shapes of driver.v2's inputs, plus interrupt):
     {"kind": "approval_answer", "approval_id": "apr-...", "decision": "approve" | "deny"}
     {"kind": "interrupt", "turn_id": "turn-..."}
     {"kind": "close"}
-A blank line is skipped. Any other line that is not one of these gets a ``protocol_error`` line and changes
-nothing, whatever it holds, and reading goes on.
+A blank line is skipped. Any other line that is not one of these (a ``user_message`` whose text holds a lone
+surrogate, which no request could carry, included) gets a ``protocol_error`` line and changes nothing, whatever
+it holds, and reading goes on.
 
 Out (one object per line; standard output carries nothing else, diagnostics go to standard error):
     ready           once, at start: protocol version, provider, model, tool names
@@ -135,6 +136,11 @@ def parse_input(line: bytes | str) -> Input:
             raise InputError("bad_delivery_id", "delivery_id")
         if not isinstance(doc["text"], str) or not doc["text"]:
             raise InputError("bad_text", "text must be a non-empty string")
+        try:
+            doc["text"].encode("utf-8")
+        except UnicodeEncodeError:
+            # A lone surrogate (JSON lets one be escaped): no request could send it, so the message is not taken.
+            raise InputError("bad_text", "text is not valid Unicode (it holds a lone surrogate)") from None
         return UserMessage(doc["turn_id"], doc["text"], doc["delivery_id"])
     if kind == "approval_answer":
         if not isinstance(doc["approval_id"], str) or not _APPROVAL.fullmatch(doc["approval_id"]):
@@ -193,7 +199,9 @@ class Redactor:
 
 
 class Writer:
-    """Writes one JSON object per line, whole, under a lock (the input thread writes too)."""
+    """Writes one JSON object per line, whole, under a lock (the input thread writes too). Whole means never
+    interleaved with another line: a process killed while it writes can leave its last line cut short, so a
+    reader drops a last line that has no LF."""
 
     def __init__(self, stream: IO[str], redactor: Redactor, *, seal_after: str | None = None) -> None:
         if seal_after is not None and (not isinstance(seal_after, str) or not seal_after):

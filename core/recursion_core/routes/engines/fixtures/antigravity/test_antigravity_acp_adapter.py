@@ -74,8 +74,8 @@ class Rig:
 
 
 class CwdTest(unittest.TestCase):
-    """The run's folder is the caller's: refused without one, and NO fallback of any kind (the Liaison's
-    ruling, Nov 15)."""
+    """The folder the agent is told is the caller's: refused without one, and that folder, with no fallback, is
+    what the agent is told (the Liaison's ruling, Nov 15). Where the process starts is the launch boundary's."""
 
     def test_a_run_without_an_absolute_cwd_is_refused_before_anything_starts(self) -> None:
         for cwd in (..., None, "", "relative/dir", "/var/tmp/a" + chr(0) + "b", b"/var/tmp/x", 5):
@@ -85,7 +85,7 @@ class CwdTest(unittest.TestCase):
                 self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "cwd"))
                 self.assertEqual((rig.launches, rig.custody, rig.asked, rig.agent.received), ([], [], [], []))
 
-    def test_no_fallback_folder_is_ever_used(self) -> None:
+    def test_no_other_folder_is_ever_told(self) -> None:
         # the daemon's working directory (PWD), the route home and the user's home are all at hand: none is used
         rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
         res = rig.run(request(cwd=...))
@@ -129,7 +129,9 @@ class EnvironmentTest(unittest.TestCase):
             "the daemon's own HOME": (dict(home=lambda r, m: "/home/operator/.config"), request(),
                                       ag.ROUTE_HOME_IS_DAEMON_HOME),
             "a parent with no HOME": (dict(parent={"PATH": "/usr/bin"}), request(), ag.DAEMON_HOME_UNKNOWN),
-            "no prepared home": (dict(home=None), request(), ag.NOT_PREPARED),
+            # with no prepared home the precondition refuses first (#411 round 3); the one-shot's own
+            # NOT_PREPARED for it is held by the one-shot tests
+            "no prepared home": (dict(home=None), request(), ag.NO_RUN_FOLDER),
         }
         for name, (kwargs, req, detail) in cases.items():
             with self.subTest(case=name):
@@ -221,7 +223,7 @@ class FactoryTest(unittest.TestCase):
         launches = []
         made = ag.AntigravityAcpAdapter(lambda *a, **k: launches.append(a), lambda: 0.0, lambda *a: KEY, PARENT)
         res = made.run(request("oauth-business", "subscription", None), 60.0)
-        self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.NOT_PREPARED))
+        self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.NO_RUN_FOLDER))
         self.assertEqual(launches, [])
 
     def test_nothing_registers_the_acp_adapter(self) -> None:
@@ -433,6 +435,60 @@ class ReviewRoundTwo411Test(unittest.TestCase):
         res = rig.run(req)
         self.assertEqual((type(res["request_id"]), res["request_id"], res["detail"]), (str, "", "request_id"))
         self.assertEqual(rig.launches, [])
+
+
+class ReviewRoundThree411Test(unittest.TestCase):
+    """DeepSeek's round-3 read of #411 at ea339644 (F1r-1 to F1r-4, OBS-1). Each fails on that head but
+    OBS-1's, a guard: the order it pins already held."""
+
+    ROUTES = {"gemini-api-key": ("api_key", "GEMINI_API_KEY"), "agent-platform": ("api_key", "GOOGLE_API_KEY"),
+              "oauth-business": ("subscription", None), "oauth-personal": ("subscription", None)}
+
+    def test_f1r4_the_class_registered_through_the_engine_table_refuses_every_run(self) -> None:
+        from recursion_core.routes.engines import EngineTable
+
+        table = EngineTable()
+        table.register("antigravity", ag.AntigravityAcpAdapter)     # registrable: the table checks callable
+        table.freeze()
+        factory = dict(table.items())["antigravity"]
+        launches, custody = [], []
+        made = factory(lambda *a, **k: launches.append(a), lambda: 0.0,
+                       lambda *a: custody.append(a) or KEY, PARENT)
+        self.assertEqual(set(self.ROUTES), set(ag.METHODS))
+        for method, (kind, cred) in self.ROUTES.items():
+            with self.subTest(method=method):
+                res = made.run(request(method, kind, cred), 60.0)
+                self.assertEqual((res["request_id"], res["code"], res["detail"]),
+                                 ("r1", c.LAUNCH_REFUSED, ag.NO_RUN_FOLDER))
+        self.assertEqual((launches, custody), ([], []))
+        readme = pathlib.Path(ag.__file__).parent / "fixtures" / "antigravity" / "README.md"
+        self.assertIn("The class itself is registrable", readme.read_text(encoding="utf-8"))
+
+    def test_f1r1_a_request_id_that_cannot_be_written_is_refused_and_never_echoed(self) -> None:
+        for lying in (None, "tenant"):
+            with self.subTest(also_lying=lying):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+                req = request()
+                req["request_id"] = "r" + chr(0xD800)
+                if lying:
+                    req[lying] = LyingStr(req[lying])
+                res = rig.run(req)
+                self.assertEqual((res["request_id"], res["code"], res["detail"]), ("", c.REQUEST_INVALID, "request_id"))
+                json.dumps(res, ensure_ascii=False).encode("utf-8")
+                self.assertEqual(rig.launches, [])
+
+    def test_f1r3_the_docstring_says_this_head_and_370_apart(self) -> None:
+        doc = " ".join(ag.AntigravityAcpAdapter.__doc__.split())
+        self.assertIn("At this head no launcher for this engine can be built", doc)
+        self.assertIn("Once #370 lands, its S4", doc)
+        self.assertNotIn("with #370's S4 where", doc)
+        self.assertNotIn("NO fallback of any kind", CwdTest.__doc__)
+
+    def test_obs1_the_first_field_in_order_is_the_one_named(self) -> None:
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        req = request()
+        req["tenant"], req["prompt"] = LyingStr(req["tenant"]), LyingStr(req["prompt"])
+        self.assertEqual(rig.run(req)["detail"], "tenant")
 
 if __name__ == "__main__":
     unittest.main()

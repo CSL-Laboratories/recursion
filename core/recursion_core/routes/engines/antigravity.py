@@ -1159,12 +1159,15 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
     WHERE THE PROCESS STARTS IS NOT THIS ADAPTER'S. It hands the launch boundary ``argv``, ``env`` and
     ``shell`` and no working directory: the launcher contract (``launcher(argv, *, env, shell=False)``) has no
     field for one, and the daemon's launcher refuses any other option (``launch_option_denied``,
-    ``daemon/launcher.py`` ``ProductionLauncher.__call__``). In the daemon as started no launcher for this
-    engine can be built yet (``ENGINE_PROFILES`` has no ``antigravity``); once one can, the child starts in the
-    engine's home under the daemon's state folder (``<state>/homes/<engine>``), not in the run's folder, and
-    with #370's S4 where the ``working_directory`` provider says (from the run's workspace), or there.
+    ``daemon/launcher.py`` ``ProductionLauncher.__call__``). At this head no launcher for this engine can be
+    built (``ENGINE_PROFILES`` has no ``antigravity``), and the daemon's launcher starts every unit in the
+    engine's home under its state folder (``<state>/homes/<engine>``), not in the run's folder. Once #370
+    lands, its S4 ``working_directory`` provider will choose the folder from the run's workspace (the engine's
+    home when it answers None).
     THIS ADAPTER MUST NOT BE REGISTERED UNTIL THE LAUNCH BOUNDARY STARTS THE CHILD IN THE RUN'S FOLDER, and
-    ``acp_factory`` refuses until then.
+    ``acp_factory`` refuses until then. The class itself is registrable (the engine table checks only that a
+    factory is callable), and what the table builds from it has no prepared home: it refuses every run, before
+    anything starts, with the precondition's own refusal (``launch_refused``, ``NO_RUN_FOLDER``).
 
     THE REQUEST IS READ ONCE. ``run`` copies it, its route and its connection into plain dicts (each key read
     once), and every check and every use after that reads the copy: one Mapping cannot answer the check one
@@ -1191,6 +1194,8 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
             # _request_once has refused a str subclass: a str here is exactly one
             if rid and not (isinstance(cwd, str) and cwd.startswith("/") and "\x00" not in cwd):
                 return c.result(rid, c.REQUEST_INVALID, detail=NO_CWD)
+            if rid and self._prepared_home is None:     # as the engine table builds it: the precondition refuses
+                return c.result(rid, c.LAUNCH_REFUSED, detail=NO_RUN_FOLDER)
         return super().run(request, deadline_at)
 
     def argv(self, request: dict) -> list[str]:
@@ -1224,7 +1229,8 @@ _EXACT_STR_CONNECTION = ("kind", "id", "credential_env")
 
 class _RequestRefused(c.RouteError):
     """A refusal of ``_request_once``: ``request_invalid``, the field named, and the caller's ``request_id``
-    when the copy holds one that is exactly a str (else ``""``), so the caller can match the refusal."""
+    when the copy holds one that is exactly a str and can be written as UTF-8 (else ``""``), so the caller can
+    match the refusal."""
 
     def __init__(self, request_id: str, detail: str) -> None:
         super().__init__(c.REQUEST_INVALID, detail)
@@ -1233,7 +1239,9 @@ class _RequestRefused(c.RouteError):
 
 def _request_once(request: Mapping) -> dict:
     """The request, its route and its connection copied into plain dicts, each key read once; a str field this
-    adapter reads that is a str subclass is refused ``request_invalid``, named (``_RequestRefused``)."""
+    adapter reads that is a str subclass is refused ``request_invalid``, named (``_RequestRefused``). The
+    ``request_id`` is read first: one holding a surrogate code point cannot be written as UTF-8, so it is
+    refused (``request_id``) and never echoed."""
     def copy(mapping, exact, prefix):
         out = dict(mapping.items())
         return out, [prefix + name for name in exact
@@ -1242,8 +1250,11 @@ def _request_once(request: Mapping) -> dict:
     rid, bad = "", []
     try:
         snapshot, bad = copy(request, _EXACT_STR, "")
-        if type(snapshot.get("request_id")) is str:
-            rid = snapshot["request_id"]
+        value = snapshot.get("request_id")
+        if type(value) is str and any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            raise _RequestRefused("", "request_id")
+        if type(value) is str:
+            rid = value
         route = snapshot.get("route")
         if not bad and isinstance(route, Mapping):
             route, bad = copy(route, _EXACT_STR_ROUTE, "route.")
@@ -1251,6 +1262,8 @@ def _request_once(request: Mapping) -> dict:
             connection = route.get("connection")
             if not bad and isinstance(connection, Mapping):
                 route["connection"], bad = copy(connection, _EXACT_STR_CONNECTION, "route.connection.")
+    except _RequestRefused:
+        raise
     except Exception:   # a Mapping that cannot be read as one
         raise _RequestRefused(rid, "request") from None
     if bad:

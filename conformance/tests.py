@@ -1191,6 +1191,65 @@ class RulesTest(unittest.TestCase):
             self.refused("record_invalid", model.change, effect=dict(found["record"]["effect"], input={"command": "make"}))
         self.assertEqual((client._exact(model.record), client._exact(model.binding)), before)
 
+    def test_a_fresh_open_or_answer_reads_no_member_of_a_record_that_is_not_an_approval(self):
+        """A whole, well-formed approval.open or approval.answer over a restored record that lacks a member
+        is refused 'record_invalid' (the core's own refusal, not an answer of either method) before the
+        record is read: no host exception, no answer, no receipt, and record, binding and receipts as they
+        were. (The sixth reads, Q1: until then a record without its effect or its lines was answered 'ok'
+        and approved, with a receipt, and one without its state was a KeyError.)"""
+        rules = self.rules
+        seed = client.read_json(next((self.folder / "fixtures" / "good" / "approval.v1").glob("h01-*.json")))
+
+        def refused_unchanged(model, principal, method, params, at):
+            self.assertTrue(rules.fits("methods.v1.json#/$defs/params." + method, params), "the call itself is whole")
+            before = copy.deepcopy((model.record, model.binding, model.receipts))
+            try:
+                self.refused("record_invalid", model.call, principal, method, params, at)
+            finally:
+                self.assertEqual((model.record, model.binding, model.receipts), before, "no answer and no receipt")
+
+        # The first read's cases: the request already shown to this principal on this surface at its revision, so
+        # that an answer would pass every check of its own.
+        shown = copy.deepcopy(seed)
+        reviewer = {"kind": "owner", "id": "review-owner"}
+        shown["opened_by"] = [{"principal": reviewer, "surface": "cli", "revision": shown["revision"], "at": shown["requested_at"]}]
+        self.assertTrue(rules.fits("approval.v1.json", shown))
+        opens = {"approval_id": shown["approval_id"], "command_id": "r6fresh-00000001", "surface": "cli"}
+        answers = dict(opens, expected_revision=shown["revision"], digest=shown["digest"], answer="approve")
+        for method, missing in (("approval.open", "state"), ("approval.answer", "state"), ("approval.open", "expires_at"),
+                                ("approval.answer", "effect"), ("approval.open", "effect"), ("approval.answer", "opened_by")):
+            record = copy.deepcopy(shown)
+            del record[missing]
+            with self.subTest(read="first", method=method, missing=missing):
+                refused_unchanged(rules.ApprovalModel(record), reviewer, method, opens if method == "approval.open" else answers,
+                                  shown["requested_at"])
+        # The second read's cases: the published request as it is, each of six members deleted, both methods.
+        opens = {"command_id": "r6.open.0001", "approval_id": seed["approval_id"], "surface": "tui"}
+        answers = dict(opens, command_id="r6.answer.0001", expected_revision=seed["revision"], digest=seed["digest"], answer="approve")
+        for missing in ("state", "opened_by", "expires_at", "revision", "approval_id", "rendered"):
+            for method, params in (("approval.open", opens), ("approval.answer", answers)):
+                record = copy.deepcopy(seed)
+                del record[missing]
+                with self.subTest(read="second", method=method, missing=missing):
+                    refused_unchanged(rules.ApprovalModel(record), self.OWNER, method, params, "2026-11-13T07:34:32.000Z")
+
+    def test_a_kept_receipt_is_replayed_even_after_the_record_is_spoiled(self):
+        """The boundary of a fresh operation is not the boundary of a replay: a receipt kept before the record
+        was spoiled is still answered as it was, and nothing changes. (Both sixth reads' controls.)"""
+        rules = self.rules
+        seed = client.read_json(next((self.folder / "fixtures" / "good" / "approval.v1").glob("h01-*.json")))
+        for principal, params, spoil in ((self.OWNER, {"command_id": "r6.replay", "approval_id": seed["approval_id"], "surface": "tui"}, "state"),
+                                         ({"kind": "owner", "id": "review-owner"},
+                                          {"approval_id": seed["approval_id"], "command_id": "r6original-00000001", "surface": "cli"}, "effect")):
+            model = rules.ApprovalModel(seed)
+            first = model.call(principal, "approval.open", params, "2026-11-13T07:34:32.000Z")
+            self.assertTrue(rules.fits("methods.v1.json#/$defs/answer.approval.open", first))
+            del model.record[spoil]
+            before = copy.deepcopy((model.record, model.binding, model.receipts))
+            with self.subTest(spoiled=spoil):
+                self.assertEqual(model.call(principal, "approval.open", params, "2026-11-13T07:34:32.000Z"), first)
+                self.assertEqual((model.record, model.binding, model.receipts), before)
+
     def test_a_change_binds_the_normalised_numbers_of_its_new_effect(self):
         rules = self.rules
         found = self.vector("approval.lifecycle/s15-*.json")

@@ -455,7 +455,7 @@ class TuiApp:
             return
         if action == "line.submit" and (burst or self._line_burst):
             self._line_burst = False  # said once; the next Enter, on its own, sends the line
-            send = self._first_key("line.submit", "command") or "Enter"
+            send = self._first_key("line.submit", "command")  # the keys that just sent it are bound to it
             self._notice(f"the command line was not sent: it or its {send} came in one read with other input "
                          f"(a paste?); press {send} to send it")
         elif action == "line.submit":

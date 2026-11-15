@@ -818,6 +818,163 @@ class WorkflowScanTests(TreeCase):
                 self.add_workflow("|\n          " + script)
                 self.assertProblem(r"env -S, whose string becomes the command")
 
+    # Round-6 reads (GPT-6 Astra changes 1-3): the supplied cases, as written.
+    def test_wrapper_options_preserve_command_position(self):
+        for prefix in ('env -iu REVIEW_UNUSED', 'env -', 'exec -ca review_name',
+                       "printf 'x\\n' | xargs -rn 1", "printf 'x\\n' | xargs -e",
+                       "printf 'x\\n' | xargs --eof", "printf 'x\\n' | xargs --replace",
+                       "printf 'x\\n' | xargs --max-lines"):
+            with self.subTest(prefix=prefix):
+                self.add_workflow('|\n          ' + prefix + " bash -c 'source ./inert-fixture.sh'")
+                self.assertProblem("runs a file's text as the script")
+
+    def test_env_unset_attached_value_is_not_split_string_option(self):
+        for script in ('env -uREVIEW_STATUS true', 'env -iuREVIEW_STATUS true'):
+            with self.subTest(script=script):
+                self.add_workflow('|\n          ' + script)
+                self.assertEqual(self.tree.problems(), [])
+
+    def test_absolute_wrapper_and_dynamic_shell_paths_are_read(self):
+        for script in ("/usr/bin/env -u REVIEW_UNUSED bash -c 'source ./inert-fixture.sh'",
+                       "WRAP=/usr/bin/env; \"$WRAP\" /bin/bash -c 'source ./inert-fixture.sh'"):
+            with self.subTest(script=script):
+                self.add_workflow('|\n          ' + script)
+                self.assertProblem("runs a file's text as the script")
+
+    def test_wrapper_value_options_are_not_command_names(self):
+        for prefix in ('command time -f elapsed', 'stdbuf -o L'):
+            with self.subTest(prefix=prefix):
+                self.add_workflow('|\n          ' + prefix + " bash -c 'source ./inert-fixture.sh'")
+                self.assertProblem("runs a file's text as the script")
+
+    def test_plus_s_reads_stdin_even_with_a_positional_argument(self):
+        self.add_workflow('|\n          bash +s ignored-argument <<< \'source ./inert-fixture.sh\'')
+        self.assertProblem("runs a file's text as the script")
+
+    # Round-6 reads (GPT-6.1 Sol changes 1-4): the supplied cases, as written.
+    def test_xargs_optional_option_values_do_not_hide_a_shell(self) -> None:
+        for prefix in ('xargs -e', 'xargs --eof', 'xargs --replace', 'xargs --max-lines'):
+            with self.subTest(prefix=prefix):
+                self.add_workflow("|\n          " + prefix + " bash -c 'p\"i\"p install -r requirements-dev.txt'")
+                self.assertTrue(self.tree.problems(), 'the nested install must be read or explicitly refused')
+
+    def test_clustered_env_options_do_not_turn_operands_into_commands(self) -> None:
+        for script in ('env -iu source true', 'env -vu source true', 'env -uSHELL true', 'env -uS true'):
+            with self.subTest(script=script):
+                self.add_workflow('|\n          ' + script)
+                self.assertEqual(self.tree.problems(), [])
+
+    def test_known_variable_wrappers_with_options_do_not_hide_a_shell(self) -> None:
+        for prefix in ('WRAP=/usr/bin/env; "$WRAP" -u UNUSED',
+                       'WRAP=/usr/bin/env; "$WRAP" nice -n 5',
+                       'WRAP=/usr/bin/nice; "$WRAP" -n 5',
+                       'WRAP=/usr/bin/timeout; "$WRAP" 3'):
+            with self.subTest(prefix=prefix):
+                self.add_workflow("|\n          " + prefix + " bash -c 'p\"i\"p install -r requirements-dev.txt'")
+                self.assertTrue(self.tree.problems(), 'the nested install must be read or explicitly refused')
+
+    def test_stdbuf_separate_option_values_are_read(self) -> None:
+        for prefix in ('stdbuf -o L', 'stdbuf --output L', 'stdbuf -i 0 -e L'):
+            with self.subTest(prefix=prefix):
+                self.add_workflow("|\n          " + prefix + " bash -c 'p\"i\"p install -r requirements-dev.txt'")
+                self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_external_time_separate_option_values_are_read(self) -> None:
+        for prefix in ('/usr/bin/time -f %E', '/usr/bin/time --format %E',
+                       '/usr/bin/time -o timing.log', '/usr/bin/time --output timing.log'):
+            with self.subTest(prefix=prefix):
+                self.add_workflow("|\n          " + prefix + " bash -c 'p\"i\"p install -r requirements-dev.txt'")
+                self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_env_option_terminator_allows_a_command_named_like_an_option(self) -> None:
+        self.add_workflow('env -- -S')
+        self.assertEqual(self.tree.problems(), [])
+
+    def test_clustered_wrapper_options_do_not_hide_a_shell(self) -> None:
+        for prefix in ('xargs -0n 1', 'xargs -rn 1', 'env -vu UNUSED', 'exec -la NAME',
+                       'timeout -vs KILL 3', '/usr/bin/time -po timing.log'):
+            with self.subTest(prefix=prefix):
+                self.add_workflow("|\n          " + prefix + " bash -c 'p\"i\"p install -r requirements-dev.txt'")
+                self.assertTrue(self.tree.problems(), 'the nested install must be read or explicitly refused')
+
+    # Round 6, mine: every option of every wrapper the check knows, read as that wrapper's own
+    # parser reads it. Each prefix but sudo's and doas's was also run on Ubuntu 24.04 with a
+    # stand-in bash, to see that the real program reaches it (the pull request has the table).
+    WRAPPED = (
+        "command -p", "command -p --", "command -pp",
+        "doas -a style", "doas -astyle", "doas -C /etc/doas.conf", "doas -u root", "doas -nsu root",
+        "doas -Ln -uroot",
+        "env -a name", "env -aname", "env -C /tmp", "env -C/tmp", "env -u NAME", "env -uNAME", "env -0iv",
+        "env -", "env -i -", "env -- -", "env -iu S", "env -uS", "env -vC S", "env -u NAME FOO=1",
+        "env --argv0=name", "env --argv0 name", "env --chdir=/tmp", "env --chdir /tmp", "env --unset NAME",
+        "env --unset=S", "env --uns NAME", "env --debug --ignore-environment --null", "env --block-signal",
+        "env --block-signal=INT", "env --default-signal", "env --ignore-signal=PIPE",
+        "env --list-signal-handling",
+        "exec -a name", "exec -aname", "exec -cl", "exec -cla name", "exec -l -c", "exec --",
+        "nice", "nice -n 5", "nice -n5", "nice -n -5", "nice -5", "nice --10", "nice -+3",
+        "nice --adjustment=5", "nice --adjustment 5", "nice --adj 5",
+        "nohup", "nohup --",
+        "setsid -fw", "setsid -c", "setsid --fork --wait", "setsid --ctty",
+        "stdbuf -oL", "stdbuf -i0 -e L", "stdbuf --output=L", "stdbuf --err L",
+        "sudo -u root", "sudo -uroot", "sudo -g wheel", "sudo -EHn -u root", "sudo -C 3", "sudo -D /tmp",
+        "sudo -h host", "sudo -p prompt", "sudo -r role -t type", "sudo -R /srv", "sudo -T 60",
+        "sudo -U other", "sudo -a style", "sudo -c class", "sudo -AbBiKkNPSs", "sudo --user root",
+        "sudo --user=root", "sudo --login", "sudo --login-class class", "sudo --preserve-env",
+        "sudo --preserve-env=PATH", "sudo --host host", "sudo --",
+        "time", "time -p", "command time -f %E", "/usr/bin/time -f%E", "/usr/bin/time -apqv -o out.txt",
+        "/usr/bin/time --format=%E", "/usr/bin/time --append --quiet --verbose",
+        "timeout 5", "timeout -s KILL 5", "timeout -sKILL 5", "timeout -k 1 5", "timeout -fpv 5",
+        "timeout --signal=KILL 5", "timeout --signal KILL 5", "timeout --kill-after 1 5",
+        "timeout --foreground --preserve-status --verbose 5", "timeout --sig KILL 5", "timeout -- 5",
+        "xargs", "xargs -0", "xargs -a list", "xargs -alist", "xargs -d ,", "xargs -E END", "xargs -eEND",
+        "xargs -I {}", "xargs -i", "xargs -i{}", "xargs -L 1", "xargs -l", "xargs -l1", "xargs -n1",
+        "xargs -P 2", "xargs -s 100", "xargs -rtx", "xargs -op", "xargs --arg-file list",
+        "xargs --arg-file=list", "xargs --delimiter=,", "xargs --eof=END", "xargs --replace={}",
+        "xargs --max-lines=1", "xargs --max-args 1", "xargs --max-a 1", "xargs --max-chars 100",
+        "xargs --max-procs 2", "xargs --process-slot-var NAME",
+        "xargs --null --no-run-if-empty --verbose --exit --show-limits", "xargs --interactive --open-tty",
+        "nice -n 5 timeout -s KILL 5 env -u NAME xargs -n 1",
+    )
+
+    def nested(self, script: str) -> list[str] | str:
+        """The scripts the check reads in a command's first simple command, or why it refuses it."""
+        try:
+            return hl._nested_scripts(hl.shell_commands(script)[0])
+        except hl.LockError as exc:
+            return f"refused: {exc}"
+
+    def test_every_wrapper_option_is_read_as_its_program_reads_it(self) -> None:
+        for prefix in self.WRAPPED:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.nested(prefix + " bash -c 'p\"i\"p install x'"), ['p"i"p install x'])
+
+    def test_a_wrapper_option_the_check_does_not_know_is_refused(self) -> None:
+        for prefix in ("env -Z", "env -5", "env --bogus", "xargs --max", "sudo --log", "nohup -n", "nice -z",
+                       "builtin -x", "command --help", "timeout -z 5", "exec -z"):
+            with self.subTest(prefix=prefix):
+                self.assertRegex(str(self.nested(prefix + " bash -c 'true'")), r"^refused: .*an option this check does not read")
+
+    def test_a_lone_dash_or_a_number_is_an_option_only_where_its_program_says(self) -> None:
+        for script in ("nice - bash -c 'true'", "xargs - bash -c 'true'", "env - -S 'bash -c true'",
+                       "timeout 5 -s KILL bash -c 'true'", "env -- -u NAME bash -c 'true'"):
+            with self.subTest(script=script):
+                self.assertEqual(self.nested(script), [])
+
+    def test_env_split_string_is_refused_only_as_an_option(self) -> None:
+        for script in ("env -vS 'bash -c true'", "env -iS'bash -c true'", "env --sp='bash -c true'",
+                       "env --split 'bash -c true'"):
+            with self.subTest(script=script):
+                self.assertRegex(str(self.nested(script)), r"^refused: env -S, whose string becomes the command")
+
+    def test_a_command_named_at_run_time_before_a_wrapper_or_a_shell_is_refused(self) -> None:
+        for script in ('"$W" -u NAME bash -c true', '"$W" env -S "bash -c true"', '"$W" -- eval true',
+                       '"$W" -- source ./f.sh', '"$W" -- . ./f.sh', '"$W" nice true'):
+            with self.subTest(script=script):
+                self.assertRegex(str(self.nested(script)), r"^refused: a command named at run time, followed by")
+        for script in ('"$W" -n done', '"$W" ./source', '"$W" bash'):
+            with self.subTest(script=script):
+                self.assertEqual(self.nested(script), [])
+
 
 class YamlReadingTests(unittest.TestCase):
     """The values the reader decodes. Each expected value is PyYAML 6.0.1's reading of the same

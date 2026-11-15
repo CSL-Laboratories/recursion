@@ -474,8 +474,10 @@ class Install:
 # whose words hold installer text, must be a pip install of hash-locked files, in a job this
 # check found, in a bash step. The scripts a command gives to `eval` or to a shell (`-c`, a
 # here-document or here-string) are read the same way, the command found at its command
-# position: after assignments, reserved words and the wrappers in WRAPPERS (`command -v` looks a
-# command up and runs nothing). A `$NAME` expansion is tried with every literal value the script or the job's
+# position: after assignments, reserved words and the wrappers in WRAPPERS, each with its options
+# as its own parser reads them (`command -v` looks a command up and runs nothing); an option a
+# wrapper does not have, and a command named at run time followed by a shell, a wrapper,
+# `source`, `.` or `eval`, are problems. A `$NAME` expansion is tried with every literal value the script or the job's
 # `env:` gives it; an expansion it cannot resolve before an installer verb, a script for
 # `eval` or a shell built at run time, a shell reading its script from a pipe, and `source`
 # or `.` of any file are problems. What the shell computes at run time beyond that (text
@@ -1071,26 +1073,109 @@ SHELLS = {"bash", "sh", "dash", "zsh", "ksh", "mksh", "ash"}
 NESTING = 8
 
 
-# Builtins and programs that run the command named after their own options: (the options that
-# take the next word as their value, the words they read between their options and that command).
+# Builtins and programs that run the command named after their own options, with those options as
+# each one's own parser reads them: GNU getopt_long for the coreutils, findutils and util-linux
+# programs and for sudo (short options clustered, a value attached or in the next word; a long
+# option by any unambiguous prefix, its value after `=` or, when it requires one, in the next
+# word), bash's own for its builtins and OpenBSD's getopt for doas (short options only). Each
+# stops at its first operand or at `--`. An option a wrapper does not have is refused, never
+# guessed at: what it would do to the words after it is unknown.
+@dataclass(frozen=True)
+class Wrapper:
+    required: str = ""  # short options whose value is attached (`-uNAME`) or the next word
+    optional: str = ""  # short options whose value can only be attached (`xargs -e`, `-eEND`)
+    flags: str = ""  # short options that take no value
+    long: tuple[str, ...] = ()  # long options: `name` takes no value, `name=` requires one, `name?` may have one
+    operands: int = 0  # words it reads after its options, before the command (timeout's duration)
+
+
+GNU_LONG = ("help", "version")
 WRAPPERS = {
-    "builtin": (set(), 0),
-    "command": (set(), 0),
-    "doas": ({"-u", "-C"}, 0),
-    "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
-    "exec": ({"-a"}, 0),
-    "nice": ({"-n", "--adjustment"}, 0),
-    "nohup": (set(), 0),
-    "setsid": (set(), 0),
-    "stdbuf": ({"-i", "--input", "-o", "--output", "-e", "--error"}, 0),
-    "sudo": ({"-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p",
-              "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user"}, 0),
-    "time": ({"-f", "--format", "-o", "--output"}, 0),
-    "timeout": ({"-k", "--kill-after", "-s", "--signal"}, 1),
-    "xargs": ({"-a", "--arg-file", "-d", "--delimiter", "-E", "-e", "--eof", "-I", "--replace", "-L",
-               "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
-               "--process-slot-var"}, 0),
+    "builtin": Wrapper(),
+    "command": Wrapper(flags="pvV"),
+    "doas": Wrapper(required="aCu", flags="Lns"),
+    "env": Wrapper(required="aCSu", flags="0iv",
+                   long=("argv0=", "block-signal?", "chdir=", "debug", "default-signal?", "ignore-environment",
+                         "ignore-signal?", "list-signal-handling", "null", "split-string=", "unset=", *GNU_LONG)),
+    "exec": Wrapper(required="a", flags="cl"),
+    "nice": Wrapper(required="n", long=("adjustment=", *GNU_LONG)),
+    "nohup": Wrapper(long=GNU_LONG),
+    "setsid": Wrapper(flags="cfwhV", long=("ctty", "fork", "wait", *GNU_LONG)),
+    "stdbuf": Wrapper(required="eio", long=("error=", "input=", "output=", *GNU_LONG)),
+    "sudo": Wrapper(required="aCcDghpRrTtUu", flags="AbBEeHiKklNnPSsVv",
+                    long=("askpass", "auth-type=", "background", "bell", "chdir=", "chroot=", "close-from=",
+                          "command-timeout=", "edit", "group=", "help", "host=", "list", "login", "login-class=",
+                          "no-update", "non-interactive", "other-user=", "preserve-env?", "preserve-groups",
+                          "prompt=", "remove-timestamp", "reset-timestamp", "role=", "set-home", "shell", "stdin",
+                          "type=", "user=", "validate", "version")),
+    "time": Wrapper(required="fo", flags="apqvV",
+                    long=("append", "format=", "output=", "portability", "quiet", "verbose", *GNU_LONG)),
+    "timeout": Wrapper(required="ks", flags="fpv",
+                       long=("foreground", "kill-after=", "preserve-status", "signal=", "verbose", *GNU_LONG),
+                       operands=1),
+    "xargs": Wrapper(required="adEILnPs", optional="eil", flags="0oprtx",
+                     long=("arg-file=", "delimiter=", "eof?", "exit", "interactive", "max-args=", "max-chars=",
+                           "max-lines?", "max-procs=", "no-run-if-empty", "null", "open-tty", "process-slot-var=",
+                           "replace?", "show-limits", "verbose", *GNU_LONG)),
 }
+
+
+def _runs_words(text: str) -> bool:
+    """Whether a command of this name runs the words after it: a shell, `source`, `.`, `eval`
+    or a wrapper."""
+    return text in ("source", ".", "eval") or Path(text).name in SHELLS or Path(text).name in WRAPPERS
+
+
+def _long_option(name: str, wrapper: Wrapper, word: str) -> tuple[str, str]:
+    """The long option a word names, by its full name or by any unambiguous prefix, as
+    getopt_long takes it; and its kind: "" (no value), "=" (a value required) or "?" (a value
+    only after `=`)."""
+    given = word[2:].split("=", 1)[0]
+    kinds = {spec.rstrip("=?"): spec[len(spec.rstrip("=?")):] for spec in wrapper.long}
+    if given in kinds:
+        return given, kinds[given]
+    found = [option for option in kinds if option.startswith(given)]
+    if len(found) != 1:
+        raise LockError(f"{name} --{given}, an option this check does not read")
+    return found[0], kinds[found[0]]
+
+
+def _after_options(name: str, args: list[Word], index: int) -> int | None:
+    """Where the command a wrapper runs is named: past the wrapper's options, their values and
+    its operands; None for `command -v`/`-V`, which looks the command up and runs nothing."""
+    wrapper = WRAPPERS[name]
+    while index < len(args):
+        word = args[index].text
+        if len(word) < 2 or word[0] != "-":
+            break  # its first operand
+        index += 1
+        if word == "--":
+            break
+        if name == "nice" and re.fullmatch(r"-[-+]?\d.*", word, re.S):
+            continue  # nice's own -NUM, its adjustment
+        if word.startswith("--"):
+            option, kind = _long_option(name, wrapper, word)
+            if name == "env" and option == "split-string":
+                raise LockError("env -S, whose string becomes the command, which this check does not read")
+            if kind == "=" and "=" not in word:
+                index += 1  # its value is the next word
+            continue
+        for at, letter in enumerate(word[1:], 1):
+            if name == "command" and letter in "vV":
+                return None  # a lookup: nothing runs
+            if name == "env" and letter == "S":
+                raise LockError("env -S, whose string becomes the command, which this check does not read")
+            if letter in wrapper.required:
+                if at == len(word) - 1:
+                    index += 1  # its value is the next word, else the rest of this one
+                break
+            if letter in wrapper.optional:
+                break  # its value, if any, is the rest of this word
+            if letter not in wrapper.flags:
+                raise LockError(f"{name} -{letter}, an option this check does not read")
+    if name == "env" and index < len(args) and args[index].text == "-":
+        index += 1  # env's lone `-`, its -i
+    return index + wrapper.operands
 
 
 def _named(words: list[Word]) -> tuple[list[Word], int | None, bool]:
@@ -1098,41 +1183,28 @@ def _named(words: list[Word]) -> tuple[list[Word], int | None, bool]:
     among them (after assignments, reserved words and the WRAPPERS with their options), or None
     when nothing runs there (no command, or `command -v`/`-V`, which looks a command up); and
     whether that is certain. It is not when a word holding an expansion stands where a wrapper
-    could (`"$SUDO" bash -c ...`) and a shell's name follows it."""
+    could (`"$SUDO" bash -c ...`) and a shell's name follows it. Such a word followed later by
+    a shell, a wrapper, `source`, `.` or `eval` is refused: it may be a wrapper whose options
+    this check cannot know."""
     args = [w for w in words if not w.stdin]
-    index = 0
-    while index < len(args):
+    index: int | None = 0
+    while index is not None and index < len(args):
         text = args[index].text
         if ASSIGNMENT.match(text) or text in RESERVED_WORDS:
             index += 1
             continue
         if args[index].dynamic:
-            following = args[index + 1].text if index + 1 < len(args) else ""
-            if Path(following).name in SHELLS:
+            rest = args[index + 1:]
+            if rest and Path(rest[0].text).name in SHELLS:
                 return args, index + 1, False
+            later = next((w.text for w in rest if _runs_words(w.text)), None)
+            if later is not None:
+                raise LockError(f"a command named at run time, followed by {later!r}, which this check does not read")
             return args, index, True
         name = Path(text).name
         if name not in WRAPPERS:
             return args, index, True
-        takes_value, positional = WRAPPERS[name]
-        index += 1
-        while index < len(args):
-            option = args[index].text
-            if option == "--":
-                index += 1
-                break
-            if option in takes_value:
-                index += 2
-            elif len(option) > 1 and option.startswith("-"):
-                short = not option.startswith("--")
-                if name == "command" and short and re.search(r"[vV]", option):
-                    return args, None, True  # a lookup: nothing runs
-                if name == "env" and ((short and "S" in option) or option.startswith("--split-string")):
-                    raise LockError("env -S, whose string becomes the command, which this check does not read")
-                index += 1
-            else:
-                break
-        index += positional  # timeout's duration
+        index = _after_options(name, args, index + 1)
     return args, None, True
 
 

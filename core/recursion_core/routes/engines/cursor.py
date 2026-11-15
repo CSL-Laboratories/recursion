@@ -65,6 +65,9 @@ from types import MappingProxyType
 # The core's RFC 8785 writer (lane SPINE's, in the method table's module): the form event.v1 names
 # ``rfc8785/v1`` for ``input_digest``. The control package does not import ``routes``.
 from recursion_core.control.methods import NoCanonicalText, canonical_text
+from recursion_core.routes import contract as c
+from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol
+from recursion_core.routes.launch import ReadTimeout, child_env
 
 ENGINE = "cursor"
 # The command a registration of this engine will state (``default_executable``, SPINE's contract as the
@@ -554,3 +557,92 @@ class StreamParser:
         self.result_seen = True
         self.result_code = code
         return [{"type": "result", "payload": {"code": code, "detail": detail}}]
+
+
+# ------------------------------------------------------------------------------- the one-shot driver
+
+# The one name an API-key route may select, filled from custody. Neither CURSOR_API_KEY nor CURSOR_AUTH_TOKEN
+# (``--auth-token``'s variable, https://cursor.com/docs/cli/acp) is ever inherited from the daemon: the child's
+# environment is ``routes.launch.child_env``'s allowlist, which names neither, plus the route's one credential.
+CURSOR_API_KEY_ENV = ("CURSOR_API_KEY",)
+MAX_PROMPT_BYTES = MAX_ARG_BYTES   # the prompt is one argument
+# Where the run's key must come from, by the route's connection kind, as system/init reports it.
+_EXPECTED_KEY_SOURCE = {"subscription": "login", "api_key": "env"}
+# Lines the one-shot driver does not run past: its own process's stdout is the engine's stream and nothing else.
+_FATAL_COUNTS = ("not_json", "no_session", "other_session")
+
+
+class CursorAdapter(RouteAdapter):
+    """Cursor's one-shot drive on today's one-turn path. Its own factory; registered nowhere yet."""
+
+    engine = ENGINE
+
+    def __init__(self, *args, binary: object = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _executable(binary)   # an option that is not an absolute path fails composition, not a run
+        self._binary = binary
+
+    def declaration(self) -> dict:
+        return oneshot_declaration()
+
+    def argv(self, request: dict) -> list[str]:
+        prompt = request["prompt"]
+        if type(prompt) is not str:   # a subclass could show these checks one text and execve another (F8-1)
+            raise c.RouteError(c.REQUEST_INVALID, "prompt: not exactly a str")
+        if "\x00" in prompt or _has_surrogate(prompt):
+            raise c.RouteError(c.REQUEST_INVALID, "prompt: a NUL or a lone surrogate cannot be passed in argv")
+        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise c.RouteError(c.REQUEST_INVALID, f"prompt: over {MAX_PROMPT_BYTES} bytes, the argv limit")
+        try:
+            options = oneshot_argv(request["route"]["model"], binary=self._binary)
+        except ArgvRefused as err:
+            raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
+        return [*options, "--", prompt]   # check_argv holds it (the tests check every launched argv with it)
+
+    def env(self, request: dict) -> dict[str, str]:
+        kind = request["route"]["connection"]["kind"]
+        if kind == "subscription":
+            return child_env(self._parent_env)
+        if kind == "api_key":
+            return child_env(self._parent_env, credential=self.credential(request, CURSOR_API_KEY_ENV))
+        raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for cursor")
+
+    def drive(self, process, request, deadline_at, events):
+        rid, kind = request["request_id"], request["route"]["connection"]["kind"]
+        process.close_stdin()   # the prompt is in argv; nothing is written to the child
+        parser = StreamParser()
+        while True:
+            remaining = deadline_at - self._clock()
+            if remaining <= 0:
+                raise Deadline()
+            try:
+                line = process.read_line(remaining)
+            except ReadTimeout:
+                raise Deadline() from None
+            if line is None:
+                return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before result")
+            before = [parser.counts[name] for name in _FATAL_COUNTS]
+            drafts = parser.parse(line)
+            for name, count in zip(_FATAL_COUNTS, before):
+                if parser.counts[name] != count:
+                    raise _Protocol(f"stdout line: {name}")
+            # The parser keeps the first init's key source and never changes it. A source Cursor does not
+            # document is not refused (the parser keeps it as None): the child's environment and argv already
+            # carry no other credential, so this check is a second line only.
+            if parser.api_key_source is not None:
+                expected = _EXPECTED_KEY_SOURCE.get(kind)
+                if parser.api_key_source != expected:
+                    # The run reports a key source the route did not pick: it would bill another meter.
+                    process.fence("billing_mismatch")
+                    return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
+                        f"the {kind} route's run reported apiKeySource {parser.api_key_source}, not {expected}: "
+                        "it would bill another meter; choose the route that matches, or cancel"))
+            for draft in drafts:
+                if draft["type"] != "result":
+                    continue
+                code = draft["payload"]["code"]
+                if code is None:
+                    return c.result(rid, None, text=parser.final_text or "", events=events)
+                if code == "protocol_error":
+                    raise _Protocol(draft["payload"]["detail"])
+                return c.result(rid, c.ENGINE_ERROR, events=events, detail=draft["payload"]["detail"])

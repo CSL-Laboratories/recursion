@@ -30,7 +30,8 @@ PYTHONPATH=core python -m unittest recursion_core.routes.engines.fixtures.cursor
     recursion_core.routes.engines.fixtures.cursor.test_cursor_switch \
     recursion_core.routes.engines.fixtures.cursor.test_cursor_argv \
     recursion_core.routes.engines.fixtures.cursor.test_cursor_fixtures \
-    recursion_core.routes.engines.fixtures.cursor.test_cursor_fake_agent
+    recursion_core.routes.engines.fixtures.cursor.test_cursor_fake_agent \
+    recursion_core.routes.engines.fixtures.cursor.test_cursor_adapter
 ```
 
 `test_cursor_fixtures` reads `schemas/control/v1/` (lane SPINE's, #368) from the repository root.
@@ -60,6 +61,7 @@ interpreter has no JSON Schema library, so `test_cursor_fixtures` checks each me
 | `DRIVES` | `("-p", "acp")` | what argv[2] must be: the one-shot drive or `agent acp` |
 | `unattended_switch() -> dict` | `{"engine": "cursor", "switch": "unattended", "state": "off", "refusal": "cursor_unattended_off", "waits_on": "counsel"}` | a copy of a read-only record; nothing reads it yet |
 | `unattended_refusal() -> dict` | `{"code": "cursor_unattended_off", "detail": <text>}` | run.record.v1's `start_error` shape |
+| `CursorAdapter(launcher, clock, credentials, environ, *, binary=None)` | a `RouteAdapter` on today's one-turn path; `run(request, deadline_at) -> result` | its own factory, registered nowhere; argv `oneshot_argv(...) + ["--", prompt]`; stdin closed; a prompt over `MAX_PROMPT_BYTES` (= `MAX_ARG_BYTES`), with a NUL or a lone surrogate is `request_invalid`; sign-in child: the allowlist only; API-key child: `CURSOR_API_KEY` from custody; a run whose init reports another key source is fenced and answers `route_choice_required` |
 
 `fake_agent.py`: `FakeLauncher(fixture)(argv, *, env, shell=False, **options)` records each launch in
 `.launches` and hands out the process in `.processes`; `fixture_lines(name)` and `fixture_header(name)` read

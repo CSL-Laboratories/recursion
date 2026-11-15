@@ -1,5 +1,5 @@
 {
-  "about": "Written by tools/release/relock.py from PyPI's JSON API; read by tools/release/hash_lock.py. Each pin lists every file PyPI publishes for that version with its sha256; requires_dist leaves out the dependencies of extras, which CI never installs.",
+  "about": "Written by tools/release/relock.py from PyPI's JSON API; read by tools/release/hash_lock.py. Each pin lists every file PyPI publishes for that version with its sha256, and every Requires-Dist entry as published; the check decides by marker which apply to CI.",
   "files": {
     "requirements-ci.txt": {
       "pins": {
@@ -37,9 +37,26 @@
           "marker": null,
           "requires_dist": [
             "attrs>=22.2.0",
+            "fqdn; extra == \"format\"",
+            "fqdn; extra == \"format-nongpl\"",
+            "idna; extra == \"format\"",
+            "idna; extra == \"format-nongpl\"",
+            "isoduration; extra == \"format\"",
+            "isoduration; extra == \"format-nongpl\"",
+            "jsonpointer>1.13; extra == \"format\"",
+            "jsonpointer>1.13; extra == \"format-nongpl\"",
             "jsonschema-specifications>=2023.03.6",
             "referencing>=0.28.4",
-            "rpds-py>=0.25.0"
+            "rfc3339-validator; extra == \"format\"",
+            "rfc3339-validator; extra == \"format-nongpl\"",
+            "rfc3986-validator>0.1.0; extra == \"format-nongpl\"",
+            "rfc3987-syntax>=1.1.0; extra == \"format-nongpl\"",
+            "rfc3987; extra == \"format\"",
+            "rpds-py>=0.25.0",
+            "uri-template; extra == \"format\"",
+            "uri-template; extra == \"format-nongpl\"",
+            "webcolors>=1.11; extra == \"format\"",
+            "webcolors>=24.6.0; extra == \"format-nongpl\""
           ],
           "requires_python": ">=3.10",
           "version": "4.26.0"
@@ -1566,6 +1583,7 @@
           ],
           "marker": null,
           "requires_dist": [
+            "bcrypt>=3.1.5; extra == \"ssh\"",
             "cffi>=2.0.0; platform_python_implementation != \"PyPy\"",
             "typing-extensions>=4.13.2; python_full_version < \"3.11\""
           ],

@@ -10,14 +10,19 @@ the workflows stand and as the patches in tools/release/proposals/ would leave t
 fails (exit 1, one line per problem) unless each one:
 
 - has only exact pins (name==version, an optional environment marker) and at least one
-  --hash=sha256 on every pin, with no other pip option;
+  --hash=sha256 on every pin, each hash its own token, with no other pip option;
 - holds exactly the hashes recorded for it in tools/release/ci-lock.json, whose entries name
-  the file each hash belongs to;
-- pins every dependency of every pin that applies to a job installing it; and
+  the file of that very release each hash belongs to;
+- pins every dependency of every pin that applies to a job installing it (a dependency that
+  requests extras is refused: the check does not follow extras); and
 - has, for every job that installs it (its runner and Python version), a wheel of every pin
   that applies there.
 
-The gate (tools/ci_gate.py) installs nothing; the check makes sure it stays that way.
+It reads every command of every shell line (`&&`, `||`, `;`, pipes, command substitution)
+and every spelling of pip it knows; a line that may install packages but cannot be read as
+pip installs of requirements files, or that sits outside a job it can read, is a problem,
+never "nothing installed". The gate (tools/ci_gate.py) installs nothing; the check makes
+sure it stays that way.
 Stdlib only and offline; tools/release/relock.py is the one script that reads PyPI.
 """
 from __future__ import annotations
@@ -40,15 +45,18 @@ GATE = "tools/ci_gate.py"
 RECORD_FORMAT = 1
 
 HASH_TOKEN = re.compile(r"--hash=(\S*)")
-SHA256 = re.compile(r"sha256:([0-9a-f]{64})")
+HASH_OPTION = re.compile(r"--hash=sha256:([0-9a-f]{64})")
 NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 RELEASE = r"[0-9]+(?:\.[0-9]+)*"
 PIN = re.compile(rf"({NAME})==({RELEASE})(?:\s*;\s*(\S.*))?")
 COMMENT = re.compile(r"(^|\s+)#.*$")
-INSTALLER = re.compile(r"\b(?:pip3?|pipx|uv)\b.*\binstall\b|\bpip-sync\b|\bpoetry\s+install\b|\buv\s+sync\b")
-PIP_INSTALL = re.compile(r"\bpip3?\s+install\b")
+# Any line that may install Python packages. It is deliberately wide: a line it matches must
+# then be read as one or more pip installs of hash-locked files, or the check fails.
+INSTALLER = re.compile(r"(?:-m\s*pip\b|\bpip3?\b|\bpipx\b|\buv\b|\bpoetry\b|\bconda\b|\bmamba\b)[^\n]*\binstall\b"
+                       r"|\bpip-sync\b|\buv\s+sync\b|\beasy_install\b")
 ALLOWED_PIP_OPTIONS = {"--only-binary=:all:", "--require-hashes", "--no-cache-dir", "-q", "--quiet",
                        "--disable-pip-version-check", "--no-input"}
+SHELL_OPERATORS = {"|", "||", "&", "&&", ";", ";;", "(", ")", "<", ">", ">>", "<<", "|&"}
 
 
 class LockError(ValueError):
@@ -105,13 +113,20 @@ def parse_requirements(text: str) -> list[Pin]:
     pins: list[Pin] = []
     seen: dict[str, int] = {}
     for number, line in logical_lines(text):
+        # Token by token, as pip reads it: the requirement first, then each --hash as a token of
+        # its own. A --hash glued to the requirement is part of the requirement to pip.
+        tokens = line.split()
+        first_hash = next((i for i, token in enumerate(tokens) if token.startswith("--hash")), len(tokens))
         hashes: set[str] = set()
-        for token in HASH_TOKEN.findall(line):
-            match = SHA256.fullmatch(token)
+        for token in tokens[first_hash:]:
+            match = HASH_OPTION.fullmatch(token)
             if not match:
-                raise LockError(f"line {number}: unsupported hash {token!r} (sha256 and 64 hex digits only)")
+                raise LockError(f"line {number}: unsupported hash {token!r} (each --hash=sha256:<64 hex digits> "
+                                "is its own token, after the requirement)")
             hashes.add(match.group(1))
-        rest = re.sub(r"\s+", " ", HASH_TOKEN.sub(" ", line)).strip()
+        rest = " ".join(tokens[:first_hash])
+        if "--hash" in rest:
+            raise LockError(f"line {number}: a --hash must be its own token, separated by whitespace: {rest!r}")
         if re.search(r"(^|\s)-", rest):
             raise LockError(f"line {number}: pip option not allowed in a locked file: {rest!r}")
         match = PIN.fullmatch(rest)
@@ -298,12 +313,30 @@ def marker_applies(marker: str | None, env: dict[str, str]) -> bool:
 REQUIREMENT = re.compile(rf"\s*({NAME})\s*(\[[^\]]*\])?\s*(?:\(([^)]*)\)|([^;]*))\s*(?:;\s*(.*))?")
 
 
+def dependency_marker(text: str) -> str | None:
+    """The environment marker of a Requires-Dist entry, read before the rest of it."""
+    return text.partition(";")[2].strip() or None
+
+
 def parse_dependency(text: str) -> tuple[str, str, str | None]:
+    """(name, specifier, marker). Refuses a dependency that requests extras: this check does not
+    follow an extra's own dependencies, so it must not pretend the plain package is enough."""
     match = REQUIREMENT.fullmatch(text)
     if not match:
         raise LockError(f"dependency {text!r} cannot be read")
+    if match.group(2) and match.group(2).strip("[] "):
+        raise LockError(f"dependency {text!r} requests extras {match.group(2)}; this check does not follow extras")
     spec = (match.group(3) if match.group(3) is not None else match.group(4) or "").strip()
     return canonical(match.group(1)), spec, (match.group(5) or "").strip() or None
+
+
+def dist_release(filename: str) -> tuple[str, str] | None:
+    """(canonical name, version) a wheel or sdist file name states, or None if it states none."""
+    if filename.endswith(".whl"):
+        parts = filename[:-4].split("-")
+        return (canonical(parts[0]), parts[1]) if len(parts) in (5, 6) else None
+    match = re.fullmatch(r"(.+)-([0-9][^-]*)\.(?:tar\.gz|zip)", filename)
+    return (canonical(match.group(1)), match.group(2)) if match else None
 
 
 # --- CI targets and wheel tags ---------------------------------------------------
@@ -420,27 +453,52 @@ class Install:
     target: Target
 
 
-def _jobs(text: str) -> dict[str, str]:
-    lines = text.splitlines()
-    if "jobs:" not in lines:
-        return {}
+JOBS_HEADER = re.compile(r"jobs:\s*(?:#.*)?")
+JOB_KEY = r"([A-Za-z0-9_-]+|\"[^\"]+\"|'[^']+'):\s*(?:#.*)?"
+
+
+def _jobs(text: str) -> tuple[dict[str, str], list[str]]:
+    """The job blocks under a block-style top-level `jobs:`, at whatever indentation the first
+    job uses, and problems for what this reader cannot follow. Lines are the file's, LF."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    problems: list[str] = []
+    headers = [i for i, line in enumerate(lines) if JOBS_HEADER.fullmatch(line)]
+    if any(re.match(r"jobs:\s*[^\s#]", line) for line in lines):
+        problems.append("`jobs:` is written inline; this check reads only a block mapping")
+    if len(headers) != 1:
+        if len(headers) > 1:
+            problems.append(f"{len(headers)} top-level `jobs:` lines")
+        return {}, problems
     out: dict[str, list[str]] = {}
-    current = None
-    for line in lines[lines.index("jobs:") + 1:]:
-        match = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
-        if match:
-            current = match.group(1)
+    current: str | None = None
+    indent: int | None = None
+    for line in lines[headers[0] + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            if current is not None:
+                out[current].append(line)
+            continue
+        lead = len(line) - len(line.lstrip(" "))
+        if lead == 0:
+            break  # the next top-level key
+        if indent is None:
+            indent = lead
+        key = re.fullmatch(" " * indent + JOB_KEY, line) if lead == indent else None
+        if key:
+            current = key.group(1).strip("\"'")
             out[current] = []
-        elif current is not None:
+        elif lead > indent and current is not None:
             out[current].append(line)
-    return {job: "\n".join(body) for job, body in out.items()}
+        else:
+            problems.append(f"a line under `jobs:` this check cannot place in a job: {line.strip()!r}")
+            current = None
+    return {job: "\n".join(body) for job, body in out.items()}, problems
 
 
 def _shell_lines(block: str) -> list[str]:
     """Each line with its backslash continuations joined; YAML comment lines dropped."""
     out: list[str] = []
     pending = ""
-    for line in block.splitlines():
+    for line in block.replace("\r\n", "\n").split("\n"):
         if not pending and line.lstrip().startswith("#"):
             continue
         if line.rstrip().endswith("\\"):
@@ -455,11 +513,16 @@ def _shell_lines(block: str) -> list[str]:
 
 def _yaml_scalar(text: str) -> str:
     text = text.strip()
-    if len(text) >= 2 and text[0] == text[-1] == "'":
-        return text[1:-1].replace("''", "'")
-    if len(text) >= 2 and text[0] == text[-1] == '"':
-        return text[1:-1]
-    return text
+    if text[:1] in ("'", '"'):
+        quote = text[0]
+        end = text.find(quote, 1)
+        while quote == "'" and end != -1 and text[end + 1:end + 2] == "'":
+            end = text.find(quote, end + 2)
+        if end != -1:
+            inner = text[1:end]
+            return inner.replace("''", "'") if quote == "'" else inner
+        return text
+    return re.split(r"\s+#", text, maxsplit=1)[0].strip()
 
 
 def _resolve(path: str, env: dict[str, set[str]]) -> str:
@@ -475,11 +538,69 @@ def _resolve(path: str, env: dict[str, set[str]]) -> str:
     return Path(resolved).as_posix()
 
 
+def _commands(line: str) -> list[list[str]]:
+    """The simple commands of one shell line, split at every shell operator."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    commands: list[list[str]] = [[]]
+    for token in lexer:
+        if token in SHELL_OPERATORS:
+            commands.append([])
+        else:
+            commands[-1].append(token)
+    return [command for command in commands if command]
+
+
+def _pip_install_args(command: list[str]) -> list[str] | None:
+    """The arguments after `install` when the command is a pip install (`pip install`, `pip3
+    install`, `python -m pip install`, `python -mpip install`, `uv pip install`), else None."""
+    for index, token in enumerate(command):
+        if token != "install" or index == 0:
+            continue
+        before = command[index - 1]
+        if Path(before).name in ("pip", "pip3") or before == "-mpip":
+            return command[index + 1:]
+    return None
+
+
+def _requirement_files(args: list[str], env: dict[str, set[str]]) -> list[str]:
+    files = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("-r", "--requirement"):
+            if index + 1 >= len(args):
+                raise LockError(f"{token} without a file")
+            files.append(_resolve(args[index + 1], env))
+            index += 2
+            continue
+        if token.startswith("--requirement="):
+            files.append(_resolve(token.split("=", 1)[1], env))
+        elif token.startswith("-r") and len(token) > 2:
+            files.append(_resolve(token[2:], env))
+        elif token not in ALLOWED_PIP_OPTIONS:
+            raise LockError(f"installs {token!r}, which is not a hash-locked requirements file"
+                            if not token.startswith("-") else f"pip option {token!r} is not allowed")
+        index += 1
+    if not files:
+        raise LockError("a pip install with no requirements file")
+    return files
+
+
 def workflow_installs(source: str, text: str) -> tuple[list[Install], list[str]]:
+    """Every pip install in a workflow and the job it runs in, and a problem for every line that
+    may install something but cannot be read as pip installs of requirements files."""
     installs: list[Install] = []
-    problems: list[str] = []
-    for job, block in _jobs(text).items():
-        runner = re.search(r"(?m)^    runs-on:\s*(.+?)\s*$", block)
+    jobs, layout = _jobs(text)
+    problems = [f"{source}: {problem}" for problem in layout]
+    candidates = sum(1 for line in _shell_lines(text) if INSTALLER.search(line))
+    placed = 0
+    for job, block in jobs.items():
+        where = f"{source} job {job}"
+        child = min((len(line) - len(line.lstrip(" ")) for line in block.split("\n")
+                     if line.strip() and not line.lstrip().startswith("#")), default=0)
+        runner = re.search(rf"(?m)^ {{{child}}}runs-on:\s*(.+?)\s*$", block)
+        runner_label = _yaml_scalar(runner.group(1)) if runner else None
         versions = {_yaml_scalar(v) for v in re.findall(r"(?m)^\s+python-version:\s*(.+?)\s*$", block)}
         env: dict[str, set[str]] = {}
         for key, value in re.findall(r"(?m)^\s+([A-Z_][A-Z0-9_]*):\s*(.+?)\s*$", block):
@@ -487,46 +608,36 @@ def workflow_installs(source: str, text: str) -> tuple[list[Install], list[str]]
         for line in _shell_lines(block):
             if not INSTALLER.search(line):
                 continue
-            where = f"{source} job {job}"
+            placed += 1
             command = line.strip()
+            if command.startswith("- "):
+                command = command[2:].strip()
             if command.startswith("run:"):
                 command = _yaml_scalar(command[4:])
-            pip = PIP_INSTALL.search(command)
-            if not pip:
-                problems.append(f"{where}: an installer this check does not read: {command!r}")
-                continue
             try:
-                tokens = shlex.split(command[pip.end():].split("&&")[0].split("||")[0].split(";")[0])
-                files = []
-                index = 0
-                while index < len(tokens):
-                    token = tokens[index]
-                    if token in ("-r", "--requirement"):
-                        if index + 1 >= len(tokens):
-                            raise LockError(f"{token} without a file")
-                        files.append(_resolve(tokens[index + 1], env))
-                        index += 2
+                found = False
+                for simple in _commands(command):
+                    args = _pip_install_args(simple)
+                    if args is None:
+                        if INSTALLER.search(" ".join(simple)):
+                            raise LockError(f"an installer this check does not read: {' '.join(simple)!r}")
                         continue
-                    if token.startswith("--requirement="):
-                        files.append(_resolve(token.split("=", 1)[1], env))
-                    elif token.startswith("-r") and len(token) > 2:
-                        files.append(_resolve(token[2:], env))
-                    elif token not in ALLOWED_PIP_OPTIONS:
-                        raise LockError(f"installs {token!r}, which is not a hash-locked requirements file"
-                                        if not token.startswith("-") else f"pip option {token!r} is not allowed")
-                    index += 1
-                if not files:
-                    raise LockError("a pip install with no requirements file")
-                if not runner or runner.group(1).strip() not in RUNNERS:
-                    raise LockError(f"runner {runner.group(1).strip() if runner else None!r} is not in RUNNERS")
-                if len(versions) != 1:
-                    raise LockError(f"the job sets python-version {sorted(versions)} (exactly one is needed)")
-                target = Target(runner.group(1).strip(), next(iter(versions)))
-                target.python_match()
+                    found = True
+                    files = _requirement_files(args, env)
+                    if runner_label not in RUNNERS:
+                        raise LockError(f"runner {runner_label!r} is not in RUNNERS")
+                    if len(versions) != 1:
+                        raise LockError(f"the job sets python-version {sorted(versions)} (exactly one is needed)")
+                    target = Target(runner_label, next(iter(versions)))
+                    target.python_match()
+                    installs.extend(Install(source, job, path, target) for path in files)
+                if not found:
+                    raise LockError(f"an installer this check does not read: {command!r}")
             except (LockError, ValueError) as exc:
                 problems.append(f"{where}: {exc}")
-                continue
-            installs.extend(Install(source, job, path, target) for path in files)
+    if placed != candidates:
+        problems.append(f"{source}: {candidates - placed} line(s) that may install packages sit outside any job "
+                        "this check can read")
     return installs, problems
 
 
@@ -650,6 +761,10 @@ def check_file(rel: str, text: str, entry: dict, targets: set[Target], report: R
             report.problems.append(f"{rel}:{pin.line}: {pin.name}=={pin.version} ; {pin.marker} differs from "
                                    f"the record ({rec.get('version')} ; {rec.get('marker')})")
         dists = rec.get("dists", [])
+        for dist in dists:
+            if dist_release(dist.get("filename", "")) != (pin.name, pin.version):
+                report.problems.append(f"{rel}:{pin.line}: the record lists {dist.get('filename')!r} for "
+                                       f"{pin.name}=={pin.version}; its name says another release")
         recorded_hashes = {d.get("sha256") for d in dists}
         if pin.hashes != recorded_hashes:
             missing = sorted(d["filename"] for d in dists if d.get("sha256") not in pin.hashes)
@@ -673,8 +788,13 @@ def check_file(rel: str, text: str, entry: dict, targets: set[Target], report: R
             if not wheels:
                 report.problems.append(f"{where}: no hashed wheel installs there (--only-binary=:all:)")
             for requirement in rec.get("requires_dist", []):
-                dep, spec, marker = parse_dependency(requirement)
-                if not marker_applies(marker, env):
+                try:
+                    # The marker first: an entry for an extra CI never asks for does not apply.
+                    if not marker_applies(dependency_marker(requirement), env):
+                        continue
+                    dep, spec, _ = parse_dependency(requirement)
+                except LockError as exc:
+                    report.problems.append(f"{where}: {exc}")
                     continue
                 if dep not in applying:
                     report.problems.append(f"{where}: needs {requirement!r}, which the file does not pin there")

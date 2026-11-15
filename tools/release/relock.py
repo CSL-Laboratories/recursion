@@ -28,8 +28,8 @@ ROOT = hash_lock.ROOT
 LOCKED = ("requirements-ci.txt", "tools/release/requirements-ci-314t.txt")
 INDEX = "https://pypi.org/pypi/{name}/{version}/json"
 ABOUT = ("Written by tools/release/relock.py from PyPI's JSON API; read by tools/release/hash_lock.py. "
-         "Each pin lists every file PyPI publishes for that version with its sha256; requires_dist "
-         "leaves out the dependencies of extras, which CI never installs.")
+         "Each pin lists every file PyPI publishes for that version with its sha256, and every "
+         "Requires-Dist entry as published; the check decides by marker which apply to CI.")
 
 
 def read_pins(text: str) -> list[tuple[str, str, str | None]]:
@@ -77,7 +77,9 @@ def lock_pin(name: str, version: str, marker: str | None) -> dict:
                       "requires_python": item.get("requires_python") or ""})
     if not dists:
         raise hash_lock.LockError(f"{name}=={version}: PyPI lists no files")
-    requires = [r for r in (data["info"].get("requires_dist") or []) if "extra" not in r.partition(";")[2]]
+    # Every entry, extras' included: the check evaluates each marker (extra is "" for CI, so an
+    # entry for an extra does not apply and `extra != "x"` does), rather than this script guessing.
+    requires = list(data["info"].get("requires_dist") or [])
     return {"version": version, "marker": marker,
             "requires_python": data["info"].get("requires_python") or "",
             "requires_dist": sorted(requires),

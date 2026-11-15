@@ -24,7 +24,7 @@ Blank context lines are written as empty lines, which git apply accepts; the fil
 then has no trailing whitespace for the gate's whitespace check.
 
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 4511af647f546ddd62c113eede7a3cd452c01266..d22cb21b65dc60ffc67ad9d7eca4447e575bda86 100644
+index 4511af647f546ddd62c113eede7a3cd452c01266..1ff28e978804ceae5cc85989a04f24b0b7e48982 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -16,9 +16,13 @@
@@ -79,7 +79,7 @@ index 4511af647f546ddd62c113eede7a3cd452c01266..d22cb21b65dc60ffc67ad9d7eca4447e
              echo "linux: docs-only scope, lightweight checks passed in preflight"
            fi
 
-@@ -368,3 +379,52 @@ jobs:
+@@ -368,3 +379,53 @@ jobs:
 
        - name: Provider-free gate
          run: python -X utf8 -B tools/ci_gate.py --force
@@ -109,6 +109,7 @@ index 4511af647f546ddd62c113eede7a3cd452c01266..d22cb21b65dc60ffc67ad9d7eca4447e
 +      - uses: actions/checkout@v4
 +        with:
 +          fetch-depth: 0
++          persist-credentials: false
 +
 +      - name: Set up Python
 +        uses: actions/setup-python@v5
@@ -133,7 +134,7 @@ index 4511af647f546ddd62c113eede7a3cd452c01266..d22cb21b65dc60ffc67ad9d7eca4447e
 +          env -u DBUS_SESSION_BUS_ADDRESS TMPDIR="$scratch_tmp" XDG_RUNTIME_DIR="$scratch_run" PYTHONPATH=core \
 +            python -X gil=0 -B -m unittest discover -s core -t core
 diff --git a/tools/test_ci_scheduling.py b/tools/test_ci_scheduling.py
-index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a30a29c1df 100644
+index 9591138d7131fc5f14a813cda1033c31c26df86d..59c28f6e66ff3e6b7bcb4deccbe3522a7c1c61bd 100644
 --- a/tools/test_ci_scheduling.py
 +++ b/tools/test_ci_scheduling.py
 @@ -218,6 +218,7 @@ def context(event, action, draft, label, pre, settle, dep, run_full, paid) -> di
@@ -182,7 +183,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
          self.assertEqual(TEXT.count("name: linux"), 1)
          settle = job_block("settle")
          self.assertIn("runs-on: ubuntu-latest", settle)
-@@ -352,6 +353,27 @@ class WorkflowShapeTests(unittest.TestCase):
+@@ -352,6 +353,28 @@ class WorkflowShapeTests(unittest.TestCase):
          for block in (windows, macos):
              self.assertIn("fetch-depth: 0", block)
              self.assertIn("tools/ci_gate.py --force", block)
@@ -193,6 +194,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
 +        self.assertEqual(job_needs(threaded), ["preflight", "settle"])
 +        self.assertEqual(job_if(threaded), job_if(tests))
 +        self.assertIn('python-version: "3.14t"', threaded)
++        self.assertIn("persist-credentials: false", threaded)  # it pushes nothing
 +        install = step_block(threaded, "Install dependencies")
 +        self.assertIn("working-directory: ${{ runner.temp }}", install)
 +        self.assertEqual(step_env(install),
@@ -210,7 +212,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
          for line in TEXT.splitlines():
              if line.lstrip().startswith("run:"):
                  self.assertNotIn("${{", line, "expressions reach shells via env, not interpolation")
-@@ -410,7 +432,7 @@ class WorkflowShapeTests(unittest.TestCase):
+@@ -410,7 +433,7 @@ class WorkflowShapeTests(unittest.TestCase):
 
 
  class ExpressionTests(unittest.TestCase):
@@ -219,7 +221,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
 
      @classmethod
      def setUpClass(cls) -> None:
-@@ -469,18 +491,18 @@ class ExpressionTests(unittest.TestCase):
+@@ -469,18 +492,18 @@ class ExpressionTests(unittest.TestCase):
          # GitHub == is case-insensitive; exactness comes from the preflight shell (tested below).
          self.assertTrue(self.runs("linux-tests", "push", paid="TRUE"))
          self.assertFalse(self.exprs["settle"][0].uses_status)
@@ -241,7 +243,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
                                                   ("run_full", "paid"), ("", "yes", "1", "pending", "true ")):
              with self.subTest(job=job, key=key, value=value):
                  self.assertFalse(self.runs(job, "pull_request", "synchronize", False,
-@@ -535,6 +557,7 @@ class AggregateTests(unittest.TestCase):
+@@ -535,6 +558,7 @@ class AggregateTests(unittest.TestCase):
          "PR_DRAFT": "${{ github.event.pull_request.draft }}", "PREFLIGHT": "${{ needs.preflight.result }}",
          "RUN_FULL": "${{ needs.preflight.outputs.run_full }}", "PAID": "${{ needs.preflight.outputs.paid }}",
          "SETTLE": "${{ needs.settle.result }}", "TESTS": "${{ needs.linux-tests.result }}",
@@ -249,7 +251,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
      }
 
      def test_wiring(self) -> None:
-@@ -542,7 +565,7 @@ class AggregateTests(unittest.TestCase):
+@@ -542,7 +566,7 @@ class AggregateTests(unittest.TestCase):
          self.assertIn("name: linux\n", block)
          self.assertIn("runs-on: ubuntu-latest", block)
          self.assertIn("timeout-minutes: 3\n", block)
@@ -258,7 +260,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
          self.assertEqual(job_if(block), "always()")
          self.assertNotIn("uses:", block)
          self.assertIn("run_full: ${{ needs.preflight.outputs.run_full }}", block)
-@@ -554,9 +577,9 @@ class AggregateTests(unittest.TestCase):
+@@ -554,9 +578,9 @@ class AggregateTests(unittest.TestCase):
          script = step_run(step_block(job_block("linux"), "Required status"))
          cases: list[dict[str, str]] = []
 
@@ -270,7 +272,7 @@ index 9591138d7131fc5f14a813cda1033c31c26df86d..1fdb34d1b3c79ce2cdd8facc1e5ef3a3
 
          valid = [("pull_request", a, "false") for a in PR_ACTIONS] + [("push", "", ""), ("workflow_dispatch", "", "")]
          odd = [("pull_request", a, d) for a in PR_ACTIONS + ("labeled",) for d in ("true", "", "yes")]
-@@ -565,15 +588,16 @@ class AggregateTests(unittest.TestCase):
+@@ -565,15 +589,16 @@ class AggregateTests(unittest.TestCase):
          bad_scopes = (("true", "false"), ("false", "true"), ("", ""), ("True", "true"), ("true", "TRUE"), ("true", "pending"))
          for state in valid + odd:
              for run_full, paid in scopes + bad_scopes:

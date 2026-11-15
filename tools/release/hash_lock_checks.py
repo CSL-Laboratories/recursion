@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -174,7 +175,8 @@ class UnpinnedLineTests(TreeCase):
         self.assertProblem(r"attrs is pinned twice")
 
     def test_a_weak_or_malformed_hash_fails(self) -> None:
-        for bad in ("md5:" + "0" * 32, "sha256:" + "0" * 63, "sha256:" + "G" * 64):
+        for bad in ("md5:" + "0" * 32, "sha256:" + "0" * 63, "sha256:" + "G" * 64, "sha256:" + "0" * 65,
+                    "sha256:" + "0" * 64 + ",x"):
             with self.subTest(bad=bad):
                 self.tree.write(CI, ROOT.joinpath(CI).read_text(encoding="utf-8").replace(
                     "attrs==26.1.0 \\\n", f"attrs==26.1.0 --hash={bad} \\\n"))
@@ -187,6 +189,85 @@ class UnpinnedLineTests(TreeCase):
     def test_a_version_differing_from_the_record_fails(self) -> None:
         self.replace_attrs("attrs==26.1.1")
         self.assertProblem(r"attrs==26\.1\.1 ; None differs from the record \(26\.1\.0 ; None\)")
+
+    def test_a_hash_glued_to_the_pin_fails(self) -> None:
+        # pip reads `attrs==26.1.0--hash=...` as one (invalid) requirement; so must the check.
+        text = self.tree.read(CI)
+        self.tree.write(CI, text.replace("attrs==26.1.0 \\\n    --hash=", "attrs==26.1.0--hash=", 1))
+        self.assertProblem(r"a --hash must be its own token")
+        with self.assertRaisesRegex(hl.LockError, "its own token"):
+            hl.parse_requirements("example==1.0--hash=sha256:" + "0" * 64)
+
+    def test_a_hash_option_split_from_its_value_fails(self) -> None:
+        with self.assertRaisesRegex(hl.LockError, "unsupported hash"):
+            hl.parse_requirements("example==1.0 --hash sha256:" + "0" * 64)
+
+    def test_requirement_text_after_a_hash_fails(self) -> None:
+        with self.assertRaisesRegex(hl.LockError, "unsupported hash"):
+            hl.parse_requirements("example==1.0 --hash=sha256:" + "0" * 64 + " other==2.0")
+
+    def test_a_file_ending_inside_a_continued_pin_fails(self) -> None:
+        self.tree.write(CI, self.tree.read(CI).rstrip("\n") + " \\\n")
+        self.assertProblem(r"the file ends inside a continued line")
+
+    def test_a_comment_on_a_continued_line_fails(self) -> None:
+        self.tree.write(CI, self.tree.read(CI).replace("attrs==26.1.0 \\\n", "attrs==26.1.0 # pinned \\\n"))
+        self.assertProblem(r"a comment on a continued line")
+
+    def test_a_file_with_no_pins_fails(self) -> None:
+        self.tree.write(CI, "# nothing pinned\n")
+        self.assertProblem(r"requirements-ci\.txt: no pins")
+
+
+class RecordTests(TreeCase):
+    def test_an_unknown_record_format_fails(self) -> None:
+        for change in ({"format": 999}, {"files": []}):
+            with self.subTest(change=change):
+                record = json.loads(ROOT.joinpath(hl.RECORD).read_text(encoding="utf-8"))
+                record.update(change)
+                self.tree.write_record(record)
+                self.assertProblem(r"ci-lock\.json: .*expected 1 with a files map")
+
+    def test_a_marker_differing_from_the_record_fails(self) -> None:
+        record = self.tree.record()
+        record["files"][CI]["pins"]["typing-extensions"]["marker"] = 'python_version < "3.14"'
+        self.tree.write_record(record)
+        self.assertProblem(r"typing-extensions==4\.16\.0 ; python_version < \"3\.13\" differs from the record")
+
+    def test_a_pin_only_in_the_record_fails(self) -> None:
+        record = self.tree.record()
+        record["files"][CI]["pins"]["extra-package"] = record["files"][CI]["pins"]["attrs"]
+        self.tree.write_record(record)
+        self.assertProblem(r"requirements-ci\.txt: pins .* differ from the record's .*'extra-package'")
+
+    def test_a_distribution_that_refuses_the_python_gives_no_coverage(self) -> None:
+        record = self.tree.record()
+        for dist in record["files"][THREADED]["pins"]["cffi"]["dists"]:
+            dist["requires_python"] = ">=99"
+        self.tree.write_record(record)
+        self.assertProblem(r"cffi==\S+ on ubuntu-24\.04/python 3\.14t: no hashed wheel installs there")
+
+    def test_a_record_filename_of_another_release_fails(self) -> None:
+        record = self.tree.record()
+        for dist in record["files"][THREADED]["pins"]["cffi"]["dists"]:
+            dist["filename"] = dist["filename"].replace("cffi-", "unrelated-", 1)
+        self.tree.write_record(record)
+        self.assertProblem(r"the record lists 'unrelated-[^']*' for cffi==2\.1\.1; its name says another release")
+
+    def test_the_record_keeps_every_published_dependency_entry(self) -> None:
+        # Relock no longer filters entries; extras' entries are in the record and do not apply.
+        pins = self.tree.record()["files"][CI]["pins"]
+        self.assertTrue(any('extra ==' in r for r in pins["jsonschema"]["requires_dist"]))
+        self.assertEqual(self.tree.problems(), [])
+
+    def test_relock_keeps_entries_whose_marker_mentions_an_extra(self) -> None:
+        import relock
+        requirement = 'base-dependency>=1; extra != "optional"'
+        metadata = {"info": {"version": "1.0", "requires_dist": [requirement], "requires_python": ""},
+                    "urls": [{"filename": "fixture-1.0-py3-none-any.whl", "digests": {"sha256": "0" * 64}}]}
+        with mock.patch.object(relock, "fetch", return_value=metadata):
+            entry = relock.lock_pin("fixture", "1.0", None)
+        self.assertEqual(entry["requires_dist"], [requirement])
 
 
 class CompletenessTests(TreeCase):
@@ -214,6 +295,20 @@ class CompletenessTests(TreeCase):
         self.tree.write_record(record)
         self.assertProblem(r"needs 'attrs>=99'; the file pins attrs==26\.1\.0")
 
+    def test_a_dependency_that_requests_extras_fails(self) -> None:
+        record = self.tree.record()
+        record["files"][CI]["pins"]["jsonschema"]["requires_dist"].append("attrs[tests]>=22.2.0")
+        self.tree.write_record(record)
+        self.assertProblem(r"jsonschema==\S+ on .*: dependency 'attrs\[tests\]>=22\.2\.0' requests extras")
+        with self.assertRaisesRegex(hl.LockError, "requests extras"):
+            hl.parse_dependency("requests[socks]>=2")
+
+    def test_a_base_active_marker_naming_an_extra_applies(self) -> None:
+        record = self.tree.record()
+        record["files"][CI]["pins"]["attrs"]["requires_dist"].append('not-pinned>=1; extra != "optional"')
+        self.tree.write_record(record)
+        self.assertProblem(r"attrs==\S+ on ubuntu-24\.04/python 3\.12: needs 'not-pinned>=1; extra != \"optional\"'")
+
     def test_a_release_that_refuses_the_python_fails(self) -> None:
         record = self.tree.record()
         record["files"][THREADED]["pins"]["cffi"]["requires_python"] = ">=3.15"
@@ -237,6 +332,49 @@ class WorkflowScanTests(TreeCase):
     def test_installing_a_bare_package_fails(self) -> None:
         self.add_workflow("python -m pip install requests")
         self.assertProblem(r"extra\.yml job build: installs 'requests', which is not a hash-locked requirements file")
+
+    def test_every_command_on_a_line_is_read(self) -> None:
+        for operator in ("&&", "||", ";", "|"):
+            with self.subTest(operator=operator):
+                self.add_workflow(f"python -m pip install -r requirements-ci.txt {operator} "
+                                  "python -m pip install -r requirements-dev.txt")
+                self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+                self.add_workflow(f"python -m pip install -r requirements-ci.txt {operator} pip install requests")
+                self.assertProblem(r"installs 'requests'")
+
+    def test_the_attached_module_spelling_is_read(self) -> None:
+        self.add_workflow("python -mpip install -r requirements-dev.txt")
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_an_install_inside_a_command_substitution_is_read(self) -> None:
+        self.add_workflow("out=$(pip install requests)")
+        self.assertProblem(r"installs 'requests'")
+
+    def test_jobs_at_another_indentation_are_read(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="ubuntu-24.04", python="3.12", command="python -m pip install -r requirements-dev.txt")
+        head, body = text.split("jobs:\n", 1)
+        self.tree.write(rel, head + "jobs:\n" + "".join("  " + line + "\n" for line in body.splitlines()))
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_a_commented_jobs_line_is_read(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="ubuntu-24.04", python="3.12", command="python -m pip install -r requirements-dev.txt")
+        self.tree.write(rel, text.replace("jobs:\n", "jobs: # the jobs\n"))
+        self.assertProblem(r"requirements-dev\.txt is installed by \['extra\.yml job build'\]")
+
+    def test_inline_jobs_fail(self) -> None:
+        self.tree.write(".github/workflows/extra.yml", 'name: x\non: push\njobs: {build: {runs-on: ubuntu-24.04, '
+                        'steps: [{run: "python -m pip install -r requirements-dev.txt"}]}}\n')
+        self.assertProblem(r"extra\.yml: `jobs:` is written inline")
+        self.assertProblem(r"extra\.yml: 1 line\(s\) that may install packages sit outside any job")
+
+    def test_a_crlf_workflow_is_read(self) -> None:
+        rel, template = self.WORKFLOW
+        text = template.format(runner="ubuntu-24.04", python="3.12", command="python -m pip install -r requirements-ci.txt")
+        found, problems = hl.workflow_installs("extra.yml", text.replace("\n", "\r\n"))
+        self.assertEqual(problems, [])
+        self.assertEqual([(i.file, str(i.target)) for i in found], [(CI, "ubuntu-24.04/python 3.12")])
 
     def test_an_installer_the_check_cannot_read_fails(self) -> None:
         self.add_workflow("uv sync")

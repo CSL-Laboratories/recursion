@@ -10,11 +10,12 @@ paths the brief names for the ACP client (`routes/acp.py`, `routes/tests/test_ac
 | File | What it is | Moves to, when the map opens the path |
 |---|---|---|
 | `acp.py` | the shared ACP client, engine-neutral | `routes/acp.py`, unchanged |
-| `fake_acp_agent.py` | a scripted fake ACP agent (SYNTHETIC) | `routes/fixtures/acp/` |
+| `fake_acp_agent.py` | a scripted fake ACP agent (SYNTHETIC), in process or as a stdio process (`main`) | `routes/fixtures/acp/` |
 | `acp_meta_v1.json` | the pinned ACP method list, byte for byte | with `acp.py`'s tests |
 | `acp_schema_excerpt.json` | values copied by a script from the pinned ACP schema | with `acp.py`'s tests |
 | `schema_check.py` | loads SPINE's `conformance/rules.py` by path to check drafts against SPINE's schemas | with the tests |
 | `test_antigravity_acp.py` | the client against the fake agent | `routes/tests/test_acp.py` |
+| `test_antigravity_acp_pipe.py` | the client over a real pipe, the fake running as its own process | `routes/tests/` |
 | `test_antigravity_one_shot.py` | the one-shot parser over the fixtures below, and the one-shot adapter | `routes/engines/tests/` |
 | `test_antigravity_driver.py` | methods, driver.v2 declarations, the ACP glue, nothing registered | `routes/engines/tests/` |
 | `one_shot/*.jsonl` | one-shot stdout streams (SYNTHETIC) | stays |
@@ -25,6 +26,7 @@ root:
 
     PYTHONPATH=core <python> -m unittest \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp \
+        recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp_pipe \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_one_shot \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_driver
 

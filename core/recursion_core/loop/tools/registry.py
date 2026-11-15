@@ -31,6 +31,7 @@ content classifier, given to head and tail in proportion).
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -70,6 +71,8 @@ class ToolContext:
     workspace: Workspace
     cancel: b.CancelToken
     scrub: Callable[[str], str]
+    # The one cap, for a tool that pages itself: dispatch sets both from the registry before each run, so a value
+    # a caller puts here is replaced, and a context shared by two registries carries the one that ran last.
     max_bytes: int = DEFAULT_MAX_BYTES
     max_lines: int = DEFAULT_MAX_LINES
     # approve(call) -> permissions.Decision; None when nothing can be asked (then such tools are refused).
@@ -106,6 +109,10 @@ class Outcome:
     truncated: bool
     spill_ref: str | None
     output_bytes: int
+
+
+def _copy(spec: b.ToolSpec) -> b.ToolSpec:
+    return b.ToolSpec(spec.name, spec.description, copy.deepcopy(dict(spec.input_schema)))
 
 
 def validate(schema: Mapping[str, Any], value: Any, where: str = "input") -> None:
@@ -270,7 +277,9 @@ class ToolRegistry:
         self.max_lines = max_lines
 
     def specs(self) -> tuple[b.ToolSpec, ...]:
-        return b.tool_specs([t.spec for t in self._tools.values()])
+        """The tool list for a request: copies, so nothing a caller does to one changes what dispatch checks."""
+
+        return b.tool_specs([_copy(t.spec) for t in self._tools.values()])
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._tools))
@@ -280,13 +289,21 @@ class ToolRegistry:
         directly would skip the input check, the approval rule, the cancel check, the scrubbing and the cap."""
 
         tool = self._tools.get(name) if isinstance(name, str) else None
-        return tool.spec if tool is not None else None
+        return _copy(tool.spec) if tool is not None else None  # a copy: the schema dispatch checks stays its own
 
     def dispatch(self, call: b.ToolCall, ctx: ToolContext) -> Outcome:
         if not isinstance(call, b.ToolCall):
             # Only a tool call runs a tool: anything else gets an error result, never an exception.
-            ids = [getattr(call, field, "") for field in ("call_id", "name")]
-            call_id, name = (value if isinstance(value, str) else "" for value in ids)
+            ids = []
+            for field in ("call_id", "name"):
+                try:
+                    value = getattr(call, field, "")
+                except KeyboardInterrupt:
+                    raise  # the process is being interrupted (SIGINT): that stops the loop, not one call
+                except BaseException:  # noqa: BLE001 - a property that raises is one more thing that is not a call
+                    value = ""
+                ids.append(value if isinstance(value, str) else "")
+            call_id, name = ids
             text = f"the call could not be run (a {type(call).__name__} is not a tool call)"
             return Outcome(call_id, name, ERROR, text, False, None, len(text))
         try:
@@ -315,13 +332,13 @@ class ToolRegistry:
             return self._finish(call, ToolOutput(json.dumps(answer, ensure_ascii=False), ERROR), ctx)
         if not isinstance(call.input, Mapping):
             return self._finish(call, ToolOutput("invalid input: the input must be a JSON object", ERROR), ctx)
+        args = dict(call.input)  # one copy: what is checked is what runs
         try:
-            validate(tool.spec.input_schema, dict(call.input))
+            validate(tool.spec.input_schema, args)
         except ToolError as exc:
             return self._finish(call, ToolOutput(f"invalid input: {exc}", ERROR), ctx)
         ctx.max_bytes, ctx.max_lines = self.max_bytes, self.max_lines
-        args = dict(call.input)
-        if tool.needs_approval:
+        if tool.needs_approval is not False:  # fails closed: anything but False (a subclass may skip the check) asks
             if tool.precheck is not None:
                 try:
                     tool.precheck(args, ctx)

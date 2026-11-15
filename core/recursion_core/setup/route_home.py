@@ -29,7 +29,9 @@ keeper of this file:
     route_home_is_operator_home  path, or the root, is the operator's own home (the password
                                  database's, or ``$HOME``), compared after links are followed
     route_home_missing           the root, a folder between it and path's parent, or a link above
-                                 the root (removed while it was being followed) does not exist
+                                 the root (removed while it was being followed) does not exist; or a
+                                 link on the way to path, the root or the operator's home was removed
+                                 between its lookup and its readlink
 
 ``check`` raises nothing else for any path or root, however malformed.
 
@@ -38,9 +40,12 @@ A route home that does not exist yet is accepted when everything above it passes
 root is ``route_home_missing``): it is made once, owner-only, before the first launch (by
 ``recursiond install`` or ``provision``, lane INSTALL), not by the check's caller on the way. A route home inside the operator's home is
 accepted (the daemon's state folder is ``~/.local/state/recursion``), only the home itself is
-refused. Nothing is created or opened: the file system is asked through ``lstat`` and ``readlink``
-only (links are followed by hand, so a lookup that fails part-way is a refusal, never a partial
-answer), and the password database through ``pwd.getpwuid`` for this user's home. POSIX ACLs
+refused. The three identities (path, root, the operator's home) are compared after links are
+followed; a name in them that does not exist is compared as written and the names after it are
+still followed (``os.path.realpath(strict=ALLOW_MISSING)``'s reading), so a ``..`` after it, a link
+or a folder that cannot be searched further on counts. Nothing is created or opened: the file
+system is asked through ``lstat`` and ``readlink`` only (links are followed by hand, so a lookup
+that fails part-way is a refusal, never a partial answer), and the password database through ``pwd.getpwuid`` for this user's home. POSIX ACLs
 are not read. The answer holds for the moment of the check: code running as the operator can change
 any of it afterwards, before ``private_dir`` makes the folder too (the B17 limit in
 ``plugin_security/authority.py``), which no path check can close. Linux only, as the launcher is.
@@ -167,9 +172,13 @@ def _check_above(root: str) -> None:
 
 def _resolve(path: str) -> str:
     """``path`` with every link followed as the kernel would, ``.`` and ``..`` taken from where the
-    resolution is; from the first name that does not exist, the rest is kept as written (a folder
-    not made yet still has a name to compare). Any other failure refuses ``route_home_untrusted``:
-    a resolution that stopped part-way must never stand in for a path's identity."""
+    resolution is. A name that does not exist is kept as written (a folder not made yet still has a
+    name to compare) and the resolution goes on past it, as ``os.path.realpath`` with
+    ``strict=ALLOW_MISSING`` does: a later ``..`` takes it away again, and every name after it is
+    looked up, followed and held to the same rules. A link that is gone when its target is read was
+    removed while it was being followed, which is not a name not made yet: ``route_home_missing``.
+    Any other failure refuses ``route_home_untrusted``: a resolution that stopped part-way must never
+    stand in for a path's identity."""
 
     names = [name for name in path.split("/") if name]
     current, links = "/", 0
@@ -183,19 +192,25 @@ def _resolve(path: str) -> str:
         candidate = os.path.join(current, name)
         try:
             info = os.lstat(candidate)
-            if stat.S_ISLNK(info.st_mode):
-                links += 1
-                if links > _MAX_LINKS:
-                    raise RouteHomeRefused("route_home_untrusted", f"more than {_MAX_LINKS} links in {path}")
-                target = os.readlink(candidate)
-                if target.startswith("/"):
-                    current = "/"
-                names[:0] = [part for part in target.split("/") if part]
-                continue
-        except FileNotFoundError:  # not made yet (or removed while being followed)
-            return os.path.join(candidate, *(n for n in names if n != "."))
+        except FileNotFoundError:  # not made yet: compared by its name, and the names after it resolved from there
+            current = candidate
+            continue
         except OSError as exc:
             raise RouteHomeRefused("route_home_untrusted", f"{candidate} cannot be resolved: {type(exc).__name__}") from None
+        if stat.S_ISLNK(info.st_mode):
+            links += 1
+            if links > _MAX_LINKS:
+                raise RouteHomeRefused("route_home_untrusted", f"more than {_MAX_LINKS} links in {path}")
+            try:
+                target = os.readlink(candidate)
+            except FileNotFoundError:  # the link was removed between its lstat and this readlink
+                raise RouteHomeRefused("route_home_missing", f"{candidate} was removed while it was followed") from None
+            except OSError as exc:
+                raise RouteHomeRefused("route_home_untrusted", f"{candidate} cannot be resolved: {type(exc).__name__}") from None
+            if target.startswith("/"):
+                current = "/"
+            names[:0] = [part for part in target.split("/") if part]
+            continue
         if names and not stat.S_ISDIR(info.st_mode):
             raise RouteHomeRefused("route_home_untrusted", f"{candidate} is not a folder")
         current = candidate

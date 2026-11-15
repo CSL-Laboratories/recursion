@@ -216,6 +216,133 @@ class RouteHomeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": os.path.join(self.path, "deeper")}):
             check(self.path, self.root)
 
+    # Round 3 of #401, Codex Astra, required 1: three regressions for rules the tests above let go
+    # (a late readlink error at the root's and at the route home's comparison; a "." in the
+    # operator's home, after an existing name and after one not made yet).
+    def test_late_root_and_leaf_readlink_errors_are_typed(self):
+        link = os.path.join(self.base, "late-state-link")
+        os.symlink(self.state, link)
+        linked_root = os.path.join(link, "homes")
+        linked_path = os.path.join(linked_root, "claude_code")
+        real_readlink = os.readlink
+        for fail_on in (2, 3):  # 1 is the walk above the root, 2 the root's comparison, 3 the route home's
+            calls = []
+
+            def fault(path, *args, **kwargs):
+                if os.fspath(path) == link:
+                    calls.append(path)
+                    if len(calls) == fail_on:
+                        raise OSError(5, "synthetic late readlink failure")
+                return real_readlink(path, *args, **kwargs)
+            with self.subTest(call=fail_on), mock.patch("os.readlink", side_effect=fault):
+                self.refused("route_home_untrusted", linked_path, linked_root)
+            self.assertEqual(len(calls), fail_on)
+
+    def test_operator_home_dot_component_is_compared(self):
+        with mock.patch.dict(os.environ, {"HOME": self.root + "/./claude_code"}):
+            self.refused("route_home_is_operator_home", self.path)
+
+    def test_missing_operator_home_trailing_dot_is_compared(self):
+        with mock.patch.dict(os.environ, {"HOME": self.path + "/."}):
+            self.refused("route_home_is_operator_home", self.path)
+
+    # Round 3 of #401, Codex Sol, required 2: the late readlink error pinned at the root's and at the
+    # route home's comparison on its own, each beside a control in which the same fixture is refused
+    # as the operator's home; and a "." in an operator's home that exists.
+    def _late_comparison_readlink_error(self, home: str, fail_on: int) -> None:
+        alias = os.path.join(self.base, "state-alias")
+        os.symlink("state", alias)
+        root = os.path.join(alias, "homes")
+        path = os.path.join(root, "engine", "leaf")
+        os.mkdir(os.path.join(self.root, "engine"), 0o700)
+        os.mkdir(os.path.join(self.root, "engine", "leaf"), 0o700)
+        calls = []
+        real_readlink = os.readlink
+
+        def failing(candidate, *args, **kwargs):
+            if os.fspath(candidate) == alias:
+                calls.append(candidate)
+                if len(calls) == fail_on:
+                    raise OSError(5, "synthetic comparison readlink error")
+            return real_readlink(candidate, *args, **kwargs)
+        with mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=home)):
+            self.refused("route_home_is_operator_home", path, root)  # control: no fault
+            with mock.patch("os.readlink", side_effect=failing):
+                error = self.refused("route_home_untrusted", path, root)
+        self.assertEqual(len(calls), fail_on)
+        self.assertIn("cannot be resolved: OSError", error.detail)
+
+    def test_root_comparison_readlink_error_is_typed_and_not_accepted(self):
+        self._late_comparison_readlink_error(self.root, 2)  # 1 is the walk above the root, 2 the root's comparison
+
+    def test_leaf_comparison_readlink_error_is_typed_and_not_accepted(self):
+        self._late_comparison_readlink_error(os.path.join(self.root, "engine", "leaf"), 3)
+
+    def test_dot_in_operator_home_is_normalized(self):
+        os.mkdir(self.path, 0o700)  # the home exists here; the Astra twin above names one not made yet
+        with mock.patch.dict(os.environ, {"HOME": self.root + "/./claude_code"}):
+            self.refused("route_home_is_operator_home", self.path)
+
+    # Round 3 of #401, Codex Sol, required 1: after a name not made yet the resolution goes on, as
+    # os.path.realpath(strict=ALLOW_MISSING) reads it. A ".." takes the missing name away again, and
+    # what comes after it is looked up, followed and held to the same rules; a link that is gone when
+    # its target is read was removed while it was followed, which is not a name not made yet.
+    def test_missing_home_fallback_does_not_ignore_unsearchable_component(self):
+        os.mkdir(self.path, 0o700)
+        hidden = os.path.join(self.base, "hidden")
+        os.mkdir(hidden, 0o700)
+        os.symlink(self.path, os.path.join(hidden, "alias"))
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.base, "missing") + "/../hidden/alias"}):
+            self.refused("route_home_is_operator_home", self.path)  # control: searchable, it names the route home
+            os.chmod(hidden, 0)
+            try:
+                error = self.refused("route_home_untrusted", self.path)
+            finally:
+                os.chmod(hidden, 0o700)
+        self.assertIn("cannot be resolved: PermissionError", error.detail)
+
+    def test_missing_dotdot_operator_alias_is_compared(self):
+        os.mkdir(self.path, 0o700)
+        os.symlink(self.path, os.path.join(self.base, "operator-alias"))
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.base, "not-made") + "/../operator-alias"}):
+            self.refused("route_home_is_operator_home", self.path)
+
+    def test_missing_dotdot_in_relative_home_link_is_compared(self):
+        os.mkdir(self.path, 0o700)
+        home_link = os.path.join(self.base, "relative-home")
+        os.symlink("not-made/../state/homes/claude_code", home_link)
+        with mock.patch.dict(os.environ, {"HOME": home_link}):
+            self.refused("route_home_is_operator_home", self.path)
+
+    def test_missing_dotdot_does_not_hide_a_name_below_a_file(self):
+        with open(os.path.join(self.base, "ordinary"), "wb"):
+            pass
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.base, "not-made") + "/../ordinary/home"}):
+            self.assertIn("ordinary is not a folder", self.refused("route_home_untrusted", self.path).detail)
+
+    def test_canonicalization_missing_readlink_does_not_accept_operator_home(self):
+        alias = os.path.join(self.base, "state-alias")
+        os.symlink("state", alias)
+        root = os.path.join(alias, "homes")
+        path = os.path.join(root, "claude_code")
+        os.mkdir(self.path, 0o700)
+        real_readlink = os.readlink
+        for site, home, fail_at in (("root", self.root, 2), ("leaf", self.path, 3)):
+            calls = []
+
+            def vanishing(candidate, *args, **kwargs):
+                if os.fspath(candidate) == alias:
+                    calls.append(candidate)
+                    if len(calls) == fail_at:
+                        raise FileNotFoundError(2, "synthetic vanished link")
+                return real_readlink(candidate, *args, **kwargs)
+            with self.subTest(site=site), mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=home)):
+                self.refused("route_home_is_operator_home", path, root)  # control: no fault
+                with mock.patch("os.readlink", side_effect=vanishing):
+                    error = self.refused("route_home_missing", path, root)
+                self.assertEqual(len(calls), fail_at)
+                self.assertEqual(error.detail, f"{alias} was removed while it was followed")
+
     def test_with_no_operators_home_known_the_check_refuses_rather_than_passes(self):
         # DeepSeek F4: an empty set of homes would let any path through the operator's-home rule.
         no_entry = mock.patch("pwd.getpwuid", side_effect=KeyError(os.geteuid()))

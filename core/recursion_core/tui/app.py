@@ -59,7 +59,8 @@ class _Output:
         # the whole history to count it or show its newest rows (review 2 of #404, Astra 3). They are counted
         # again when the width changes, and whenever they may be out of step with the lines: -1 means "not
         # counted", from the start and while a feed adds to them, so a failure part way leaves them to be
-        # counted again, never wrong (review 3 of #404, DeepSeek F1, F2).
+        # counted again, never wrong (review 3 of #404, DeepSeek F1, F2). One _Output is used by one thread at
+        # a time: the app calls it under its lock (review 4 of #404, DeepSeek's section 4).
         self._width = -1
         self._rows: collections.deque[int] = collections.deque(maxlen=cap)
 

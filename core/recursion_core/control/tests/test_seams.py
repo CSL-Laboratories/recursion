@@ -1754,6 +1754,27 @@ class AdmissionTest(unittest.TestCase):
         made.freeze()
         self.assertFalse(made.gate.enabled, 'a hook that holds no resource does not need the gate')
 
+    def test_a_drive_owner_turns_the_gate_on_by_itself_and_the_other_single_hooks_do_not(self) -> None:
+        """A drive owner with no service beside it: the run it accepts is handed over under a lifetime reference,
+        which counts only where the gate is on. The other single hooks registered alone leave it off; that is
+        the gate's text, held here so that a change of it is a decision and not an accident."""
+        made = H.Hooks()
+        made.set('drive_owner', lambda ctx, request: None)
+        made.freeze()
+        self.assertTrue(made.gate.enabled)
+        self.assertTrue(made.gate.enter())
+        made.gate.leave()
+        made.begin_close()
+        self.assertFalse(made.gate.enter(), 'once closing has begun nothing is admitted, with the owner alone')
+        others = [name for name in H.SINGLE if name not in ('drive_owner', 'event_store')]
+        self.assertEqual(len(others), 6, 'every single hook is on one side or the other of this test')
+        for name in others:
+            with self.subTest(hook=name):
+                made = H.Hooks()
+                made.set(name, lambda *args: None)
+                made.freeze()
+                self.assertFalse(made.gate.enabled)
+
     def test_no_call_is_admitted_after_closing_began(self) -> None:
         gate = H.Admission()
         gate.enabled = True

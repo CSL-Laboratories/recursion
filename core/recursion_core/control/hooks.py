@@ -535,8 +535,15 @@ class Admission:
     interruption of the wait: it is kept, the wait goes on, and it is raised once every call has left.
 
     The gate does nothing until it is ``enabled``, which composition does when a lane has registered a
-    handler, a service or an event store. With nothing registered a call is never refused and closing
-    waits for nothing, as today.
+    handler, a service, an event store or a drive owner. With nothing registered a call is never refused
+    and closing waits for nothing, as today.
+
+    A drive owner turns it on by itself, with no service beside it: the run it accepts is handed over
+    under a lifetime reference (S9), and what S9 says of closing holds for every registered owner. Closing
+    waits for the hand-over, a run is refused once closing has begun, and a settling that is under way
+    fences nothing. Without the gate the reference would count nothing and none of the three would hold.
+    A launch hook or a credential source (S4, S7, S10) registered with none of the four above leaves the
+    gate off: its reference then counts nothing, and a launch during a close is what it is today.
     """
 
     def __init__(self) -> None:
@@ -752,8 +759,10 @@ class Hooks:
         if self._engines is not None:
             self._engines.freeze()
         self.methods.service_ready = self.service_ready
-        # The gate guards what a lane brought: a handler, a service, a store. With none of them it stays off.
-        self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single)
+        # The gate guards what a lane brought: a handler, a service, a store, or a drive owner, whose hand-over
+        # closing waits for whether or not its lane registered a service. With none of them it stays off.
+        self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single
+                                 or 'drive_owner' in self._single)
 
     # -- S5 ---------------------------------------------------------------------------------------
     def authorize(self, principal: Principal, method, params) -> dict | None:

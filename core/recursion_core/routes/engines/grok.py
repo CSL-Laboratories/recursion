@@ -54,8 +54,8 @@ Whatever the code, the detail ends with how many tool calls got no draft because
 RFC 8785 form, when there were any, so such a run never looks complete.
 
 Usage is never 0 because it was not known (event.v1, ``token_count``): a per-response ``usage`` line
-or turn totals with no count above 0 are unknown, not free; the turn's counts are a lower bound when
-``usage_is_incomplete`` is set; the cost is known only from ``total_cost_usd_ticks`` or a finite
+or turn totals with no count above 0 are unknown, not free; counts that were sent are a lower bound
+when the line's ``usage_is_incomplete`` is set (a call line's as a turn's); the cost is known only from ``total_cost_usd_ticks`` or a finite
 ``total_cost_usd`` when neither withholding flag is set (a flag is set when present and neither
 ``false`` nor ``null``, so a malformed value withholds). Two things print a ``usage`` line
 (``headless/reducer/acp.rs:147-169``): one model response (``ResponseCompleted``, with an optional
@@ -64,8 +64,9 @@ or turn totals with no count above 0 are unknown, not free; the turn's counts ar
 the three is one call (span ``call``). A line with none of them may be either, so it gets no draft (it
 is counted in ``ignored``; its raw line is in ``engine.output``): the totals on ``end`` or ``error``
 cover the turn (span ``turn``), drafted once per run (a second line with totals is counted, not
-drafted); a line that says its usage is incomplete and carries none drafts the turn as unknown, once,
-without taking the place of a later line's totals. Neither names the model, except the totals when
+drafted); a line that carries no totals (only the incomplete flag, or a ``usage`` object with no count
+above 0 and no known cost) drafts the turn as unknown, once, without taking the place of a later line's
+totals. Neither names the model, except the totals when
 ``modelUsage`` names exactly one, and not one whose name held a lone surrogate.
 
 A ``tool.call`` carries ``input_digest``, the SHA-256 of the input as RFC 8785 writes it, taken with
@@ -211,7 +212,8 @@ _IDENTITY_KEYS = ("toolCallId", "sessionId", "requestId")
 
 
 def _decode(line: str) -> tuple[dict, bool, frozenset]:
-    """``decode_line``, whether cleaning changed a string, and which identity fields it changed."""
+    """``decode_line``, whether cleaning changed a string, and the names cleaning would make inexact: the
+    identity fields it changed, and ``"modelUsage"`` when it changed a model name."""
 
     try:
         raw = json.loads(line, parse_constant=_refuse_constant)
@@ -268,7 +270,8 @@ class OneShotParser:
 
     ``parse(line)`` gives the drafts of one stdout line: always one ``engine.output`` (the line, with any
     lone surrogate written as U+FFFD, and its byte span in the file), then any ``tool.call``,
-    ``tool.result`` and ``usage`` it carries. ``line`` must be a ``str`` (``TypeError`` otherwise). ``finish(code)``
+    ``tool.result`` and ``usage`` it carries. ``line`` must be a ``str`` (``TypeError`` otherwise; after
+``finish``, any ``parse`` raises ``RuntimeError`` first). ``finish(code)``
     gives the run's ``result`` draft from what was seen and the process's return code. Not shared
     between threads: one parser per run, and ``finish`` is called by the thread that calls ``parse``,
     after the last line (a Stop or a watchdog on another thread ends the process, not the parser).
@@ -293,7 +296,7 @@ class OneShotParser:
         self._protocol: str | None = None        # the first protocol fault
         self._cut_line: str | None = None        # why a last line with no newline did not decode
         self._undrafted_calls = 0                # tool calls whose input has no RFC 8785 form
-        self._altered: frozenset = frozenset()   # identity fields of the current line that held a lone surrogate
+        self._altered: frozenset = frozenset()   # names in the current line that held a lone surrogate
         self._turn_spend_drafted = False         # the turn's totals are drafted once
         self._turn_unknown_drafted = False       # and an incomplete line with none, once, beside them
         self._open_calls: set[str] = set()       # tool calls drafted and not yet given a result
@@ -490,7 +493,8 @@ class OneShotParser:
             known = None   # no bucket above 0: the backend reported nothing, which is not "free"
         else:
             known = counts
-        drafts.append(_usage_draft(self.connection_id, None, "call", known, lower_bound=False, cost=None))
+        drafts.append(_usage_draft(self.connection_id, None, "call", known,
+                                   lower_bound=_flag_set(message, "usage_is_incomplete"), cost=None))
 
     def _max_turns_line(self, message: dict, drafts: list) -> None:
         self._max_turns = True
@@ -499,16 +503,22 @@ class OneShotParser:
         self._ended = True
         stop = message.get("stopReason")
         self.stop_reason = stop if isinstance(stop, str) else None
+        # Both ids obey one rule: one line of at most 256 characters, never cleaned; anything else that is
+        # present is counted and not kept.
         session = message.get("sessionId")
         if "sessionId" in self._altered:
             self._count("session_id_not_utf8")   # a cleaned id would resume another conversation, or none
         elif _is_one_line(session, 256):
             self.engine_session_id = session
+        elif session is not None:
+            self._count("session_id_unusable")
         request = message.get("requestId")
         if "requestId" in self._altered:
             self._count("request_id_not_utf8")   # a cleaned id could match another request's
-        elif isinstance(request, str) and request:
+        elif _is_one_line(request, 256):
             self.request_id = request
+        elif request is not None:
+            self._count("request_id_unusable")
         self._spend(message, drafts)
 
     def _error_line(self, message: dict, drafts: list) -> None:
@@ -523,19 +533,28 @@ class OneShotParser:
     def _spend(self, message: dict, drafts: list) -> None:
         """The turn's totals on ``end`` or ``error``, when the engine sent any, drafted once: a second
         line that carries totals (a second ``error``, or ``end`` after ``error``) is counted, so a
-        consumer that sums span ``turn`` never counts the turn twice. A line that says its usage is
-        incomplete and carries none drafts the turn as unknown (once) and does not take the place of
-        totals a later line carries: the consumer then sees one unknown and at most one number."""
+        consumer that sums span ``turn`` never counts the turn twice. A line that carries no totals (no
+        ``usage`` object but the incomplete flag, or a ``usage`` object with no count above 0 and no
+        known cost) drafts the turn as unknown, once, and does not take the place of totals a later line
+        carries: the consumer then sees one unknown and at most one number."""
 
         usage = message.get("usage")
         incomplete = _flag_set(message, "usage_is_incomplete")
-        if not isinstance(usage, Mapping):
-            if not incomplete:
-                return
+        if not isinstance(usage, Mapping) and not incomplete:
+            return
+        counts = None
+        cost = None
+        if isinstance(usage, Mapping):
+            counts = [_count_of(usage.get(key)) for key in _RESPONSE_KEYS]
+            if _nothing_reported(counts):
+                counts = None   # no bucket above 0: nothing was reported, which is not "free" (as for a call)
+            if not (incomplete or _flag_set(message, "cost_is_partial")):
+                cost = _cost(message)
+        if counts is None and cost is None:
+            # No totals: say unknown, never 0, once, and leave the place for a line that has them.
             if self._turn_spend_drafted or self._turn_unknown_drafted:
                 self._count("turn_usage_already_drafted")
                 return
-            # incomplete and no tokens recorded: say unknown, never 0
             self._turn_unknown_drafted = True
             drafts.append(_usage_draft(self.connection_id, None, "turn", None, lower_bound=False, cost=None))
             return
@@ -543,13 +562,8 @@ class OneShotParser:
             self._count("turn_usage_already_drafted")
             return
         self._turn_spend_drafted = True
-        counts = [_count_of(usage.get(key)) for key in _RESPONSE_KEYS]
-        if _nothing_reported(counts):
-            counts = None   # no bucket above 0: nothing was reported, which is not "free" (as for a call)
-        withheld = incomplete or _flag_set(message, "cost_is_partial")
         model = None if "modelUsage" in self._altered else _single_model(message.get("modelUsage"))
-        drafts.append(_usage_draft(self.connection_id, model, "turn",
-                                   counts, lower_bound=incomplete, cost=None if withheld else _cost(message)))
+        drafts.append(_usage_draft(self.connection_id, model, "turn", counts, lower_bound=incomplete, cost=cost))
 
     # -- bookkeeping --------------------------------------------------------------------------------
     def _fault(self, reason: str) -> None:
@@ -579,10 +593,11 @@ _TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_rea
 
 def parse_run(connection_id: str, lines: Sequence[str], returncode: int) -> tuple[list[dict], OneShotParser]:
     """Every draft of one finished run, in order, and the parser that made them. ``lines`` is the lines,
-    not the file: a ``str`` or ``bytes`` is refused (``TypeError``) rather than read a character at a time."""
+    in order, not the file: a ``str``, ``bytes``, a mapping or a set is refused (``TypeError``) rather than
+    read a character, a key or an unordered member at a time."""
 
-    if isinstance(lines, (str, bytes, bytearray)):
-        raise TypeError("lines: pass the output's lines, not one string")
+    if isinstance(lines, (str, bytes, bytearray, Mapping, set, frozenset)):
+        raise TypeError("lines: pass the output's lines in order, not one string, a mapping or a set")
     parser = OneShotParser(connection_id)
     drafts: list[dict] = []
     for line in lines:

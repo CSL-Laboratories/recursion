@@ -148,11 +148,20 @@ class CaseReplayTest(unittest.TestCase):
         self.assertEqual(parser.request_id, "req_7")
         self.assertEqual(parser.stop_reason, "end_turn")
 
-    def test_a_request_id_is_kept_only_when_it_is_a_non_empty_string(self):
-        for request, kept in (("r-1", True), ("", False), (7, False), (None, False)):
-            with self.subTest(request=request):
+    def test_a_request_id_is_kept_only_when_it_is_one_line_of_at_most_256(self):
+        for request, kept in (("r-1", True), ("r" * 256, True), ("r" * 257, False), ("r\nx", False),
+                              ("r\rx", False), ("", False), (7, False), (None, False)):
+            with self.subTest(request=str(request)[:20]):
                 _, parser = run([line({"type": "end", "stopReason": "end_turn", "requestId": request})], 0)
                 self.assertEqual(parser.request_id, request if kept else None)
+                self.assertEqual(parser.ignored.get("request_id_unusable", 0), 0 if kept or request is None else 1)
+
+    def test_an_unusable_session_id_is_counted(self):
+        _, parser = run([line({"type": "end", "stopReason": "end_turn", "sessionId": "s\nx"})], 0)
+        self.assertIsNone(parser.engine_session_id)
+        self.assertEqual(parser.ignored["session_id_unusable"], 1)
+        _, parser = run([line({"type": "end", "stopReason": "end_turn"})], 0)
+        self.assertNotIn("session_id_unusable", parser.ignored)
 
     def test_a_session_id_that_held_a_lone_surrogate_is_not_kept(self):
         _, parser = run([escaped({"type": "end", "stopReason": "end_turn", "sessionId": "s" + LONE})], 0)
@@ -349,7 +358,7 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(result_of(drafts), {"code": c.PROTOCOL_ERROR, "detail": "stdout line is nested too deeply"})
 
     def test_parse_run_takes_lines_not_one_string(self):
-        for whole in ("abc\n", b"abc\n", bytearray(b"abc\n")):
+        for whole in ("abc\n", b"abc\n", bytearray(b"abc\n"), {"type": "text"}, {"a\n", "b\n"}, frozenset({"a\n"})):
             with self.subTest(kind=type(whole).__name__), self.assertRaises(TypeError):
                 grok.parse_run(CONN, whole, 0)
 
@@ -612,6 +621,29 @@ class UsageTest(unittest.TestCase):
         drafts, parser = run([line(error), line(error)], 1)   # two with none: unknown once
         self.assertEqual(len(of_type(drafts, "usage")), 1)
         self.assertEqual(parser.ignored["turn_usage_already_drafted"], 1)
+
+    def test_a_usage_object_that_reports_nothing_does_not_take_the_place_of_later_totals(self):
+        real = end(usage={"input_tokens": 9, "output_tokens": 3}, total_cost_usd_ticks=10 ** 10)
+        for empty in ({}, {"input_tokens": 0, "output_tokens": 0}, {"input_tokens": -1}, {"input_tokens": True},
+                      {"input_tokens": 2 ** 60}):
+            for extra in ({}, {"usage_is_incomplete": True}):
+                with self.subTest(usage=empty, extra=extra):
+                    first = line({"type": "error", "message": "boom", "usage": empty, **extra})
+                    drafts, parser = run([first, real], 1)
+                    turns = [(u["input_tokens"]["value"], u["cost_usd"]["value"]) for u in of_type(drafts, "usage")]
+                    self.assertEqual(turns, [(None, None), (9, 1.0)])
+                    self.assertNotIn("turn_usage_already_drafted", parser.ignored)
+        nothing = line({"type": "error", "message": "boom", "usage": {}})
+        drafts, parser = run([nothing, nothing], 1)   # two that report nothing: unknown once
+        self.assertEqual(len(of_type(drafts, "usage")), 1)
+        self.assertEqual(parser.ignored["turn_usage_already_drafted"], 1)
+        (usage,) = of_type(run([end(usage={}, total_cost_usd_ticks=10 ** 10)], 0)[0], "usage")   # a cost is totals
+        self.assertEqual((usage["input_tokens"]["quality"], usage["cost_usd"]["value"]), ("unknown", 1.0))
+
+    def test_an_incomplete_call_line_is_a_lower_bound(self):
+        (usage,) = of_type(run([line({"type": "usage", "messageId": "m", "usage_is_incomplete": True,
+                                      "usage": {"input_tokens": 5}})], 0)[0], "usage")
+        self.assertEqual((usage["span"], usage["input_tokens"]["quality"]), ("call", "lower_bound"))
 
     def test_a_withholding_flag_withholds_unless_it_is_false_or_null(self):
         totals = {"input_tokens": 7}

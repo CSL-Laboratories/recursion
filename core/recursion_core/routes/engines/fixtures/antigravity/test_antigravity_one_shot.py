@@ -1118,5 +1118,77 @@ class ReviewRoundSixTest(unittest.TestCase):
         self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.CREDENTIAL_UNAVAILABLE))
         self.assertEqual(launcher.calls, [])
 
+
+class ReviewRoundSevenTest(unittest.TestCase):
+    """Regressions for DeepSeek's round-7 confirming read of #396 at 4205e522 (F1, F2 MEDIUM; F3 LOW). Each
+    fails on that head."""
+
+    def adapter_and_launcher(self, clock=None):
+        clock = clock or Clock()
+        launcher = Launcher(lines("synthetic-ok.jsonl"), clock)
+        return adapter(launcher, clock), launcher, clock
+
+    def test_f1_a_request_the_contract_refuses_is_refused_before_anything_starts(self) -> None:
+        cases = {"deadline_s": [None, -1, 0, "x", True, float("nan"), float("inf"), 10**400],
+                 "contract": [None, "recursion.route/v9"], "tenant": [None, "", 5]}
+        for field, values in cases.items():
+            for value in values:
+                with self.subTest(field=field, value=repr(value)):
+                    made, launcher, clock = self.adapter_and_launcher()
+                    req = request()
+                    if value is None:
+                        del req[field]
+                    else:
+                        req[field] = value
+                    res = made.run(req, clock() + 60)
+                    self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, field))
+                    self.assertEqual(launcher.calls, [])
+        made, launcher, clock = self.adapter_and_launcher()
+        req = request()
+        req["route"]["connection"]["id"] = ""
+        self.assertEqual(made.run(req, clock() + 60)["detail"], "route.connection")
+        self.assertEqual(launcher.calls, [])
+        made, launcher, clock = self.adapter_and_launcher()                     # guard: the shape the contract has
+        self.assertIsNone(made.run(request(), clock() + 60)["code"])
+
+    def test_f2_a_deadline_that_is_not_a_finite_number_is_refused_before_the_launch(self) -> None:
+        for bad in (None, "x", float("nan"), float("inf"), True, 10**400):
+            with self.subTest(deadline_at=repr(bad)):
+                made, launcher, _clock = self.adapter_and_launcher()
+                res = made.run(request(), bad)
+                self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "deadline_at"))
+                self.assertEqual(launcher.calls, [])
+
+    def test_f2_whatever_escapes_after_the_launch_fences_the_child_first(self) -> None:
+        for error in (ValueError, KeyboardInterrupt):
+            with self.subTest(error=error.__name__):
+                clock = Clock()
+                launcher = Launcher(lines("synthetic-ok.jsonl"), clock, eof=False)
+                made = adapter(launcher, clock)
+
+                def failing_clock(err=error):
+                    raise err("synthetic: a clock that fails once the child runs")
+
+                made._clock = failing_clock
+                with self.assertRaises(error):
+                    made.run(request(), clock() + 60)
+                self.assertEqual(len(launcher.calls), 1)
+                self.assertEqual(launcher.process.fenced, ["unexpected"])
+
+    def test_f3_a_values_normalization_variant_is_masked(self) -> None:
+        import unicodedata
+        key = "r7-caf" + chr(0xE9) + "-made-up"                      # composed (NFC) in custody
+        decomposed = unicodedata.normalize("NFD", key)
+        self.assertNotEqual(key, decomposed)
+        for held, spelled in ((key, decomposed), (decomposed, key)):
+            with self.subTest(held=held.encode("unicode_escape")):
+                line = json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": spelled}},
+                                  ensure_ascii=False)
+                parser = ag.OneShotParser(CONN, MODEL, redact=(held,))
+                drafts = parser.parse(line)
+                for value in (key, decomposed):
+                    self.assertNotIn(value, json.dumps(drafts, ensure_ascii=False))
+                    self.assertNotIn(value, parser.result["response"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -910,11 +910,23 @@ class _DeclarationRules:
 
 
 def _has_sql(statement: str) -> bool:
-    """Whether a piece of declaration text holds more than comments, blanks and semicolons (an approximation used
-    only to skip such pieces; the text that is executed is never altered)."""
-    text = re.sub(r'/\*.*?\*/', ' ', statement, flags=re.S)
-    text = re.sub(r'--[^\n]*', ' ', text)
-    return bool(text.replace(';', ' ').strip())
+    """Whether a piece of declaration text holds more than blanks, semicolons and comments. It reads from the start
+    in order, as SQLite does: a ``--`` comment runs to the end of its line, a ``/*`` comment to its ``*/`` or to the
+    end of the text, and the first character of anything else is SQL. So a comment marker inside another comment
+    never hides a statement (review 3 of #373). The text that is executed is never altered."""
+    position, end = 0, len(statement)
+    while position < end:
+        if statement[position] in ' \t\n\f\r;':
+            position += 1
+        elif statement.startswith('--', position):
+            newline = statement.find('\n', position + 2)
+            position = end if newline < 0 else newline + 1
+        elif statement.startswith('/*', position):
+            closing = statement.find('*/', position + 2)
+            position = end if closing < 0 else closing + 2
+        else:
+            return True
+    return False
 
 
 def _statements(ddl: str):

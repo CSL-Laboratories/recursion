@@ -48,16 +48,25 @@ POSIX = D.fcntl is not None and hasattr(signal, 'SIGKILL')
 MOUNTED = 'namespace-ready'      # what the namespace prints once its tmpfs is mounted, before the writer starts
 
 
+# What ``unshare`` says when the kernel or a security module refuses an unprivileged namespace: the namespace
+# itself, or the uid or gid map (Ubuntu 24.04's restriction says the latter). Nothing else is a refusal.
+REFUSALS = ('unshare: unshare failed: ', 'unshare: write failed /proc/self/uid_map: ', 'unshare: write failed /proc/self/gid_map: ')
+REFUSED_BECAUSE = ('Operation not permitted', 'Permission denied')
+
+
 def full_disk_verdict(run) -> tuple:
     """How a run of the full-file-system writer ended. ``('skip', why)`` only when the namespace or the mount was
-    refused BEFORE the mount was confirmed: ``unshare`` failed (its own messages begin ``unshare:``; the text
-    differs between kernels and security modules) or the mount did (exit 77). ``('ran', the child's lines)``
-    once the mount was confirmed, whatever happened next: the test then holds those lines to the whole proof.
-    ``('broken', why)`` for anything else, which fails the test."""
+    refused BEFORE the mount was confirmed: ``unshare`` names a refused namespace or map (``REFUSALS``, ending in
+    ``REFUSED_BECAUSE``), or the mount failed (exit 77). ``('ran', the child's lines)`` once the mount was
+    confirmed, whatever happened next: the test then holds those lines to the whole proof. ``('broken', why)``
+    for anything else, a command that could not run or was given a wrong option among them, which fails the
+    test (review 3 of #373)."""
     lines = run.stdout.splitlines()
     if lines and lines[0] == MOUNTED:
         return 'ran', lines[1:]
-    if run.returncode == 77 or (run.returncode != 0 and run.stderr.lstrip().startswith('unshare:')):
+    first = (run.stderr.strip().splitlines() or [''])[0].rstrip()
+    refused = run.returncode != 0 and first.startswith(REFUSALS) and first.endswith(REFUSED_BECAUSE)
+    if run.returncode == 77 or refused:
         return 'skip', f'no private mount namespace here (exit {run.returncode}): {run.stderr.strip()[-200:]}'
     return 'broken', f'the namespace step ended unexpectedly (exit {run.returncode}): {run.stderr.strip()[-300:]}'
 
@@ -261,7 +270,16 @@ class FullDiskVerdictTest(unittest.TestCase):
         cases = [
             (self.run_of(1, '', 'unshare: unshare failed: Operation not permitted\n'), 'skip'),
             (self.run_of(1, '', 'unshare: write failed /proc/self/uid_map: Operation not permitted\n'), 'skip'),
+            (self.run_of(1, '', 'unshare: write failed /proc/self/gid_map: Permission denied\n'), 'skip'),
             (self.run_of(77, '', 'mount: /x: permission denied.\n'), 'skip'),
+            # Review 3: a broken command is not a refused namespace.
+            (self.run_of(127, '', 'unshare: failed to execute /missing/shell: No such file or directory\n'), 'broken'),
+            (self.run_of(1, '', "unshare: unrecognized option '--bad-option'\nTry 'unshare --help' for more information.\n"),
+             'broken'),
+            (self.run_of(1, '', 'unshare: unshare failed: Invalid argument\n'), 'broken'),
+            (self.run_of(2, '', 'sh: 1: cannot create /var/tmp/x: Permission denied\n'), 'broken'),   # not unshare's
+            (self.run_of(77, f'{MOUNTED}\n', 'mount: permission denied.\n'), 'ran'),       # after the mount, never a skip
+            (self.run_of(1, f'{MOUNTED}\n', 'unshare: unshare failed: Operation not permitted\n'), 'ran'),
             (self.run_of(0, f'{MOUNTED}\n'), 'ran'),                          # mounted, and the writer said nothing
             (self.run_of(1, f'{MOUNTED}\nopen 1\n', 'Traceback (most recent call last):\n'), 'ran'),
             (self.run_of(1, '', 'Traceback (most recent call last):\n'), 'broken'),
@@ -270,6 +288,18 @@ class FullDiskVerdictTest(unittest.TestCase):
         for run, expected in cases:
             with self.subTest(code=run.returncode, out=run.stdout, err=run.stderr):
                 self.assertEqual(full_disk_verdict(run)[0], expected)
+
+    def test_a_whole_looking_proof_with_the_wrong_first_line_fails(self) -> None:
+        failure = {'size': 1024 * 1024, 'free': 0, 'error': 'CommitUnknown', 'code': 'commit_outcome_unknown',
+                   'cause': 'SQLITE_FULL', 'acked': 1}
+        survived = {'rows': [1], 'integrity': [['ok']], 'seqs': [1], 'ks': [1], 'receipts': [1]}
+        good = ['open 1', json.dumps(failure), 'after StoreError store_failed', json.dumps(survived)]
+        run = self.run_of(0, MOUNTED + '\n' + '\n'.join(good) + '\n')
+        assert_full_disk_proof(self, run, full_disk_verdict(run)[1])      # the whole proof passes as given
+        bad = ['not the open line'] + good[1:]
+        run = self.run_of(0, MOUNTED + '\n' + '\n'.join(bad) + '\n')
+        with self.assertRaises(AssertionError):
+            assert_full_disk_proof(self, run, full_disk_verdict(run)[1])
 
     def test_a_mounted_writer_without_its_whole_proof_fails(self) -> None:
         for out, code in ((f'{MOUNTED}\n', 0), (f'{MOUNTED}\nopen 1\n', 0), (f'{MOUNTED}\nopen 1\n', 1)):

@@ -641,6 +641,27 @@ class Cases:
             tx.execute('INSERT INTO queue_items VALUES (?, ?)', ('item-1', 'queued'))
             self.assertEqual(tx.execute('SELECT item_id FROM queue_items WHERE state = ?', ('queued',)), [('item-1',)])
 
+    def test_comment_markers_inside_a_line_comment_never_hide_a_declared_table(self) -> None:
+        # Review 3 of #373 (the first reader): a /* inside a -- comment once swallowed the next statement.
+        store = self.make()
+        store.register_tables('queue', 1, 'CREATE TABLE queue_one (n); -- /* an opener in a line comment\n'
+                                          'CREATE TABLE queue_two (n)\n-- */ a closer in another')
+        self.assertEqual(committed(store, "SELECT name FROM sqlite_master WHERE name LIKE 'queue_%' ORDER BY name"),
+                         [('queue_one',), ('queue_two',)])
+        with store.transaction() as tx:
+            tx.execute('INSERT INTO queue_two VALUES (7)')
+            self.assertEqual(tx.execute('SELECT n FROM queue_two'), [(7,)])
+
+    def test_a_declaration_may_end_with_comments_and_empty_statements(self) -> None:
+        for ending in ('-- a tail\n', '-- a tail with no newline', '/* a whole block */', '; ; -- a tail\n',
+                       '/* a block running to the end of the text'):
+            with self.subTest(ending=ending):
+                store = self.make()
+                store.register_tables('queue', 1, 'CREATE TABLE queue_one (n); ' + ending)
+                with store.transaction() as tx:
+                    tx.execute('INSERT INTO queue_one VALUES (7)')
+                    self.assertEqual(tx.execute('SELECT n FROM queue_one'), [(7,)])
+
     def test_a_foreign_key_a_declaration_states_is_enforced(self) -> None:
         store = self.make()
         store.register_tables('queue', 1, 'CREATE TABLE queue_parents (id TEXT PRIMARY KEY); '

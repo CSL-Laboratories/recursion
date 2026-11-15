@@ -12,14 +12,14 @@ It fetches each saved value from the pinned backend and searches, as bytes:
 - the user's journal (``journalctl --user -o cat``), where the daemon's log lines go when it runs as a user
   service, unless ``--no-journal``.
 
-It also searches for the value of an interrupted add that the backend still holds, and for every value the
-owner-only file holds that no record of the index reaches (the index lost, replaced, or naming another save), and
-names the id of each such value: one ``remove`` deletes, in the store's own file, or one in a file the store does
-not use (another store's, or one beside a store whose keys are in a keychain), which no command of the store
-changes; such a file that cannot be read is named unreadable. Each value is looked for as it was saved and as JSON
-would write it inside a string. Symlinks are not followed and only regular files are read (a FIFO cannot block the
-search). The report names files and key ids only: no value, no part of one, no
-surrounding text. Two ids that hold one value are both named, once per place.
+It also searches for the value of an interrupted add that the backend still holds, and for every value the owner-only
+file holds that no record of the index reaches (the index lost, replaced, or naming another save), and names the id of
+each such value: one ``remove`` deletes, in the store's own file, or one in a file the store does not use (another
+store's while the index has records on the file, or any while the index pins the store to a keychain), which no command
+of the store changes; such a file that cannot be read is named unreadable. Each value is looked for as it was saved and
+as JSON would write it inside a string. Symlinks are not followed and only regular files are read (a FIFO cannot block
+the search). The report names files and key ids only: no value, no part of one, no surrounding text. Two ids that hold
+one value are both named, once per place.
 
 ITEMS NO RECORD NAMES. On the Secret Service it also counts the items that carry ``application recursion`` and that
 neither a record of this store's index names by its save nor an unfinished operation by its id

@@ -3087,40 +3087,16 @@ class WorkerService:
                 raise AssertionError('the test worker did not stop within BOUND_S')
 
 
-class OwnershipRegionTest(unittest.TestCase):
-    """Every traceable point of each protected region, interrupted there once (the comment OWNERSHIP in
-    ``control/hooks.py``). Three reads in a row found the point just past the last repair; this walks them all,
-    so that the next one is found here.
+class RegionWalk:
+    """The walk of ``OwnershipRegionTest``, for any test case that names its regions: ``REGIONS`` maps a name to
+    ``(make, call, lock_of, finished)``, and ``FILES`` are the source files whose code is walked. The daemon's
+    own close has the same form and is walked with this from its own test file."""
 
-    For each of the four regions a run with no interruption is traced, counting what executes in the module's own
-    code between the region's entry and its return: the region itself, the helpers that take an ownership and
-    raise what was kept, and for the lifecycle the whole teardown under it, the gate's close and drain included.
-    Then the region is run once for each point counted, with a KeyboardInterrupt raised exactly there. Each time:
-
-    - the interruption is raised to the caller, the same object: never swallowed;
-    - this thread owns nothing when the call ends, and another thread can take the lock;
-    - the work is finished, or nothing of it was done and the call can simply be made again. The second happens
-      only where the interruption landed before the region was entered, which is asserted: those points are the
-      first ones of the run, with none in between that finished the work;
-    - a second call, uninterrupted, returns and leaves the work done.
-
-    The points are walked twice. Once by EVENT (every call, line and return), on every interpreter. Once by
-    INSTRUCTION (every bytecode instruction), where the interpreter delivers an exception raised at an instruction
-    event at all of them; that is measured here first, on a small function, and where it is not so the walk by
-    instruction is skipped and says how many it would have lost. (Measured on Nov 14, 2026: 3.12.3 delivers all;
-    free-threaded 3.14.8 drops about one in four.) The first traced run of a function sees no instruction events
-    on either, so every count is taken on a later run.
-
-    WHAT PURE PYTHON CANNOT PROTECT, and this test therefore does not visit: a second interruption that lands
-    while the first is being put away (the instructions of the ``except`` clause and the way back to the top of
-    the loop execute only after an interruption); and whatever the lock's own acquire and release do inside
-    themselves (one call into C each, for ``threading.RLock``). The release CALL is inside the region and is
-    walked like every other point."""
-
+    FILES = (H.__file__,)
     EVENTS, INSTRUCTIONS = ('call', 'line', 'return'), ('opcode',)
 
     def traced(self, run, kinds, codes=None, at=None, cut=None) -> int:
-        """Run with every point of ``kinds`` counted, in ``control/hooks.py`` or in the given code objects;
+        """Run with every point of ``kinds`` counted, in the code of ``FILES`` or in the given code objects;
         ``cut`` is raised at point number ``at``. How many were counted."""
         counted = [0]
 
@@ -3132,7 +3108,7 @@ class OwnershipRegionTest(unittest.TestCase):
             return points
 
         def calls(frame, event, arg):
-            if event == 'call' and (frame.f_code in codes if codes is not None else frame.f_code.co_filename == H.__file__):
+            if event == 'call' and (frame.f_code in codes if codes is not None else frame.f_code.co_filename in self.FILES):
                 if kinds == self.INSTRUCTIONS:
                     frame.f_trace_opcodes = True
                     frame.f_trace_lines = False
@@ -3173,6 +3149,79 @@ class OwnershipRegionTest(unittest.TestCase):
             except KeyboardInterrupt:
                 pass
         return total, lost
+
+    def walk(self, region, kinds) -> None:
+        make, call, lock_of, finished = self.REGIONS[region]
+        counts = []
+        for _ in range(3):                  # the first run of a function sees no instruction events
+            subject = make(self)            # made before the tracing starts, as in every run below
+            counts.append(self.traced(lambda: call(subject), kinds))
+        total = counts[-1]
+        self.assertEqual(counts[1], total, 'the count is the same from one run to the next')
+        self.assertGreater(total, 8, 'the walk saw the region')
+        unfinished = []
+        for at in range(total):
+            subject = make(self)
+            lock, cut, raised = lock_of(subject), KeyboardInterrupt(f'{region}, point {at}'), None
+            try:
+                self.traced(lambda: call(subject), kinds, None, at, cut)
+            except BaseException as exc:  # noqa: BLE001 - what the region raised is what is looked at
+                raised = exc
+            with self.subTest(region=region, by=kinds[-1], point=at):
+                self.assertIs(raised, cut, 'the interruption reaches the caller, the same object')
+                self.assertFalse(lock._is_owned(), 'this thread owns nothing when the call ends')
+                taken: list = []
+                other = threading.Thread(target=lambda: taken.append(lock.acquire(timeout=BOUND_S) and (lock.release() or True)),
+                                         daemon=True)
+                other.start()
+                other.join(BOUND_S)
+                self.assertEqual(taken, [True], 'another thread can take the lock')
+                if not finished(subject):
+                    unfinished.append(at)
+                call(subject)               # uninterrupted: it returns, and the work is done
+                self.assertEqual((finished(subject), lock._is_owned()), (True, False))
+        # The work was left undone only by an interruption that landed before the region was entered: on the
+        # first points of the run, with none in between that finished it.
+        self.assertEqual(unfinished, list(range(len(unfinished))), 'only the first points leave the work to be done again')
+        self.assertLess(len(unfinished), total // 2, 'and they are few: once entered, the region always finishes')
+
+    def by_instruction(self, region) -> None:
+        total, lost = self.lost_at_instructions()
+        if lost:
+            self.skipTest(f'this interpreter does not deliver an exception raised at an instruction event at {lost} of '
+                          f'{total} instructions of a small function; the walk by event covers this region')
+        self.walk(region, self.INSTRUCTIONS)
+
+
+class OwnershipRegionTest(RegionWalk, unittest.TestCase):
+    """Every traceable point of each protected region, interrupted there once (the comment OWNERSHIP in
+    ``control/hooks.py``). Three reads in a row found the point just past the last repair; this walks them all,
+    so that the next one is found here.
+
+    For each of the four regions a run with no interruption is traced, counting what executes in the module's own
+    code between the region's entry and its return: the region itself, the helpers that take an ownership and
+    raise what was kept, and for the lifecycle the whole teardown under it, the gate's close and drain included.
+    Then the region is run once for each point counted, with a KeyboardInterrupt raised exactly there. Each time:
+
+    - the interruption is raised to the caller, the same object: never swallowed;
+    - this thread owns nothing when the call ends, and another thread can take the lock;
+    - the work is finished, or nothing of it was done and the call can simply be made again. The second happens
+      only where the interruption landed before the region was entered, which is asserted: those points are the
+      first ones of the run, with none in between that finished the work;
+    - a second call, uninterrupted, returns and leaves the work done.
+
+    The points are walked twice. Once by EVENT (every call, line and return), on every interpreter. Once by
+    INSTRUCTION (every bytecode instruction), where the interpreter delivers an exception raised at an instruction
+    event at all of them; that is measured here first, on a small function, and where it is not so the walk by
+    instruction is skipped and says how many it would have lost. (Measured on Nov 14, 2026: 3.12.3 delivers all;
+    free-threaded 3.14.8 drops about one in four.) The first traced run of a function sees no instruction events
+    on either, so every count is taken on a later run.
+
+    WHAT PURE PYTHON CANNOT PROTECT, and this test therefore does not visit: a second interruption that lands
+    while the first is being put away (the instructions of the ``except`` clause and the way back to the top of
+    the loop execute only after an interruption); and whatever the lock's own acquire and release do inside
+    themselves (one call into C each, for ``threading.RLock``). The release CALL is inside the region and is
+    walked like every other point."""
 
     def lifecycle(self):
         """Hooks with a store open and a service started, cheap enough to make a few hundred times."""
@@ -3217,48 +3266,6 @@ class OwnershipRegionTest(unittest.TestCase):
         gate = H.Admission()
         gate.enabled = True
         return gate
-
-    def walk(self, region, kinds) -> None:
-        make, call, lock_of, finished = self.REGIONS[region]
-        counts = []
-        for _ in range(3):                  # the first run of a function sees no instruction events
-            subject = make(self)            # made before the tracing starts, as in every run below
-            counts.append(self.traced(lambda: call(subject), kinds))
-        total = counts[-1]
-        self.assertEqual(counts[1], total, 'the count is the same from one run to the next')
-        self.assertGreater(total, 8, 'the walk saw the region')
-        unfinished = []
-        for at in range(total):
-            subject = make(self)
-            lock, cut, raised = lock_of(subject), KeyboardInterrupt(f'{region}, point {at}'), None
-            try:
-                self.traced(lambda: call(subject), kinds, None, at, cut)
-            except BaseException as exc:  # noqa: BLE001 - what the region raised is what is looked at
-                raised = exc
-            with self.subTest(region=region, by=kinds[-1], point=at):
-                self.assertIs(raised, cut, 'the interruption reaches the caller, the same object')
-                self.assertFalse(lock._is_owned(), 'this thread owns nothing when the call ends')
-                taken: list = []
-                other = threading.Thread(target=lambda: taken.append(lock.acquire(timeout=BOUND_S) and (lock.release() or True)),
-                                         daemon=True)
-                other.start()
-                other.join(BOUND_S)
-                self.assertEqual(taken, [True], 'another thread can take the lock')
-                if not finished(subject):
-                    unfinished.append(at)
-                call(subject)               # uninterrupted: it returns, and the work is done
-                self.assertEqual((finished(subject), lock._is_owned()), (True, False))
-        # The work was left undone only by an interruption that landed before the region was entered: on the
-        # first points of the run, with none in between that finished it.
-        self.assertEqual(unfinished, list(range(len(unfinished))), 'only the first points leave the work to be done again')
-        self.assertLess(len(unfinished), total // 2, 'and they are few: once entered, the region always finishes')
-
-    def by_instruction(self, region) -> None:
-        total, lost = self.lost_at_instructions()
-        if lost:
-            self.skipTest(f'this interpreter does not deliver an exception raised at an instruction event at {lost} of '
-                          f'{total} instructions of a small function; the walk by event covers this region')
-        self.walk(region, self.INSTRUCTIONS)
 
     @quiet
     def test_the_gates_close_at_every_event(self) -> None:

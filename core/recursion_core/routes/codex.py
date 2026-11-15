@@ -34,7 +34,12 @@ Typed limit signals:
   read is classified as on any route: ``usageLimitExceeded`` is ``plan_limit``, ``unauthorized`` is
   ``auth_failed``, EOF is ``engine_exited``. Nothing is written after an EOF. The ignored error is
   recorded as a fixed event, never with its text, because an upstream message can echo the key.
-* a JSON-RPC error, or a failed turn, whose typed ``codexErrorInfo`` is ``usageLimitExceeded``.
+* a JSON-RPC error, or a failed turn, whose typed ``codexErrorInfo`` is ``usageLimitExceeded``. A null
+  or empty ``codexErrorInfo`` on the error itself does not hide a typed one in its ``data``.
+
+Any other error is ``engine_error``, and its detail is a ``CodexErrorInfo`` name the protocol defines
+(``ERROR_INFO_NAMES``), else the JSON-RPC integer code, else "error": an unrecorded name, the message
+and ``data`` are engine text and never reach the result.
 
 Agent message text is model payload and is never inspected. Free error text that only sounds like a
 quota is a SHORT_FAULT (grill Q23).
@@ -67,6 +72,15 @@ NO_UPDATE_OVERRIDE = ("-c", "check_for_update_on_startup=false")
 DEFAULT_LIMIT_ID = "codex"  # name of the credential-wide bucket (unverified: limitId is free text in 0.160.0)
 _LIMIT_ERRORS = ("usageLimitExceeded",)  # CodexErrorInfo values (verified, 0.160.0)
 _AUTH_ERRORS = ("unauthorized",)  # CodexErrorInfo values (verified, 0.160.0)
+# Every CodexErrorInfo name 0.160.0 defines: its text values and the tags of its object variants (checked
+# against the fixture by test_codex_protocol). Only these may become a result's detail.
+ERROR_INFO_NAMES = frozenset((
+    "contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "rateLimitExceeded",
+    "flexUnavailable", "serverOverloaded", "cyberPolicy", "misalignmentPolicyViolation", "tooManyDenials",
+    "internalServerError", "unauthorized", "badRequest", "threadRollbackFailed", "sandboxError", "other",
+    "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected",
+    "responseTooManyFailedAttempts", "activeTurnNotSteerable",
+))
 # The one rate-limit read error an api_key route may ignore (R3 finding 4). Found byte for byte in the
 # installed codex-cli 0.160.0 binary; its sibling for a session with no Codex login at all,
 # "codex account authentication required to read rate limits", is NOT ignored.
@@ -219,16 +233,31 @@ def _exhausted(snapshot: object, source: str, events: list, translate) -> dict |
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
+def _discriminant(info: object) -> object:
+    """A tagged variant such as ``{"responseStreamDisconnected": {...}}`` reads as its tag, ``{}`` as None."""
+
+    return next(iter(info), None) if isinstance(info, dict) else info
+
+
 def _error_info(error: dict) -> object:
     """The typed ``codexErrorInfo`` of an error, or None. In a turn error the field is typed (0.160.0's
     ``TurnError``); in a JSON-RPC error the schema types ``data`` as any value, so both places are read
-    (unverified). A tagged variant such as ``{"responseStreamDisconnected": {...}}`` reads as its tag."""
+    (unverified): the error's own field first, then ``data``'s. A null or empty value in the first place
+    names nothing, so it does not hide a typed value in the second (the #393 reads, GPT-6.1 Sol R2)."""
 
     data = error.get("data") if isinstance(error.get("data"), dict) else {}
-    info = error.get("codexErrorInfo", data.get("codexErrorInfo"))
-    if isinstance(info, dict):
-        info = next(iter(info), None)
-    return info
+    info = _discriminant(error.get("codexErrorInfo"))
+    return _discriminant(data.get("codexErrorInfo")) if info is None else info
+
+
+def _error_detail(info: object, code: object) -> str:
+    """The detail of an engine_error result: a ``CodexErrorInfo`` name the protocol defines, else the
+    JSON-RPC integer code, else "error". An unrecorded name, the message and ``data`` are engine text and
+    never reach the result (the #393 reads, GPT-6.1 Sol R1)."""
+
+    if isinstance(info, str) and info in ERROR_INFO_NAMES:
+        return info
+    return str(code) if type(code) is int else "error"
 
 
 def _chatgpt_auth_required(error: dict) -> bool:
@@ -254,4 +283,4 @@ def _classify_error(rid: str, error: dict, limit: dict | None, events: list, mod
         return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before turn/completed")
     if c.sounds_like_quota(error.get("message")):
         return c.result(rid, c.SHORT_FAULT, events=events, detail=f"untyped quota-like text on {model}")
-    return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(scalar(info) or scalar(error.get("code")) or "error"))
+    return c.result(rid, c.ENGINE_ERROR, events=events, detail=_error_detail(info, error.get("code")))

@@ -104,7 +104,10 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
     service from another thread binds that thread itself, with ``bound_run(ctx)`` (``daemon.launcher``).
     If ``owner.run`` raises, the seam gives the run an engine-error result when it has none, settles
     what was launched unless the daemon is closing, and releases; an owner that wants another end does
-    not raise. That fallback is for an ordinary exception out of ``owner.run`` itself. A failure after
+    not raise. While the daemon or its composition is closing nothing is settled: the run's
+    descriptors are closed, nothing is fenced, and the unit is left alive for the next daemon. That
+    holds for a settling that is already under way when closing begins, too.
+    That fallback is for an ordinary exception out of ``owner.run`` itself. A failure after
     the hand-over, in the owner's own worker, is the driver's own try/finally, and the fallback is no
     promise to record a final result or to call ``fault_run``.
     A hand-over is all or nothing. ``owner.run`` either raises with no worker holding the run, or

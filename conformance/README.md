@@ -40,7 +40,14 @@ Three files:
   asked for, and the digests an event carries. It also reads the published schemas themselves with
   the standard library (`fits`), because complete validation of an approval is its published shape
   as well as what must agree inside it: a change and a consumption check both, and `fits` says what
-  the Draft 2020-12 validator says on every fixture of the control folder. A client in another
+  the Draft 2020-12 validator says on every fixture of the control folder. Before validating an
+  instance, fits checks every schema position in its supplied schema set for supported vocabulary,
+  including definitions, alternatives and both conditional branches. An unsupported keyword raises
+  ValueError before validation can return true. Short-circuiting instance validation does not waive
+  this check. Objects used as instance data in const or enum are not schema positions. Every reference
+  it accepts is resolved as the dialect resolves it; the forms it does not implement (an embedded
+  `$id`, a pointer through an array or a percent-encoded one, a document other than a bare name of the
+  set) are refused with ValueError before any instance is looked at. A client in another
   language implements these and checks the same vectors.
 - `tests.py`: all of it as tests. Its class `RulesTest` holds what a vector file cannot: the host's
   own state around a rule (the Decimal context a number is read under), a record changed behind a

@@ -950,13 +950,21 @@ class Hooks:
 
     def stop_services(self, context: ServiceContext) -> None:
         """Stop every started service, in reverse order, each until its stop has returned. The first failure
-        is raised after the last service has stopped."""
+        is raised after the last service has stopped. As in ``finish_close``, the taking of the lifecycle, the
+        way back from it and the stopping are one protected region."""
         errors: list = []
-        own_teardown(self._lifecycle, errors)
-        try:
-            self._stop_all(context, errors)
-        finally:
-            self._lifecycle.release()
+        if self._lifecycle._is_owned():
+            raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+        while True:
+            try:
+                own_teardown(self._lifecycle, errors)
+                self._stop_all(context, errors)
+                break
+            except BaseException as exc:  # noqa: BLE001 - on the way back from the taking: kept, and tried again
+                errors.append(exc)
+            finally:
+                if self._lifecycle._is_owned():
+                    self._lifecycle.release()
         raise_kept(errors)
 
     def _stop_all(self, context, errors: list) -> None:
@@ -1010,34 +1018,50 @@ class Hooks:
 
         One caller owns the teardown. Another that calls while it runs, or after it, waits for the owner to
         finish and then returns: it closes nothing itself. A caller that is interrupted while it waits for the
-        owner goes on waiting and raises its interruption only once the owner has finished."""
+        owner goes on waiting and raises its interruption only once the owner has finished.
+
+        The taking of the lifecycle, the way back from it and the teardown are ONE protected region: an
+        interruption on the return from the taking is kept like any other, the lifecycle is released where this
+        thread owns it, and the teardown is taken up again until it is complete. So this method does not raise
+        with the teardown unfinished, and does not leave the lifecycle owned. A call from inside a lifecycle
+        method is refused before any of it. (Not claimed: an interruption inside the release itself.)"""
         errors: list = []
-        own_teardown(self._lifecycle, errors)
-        try:
-            # The owned teardown. Whatever interrupts a step of it is kept and the teardown goes on from that
-            # step: closing admission again changes nothing, the drain is asked again until it RETURNS, the
-            # services still tracked are stopped, and the store is closed while it is still the store.
-            while not self._closed:
-                try:
-                    self.begin_close()
-                    self.gate.drain()               # returns only when every admitted call has left
-                    self._stop_all(context, errors)
-                    store = self.store
-                    close = getattr(store, 'close', None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception as exc:  # noqa: BLE001
-                            log.exception('the event store did not close cleanly')
-                            errors.append(exc)
-                    self.store = None
-                    self.methods.store = None
-                    self._closed = True
-                except BaseException as exc:  # noqa: BLE001 - proves no quiescence: the owned teardown goes on
-                    errors.append(exc)
-        finally:
-            self._lifecycle.release()
+        if self._lifecycle._is_owned():
+            raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
+        while True:
+            try:
+                own_teardown(self._lifecycle, errors)
+                self._teardown(context, errors)
+                break
+            except BaseException as exc:  # noqa: BLE001 - on the way back from the taking: kept, and tried again
+                errors.append(exc)
+            finally:
+                if self._lifecycle._is_owned():
+                    self._lifecycle.release()
         raise_kept(errors)
+
+    def _teardown(self, context: ServiceContext, errors: list) -> None:
+        """The owned teardown; the caller holds the lifecycle. Whatever interrupts a step of it is kept and the
+        teardown goes on from that step: closing admission again changes nothing, the drain is asked again until
+        it RETURNS, the services still tracked are stopped, and the store is closed while it is still the store."""
+        while not self._closed:
+            try:
+                self.begin_close()
+                self.gate.drain()               # returns only when every admitted call has left
+                self._stop_all(context, errors)
+                store = self.store
+                close = getattr(store, 'close', None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception('the event store did not close cleanly')
+                        errors.append(exc)
+                self.store = None
+                self.methods.store = None
+                self._closed = True
+            except BaseException as exc:  # noqa: BLE001 - proves no quiescence: the owned teardown goes on
+                errors.append(exc)
 
 
 # ---- the registrants, one guarded static import each -----------------------------------------------------------

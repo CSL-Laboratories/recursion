@@ -262,6 +262,109 @@ class FakeRpcTest(unittest.TestCase):
         self.assertLess(steer_at, [r["type"] for r in records].index("agent_end"))
         self.assertEqual(self.pending_count(), 0)
 
+    def steer_then_abort(self, process, steers):
+        """A run with ``steers`` queued, aborted, read through its settle with the abort's answer left unread."""
+        process.send('{"id":"p0","type":"prompt","message":"initial"}')
+        for _ in range(7):
+            process.read_line(1.0)
+        for n, text in enumerate(steers):
+            process.send(json.dumps({"id": f"s{n}", "type": "prompt", "message": text, "streamingBehavior": "steer"}))
+            self.assertEqual(json.loads(process.read_line(1.0))["data"]["disposition"], "queued")
+        process.send('{"id":"a0","type":"abort"}')
+        records = []
+        while not records or records[-1]["type"] != "agent_settled":
+            records.append(json.loads(process.read_line(1.0)))
+        return records
+
+    def drain_records(self, process):
+        records = []
+        while True:
+            try:
+                records.append(json.loads(process.read_line(1.0)))
+            except ReadTimeout:
+                return records
+
+    def test_an_unread_answer_to_an_earlier_abort_hides_no_steer_from_the_next_abort(self):
+        # The earlier abort's answer is still queued when the next run starts; aborting that run before its
+        # user messages are read must keep both the answer and the steer the run already took.
+        for read_the_answer_first in (True, False):
+            with self.subTest(read_the_answer_first=read_the_answer_first):
+                process = f.FakePi("rpc")
+                records = self.steer_then_abort(process, ["steer-a", "steer-b"])
+                process.send('{"id":"p1","type":"prompt","message":"resume"}')
+                if read_the_answer_first:
+                    records.append(json.loads(process.read_line(1.0)))
+                process.send('{"id":"a1","type":"abort"}')
+                records += self.drain_records(process)
+                process.send('{"id":"p2","type":"prompt","message":"finish"}')
+                records += self.drain_records(process)
+                self.assertEqual([u for u in self.users(records) if u.startswith("steer-")], ["steer-a", "steer-b"])
+                answers = [r["id"] for r in records if r["type"] == "response"]
+                self.assertEqual(sorted(answers), ["a0", "a1", "p1", "p2"])
+                self.assertLess(answers.index("a0"), answers.index("a1"))
+                self.assertEqual(self.count_of(process), 0)
+
+    def test_two_aborts_before_the_settle_is_read_are_both_answered_in_order(self):
+        process = f.FakePi("rpc")
+        process.send('{"id":"p0","type":"prompt","message":"initial"}')
+        for _ in range(7):
+            process.read_line(1.0)
+        process.send('{"id":"a1","type":"abort"}')
+        process.send('{"id":"a2","type":"abort"}')
+        records = self.drain_records(process)
+        self.assertEqual([r["id"] for r in records if r["type"] == "response"], ["a1", "a2"])
+        self.assertEqual([r["type"] for r in records].count("agent_settled"), 1)
+        self.assertEqual([r["type"] for r in records].index("agent_settled"), len(records) - 3)
+
+    def test_an_abort_at_any_point_of_the_next_run_delivers_a_kept_steer_exactly_once(self):
+        for read_first in range(0, 11):
+            with self.subTest(records_read=read_first):
+                process = f.FakePi("rpc")
+                records = self.steer_then_abort(process, ["kept"])
+                records += self.drain_records(process)                  # the earlier abort's answer
+                process.send('{"id":"p1","type":"prompt","message":"resume"}')
+                for _ in range(read_first):
+                    records.append(json.loads(process.read_line(1.0)))
+                process.send('{"id":"a1","type":"abort"}')
+                records += self.drain_records(process)
+                process.send('{"id":"p2","type":"prompt","message":"finish"}')
+                records += self.drain_records(process)
+                self.assertEqual(self.users(records).count("kept"), 1)
+                self.assertEqual(self.count_of(process), 0)
+
+    def test_a_steer_the_loop_has_taken_is_counted_until_its_message_starts(self):
+        # pendingMessageCount is the session's list, not the delivery queue: the poll takes the steer out of
+        # delivery at the steered turn's start, and the count drops only at its user message.
+        self.prompt("Long task.", "dlv-1", "turn-1")
+        read(self.process, self.stream, 7)
+        self.prompt("Also this.", "dlv-2", "turn-1", how="mid_turn")
+        read(self.process, self.stream, 4)                 # queued, the reply's end, turn_end, the steer's turn_start
+        self.assertEqual(self.pending_count(), 1)
+
+    def test_distinct_steers_are_delivered_in_the_order_they_were_queued(self):
+        self.process = f.FakePi("rpc")                     # more replies than setUp's four
+        self.prompt("Long task.", "dlv-1", "turn-1")
+        read(self.process, self.stream, 7)
+        self.prompt("a", "dlv-2", "turn-1", how="mid_turn")
+        self.prompt("b", "dlv-3", "turn-1", how="mid_turn")
+        self.assertEqual(self.users(self.read_all()), ["a", "b"])           # polled at each turn's end
+        self.prompt("Again.", "dlv-4", "turn-2")
+        read(self.process, self.stream, 7)
+        self.prompt("c", "dlv-5", "turn-2", how="mid_turn")
+        self.prompt("d", "dlv-6", "turn-2", how="mid_turn")
+        _token, record = self.stream.command("abort")
+        self.send(record)
+        self.read_all()
+        self.prompt("Next.", "dlv-7", "turn-3")
+        self.assertEqual(self.users(self.read_all()), ["Next.", "c", "d"])  # first at the run's start
+
+    def count_of(self, process):
+        process.send('{"id":"count","type":"get_state"}')
+        while True:
+            got = json.loads(process.read_line(1.0))
+            if got.get("id") == "count":
+                return got["data"]["pendingMessageCount"]
+
     def pending_count(self):
         """Pi's ``pendingMessageCount``, read with a ``get_state`` (what comes before its answer is fed too)."""
         _token, record = self.stream.command("get_state")

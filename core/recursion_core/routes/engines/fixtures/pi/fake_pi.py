@@ -27,8 +27,9 @@ something is sent) and ``fence(reason)``. It keeps no thread and no clock.
   ends and the run would end (a turn of its own before ``agent_end``), and when a new run starts (its
   user message right after the prompt's, in the same turn). An abort does not empty the queue: the
   aborted run ends without polling it, and the next prompt's run delivers it; a user message the loop
-  had already taken is still written before the aborted reply. Like Pi, the fake keeps two queues: the
-  one delivery takes from (agent.ts ``steeringQueue``) and the one ``pendingMessageCount`` counts
+  had already taken is still written before the aborted reply, and no answer already given is dropped.
+  Like Pi, the fake keeps two queues: the one delivery takes from (agent.ts ``steeringQueue``) and the
+  one ``pendingMessageCount`` counts
   (agent-session.ts ``_steeringMessages``), from which a text leaves when a user message with that text
   starts (agent-session.ts:1120-1130). So a prompt whose text equals a queued steer lowers the count,
   as in Pi, and takes nothing from delivery.
@@ -235,16 +236,22 @@ class FakePi:
 
     def _abort(self) -> None:
         """End the run now: the reply being streamed stops ``aborted``, then the run settles aborted. The
-        queued steers stay queued (Pi's abort does not clear them). What the loop already took is still
-        written: the run's start and the user messages at the head of what is left (agent-loop.ts emits
-        them before it calls the model, and only that call sees the abort)."""
+        queued steers stay queued (Pi's abort does not clear them). Nothing Pi already answered or took is
+        dropped: an earlier abort's answer still waiting at the head of what is left (it was written when
+        that abort's run went idle, before this run began; rpc-mode.ts:426-428) stays first; then the
+        run's start and the user messages the loop already took (agent-loop.ts emits them before it calls
+        the model, and only that call sees the abort); and an answer to an abort of this same run that
+        came before this one is written after the settle, ahead of this abort's own answer."""
         self._aborted = True
         records = [json.loads(r) for r in self._run]
         taken = 0
+        while taken < len(records) and records[taken]["type"] == "response":
+            taken += 1
         while taken < len(records) and (records[taken]["type"] in ("agent_start", "turn_start") or (
                 records[taken]["type"] in ("message_start", "message_end")
                 and records[taken]["message"].get("role") == "user")):
             taken += 1
+        answered = [r for r in records[taken:] if r["type"] == "response"]
         streaming = next((r["message"] for r in records
                           if r["type"] == "message_end" and r["message"].get("role") == "assistant"), None)
         self._run = deque(line(r) for r in records[:taken])
@@ -257,3 +264,4 @@ class FakePi:
         self._run.extend(line(r) for r in (
             {"type": "agent_end", "messages": [], "willRetry": False},
             {"type": "agent_settled", "aborted": True}))
+        self._run.extend(line(r) for r in answered)

@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.engines import CATALOGUE, SEEDED, EngineTable
@@ -72,6 +73,16 @@ def run(lines: list[str], returncode: int, conn: str = CONN) -> tuple[list[dict]
 
 def line(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def escaped(obj: object) -> str:
+    """A line as an engine would escape it: every character outside ASCII, a lone surrogate included,
+    written as a JSON escape."""
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":")) + "\n"
+
+
+LONE = chr(0xD800)          # a lone surrogate
+REPLACED = chr(0xFFFD)      # what cleaning writes for one
 
 
 def end(stop: str = "end_turn", **extra) -> str:
@@ -142,6 +153,11 @@ class CaseReplayTest(unittest.TestCase):
             with self.subTest(request=request):
                 _, parser = run([line({"type": "end", "stopReason": "end_turn", "requestId": request})], 0)
                 self.assertEqual(parser.request_id, request if kept else None)
+
+    def test_a_session_id_that_held_a_lone_surrogate_is_not_kept(self):
+        _, parser = run([escaped({"type": "end", "stopReason": "end_turn", "sessionId": "s" + LONE})], 0)
+        self.assertIsNone(parser.engine_session_id)
+        self.assertEqual(parser.ignored["session_id_not_utf8"], 1)
 
     def test_a_session_id_is_kept_only_when_it_is_one_line_of_at_most_256(self):
         for session, kept in (("s" * 256, True), ("s" * 257, False), ("a\rb", False), ("", False), (7, False)):
@@ -313,6 +329,30 @@ class OutcomeTest(unittest.TestCase):
                 payload = result_of(run([call, call.replace("c1", "c2"), end()], code)[0])
                 self.assertEqual(payload["detail"],
                                  prefix + "; 2 tool call(s) not drafted: their input has no RFC 8785 form")
+
+    def test_a_line_nested_too_deeply_to_read_is_a_protocol_fault_with_its_raw_line_kept(self):
+        # Deep enough that the decoder or the cleaning pass runs out of stack; both are a protocol fault.
+        raw = '{"type":"text","data":"ok","extra":' + "[" * 1000 + "0" + "]" * 1000 + "}\n"
+        drafts, _ = run([raw, end()], 0)
+        self.assertEqual(drafts[0]["payload"]["text"], raw)
+        self.assertEqual(result_of(drafts)["code"], c.PROTOCOL_ERROR)
+        self.assertIn(result_of(drafts)["detail"], ("stdout line is nested too deeply", "stdout line is not JSON"))
+
+    def test_the_cleaning_pass_running_out_of_stack_is_a_protocol_fault(self):
+        with mock.patch.object(grok, "_clean_value", side_effect=RecursionError("deep")):
+            drafts, _ = run([line({"type": "text", "data": "x"}), end()], 0)
+        self.assertEqual(result_of(drafts), {"code": c.PROTOCOL_ERROR, "detail": "stdout line is nested too deeply"})
+
+    def test_parse_run_takes_lines_not_one_string(self):
+        for whole in ("abc\n", b"abc\n", bytearray(b"abc\n")):
+            with self.subTest(kind=type(whole).__name__), self.assertRaises(TypeError):
+                grok.parse_run(CONN, whole, 0)
+
+    def test_the_public_decoder_validates_and_cleans(self):
+        self.assertEqual(grok.decode_line('{"type":"text","data":"\\ud800"}'), {"type": "text", "data": REPLACED})
+        for raw in ("[]", "{}", '{"type":false}', '{"type":""}', "nope"):
+            with self.subTest(raw=raw), self.assertRaises(grok.GrokProtocolError):
+                grok.decode_line(raw)
 
     def test_a_second_end_is_a_protocol_fault(self):
         drafts, _ = run([end(), end()], 0)
@@ -524,6 +564,32 @@ class UsageTest(unittest.TestCase):
                 (usage,) = of_type(run([end(usage={"input_tokens": 1}, total_cost_usd_ticks=ticks)], 0)[0], "usage")
                 self.assertEqual(usage["cost_usd"]["value"], cost)
 
+    def test_an_integer_dollar_cost_is_bounded_before_it_becomes_a_float(self):
+        top = 2 ** 53 - 1
+        for fields, value in (({"total_cost_usd": 10 ** 400}, None),
+                              ({"total_cost_usd_ticks": 10 ** 400, "total_cost_usd": 10 ** 400}, None),
+                              ({"total_cost_usd": top + 1}, None), ({"total_cost_usd": -1}, None),
+                              ({"total_cost_usd": 2}, 2.0), ({"total_cost_usd": top}, float(top))):
+            with self.subTest(fields=list(fields), value=value):
+                for final in (end(usage={"input_tokens": 1}, **fields),
+                              line({"type": "error", "message": "x", "usage": {"input_tokens": 1}, **fields})):
+                    (usage,) = of_type(run([final], 0)[0], "usage")
+                    self.assertEqual(usage["cost_usd"]["value"], value)
+
+    def test_the_turn_totals_are_drafted_once(self):
+        error = {"type": "error", "message": "boom"}
+        for lines, first in (([line({**error, "usage": {"input_tokens": 4}}), line({**error, "usage": {"input_tokens": 5}})], 4),
+                             ([line({**error, "usage": {"input_tokens": 4}}), end(usage={"input_tokens": 9})], 4),
+                             ([line({**error, "usage_is_incomplete": True}), end(usage={"input_tokens": 3})], None)):
+            with self.subTest(first=first):
+                drafts, parser = run(lines, 1)
+                turns = [u["input_tokens"]["value"] for u in of_type(drafts, "usage") if u["span"] == "turn"]
+                self.assertEqual(turns, [first])
+                self.assertEqual(parser.ignored["turn_usage_already_drafted"], 1)
+        drafts, parser = run([line(error), end(usage={"input_tokens": 9})], 1)   # the first carried no totals
+        self.assertEqual([u["input_tokens"]["value"] for u in of_type(drafts, "usage")], [9])
+        self.assertNotIn("turn_usage_already_drafted", parser.ignored)
+
     def test_a_cost_that_is_not_finite_is_unknown(self):
         # 1e400 is valid JSON and reads as an infinite float.
         raw = '{"type":"end","stopReason":"end_turn","usage":{"input_tokens":1},"total_cost_usd":1e400}\n'
@@ -645,6 +711,34 @@ class ToolTest(unittest.TestCase):
                     self.assertEqual(result_of(drafts)["code"], c.PROTOCOL_ERROR)
                     self.assertEqual(parser.ignored["protocol_fault"], 1)
 
+    def test_a_tool_id_that_held_a_lone_surrogate_is_refused_not_paired_with_another_call(self):
+        base = {"type": "tool_call", "toolName": "t", "status": "completed"}
+        drafts, parser = run([escaped({**base, "toolCallId": "id" + LONE}),
+                              escaped({**base, "toolCallId": "id" + REPLACED}), end()], 0)
+        self.assertEqual([p["call_id"] for p in of_type(drafts, "tool.call")], ["id" + REPLACED])
+        self.assertEqual(parser.ignored["tool_id_not_utf8"], 1)
+        self.assertNotIn("tool_call_repeated", parser.ignored)
+        parser = grok.OneShotParser(CONN)
+        parser.parse(escaped({**base, "toolCallId": "id" + REPLACED, "status": "in_progress"}))
+        wrong = parser.parse(escaped({"type": "tool_call_update", "toolCallId": "id" + LONE, "status": "completed"}))
+        self.assertEqual(of_type(wrong, "tool.result"), [])
+        right = parser.parse(escaped({"type": "tool_call_update", "toolCallId": "id" + REPLACED, "status": "completed"}))
+        self.assertEqual(len(of_type(right, "tool.result")), 1)
+
+    def test_nested_strings_are_cleaned_and_the_writers_running_out_of_stack_are_handled(self):
+        (call,) = of_type(run([escaped({"type": "tool_call", "toolCallId": "c", "toolName": "t",
+                                        "rawInput": {"a": [{"b": LONE}]}})], 0)[0], "tool.call")
+        self.assertEqual(call["input"], {"a": [{"b": REPLACED}]})
+        with mock.patch.object(grok, "_canonical_text", side_effect=RecursionError("deep")):
+            drafts, parser = run([self.call(), end()], 0)
+        self.assertEqual(of_type(drafts, "tool.call"), [])
+        self.assertEqual(parser.ignored["tool_input_without_rfc8785_form"], 1)
+        parser = grok.OneShotParser(CONN)
+        parser.parse(self.call())
+        with mock.patch.object(grok, "_canonical_text", side_effect=RecursionError("deep")):
+            (res,) = of_type(parser.parse(self.update("completed", rawOutput={"n": 1})), "tool.result")
+        self.assertEqual((res["text"], res["truncated"]), ("", True))
+
     def test_a_call_seen_again_after_its_result_is_not_drafted_again(self):
         drafts, parser = run([self.call(), self.update("completed"), self.call()], 0)
         self.assertEqual(len(of_type(drafts, "tool.call")), 1)
@@ -737,6 +831,7 @@ class ArgvTest(unittest.TestCase):
                              ({"prompt_file": "/p", "model": "grok\x00x"}, c.REQUEST_INVALID),
                              ({"prompt_file": "/p", "model": "a\nb"}, c.REQUEST_INVALID),
                              ({"prompt_file": "/p\n", "model": None}, c.REQUEST_INVALID),
+                             ({"prompt_file": "-p", "model": None}, c.REQUEST_INVALID),
                              ({"prompt_file": "/p\r", "model": None}, c.REQUEST_INVALID),
                              ({"prompt_file": "/p", "model": "a\rb"}, c.REQUEST_INVALID),
                              ({"prompt_file": "/p", "model": ""}, c.REQUEST_INVALID),

@@ -36,9 +36,10 @@ not run by this lane):
 
 How a run ends (``OneShotParser.finish``), first match wins:
 
-1. a line that is not blank and is not one JSON object with a string ``type``, a tool line whose
-   ``toolCallId`` or ``status`` is not a string, or a second ``end``: ``protocol_error``. The last line
-   counts here only if it ends with its newline;
+1. a line that is not blank and is not one JSON object with a string ``type`` (or is nested too deeply
+   to read), a tool line whose ``toolCallId`` is not a string or whose ``status``, when present and not
+   null, is not a string, or a second ``end``: ``protocol_error``. The last line counts here only if it
+   ends with its newline;
 2. the process ended on a signal (a negative return code, 130 or 143): ``engine_exited``. A kill that
    lands inside a write leaves a last line with no newline; it is a cut line, not a protocol fault;
 3. a last line with no newline that is not one typed JSON object, with no signal: ``protocol_error``;
@@ -61,19 +62,20 @@ or turn totals with no count above 0 are unknown, not free; the turn's counts ar
 (``TurnUsage``, ``extensions/notification.rs:1188-1190``, with none of them). A line that carries any of
 the three is one call (span ``call``). A line with none of them may be either, so it gets no draft (it
 is counted in ``ignored``; its raw line is in ``engine.output``): the totals on ``end`` or ``error``
-cover the turn (span ``turn``). Neither names the model, except the totals when ``modelUsage`` names
-exactly one.
+cover the turn (span ``turn``), drafted once per run (a second line with totals is counted, not
+drafted). Neither names the model, except the totals when ``modelUsage`` names exactly one.
 
 A ``tool.call`` carries ``input_digest``, the SHA-256 of the input as RFC 8785 writes it, taken with
 the core's own writer (``control.methods.canonical_text``); the input itself is carried only when it
 is an object whose RFC 8785 text is at most ``MAX_TOOL_INPUT_BYTES`` UTF-8 bytes. An input with no
 RFC 8785 form (an integer beyond 2**53, a lone surrogate) gets no ``tool.call`` draft; its raw line is
 still in ``engine.output``, the case is counted in ``OneShotParser.ignored`` and named in the
-result's detail. A tool line whose ``toolCallId`` or ``status`` is not a string is a protocol fault; a
-string id that is empty, too long or holds a line break is counted and drafts nothing. A
-``tool.result`` text is the call's text content blocks, else its raw output as RFC 8785 writes it;
-raw output with no RFC 8785 form gives an empty text marked truncated (counted), never another
-spelling such as ``Infinity``.
+result's detail. A tool line whose ``toolCallId`` is not a string, or whose ``status`` is present,
+not null and not a string, is a protocol fault; a string id that is empty, too long, holds a line
+break or held a lone surrogate (cleaning it could make it another call's id) is counted and drafts
+nothing. A ``tool.result`` text is the call's text content blocks; else a string ``rawOutput`` as it
+stands; else the raw output as RFC 8785 writes it. Raw output with no RFC 8785 form gives an empty
+text marked truncated (counted), never another spelling such as ``Infinity``.
 
 What is public. ``OneShotParser`` (``parse``, ``finish``, ``outcome``), ``parse_run``,
 ``decode_line``, ``GrokProtocolError``, ``DECLARATION`` (read-only) and ``declaration()`` (a plain
@@ -88,6 +90,8 @@ exactly as it stands in that file, with its newline; the parser counts UTF-8 byt
 Text no UTF-8 writer can write. A lone surrogate (from a JSON escape such as ``\\ud800``, or a byte that
 is not UTF-8 kept by the reader) is written as U+FFFD before anything is read from the line, in the
 ``engine.output`` text and in every string of the decoded line; so a digest is of the cleaned input.
+A name that must be exact is not cleaned but refused: a ``toolCallId`` (above) or a ``sessionId``
+(not kept) that held a lone surrogate.
 A count or a tick total above 2**53 - 1 has no exact RFC 8785 form and is unknown.
 """
 
@@ -170,12 +174,17 @@ def oneshot_argv(*, prompt_file: str, model: str | None, binary: str | None = No
     every user of the machine through ``/proc/<pid>/cmdline``, it is capped near 128 KiB, and a prompt
     beginning with ``-`` would be read as a flag. ``--prompt-file`` puts the CLI in headless mode as
     ``-p`` does (headless guide, "Basic Usage"). ``model`` None leaves the engine's default.
+
+    Refusals, each a ``contract.RouteError`` raised before anything is launched: ``launch_refused`` for an
+    executable that is empty or holds NUL; ``request_invalid`` for a prompt path or a model that is empty,
+    holds NUL, CR or LF, or begins with ``-`` (it would be read as a flag).
     """
 
     executable = DEFAULT_EXECUTABLE if binary is None else binary
     if not isinstance(executable, str) or not executable or "\x00" in executable:
         raise c.RouteError(c.LAUNCH_REFUSED, "grok: no executable")
-    if not isinstance(prompt_file, str) or not _ONE_LINE.fullmatch(prompt_file) or "\x00" in prompt_file:
+    if (not isinstance(prompt_file, str) or not _ONE_LINE.fullmatch(prompt_file) or "\x00" in prompt_file
+            or prompt_file.startswith("-")):
         raise c.RouteError(c.REQUEST_INVALID, "grok: prompt file")
     argv = [executable, "--prompt-file", prompt_file, "--output-format", OUTPUT_FORMAT]
     if model is not None:
@@ -193,8 +202,13 @@ def decode_line(line: str) -> dict:
     return _decode(line)[0]
 
 
-def _decode(line: str) -> tuple[dict, bool]:
-    """``decode_line``, and whether cleaning changed a string."""
+# Fields that name something exactly (a tool call to pair with its result; the conversation to resume).
+# Cleaning one would make two different names the same, so a name that held a lone surrogate is refused.
+_IDENTITY_KEYS = ("toolCallId", "sessionId")
+
+
+def _decode(line: str) -> tuple[dict, bool, frozenset]:
+    """``decode_line``, whether cleaning changed a string, and which identity fields it changed."""
 
     try:
         raw = json.loads(line, parse_constant=_refuse_constant)
@@ -202,11 +216,17 @@ def _decode(line: str) -> tuple[dict, bool]:
         raise GrokProtocolError("stdout line is not JSON") from None
     if not isinstance(raw, dict):
         raise GrokProtocolError("stdout line is not a JSON object")
-    message = _clean_value(raw)
+    try:
+        message = _clean_value(raw)
+        cleaned = message != raw
+    except RecursionError:
+        raise GrokProtocolError("stdout line is nested too deeply") from None
     kind = message.get("type")
     if not isinstance(kind, str) or not kind:
         raise GrokProtocolError("stdout line has no type")
-    return message, message != raw
+    altered = frozenset(key for key in _IDENTITY_KEYS
+                        if isinstance(raw.get(key), str) and _clean_text(raw[key]) is not raw[key])
+    return message, cleaned, altered
 
 
 def _refuse_constant(name: str) -> object:
@@ -266,6 +286,8 @@ class OneShotParser:
         self._protocol: str | None = None        # the first protocol fault
         self._cut_line: str | None = None        # why a last line with no newline did not decode
         self._undrafted_calls = 0                # tool calls whose input has no RFC 8785 form
+        self._altered: frozenset = frozenset()   # identity fields of the current line that held a lone surrogate
+        self._turn_spend_drafted = False         # the turn's totals are drafted once
         self._open_calls: set[str] = set()       # tool calls drafted and not yet given a result
         self._done_calls: set[str] = set()
         self._finished = False
@@ -295,7 +317,7 @@ class OneShotParser:
             self._count("blank_line")
             return drafts
         try:
-            message, cleaned = _decode(line)
+            message, cleaned, self._altered = _decode(line)
         except GrokProtocolError as err:
             if line.endswith("\n"):
                 self._fault(str(err))
@@ -372,7 +394,7 @@ class OneShotParser:
 
     def _tool_call(self, message: dict, drafts: list) -> None:
         call_id = message.get("toolCallId")
-        if not self._well_typed_tool_line(message):
+        if not self._well_typed_tool_line(message) or not self._identity_is_exact():
             return
         if not _is_one_line(call_id, 128):
             self._count("tool_call_without_id")
@@ -404,8 +426,17 @@ class OneShotParser:
         self._tool_result(message, drafts)   # a call can be reported already finished
 
     def _tool_update(self, message: dict, drafts: list) -> None:
-        if self._well_typed_tool_line(message):
+        if self._well_typed_tool_line(message) and self._identity_is_exact():
             self._tool_result(message, drafts)
+
+    def _identity_is_exact(self) -> bool:
+        """A ``toolCallId`` that held a lone surrogate is refused (counted), not cleaned: cleaning could make
+        it the id of another call, and a result would then be paired with the wrong call."""
+
+        if "toolCallId" in self._altered:
+            self._count("tool_id_not_utf8")
+            return False
+        return True
 
     def _well_typed_tool_line(self, message: dict) -> bool:
         """A tool line's ``toolCallId`` must be a string and its ``status``, when present, a string:
@@ -461,7 +492,9 @@ class OneShotParser:
         stop = message.get("stopReason")
         self.stop_reason = stop if isinstance(stop, str) else None
         session = message.get("sessionId")
-        if _is_one_line(session, 256):
+        if "sessionId" in self._altered:
+            self._count("session_id_not_utf8")   # a cleaned id would resume another conversation, or none
+        elif _is_one_line(session, 256):
             self.engine_session_id = session
         request = message.get("requestId")
         if isinstance(request, str) and request:
@@ -478,13 +511,21 @@ class OneShotParser:
         self._spend(message, drafts)
 
     def _spend(self, message: dict, drafts: list) -> None:
-        """The turn's totals on ``end`` or ``error``, when the engine sent any."""
+        """The turn's totals on ``end`` or ``error``, when the engine sent any, drafted once: a second
+        line that carries totals (a second ``error``, or ``end`` after ``error``) is counted, so a
+        consumer that sums span ``turn`` never counts the turn twice."""
 
         usage = message.get("usage")
         incomplete = message.get("usage_is_incomplete") is True
+        if not isinstance(usage, Mapping) and not incomplete:
+            return
+        if self._turn_spend_drafted:
+            self._count("turn_usage_already_drafted")
+            return
+        self._turn_spend_drafted = True
         if not isinstance(usage, Mapping):
-            if incomplete:   # incomplete and no tokens recorded: say unknown, never 0
-                drafts.append(_usage_draft(self.connection_id, None, "turn", None, lower_bound=False, cost=None))
+            # incomplete and no tokens recorded: say unknown, never 0
+            drafts.append(_usage_draft(self.connection_id, None, "turn", None, lower_bound=False, cost=None))
             return
         counts = [_count_of(usage.get(key)) for key in _RESPONSE_KEYS]
         if _nothing_reported(counts):
@@ -520,8 +561,11 @@ _TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_rea
 
 
 def parse_run(connection_id: str, lines: Sequence[str], returncode: int) -> tuple[list[dict], OneShotParser]:
-    """Every draft of one finished run, in order, and the parser that made them."""
+    """Every draft of one finished run, in order, and the parser that made them. ``lines`` is the lines,
+    not the file: a ``str`` or ``bytes`` is refused (``TypeError``) rather than read a character at a time."""
 
+    if isinstance(lines, (str, bytes, bytearray)):
+        raise TypeError("lines: pass the output's lines, not one string")
     parser = OneShotParser(connection_id)
     drafts: list[dict] = []
     for line in lines:
@@ -589,8 +633,12 @@ def _cost(message: dict) -> float | None:
     if not isinstance(ticks, bool) and isinstance(ticks, int) and ticks >= 0 and ticks <= _MAX_EXACT_INT:
         return ticks / _TICKS_PER_USD
     dollars = message.get("total_cost_usd")
-    if not isinstance(dollars, bool) and isinstance(dollars, (int, float)) and math.isfinite(dollars) and dollars >= 0:
-        return float(dollars)
+    if isinstance(dollars, bool):
+        return None
+    if isinstance(dollars, int):   # an integer of any size: bounded before it becomes a float
+        return float(dollars) if 0 <= dollars <= _MAX_EXACT_INT else None
+    if isinstance(dollars, float) and math.isfinite(dollars) and dollars >= 0:
+        return dollars
     return None
 
 

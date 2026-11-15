@@ -255,8 +255,9 @@ validates all of it (its digest, its lines, its envelope against its effect) bef
 pending request; a refusal is typed and leaves the record, its revision and the binding as they were.
 A change of content is not a change of target: an effect bound to another run, session or engine, or
 from another plugin, is refused (`target`). A record read back from where it is durable is checked
-before it is read: a consumption checks its shape before its state, and a change checks its state
-before branching on it and a pending record whole before building the candidate from it. A member
+before it is read: a consumption checks its shape before its state, a change checks its state
+before branching on it and a pending record whole before building the candidate from it, and a fresh
+`approval.open` or `approval.answer` checks it whole after a kept receipt is replayed. A member
 that is missing, of another type or outside its list is `record_invalid`, never a host exception,
 and the record, its revision, the binding and the receipts stay as they were.
 

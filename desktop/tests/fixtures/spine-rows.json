@@ -1,0 +1,412 @@
+{
+  "about": "Rows of SPINE's draft method table for the methods the desktop's actions use, as sync_spine.py read them from pull request #368 at spine_head. Made by that script with --write; not edited by hand.",
+  "rows": {
+    "approval.answer": {
+      "beta": true,
+      "idempotency": "command_id",
+      "lane": "APPROVALS",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "answer",
+          "approval_id",
+          "command_id",
+          "digest",
+          "expected_revision",
+          "surface"
+        ],
+        "required": [
+          "answer",
+          "approval_id",
+          "command_id",
+          "digest",
+          "expected_revision",
+          "surface"
+        ]
+      },
+      "precondition": "expected_revision",
+      "scope": "approve"
+    },
+    "approval.list": {
+      "beta": true,
+      "idempotency": "none",
+      "lane": "APPROVALS",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "after",
+          "limit",
+          "session_id",
+          "state"
+        ],
+        "required": []
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "approval.open": {
+      "beta": true,
+      "idempotency": "command_id",
+      "lane": "APPROVALS",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "approval_id",
+          "command_id",
+          "surface"
+        ],
+        "required": [
+          "approval_id",
+          "command_id",
+          "surface"
+        ]
+      },
+      "precondition": "none",
+      "scope": "approve"
+    },
+    "events.follow": {
+      "beta": true,
+      "idempotency": "none",
+      "lane": "EVENTS",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "cursor",
+          "limit",
+          "projection",
+          "wait_ms"
+        ],
+        "required": [
+          "cursor"
+        ]
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "events.read": {
+      "beta": true,
+      "idempotency": "none",
+      "lane": "EVENTS",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "cursor",
+          "limit",
+          "projection"
+        ],
+        "required": [
+          "cursor"
+        ]
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "plugin.list": {
+      "beta": false,
+      "idempotency": "none",
+      "lane": "PLUGIN-HOST",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [],
+        "required": []
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "route.list": {
+      "beta": false,
+      "idempotency": "none",
+      "lane": "CONTROL",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [],
+        "required": []
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "run.list": {
+      "beta": false,
+      "idempotency": "none",
+      "lane": "CONTROL",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "after",
+          "limit"
+        ],
+        "required": []
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "run.start": {
+      "beta": false,
+      "idempotency": "client_key",
+      "lane": "CONTROL",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "client_key",
+          "containment_level",
+          "engine",
+          "hand_pick",
+          "prompt",
+          "tenant",
+          "workspace"
+        ],
+        "required": [
+          "prompt",
+          "tenant"
+        ]
+      },
+      "precondition": "none",
+      "scope": "run"
+    },
+    "run.status": {
+      "beta": false,
+      "idempotency": "none",
+      "lane": "CONTROL",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "run_id"
+        ],
+        "required": [
+          "run_id"
+        ]
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "run.stop": {
+      "beta": false,
+      "idempotency": "none",
+      "lane": "STOP",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "run_id"
+        ],
+        "required": [
+          "run_id"
+        ]
+      },
+      "precondition": "none",
+      "scope": "run"
+    },
+    "session.interrupt": {
+      "beta": true,
+      "idempotency": "command_id",
+      "lane": "SESSIONS",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "command_id",
+          "expected_turn_id",
+          "session_id"
+        ],
+        "required": [
+          "command_id",
+          "expected_turn_id",
+          "session_id"
+        ]
+      },
+      "precondition": "expected_turn_id",
+      "scope": "run"
+    },
+    "session.list": {
+      "beta": true,
+      "idempotency": "none",
+      "lane": "SESSIONS",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "after",
+          "limit",
+          "parent_session_id",
+          "state",
+          "tenant"
+        ],
+        "required": []
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "session.start": {
+      "beta": true,
+      "idempotency": "command_id",
+      "lane": "SESSIONS",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "budget",
+          "command_id",
+          "containment_level",
+          "engine",
+          "hand_pick",
+          "parent_session_id",
+          "prompt",
+          "tenant",
+          "workspace"
+        ],
+        "required": [
+          "command_id",
+          "tenant"
+        ]
+      },
+      "precondition": "none",
+      "scope": "run"
+    },
+    "session.status": {
+      "beta": true,
+      "idempotency": "none",
+      "lane": "SESSIONS",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "session_id"
+        ],
+        "required": [
+          "session_id"
+        ]
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "session.stop": {
+      "beta": true,
+      "idempotency": "command_id",
+      "lane": "DELEGATION",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "command_id",
+          "scope",
+          "session_id"
+        ],
+        "required": [
+          "command_id",
+          "scope",
+          "session_id"
+        ]
+      },
+      "precondition": "none",
+      "scope": "run"
+    },
+    "session.turn": {
+      "beta": true,
+      "idempotency": "command_id",
+      "lane": "SESSIONS",
+      "mutating": true,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "command_id",
+          "expected_revision",
+          "session_id",
+          "text"
+        ],
+        "required": [
+          "command_id",
+          "expected_revision",
+          "session_id",
+          "text"
+        ]
+      },
+      "precondition": "expected_revision",
+      "scope": "run"
+    },
+    "surface.prefs.get": {
+      "beta": true,
+      "idempotency": "none",
+      "lane": "PAGE",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "surface"
+        ],
+        "required": [
+          "surface"
+        ]
+      },
+      "precondition": "none",
+      "scope": "read"
+    },
+    "workspace.diff": {
+      "beta": true,
+      "idempotency": "none",
+      "lane": "WORKSPACE",
+      "mutating": false,
+      "page_allowed": true,
+      "params": {
+        "additionalProperties": false,
+        "properties": [
+          "session_id",
+          "turn_id"
+        ],
+        "required": [
+          "session_id"
+        ]
+      },
+      "precondition": "none",
+      "scope": "read"
+    }
+  },
+  "sources": {
+    "approval.v1.json": "2a36b8762357d455cf4ea0cb4d01c42b709078f8b0784c50eb99a766d4f52189",
+    "methods.table.v1.json": "1e07fc7c59f3d608b3ad4dbde599d8fc7db4d68c48ba2240296ccc03accd0640",
+    "methods.v1.json": "fe9fc65295b73fe396898fff262dc9845c917c88210087166f2f6f232d853b19"
+  },
+  "spine_head": "5aface43d357b4135a594ba68abfc5944ac4045d",
+  "surfaces": {
+    "approval": [
+      "cli",
+      "tui",
+      "page",
+      "phone"
+    ],
+    "surface.prefs": [
+      "tui",
+      "page",
+      "desktop",
+      "phone"
+    ]
+  },
+  "table_version": "1.0-draft.10"
+}

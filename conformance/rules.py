@@ -1224,7 +1224,12 @@ class ApprovalModel:
     'request_invalid' naming the field, keeps no receipt and changes nothing; the same command id with
     the same params returns the first answer, and with other
     params is 'conflict' (command_id_reused): such a replay is HISTORICAL, it reports what was answered
-    and never carries an effect out again; then, before a fresh answer is taken, the current time is
+    and never carries an effect out again; then, before either fresh operation (approval.open as well as
+    approval.answer) reads any member of the retained record, the record's published shape is validated:
+    a restored record that is not the shape of an approval raises ``Refused("record_invalid")``, the
+    core's own refusal and not an answer of either method (the method table gains no code), and keeps no
+    receipt and changes neither record, binding nor receipts, while a replay of a kept receipt stays
+    historical and is answered as before; then, before a fresh answer is taken, the current time is
     compared with expires_at under the same serialisation as the request's state: at or after the
     deadline a pending request becomes 'expired' with no answer, answerer or answer time, and the
     fresh answer is 'conflict' (already_resolved); a request that is no longer pending is 'conflict'
@@ -1345,6 +1350,8 @@ class ApprovalModel:
             if first_payload == payload:
                 return copy.deepcopy(first_answer)
             return {"code": "conflict", "detail": "command_id_reused"}
+        if not fits("approval.v1.json", self.record):   # a fresh operation reads only a record that is an approval
+            raise Refused("record_invalid")
         answer = self._open(principal, params, at) if method == "approval.open" else self._answer(principal, params, at)
         self.receipts[receipt_key] = (payload, copy.deepcopy(answer))
         return answer

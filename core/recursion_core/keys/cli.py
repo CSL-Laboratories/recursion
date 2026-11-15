@@ -17,13 +17,15 @@
     then says what it removed and from where. It also clears what an interrupted save left behind.
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
-    names each place a value was found, never the value. Exit 1 when one was found, 4 when the search was
-    incomplete (a value or a file could not be read, an operation is unfinished, or the journal was asked for
-    and not searched to the end) and nothing was found.
+    names each place a value was found, never the value, and each temp file an interrupted save left in the
+    store's folder. Exit 1 when one was found, 4 when the search was incomplete (a value or a file could not be
+    read, an operation is unfinished, or the journal was asked for and not searched to the end) and nothing was
+    found, and 3, not 1, when it was refused, so that 1 always means a finding.
 
-Exit statuses: 0 done, 1 refused (``refused: <code>: <detail>`` on standard error), 2 a usage error, which
-includes a command line holding words the command does not take (``value_from_argv``; they are not repeated).
-Every argument's destination starts with ``key_``, so none can meet a name of the control CLI's own.
+Exit statuses: 0 done, 1 refused (``refused: <code>: <detail>`` on standard error; 3 for ``audit``), 2 a usage
+error, which includes a command line holding words the command does not take (``value_from_argv``; they are not
+repeated), 130 interrupted (Ctrl-C; the terminal is restored, and an unfinished save stays on record). Every
+argument's destination starts with ``key_``, so none can meet a name of the control CLI's own.
 """
 from __future__ import annotations
 
@@ -223,9 +225,9 @@ class Terminal:
         return '' if line is None else line.decode('ascii', 'replace').strip()
 
 
-def _refused(err, exc: KeyStoreError) -> int:
+def _refused(err, exc: KeyStoreError, status: int) -> int:
     print(f'refused: {exc}', file=err)
-    return 1
+    return status
 
 
 def _store_line(backend: str | None, store: KeyStore) -> str:
@@ -251,6 +253,7 @@ def run(args, out=None, err=None, *, store: KeyStore | None = None, terminal: Te
         print('refused: value_from_argv: the command line holds words this command does not take, and a key is never '
               'taken from the command line; nothing was done (and what was typed is not repeated here)', file=err)
         return 2
+    refused = 3 if args.key_action == 'audit' else 1
     try:
         if args.key_action == 'add':
             return _add(args, out, err, store, terminal, stdin)
@@ -261,10 +264,13 @@ def run(args, out=None, err=None, *, store: KeyStore | None = None, terminal: Te
         if args.key_action == 'audit':
             return _audit(args, out, err, store)
     except KeyStoreError as exc:
-        return _refused(err, exc)
+        return _refused(err, exc, refused)
     except OSError as exc:
         # The folder or a helper failed underneath the store (a full disk, say). Its type and errno only.
-        return _refused(err, KeyStoreError('store_failed', f'{type(exc).__name__} errno {exc.errno}'))
+        return _refused(err, KeyStoreError('store_failed', f'{type(exc).__name__} errno {exc.errno}'), refused)
+    except KeyboardInterrupt:
+        print('interrupted: nothing more was done (an unfinished save stays on record; "key list" shows it)', file=err)
+        return 130
     print('usage: key add|list|remove|audit', file=err)
     return 2
 
@@ -393,12 +399,16 @@ def _audit(args, out, err, store) -> int:
     for key_id, op in sorted(report.pending.items()):
         print(f'unfinished {op} of {key_id}: its value may still be in the store; "key remove {key_id}" clears it',
               file=out)
+    for place in report.leftovers:
+        print(f'FOUND: a temp file an interrupted save left behind, which may hold part of a key: {place} (the next '
+              '"key add" or "key remove" deletes it)', file=out)
     for place in report.unreadable[:20]:
         print(f'unreadable: {place}', file=out)
     if len(report.unreadable) > 20:
         print(f'unreadable: {len(report.unreadable) - 20} more', file=out)
+    findings = len(report.found) + len(report.leftovers)
     print(f'audit: {report.keys} saved key(s); {report.files} file(s) searched under {", ".join(report.roots)}; '
-          f'journal {report.journal}; {len(report.found)} finding(s)', file=out)
-    if report.found:
+          f'journal {report.journal}; {findings} finding(s)', file=out)
+    if findings:
         return 1
     return 0 if report.complete() else 4

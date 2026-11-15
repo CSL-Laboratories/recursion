@@ -3,7 +3,9 @@
 - key id: 1 to 128 of ``A-Z a-z 0-9 . _ : -``, starting with a letter or digit. It is the route's connection
   id (``route.connection.id``), the ``token`` of ``schemas/control/v1/common.v1.json`` NARROWED: an id that
   starts with ``.``, ``_``, ``:`` or ``-`` is refused, so that no id can ever be read as a helper's option. A
-  route whose connection id starts so cannot have a saved key.
+  route whose connection id starts so cannot have a saved key. A NEW id (``add``, ``remove``) is also at most 64
+  characters and not shaped like a key (``looks_like_a_key``), so that a key pasted where the id goes is
+  refused, not saved as the id and shown.
 - provider: any lower-case vendor id, 1 to 64 of ``a-z 0-9 . _ -``, starting with a letter or digit ("API keys
   are configurable for every vendor", CONTRACT 275). ``PROVIDERS`` below is the published list of the vendors
   the contract names; the key store owns it (the Liaison's ruling of Nov 14, 2026) and lane ROUTING matches a
@@ -56,22 +58,40 @@ def valid_key_id(text: object) -> bool:
 
 
 ID_SAVE_MAX = 64
-_KEY_LIKE_RUN = re.compile(r'[A-Za-z0-9]{20,}')
+ID_WORD_MAX = 16             # letters and digits between two of . _ : -
+ID_DIGITS_MAX = 8            # digits in a row (a date, 20261114, is 8)
+ID_CLASS_CHANGES_MAX = 4     # changes between lower case, upper case and digit inside the words, in all
+_ID_WORD = re.compile(r'[A-Za-z0-9]+')
+_DIGITS = re.compile(r'[0-9]+')
+
+
+def _kind(ch: str) -> int:
+    return 0 if 'a' <= ch <= 'z' else 1 if 'A' <= ch <= 'Z' else 2
 
 
 def looks_like_a_key(text: str) -> bool:
-    """An id with a run of 20 or more letters and digits that mixes upper case, lower case and digits: the shape of
-    an API key pasted where the id goes, never of a route's connection id."""
-    return any(any(c.isupper() for c in run) and any(c.islower() for c in run) and any(c.isdigit() for c in run)
-               for run in _KEY_LIKE_RUN.findall(text))
+    """True when ``text`` has the shape of an API key, not of a name.
+
+    A connection id is a name: a few words of letters and digits between ``. _ : -``, as route files spell them
+    (``codex-key``, ``login-B``, ``gpt4o-mini``, ``OpenAI-prod``). A key is long runs of mixed characters, split
+    or not. So an id is key-shaped when a word is longer than 16 characters, when more than 8 digits stand in a
+    row, or when its words change between lower case, upper case and digits more than 4 times in all
+    (``Ab3d-Ef5h`` changes 6 times, ``OpenAI-prod`` twice, ``gpt4o-mini`` twice)."""
+    words = _ID_WORD.findall(text)
+    if any(len(word) > ID_WORD_MAX for word in words):
+        return True
+    if any(len(run) > ID_DIGITS_MAX for run in _DIGITS.findall(text)):
+        return True
+    changes = sum(_kind(a) != _kind(b) for word in words for a, b in zip(word, word[1:]))
+    return changes > ID_CLASS_CHANGES_MAX
 
 
 def id_problem(text: object) -> str | None:
     """Why ``text`` cannot be saved (or removed) as a key id, in words that never repeat it; None when it can.
 
     Narrower than ``valid_key_id`` (which reads an index the store already wrote): at most 64 characters, and not
-    the shape of a key, so that a key typed in the id's place is refused instead of being saved as the id and
-    shown by ``list``."""
+    the shape of a key (``looks_like_a_key``), so that a key typed in the id's place is refused instead of being
+    saved as the id and shown by ``list``."""
     if not valid_key_id(text):
         return 'a key id is 1 to 64 of A-Z a-z 0-9 . _ : -, starting with a letter or digit'
     if len(text) > ID_SAVE_MAX or looks_like_a_key(text):

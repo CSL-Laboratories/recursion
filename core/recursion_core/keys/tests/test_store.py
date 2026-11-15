@@ -28,9 +28,12 @@ class SaveTest(TempStoreCase):
                          ('codex-key', 'openai', 'CODEX_API_KEY', 'owner_file'))
         self.assertEqual(record.created_at, '2025-11-14T22:40:00.250Z')
         index = json.loads((self.root / 'index.json').read_text())
-        self.assertEqual(index, {'version': 1, 'backend': 'owner_file', 'keys': {'codex-key': {
-            'provider': 'openai', 'env_name': 'CODEX_API_KEY', 'created_at': '2025-11-14T22:40:00.250Z',
-            'store': 'owner_file', 'metered_spend_allowed': True, 'cap_usd': 5}}, 'pending': {}})
+        self.assertRegex(index['store_id'], r'^[0-9a-f]{32}$')
+        self.assertRegex(record.save_id, r'^[0-9a-f]{32}$')
+        self.assertEqual(index, {'version': 1, 'store_id': index['store_id'], 'backend': 'owner_file', 'keys': {
+            'codex-key': {'provider': 'openai', 'env_name': 'CODEX_API_KEY', 'created_at': '2025-11-14T22:40:00.250Z',
+                          'store': 'owner_file', 'metered_spend_allowed': True, 'cap_usd': 5,
+                          'save_id': record.save_id}}, 'pending': {}})
         self.assertNotIn(MARKER.encode(), (self.root / 'index.json').read_bytes())
         self.assertEqual(json.loads((self.root / 'secrets.json').read_text()),
                          {'version': 1, 'secrets': {'codex-key': MARKER}})

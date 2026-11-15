@@ -47,10 +47,10 @@ class ConsistentReadTest(TempStoreCase):
         original = OwnerFile.get
         results, writer_done = [], threading.Event()
 
-        def paused_get(backend, key_id, folder):
+        def paused_get(backend, key_id, folder, save_id=None):
             reached.set()
             resume.wait()
-            return original(backend, key_id, folder)
+            return original(backend, key_id, folder, save_id)
 
         def read():
             try:
@@ -91,10 +91,10 @@ class ConsistentReadTest(TempStoreCase):
         reached, resume, listed = threading.Event(), threading.Event(), threading.Event()
         original = OwnerFile.get
 
-        def paused_get(backend, key_id, folder):
+        def paused_get(backend, key_id, folder, save_id=None):
             reached.set()
             resume.wait()
-            return original(backend, key_id, folder)
+            return original(backend, key_id, folder, save_id)
 
         with mock.patch.object(OwnerFile, 'get', paused_get):
             first = threading.Thread(target=lambda: store.credential('codex-key', 'CODEX_API_KEY'), daemon=True)
@@ -154,7 +154,8 @@ class HelperDiagnosticsTest(TempStoreCase):
                 system.tools['secret-tool'] = lambda argv, data: Completed(1, b'', MARKER.encode() + b'\n')
                 argv = ['audit', '--no-journal'] if action == 'audit' else ['remove', 'codex-key', '--yes']
                 status, text = run_main(store, *argv)
-                self.assertEqual(status, 1)
+                # An audit whose values cannot be read is incomplete (4), not refused (DeepSeek N4, round 2).
+                self.assertEqual(status, 4 if action == 'audit' else 1)
                 self.assertIn('keychain_failed', text)
                 self.assertNotIn(MARKER, text)
 
@@ -305,7 +306,7 @@ class RemovalRecoveryTest(TempStoreCase):
             return original(argv, data)
         system.tools['secret-tool'] = first_clear_finds_nothing
         store.remove('codex-key')
-        self.assertEqual(calls, ['clear', 'lookup', 'clear'])
+        self.assertEqual(calls, ['clear', 'lookup', 'clear', 'lookup', 'search'])     # gone is verified (astra R4, round 2)
         self.assertEqual(chain.items, {})
 
     def test_a_removal_whose_index_write_failed_can_be_retried(self) -> None:
@@ -434,7 +435,7 @@ class CapacityTest(TempStoreCase):
         (self.root / 'index.json').write_text(json.dumps(index, indent=1) + '\n')
         self.assertEqual(store.credential('codex-key', 'CODEX_API_KEY'), MARKER)
         with self.assertRaises(KeyStoreError) as caught:
-            self.add(store, key_id='a-much-longer-key-id-than-the-others-' + 'x' * 20)
+            self.add(store, key_id='a-much-longer-key-id-than-the-other-ids-in-the-index')
         self.assertEqual(caught.exception.code, 'store_full')
         self.assertEqual(store.credential('codex-key', 'CODEX_API_KEY'), MARKER)
 

@@ -11,7 +11,8 @@ owned by that user, with one link. Each is checked on EVERY open, through the de
   refused, and a FIFO planted in a file's place cannot block the open; it is then refused as not regular;
 - a file is written to a fresh temp file (``O_CREAT | O_EXCL``, 0600 whatever the umask), synced, renamed
   over the old one and the folder synced, so a reader without the lock sees the old file or the new one,
-  never a part of either;
+  never a part of either; a temp file an interrupted write left behind is deleted by the next writer
+  (``sweep``);
 - writers take ``flock`` on the folder's ``.lock`` file, so two saves at once do not lose one another.
 
 The folders ABOVE the store's own are not checked. Someone who can write one of them can rename the
@@ -28,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import re
 import secrets
 import stat
 from pathlib import Path
@@ -38,6 +40,7 @@ from recursion_core.keys.errors import KeyStoreError
 FOLDER_MODE = 0o700
 FILE_MODE = 0o600
 LOCK_NAME = '.lock'
+TEMP_NAME = re.compile(r'\.[A-Za-z0-9._-]+\.[0-9a-f]{16}\.tmp')     # what ``Folder.write`` names a temp file
 
 # getattr: these names do not exist on Windows, where nothing below runs (the store refuses first).
 _CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
@@ -93,6 +96,14 @@ class Folder:
             return b''.join(chunks)
         finally:
             os.close(fd)
+
+    def sweep(self) -> None:
+        """Delete the temp files an interrupted ``write`` left behind (they may hold part of a value). Only a writer
+        calls it, holding the exclusive lock, so no write is under way."""
+        for name in os.listdir(self.fd):
+            if TEMP_NAME.fullmatch(name):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=self.fd)
 
     def write(self, name: str, data: bytes) -> None:
         """Replace ``name`` with ``data``: a temp file, fsync, rename, fsync of the folder."""

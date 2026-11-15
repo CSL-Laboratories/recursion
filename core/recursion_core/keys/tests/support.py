@@ -73,33 +73,74 @@ def busctl(owner: bool = False, activatable: bool = False, kwallet: bool = False
     return run
 
 
+def attribute_pairs(words) -> dict:
+    return dict(zip(words[0::2], words[1::2]))
+
+
 class FakeKeychain:
-    """An in-memory Secret Service behind a fake ``secret-tool``, for FakeSystem."""
+    """An in-memory Secret Service behind a fake ``secret-tool``, for FakeSystem.
+
+    ``items`` maps an item's attribute words (a tuple) to its secret. A query matches an item as the Secret
+    Service matches it: when the item's attributes include every pair asked for. ``lookup`` and ``clear`` act on
+    unlocked items only, as libsecret does, and exit 1 silently when they find none; ``lookup`` first prompts to
+    unlock a locked match, and ``unlock`` says how the prompt is answered: ``accept``, or ``cancel`` (libsecret
+    then yields no path and no error, so secret-tool exits 1 silently). ``search --all`` lists every match, locked
+    ones too, one ``[<n>]`` line each with the secret of an unlocked one on its own line, as secret-tool prints
+    them; exit 0, and nothing printed when nothing matches.
+    """
 
     def __init__(self) -> None:
         self.items: dict = {}
-        self.mode = 'ok'     # ok | locked | fail | dismissed
+        self.locked: set = set()      # items in a locked collection
+        self.unlock = 'accept'        # accept | cancel
+        self.mode = 'ok'              # ok | locked | fail | dismissed | silent (every call exits 1, saying nothing)
+        self.after_store = None       # what ``store`` answers AFTER saving (a helper killed once it saved), or None
+        self.searched = 'ok'          # ok | fail: what ``search`` does
+
+    def _matches(self, words) -> list:
+        query = attribute_pairs(words).items()
+        return [key for key in self.items if query <= attribute_pairs(key).items()]
 
     def __call__(self, argv, input):
         action = argv[1]
-        attrs = argv[2:] if action != 'store' else argv[3:]
-        key = tuple(attrs)
         if self.mode == 'locked':
             return Completed(1, b'', b'secret-tool: Cannot create an item in a locked collection\n')
         if self.mode == 'dismissed':
             return Completed(1, b'', b'secret-tool: Prompt dismissed\n')
         if self.mode == 'fail':
             return Completed(1, b'', b'secret-tool: The name org.freedesktop.secrets was not provided\n')
+        if self.mode == 'silent':
+            return Completed(1, b'', b'')
         if action == 'store':
+            key = tuple(argv[3:])
             self.items[key] = input
-            return Completed(0, b'', b'')
+            self.locked.discard(key)
+            return self.after_store or Completed(0, b'', b'')
+        if action == 'search':
+            if self.searched == 'fail':
+                return Completed(1, b'', b'secret-tool: The name org.freedesktop.secrets was not provided\n')
+            out = []
+            for number, key in enumerate(self._matches([w for w in argv[2:] if w != '--all']), 1):
+                if key in self.locked and '--all' not in argv:
+                    continue
+                out.append(f'[{number}]\nlabel = Recursion API key\n'.encode())
+                if key not in self.locked:
+                    out.append(b'secret = ' + self.items[key] + b'\n')
+            return Completed(0, b''.join(out), b'')
+        matches = self._matches(argv[2:])
         if action == 'lookup':
-            if key in self.items:
+            for key in sorted(matches, key=lambda k: k in self.locked):
+                if key in self.locked:
+                    if self.unlock != 'accept':
+                        return Completed(1, b'', b'')
+                    self.locked.discard(key)
                 return Completed(0, self.items[key], b'')
             return Completed(1, b'', b'')
         if action == 'clear':
-            # As libsecret: clear reports whether it removed something; secret-tool exits 1, silently, if not.
-            return Completed(0, b'', b'') if self.items.pop(key, None) is not None else Completed(1, b'', b'')
+            gone = [key for key in matches if key not in self.locked]
+            for key in gone:
+                del self.items[key]
+            return Completed(0 if gone else 1, b'', b'')
         return Completed(2, b'', b'secret-tool: unknown action\n')
 
 
@@ -163,16 +204,29 @@ items = json.load(open(items_path)) if os.path.exists(items_path) else {{}}
 action, rest = argv[0], argv[1:]
 if action == 'store':
     rest = [a for a in rest if not a.startswith('--label=')]
-key = '\x1f'.join(rest)
+SEP = chr(31)
+def pairs(words):
+    return dict(zip(words[0::2], words[1::2]))
+def matching(words):
+    query = pairs(words).items()
+    return [k for k in items if query <= pairs(k.split(SEP)).items()]
 if action == 'store':
-    items[key] = data.decode('ascii')
+    items[SEP.join(rest)] = data.decode('ascii')
 elif action == 'lookup':
-    if key not in items:
+    found = matching(rest)
+    if not found:
         sys.exit(1)
-    sys.stdout.write(items[key]); sys.stdout.flush(); sys.exit(0)
+    sys.stdout.write(items[found[0]]); sys.stdout.flush(); sys.exit(0)
 elif action == 'clear':
-    if items.pop(key, None) is None:
+    found = matching(rest)
+    if not found:
         sys.exit(1)
+    for k in found:
+        del items[k]
+elif action == 'search':
+    for number, k in enumerate(matching([w for w in rest if w != '--all']), 1):
+        sys.stdout.write('[%d]\nlabel = item\nsecret = %s\n' % (number, items[k]))
+    sys.exit(0)
 else:
     sys.stderr.write('secret-tool: unknown\n'); sys.exit(2)
 with open(items_path, 'w') as fh:

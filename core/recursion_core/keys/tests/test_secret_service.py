@@ -48,14 +48,22 @@ class SecretToolTest(TempStoreCase):
         self.assertEqual(store.list().backend, 'secret_service')
         self.assertFalse((self.root / 'secrets.json').exists())
         self.assertEqual(store.credential('codex-key', 'CODEX_API_KEY'), MARKER)
+        index = store.list()
+        store_id, save_id = index.store_id, index.keys['codex-key'].save_id
         store.remove('codex-key')
         calls = tool_calls(self.tool_state)
-        self.assertEqual([c['argv'][0] for c in calls], ['store', 'lookup', 'clear'])
+        # The removal is verified: lookup finds nothing, and search --all lists nothing, locked items included.
+        self.assertEqual([c['argv'][0] for c in calls], ['store', 'lookup', 'clear', 'lookup', 'search'])
         stored = calls[0]
         self.assertEqual(stored['stdin_sha256'], hashlib.sha256(MARKER.encode()).hexdigest())
-        self.assertEqual(stored['argv'], ['store', '--label=Recursion API key codex-key', 'application', 'recursion',
-                                          'recursion_store', store.store_id, 'recursion_key_id', 'codex-key'])
-        self.assertRegex(store.store_id, r'^[0-9a-f]{32}$')
+        namespace = ['application', 'recursion', 'recursion_store', store_id, 'recursion_key_id', 'codex-key']
+        self.assertEqual(stored['argv'], ['store', '--label=Recursion API key codex-key', *namespace,
+                                          'recursion_save', save_id])
+        self.assertEqual(calls[1]['argv'], ['lookup', *namespace, 'recursion_save', save_id])
+        self.assertEqual([c['argv'] for c in calls[2:]], [['clear', *namespace], ['lookup', *namespace],
+                                                          ['search', '--all', *namespace]])
+        self.assertRegex(store_id, r'^[0-9a-f]{32}$')
+        self.assertRegex(save_id, r'^[0-9a-f]{32}$')
         for call in calls:
             self.assertNotIn(MARKER, json.dumps(call['argv']))
             self.assertNotIn(MARKER, json.dumps(call['env']))

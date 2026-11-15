@@ -14,5 +14,6 @@ from recursion_core.keys.store import credentials
 
 
 def register(hooks) -> None:
+    commands = hooks.commands       # a hooks object with no command table fails here, before anything is set
     hooks.set('credentials', credentials)
-    hooks.commands.register(key_commands.NAMES, key_commands.parser, key_commands.dispatch)
+    commands.register(key_commands.NAMES, key_commands.parser, key_commands.dispatch)
